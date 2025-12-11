@@ -1538,17 +1538,38 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<PathBuf>> {
-        // Get group data to check if it has an image
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
         let group = mdk
             .get_group(group_id)
             .map_err(WhitenoiseError::from)?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
+        self.resolve_group_image_path(account, &group).await
+    }
+
+    /// Resolves the cached image path for a group (core logic).
+    ///
+    /// This is the internal implementation that receives the Group directly,
+    /// avoiding redundant MDK instantiation and group fetching when the caller
+    /// already has the group data.
+    ///
+    /// # Arguments
+    /// * `account` - The account accessing the image
+    /// * `group` - The group to resolve the image for
+    ///
+    /// # Returns
+    /// * `Ok(Some(PathBuf))` - Path to cached decrypted image
+    /// * `Ok(None)` - Group has no image configured
+    /// * `Err(...)` - Download or cache operation failed
+    pub(crate) async fn resolve_group_image_path(
+        &self,
+        account: &Account,
+        group: &group_types::Group,
+    ) -> Result<Option<PathBuf>> {
         // Check if group has an image set
         let (image_hash, image_key, image_nonce) =
-            match (group.image_hash, group.image_key, group.image_nonce) {
-                (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
+            match (&group.image_hash, &group.image_key, &group.image_nonce) {
+                (Some(hash), Some(key), Some(nonce)) => (*hash, *key, *nonce),
                 _ => return Ok(None), // No image set
             };
 
@@ -1572,7 +1593,7 @@ impl Whitenoise {
             .download_and_cache_group_image(
                 blossom_url,
                 &account.pubkey,
-                group_id,
+                &group.mls_group_id,
                 &image_hash,
                 &image_key,
                 &image_nonce,
