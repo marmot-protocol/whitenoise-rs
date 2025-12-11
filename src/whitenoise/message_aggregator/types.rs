@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
+use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::media_files::MediaFile;
@@ -52,6 +54,9 @@ pub struct ChatMessage {
 /// message data isn't needed. Uses `DateTime<Utc>` for database consistency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessageSummary {
+    /// The MLS group this message belongs to
+    pub mls_group_id: GroupId,
+
     /// Public key of the message author
     pub author: PublicKey,
 
