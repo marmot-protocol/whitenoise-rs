@@ -31,19 +31,6 @@ where
         let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
         let user_confirmation_int: Option<i64> = row.try_get("user_confirmation")?;
 
-        // Validate mls_group_id length (must be 32 bytes)
-        if mls_group_id_bytes.len() != 32 {
-            return Err(sqlx::Error::ColumnDecode {
-                index: "mls_group_id".to_string(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Invalid mls_group_id length: expected 32 bytes, got {}",
-                        mls_group_id_bytes.len()
-                    ),
-                )),
-            });
-        }
         let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
 
         // Validate user_confirmation: only 0, 1, or NULL are valid
