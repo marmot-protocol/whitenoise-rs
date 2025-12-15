@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use nostr_sdk::prelude::*;
 
 use crate::whitenoise::{
@@ -5,6 +7,8 @@ use crate::whitenoise::{
     accounts::Account,
     accounts_groups::AccountGroup,
     error::{Result, WhitenoiseError},
+    group_information::GroupInformation,
+    relays::Relay,
 };
 
 impl Whitenoise {
@@ -46,14 +50,14 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Process the welcome message - lock scope is minimal
-        let group_id = {
+        // Process the welcome message and get group info - lock scope is minimal
+        let (group_id, group_name) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
             let welcome = mdk
                 .process_welcome(&event.id, &rumor)
                 .map_err(WhitenoiseError::MdkCoreError)?;
             tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
-            welcome.mls_group_id
+            (welcome.mls_group_id, welcome.group_name)
         }; // mdk lock released here
 
         // After processing welcome, proactively cache the group image if it has one
@@ -81,6 +85,55 @@ impl Whitenoise {
                 account_group.user_confirmation
             );
         }
+
+        // Create GroupInformation so the group is visible in UI and messages can be decrypted
+        GroupInformation::create_for_group(self, &group_id, None, &group_name).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome",
+            "Created GroupInformation for group {}",
+            hex::encode(group_id.as_slice())
+        );
+
+        // Set up subscriptions for group messages so we can decrypt and display them
+        // This allows users to see messages while the invite is pending
+        let keys = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+
+        let (group_ids, group_relays) = {
+            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let groups = mdk.get_groups()?;
+            let mut group_relays_set = BTreeSet::new();
+            let group_ids = groups
+                .iter()
+                .map(|g| hex::encode(g.nostr_group_id))
+                .collect::<Vec<_>>();
+
+            for group in &groups {
+                let relays = mdk.get_relays(&group.mls_group_id)?;
+                group_relays_set.extend(relays);
+            }
+
+            let group_relays = group_relays_set.into_iter().collect::<Vec<_>>();
+            (group_ids, group_relays)
+        };
+
+        for relay in &group_relays {
+            let _ = Relay::find_or_create_by_url(relay, &self.database).await?;
+        }
+
+        self.nostr
+            .setup_group_messages_subscriptions_with_signer(
+                account.pubkey,
+                &group_relays,
+                &group_ids,
+                keys,
+            )
+            .await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome",
+            "Set up group message subscriptions"
+        );
 
         let key_package_event_id: Option<EventId> = rumor
             .tags
