@@ -120,8 +120,8 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<(Self, bool), sqlx::Error> {
-        // Try to insert first - this handles the race condition properly
-        match Self::insert_new(account_pubkey, mls_group_id, database).await {
+        // Try to create first - this handles the race condition properly
+        match Self::create(account_pubkey, mls_group_id, database).await {
             Ok(created) => Ok((created, true)),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Another task inserted the record between our check and insert
@@ -235,8 +235,8 @@ impl AccountGroup {
         Ok(())
     }
 
-    /// Inserts a new AccountGroup with user_confirmation = NULL (pending).
-    async fn insert_new(
+    /// Creates a new AccountGroup with user_confirmation = NULL (pending).
+    async fn create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         database: &Database,
