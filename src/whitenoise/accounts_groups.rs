@@ -318,7 +318,6 @@ mod tests {
         assert_eq!(pending[0].mls_group_id, group_id1);
     }
 
-
     #[tokio::test]
     async fn test_accept_nonexistent_group_returns_error() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
