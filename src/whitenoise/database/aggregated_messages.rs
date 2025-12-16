@@ -567,7 +567,6 @@ impl AggregatedMessage {
     ///
     /// Groups without messages or with only deleted messages are not included
     /// in the result.
-    #[allow(dead_code)] // Used by chat_list module (upcoming feature)
     pub async fn find_last_by_group_ids(
         group_ids: &[GroupId],
         database: &Database,

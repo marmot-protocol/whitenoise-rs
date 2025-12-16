@@ -160,7 +160,6 @@ impl User {
     ///
     /// Returns a `Vec<User>` containing all users found.
     /// Users that don't exist in the database are simply not included in the result.
-    #[allow(dead_code)] // Used by chat_list module (upcoming feature)
     pub(crate) async fn find_by_pubkeys(
         pubkeys: &[PublicKey],
         database: &Database,
