@@ -73,25 +73,16 @@ where
     }
 }
 
-impl AccountGroupRow {
-    fn into_account_group(self) -> Result<AccountGroup, sqlx::Error> {
-        let account_pubkey =
-            PublicKey::parse(&self.account_pubkey).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "account_pubkey".to_string(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Invalid public key: {}", e),
-                )),
-            })?;
-
-        Ok(AccountGroup {
-            id: Some(self.id),
-            account_pubkey,
-            mls_group_id: self.mls_group_id,
-            user_confirmation: self.user_confirmation,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        })
+impl From<AccountGroupRow> for AccountGroup {
+    fn from(row: AccountGroupRow) -> Self {
+        AccountGroup {
+            id: Some(row.id),
+            account_pubkey: row.account_pubkey,
+            mls_group_id: row.mls_group_id,
+            user_confirmation: row.user_confirmation,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
     }
 }
 
@@ -113,7 +104,7 @@ impl AccountGroup {
         .await?;
 
         match row {
-            Some(r) => Ok(Some(r.into_account_group()?)),
+            Some(r) => Ok(Some(r.into())),
             None => Ok(None),
         }
     }
@@ -182,9 +173,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| r.into_account_group())
-            .collect::<Result<Vec<_>, _>>()
+        Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
     /// Finds all pending AccountGroups for a given account.
@@ -203,9 +192,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| r.into_account_group())
-            .collect::<Result<Vec<_>, _>>()
+        Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
@@ -233,7 +220,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        row.into_account_group()
+        Ok(row.into())
     }
 
     /// Deletes this AccountGroup from the database.
@@ -270,7 +257,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        row.into_account_group()
+        Ok(row.into())
     }
 }
 
