@@ -166,8 +166,7 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = 1)
-             ORDER BY created_at DESC",
+             WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = TRUE)",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
@@ -185,8 +184,7 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ? AND user_confirmation IS NULL
-             ORDER BY created_at DESC",
+             WHERE account_pubkey = ? AND user_confirmation IS NULL",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
