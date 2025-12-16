@@ -8,9 +8,9 @@ CREATE TABLE accounts_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_pubkey TEXT NOT NULL,
     mls_group_id BLOB NOT NULL,
-    user_confirmation INTEGER DEFAULT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
+    user_confirmation INTEGER DEFAULT NULL CHECK (user_confirmation IS NULL OR user_confirmation IN (0, 1)),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE,
     UNIQUE(account_pubkey, mls_group_id)
 );
@@ -21,9 +21,7 @@ CREATE INDEX idx_accounts_groups_account ON accounts_groups(account_pubkey);
 -- Index for efficient lookups by group
 CREATE INDEX idx_accounts_groups_group ON accounts_groups(mls_group_id);
 
--- Migrate existing groups from group_information as accepted (user_confirmation = 1)
--- These were created before auto-accept flow, so users explicitly accepted them
--- Using INSERT OR IGNORE to safely handle any potential duplicates
-INSERT OR IGNORE INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, created_at, updated_at)
-SELECT account_pubkey, mls_group_id, 1, created_at, updated_at
-FROM group_information;
+-- Note: We cannot migrate existing groups from group_information because that table
+-- doesn't track account_pubkey (it's global, not per-account). Existing groups will
+-- get accounts_groups records created when users interact with them through the
+-- normal flow (process_welcome, accept_welcome, etc.).
