@@ -94,7 +94,7 @@ impl AccountGroup {
     /// Accepts this group invite by setting user_confirmation to true.
     pub async fn accept(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self
-            .update_user_confirmation(Some(true), &whitenoise.database)
+            .update_user_confirmation(true, &whitenoise.database)
             .await?;
         Ok(updated)
     }
@@ -103,18 +103,7 @@ impl AccountGroup {
     /// The group will be hidden from the UI but remains in MLS.
     pub async fn decline(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self
-            .update_user_confirmation(Some(false), &whitenoise.database)
-            .await?;
-        Ok(updated)
-    }
-
-    /// Resets confirmation to pending state (None).
-    pub async fn reset_confirmation(
-        &self,
-        whitenoise: &Whitenoise,
-    ) -> Result<Self, WhitenoiseError> {
-        let updated = self
-            .update_user_confirmation(None, &whitenoise.database)
+            .update_user_confirmation(false, &whitenoise.database)
             .await?;
         Ok(updated)
     }
@@ -329,27 +318,6 @@ mod tests {
         assert_eq!(pending[0].mls_group_id, group_id1);
     }
 
-    #[tokio::test]
-    async fn test_reset_confirmation() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[10; 32]);
-
-        let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
-            .await
-            .unwrap();
-
-        // Accept, then reset
-        let accepted_group = pending_group.accept(&whitenoise).await.unwrap();
-        assert!(accepted_group.is_accepted());
-
-        let reset_group = accepted_group
-            .reset_confirmation(&whitenoise)
-            .await
-            .unwrap();
-        assert!(reset_group.is_pending());
-    }
 
     #[tokio::test]
     async fn test_accept_nonexistent_group_returns_error() {

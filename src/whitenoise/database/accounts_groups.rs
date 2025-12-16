@@ -176,7 +176,7 @@ impl AccountGroup {
     /// Updates the user_confirmation status for this AccountGroup.
     pub(crate) async fn update_user_confirmation(
         &self,
-        user_confirmation: Option<bool>,
+        user_confirmation: bool,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.ok_or_else(|| {
@@ -184,7 +184,7 @@ impl AccountGroup {
         })?;
 
         let now_ms = Utc::now().timestamp_millis();
-        let confirmation_int: Option<i64> = user_confirmation.map(|v| if v { 1 } else { 0 });
+        let confirmation_int: i64 = if user_confirmation { 1 } else { 0 };
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
             "UPDATE accounts_groups
@@ -316,7 +316,7 @@ mod tests {
         assert!(account_group.user_confirmation.is_none());
 
         let updated = account_group
-            .update_user_confirmation(Some(true), &whitenoise.database)
+            .update_user_confirmation(true, &whitenoise.database)
             .await
             .unwrap();
 
@@ -336,7 +336,7 @@ mod tests {
                 .unwrap();
 
         let updated = account_group
-            .update_user_confirmation(Some(false), &whitenoise.database)
+            .update_user_confirmation(false, &whitenoise.database)
             .await
             .unwrap();
 
@@ -365,10 +365,10 @@ mod tests {
                 .unwrap();
 
         // ag1 stays pending (NULL)
-        ag2.update_user_confirmation(Some(true), &whitenoise.database)
+        ag2.update_user_confirmation(true, &whitenoise.database)
             .await
             .unwrap();
-        ag3.update_user_confirmation(Some(false), &whitenoise.database)
+        ag3.update_user_confirmation(false, &whitenoise.database)
             .await
             .unwrap();
 
@@ -400,7 +400,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        ag2.update_user_confirmation(Some(true), &whitenoise.database)
+        ag2.update_user_confirmation(true, &whitenoise.database)
             .await
             .unwrap();
 
