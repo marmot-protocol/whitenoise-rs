@@ -136,26 +136,6 @@ impl AccountGroup {
         }
     }
 
-    /// Finds all AccountGroups for a given account.
-    pub(crate) async fn find_all_for_account(
-        account_pubkey: &PublicKey,
-        database: &Database,
-    ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
-             FROM accounts_groups
-             WHERE account_pubkey = ?
-             ORDER BY created_at DESC",
-        )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&database.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| r.into_account_group())
-            .collect::<Result<Vec<_>, _>>()
-    }
-
     /// Finds all visible AccountGroups for a given account.
     /// Visible means: user_confirmation is NULL (pending) or true (accepted).
     /// Declined groups (user_confirmation = false) are hidden.
@@ -361,27 +341,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.user_confirmation, Some(false));
-    }
-
-    #[tokio::test]
-    async fn test_find_all_for_account() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id1 = GroupId::from_slice(&[6; 32]);
-        let group_id2 = GroupId::from_slice(&[7; 32]);
-
-        AccountGroup::find_or_create(&account.pubkey, &group_id1, &whitenoise.database)
-            .await
-            .unwrap();
-        AccountGroup::find_or_create(&account.pubkey, &group_id2, &whitenoise.database)
-            .await
-            .unwrap();
-
-        let all = AccountGroup::find_all_for_account(&account.pubkey, &whitenoise.database)
-            .await
-            .unwrap();
-
-        assert_eq!(all.len(), 2);
     }
 
     #[tokio::test]
