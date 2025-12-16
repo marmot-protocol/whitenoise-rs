@@ -146,7 +146,7 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = TRUE)",
+             WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = 1)",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
@@ -202,6 +202,7 @@ impl AccountGroup {
     }
 
     /// Deletes this AccountGroup from the database.
+    #[allow(dead_code)]
     pub(crate) async fn delete(&self, database: &Database) -> Result<(), sqlx::Error> {
         let id = self.id.ok_or_else(|| {
             sqlx::Error::Protocol("Cannot delete unsaved AccountGroup".to_string())
