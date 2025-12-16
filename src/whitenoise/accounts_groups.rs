@@ -72,15 +72,6 @@ impl AccountGroup {
         Ok(account_group)
     }
 
-    /// Gets all AccountGroups for the given account.
-    pub async fn all_for_account(
-        whitenoise: &Whitenoise,
-        account_pubkey: &PublicKey,
-    ) -> Result<Vec<Self>, WhitenoiseError> {
-        let groups = Self::find_all_for_account(account_pubkey, &whitenoise.database).await?;
-        Ok(groups)
-    }
-
     /// Gets all visible AccountGroups for the given account.
     /// Visible means: pending or accepted (not declined).
     pub async fn visible_for_account(
@@ -127,12 +118,6 @@ impl AccountGroup {
             .await?;
         Ok(updated)
     }
-
-    /// Removes this AccountGroup from the database.
-    pub async fn remove(&self, whitenoise: &Whitenoise) -> Result<(), WhitenoiseError> {
-        self.delete(&whitenoise.database).await?;
-        Ok(())
-    }
 }
 
 impl Whitenoise {
@@ -143,23 +128,6 @@ impl Whitenoise {
         mls_group_id: &GroupId,
     ) -> Result<(AccountGroup, bool), WhitenoiseError> {
         AccountGroup::get_or_create(self, &account.pubkey, mls_group_id).await
-    }
-
-    /// Gets an AccountGroup for the given account and MLS group, if it exists.
-    pub async fn get_account_group(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-    ) -> Result<Option<AccountGroup>, WhitenoiseError> {
-        AccountGroup::get(self, &account.pubkey, mls_group_id).await
-    }
-
-    /// Gets all AccountGroups for the given account.
-    pub async fn get_all_account_groups(
-        &self,
-        account: &Account,
-    ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        AccountGroup::all_for_account(self, &account.pubkey).await
     }
 
     /// Gets all visible AccountGroups for the given account.
