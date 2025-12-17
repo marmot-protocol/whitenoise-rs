@@ -332,229 +332,525 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::{Keys, Metadata};
+    use crate::whitenoise::aggregated_message::AggregatedMessage;
+    use crate::whitenoise::message_aggregator::ChatMessage;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
+    use nostr_sdk::{Metadata, Timestamp};
 
-    #[test]
-    fn test_resolve_display_name_with_display_name() {
-        let user = User {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            metadata: Metadata::new().display_name("Display").name("Name"),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        assert_eq!(
-            resolve_display_name(Some(&user)),
-            Some("Display".to_string())
+    #[tokio::test]
+    async fn test_get_chat_list_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&account).await.unwrap();
+        assert!(chat_list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_single_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let _group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].group_type, GroupType::Group);
+        assert_eq!(chat_list[0].name, Some("Test group".to_string()));
+        assert!(chat_list[0].last_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_dm_without_other_user_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut member_user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        member_user.metadata = Metadata::new();
+        member_user.save(&whitenoise.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].group_type, GroupType::DirectMessage);
+        assert!(
+            chat_list[0].name.is_none(),
+            "Expected DM name to be None, got: {:?}",
+            chat_list[0].name
         );
     }
 
-    #[test]
-    fn test_resolve_display_name_falls_back_to_name() {
-        let user = User {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            metadata: Metadata::new().name("Name"),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+    #[tokio::test]
+    async fn test_get_chat_list_dm_with_display_name() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        user.metadata = Metadata::new().display_name("Bob Display").name("Bob Name");
+        user.save(&whitenoise.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        // Should use display_name, not name
+        assert_eq!(chat_list[0].name, Some("Bob Display".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_dm_falls_back_to_name() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        user.metadata = Metadata::new().name("Bob Name");
+        user.save(&whitenoise.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].name, Some("Bob Name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_dm_skips_empty_display_name() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        let mut metadata = Metadata::new().name("Fallback Name");
+        metadata.display_name = Some(String::new());
+        user.metadata = metadata;
+        user.save(&whitenoise.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].name, Some("Fallback Name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_multiple_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member1 = whitenoise.create_identity().await.unwrap();
+        let member2 = whitenoise.create_identity().await.unwrap();
+
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config1.name = "First Group".to_string();
+        let _group1 = whitenoise
+            .create_group(
+                &creator,
+                vec![member1.pubkey],
+                config1,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "Second Group".to_string();
+        let _group2 = whitenoise
+            .create_group(
+                &creator,
+                vec![member2.pubkey],
+                config2,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 2);
+        assert!(chat_list.iter().all(|c| c.group_type == GroupType::Group));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_sorting_by_created_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member1 = whitenoise.create_identity().await.unwrap();
+        let member2 = whitenoise.create_identity().await.unwrap();
+
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config1.name = "First".to_string();
+        let _group1 = whitenoise
+            .create_group(&creator, vec![member1.pubkey], config1, None)
+            .await
+            .unwrap();
+
+        // Small delay to ensure different timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "Second".to_string();
+        let _group2 = whitenoise
+            .create_group(&creator, vec![member2.pubkey], config2, None)
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 2);
+        assert_eq!(chat_list[0].name, Some("Second".to_string()));
+        assert_eq!(chat_list[1].name, Some("First".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_sorting_by_last_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member1 = whitenoise.create_identity().await.unwrap();
+        let member2 = whitenoise.create_identity().await.unwrap();
+
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config1.name = "Old Message Group".to_string();
+        let group1 = whitenoise
+            .create_group(
+                &creator,
+                vec![member1.pubkey],
+                config1,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        // Small delay
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "New Message Group".to_string();
+        let group2 = whitenoise
+            .create_group(
+                &creator,
+                vec![member2.pubkey],
+                config2,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let msg1 = ChatMessage {
+            id: format!("{:0>64}", "msg1"),
+            author: creator.pubkey,
+            content: "Old".to_string(),
+            created_at: Timestamp::from(1000),
+            tags: nostr_sdk::Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
         };
-        assert_eq!(resolve_display_name(Some(&user)), Some("Name".to_string()));
-    }
+        AggregatedMessage::insert_message(&msg1, &group1.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
 
-    #[test]
-    fn test_resolve_display_name_empty_display_name_falls_back() {
-        let mut metadata = Metadata::new().name("Name");
-        metadata.display_name = Some(String::new()); // Empty display name
-        let user = User {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            metadata,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+        let msg2 = ChatMessage {
+            id: format!("{:0>64}", "msg2"),
+            author: creator.pubkey,
+            content: "New".to_string(),
+            created_at: Timestamp::from(2000),
+            tags: nostr_sdk::Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
         };
-        assert_eq!(resolve_display_name(Some(&user)), Some("Name".to_string()));
+        AggregatedMessage::insert_message(&msg2, &group2.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 2);
+        assert_eq!(chat_list[0].name, Some("New Message Group".to_string()));
+        assert_eq!(chat_list[1].name, Some("Old Message Group".to_string()));
     }
 
-    #[test]
-    fn test_resolve_display_name_none_when_no_metadata() {
-        let user = User {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            metadata: Metadata::new(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+    #[tokio::test]
+    async fn test_get_chat_list_mixed_group_and_dm() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member1 = whitenoise.create_identity().await.unwrap();
+        let member2 = whitenoise.create_identity().await.unwrap();
+
+        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let _group1 = whitenoise
+            .create_group(
+                &creator,
+                vec![member1.pubkey],
+                config1,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member2.pubkey]);
+        config2.name = String::new();
+        let _group2 = whitenoise
+            .create_group(
+                &creator,
+                vec![member2.pubkey],
+                config2,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 2);
+        let group_count = chat_list
+            .iter()
+            .filter(|c| c.group_type == GroupType::Group)
+            .count();
+        let dm_count = chat_list
+            .iter()
+            .filter(|c| c.group_type == GroupType::DirectMessage)
+            .count();
+        assert_eq!(group_count, 1);
+        assert_eq!(dm_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_dm_shows_other_user_picture_url() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        user.metadata = user
+            .metadata
+            .picture(nostr_sdk::Url::parse("https://example.com/pic.jpg").unwrap());
+        user.save(&whitenoise.database).await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].group_type, GroupType::DirectMessage);
+        assert_eq!(
+            chat_list[0].group_image_url,
+            Some("https://example.com/pic.jpg".to_string())
+        );
+        assert!(chat_list[0].group_image_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_group_has_no_image_url() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let _group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].group_type, GroupType::Group);
+        assert!(chat_list[0].group_image_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_last_message_author_display_name() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        user.metadata = user.metadata.display_name("Alice");
+        user.save(&whitenoise.database).await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        use crate::whitenoise::message_aggregator::ChatMessage;
+        let msg = ChatMessage {
+            id: format!("{:0>64}", "msg1"),
+            author: creator.pubkey,
+            content: "Hello".to_string(),
+            created_at: Timestamp::now(),
+            tags: nostr_sdk::Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
         };
-        assert_eq!(resolve_display_name(Some(&user)), None);
+        AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(chat_list.len(), 1);
+        let last_msg = chat_list[0].last_message.as_ref().unwrap();
+        assert_eq!(last_msg.author_display_name, Some("Alice".to_string()));
+        assert_eq!(last_msg.content, "Hello");
     }
 
-    #[test]
-    fn test_resolve_display_name_none_when_no_user() {
-        assert_eq!(resolve_display_name(None), None);
-    }
+    #[tokio::test]
+    async fn test_get_chat_list_sorting_mixed_messages_and_no_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member1 = whitenoise.create_identity().await.unwrap();
+        let member2 = whitenoise.create_identity().await.unwrap();
 
-    #[test]
-    fn test_get_dm_other_user() {
-        let account_pk = Keys::generate().public_key();
-        let other_pk = Keys::generate().public_key();
-        let members = vec![account_pk, other_pk];
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config1.name = "Old Message".to_string();
+        let group1 = whitenoise
+            .create_group(
+                &creator,
+                vec![member1.pubkey],
+                config1,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(get_dm_other_user(&members, &account_pk), Some(other_pk));
-    }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-    #[test]
-    fn test_get_dm_other_user_not_found() {
-        let account_pk = Keys::generate().public_key();
-        let members = vec![account_pk]; // Only account owner
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "No Message".to_string();
+        let _group2 = whitenoise
+            .create_group(
+                &creator,
+                vec![member2.pubkey],
+                config2,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(get_dm_other_user(&members, &account_pk), None);
-    }
+        use crate::whitenoise::message_aggregator::ChatMessage;
+        let msg = ChatMessage {
+            id: format!("{:0>64}", "msg1"),
+            author: creator.pubkey,
+            content: "Old".to_string(),
+            created_at: Timestamp::from(1000),
+            tags: nostr_sdk::Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: Default::default(),
+            kind: 9,
+            media_attachments: vec![],
+        };
+        AggregatedMessage::insert_message(&msg, &group1.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
 
-    #[test]
-    fn test_sort_chat_list_by_last_message() {
-        let group_id1 = GroupId::from_slice(&[1; 32]);
-        let group_id2 = GroupId::from_slice(&[2; 32]);
-        let author = Keys::generate().public_key();
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
 
-        let older = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let newer = DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let mut items = vec![
-            ChatListItem {
-                mls_group_id: group_id1.clone(),
-                name: Some("Older".to_string()),
-                group_type: GroupType::Group,
-                created_at: older,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: Some(ChatMessageSummary {
-                    mls_group_id: group_id1,
-                    author,
-                    author_display_name: None,
-                    content: "Old message".to_string(),
-                    created_at: older,
-                    media_attachment_count: 0,
-                }),
-            },
-            ChatListItem {
-                mls_group_id: group_id2.clone(),
-                name: Some("Newer".to_string()),
-                group_type: GroupType::Group,
-                created_at: older,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: Some(ChatMessageSummary {
-                    mls_group_id: group_id2,
-                    author,
-                    author_display_name: None,
-                    content: "New message".to_string(),
-                    created_at: newer,
-                    media_attachment_count: 0,
-                }),
-            },
-        ];
-
-        sort_chat_list(&mut items);
-
-        // Newer should be first
-        assert_eq!(items[0].name, Some("Newer".to_string()));
-        assert_eq!(items[1].name, Some("Older".to_string()));
-    }
-
-    #[test]
-    fn test_sort_chat_list_no_messages_uses_created_at() {
-        let group_id1 = GroupId::from_slice(&[1; 32]);
-        let group_id2 = GroupId::from_slice(&[2; 32]);
-
-        let older = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let newer = DateTime::parse_from_rfc3339("2024-01-02T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let mut items = vec![
-            ChatListItem {
-                mls_group_id: group_id1,
-                name: Some("Older Group".to_string()),
-                group_type: GroupType::Group,
-                created_at: older,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: None,
-            },
-            ChatListItem {
-                mls_group_id: group_id2,
-                name: Some("Newer Group".to_string()),
-                group_type: GroupType::Group,
-                created_at: newer,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: None,
-            },
-        ];
-
-        sort_chat_list(&mut items);
-
-        // Newer created_at should be first
-        assert_eq!(items[0].name, Some("Newer Group".to_string()));
-        assert_eq!(items[1].name, Some("Older Group".to_string()));
-    }
-
-    #[test]
-    fn test_sort_chat_list_mixed_with_and_without_messages() {
-        let group_id1 = GroupId::from_slice(&[1; 32]);
-        let group_id2 = GroupId::from_slice(&[2; 32]);
-        let author = Keys::generate().public_key();
-
-        let old_created = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let message_time = DateTime::parse_from_rfc3339("2024-01-05T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let new_created = DateTime::parse_from_rfc3339("2024-01-10T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let mut items = vec![
-            // Old group with a message at day 5
-            ChatListItem {
-                mls_group_id: group_id1.clone(),
-                name: Some("Old with message".to_string()),
-                group_type: GroupType::Group,
-                created_at: old_created,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: Some(ChatMessageSummary {
-                    mls_group_id: group_id1,
-                    author,
-                    author_display_name: None,
-                    content: "Message".to_string(),
-                    created_at: message_time,
-                    media_attachment_count: 0,
-                }),
-            },
-            // New group with no messages
-            ChatListItem {
-                mls_group_id: group_id2,
-                name: Some("New no message".to_string()),
-                group_type: GroupType::Group,
-                created_at: new_created,
-                group_image_path: None,
-                group_image_url: None,
-                last_message: None,
-            },
-        ];
-
-        sort_chat_list(&mut items);
-
-        // New group (created day 10) should be first because its effective time (day 10)
-        // is more recent than the message time (day 5)
-        assert_eq!(items[0].name, Some("New no message".to_string()));
-        assert_eq!(items[1].name, Some("Old with message".to_string()));
+        assert_eq!(chat_list.len(), 2);
+        assert_eq!(chat_list[0].name, Some("No Message".to_string()));
+        assert_eq!(chat_list[1].name, Some("Old Message".to_string()));
     }
 }
