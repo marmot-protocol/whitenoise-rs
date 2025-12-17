@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::WhitenoiseError;
 use crate::integration_tests::benchmarks::test_cases::FetchAggregatedMessagesBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
-use crate::integration_tests::core::{ScenarioContext, TestCase};
+use crate::integration_tests::core::{ScenarioContext, TestCase, retry_default};
 use crate::integration_tests::test_cases::chat_media_upload::{
     SendMessageWithMediaTestCase, UploadChatImageTestCase,
 };
@@ -119,13 +119,61 @@ impl BenchmarkScenario for MessageAggregationBenchmark {
             .run(context)
             .await?;
 
-        // Wait for welcome invitations to be sent and processed
-        // Note: MLS membership is auto-finalized when welcome is received,
-        // so members can participate immediately without explicit accept
-        tracing::info!("Waiting for welcome invitations to be processed...");
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Wait for MLS welcome auto-finalization using retry mechanism
+        // This verifies bob and charlie have received and processed their welcome messages
+        let group = context.get_group("benchmark_group")?;
+        let group_id = group.mls_group_id.clone();
 
-        // Ensure bob and charlie have proper group access by having them send test messages
+        let bob_account = context.get_account("bob")?.clone();
+        let charlie_account = context.get_account("charlie")?.clone();
+
+        tracing::info!("Waiting for bob to receive welcome...");
+        retry_default(
+            || {
+                let wn = context.whitenoise;
+                let acc = bob_account.clone();
+                let gid = group_id.clone();
+                async move {
+                    let groups = wn.groups(&acc, true).await?;
+                    if groups.iter().any(|g| g.mls_group_id == gid) {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "bob has not yet received the group"
+                        )))
+                    }
+                }
+            },
+            "bob welcome auto-finalization",
+        )
+        .await?;
+
+        tracing::info!("Waiting for charlie to receive welcome...");
+        retry_default(
+            || {
+                let wn = context.whitenoise;
+                let acc = charlie_account.clone();
+                let gid = group_id.clone();
+                async move {
+                    let groups = wn.groups(&acc, true).await?;
+                    if groups.iter().any(|g| g.mls_group_id == gid) {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "charlie has not yet received the group"
+                        )))
+                    }
+                }
+            },
+            "charlie welcome auto-finalization",
+        )
+        .await?;
+
+        tracing::info!(
+            "✓ Both bob and charlie have received welcome and auto-finalized MLS membership"
+        );
+
+        // Verify group access by having bob and charlie send test messages
         tracing::info!("Verifying group access for bob and charlie...");
         SendMessageTestCase::basic()
             .with_sender("bob")
