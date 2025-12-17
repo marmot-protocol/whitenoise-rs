@@ -131,7 +131,7 @@ impl SecretsStore {
     /// * Setting the password in the keyring fails
     /// * The secret key cannot be retrieved from the keypair
     pub fn store_private_key(&self, keys: &Keys) -> Result<(), SecretsStoreError> {
-        if cfg!(target_os = "android") {
+        if cfg!(target_os = "android") || cfg!(test) {
             let mut secrets = self.read_secrets_file().unwrap_or(json!({}));
             let obfuscated_key = self.obfuscate(keys.secret_key().to_secret_hex().as_str());
             secrets[keys.public_key().to_hex()] = json!(obfuscated_key);
@@ -168,7 +168,7 @@ impl SecretsStore {
     /// * Parsing the private key into a `Keys` object fails
     pub fn get_nostr_keys_for_pubkey(&self, pubkey: &PublicKey) -> Result<Keys, SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        if cfg!(target_os = "android") {
+        if cfg!(target_os = "android") || cfg!(test) {
             let secrets = self.read_secrets_file()?;
             let obfuscated_key = secrets[&hex_pubkey.as_str()]
                 .as_str()
@@ -208,7 +208,7 @@ impl SecretsStore {
         pubkey: &PublicKey,
     ) -> Result<(), SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        if cfg!(target_os = "android") {
+        if cfg!(target_os = "android") || cfg!(test) {
             let mut secrets = self.read_secrets_file()?;
             secrets
                 .as_object_mut()
