@@ -50,13 +50,19 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Process the welcome message and get group info - lock scope is minimal
+        // Process and auto-accept the welcome message - lock scope is minimal
         let (group_id, group_name) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
             let welcome = mdk
                 .process_welcome(&event.id, &rumor)
                 .map_err(WhitenoiseError::MdkCoreError)?;
             tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
+
+            // Auto-accept the welcome to finalize MLS membership
+            mdk.accept_welcome(&welcome)
+                .map_err(WhitenoiseError::MdkCoreError)?;
+            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+
             (welcome.mls_group_id, welcome.group_name)
         }; // mdk lock released here
 
@@ -65,14 +71,14 @@ impl Whitenoise {
         // Spawn as background task to avoid blocking event processing
         Whitenoise::background_sync_group_image_cache_if_needed(account, &group_id);
 
-        // Create AccountGroup record with user_confirmation = NULL (pending)
-        // This tracks that the account has auto-joined this group but hasn't explicitly accepted/declined
+        // Create AccountGroup record with user_confirmation = NULL (pending at app level)
+        // MLS membership is finalized above, but user still needs to confirm at the app/UI level
         let (account_group, was_created) =
             AccountGroup::get_or_create(self, &account.pubkey, &group_id).await?;
         if was_created {
             tracing::debug!(
                 target: "whitenoise::event_processor::process_welcome",
-                "Created AccountGroup record for account {} and group {}",
+                "Created AccountGroup record for account {} and group {} (pending user confirmation)",
                 account.pubkey.to_hex(),
                 hex::encode(group_id.as_slice())
             );
