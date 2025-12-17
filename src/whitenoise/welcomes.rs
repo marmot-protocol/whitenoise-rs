@@ -433,4 +433,65 @@ mod tests {
         assert_eq!(subsequent_info.id, original_info.id);
         assert_eq!(subsequent_info.group_type, GroupType::DirectMessage); // Original type preserved
     }
+
+    #[tokio::test]
+    async fn test_find_welcome_by_event_id_invalid_event_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Invalid event ID should return error
+        let result = whitenoise
+            .find_welcome_by_event_id(&account.pubkey, "invalid_event_id".to_string())
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::InvalidEvent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_accept_welcome_invalid_event_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Invalid event ID should return error
+        let result = whitenoise
+            .accept_welcome(&account.pubkey, "not_a_valid_hex".to_string())
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::InvalidEvent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_decline_welcome_invalid_event_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Invalid event ID should return error
+        let result = whitenoise
+            .decline_welcome(&account.pubkey, "xyz_invalid".to_string())
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::InvalidEvent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_pending_welcomes_empty_for_new_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let welcomes = whitenoise.pending_welcomes(&account.pubkey).await.unwrap();
+
+        assert!(welcomes.is_empty());
+    }
 }

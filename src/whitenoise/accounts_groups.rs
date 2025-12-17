@@ -461,4 +461,69 @@ mod tests {
             .unwrap();
         assert!(pending.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_is_visible_true_for_accepted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[19; 32]);
+
+        let (pending_group, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Pending should be visible
+        assert!(pending_group.is_visible());
+
+        // Accept and verify still visible
+        let accepted_group = pending_group.accept(&whitenoise).await.unwrap();
+        assert!(accepted_group.is_visible());
+    }
+
+    #[tokio::test]
+    async fn test_is_visible_false_for_declined() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[20; 32]);
+
+        let (pending_group, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        let declined_group = pending_group.decline(&whitenoise).await.unwrap();
+        assert!(!declined_group.is_visible());
+    }
+
+    #[tokio::test]
+    async fn test_same_account_multiple_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let group_id1 = GroupId::from_slice(&[21; 32]);
+        let group_id2 = GroupId::from_slice(&[22; 32]);
+        let group_id3 = GroupId::from_slice(&[23; 32]);
+
+        // Create 3 groups for the same account
+        let (ag1, c1) = whitenoise
+            .get_or_create_account_group(&account, &group_id1)
+            .await
+            .unwrap();
+        let (ag2, c2) = whitenoise
+            .get_or_create_account_group(&account, &group_id2)
+            .await
+            .unwrap();
+        let (ag3, c3) = whitenoise
+            .get_or_create_account_group(&account, &group_id3)
+            .await
+            .unwrap();
+
+        assert!(c1 && c2 && c3);
+        assert_ne!(ag1.id, ag2.id);
+        assert_ne!(ag2.id, ag3.id);
+
+        // All should be pending initially
+        assert!(ag1.is_pending() && ag2.is_pending() && ag3.is_pending());
+    }
 }
