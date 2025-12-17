@@ -332,4 +332,133 @@ mod tests {
             WhitenoiseError::GroupNotFound
         ));
     }
+
+    #[tokio::test]
+    async fn test_decline_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[12; 32]);
+
+        let result = whitenoise.decline_account_group(&account, &group_id).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::GroupNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_account_group_get_returns_none_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[13; 32]);
+
+        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_account_group_get_returns_some_for_existing() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[14; 32]);
+
+        // Create an account group first
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Now get should return it
+        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        let ag = result.unwrap();
+        assert_eq!(ag.account_pubkey, account.pubkey);
+        assert_eq!(ag.mls_group_id, group_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_returns_was_created_false_for_existing() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[15; 32]);
+
+        // First call creates
+        let (_, was_created1) = whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+        assert!(was_created1);
+
+        // Second call finds existing
+        let (_, was_created2) = whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+        assert!(!was_created2);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_accounts_can_have_same_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account1 = whitenoise.create_identity().await.unwrap();
+        let account2 = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[16; 32]);
+
+        // Both accounts can have the same group
+        let (ag1, _) = whitenoise
+            .get_or_create_account_group(&account1, &group_id)
+            .await
+            .unwrap();
+        let (ag2, _) = whitenoise
+            .get_or_create_account_group(&account2, &group_id)
+            .await
+            .unwrap();
+
+        // Different records for different accounts
+        assert_ne!(ag1.id, ag2.id);
+
+        // Can have different confirmation states
+        let accepted = ag1.accept(&whitenoise).await.unwrap();
+        let declined = ag2.decline(&whitenoise).await.unwrap();
+
+        assert!(accepted.is_accepted());
+        assert!(declined.is_declined());
+    }
+
+    #[tokio::test]
+    async fn test_pending_groups_empty_when_all_confirmed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let group_id1 = GroupId::from_slice(&[17; 32]);
+        let group_id2 = GroupId::from_slice(&[18; 32]);
+
+        let (ag1, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id1)
+            .await
+            .unwrap();
+        let (ag2, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id2)
+            .await
+            .unwrap();
+
+        // Accept one, decline the other
+        ag1.accept(&whitenoise).await.unwrap();
+        ag2.decline(&whitenoise).await.unwrap();
+
+        // No pending groups should remain
+        let pending = whitenoise
+            .get_pending_account_groups(&account)
+            .await
+            .unwrap();
+        assert!(pending.is_empty());
+    }
 }

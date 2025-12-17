@@ -373,4 +373,47 @@ mod tests {
         let result = whitenoise.handle_giftwrap(&account, giftwrap_event).await;
         assert!(result.is_ok());
     }
+
+    #[tokio::test]
+    async fn test_get_group_subscription_info_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // New account has no groups
+        let result =
+            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey);
+        assert!(result.is_ok());
+
+        let (group_ids, relays) = result.unwrap();
+        assert!(group_ids.is_empty());
+        assert!(relays.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_group_subscription_info_with_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create creator and member accounts
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        // Create a group
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Creator should now have one group with relays
+        let result = Whitenoise::get_group_subscription_info(
+            &whitenoise.config.data_dir,
+            &creator_account.pubkey,
+        );
+        assert!(result.is_ok());
+
+        let (group_ids, relays) = result.unwrap();
+        assert_eq!(group_ids.len(), 1, "Creator should have one group");
+        assert!(!relays.is_empty(), "Group should have relays");
+    }
 }
