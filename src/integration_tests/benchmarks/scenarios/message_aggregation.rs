@@ -10,8 +10,7 @@ use crate::integration_tests::test_cases::chat_media_upload::{
     SendMessageWithMediaTestCase, UploadChatImageTestCase,
 };
 use crate::integration_tests::test_cases::shared::{
-    AcceptGroupInviteTestCase, CreateAccountsTestCase, CreateGroupTestCase, DeleteMessageTestCase,
-    SendMessageTestCase,
+    CreateAccountsTestCase, CreateGroupTestCase, DeleteMessageTestCase, SendMessageTestCase,
 };
 
 /// Configuration for message aggregation benchmark dataset
@@ -121,15 +120,10 @@ impl BenchmarkScenario for MessageAggregationBenchmark {
             .await?;
 
         // Wait for welcome invitations to be sent and processed
+        // Note: MLS membership is auto-finalized when welcome is received,
+        // so members can participate immediately without explicit accept
         tracing::info!("Waiting for welcome invitations to be processed...");
         tokio::time::sleep(Duration::from_millis(1000)).await;
-
-        // 2. Accept group invitations (MLS requirement - users must accept before participating)
-        AcceptGroupInviteTestCase::new("bob").run(context).await?;
-
-        AcceptGroupInviteTestCase::new("charlie")
-            .run(context)
-            .await?;
 
         // Ensure bob and charlie have proper group access by having them send test messages
         tracing::info!("Verifying group access for bob and charlie...");

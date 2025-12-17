@@ -31,10 +31,8 @@ impl Scenario for BasicMessagingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Accept group invitations for the member account
-        AcceptGroupInviteTestCase::new("basic_msg_member")
-            .execute(&mut self.context)
-            .await?;
+        // Note: MLS membership is auto-finalized when welcome is received,
+        // so members can participate immediately without explicit accept
 
         SendMessageTestCase::basic()
             .with_sender("basic_msg_creator")
