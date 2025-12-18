@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
+use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
 use crate::whitenoise::{
@@ -85,173 +87,240 @@ impl Whitenoise {
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
         tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        "Failed to get Whitenoise instance: {}",
-                        e
-                    );
-                    return;
-                }
-            };
-
-            // 1. Create AccountGroup record (user_confirmation = NULL for pending at app level)
-            match AccountGroup::get_or_create(whitenoise, &account_clone.pubkey, &group_id).await {
-                Ok((ag, created)) => {
-                    tracing::debug!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
-                        account_clone.pubkey.to_hex(),
-                        hex::encode(group_id.as_slice()),
-                        created,
-                        ag.user_confirmation
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        "Failed to create AccountGroup for account {} and group {}: {}",
-                        account_clone.pubkey.to_hex(),
-                        hex::encode(group_id.as_slice()),
-                        e
-                    );
-                }
-            }
-
-            // 2. Create GroupInformation so the group is visible in UI
-            if let Err(e) =
-                GroupInformation::create_for_group(whitenoise, &group_id, None, &group_name).await
-            {
-                tracing::error!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to create GroupInformation for group {}: {}",
-                    hex::encode(group_id.as_slice()),
-                    e
-                );
-            }
-
-            // 3. Set up subscriptions for group messages
-            let keys = match whitenoise
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account_clone.pubkey)
-            {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        "Failed to get keys for account {}: {}",
-                        account_clone.pubkey.to_hex(),
-                        e
-                    );
-                    return;
-                }
-            };
-
-            let (group_ids, group_relays) =
-                match Self::get_group_subscription_info(&data_dir, &account_clone.pubkey) {
-                    Ok(info) => info,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "whitenoise::event_processor::process_welcome::background",
-                            "Failed to get group subscription info for account {}: {}",
-                            account_clone.pubkey.to_hex(),
-                            e
-                        );
-                        return;
-                    }
-                };
-
-            // Create relay records (idempotent)
-            for relay in &group_relays {
-                if let Err(e) = Relay::find_or_create_by_url(relay, &whitenoise.database).await {
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        "Failed to create relay record for {}: {}",
-                        relay,
-                        e
-                    );
-                }
-            }
-
-            if let Err(e) = whitenoise
-                .nostr
-                .setup_group_messages_subscriptions_with_signer(
-                    account_clone.pubkey,
-                    &group_relays,
-                    &group_ids,
-                    keys,
-                )
-                .await
-            {
-                tracing::error!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to setup group subscriptions for account {}: {}",
-                    account_clone.pubkey.to_hex(),
-                    e
-                );
-            }
-
-            // 4. Handle key package rotation
-            if let Some(kp_event_id) = key_package_event_id {
-                match whitenoise
-                    .delete_key_package_for_account(&account_clone, &kp_event_id, false)
-                    .await
-                {
-                    Ok(true) => {
-                        tracing::debug!(target: "whitenoise::event_processor::process_welcome::background", "Deleted used key package from relays");
-                        if let Err(e) = whitenoise
-                            .publish_key_package_for_account(&account_clone)
-                            .await
-                        {
-                            tracing::error!(
-                                target: "whitenoise::event_processor::process_welcome::background",
-                                "Failed to publish new key package for account {}: {}",
-                                account_clone.pubkey.to_hex(),
-                                e
-                            );
-                        } else {
-                            tracing::debug!(target: "whitenoise::event_processor::process_welcome::background", "Published new key package");
-                        }
-                    }
-                    Ok(false) => {
-                        tracing::debug!(target: "whitenoise::event_processor::process_welcome::background", "Key package already deleted, skipping publish");
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "whitenoise::event_processor::process_welcome::background",
-                            "Failed to delete key package for account {}: {}",
-                            account_clone.pubkey.to_hex(),
-                            e
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(target: "whitenoise::event_processor::process_welcome::background", "No key package event id found in welcome event");
-            }
-
-            // 5. Sync group image cache
-            if let Err(e) = whitenoise
-                .sync_group_image_cache_if_needed(&account_clone, &group_id)
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to sync group image cache: {}",
-                    e
-                );
-            }
-
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Completed post-welcome processing for account {} and group {}",
-                account_clone.pubkey.to_hex(),
-                hex::encode(group_id.as_slice())
-            );
+            Self::background_finalize_welcome(
+                account_clone,
+                group_id,
+                group_name,
+                key_package_event_id,
+                data_dir,
+            )
+            .await;
         });
 
         Ok(())
+    }
+
+    /// Background task to finalize welcome processing.
+    /// Handles DB writes, network calls, and other non-critical operations.
+    /// All operations are idempotent and failures are logged but don't stop other operations.
+    async fn background_finalize_welcome(
+        account: Account,
+        group_id: GroupId,
+        group_name: String,
+        key_package_event_id: Option<EventId>,
+        data_dir: PathBuf,
+    ) {
+        let whitenoise = match Whitenoise::get_instance() {
+            Ok(wn) => wn,
+            Err(e) => {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to get Whitenoise instance: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        // Get keys early - needed for subscriptions
+        let keys = match whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+        {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to get keys for account {}: {}",
+                    account.pubkey.to_hex(),
+                    e
+                );
+                return;
+            }
+        };
+
+        // Run independent operations concurrently
+        let (
+            account_group_result,
+            group_info_result,
+            subscription_result,
+            key_rotation_result,
+            image_sync_result,
+        ) = tokio::join!(
+            Self::create_account_group(whitenoise, &account, &group_id),
+            Self::create_group_info(whitenoise, &group_id, &group_name),
+            Self::setup_group_subscriptions(whitenoise, &account, &data_dir, keys),
+            Self::rotate_key_package(whitenoise, &account, key_package_event_id),
+            Self::sync_group_image(whitenoise, &account, &group_id),
+        );
+
+        // Log results
+        if let Err(e) = account_group_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to create AccountGroup for account {} and group {}: {}",
+                account.pubkey.to_hex(),
+                hex::encode(group_id.as_slice()),
+                e
+            );
+        }
+
+        if let Err(e) = group_info_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to create GroupInformation for group {}: {}",
+                hex::encode(group_id.as_slice()),
+                e
+            );
+        }
+
+        if let Err(e) = subscription_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to setup subscriptions for account {}: {}",
+                account.pubkey.to_hex(),
+                e
+            );
+        }
+
+        if let Err(e) = key_rotation_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to rotate key package for account {}: {}",
+                account.pubkey.to_hex(),
+                e
+            );
+        }
+
+        if let Err(e) = image_sync_result {
+            tracing::warn!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to sync group image cache: {}",
+                e
+            );
+        }
+
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "Completed post-welcome processing for account {} and group {}",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice())
+        );
+    }
+
+    /// Create AccountGroup record for the welcome
+    async fn create_account_group(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let (ag, created) =
+            AccountGroup::get_or_create(whitenoise, &account.pubkey, group_id).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice()),
+            created,
+            ag.user_confirmation
+        );
+        Ok(())
+    }
+
+    /// Create GroupInformation for the welcome
+    async fn create_group_info(
+        whitenoise: &Whitenoise,
+        group_id: &GroupId,
+        group_name: &str,
+    ) -> Result<()> {
+        GroupInformation::create_for_group(whitenoise, group_id, None, group_name).await?;
+        Ok(())
+    }
+
+    /// Set up Nostr subscriptions for group messages
+    async fn setup_group_subscriptions(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        data_dir: &std::path::Path,
+        keys: Keys,
+    ) -> Result<()> {
+        let (group_ids, group_relays) =
+            Self::get_group_subscription_info(data_dir, &account.pubkey)?;
+
+        // Create relay records (idempotent)
+        for relay in &group_relays {
+            if let Err(e) = Relay::find_or_create_by_url(relay, &whitenoise.database).await {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to create relay record for {}: {}",
+                    relay,
+                    e
+                );
+            }
+        }
+
+        whitenoise
+            .nostr
+            .setup_group_messages_subscriptions_with_signer(
+                account.pubkey,
+                &group_relays,
+                &group_ids,
+                keys,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handle key package rotation after welcome
+    async fn rotate_key_package(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        key_package_event_id: Option<EventId>,
+    ) -> Result<()> {
+        let Some(kp_event_id) = key_package_event_id else {
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "No key package event id found in welcome event"
+            );
+            return Ok(());
+        };
+
+        match whitenoise
+            .delete_key_package_for_account(account, &kp_event_id, false)
+            .await?
+        {
+            true => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Deleted used key package from relays"
+                );
+                whitenoise.publish_key_package_for_account(account).await?;
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Published new key package"
+                );
+            }
+            false => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Key package already deleted, skipping publish"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sync group image cache if needed
+    async fn sync_group_image(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        whitenoise
+            .sync_group_image_cache_if_needed(account, group_id)
+            .await
     }
 
     /// Helper to get group subscription info (group IDs and relay URLs) for an account.
