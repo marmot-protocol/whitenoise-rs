@@ -52,6 +52,7 @@ impl TestCase for WaitForWelcomeTestCase {
                     let wn = wn;
                     let acc = acc.clone();
                     let gid = gid.clone();
+                    let name = name.clone();
                     async move {
                         let groups = wn.groups(&acc, true).await?;
                         if groups.iter().any(|g| g.mls_group_id == gid) {
