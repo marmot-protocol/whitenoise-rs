@@ -2,7 +2,7 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use async_trait::async_trait;
 use mdk_core::prelude::*;
-use nostr_sdk::prelude::*;
+use nostr_sdk::PublicKey;
 
 pub struct CreateGroupTestCase {
     group_name: String,
@@ -46,12 +46,6 @@ impl TestCase for CreateGroupTestCase {
             .collect::<Result<Vec<_>, _>>()?;
         let admin_pubkeys = vec![creator.pubkey];
 
-        let test_relay = if cfg!(debug_assertions) {
-            vec![RelayUrl::parse("ws://localhost:8080").unwrap()]
-        } else {
-            vec![RelayUrl::parse("wss://relay.primal.net").unwrap()]
-        };
-
         let test_group = context
             .whitenoise
             .create_group(
@@ -63,7 +57,7 @@ impl TestCase for CreateGroupTestCase {
                     None, // image_hash
                     None, // image_key
                     None, // image_nonce
-                    test_relay,
+                    context.test_relays(),
                     admin_pubkeys,
                 ),
                 None,

@@ -9,7 +9,7 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ReactionSummary},
+    message_aggregator::{ChatMessage, ChatMessageSummary, ReactionSummary},
     utils::timestamp_to_datetime,
 };
 
@@ -560,6 +560,89 @@ impl AggregatedMessage {
             .collect())
     }
 
+    /// Fetches the most recent kind-9 message for each group in a single query.
+    ///
+    /// Returns `ChatMessageSummary` with `author_display_name: None`.
+    /// The caller populates display names after a separate user batch lookup.
+    ///
+    /// Groups without messages or with only deleted messages are not included
+    /// in the result.
+    pub async fn find_last_by_group_ids(
+        group_ids: &[GroupId],
+        database: &Database,
+    ) -> Result<Vec<ChatMessageSummary>> {
+        use sqlx::Row;
+
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let group_id_bytes: Vec<Vec<u8>> = group_ids.iter().map(|id| id.to_vec()).collect();
+
+        // Build dynamic query with correct number of placeholders
+        let placeholders = "?,".repeat(group_id_bytes.len());
+        let placeholders = placeholders.trim_end_matches(',');
+
+        // Correlated subquery to get the last message per group
+        // Uses id matching with ORDER BY LIMIT 1 for deterministic results on timestamp ties
+        let query = format!(
+            "SELECT mls_group_id, author, content, created_at,
+                    json_array_length(media_attachments) as media_count
+             FROM aggregated_messages am1
+             WHERE kind = 9
+               AND mls_group_id IN ({})
+               AND deletion_event_id IS NULL
+               AND id = (
+                   SELECT id
+                   FROM aggregated_messages am2
+                   WHERE am2.mls_group_id = am1.mls_group_id
+                     AND am2.kind = 9
+                     AND am2.deletion_event_id IS NULL
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1
+               )",
+            placeholders
+        );
+
+        // Build and execute query with bindings
+        let mut query_builder = sqlx::query(&query);
+        for id_bytes in &group_id_bytes {
+            query_builder = query_builder.bind(id_bytes);
+        }
+
+        let rows = query_builder.fetch_all(&database.pool).await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
+            let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
+
+            let author_hex: String = row.try_get("author")?;
+            let author =
+                PublicKey::from_hex(&author_hex).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "author".to_string(),
+                    source: Box::new(e),
+                })?;
+
+            let content: String = row.try_get("content")?;
+            let created_at = parse_timestamp(&row, "created_at")?;
+            let media_count: i64 = row.try_get("media_count")?;
+
+            let summary = ChatMessageSummary {
+                mls_group_id,
+                author,
+                author_display_name: None,
+                content,
+                created_at,
+                media_attachment_count: media_count as usize,
+            };
+
+            results.push(summary);
+        }
+
+        Ok(results)
+    }
+
     /// Convert database row to ChatMessage
     fn row_to_chat_message(row: AggregatedMessageRow) -> Result<ChatMessage> {
         // Convert DateTime<Utc> to Timestamp (seconds)
@@ -903,5 +986,174 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].reactions.by_emoji.len(), 1);
         assert!(messages[0].reactions.by_emoji.contains_key("👍"));
+    }
+
+    #[tokio::test]
+    async fn test_find_last_by_group_ids_empty_input() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let result = AggregatedMessage::find_last_by_group_ids(&[], &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_last_by_group_ids_comprehensive() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Setup groups with different scenarios
+        let group_with_media = GroupId::from_slice(&[50; 32]);
+        let group_no_media = GroupId::from_slice(&[51; 32]);
+        let group_with_deletion = GroupId::from_slice(&[52; 32]);
+        let group_empty = GroupId::from_slice(&[53; 32]);
+        let group_multiple_messages = GroupId::from_slice(&[54; 32]);
+
+        for group_id in [
+            &group_with_media,
+            &group_no_media,
+            &group_with_deletion,
+            &group_empty,
+            &group_multiple_messages,
+        ] {
+            setup_group(group_id, &whitenoise.database).await;
+        }
+
+        let author = Keys::generate().public_key();
+
+        // Group 1: Message with 2 media attachments
+        let mut msg_with_media = create_test_chat_message(50, author);
+        msg_with_media.content = "Message with media".to_string();
+        msg_with_media.media_attachments = vec![
+            MediaFile {
+                id: Some(1),
+                mls_group_id: group_with_media.clone(),
+                account_pubkey: author,
+                file_path: std::path::PathBuf::from("/path/to/file1"),
+                original_file_hash: Some(vec![1; 32]),
+                encrypted_file_hash: vec![2; 32],
+                mime_type: "image/png".to_string(),
+                media_type: "image".to_string(),
+                blossom_url: None,
+                nostr_key: None,
+                file_metadata: None,
+                created_at: chrono::Utc::now(),
+            },
+            MediaFile {
+                id: Some(2),
+                mls_group_id: group_with_media.clone(),
+                account_pubkey: author,
+                file_path: std::path::PathBuf::from("/path/to/file2"),
+                original_file_hash: Some(vec![3; 32]),
+                encrypted_file_hash: vec![4; 32],
+                mime_type: "image/jpeg".to_string(),
+                media_type: "image".to_string(),
+                blossom_url: None,
+                nostr_key: None,
+                file_metadata: None,
+                created_at: chrono::Utc::now(),
+            },
+        ];
+        AggregatedMessage::insert_message(&msg_with_media, &group_with_media, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Group 2: Message without media
+        let mut msg_no_media = create_test_chat_message(51, author);
+        msg_no_media.content = "Message without media".to_string();
+        AggregatedMessage::insert_message(&msg_no_media, &group_no_media, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Group 3: Has deleted newest message, should return older one
+        let mut msg_older = create_test_chat_message(52, author);
+        msg_older.content = "Older non-deleted".to_string();
+        msg_older.created_at = Timestamp::from(1000);
+        AggregatedMessage::insert_message(&msg_older, &group_with_deletion, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let mut msg_deleted = create_test_chat_message(53, author);
+        msg_deleted.content = "Deleted message".to_string();
+        msg_deleted.created_at = Timestamp::from(2000);
+        AggregatedMessage::insert_message(&msg_deleted, &group_with_deletion, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg_deleted.id,
+            &group_with_deletion,
+            &format!("{:0>64}", "del"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Group 4: Empty (no messages) - already set up, no messages added
+
+        // Group 5: Multiple messages, should return the last one
+        let mut msg_first = create_test_chat_message(54, author);
+        msg_first.content = "First message".to_string();
+        msg_first.created_at = Timestamp::from(1000);
+        AggregatedMessage::insert_message(
+            &msg_first,
+            &group_multiple_messages,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let mut msg_last = create_test_chat_message(55, author);
+        msg_last.content = "Last message".to_string();
+        msg_last.created_at = Timestamp::from(2000);
+        AggregatedMessage::insert_message(
+            &msg_last,
+            &group_multiple_messages,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Query all groups
+        let result = AggregatedMessage::find_last_by_group_ids(
+            &[
+                group_with_media.clone(),
+                group_no_media.clone(),
+                group_with_deletion.clone(),
+                group_empty.clone(),
+                group_multiple_messages.clone(),
+            ],
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Should return 4 results (empty group excluded)
+        assert_eq!(result.len(), 4);
+
+        // Convert to HashMap for easier assertions
+        let map: std::collections::HashMap<_, _> = result
+            .into_iter()
+            .map(|s| (s.mls_group_id.clone(), s))
+            .collect();
+
+        // Verify each group's result
+        assert_eq!(map[&group_with_media].content, "Message with media");
+        assert_eq!(map[&group_with_media].media_attachment_count, 2);
+
+        assert_eq!(map[&group_no_media].content, "Message without media");
+        assert_eq!(map[&group_no_media].media_attachment_count, 0);
+
+        assert_eq!(map[&group_with_deletion].content, "Older non-deleted");
+
+        assert_eq!(map[&group_multiple_messages].content, "Last message");
+
+        // Empty group should not be in results
+        assert!(!map.contains_key(&group_empty));
+
+        // All should have author_display_name as None
+        for summary in map.values() {
+            assert_eq!(summary.author_display_name, None);
+            assert_eq!(summary.author, author);
+        }
     }
 }

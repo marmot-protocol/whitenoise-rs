@@ -149,6 +149,52 @@ impl User {
         Ok(user_row.into())
     }
 
+    /// Fetches multiple users by their public keys in a single query.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkeys` - A slice of `PublicKey` to search for
+    /// * `database` - A reference to the `Database` instance for database operations
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Vec<User>` containing all users found.
+    /// Users that don't exist in the database are simply not included in the result.
+    pub(crate) async fn find_by_pubkeys(
+        pubkeys: &[PublicKey],
+        database: &Database,
+    ) -> Result<Vec<User>, WhitenoiseError> {
+        if pubkeys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_hex()).collect();
+
+        // Build dynamic query with correct number of placeholders
+        let placeholders = "?,".repeat(pubkey_hexes.len());
+        let placeholders = placeholders.trim_end_matches(',');
+
+        let query = format!(
+            "SELECT id, pubkey, metadata, created_at, updated_at
+             FROM users
+             WHERE pubkey IN ({})",
+            placeholders
+        );
+
+        // Build and execute query with bindings
+        let mut query_builder = sqlx::query_as::<_, UserRow>(&query);
+        for hex in &pubkey_hexes {
+            query_builder = query_builder.bind(hex);
+        }
+
+        let rows = query_builder
+            .fetch_all(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+
+        Ok(rows.into_iter().map(User::from).collect())
+    }
+
     /// Gets all relays of a specific type associated with this user.
     ///
     /// # Arguments
@@ -913,6 +959,157 @@ mod tests {
         } else {
             panic!("Expected UserNotFound error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_empty_input() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let result = User::find_by_pubkeys(&[], &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_single_existing() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new().name("Test User"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pubkey, test_pubkey);
+        assert_eq!(result[0].metadata.name, Some("Test User".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_multiple_existing() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let pubkey1 = nostr_sdk::Keys::generate().public_key();
+        let pubkey2 = nostr_sdk::Keys::generate().public_key();
+        let pubkey3 = nostr_sdk::Keys::generate().public_key();
+
+        for (i, pubkey) in [pubkey1, pubkey2, pubkey3].iter().enumerate() {
+            let user = User {
+                id: None,
+                pubkey: *pubkey,
+                metadata: Metadata::new().name(format!("User {}", i + 1)),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            user.save(&whitenoise.database).await.unwrap();
+        }
+
+        let result = User::find_by_pubkeys(&[pubkey1, pubkey2, pubkey3], &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+
+        let pubkeys: Vec<_> = result.iter().map(|u| u.pubkey).collect();
+        assert!(pubkeys.contains(&pubkey1));
+        assert!(pubkeys.contains(&pubkey2));
+        assert!(pubkeys.contains(&pubkey3));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_mixed_existing_and_missing() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let existing_pubkey = nostr_sdk::Keys::generate().public_key();
+        let missing_pubkey = nostr_sdk::Keys::generate().public_key();
+
+        let user = User {
+            id: None,
+            pubkey: existing_pubkey,
+            metadata: Metadata::new().name("Existing User"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        let result =
+            User::find_by_pubkeys(&[existing_pubkey, missing_pubkey], &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Should only contain the existing user
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pubkey, existing_pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_none_exist() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let pubkey1 = nostr_sdk::Keys::generate().public_key();
+        let pubkey2 = nostr_sdk::Keys::generate().public_key();
+
+        let result = User::find_by_pubkeys(&[pubkey1, pubkey2], &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_pubkeys_preserves_metadata() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let test_metadata = Metadata::new()
+            .name("Full Name")
+            .display_name("Display Name")
+            .about("About text")
+            .nip05("user@example.com");
+
+        let user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: test_metadata.clone(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let loaded_user = &result[0];
+        assert_eq!(loaded_user.metadata.name, test_metadata.name);
+        assert_eq!(
+            loaded_user.metadata.display_name,
+            test_metadata.display_name
+        );
+        assert_eq!(loaded_user.metadata.about, test_metadata.about);
+        assert_eq!(loaded_user.metadata.nip05, test_metadata.nip05);
     }
 
     #[tokio::test]

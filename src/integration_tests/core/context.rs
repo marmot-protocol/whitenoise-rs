@@ -1,6 +1,7 @@
 use crate::whitenoise::media_files::MediaFile;
 use crate::{Account, Whitenoise, WhitenoiseError};
 use mdk_core::prelude::group_types::Group;
+use nostr_sdk::prelude::RelayUrl;
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -84,5 +85,13 @@ impl ScenarioContext {
         if passed {
             self.tests_passed += 1;
         }
+    }
+
+    /// Returns the test relays as parsed `RelayUrl` instances.
+    pub fn test_relays(&self) -> Vec<RelayUrl> {
+        self.dev_relays
+            .iter()
+            .filter_map(|r| RelayUrl::parse(r).ok())
+            .collect()
     }
 }
