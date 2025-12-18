@@ -82,7 +82,10 @@ impl Whitenoise {
 
         let welcome = mdk.get_welcome(&welcome_event_id)?;
         let result = if let Some(welcome) = welcome {
-            mdk.accept_welcome(&welcome)?;
+            // Note: mdk.accept_welcome() is NOT called here because the welcome
+            // has already been accepted by the event processor's auto-finalization.
+            // This method only handles UI-level acceptance (AccountGroup state)
+            // and additional setup (GroupInformation, subscriptions).
 
             // Create group information with GroupType inferred from group name
             GroupInformation::create_for_group(
