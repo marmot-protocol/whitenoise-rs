@@ -21,7 +21,7 @@ CREATE INDEX idx_accounts_groups_account ON accounts_groups(account_pubkey);
 -- Index for efficient lookups by group
 CREATE INDEX idx_accounts_groups_group ON accounts_groups(mls_group_id);
 
--- Note: We cannot migrate existing groups from group_information because that table
--- doesn't track account_pubkey (it's global, not per-account). Existing groups will
--- get accounts_groups records created when users interact with them through the
--- normal flow (process_welcome, accept_welcome, etc.).
+-- Note: Existing groups are migrated lazily in the groups() method.
+-- When groups() is called, any active MLS group without an AccountGroup record
+-- will have one auto-created with user_confirmation = true (accepted).
+-- This ensures existing users don't have to manually re-accept their groups.

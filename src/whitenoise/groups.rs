@@ -19,6 +19,7 @@ use crate::{
     whitenoise::{
         Whitenoise,
         accounts::Account,
+        accounts_groups::AccountGroup,
         database::media_files::{FileMetadata, MediaFile},
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
@@ -284,12 +285,35 @@ impl Whitenoise {
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        Ok(mdk
+        let groups: Vec<group_types::Group> = mdk
             .get_groups()
             .map_err(WhitenoiseError::from)?
             .into_iter()
             .filter(|group| !active_filter || group.state == group_types::GroupState::Active)
-            .collect::<Vec<group_types::Group>>())
+            .collect();
+
+        // Lazy migration: ensure AccountGroup records exist for all active groups.
+        // This handles existing users who had groups before the accounts_groups table was added.
+        // Only creates records for active groups (already finalized MLS membership).
+        for group in &groups {
+            if group.state == group_types::GroupState::Active {
+                let (ag, was_created) =
+                    AccountGroup::get_or_create(self, &account.pubkey, &group.mls_group_id).await?;
+
+                // If this is a newly created record for an existing active group,
+                // auto-accept it since the user is already a member
+                if was_created {
+                    ag.accept(self).await?;
+                    tracing::debug!(
+                        target: "whitenoise::groups",
+                        "Lazy migration: created and accepted AccountGroup for existing group {}",
+                        hex::encode(group.mls_group_id.as_slice())
+                    );
+                }
+            }
+        }
+
+        Ok(groups)
     }
 
     /// Retrieves a single group by its MLS group ID
