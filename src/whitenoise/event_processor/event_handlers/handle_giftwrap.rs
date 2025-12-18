@@ -100,9 +100,8 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Background task to finalize welcome processing.
-    /// Handles DB writes, network calls, and other non-critical operations.
-    /// All operations are idempotent and failures are logged but don't stop other operations.
+    /// Background task wrapper that gets Whitenoise instance and delegates to core logic.
+    /// This thin wrapper exists because tokio::spawn requires 'static lifetime.
     async fn background_finalize_welcome(
         account: Account,
         group_id: GroupId,
@@ -110,18 +109,36 @@ impl Whitenoise {
         key_package_event_id: Option<EventId>,
         data_dir: PathBuf,
     ) {
-        let whitenoise = match Whitenoise::get_instance() {
-            Ok(wn) => wn,
-            Err(e) => {
-                tracing::error!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to get Whitenoise instance: {}",
-                    e
-                );
-                return;
-            }
+        let Ok(whitenoise) = Whitenoise::get_instance() else {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to get Whitenoise instance"
+            );
+            return;
         };
 
+        Self::finalize_welcome_with_instance(
+            whitenoise,
+            &account,
+            &group_id,
+            &group_name,
+            key_package_event_id,
+            &data_dir,
+        )
+        .await;
+    }
+
+    /// Core welcome finalization logic. Testable because it takes Whitenoise as a parameter.
+    /// Handles DB writes, network calls, and other non-critical operations.
+    /// All operations are idempotent and failures are logged but don't stop other operations.
+    pub(crate) async fn finalize_welcome_with_instance(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+        group_name: &str,
+        key_package_event_id: Option<EventId>,
+        data_dir: &std::path::Path,
+    ) {
         // Get keys early - needed for subscriptions
         let keys = match whitenoise
             .secrets_store
@@ -147,14 +164,14 @@ impl Whitenoise {
             key_rotation_result,
             image_sync_result,
         ) = tokio::join!(
-            Self::create_account_group(whitenoise, &account, &group_id),
-            Self::create_group_info(whitenoise, &group_id, &group_name),
-            Self::setup_group_subscriptions(whitenoise, &account, &data_dir, keys),
-            Self::rotate_key_package(whitenoise, &account, key_package_event_id),
-            Self::sync_group_image(whitenoise, &account, &group_id),
+            Self::create_account_group(whitenoise, account, group_id),
+            Self::create_group_info(whitenoise, group_id, group_name),
+            Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
+            Self::rotate_key_package(whitenoise, account, key_package_event_id),
+            Self::sync_group_image(whitenoise, account, group_id),
         );
 
-        // Log results
+        // Log any errors (operations are independent, so we log all failures)
         if let Err(e) = account_group_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
@@ -484,5 +501,74 @@ mod tests {
         let (group_ids, relays) = result.unwrap();
         assert_eq!(group_ids.len(), 1, "Creator should have one group");
         assert!(!relays.is_empty(), "Group should have relays");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_creates_account_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
+        let group_name = "Test Group";
+
+        // Run finalize_welcome_with_instance directly (no key package event id)
+        // Some operations may fail (e.g., group not in MLS) but the function should complete
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None, // no key package to rotate
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Verify AccountGroup was created (this operation should succeed)
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        let account_group = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+        assert!(account_group.is_some(), "AccountGroup should be created");
+        let ag = account_group.unwrap();
+        assert!(ag.is_pending(), "New AccountGroup should be pending");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
+        let group_name = "Idempotent Test Group";
+
+        // Run twice - should not panic (some operations may log errors but that's ok)
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Should still have exactly one AccountGroup
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        let visible = AccountGroup::visible_for_account(&whitenoise, &account.pubkey)
+            .await
+            .unwrap();
+        let matching: Vec<_> = visible
+            .iter()
+            .filter(|ag| ag.mls_group_id == group_id)
+            .collect();
+        assert_eq!(matching.len(), 1, "Should have exactly one AccountGroup");
     }
 }
