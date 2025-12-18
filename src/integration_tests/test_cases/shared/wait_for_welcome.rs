@@ -49,7 +49,6 @@ impl TestCase for WaitForWelcomeTestCase {
 
             retry_default(
                 || {
-                    let wn = wn;
                     let acc = acc.clone();
                     let gid = gid.clone();
                     let name = name.clone();
