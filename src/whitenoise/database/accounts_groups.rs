@@ -201,21 +201,6 @@ impl AccountGroup {
         Ok(row.into())
     }
 
-    /// Deletes this AccountGroup from the database.
-    #[allow(dead_code)]
-    pub(crate) async fn delete(&self, database: &Database) -> Result<(), sqlx::Error> {
-        let id = self.id.ok_or_else(|| {
-            sqlx::Error::Protocol("Cannot delete unsaved AccountGroup".to_string())
-        })?;
-
-        sqlx::query("DELETE FROM accounts_groups WHERE id = ?")
-            .bind(id)
-            .execute(&database.pool)
-            .await?;
-
-        Ok(())
-    }
-
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
     async fn create(
         account_pubkey: &PublicKey,
@@ -411,30 +396,6 @@ mod tests {
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].mls_group_id, group_id1);
-    }
-
-    #[tokio::test]
-    async fn test_delete() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[13; 32]);
-
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
-                .await
-                .unwrap();
-
-        account_group.delete(&whitenoise.database).await.unwrap();
-
-        let result = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(result.is_none());
     }
 
     #[tokio::test]
