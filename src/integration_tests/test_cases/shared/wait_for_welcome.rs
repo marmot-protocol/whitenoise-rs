@@ -1,5 +1,5 @@
 use crate::WhitenoiseError;
-use crate::integration_tests::core::{retry_default, ScenarioContext, TestCase};
+use crate::integration_tests::core::{ScenarioContext, TestCase, retry_default};
 use async_trait::async_trait;
 
 /// Test case that waits for specified accounts to receive and process welcome messages
