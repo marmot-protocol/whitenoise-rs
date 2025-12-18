@@ -342,8 +342,8 @@ impl Whitenoise {
     /// This method performs the complete workflow for adding members to a group:
     /// 1. Fetches key packages for all new members from their configured relays
     /// 2. Creates an MLS add members proposal and generates welcome messages
-    /// 3. Publishes the evolution event to the group's relays
-    /// 4. Merges the pending commit to finalize the member addition
+    /// 3. Publishes the evolution event to the group's relays and waits for acknowledgment
+    /// 4. Merges the pending commit locally after the publish succeeds
     /// 5. Sends welcome messages to each new member via gift wrap
     ///
     /// # Arguments
@@ -391,30 +391,17 @@ impl Whitenoise {
             users.push(user);
         }
 
-        let (relay_urls, evolution_event, welcome_rumors) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-            let update_result = mdk.add_members(group_id, &key_package_events)?;
-            // Merge the pending commit immediately after creating it
-            // This ensures our local state is correct before publishing
-            mdk.merge_pending_commit(group_id)?;
-
-            (
-                relay_urls,
-                update_result.evolution_event,
-                update_result.welcome_rumors,
-            )
-        };
-
-        let welcome_rumors = match welcome_rumors {
-            None => {
-                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::Group(
-                    "Missing welcome message".to_owned(),
-                )));
-            }
-            Some(wr) => wr,
-        };
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let update_result = mdk.add_members(group_id, &key_package_events)?;
+        let UpdateGroupResult {
+            evolution_event,
+            welcome_rumors,
+            ..
+        } = update_result;
+        let welcome_rumors = welcome_rumors.ok_or(WhitenoiseError::MdkCoreError(
+            mdk_core::Error::Group("Missing welcome message".to_owned()),
+        ))?;
 
         if welcome_rumors.len() != users.len() {
             return Err(WhitenoiseError::Other(anyhow::Error::msg(
@@ -422,9 +409,38 @@ impl Whitenoise {
             )));
         }
 
-        self.nostr
+        let publish_result = self
+            .nostr
             .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        if publish_result.success.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "Failed to publish group commit to any relay: {failures}"
+            )));
+        } else if !publish_result.failed.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "whitenoise::groups::add_members_to_group",
+                "Group commit acknowledged by {} relay(s) but rejected by: {}",
+                publish_result.success.len(),
+                failures
+            );
+        }
+
+        // Relay acknowledged the commit; now merge the pending state locally.
+        mdk.merge_pending_commit(group_id)?;
 
         // Evolution event published successfully
         // Fan out the welcome message to all members
@@ -480,8 +496,8 @@ impl Whitenoise {
     ///
     /// This method performs the complete workflow for removing members from a group:
     /// 1. Creates an MLS remove members proposal
-    /// 2. Merges the pending commit to finalize the member removal
-    /// 3. Publishes the evolution event to the group's relays
+    /// 2. Publishes the evolution event to the group's relays and waits for acknowledgment
+    /// 3. Merges the pending commit locally to finalize the member removal
     ///
     /// # Arguments
     /// * `account` - The account performing the member removal (must be group admin)
@@ -493,19 +509,42 @@ impl Whitenoise {
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
-        let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let update_result = mdk.remove_members(group_id, &members)?;
+        let evolution_event = update_result.evolution_event;
 
-            let update_result = mdk.remove_members(group_id, &members)?;
-            mdk.merge_pending_commit(group_id)?;
-
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.nostr
+        let publish_result = self
+            .nostr
             .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        if publish_result.success.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "Failed to publish removal commit to any relay: {failures}"
+            )));
+        } else if !publish_result.failed.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "whitenoise::groups::remove_members_from_group",
+                "Removal commit acknowledged by {} relay(s) but rejected by: {}",
+                publish_result.success.len(),
+                failures
+            );
+        }
+
+        mdk.merge_pending_commit(group_id)?;
         Ok(())
     }
 
@@ -523,19 +562,42 @@ impl Whitenoise {
         group_id: &GroupId,
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
-        let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let update_result = mdk.update_group_data(group_id, group_data)?;
+        let evolution_event = update_result.evolution_event;
 
-            let update_result = mdk.update_group_data(group_id, group_data)?;
-            mdk.merge_pending_commit(group_id)?;
-
-            (relay_urls, update_result.evolution_event)
-        };
-
-        self.nostr
+        let publish_result = self
+            .nostr
             .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        if publish_result.success.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "Failed to publish group update to any relay: {failures}"
+            )));
+        } else if !publish_result.failed.is_empty() {
+            let failures = publish_result
+                .failed
+                .iter()
+                .map(|(relay, err)| format!("{relay}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                target: "whitenoise::groups::update_group_data",
+                "Group update acknowledged by {} relay(s) but rejected by: {}",
+                publish_result.success.len(),
+                failures
+            );
+        }
+
+        mdk.merge_pending_commit(group_id)?;
         Ok(())
     }
 

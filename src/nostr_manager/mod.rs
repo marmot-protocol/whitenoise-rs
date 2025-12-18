@@ -47,6 +47,8 @@ pub enum NostrManagerError {
     FailedToTrackPublishedEvent(String),
     #[error("Invalid timestamp")]
     InvalidTimestamp,
+    #[error("Event {event_id} was rejected by all relays (attempted {attempted} relays)")]
+    PublishRejected { event_id: EventId, attempted: usize },
 }
 
 #[derive(Clone)]

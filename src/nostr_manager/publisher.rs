@@ -217,7 +217,21 @@ impl NostrManager {
     ) -> Result<Output<EventId>> {
         // Ensure we're connected to all target relays before publishing
         self.ensure_relays_connected(relays).await?;
+        let event_id = event.id;
         let result = self.client.send_event_to(relays, &event).await?;
+
+        if result.success.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::nostr_manager::publish_event_to",
+                "Event {} was rejected by all relays: attempted {} relays",
+                event_id.to_hex(),
+                relays.len()
+            );
+            return Err(NostrManagerError::PublishRejected {
+                event_id,
+                attempted: relays.len(),
+            });
+        }
 
         // Track the published event if we have a successful result (best-effort)
         if !result.success.is_empty() {
@@ -719,21 +733,13 @@ mod publish_tests {
             .publish_event_to(event, &keys.public_key(), &relays)
             .await;
 
-        // The publish should succeed at the API level (returns Output)
-        // but have no successful relay sends
-        match result {
-            Ok(output) => {
-                // All relay publishes should have failed
-                assert!(
-                    output.success.is_empty(),
-                    "No relays should have succeeded with unreachable endpoints"
-                );
-            }
-            Err(_) => {
-                // It's also acceptable for the entire operation to fail
-                // due to connection issues
-            }
-        }
+        assert!(
+            matches!(
+                result,
+                Err(NostrManagerError::PublishRejected { .. }) | Err(NostrManagerError::Client(_))
+            ),
+            "Publishing to unreachable relays should fail with rejection or client error"
+        );
     }
 
     #[tokio::test]
@@ -773,6 +779,10 @@ mod publish_tests {
             Ok(output) => {
                 // Should have the correct event ID
                 assert_eq!(*output.id(), event.id);
+                assert!(
+                    !output.success.is_empty(),
+                    "At least one relay should acknowledge the event in success case"
+                );
                 tracing::debug!(
                     "Published to {} successful relays, {} failed",
                     output.success.len(),
