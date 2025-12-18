@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::*;
@@ -14,6 +15,11 @@ use crate::nostr_manager::{NostrManager, NostrManagerError};
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
+#[cfg(target_os = "android")]
+use crate::whitenoise::signers::AmberSigner;
+#[cfg(feature = "insecure-local-signer")]
+use crate::whitenoise::signers::LocalSigner;
+use crate::whitenoise::signers::{EphemeralSigner, SignerError, SignerKind};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
@@ -36,6 +42,12 @@ pub enum AccountError {
 
     #[error("Whitenoise not initialized")]
     WhitenoiseNotInitialized,
+
+    #[error("Signer error: {0}")]
+    SignerError(#[from] SignerError),
+
+    #[error("Signer kind not found for account")]
+    SignerKindNotFound,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -70,6 +82,30 @@ impl Account {
         Ok((account, keys))
     }
 
+    /// Creates a new Account from a public key only (no private key needed).
+    ///
+    /// This is used for external signers like Amber where we don't have access
+    /// to the private key.
+    #[cfg(target_os = "android")]
+    pub(crate) async fn new_from_pubkey(
+        whitenoise: &Whitenoise,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (user, _created) =
+            User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
+
+        let account = Account {
+            id: None,
+            user_id: user.id.unwrap(),
+            pubkey,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        Ok(account)
+    }
+
     /// Convert last_synced_at to a Timestamp applying a lookback buffer.
     /// Clamps future timestamps to now to avoid empty subscriptions.
     /// Returns None if the account has never synced.
@@ -80,6 +116,25 @@ impl Account {
         let last_secs = (ts.timestamp().max(0) as u64).min(now_secs);
         let secs = last_secs.saturating_sub(buffer_secs);
         Some(nostr_sdk::Timestamp::from(secs))
+    }
+
+    /// Gets the signer kind for this account.
+    ///
+    /// The signer kind determines how signing operations are performed for this account.
+    /// It's stored in the secrets store alongside the account.
+    ///
+    /// # Arguments
+    ///
+    /// * `whitenoise` - The Whitenoise instance to access the secrets store
+    ///
+    /// # Returns
+    ///
+    /// The `SignerKind` for this account, or an error if not found.
+    pub fn signer_kind(&self, whitenoise: &Whitenoise) -> Result<SignerKind> {
+        whitenoise
+            .secrets_store
+            .get_signer_kind(&self.pubkey)
+            .map_err(|_| WhitenoiseError::Account(AccountError::SignerKindNotFound))
     }
 
     /// Retrieves the account's configured relays for a specific relay type.
@@ -242,9 +297,7 @@ impl Account {
         whitenoise: &Whitenoise,
     ) -> Result<String> {
         let client = BlossomClient::new(server);
-        let keys = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&self.pubkey)?;
+        let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;
 
         let descriptor = client
@@ -252,7 +305,7 @@ impl Account {
                 data,
                 Some(image_type.mime_type().to_string()),
                 None,
-                Some(&keys),
+                Some(&signer),
             )
             .await
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
@@ -271,16 +324,28 @@ impl Account {
 }
 
 impl Whitenoise {
-    /// Creates a new identity (account) for the user.
+    // ========================================================================
+    // Account Creation (Local Signer - Insecure)
+    // ========================================================================
+
+    /// Creates a new identity (account) for the user using local key storage.
+    ///
+    /// **WARNING**: This method stores private keys locally, which is inherently insecure.
+    /// On Android, use `login_with_amber()` instead for secure key management.
     ///
     /// This method generates a new keypair, sets up the account with default relay lists,
     /// creates a metadata event with a generated petname, and fully configures the account
     /// for use in Whitenoise.
+    ///
+    /// Only available when the `insecure-local-signer` feature is enabled.
+    #[cfg(feature = "insecure-local-signer")]
     pub async fn create_identity(&self) -> Result<Account> {
         let keys = Keys::generate();
         tracing::debug!(target: "whitenoise::create_identity", "Generated new keypair: {}", keys.public_key().to_hex());
 
-        let mut account = self.create_base_account_with_private_key(&keys).await?;
+        let mut account = self
+            .create_base_account_with_private_key(&keys, SignerKind::LocalInsecure)
+            .await?;
         tracing::debug!(target: "whitenoise::create_identity", "Keys stored in secret store and account saved to database");
 
         let mut user = account.user(&self.database).await?;
@@ -303,19 +368,27 @@ impl Whitenoise {
 
     /// Logs in an existing user using a private key (nsec or hex format).
     ///
+    /// **WARNING**: This method stores private keys locally, which is inherently insecure.
+    /// On Android, use `login_with_amber()` instead for secure key management.
+    ///
     /// This method parses the private key, checks if the account exists locally,
     /// and sets up the account for use. If the account doesn't exist locally,
     /// it treats it as an existing account and fetches data from the network.
     ///
+    /// Only available when the `insecure-local-signer` feature is enabled.
+    ///
     /// # Arguments
     ///
     /// * `nsec_or_hex_privkey` - The user's private key as a nsec string or hex-encoded string.
+    #[cfg(feature = "insecure-local-signer")]
     pub async fn login(&self, nsec_or_hex_privkey: String) -> Result<Account> {
         let keys = Keys::parse(&nsec_or_hex_privkey)?;
         let pubkey = keys.public_key();
         tracing::debug!(target: "whitenoise::login", "Logging in with pubkey: {}", pubkey.to_hex());
 
-        let mut account = self.create_base_account_with_private_key(&keys).await?;
+        let mut account = self
+            .create_base_account_with_private_key(&keys, SignerKind::LocalInsecure)
+            .await?;
         tracing::debug!(target: "whitenoise::login", "Keys stored in secret store and account saved to database");
 
         // Always check for existing relay lists when logging in, even if the user is
@@ -341,11 +414,105 @@ impl Whitenoise {
         Ok(account)
     }
 
+    // ========================================================================
+    // Account Creation (Amber Signer - Android Only)
+    // ========================================================================
+
+    /// Logs in using Amber signer on Android.
+    ///
+    /// This method creates an account that delegates all signing operations to Amber,
+    /// a dedicated NIP-55 signer app. The private key never enters this process.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key obtained from Amber
+    ///
+    /// # Platform
+    ///
+    /// This method is only available on Android. Call `Whitenoise::init_android_context()`
+    /// before using this method.
+    #[cfg(target_os = "android")]
+    pub async fn login_with_amber(&self, pubkey: PublicKey) -> Result<Account> {
+        tracing::debug!(target: "whitenoise::login_with_amber", "Logging in with Amber for pubkey: {}", pubkey.to_hex());
+
+        let signer_kind = SignerKind::amber();
+        let mut account = self
+            .create_base_account_from_pubkey(pubkey, signer_kind)
+            .await?;
+        tracing::debug!(target: "whitenoise::login_with_amber", "Account created with Amber signer");
+
+        // Check for existing relay lists
+        let (nip65_relays, inbox_relays, key_package_relays) =
+            self.setup_relays_for_existing_account(&mut account).await?;
+        tracing::debug!(target: "whitenoise::login_with_amber", "Relays setup");
+
+        let user = account.user(&self.database).await?;
+        self.activate_account(
+            &account,
+            &user,
+            false,
+            &nip65_relays,
+            &inbox_relays,
+            &key_package_relays,
+        )
+        .await?;
+        tracing::debug!(target: "whitenoise::login_with_amber", "Account activated");
+
+        tracing::debug!(target: "whitenoise::login_with_amber", "Successfully logged in with Amber: {}", account.pubkey.to_hex());
+        Ok(account)
+    }
+
+    /// Logs in using Amber signer with a custom package name.
+    ///
+    /// This method is similar to `login_with_amber()` but allows specifying a custom
+    /// signer app package name for non-standard Amber installations.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key obtained from Amber
+    /// * `package_name` - The package name of the signer app
+    #[cfg(target_os = "android")]
+    pub async fn login_with_amber_custom(
+        &self,
+        pubkey: PublicKey,
+        package_name: String,
+    ) -> Result<Account> {
+        tracing::debug!(
+            target: "whitenoise::login_with_amber_custom",
+            "Logging in with custom Amber ({}) for pubkey: {}",
+            package_name,
+            pubkey.to_hex()
+        );
+
+        let signer_kind = SignerKind::amber_with_package(package_name);
+        let mut account = self
+            .create_base_account_from_pubkey(pubkey, signer_kind)
+            .await?;
+
+        let (nip65_relays, inbox_relays, key_package_relays) =
+            self.setup_relays_for_existing_account(&mut account).await?;
+
+        let user = account.user(&self.database).await?;
+        self.activate_account(
+            &account,
+            &user,
+            false,
+            &nip65_relays,
+            &inbox_relays,
+            &key_package_relays,
+        )
+        .await?;
+
+        tracing::debug!(target: "whitenoise::login_with_amber_custom", "Successfully logged in with custom Amber: {}", account.pubkey.to_hex());
+        Ok(account)
+    }
+
     /// Logs out the user associated with the given account.
     ///
     /// This method performs the following steps:
     /// - Removes the account from the database.
-    /// - Removes the private key from the secret store.
+    /// - Removes the private key from the secret store (if stored locally).
+    /// - Removes the signer kind from the secret store.
     /// - Updates the active account if the logged-out account was active.
     /// - Removes the account from the in-memory accounts list.
     ///
@@ -353,7 +520,7 @@ impl Whitenoise {
     ///
     /// # Arguments
     ///
-    /// * `account` - The account to log out.
+    /// * `pubkey` - The public key of the account to log out.
     pub async fn logout(&self, pubkey: &PublicKey) -> Result<()> {
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
 
@@ -370,8 +537,19 @@ impl Whitenoise {
         // Delete the account from the database
         account.delete(&self.database).await?;
 
-        // Remove the private key from the secret store
+        // Remove the private key from the secret store (only applies for local signers)
+        // This is a no-op when insecure-local-signer feature is disabled
         self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
+
+        // Remove the signer kind from the secret store
+        if let Err(e) = self.secrets_store.remove_signer_kind(pubkey) {
+            tracing::warn!(
+                target: "whitenoise::logout",
+                "Failed to remove signer kind for {}: {}",
+                pubkey, e
+            );
+            // Don't fail logout if signer kind removal fails
+        }
 
         Ok(())
     }
@@ -411,13 +589,146 @@ impl Whitenoise {
         Account::find_by_pubkey(pubkey, &self.database).await
     }
 
-    async fn create_base_account_with_private_key(&self, keys: &Keys) -> Result<Account> {
+    // ========================================================================
+    // Signer Retrieval
+    // ========================================================================
+
+    /// Gets the appropriate signer for an account based on its stored SignerKind.
+    ///
+    /// This method returns an `Arc<dyn NostrSigner>` trait object that can be used for
+    /// signing operations. The Arc wrapper allows the signer to be cloned and shared
+    /// across async tasks.
+    ///
+    /// The actual signer implementation depends on the account's configured signer kind:
+    ///
+    /// - `SignerKind::LocalInsecure` - Returns a `LocalSigner` using locally stored keys
+    /// - `SignerKind::Amber` - Returns an `AmberSigner` that delegates to the Amber app (Android only)
+    /// - `SignerKind::Ephemeral` - Returns an `EphemeralSigner` (not typically used for accounts)
+    ///
+    /// # Arguments
+    ///
+    /// * `account` - The account to get a signer for
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The signer kind is not found for the account
+    /// - The required feature is not enabled for the signer kind
+    /// - The signer cannot be created (e.g., keys not found for LocalSigner)
+    pub fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
+        let signer_kind = account.signer_kind(self)?;
+
+        match signer_kind {
+            #[cfg(feature = "insecure-local-signer")]
+            SignerKind::LocalInsecure => {
+                let signer = LocalSigner::from_secrets_store(&account.pubkey, &self.secrets_store)
+                    .map_err(|e| WhitenoiseError::Account(AccountError::SignerError(e)))?;
+                Ok(Arc::new(signer))
+            }
+
+            #[cfg(target_os = "android")]
+            SignerKind::Amber { package_name } => {
+                let signer = if package_name == crate::whitenoise::signers::AMBER_PACKAGE_NAME {
+                    AmberSigner::new(account.pubkey)
+                } else {
+                    AmberSigner::with_package(account.pubkey, package_name)
+                };
+                Ok(Arc::new(signer))
+            }
+
+            SignerKind::Ephemeral => {
+                // Ephemeral signers can't be restored - this shouldn't happen for persisted accounts
+                tracing::error!(
+                    target: "whitenoise::get_signer_for_account",
+                    "Attempting to get signer for ephemeral account {}. Ephemeral signers cannot be restored.",
+                    account.pubkey
+                );
+                Err(WhitenoiseError::Account(AccountError::SignerError(
+                    SignerError::FeatureNotEnabled(
+                        "Ephemeral signers cannot be restored for persisted accounts".to_string(),
+                    ),
+                )))
+            }
+
+            // Handle cases where feature/platform doesn't match the stored signer kind
+            #[allow(unreachable_patterns)]
+            _ => {
+                tracing::error!(
+                    target: "whitenoise::get_signer_for_account",
+                    "Signer kind {:?} not supported on this platform/build",
+                    signer_kind
+                );
+                Err(WhitenoiseError::Account(AccountError::SignerError(
+                    SignerError::FeatureNotEnabled(format!("{:?}", signer_kind)),
+                )))
+            }
+        }
+    }
+
+    /// Gets the signer for an account by public key.
+    ///
+    /// This is a convenience method that combines `find_account_by_pubkey` and
+    /// `get_signer_for_account`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key of the account
+    pub async fn get_signer_for_pubkey(&self, pubkey: &PublicKey) -> Result<Arc<dyn NostrSigner>> {
+        let account = self.find_account_by_pubkey(pubkey).await?;
+        self.get_signer_for_account(&account)
+    }
+
+    // ========================================================================
+    // Account Creation Helpers
+    // ========================================================================
+
+    #[cfg(feature = "insecure-local-signer")]
+    async fn create_base_account_with_private_key(
+        &self,
+        keys: &Keys,
+        signer_kind: SignerKind,
+    ) -> Result<Account> {
         let (account, _keys) = Account::new(self, Some(keys.clone())).await?;
 
         self.secrets_store.store_private_key(keys).map_err(|e| {
             tracing::error!(target: "whitenoise::setup_account", "Failed to store private key: {}", e);
             e
         })?;
+
+        // Store the signer kind for this account
+        self.secrets_store
+            .store_signer_kind(&account.pubkey, &signer_kind)
+            .map_err(|e| {
+                // Try to clean up stored private key on failure
+                let _ = self.secrets_store.remove_private_key_for_pubkey(&account.pubkey);
+                tracing::error!(target: "whitenoise::setup_account", "Failed to store signer kind: {}", e);
+                WhitenoiseError::Other(anyhow::anyhow!(e))
+            })?;
+
+        let account = self.persist_account(&account).await?;
+
+        Ok(account)
+    }
+
+    /// Creates a base account from a public key only (for external signers like Amber).
+    ///
+    /// This method creates an account without storing any private key material.
+    /// The signer kind is stored to track how signing should be performed.
+    #[cfg(target_os = "android")]
+    async fn create_base_account_from_pubkey(
+        &self,
+        pubkey: PublicKey,
+        signer_kind: SignerKind,
+    ) -> Result<Account> {
+        let account = Account::new_from_pubkey(self, pubkey).await?;
+
+        // Store the signer kind for this account
+        self.secrets_store
+            .store_signer_kind(&account.pubkey, &signer_kind)
+            .map_err(|e| {
+                tracing::error!(target: "whitenoise::setup_account", "Failed to store signer kind: {}", e);
+                WhitenoiseError::Other(anyhow::anyhow!(e))
+            })?;
 
         let account = self.persist_account(&account).await?;
 
@@ -577,9 +888,7 @@ impl Whitenoise {
         account: &mut Account,
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
         let default_relays = self.load_default_relays().await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
         let (nip65_relays, should_publish_nip65) = self
@@ -611,19 +920,29 @@ impl Whitenoise {
 
         // Only publish relay lists that need publishing (when using defaults as fallback)
         if should_publish_nip65 {
-            self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                .await?;
+            self.publish_relay_list(
+                &nip65_relays,
+                RelayType::Nip65,
+                &nip65_relays,
+                signer.clone(),
+            )
+            .await?;
         }
         if should_publish_inbox {
-            self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                .await?;
+            self.publish_relay_list(
+                &inbox_relays,
+                RelayType::Inbox,
+                &nip65_relays,
+                signer.clone(),
+            )
+            .await?;
         }
         if should_publish_key_package {
             self.publish_relay_list(
                 &key_package_relays,
                 RelayType::KeyPackage,
                 &nip65_relays,
-                &keys,
+                signer.clone(),
             )
             .await?;
         }
@@ -707,17 +1026,12 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
         target_relays: &[Relay],
-        keys: &Keys,
+        signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.nostr
-            .publish_relay_list_with_signer(
-                &relays_urls,
-                relay_type,
-                &target_relays_urls,
-                keys.clone(),
-            )
+            .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, signer)
             .await?;
         Ok(())
     }
@@ -728,9 +1042,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let user = account.user(&self.database).await?;
         let relays = account.nip65_relays(self).await?;
 
@@ -769,9 +1081,7 @@ impl Whitenoise {
         } else {
             account.relays(relay_type, self).await?
         };
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let target_relays = if relay_type == RelayType::Nip65 {
             relays.clone()
         } else {
@@ -785,7 +1095,12 @@ impl Whitenoise {
             let target_relays_urls = Relay::urls(&target_relays);
 
             nostr
-                .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, keys)
+                .publish_relay_list_with_signer(
+                    &relays_urls,
+                    relay_type,
+                    &target_relays_urls,
+                    signer,
+                )
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts::background_publish_account_relay_list", "Successfully published relay list for account: {:?}", account_clone.pubkey);
@@ -801,9 +1116,7 @@ impl Whitenoise {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
         let relays = account.nip65_relays(self).await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
 
@@ -811,12 +1124,17 @@ impl Whitenoise {
             tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Background task: Publishing follow list for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
-            nostr
-                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, keys)
-                .await?;
-
-            tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Successfully published follow list for account: {:?}", account_clone.pubkey);
-            Ok::<(), WhitenoiseError>(())
+            match nostr
+                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
+                .await
+            {
+                Ok(_) => {
+                    tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Successfully published follow list for account: {:?}", account_clone.pubkey);
+                }
+                Err(e) => {
+                    tracing::error!(target: "whitenoise::accounts::background_publish_account_follow_list", "Failed to publish follow list for account {:?}: {}", account_clone.pubkey, e);
+                }
+            }
         });
         Ok(())
     }
@@ -882,9 +1200,7 @@ impl Whitenoise {
             ),
         }
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         self.nostr
             .setup_account_subscriptions_with_signer(
@@ -894,7 +1210,7 @@ impl Whitenoise {
                 &group_relays_urls,
                 &nostr_group_ids,
                 since,
-                keys,
+                signer,
             )
             .await?;
 
@@ -928,9 +1244,7 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         self.nostr
             .update_account_subscriptions_with_signer(
@@ -939,7 +1253,7 @@ impl Whitenoise {
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,
-                keys,
+                signer,
             )
             .await
             .map_err(WhitenoiseError::from)
@@ -984,6 +1298,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "insecure-local-signer")]
     async fn test_load_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
@@ -1002,6 +1317,20 @@ mod tests {
         // Store keys in secrets store (required for background fetch)
         whitenoise.secrets_store.store_private_key(&keys1).unwrap();
         whitenoise.secrets_store.store_private_key(&keys2).unwrap();
+        whitenoise
+            .secrets_store
+            .store_signer_kind(
+                &account1.pubkey,
+                &crate::whitenoise::signers::SignerKind::LocalInsecure,
+            )
+            .unwrap();
+        whitenoise
+            .secrets_store
+            .store_signer_kind(
+                &account2.pubkey,
+                &crate::whitenoise::signers::SignerKind::LocalInsecure,
+            )
+            .unwrap();
 
         // Load accounts from database
         let loaded_accounts = Account::all(&whitenoise.database).await.unwrap();
@@ -1364,12 +1693,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "insecure-local-signer")]
     async fn test_update_metadata() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_test_account(&whitenoise).await;
         account.save(&whitenoise.database).await.unwrap();
 
         whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .secrets_store
+            .store_signer_kind(
+                &account.pubkey,
+                &crate::whitenoise::signers::SignerKind::LocalInsecure,
+            )
+            .unwrap();
 
         let default_relays = whitenoise.load_default_relays().await.unwrap();
         whitenoise

@@ -31,6 +31,7 @@ pub mod messages;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
+pub mod signers;
 pub mod storage;
 pub mod users;
 pub mod utils;
@@ -140,6 +141,67 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    // ========================================================================
+    // Android Initialization
+    // ========================================================================
+
+    /// Initialize the Android JNI context for Amber signer support.
+    ///
+    /// This function **must** be called from your Android application's startup
+    /// (e.g., in `Application.onCreate()` or before any Nostr signing operations)
+    /// when running on Android and using Amber as a signer.
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe because it accepts raw JNI pointers. The caller must
+    /// ensure that:
+    /// - `env` is a valid JNI environment pointer
+    /// - `content_resolver` is a valid Android ContentResolver object
+    /// - The ContentResolver remains valid for the lifetime of the application
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The JNI environment from Android
+    /// * `content_resolver` - The Android ContentResolver object (from `context.getContentResolver()`)
+    ///
+    /// # Errors
+    ///
+    /// Returns `SignerError::JniError` if the JNI context cannot be created, or if
+    /// this function has already been called (context can only be set once).
+    ///
+    /// # Example (Kotlin)
+    ///
+    /// ```kotlin
+    /// // In your Application class or main Activity
+    /// override fun onCreate() {
+    ///     super.onCreate()
+    ///     Whitenoise.initAndroidContext(contentResolver)
+    /// }
+    /// ```
+    #[cfg(target_os = "android")]
+    pub unsafe fn init_android_context(
+        env: &mut jni::JNIEnv,
+        content_resolver: &jni::objects::JObject,
+    ) -> std::result::Result<(), signers::SignerError> {
+        // SAFETY: The caller guarantees env and content_resolver are valid JNI objects
+        let ctx = unsafe { signers::amber::AmberJniContext::new(env, content_resolver)? };
+        signers::android_context::set(ctx).map_err(|_| {
+            signers::SignerError::JniError("Android context already initialized".to_string())
+        })
+    }
+
+    /// Check if the Android context has been initialized.
+    ///
+    /// Returns `true` if `init_android_context` was called successfully.
+    #[cfg(target_os = "android")]
+    pub fn is_android_context_initialized() -> bool {
+        signers::android_context::get().is_some()
+    }
+
+    // ========================================================================
+    // Whitenoise Initialization
+    // ========================================================================
+
     /// Initializes the Whitenoise application with the provided configuration.
     ///
     /// This method sets up the necessary data and log directories, configures logging,
@@ -297,9 +359,7 @@ impl Whitenoise {
             return Ok(());
         };
 
-        let keys = whitenoise_ref
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+        let signer = whitenoise_ref.get_signer_for_account(&signer_account)?;
 
         // Compute shared since for global user subscriptions with 10s lookback buffer
         let since = Self::compute_global_since_timestamp(whitenoise_ref).await?;
@@ -309,7 +369,7 @@ impl Whitenoise {
             .setup_batched_relay_subscriptions_with_signer(
                 users_with_relays,
                 &default_relays,
-                keys,
+                signer,
                 since,
             )
             .await?;
@@ -525,6 +585,16 @@ impl Whitenoise {
         self.scheduler_handles.lock().await.len()
     }
 
+    /// Exports the account's private key as a bech32-encoded nsec string.
+    ///
+    /// **WARNING**: This method exports the raw private key. Only use this for backup
+    /// purposes and ensure the key is stored securely.
+    ///
+    /// This method is only available for accounts using `LocalInsecure` signer kind.
+    /// For accounts using external signers like Amber, the private key is not accessible.
+    ///
+    /// Only available when the `insecure-local-signer` feature is enabled.
+    #[cfg(feature = "insecure-local-signer")]
     pub async fn export_account_nsec(&self, account: &Account) -> Result<String> {
         Ok(self
             .secrets_store
@@ -622,16 +692,14 @@ impl Whitenoise {
             return Ok(());
         };
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+        let signer = self.get_signer_for_account(&signer_account)?;
 
         self.nostr
             .refresh_user_global_subscriptions_with_signer(
                 user.pubkey,
                 users_with_relays,
                 &default_relays,
-                keys,
+                signer,
             )
             .await?;
         Ok(())

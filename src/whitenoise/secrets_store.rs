@@ -3,12 +3,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "insecure-local-signer")]
 use base64::{Engine as _, engine::general_purpose};
+#[cfg(feature = "insecure-local-signer")]
 use keyring::Entry;
 use nostr_sdk::{Keys, PublicKey};
 use serde_json::{Value, json};
 use thiserror::Error;
+#[cfg(feature = "insecure-local-signer")]
 use uuid::Uuid;
+
+use super::signers::SignerKind;
 
 #[derive(Error, Debug)]
 pub enum SecretsStoreError {
@@ -35,8 +40,15 @@ pub enum SecretsStoreError {
 
     #[error("Key not found")]
     KeyNotFound,
+
+    #[error("Signer kind not found")]
+    SignerKindNotFound,
+
+    #[error("Feature not enabled: {0}")]
+    FeatureNotEnabled(String),
 }
 
+#[cfg(feature = "insecure-local-signer")]
 const SERVICE_NAME: &str = "whitenoise";
 
 pub struct SecretsStore {
@@ -50,6 +62,8 @@ impl SecretsStore {
         }
     }
 
+    /// Get a device-specific key for obfuscation (insecure)
+    #[cfg(feature = "insecure-local-signer")]
     fn get_device_key(&self) -> Vec<u8> {
         let uuid_file = self.data_dir.join("whitenoise_uuid");
 
@@ -74,6 +88,8 @@ impl SecretsStore {
         self.data_dir.join("whitenoise.json")
     }
 
+    /// XOR-based obfuscation (insecure - not encryption!)
+    #[cfg(feature = "insecure-local-signer")]
     fn obfuscate(&self, data: &str) -> String {
         let xored: Vec<u8> = data
             .as_bytes()
@@ -84,6 +100,8 @@ impl SecretsStore {
         general_purpose::STANDARD_NO_PAD.encode(xored)
     }
 
+    /// XOR-based deobfuscation (insecure - not encryption!)
+    #[cfg(feature = "insecure-local-signer")]
     fn deobfuscate(&self, data: &str) -> Result<String, SecretsStoreError> {
         let decoded = general_purpose::STANDARD_NO_PAD
             .decode(data)
@@ -113,6 +131,9 @@ impl SecretsStore {
 
     /// Stores the private key associated with the given Keys in the system's keyring.
     ///
+    /// **WARNING**: This method stores private keys locally, which is inherently insecure.
+    /// On Android, use Amber signer instead.
+    ///
     /// This function takes a reference to a `Keys` object and stores the private key
     /// in the system's keyring, using the public key as an identifier.
     ///
@@ -127,9 +148,11 @@ impl SecretsStore {
     /// # Errors
     ///
     /// This function will return an error if:
+    /// * The `insecure-local-signer` feature is not enabled
     /// * The Entry creation fails
     /// * Setting the password in the keyring fails
     /// * The secret key cannot be retrieved from the keypair
+    #[cfg(feature = "insecure-local-signer")]
     pub fn store_private_key(&self, keys: &Keys) -> Result<(), SecretsStoreError> {
         if cfg!(target_os = "android") || cfg!(test) {
             let mut secrets = self.read_secrets_file().unwrap_or(json!({}));
@@ -147,7 +170,21 @@ impl SecretsStore {
         Ok(())
     }
 
+    /// Stores the private key (stub when feature is disabled).
+    ///
+    /// This method is only available when the `insecure-local-signer` feature is enabled.
+    /// On Android, use Amber signer instead.
+    #[cfg(not(feature = "insecure-local-signer"))]
+    pub fn store_private_key(&self, _keys: &Keys) -> Result<(), SecretsStoreError> {
+        Err(SecretsStoreError::FeatureNotEnabled(
+            "insecure-local-signer".to_string(),
+        ))
+    }
+
     /// Retrieves the Nostr keys associated with a given public key from the system's keyring.
+    ///
+    /// **WARNING**: This method retrieves locally stored private keys, which is inherently insecure.
+    /// On Android, use Amber signer instead.
     ///
     /// This function looks up the private key stored in the system's keyring using the provided
     /// public key as an identifier, and then constructs a `Keys` object from the retrieved private key.
@@ -163,9 +200,11 @@ impl SecretsStore {
     /// # Errors
     ///
     /// This function will return an error if:
+    /// * The `insecure-local-signer` feature is not enabled
     /// * The Entry creation fails
     /// * Retrieving the password from the keyring fails
     /// * Parsing the private key into a `Keys` object fails
+    #[cfg(feature = "insecure-local-signer")]
     pub fn get_nostr_keys_for_pubkey(&self, pubkey: &PublicKey) -> Result<Keys, SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
         if cfg!(target_os = "android") || cfg!(test) {
@@ -185,6 +224,20 @@ impl SecretsStore {
         }
     }
 
+    /// Retrieves Nostr keys (stub when feature is disabled).
+    ///
+    /// This method is only available when the `insecure-local-signer` feature is enabled.
+    /// On Android, use Amber signer instead.
+    #[cfg(not(feature = "insecure-local-signer"))]
+    pub fn get_nostr_keys_for_pubkey(
+        &self,
+        _pubkey: &PublicKey,
+    ) -> Result<Keys, SecretsStoreError> {
+        Err(SecretsStoreError::FeatureNotEnabled(
+            "insecure-local-signer".to_string(),
+        ))
+    }
+
     /// Removes the private key associated with a given public key from the system's keyring.
     ///
     /// This function attempts to delete the credential entry for the specified public key
@@ -202,7 +255,9 @@ impl SecretsStore {
     /// # Errors
     ///
     /// This function will return an error if:
+    /// * The `insecure-local-signer` feature is not enabled
     /// * The Entry creation fails
+    #[cfg(feature = "insecure-local-signer")]
     pub fn remove_private_key_for_pubkey(
         &self,
         pubkey: &PublicKey,
@@ -222,6 +277,71 @@ impl SecretsStore {
         }
         Ok(())
     }
+
+    /// Removes private key (stub when feature is disabled).
+    #[cfg(not(feature = "insecure-local-signer"))]
+    pub fn remove_private_key_for_pubkey(
+        &self,
+        _pubkey: &PublicKey,
+    ) -> Result<(), SecretsStoreError> {
+        // No-op when feature is disabled - there's nothing to remove
+        Ok(())
+    }
+
+    // ========================================================================
+    // Signer Kind Storage
+    // ========================================================================
+
+    /// Stores the signer kind for an account.
+    ///
+    /// This records which type of signer (Amber, LocalInsecure, Ephemeral) is being
+    /// used for a given account, allowing proper signer restoration on app restart.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key of the account
+    /// * `signer_kind` - The type of signer being used
+    pub fn store_signer_kind(
+        &self,
+        pubkey: &PublicKey,
+        signer_kind: &SignerKind,
+    ) -> Result<(), SecretsStoreError> {
+        let mut secrets = self.read_secrets_file().unwrap_or(json!({}));
+        let key = format!("{}_signer_kind", pubkey.to_hex());
+        secrets[key] = serde_json::to_value(signer_kind)?;
+        self.write_secrets_file(&secrets)
+    }
+
+    /// Retrieves the signer kind for an account.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key of the account
+    ///
+    /// # Returns
+    ///
+    /// The `SignerKind` if found, or `SignerKindNotFound` error if not stored.
+    pub fn get_signer_kind(&self, pubkey: &PublicKey) -> Result<SignerKind, SecretsStoreError> {
+        let secrets = self.read_secrets_file()?;
+        let key = format!("{}_signer_kind", pubkey.to_hex());
+
+        secrets
+            .get(&key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .ok_or(SecretsStoreError::SignerKindNotFound)
+    }
+
+    /// Removes the signer kind for an account.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The public key of the account
+    pub fn remove_signer_kind(&self, pubkey: &PublicKey) -> Result<(), SecretsStoreError> {
+        let mut secrets = self.read_secrets_file()?;
+        let key = format!("{}_signer_kind", pubkey.to_hex());
+        secrets.as_object_mut().map(|obj| obj.remove(&key));
+        self.write_secrets_file(&secrets)
+    }
 }
 
 #[cfg(test)]
@@ -235,7 +355,85 @@ mod tests {
         (secrets_store, data_temp)
     }
 
+    #[test]
+    fn test_secrets_store_creation() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let secrets_store = SecretsStore::new(temp_dir.path());
+
+        // Test that the file path is constructed correctly
+        assert_eq!(
+            secrets_store.get_file_path(),
+            temp_dir.path().join("whitenoise.json")
+        );
+    }
+
+    // ========================================================================
+    // Signer Kind Tests (always available)
+    // ========================================================================
+
+    #[test]
+    fn test_store_and_retrieve_signer_kind_ephemeral() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let signer_kind = SignerKind::Ephemeral;
+
+        secrets_store
+            .store_signer_kind(&pubkey, &signer_kind)
+            .unwrap();
+        let retrieved = secrets_store.get_signer_kind(&pubkey).unwrap();
+
+        assert_eq!(signer_kind, retrieved);
+    }
+
+    #[test]
+    #[cfg(feature = "insecure-local-signer")]
+    fn test_store_and_retrieve_signer_kind_local() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let signer_kind = SignerKind::LocalInsecure;
+
+        secrets_store
+            .store_signer_kind(&pubkey, &signer_kind)
+            .unwrap();
+        let retrieved = secrets_store.get_signer_kind(&pubkey).unwrap();
+
+        assert_eq!(signer_kind, retrieved);
+    }
+
+    #[test]
+    fn test_get_nonexistent_signer_kind() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let result = secrets_store.get_signer_kind(&pubkey);
+        assert!(matches!(result, Err(SecretsStoreError::SignerKindNotFound)));
+    }
+
+    #[test]
+    fn test_remove_signer_kind() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let signer_kind = SignerKind::Ephemeral;
+
+        secrets_store
+            .store_signer_kind(&pubkey, &signer_kind)
+            .unwrap();
+        secrets_store.remove_signer_kind(&pubkey).unwrap();
+
+        let result = secrets_store.get_signer_kind(&pubkey);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Private Key Tests (require insecure-local-signer feature)
+    // ========================================================================
+
     #[tokio::test]
+    #[cfg(feature = "insecure-local-signer")]
     async fn test_store_and_retrieve_private_key() -> Result<(), SecretsStoreError> {
         let (secrets_store, _temp_dir) = create_test_secrets_store();
         let keys = Keys::generate();
@@ -257,6 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "insecure-local-signer")]
     async fn test_remove_private_key() -> Result<(), SecretsStoreError> {
         let (secrets_store, _temp_dir) = create_test_secrets_store();
         let keys = Keys::generate();
@@ -277,6 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "insecure-local-signer")]
     async fn test_get_nonexistent_key() {
         let (secrets_store, _temp_dir) = create_test_secrets_store();
         let keys = Keys::generate();
@@ -286,20 +486,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_secrets_store_creation() {
-        let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let secrets_store = SecretsStore::new(temp_dir.path());
-
-        // Test that the file path is constructed correctly
-        assert_eq!(
-            secrets_store.get_file_path(),
-            temp_dir.path().join("whitenoise.json")
-        );
-    }
-
     #[tokio::test]
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "insecure-local-signer"))]
     async fn test_android_store_and_retrieve_private_key() -> Result<(), SecretsStoreError> {
         let (secrets_store, _temp_dir) = create_test_secrets_store();
         let keys = Keys::generate();

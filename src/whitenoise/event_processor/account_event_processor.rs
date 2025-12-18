@@ -343,11 +343,9 @@ impl Whitenoise {
         event: &Event,
         account: &Account,
     ) -> Result<Option<Timestamp>> {
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
-        match extract_rumor(&keys, event).await {
+        match extract_rumor(&signer, event).await {
             Ok(unwrapped) => Ok(Some(unwrapped.rumor.created_at)),
             Err(_) => Ok(None), // Don't advance on extraction failure
         }

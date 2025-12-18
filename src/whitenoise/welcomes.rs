@@ -75,7 +75,7 @@ impl Whitenoise {
             WhitenoiseError::InvalidEvent("Couldn't parse welcome event ID".to_string())
         })?;
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let keys = self.secrets_store.get_nostr_keys_for_pubkey(pubkey)?;
+        let signer = self.get_signer_for_account(&account)?;
 
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
 
@@ -124,7 +124,7 @@ impl Whitenoise {
                 *pubkey,
                 &group_relays_urls,
                 &group_ids,
-                keys,
+                signer,
             )
             .await?;
 

@@ -14,11 +14,9 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
-        let unwrapped = extract_rumor(&keys, &event).await.map_err(|e| {
+        let unwrapped = extract_rumor(&signer, &event).await.map_err(|e| {
             WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
         })?;
 
@@ -135,11 +133,8 @@ mod tests {
             .expect("welcome rumor exists")
             .clone();
 
-        // Use the creator's real keys as signer to build the giftwrap
-        let creator_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&creator_account.pubkey)
-            .unwrap();
+        // Use the creator's signer to build the giftwrap
+        let creator_signer = whitenoise.get_signer_for_account(creator_account).unwrap();
 
         EventBuilder::gift_wrap(&creator_signer, &member_pubkey, welcome_rumor, vec![])
             .await

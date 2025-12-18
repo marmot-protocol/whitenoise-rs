@@ -99,9 +99,17 @@ mockito = "1.2"
 [features]
 default = []
 # Feature flag for integration tests - enables IDE support without including in production
-integration-tests = []
+# Also enables insecure-local-signer for testing account creation and login
+integration-tests = ["insecure-local-signer"]
 # Feature flag for performance benchmarks - depends on integration-tests to reuse infrastructure
 benchmark-tests = ["integration-tests", "indicatif"]
+# Feature flag for local key storage - INSECURE, disabled by default
+# On Android, use Amber signer instead. Enable only for development/testing.
+insecure-local-signer = []
+
+# Android-specific dependencies for Amber signer (NIP-55)
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
 
 [[bin]]
 name = "integration_test"

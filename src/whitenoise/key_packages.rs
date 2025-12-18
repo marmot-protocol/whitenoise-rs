@@ -3,6 +3,7 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::Relay;
 use nostr_sdk::prelude::*;
+use std::sync::Arc;
 use std::time::Duration;
 
 impl Whitenoise {
@@ -41,9 +42,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let (encoded_key_package, tags) = self.encoded_key_package(account, relays).await?;
         let relays_urls = Relay::urls(relays);
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let result = self
             .nostr
             .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
@@ -78,9 +77,7 @@ impl Whitenoise {
         while let Some(event) = key_package_stream.next().await {
             key_package_events.push(event);
         }
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
@@ -308,10 +305,8 @@ impl Whitenoise {
     async fn prepare_key_package_deletion_context(
         &self,
         account: &Account,
-    ) -> Result<(Keys, Vec<RelayUrl>)> {
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+    ) -> Result<(Arc<dyn NostrSigner>, Vec<RelayUrl>)> {
+        let signer = self.get_signer_for_account(account)?;
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
@@ -368,7 +363,7 @@ impl Whitenoise {
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: Keys,
+        signer: Arc<dyn NostrSigner>,
         context: &str,
     ) -> Result<()> {
         match self

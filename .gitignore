@@ -4,13 +4,6 @@
 !.env.example
 /dev/data
 
-
-# AI stuff
-.repomix-*.txt
-vibe-tools.config.json
-.cursor/rules/vibe-tools.mdc
-.goose/memory
-
 # Docker and Rust
 /target
 

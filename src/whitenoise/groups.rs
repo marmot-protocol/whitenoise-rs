@@ -125,9 +125,7 @@ impl Whitenoise {
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&creator_account.pubkey)?;
+        let signer = self.get_signer_for_account(creator_account)?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut members = Vec::new();
@@ -245,7 +243,7 @@ impl Whitenoise {
                     &[Tag::expiration(one_month_future)],
                     creator_account.pubkey,
                     &Relay::urls(&relays_to_use),
-                    keys.clone(),
+                    signer.clone(),
                 )
                 .await
                 .map_err(WhitenoiseError::from)?;
@@ -262,7 +260,7 @@ impl Whitenoise {
                 creator_account.pubkey,
                 &Relay::urls(&relays),
                 &group_ids,
-                keys,
+                signer,
             )
             .await
             .map_err(WhitenoiseError::from)?;
@@ -357,9 +355,7 @@ impl Whitenoise {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let mut key_package_events: Vec<Event> = Vec::new();
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let mut users = Vec::new();
 
         // Fetch key packages for all members
@@ -467,7 +463,7 @@ impl Whitenoise {
                     &[Tag::expiration(one_month_future)],
                     account.pubkey,
                     &relay_urls,
-                    keys.clone(),
+                    signer.clone(),
                 )
                 .await
                 .map_err(WhitenoiseError::from)?;
