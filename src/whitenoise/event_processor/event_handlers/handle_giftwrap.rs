@@ -14,13 +14,13 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
 
-        let unwrapped = extract_rumor(&keys, &event).await.map_err(|e| {
-            WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
-        })?;
+        let unwrapped = crate::whitenoise::utils::extract_rumor_with_signer(&signer, &event)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
+            })?;
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {

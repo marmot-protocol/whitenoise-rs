@@ -70,6 +70,25 @@ impl Account {
         Ok((account, keys))
     }
 
+    pub(crate) async fn new_from_pubkey(
+        whitenoise: &Whitenoise,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (user, _created) =
+            User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
+
+        let account = Account {
+            id: None,
+            user_id: user.id.unwrap(),
+            pubkey,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        Ok(account)
+    }
+
     /// Convert last_synced_at to a Timestamp applying a lookback buffer.
     /// Clamps future timestamps to now to avoid empty subscriptions.
     /// Returns None if the account has never synced.
@@ -242,9 +261,7 @@ impl Account {
         whitenoise: &Whitenoise,
     ) -> Result<String> {
         let client = BlossomClient::new(server);
-        let keys = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&self.pubkey)?;
+        let signer = whitenoise.get_signer_for_account(self).await?;
         let data = tokio::fs::read(file_path).await?;
 
         let descriptor = client
@@ -252,7 +269,7 @@ impl Account {
                 data,
                 Some(image_type.mime_type().to_string()),
                 None,
-                Some(&keys),
+                Some(&signer),
             )
             .await
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
@@ -338,6 +355,83 @@ impl Whitenoise {
         tracing::debug!(target: "whitenoise::login", "Account persisted and activated");
 
         tracing::debug!(target: "whitenoise::login", "Successfully logged in: {}", account.pubkey.to_hex());
+        Ok(account)
+    }
+
+    /// Login or create account using NIP-55 signer
+    ///
+    /// This method uses the configured NIP-55 callback to query the external signer for
+    /// a public key, checks if an account exists for that key, and logs in or creates
+    /// the account accordingly.
+    pub async fn login_with_nip55(&self) -> Result<Account> {
+        let callback = {
+            let cb = self.nip55_flutter_callback.read().await;
+            cb.as_ref()
+                .ok_or_else(|| {
+                    WhitenoiseError::InvalidInput(
+                        "NIP-55 Flutter callback not set. Call set_nip55_flutter_callback first."
+                            .to_string(),
+                    )
+                })?
+                .clone()
+        };
+
+        // Create temporary signer to get public key
+        let signer = crate::whitenoise::nip55_signer::Nip55Signer::new(callback);
+
+        // Get public key using NostrSigner trait
+        use nostr_sdk::NostrSigner;
+        let pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(WhitenoiseError::Signer)?;
+
+        tracing::info!(
+            target: "whitenoise::login_with_nip55",
+            "Got public key from NIP-55 signer: {}",
+            pubkey.to_hex()
+        );
+
+        // Check if account already exists or create new one
+        let account = if let Ok(account) = self.find_account_by_pubkey(&pubkey).await {
+            tracing::info!(
+                target: "whitenoise::login_with_nip55",
+                "Found existing account for pubkey: {}",
+                pubkey.to_hex()
+            );
+            account
+        } else {
+            tracing::info!(
+                target: "whitenoise::login_with_nip55",
+                "Creating new account for pubkey: {}",
+                pubkey.to_hex()
+            );
+            // Create new account structure
+            let account = Account::new_from_pubkey(self, pubkey).await?;
+            // Persist it
+            self.persist_account(&account).await?
+        };
+
+        // Enable NIP-55 signer for this account
+        self.enable_nip55_signer(&account).await?;
+
+        // Setup relays for the account
+        let mut account_clone = account.clone();
+        let (nip65_relays, inbox_relays, key_package_relays) = self
+            .setup_relays_for_existing_account(&mut account_clone)
+            .await?;
+
+        let user = account.user(&self.database).await?;
+        self.activate_account(
+            &account,
+            &user,
+            false,
+            &nip65_relays,
+            &inbox_relays,
+            &key_package_relays,
+        )
+        .await?;
+
         Ok(account)
     }
 
@@ -577,9 +671,7 @@ impl Whitenoise {
         account: &mut Account,
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
         let default_relays = self.load_default_relays().await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
 
         // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
         let (nip65_relays, should_publish_nip65) = self
@@ -611,19 +703,29 @@ impl Whitenoise {
 
         // Only publish relay lists that need publishing (when using defaults as fallback)
         if should_publish_nip65 {
-            self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                .await?;
+            self.publish_relay_list(
+                &nip65_relays,
+                RelayType::Nip65,
+                &nip65_relays,
+                signer.clone(),
+            )
+            .await?;
         }
         if should_publish_inbox {
-            self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                .await?;
+            self.publish_relay_list(
+                &inbox_relays,
+                RelayType::Inbox,
+                &nip65_relays,
+                signer.clone(),
+            )
+            .await?;
         }
         if should_publish_key_package {
             self.publish_relay_list(
                 &key_package_relays,
                 RelayType::KeyPackage,
                 &nip65_relays,
-                &keys,
+                signer.clone(),
             )
             .await?;
         }
@@ -707,17 +809,12 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
         target_relays: &[Relay],
-        keys: &Keys,
+        signer: impl NostrSigner + 'static,
     ) -> Result<()> {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.nostr
-            .publish_relay_list_with_signer(
-                &relays_urls,
-                relay_type,
-                &target_relays_urls,
-                keys.clone(),
-            )
+            .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, signer)
             .await?;
         Ok(())
     }
@@ -728,9 +825,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
         let user = account.user(&self.database).await?;
         let relays = account.nip65_relays(self).await?;
 
@@ -769,9 +864,7 @@ impl Whitenoise {
         } else {
             account.relays(relay_type, self).await?
         };
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
         let target_relays = if relay_type == RelayType::Nip65 {
             relays.clone()
         } else {
@@ -785,7 +878,12 @@ impl Whitenoise {
             let target_relays_urls = Relay::urls(&target_relays);
 
             nostr
-                .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, keys)
+                .publish_relay_list_with_signer(
+                    &relays_urls,
+                    relay_type,
+                    &target_relays_urls,
+                    signer,
+                )
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts::background_publish_account_relay_list", "Successfully published relay list for account: {:?}", account_clone.pubkey);
@@ -801,9 +899,7 @@ impl Whitenoise {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
         let relays = account.nip65_relays(self).await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
         let follows = account.follows(&self.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
 
@@ -812,7 +908,7 @@ impl Whitenoise {
 
             let relays_urls = Relay::urls(&relays);
             nostr
-                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, keys)
+                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Successfully published follow list for account: {:?}", account_clone.pubkey);
@@ -882,9 +978,7 @@ impl Whitenoise {
             ),
         }
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
 
         self.nostr
             .setup_account_subscriptions_with_signer(
@@ -894,7 +988,7 @@ impl Whitenoise {
                 &group_relays_urls,
                 &nostr_group_ids,
                 since,
-                keys,
+                signer,
             )
             .await?;
 
@@ -928,9 +1022,7 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
 
         self.nostr
             .update_account_subscriptions_with_signer(
@@ -939,7 +1031,7 @@ impl Whitenoise {
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,
-                keys,
+                signer,
             )
             .await
             .map_err(WhitenoiseError::from)

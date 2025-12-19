@@ -117,10 +117,10 @@ impl Nip55Signer {
         let response_json = self
             .callback
             .call_nip55_method(method, &params_json)
-            .map_err(|e| Nip55SignerError::FlutterCallback(e))?;
+            .map_err(Nip55SignerError::FlutterCallback)?;
 
         let response: Nip55Response =
-            serde_json::from_str(&response_json).map_err(|e| Nip55SignerError::Serialization(e))?;
+            serde_json::from_str(&response_json).map_err(Nip55SignerError::Serialization)?;
 
         // Check if the request was rejected
         if response.rejected.unwrap_or(false) {
@@ -156,9 +156,9 @@ impl Nip55Signer {
         let result = self
             .call_method("get_public_key", vec![])
             .await
-            .map_err(|e| SignerError::backend(e))?;
+            .map_err(SignerError::backend)?;
 
-        let pubkey = PublicKey::from_hex(&result).map_err(|e| SignerError::backend(e))?;
+        let pubkey = PublicKey::from_hex(&result).map_err(SignerError::backend)?;
 
         // Cache the pubkey
         {
@@ -195,11 +195,11 @@ impl NostrSigner for Nip55Signer {
             let current_user = this
                 .get_current_user()
                 .await
-                .map_err(|e| SignerError::backend(e))?;
+                .map_err(SignerError::backend)?;
 
             // Serialize the unsigned event
             let event_json =
-                serde_json::to_string(&unsigned_event).map_err(|e| SignerError::backend(e))?;
+                serde_json::to_string(&unsigned_event).map_err(SignerError::backend)?;
 
             // Call Flutter to sign the event
             let params = vec![json!(event_json), json!(current_user.to_hex())];
@@ -207,11 +207,10 @@ impl NostrSigner for Nip55Signer {
             let result = this
                 .call_method("sign_event", params)
                 .await
-                .map_err(|e| SignerError::backend(e))?;
+                .map_err(SignerError::backend)?;
 
             // Parse the signed event
-            let event: Event =
-                serde_json::from_str(&result).map_err(|e| SignerError::backend(e))?;
+            let event: Event = serde_json::from_str(&result).map_err(SignerError::backend)?;
 
             Ok(event)
         })

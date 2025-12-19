@@ -76,9 +76,7 @@ impl Whitenoise {
         while let Some(event) = key_package_stream.next().await {
             key_package_events.push(event);
         }
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account).await?;
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
@@ -244,10 +242,11 @@ impl Whitenoise {
     async fn prepare_key_package_deletion_context(
         &self,
         account: &Account,
-    ) -> Result<(Keys, Vec<RelayUrl>)> {
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+    ) -> Result<(
+        crate::whitenoise::nip55_signer::WhitenoiseSigner,
+        Vec<RelayUrl>,
+    )> {
+        let signer = self.get_signer_for_account(account).await?;
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
@@ -304,7 +303,7 @@ impl Whitenoise {
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: Keys,
+        signer: impl NostrSigner + 'static,
         context: &str,
     ) -> Result<()> {
         match self
@@ -347,7 +346,7 @@ impl Whitenoise {
         account: &Account,
         initial_count: usize,
         relay_urls: &[RelayUrl],
-        signer: Keys,
+        signer: impl NostrSigner + Clone + 'static,
     ) -> Result<usize> {
         tokio::time::sleep(Duration::from_millis(500)).await;
 

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use nostr_sdk::{PublicKey, Timestamp, ToBech32};
+use nostr_sdk::{JsonUtil, PublicKey, Timestamp, ToBech32};
 
 use crate::whitenoise::{Whitenoise, error::WhitenoiseError};
 
@@ -50,6 +50,74 @@ impl Whitenoise {
             Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         }
     }
+}
+
+/// Extract rumor from a Gift Wrap event using a signer.
+/// This is a NIP-55 compatible version of `nostr_sdk::nips::nip59::extract_rumor`.
+pub async fn extract_rumor_with_signer<S>(
+    signer: &S,
+    gift_wrap: &nostr_sdk::Event,
+) -> Result<nostr_sdk::nips::nip59::UnwrappedGift, WhitenoiseError>
+where
+    S: nostr_sdk::NostrSigner,
+{
+    // 1. Check if event is a gift wrap
+    if gift_wrap.kind != nostr_sdk::Kind::GiftWrap {
+        return Err(WhitenoiseError::InvalidEvent(
+            "Event is not a gift wrap".to_string(),
+        ));
+    }
+
+    // 2. Decrypt the outer gift wrap (content is encrypted seal)
+    // The sender is the ephemeral key (gift_wrap.pubkey)
+    // We decrypt using our private key (via signer)
+    // NIP-44 v2 decryption: nip44_decrypt(public_key, ciphertext)
+    let seal_json = signer
+        .nip44_decrypt(&gift_wrap.pubkey, &gift_wrap.content)
+        .await
+        .map_err(WhitenoiseError::Signer)?;
+
+    // 3. Parse the seal event
+    let seal = nostr_sdk::Event::from_json(&seal_json)
+        .map_err(|e| WhitenoiseError::InvalidEvent(format!("Failed to parse seal: {}", e)))?;
+
+    if seal.kind != nostr_sdk::Kind::Seal {
+        return Err(WhitenoiseError::InvalidEvent(
+            "Inner event is not a seal".to_string(),
+        ));
+    }
+
+    // 4. Decrypt the inner seal (content is encrypted rumor)
+    // The sender of the seal is the actual sender
+    let rumor_json = signer
+        .nip44_decrypt(&seal.pubkey, &seal.content)
+        .await
+        .map_err(WhitenoiseError::Signer)?;
+
+    // 5. Parse the rumor event
+    let rumor = nostr_sdk::UnsignedEvent::from_json(&rumor_json)
+        .map_err(|e| WhitenoiseError::InvalidEvent(format!("Failed to parse rumor: {}", e)))?;
+
+    // 6. Return UnwrappedGift
+    // Note: We construct UnwrappedGift manually if fields are public,
+    // otherwise we might need to return a custom struct or just the rumor.
+    // UnwrappedGift { rumor, sender: seal.pubkey }
+    // Checking if UnwrappedGift has public fields or constructor.
+    // If not, we return a custom struct or tuple.
+    // Assuming for now we can't construct UnwrappedGift if fields are private.
+    // Let's verify usage: usages access .rumor.
+    // So I can return a struct with .rumor and .sender.
+
+    // Actually, looking at usages, they just access .rumor.
+    // And `handle_giftwrap` expects `UnwrappedGift` or similar structure.
+    // I'll define a local struct or return a tuple/custom type if UnwrappedGift is not constructible.
+    // But since nostr_sdk 0.29+ usually has UnwrappedGift, let's try to use it.
+    // If fields are private, I will define a helper struct `ExtractedRumor`.
+
+    Ok(nostr_sdk::nips::nip59::UnwrappedGift {
+        rumor,
+        sender: seal.pubkey,
+    })
 }
 
 /// Converts a Nostr timestamp to a DateTime<Utc> with proper error handling.

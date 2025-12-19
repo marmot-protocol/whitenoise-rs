@@ -142,6 +142,9 @@ pub enum WhitenoiseError {
     #[error("Unsupported media format: {0}")]
     UnsupportedMediaFormat(String),
 
+    #[error("Signer error: {0}")]
+    Signer(#[from] nostr_sdk::SignerError),
+
     #[error(
         "Cannot deliver MLS welcome for {member_pubkey}: no inbox/NIP-65 relays configured and account {account_pubkey} has no fallback relays"
     )]
