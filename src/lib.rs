@@ -29,6 +29,7 @@ pub use whitenoise::users::{User, UserSyncMode};
 pub use whitenoise::app_settings::{AppSettings, ThemeMode};
 
 // Groups and relays
+pub use whitenoise::accounts_groups::AccountGroup;
 pub use whitenoise::group_information::{GroupInformation, GroupType};
 pub use whitenoise::relays::{Relay, RelayType};
 
