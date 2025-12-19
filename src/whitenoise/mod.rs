@@ -23,6 +23,8 @@ pub mod media_files;
 pub mod message_aggregator;
 pub mod messages;
 pub mod nip55_signer;
+#[cfg(test)]
+mod nip55_tests;
 pub mod relays;
 pub mod secrets_store;
 pub mod storage;
