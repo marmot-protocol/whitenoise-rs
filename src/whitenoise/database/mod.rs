@@ -12,6 +12,7 @@ use sqlx::{
 use thiserror::Error;
 
 pub mod accounts;
+pub mod accounts_groups;
 pub mod aggregated_messages;
 pub mod app_settings;
 pub mod group_information;

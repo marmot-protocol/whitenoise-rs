@@ -13,6 +13,7 @@ use tokio::sync::{
 use tokio::task::JoinHandle;
 
 pub mod accounts;
+pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
 pub mod chat_list;

@@ -43,10 +43,8 @@ impl MessageStreamingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Member needs to accept the group invite before they can send messages
-        AcceptGroupInviteTestCase::new("stream_member")
-            .execute(&mut self.context)
-            .await?;
+        // Note: MLS membership is auto-finalized when welcome is received,
+        // so members can participate immediately without explicit accept
 
         Ok(())
     }

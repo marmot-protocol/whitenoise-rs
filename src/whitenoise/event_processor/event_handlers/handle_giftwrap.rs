@@ -1,16 +1,23 @@
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
+use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
+    accounts_groups::AccountGroup,
     error::{Result, WhitenoiseError},
+    group_information::GroupInformation,
+    relays::Relay,
 };
 
 impl Whitenoise {
     pub async fn handle_giftwrap(&self, account: &Account, event: Event) -> Result<()> {
-        tracing::info!(
+        tracing::debug!(
             target: "whitenoise::event_handlers::handle_giftwrap",
-            "Giftwrap received for account: {} - processing not yet implemented",
+            "Giftwrap received for account: {}",
             account.pubkey.to_hex()
         );
 
@@ -45,21 +52,25 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Process the welcome message - lock scope is minimal
-        let group_id = {
+        // Critical synchronous section: process and auto-accept MLS welcome
+        // This must complete for MLS state consistency
+        let (group_id, group_name) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+
             let welcome = mdk
                 .process_welcome(&event.id, &rumor)
                 .map_err(WhitenoiseError::MdkCoreError)?;
             tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
-            welcome.mls_group_id
-        }; // mdk lock released here
 
-        // After processing welcome, proactively cache the group image if it has one
-        // This ensures the image is ready when the UI displays the group
-        // Spawn as background task to avoid blocking event processing
-        Whitenoise::background_sync_group_image_cache_if_needed(account, &group_id);
+            // Auto-accept the welcome to finalize MLS membership
+            mdk.accept_welcome(&welcome)
+                .map_err(WhitenoiseError::MdkCoreError)?;
+            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
 
+            (welcome.mls_group_id, welcome.group_name)
+        };
+
+        // Extract key package event ID for rotation
         let key_package_event_id: Option<EventId> = rumor
             .tags
             .iter()
@@ -69,27 +80,277 @@ impl Whitenoise {
             .and_then(|tag| tag.content())
             .and_then(|content| EventId::parse(content).ok());
 
-        if let Some(key_package_event_id) = key_package_event_id {
-            let deleted = self
-                .delete_key_package_for_account(
-                    account,
-                    &key_package_event_id,
-                    false, // For now we don't want to delete the key packages from MLS storage
-                )
-                .await?;
+        let data_dir = self.config.data_dir.clone();
 
-            if deleted {
-                tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Deleted used key package from relays");
-                self.publish_key_package_for_account(account).await?;
-                tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Published new key package");
-            } else {
-                tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Key package already deleted, skipping publish");
+        // Spawn background task for remaining operations (DB writes, network calls)
+        // All operations are idempotent and failures are logged but don't stop other operations
+        tokio::spawn(Self::background_finalize_welcome(
+            account.clone(),
+            group_id,
+            group_name,
+            key_package_event_id,
+            data_dir,
+        ));
+
+        Ok(())
+    }
+
+    /// Background task wrapper that gets Whitenoise instance and delegates to core logic.
+    /// This thin wrapper exists because tokio::spawn requires 'static lifetime.
+    async fn background_finalize_welcome(
+        account: Account,
+        group_id: GroupId,
+        group_name: String,
+        key_package_event_id: Option<EventId>,
+        data_dir: PathBuf,
+    ) {
+        let Ok(whitenoise) = Whitenoise::get_instance() else {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to get Whitenoise instance"
+            );
+            return;
+        };
+
+        Self::finalize_welcome_with_instance(
+            whitenoise,
+            &account,
+            &group_id,
+            &group_name,
+            key_package_event_id,
+            &data_dir,
+        )
+        .await;
+    }
+
+    /// Core welcome finalization logic. Testable because it takes Whitenoise as a parameter.
+    /// Handles DB writes, network calls, and other non-critical operations.
+    /// All operations are idempotent and failures are logged but don't stop other operations.
+    pub(crate) async fn finalize_welcome_with_instance(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+        group_name: &str,
+        key_package_event_id: Option<EventId>,
+        data_dir: &std::path::Path,
+    ) {
+        // Get keys early - needed for subscriptions
+        let keys = match whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+        {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to get keys for account {}: {}",
+                    account.pubkey.to_hex(),
+                    e
+                );
+                return;
             }
+        };
+
+        // Run independent operations concurrently
+        let (
+            account_group_result,
+            group_info_result,
+            subscription_result,
+            key_rotation_result,
+            image_sync_result,
+        ) = tokio::join!(
+            Self::create_account_group(whitenoise, account, group_id),
+            Self::create_group_info(whitenoise, group_id, group_name),
+            Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
+            Self::rotate_key_package(whitenoise, account, key_package_event_id),
+            Self::sync_group_image(whitenoise, account, group_id),
+        );
+
+        // Log any errors (operations are independent, so we log all failures)
+        if let Err(e) = account_group_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to create AccountGroup for account {} and group {}: {}",
+                account.pubkey.to_hex(),
+                hex::encode(group_id.as_slice()),
+                e
+            );
+        }
+
+        if let Err(e) = group_info_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to create GroupInformation for group {}: {}",
+                hex::encode(group_id.as_slice()),
+                e
+            );
+        }
+
+        if let Err(e) = subscription_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to setup subscriptions for account {}: {}",
+                account.pubkey.to_hex(),
+                e
+            );
+        }
+
+        if let Err(e) = key_rotation_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to rotate key package for account {}: {}",
+                account.pubkey.to_hex(),
+                e
+            );
+        }
+
+        if let Err(e) = image_sync_result {
+            tracing::warn!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to sync group image cache: {}",
+                e
+            );
+        }
+
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "Completed post-welcome processing for account {} and group {}",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice())
+        );
+    }
+
+    /// Create AccountGroup record for the welcome
+    async fn create_account_group(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let (ag, created) =
+            AccountGroup::get_or_create(whitenoise, &account.pubkey, group_id).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice()),
+            created,
+            ag.user_confirmation
+        );
+        Ok(())
+    }
+
+    /// Create GroupInformation for the welcome
+    async fn create_group_info(
+        whitenoise: &Whitenoise,
+        group_id: &GroupId,
+        group_name: &str,
+    ) -> Result<()> {
+        GroupInformation::create_for_group(whitenoise, group_id, None, group_name).await?;
+        Ok(())
+    }
+
+    /// Set up Nostr subscriptions for group messages
+    async fn setup_group_subscriptions(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        data_dir: &std::path::Path,
+        keys: Keys,
+    ) -> Result<()> {
+        let (group_ids, group_relays) =
+            Self::get_group_subscription_info(data_dir, &account.pubkey)?;
+
+        // Create relay records (idempotent)
+        for relay in &group_relays {
+            if let Err(e) = Relay::find_or_create_by_url(relay, &whitenoise.database).await {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to create relay record for {}: {}",
+                    relay,
+                    e
+                );
+            }
+        }
+
+        whitenoise
+            .nostr
+            .setup_group_messages_subscriptions_with_signer(
+                account.pubkey,
+                &group_relays,
+                &group_ids,
+                keys,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Handle key package rotation after welcome
+    async fn rotate_key_package(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        key_package_event_id: Option<EventId>,
+    ) -> Result<()> {
+        let Some(kp_event_id) = key_package_event_id else {
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "No key package event id found in welcome event"
+            );
+            return Ok(());
+        };
+
+        if whitenoise
+            .delete_key_package_for_account(account, &kp_event_id, false)
+            .await?
+        {
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Deleted used key package from relays"
+            );
+            whitenoise.publish_key_package_for_account(account).await?;
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Published new key package"
+            );
         } else {
-            tracing::warn!(target: "whitenoise::event_processor::process_welcome", "No key package event id found in welcome event");
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Key package already deleted, skipping publish"
+            );
         }
 
         Ok(())
+    }
+
+    /// Sync group image cache if needed
+    async fn sync_group_image(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        whitenoise
+            .sync_group_image_cache_if_needed(account, group_id)
+            .await
+    }
+
+    /// Helper to get group subscription info (group IDs and relay URLs) for an account.
+    fn get_group_subscription_info(
+        data_dir: &std::path::Path,
+        pubkey: &PublicKey,
+    ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
+        let mdk = Account::create_mdk(*pubkey, data_dir)?;
+        let groups = mdk.get_groups()?;
+        let mut group_relays_set = BTreeSet::new();
+        let group_ids = groups
+            .iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect::<Vec<_>>();
+
+        for group in &groups {
+            let relays = mdk.get_relays(&group.mls_group_id)?;
+            group_relays_set.extend(relays);
+        }
+
+        Ok((group_ids, group_relays_set.into_iter().collect()))
     }
 }
 
@@ -189,5 +450,117 @@ mod tests {
 
         let result = whitenoise.handle_giftwrap(&account, giftwrap_event).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_group_subscription_info_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // New account has no groups
+        let result =
+            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey);
+        assert!(result.is_ok());
+
+        let (group_ids, relays) = result.unwrap();
+        assert!(group_ids.is_empty());
+        assert!(relays.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_group_subscription_info_with_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create creator and member accounts
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        // Create a group
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Creator should now have one group with relays
+        let result = Whitenoise::get_group_subscription_info(
+            &whitenoise.config.data_dir,
+            &creator_account.pubkey,
+        );
+        assert!(result.is_ok());
+
+        let (group_ids, relays) = result.unwrap();
+        assert_eq!(group_ids.len(), 1, "Creator should have one group");
+        assert!(!relays.is_empty(), "Group should have relays");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_creates_account_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
+        let group_name = "Test Group";
+
+        // Run finalize_welcome_with_instance directly (no key package event id)
+        // Some operations may fail (e.g., group not in MLS) but the function should complete
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None, // no key package to rotate
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Verify AccountGroup was created (this operation should succeed)
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        let account_group = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+        assert!(account_group.is_some(), "AccountGroup should be created");
+        let ag = account_group.unwrap();
+        assert!(ag.is_pending(), "New AccountGroup should be pending");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
+        let group_name = "Idempotent Test Group";
+
+        // Run twice - should not panic (some operations may log errors but that's ok)
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Should still have exactly one AccountGroup
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        let visible = AccountGroup::visible_for_account(&whitenoise, &account.pubkey)
+            .await
+            .unwrap();
+        let matching: Vec<_> = visible
+            .iter()
+            .filter(|ag| ag.mls_group_id == group_id)
+            .collect();
+        assert_eq!(matching.len(), 1, "Should have exactly one AccountGroup");
     }
 }
