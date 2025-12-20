@@ -176,9 +176,7 @@ impl AccountGroup {
         user_confirmation: bool,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let id = self.id.ok_or_else(|| {
-            sqlx::Error::Protocol("Cannot update unsaved AccountGroup".to_string())
-        })?;
+        let id = self.id.expect("AccountGroup must be persisted");
 
         let now_ms = Utc::now().timestamp_millis();
         let confirmation_int: i64 = if user_confirmation { 1 } else { 0 };
