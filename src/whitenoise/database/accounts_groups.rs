@@ -121,8 +121,8 @@ impl AccountGroup {
         match Self::create(account_pubkey, mls_group_id, database).await {
             Ok(created) => Ok((created, true)),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                // Another task inserted the record between our check and insert
-                // Fetch the existing record
+                // Insert failed due to unique constraint - a concurrent task already created the row
+                // Fall back to fetching the existing record
                 let existing =
                     Self::find_by_account_and_group(account_pubkey, mls_group_id, database)
                         .await?
