@@ -80,22 +80,17 @@ impl Whitenoise {
             .and_then(|tag| tag.content())
             .and_then(|content| EventId::parse(content).ok());
 
-        // Clone data needed for background task
-        let account_clone = account.clone();
         let data_dir = self.config.data_dir.clone();
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
-        tokio::spawn(async move {
-            Self::background_finalize_welcome(
-                account_clone,
-                group_id,
-                group_name,
-                key_package_event_id,
-                data_dir,
-            )
-            .await;
-        });
+        tokio::spawn(Self::background_finalize_welcome(
+            account.clone(),
+            group_id,
+            group_name,
+            key_package_event_id,
+            data_dir,
+        ));
 
         Ok(())
     }
@@ -307,20 +302,20 @@ impl Whitenoise {
             .delete_key_package_for_account(account, &kp_event_id, false)
             .await?
         {
-                tracing::debug!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Deleted used key package from relays"
-                );
-                whitenoise.publish_key_package_for_account(account).await?;
-                tracing::debug!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Published new key package"
-                );
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Deleted used key package from relays"
+            );
+            whitenoise.publish_key_package_for_account(account).await?;
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Published new key package"
+            );
         } else {
-                tracing::debug!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Key package already deleted, skipping publish"
-                );
+            tracing::debug!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Key package already deleted, skipping publish"
+            );
         }
 
         Ok(())
