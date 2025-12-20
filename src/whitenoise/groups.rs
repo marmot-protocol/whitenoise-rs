@@ -293,23 +293,10 @@ impl Whitenoise {
             .collect();
 
         // Lazy migration: ensure AccountGroup records exist for all active groups.
-        // This handles existing users who had groups before the accounts_groups table was added.
-        // Only creates records for active groups (already finalized MLS membership).
         for group in &groups {
             if group.state == group_types::GroupState::Active {
-                let (ag, was_created) =
-                    AccountGroup::get_or_create(self, &account.pubkey, &group.mls_group_id).await?;
-
-                // If this is a newly created record for an existing active group,
-                // auto-accept it since the user is already a member
-                if was_created {
-                    ag.accept(self).await?;
-                    tracing::debug!(
-                        target: "whitenoise::groups",
-                        "Lazy migration: created and accepted AccountGroup for existing group {}",
-                        hex::encode(group.mls_group_id.as_slice())
-                    );
-                }
+                self.ensure_account_group_exists(account, &group.mls_group_id)
+                    .await?;
             }
         }
 
@@ -328,9 +315,45 @@ impl Whitenoise {
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        mdk.get_group(group_id)
+        let group = mdk
+            .get_group(group_id)
             .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        // Lazy migration: ensure AccountGroup record exists for this group
+        if group.state == group_types::GroupState::Active {
+            self.ensure_account_group_exists(account, group_id).await?;
+        }
+
+        Ok(group)
+    }
+
+    /// Ensures an AccountGroup record exists for the given account and group.
+    /// This handles lazy migration for existing users who had groups before
+    /// the accounts_groups table was added.
+    ///
+    /// If a new record is created for an existing active group, it's automatically
+    /// accepted since the user is already a member.
+    async fn ensure_account_group_exists(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let (ag, was_created) =
+            AccountGroup::get_or_create(self, &account.pubkey, group_id).await?;
+
+        // If this is a newly created record for an existing active group,
+        // auto-accept it since the user is already a member
+        if was_created {
+            ag.accept(self).await?;
+            tracing::debug!(
+                target: "whitenoise::groups",
+                "Lazy migration: created and accepted AccountGroup for existing group {}",
+                hex::encode(group_id.as_slice())
+            );
+        }
+
+        Ok(())
     }
 
     pub async fn group_members(
