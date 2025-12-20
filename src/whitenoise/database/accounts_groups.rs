@@ -103,10 +103,7 @@ impl AccountGroup {
         .fetch_optional(&database.pool)
         .await?;
 
-        match row {
-            Some(r) => Ok(Some(r.into())),
-            None => Ok(None),
-        }
+        Ok(row.map(Into::into))
     }
 
     /// Finds or creates an AccountGroup for the given account and group.
@@ -152,7 +149,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Finds all pending AccountGroups for a given account.
@@ -170,7 +167,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
