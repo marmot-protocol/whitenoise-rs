@@ -303,11 +303,10 @@ impl Whitenoise {
             return Ok(());
         };
 
-        match whitenoise
+        if whitenoise
             .delete_key_package_for_account(account, &kp_event_id, false)
             .await?
         {
-            true => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::process_welcome::background",
                     "Deleted used key package from relays"
@@ -317,13 +316,11 @@ impl Whitenoise {
                     target: "whitenoise::event_processor::process_welcome::background",
                     "Published new key package"
                 );
-            }
-            false => {
+        } else {
                 tracing::debug!(
                     target: "whitenoise::event_processor::process_welcome::background",
                     "Key package already deleted, skipping publish"
                 );
-            }
         }
 
         Ok(())
