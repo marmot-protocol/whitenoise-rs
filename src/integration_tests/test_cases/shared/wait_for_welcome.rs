@@ -33,33 +33,29 @@ impl TestCase for WaitForWelcomeTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
         let group_id = group.mls_group_id.clone();
+        let wn = context.whitenoise;
 
         for account_name in &self.account_names {
-            let account = context.get_account(account_name)?.clone();
+            let account = context.get_account(account_name)?;
             tracing::info!(
                 "Waiting for {} to receive welcome for group '{}'...",
                 account_name,
                 self.group_name
             );
 
-            let wn = context.whitenoise;
-            let acc = account.clone();
-            let gid = group_id.clone();
-            let name = account_name.clone();
-
             retry_default(
                 || {
-                    let acc = acc.clone();
-                    let gid = gid.clone();
-                    let name = name.clone();
+                    let account = account.clone();
+                    let group_id = group_id.clone();
+                    let account_name = account_name.clone();
                     async move {
-                        let groups = wn.groups(&acc, true).await?;
-                        if groups.iter().any(|g| g.mls_group_id == gid) {
+                        let groups = wn.groups(&account, true).await?;
+                        if groups.iter().any(|g| g.mls_group_id == group_id) {
                             Ok(())
                         } else {
                             Err(WhitenoiseError::Other(anyhow::anyhow!(
-                                "{} has not yet received the group",
-                                name
+                                "{} has not yet processed the welcome for the group",
+                                account_name
                             )))
                         }
                     }
