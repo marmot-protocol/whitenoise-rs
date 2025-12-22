@@ -29,7 +29,7 @@ pub use whitenoise::users::{User, UserSyncMode};
 pub use whitenoise::app_settings::{AppSettings, ThemeMode};
 
 // App updates
-pub use whitenoise::app_update::AppUpdateInfo;
+pub use whitenoise::app_update::{AppUpdateInfo, check_for_app_update};
 
 // Groups and relays
 pub use whitenoise::accounts_groups::AccountGroup;

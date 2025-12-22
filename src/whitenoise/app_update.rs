@@ -2,13 +2,11 @@ use nostr_sdk::prelude::*;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::whitenoise::{
-    Whitenoise,
-    error::{Result, WhitenoiseError},
-};
+use crate::whitenoise::error::{Result, WhitenoiseError};
 
 const ZAPSTORE_RELAY_URL: &str = "wss://relay.zapstore.dev";
 const WHITE_NOISE_PUBKEY: &str = "75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7";
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct AppUpdateInfo {
@@ -65,82 +63,84 @@ impl std::fmt::Display for Version {
     }
 }
 
-impl Whitenoise {
-    /// Checks for available application updates by querying the Zapstore relay.
-    ///
-    /// This method connects to the Zapstore relay and fetches the latest version
-    /// information for Whitenoise. It compares the latest available version against
-    /// the provided current version to determine if an update is available.
-    ///
-    /// # Arguments
-    ///
-    /// * `current_version` - The current application version string in semver format (e.g., "1.2.3")
-    ///
-    /// # Returns
-    ///
-    /// Returns an [`AppUpdateInfo`] containing:
-    /// - `version`: The latest available version string
-    /// - `update_available`: `true` if the latest version is newer than the current version
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Failed to connect to the Zapstore relay
-    /// - No version events were found
-    /// - The version string format is invalid
-    pub async fn check_for_app_update(&self, current_version: &str) -> Result<AppUpdateInfo> {
-        let client = Client::default();
+/// Checks for available application updates by querying the Zapstore relay.
+///
+/// This function connects to the Zapstore relay and fetches the latest version
+/// information for Whitenoise. It compares the latest available version against
+/// the provided current version to determine if an update is available.
+///
+/// # Arguments
+///
+/// * `current_version` - The current application version string in semver format (e.g., "1.2.3")
+///
+/// # Returns
+///
+/// Returns an [`AppUpdateInfo`] containing:
+/// - `version`: The latest available version string
+/// - `update_available`: `true` if the latest version is newer than the current version
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Failed to connect to the Zapstore relay
+/// - No version events were found
+/// - The version string format is invalid
+pub async fn check_for_app_update(current_version: &str) -> Result<AppUpdateInfo> {
+    let client = Client::default();
 
-        let relay_url = RelayUrl::parse(ZAPSTORE_RELAY_URL)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    let relay_url = RelayUrl::parse(ZAPSTORE_RELAY_URL)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
 
-        client
-            .add_relay(relay_url.clone())
-            .await
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    client
+        .add_relay(relay_url.clone())
+        .await
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
 
-        client.connect().await;
+    tokio::time::timeout(TIMEOUT, client.connect())
+        .await
+        .map_err(|_| {
+            WhitenoiseError::Other(anyhow::anyhow!("Timeout connecting to Zapstore relay"))
+        })?;
 
-        let pubkey = PublicKey::from_hex(WHITE_NOISE_PUBKEY)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    let pubkey = PublicKey::from_hex(WHITE_NOISE_PUBKEY)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
 
-        let filter = Filter::new().author(pubkey).kind(Kind::Custom(1063));
+    let filter = Filter::new().author(pubkey).kind(Kind::Custom(1063));
 
-        let events = client
-            .fetch_events_from([relay_url.clone()], filter, Duration::from_secs(10))
-            .await
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    let events = client
+        .fetch_events_from([relay_url.clone()], filter, TIMEOUT)
+        .await
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
 
-        client.disconnect().await;
+    client.disconnect().await;
 
-        let event = events
-            .into_iter()
-            .max_by_key(|e| e.created_at)
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No events found")))?;
+    let event = events
+        .into_iter()
+        .max_by_key(|e| e.created_at)
+        .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No events found")))?;
 
-        let latest_version_str = event
-            .tags
-            .iter()
-            .find_map(|tag| {
-                if tag.as_slice().first().map(|s| s.as_str()) == Some("version") {
-                    tag.as_slice().get(1).map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No version tag found")))?;
-
-        let latest = Version::from_str(&latest_version_str)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
-
-        let current = Version::from_str(current_version)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
-
-        Ok(AppUpdateInfo {
-            version: latest.to_string(),
-            update_available: latest > current,
+    let latest_version_str = event
+        .tags
+        .iter()
+        .find_map(|tag| {
+            if tag.as_slice().first().map(|s| s.as_str()) == Some("version") {
+                tag.as_slice().get(1).map(|s| s.to_string())
+            } else {
+                None
+            }
         })
-    }
+        .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No version tag found")))?;
+
+    let latest = Version::from_str(&latest_version_str)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+
+    let current = Version::from_str(current_version)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+
+    Ok(AppUpdateInfo {
+        version: latest.to_string(),
+        update_available: latest > current,
+    })
 }
 
 #[cfg(test)]
