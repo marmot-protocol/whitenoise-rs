@@ -115,3 +115,273 @@ pub async fn check_for_app_update(current_version: &str) -> Result<AppUpdateInfo
         update_available: latest > current,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Version Parsing Tests (FromStr implementation)
+
+    #[test]
+    fn test_version_parse_valid() {
+        // Test parsing a standard semantic version string "1.2.3"
+        let version = Version::from_str("1.2.3").unwrap();
+
+        assert_eq!(version.major, 1);
+        assert_eq!(version.minor, 2);
+        assert_eq!(version.patch, 3);
+    }
+
+    #[test]
+    fn test_version_parse_zeros() {
+        // Test parsing version with all zeros
+        let version = Version::from_str("0.0.0").unwrap();
+
+        assert_eq!(version.major, 0);
+        assert_eq!(version.minor, 0);
+        assert_eq!(version.patch, 0);
+    }
+
+    #[test]
+    fn test_version_parse_large_numbers() {
+        // Test parsing version with large numbers to ensure no overflow issues
+        let version = Version::from_str("100.200.300").unwrap();
+
+        assert_eq!(version.major, 100);
+        assert_eq!(version.minor, 200);
+        assert_eq!(version.patch, 300);
+    }
+
+    #[test]
+    fn test_version_parse_invalid_format_too_few_parts() {
+        // Test that parsing fails when version has fewer than 3 parts
+        let result = Version::from_str("1.2");
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Invalid version format (expected x.y.z)"
+        );
+    }
+
+    #[test]
+    fn test_version_parse_invalid_format_too_many_parts() {
+        // Test that parsing fails when version has more than 3 parts
+        let result = Version::from_str("1.2.3.4");
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Invalid version format (expected x.y.z)"
+        );
+    }
+
+    #[test]
+    fn test_version_parse_invalid_major() {
+        // Test that parsing fails when major version is not a valid number
+        let result = Version::from_str("abc.2.3");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid major");
+    }
+
+    #[test]
+    fn test_version_parse_invalid_minor() {
+        // Test that parsing fails when minor version is not a valid number
+        let result = Version::from_str("1.xyz.3");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid minor");
+    }
+
+    #[test]
+    fn test_version_parse_invalid_patch() {
+        // Test that parsing fails when patch version is not a valid number
+        let result = Version::from_str("1.2.abc");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Invalid patch");
+    }
+
+    #[test]
+    fn test_version_parse_empty_string() {
+        // Test that parsing fails for an empty string
+        let result = Version::from_str("");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_version_parse_negative_numbers() {
+        // Test that parsing fails for negative numbers (u32 can't be negative)
+        let result = Version::from_str("-1.2.3");
+
+        assert!(result.is_err());
+    }
+
+    /// Version Comparison Tests (Ord and PartialOrd implementations)
+
+    #[test]
+    fn test_version_compare_equal() {
+        // Test that two identical versions are equal
+        let v1 = Version::from_str("1.2.3").unwrap();
+        let v2 = Version::from_str("1.2.3").unwrap();
+
+        assert_eq!(v1, v2);
+        assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Equal);
+        assert_eq!(v1.partial_cmp(&v2), Some(std::cmp::Ordering::Equal));
+    }
+
+    #[test]
+    fn test_version_compare_major_greater() {
+        // Test comparison when major version differs (lower major but higher minor/patch)
+        let v1 = Version::from_str("2.0.0").unwrap();
+        let v2 = Version::from_str("1.9.9").unwrap();
+        
+        assert!(v1 > v2);
+        assert!(v2 < v1);
+        assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_version_compare_minor_greater() {
+        // Test comparison when major is equal but minor differs (same major, higher minor)
+        let v1 = Version::from_str("1.3.0").unwrap();
+        let v2 = Version::from_str("1.2.9").unwrap();
+
+        assert!(v1 > v2);
+        assert!(v2 < v1);
+    }
+
+    #[test]
+    fn test_version_compare_patch_greater() {
+        // Test comparison when major and minor are equal but patch differs (same major.minor, higher patch)
+        let v1 = Version::from_str("1.2.4").unwrap();
+        let v2 = Version::from_str("1.2.3").unwrap();
+
+        assert!(v1 > v2);
+        assert!(v2 < v1);
+    }
+
+    #[test]
+    fn test_version_compare_ordering_chain() {
+        // Test a chain of versions to verify correct ordering
+        let v0 = Version::from_str("0.0.1").unwrap();
+        let v1 = Version::from_str("0.1.0").unwrap();
+        let v2 = Version::from_str("1.0.0").unwrap();
+        let v3 = Version::from_str("1.0.1").unwrap();
+        let v4 = Version::from_str("1.1.0").unwrap();
+        let v5 = Version::from_str("2.0.0").unwrap();
+
+        assert!(v0 < v1);
+        assert!(v1 < v2);
+        assert!(v2 < v3);
+        assert!(v3 < v4);
+        assert!(v4 < v5);
+    }
+
+    /// Version Display Tests (Display implementation)
+
+    #[test]
+    fn test_version_display() {
+        // Test that Display formats the version correctly as "x.y.z"
+        let version = Version::from_str("1.2.3").unwrap();
+
+        assert_eq!(version.to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn test_version_display_zeros() {
+        // Test Display with zero values
+        let version = Version::from_str("0.0.0").unwrap();
+
+        assert_eq!(version.to_string(), "0.0.0");
+    }
+
+    #[test]
+    fn test_version_display_large_numbers() {
+        // Test Display with large numbers
+        let version = Version::from_str("100.200.300").unwrap();
+
+        assert_eq!(version.to_string(), "100.200.300");
+    }
+
+    // Version Clone and Copy Tests (derived traits)
+
+    #[test]
+    fn test_version_clone() {
+        // Test that Clone works correctly
+        let v1 = Version::from_str("1.2.3").unwrap();
+        let v2 = v1.clone();
+
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn test_version_copy() {
+        // Test that Copy works correctly (Version implements Copy)
+        let v1 = Version::from_str("1.2.3").unwrap();
+        let v2 = v1;
+
+        assert_eq!(v1, v2);
+        assert_eq!(v1.major, 1);
+    }
+
+    /// AppUpdateInfo Tests
+
+    #[test]
+    fn test_app_update_info_creation() {
+        // Test creating AppUpdateInfo struct
+        let info = AppUpdateInfo {
+            version: "1.2.3".to_string(),
+            update_available: true,
+        };
+     
+        assert_eq!(info.version, "1.2.3");
+        assert!(info.update_available);
+    }
+
+    #[test]
+    fn test_app_update_info_clone() {
+        // Test that AppUpdateInfo can be cloned
+        let info1 = AppUpdateInfo {
+            version: "2.0.0".to_string(),
+            update_available: false,
+        };
+        let info2 = info1.clone();
+
+        assert_eq!(info1.version, info2.version);
+        assert_eq!(info1.update_available, info2.update_available);
+    }
+
+    #[test]
+    fn test_app_update_info_debug() {
+        // Test that Debug formatting works (doesn't panic)
+        let info = AppUpdateInfo {
+            version: "1.0.0".to_string(),
+            update_available: true,
+        };
+
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("AppUpdateInfo"));
+        assert!(debug_str.contains("1.0.0"));
+    }
+
+    /// Constants Tests
+
+    #[test]
+    fn test_zapstore_relay_url_is_valid() {
+        // Test that the hardcoded relay URL is a valid WebSocket URL and contains zapstore
+        assert!(ZAPSTORE_RELAY_URL.starts_with("wss://"));
+        assert!(ZAPSTORE_RELAY_URL.contains("zapstore"));
+    }
+
+    #[test]
+    fn test_whitenoise_pubkey_is_valid_hex() {
+        // Test that the hardcoded pubkey is valid 64-character hex
+        assert_eq!(WHITE_NOISE_PUBKEY.len(), 64);
+
+        // Verify all characters are valid hex digits
+        assert!(WHITE_NOISE_PUBKEY.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
