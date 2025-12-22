@@ -100,6 +100,12 @@ impl Nip55Signer {
         *cached = None;
     }
 
+    /// Set the cached public key directly (useful when we already have it)
+    pub async fn set_cached_pubkey(&self, pubkey: PublicKey) {
+        let mut cached = self.cached_pubkey.write().await;
+        *cached = Some(pubkey);
+    }
+
     /// Call a NIP-55 method via the Flutter callback
     async fn call_method(
         &self,

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::*;
@@ -376,7 +377,7 @@ impl Whitenoise {
                 .clone()
         };
 
-        // Create temporary signer to get public key
+        // Create signer to get public key
         let signer = crate::whitenoise::nip55_signer::Nip55Signer::new(callback);
 
         // Get public key using NostrSigner trait
@@ -412,8 +413,17 @@ impl Whitenoise {
             self.persist_account(&account).await?
         };
 
-        // Enable NIP-55 signer for this account
-        self.enable_nip55_signer(&account).await?;
+        // Set the current user on the signer and ensure the pubkey is cached
+        // (it should already be cached from get_public_key() above, but ensure it's set)
+        signer.set_current_user(account.pubkey).await;
+        signer.set_cached_pubkey(pubkey).await;
+        self.nip55_signers.insert(account.pubkey, Arc::new(signer));
+
+        tracing::info!(
+            target: "whitenoise::login_with_nip55",
+            "Enabled NIP-55 signer for account {}",
+            account.pubkey.to_hex()
+        );
 
         // Setup relays for the account
         let mut account_clone = account.clone();
@@ -425,7 +435,7 @@ impl Whitenoise {
         self.activate_account(
             &account,
             &user,
-            false,
+            true,
             &nip65_relays,
             &inbox_relays,
             &key_package_relays,
@@ -672,6 +682,11 @@ impl Whitenoise {
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
         let default_relays = self.load_default_relays().await?;
         let signer = self.get_signer_for_account(account).await?;
+
+        let default_relay_urls = Relay::urls(&default_relays);
+        self.nostr
+            .ensure_relays_connected(&default_relay_urls)
+            .await?;
 
         // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
         let (nip65_relays, should_publish_nip65) = self

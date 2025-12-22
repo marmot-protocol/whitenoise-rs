@@ -99,21 +99,6 @@ where
         .map_err(|e| WhitenoiseError::InvalidEvent(format!("Failed to parse rumor: {}", e)))?;
 
     // 6. Return UnwrappedGift
-    // Note: We construct UnwrappedGift manually if fields are public,
-    // otherwise we might need to return a custom struct or just the rumor.
-    // UnwrappedGift { rumor, sender: seal.pubkey }
-    // Checking if UnwrappedGift has public fields or constructor.
-    // If not, we return a custom struct or tuple.
-    // Assuming for now we can't construct UnwrappedGift if fields are private.
-    // Let's verify usage: usages access .rumor.
-    // So I can return a struct with .rumor and .sender.
-
-    // Actually, looking at usages, they just access .rumor.
-    // And `handle_giftwrap` expects `UnwrappedGift` or similar structure.
-    // I'll define a local struct or return a tuple/custom type if UnwrappedGift is not constructible.
-    // But since nostr_sdk 0.29+ usually has UnwrappedGift, let's try to use it.
-    // If fields are private, I will define a helper struct `ExtractedRumor`.
-
     Ok(nostr_sdk::nips::nip59::UnwrappedGift {
         rumor,
         sender: seal.pubkey,
