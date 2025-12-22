@@ -435,7 +435,7 @@ impl Whitenoise {
         self.activate_account(
             &account,
             &user,
-            true,
+            false,
             &nip65_relays,
             &inbox_relays,
             &key_package_relays,
