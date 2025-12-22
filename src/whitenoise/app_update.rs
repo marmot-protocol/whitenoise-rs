@@ -337,8 +337,9 @@ mod tests {
 
     #[test]
     fn test_version_clone() {
-        // Test that Clone works correctly
+        // Test that Clone works correctly (using explicit clone for trait verification)
         let v1 = Version::from_str("1.2.3").unwrap();
+        #[allow(clippy::clone_on_copy)]
         let v2 = v1.clone();
 
         assert_eq!(v1, v2);
