@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 pub mod accounts;
 pub mod accounts_groups;
+pub mod app_update;
 pub mod aggregated_message;
 pub mod app_settings;
 pub mod chat_list;
