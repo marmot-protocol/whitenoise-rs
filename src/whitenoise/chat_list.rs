@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use mdk_core::prelude::*;
-use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +43,11 @@ pub struct ChatListItem {
 
     /// Preview of the last message (None if no messages)
     pub last_message: Option<ChatMessageSummary>,
+
+    /// Whether this group is pending user confirmation.
+    /// `true` = user was invited but hasn't accepted/declined yet
+    /// `false` = user has accepted (or created) this group
+    pub pending_confirmation: bool,
 }
 
 /// Resolves a user's display name from metadata.
@@ -84,30 +88,6 @@ fn get_dm_other_user(group_members: &[PublicKey], account_pubkey: &PublicKey) ->
         .copied()
 }
 
-/// Identifies the "other user" in each DM group.
-fn identify_dm_participants(
-    groups: &[group_types::Group],
-    group_info_map: &HashMap<GroupId, GroupInformation>,
-    mdk: &MDK<MdkSqliteStorage>,
-    account_pubkey: &PublicKey,
-) -> Result<HashMap<GroupId, PublicKey>> {
-    let mut dm_other_users = HashMap::new();
-
-    for group in groups {
-        if let Some(info) = group_info_map.get(&group.mls_group_id)
-            && info.group_type == GroupType::DirectMessage
-        {
-            let members: Vec<PublicKey> =
-                mdk.get_members(&group.mls_group_id)?.into_iter().collect();
-            if let Some(other_pk) = get_dm_other_user(&members, account_pubkey) {
-                dm_other_users.insert(group.mls_group_id.clone(), other_pk);
-            }
-        }
-    }
-
-    Ok(dm_other_users)
-}
-
 /// Collects all pubkeys that need metadata lookup (DM participants + message authors).
 fn collect_pubkeys_to_fetch(
     dm_other_users: &HashMap<GroupId, PublicKey>,
@@ -130,6 +110,7 @@ fn assemble_chat_list_items(
     last_message_map: &HashMap<GroupId, ChatMessageSummary>,
     users_by_pubkey: &HashMap<PublicKey, User>,
     image_paths: &HashMap<GroupId, PathBuf>,
+    pending_map: &HashMap<GroupId, bool>,
 ) -> Vec<ChatListItem> {
     groups
         .iter()
@@ -157,6 +138,11 @@ fn assemble_chat_list_items(
                 msg
             });
 
+            let pending_confirmation = pending_map
+                .get(&group.mls_group_id)
+                .copied()
+                .unwrap_or(false);
+
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
                 name,
@@ -165,6 +151,7 @@ fn assemble_chat_list_items(
                 group_image_path,
                 group_image_url,
                 last_message,
+                pending_confirmation,
             })
         })
         .collect()
@@ -193,20 +180,28 @@ impl Whitenoise {
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Groups without messages are sorted by creation date.
+    /// Declined groups are filtered out.
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let groups = mdk.get_groups()?;
-        if groups.is_empty() {
+        // Use visible_groups() to filter out declined groups and get membership data
+        let visible_groups = self.visible_groups(account).await?;
+        if visible_groups.is_empty() {
             return Ok(Vec::new());
         }
 
+        // Extract groups for existing helper functions
+        let groups: Vec<_> = visible_groups.iter().map(|gwm| gwm.group.clone()).collect();
         let group_ids: Vec<GroupId> = groups.iter().map(|g| g.mls_group_id.clone()).collect();
+
+        // Build pending status map from membership data
+        let pending_map: HashMap<GroupId, bool> = visible_groups
+            .iter()
+            .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.is_pending()))
+            .collect();
 
         let group_info_map = self
             .build_group_info_map(account.pubkey, &group_ids)
             .await?;
-        let dm_other_users =
-            identify_dm_participants(&groups, &group_info_map, &mdk, &account.pubkey)?;
+        let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map)?;
         let last_message_map = self.build_last_message_map(&group_ids).await;
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
         let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await;
@@ -221,6 +216,7 @@ impl Whitenoise {
             &last_message_map,
             &users_by_pubkey,
             &image_paths,
+            &pending_map,
         );
         sort_chat_list(&mut items);
 
@@ -238,6 +234,31 @@ impl Whitenoise {
             .into_iter()
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect())
+    }
+
+    /// Identifies the "other user" in each DM group.
+    fn identify_dm_participants(
+        &self,
+        account: &Account,
+        groups: &[group_types::Group],
+        group_info_map: &HashMap<GroupId, GroupInformation>,
+    ) -> Result<HashMap<GroupId, PublicKey>> {
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mut dm_other_users = HashMap::new();
+
+        for group in groups {
+            if let Some(info) = group_info_map.get(&group.mls_group_id)
+                && info.group_type == GroupType::DirectMessage
+            {
+                let members: Vec<PublicKey> =
+                    mdk.get_members(&group.mls_group_id)?.into_iter().collect();
+                if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
+                    dm_other_users.insert(group.mls_group_id.clone(), other_pk);
+                }
+            }
+        }
+
+        Ok(dm_other_users)
     }
 
     async fn build_last_message_map(
@@ -364,6 +385,7 @@ mod tests {
         assert_eq!(chat_list[0].group_type, GroupType::Group);
         assert_eq!(chat_list[0].name, Some("Test group".to_string()));
         assert!(chat_list[0].last_message.is_none());
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -399,6 +421,7 @@ mod tests {
             "Expected DM name to be None, got: {:?}",
             chat_list[0].name
         );
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -430,6 +453,7 @@ mod tests {
         assert_eq!(chat_list.len(), 1);
         // Should use display_name, not name
         assert_eq!(chat_list[0].name, Some("Bob Display".to_string()));
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -460,6 +484,7 @@ mod tests {
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Bob Name".to_string()));
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -492,6 +517,7 @@ mod tests {
 
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Fallback Name".to_string()));
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -529,6 +555,7 @@ mod tests {
 
         assert_eq!(chat_list.len(), 2);
         assert!(chat_list.iter().all(|c| c.group_type == GroupType::Group));
+        assert!(chat_list.iter().all(|c| !c.pending_confirmation));
     }
 
     #[tokio::test]
@@ -560,6 +587,7 @@ mod tests {
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("Second".to_string()));
         assert_eq!(chat_list[1].name, Some("First".to_string()));
+        assert!(chat_list.iter().all(|c| !c.pending_confirmation));
     }
 
     #[tokio::test]
@@ -637,6 +665,7 @@ mod tests {
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("New Message Group".to_string()));
         assert_eq!(chat_list[1].name, Some("Old Message Group".to_string()));
+        assert!(chat_list.iter().all(|c| !c.pending_confirmation));
     }
 
     #[tokio::test]
@@ -682,6 +711,7 @@ mod tests {
             .count();
         assert_eq!(group_count, 1);
         assert_eq!(dm_count, 1);
+        assert!(chat_list.iter().all(|c| !c.pending_confirmation));
     }
 
     #[tokio::test]
@@ -719,6 +749,7 @@ mod tests {
             Some("https://example.com/pic.jpg".to_string())
         );
         assert!(chat_list[0].group_image_path.is_none());
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -743,6 +774,7 @@ mod tests {
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].group_type, GroupType::Group);
         assert!(chat_list[0].group_image_url.is_none());
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -793,6 +825,7 @@ mod tests {
         let last_msg = chat_list[0].last_message.as_ref().unwrap();
         assert_eq!(last_msg.author_display_name, Some("Alice".to_string()));
         assert_eq!(last_msg.content, "Hello");
+        assert!(!chat_list[0].pending_confirmation);
     }
 
     #[tokio::test]
@@ -852,5 +885,6 @@ mod tests {
         assert_eq!(chat_list.len(), 2);
         assert_eq!(chat_list[0].name, Some("No Message".to_string()));
         assert_eq!(chat_list[1].name, Some("Old Message".to_string()));
+        assert!(chat_list.iter().all(|c| !c.pending_confirmation));
     }
 }
