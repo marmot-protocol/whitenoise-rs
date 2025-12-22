@@ -71,7 +71,7 @@ struct Nip55Request {
 /// NIP-55 method response
 #[derive(Debug, Serialize, Deserialize)]
 struct Nip55Response {
-    result: Option<String>,
+    result: Option<serde_json::Value>,
     rejected: Option<bool>,
     error: Option<String>,
 }
@@ -120,10 +120,23 @@ impl Nip55Signer {
         let params_json =
             serde_json::to_string(&request.params).map_err(Nip55SignerError::Serialization)?;
 
+        tracing::info!(
+            target: "whitenoise::nip55_signer",
+            "Calling NIP-55 method: {} with params: {}",
+            method,
+            params_json
+        );
+
         let response_json = self
             .callback
             .call_nip55_method(method, &params_json)
             .map_err(Nip55SignerError::FlutterCallback)?;
+
+        tracing::info!(
+            target: "whitenoise::nip55_signer",
+            "NIP-55 response: {}",
+            response_json
+        );
 
         let response: Nip55Response =
             serde_json::from_str(&response_json).map_err(Nip55SignerError::Serialization)?;
@@ -138,9 +151,13 @@ impl Nip55Signer {
             return Err(Nip55SignerError::FlutterCallback(error));
         }
 
-        response
-            .result
-            .ok_or_else(|| Nip55SignerError::InvalidResponse("No result in response".to_string()))
+        match response.result {
+            Some(serde_json::Value::String(s)) => Ok(s),
+            Some(val) => Ok(val.to_string()),
+            None => Err(Nip55SignerError::InvalidResponse(
+                "No result in response".to_string(),
+            )),
+        }
     }
 
     /// Get the current user's public key
@@ -224,25 +241,54 @@ impl NostrSigner for Nip55Signer {
 
     fn nip44_encrypt(
         &self,
-        _receiver: &PublicKey,
-        _content: &str,
+        receiver: &PublicKey,
+        content: &str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::result::Result<String, SignerError>> + Send + '_>,
     > {
+        let this = self.clone();
+        let receiver = *receiver;
+        let content = content.to_string();
         Box::pin(async move {
-            todo!("NIP-44 encryption is intentionally unimplemented - not used in whitenoise");
+            let current_user = this
+                .get_current_user()
+                .await
+                .map_err(SignerError::backend)?;
+            let params = vec![
+                json!(receiver.to_hex()),
+                json!(content),
+                json!(current_user.to_hex()),
+            ];
+            this.call_method("nip44_encrypt", params)
+                .await
+                .map_err(SignerError::backend)
         })
     }
 
     fn nip44_decrypt(
         &self,
-        _sender: &PublicKey,
-        _content: &str,
+        sender: &PublicKey,
+        content: &str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::result::Result<String, SignerError>> + Send + '_>,
     > {
+        let this = self.clone();
+        let sender = *sender;
+        let content = content.to_string();
         Box::pin(async move {
-            todo!("NIP-44 decryption is intentionally unimplemented - not used in whitenoise");
+            let current_user = this
+                .get_current_user()
+                .await
+                .map_err(SignerError::backend)?;
+
+            let params = vec![
+                json!(sender.to_hex()),
+                json!(content),
+                json!(current_user.to_hex()),
+            ];
+            this.call_method("nip44_decrypt", params)
+                .await
+                .map_err(SignerError::backend)
         })
     }
 

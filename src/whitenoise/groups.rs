@@ -418,8 +418,18 @@ impl Whitenoise {
             )));
         }
 
+        // Re-sign the evolution event using the account's signer
+        let unsigned = UnsignedEvent::new(
+            evolution_event.pubkey,
+            evolution_event.created_at,
+            evolution_event.kind,
+            evolution_event.tags.clone(),
+            evolution_event.content.clone(),
+        );
+        let signed_evolution_event = signer.sign_event(unsigned).await?;
+
         self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .publish_event_to(signed_evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
         // Evolution event published successfully
@@ -489,6 +499,7 @@ impl Whitenoise {
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
+        let signer = self.get_signer_for_account(account).await?;
         let (relay_urls, evolution_event) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -499,8 +510,18 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
+        // Re-sign the evolution event using the account's signer
+        let unsigned = UnsignedEvent::new(
+            evolution_event.pubkey,
+            evolution_event.created_at,
+            evolution_event.kind,
+            evolution_event.tags.clone(),
+            evolution_event.content.clone(),
+        );
+        let signed_evolution_event = signer.sign_event(unsigned).await?;
+
         self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .publish_event_to(signed_evolution_event, &account.pubkey, &relay_urls)
             .await?;
         Ok(())
     }
@@ -519,6 +540,7 @@ impl Whitenoise {
         group_id: &GroupId,
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
+        let signer = self.get_signer_for_account(account).await?;
         let (relay_urls, evolution_event) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -529,8 +551,18 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
+        // Re-sign the evolution event using the account's signer
+        let unsigned = UnsignedEvent::new(
+            evolution_event.pubkey,
+            evolution_event.created_at,
+            evolution_event.kind,
+            evolution_event.tags.clone(),
+            evolution_event.content.clone(),
+        );
+        let signed_evolution_event = signer.sign_event(unsigned).await?;
+
         self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .publish_event_to(signed_evolution_event, &account.pubkey, &relay_urls)
             .await?;
         Ok(())
     }
@@ -545,6 +577,7 @@ impl Whitenoise {
     /// * `account` - The account that wants to leave the group
     /// * `group_id` - The ID of the group to leave
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
+        let signer = self.get_signer_for_account(account).await?;
         let (relay_urls, evolution_event) = {
             let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -555,9 +588,19 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
+        // Re-sign the evolution event using the account's signer
+        let unsigned = UnsignedEvent::new(
+            evolution_event.pubkey,
+            evolution_event.created_at,
+            evolution_event.kind,
+            evolution_event.tags.clone(),
+            evolution_event.content.clone(),
+        );
+        let signed_evolution_event = signer.sign_event(unsigned).await?;
+
         // Publish the self-removal proposal to the group
         self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .publish_event_to(signed_evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
         // TODO: Do any local updates to ensure that we're accurately reflecting that the account is trying to leave this group
