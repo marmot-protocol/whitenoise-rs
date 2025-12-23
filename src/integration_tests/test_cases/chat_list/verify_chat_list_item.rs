@@ -9,6 +9,7 @@ pub struct VerifyChatListItemTestCase {
     expected_name: Option<String>,
     expected_has_last_message: bool,
     expected_last_message_content: Option<String>,
+    expected_pending_confirmation: Option<bool>,
 }
 
 impl VerifyChatListItemTestCase {
@@ -19,6 +20,7 @@ impl VerifyChatListItemTestCase {
             expected_name: None,
             expected_has_last_message: false,
             expected_last_message_content: None,
+            expected_pending_confirmation: None,
         }
     }
 
@@ -37,6 +39,19 @@ impl VerifyChatListItemTestCase {
         self.expected_has_last_message = false;
         self.expected_last_message_content = None;
         self
+    }
+
+    /// Verifies the pending_confirmation field matches the expected value.
+    /// Use `expecting_not_pending()` for creator's groups (auto-accepted).
+    pub fn expecting_pending_confirmation(mut self, pending: bool) -> Self {
+        self.expected_pending_confirmation = Some(pending);
+        self
+    }
+
+    /// Convenience method: verifies the group is NOT pending (i.e., accepted).
+    /// Use this for groups created by the account being tested.
+    pub fn expecting_not_pending(self) -> Self {
+        self.expecting_pending_confirmation(false)
     }
 }
 
@@ -93,6 +108,15 @@ impl TestCase for VerifyChatListItemTestCase {
                 item.last_message.is_none(),
                 "Expected no last message but found: {:?}",
                 item.last_message
+            );
+        }
+
+        // Verify pending_confirmation
+        if let Some(expected_pending) = self.expected_pending_confirmation {
+            assert_eq!(
+                item.pending_confirmation, expected_pending,
+                "Expected pending_confirmation={} but got {}",
+                expected_pending, item.pending_confirmation
             );
         }
 

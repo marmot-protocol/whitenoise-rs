@@ -87,6 +87,7 @@ impl Scenario for ChatListScenario {
         VerifyChatListItemTestCase::new("chat_list_alice", "chat_list_group")
             .expecting_name("chat_list_group") // Name matches context key from with_name()
             .expecting_no_last_message()
+            .expecting_not_pending() // Creator's groups are auto-accepted
             .execute(&mut self.context)
             .await?;
 
@@ -171,6 +172,7 @@ impl Scenario for ChatListScenario {
         tracing::info!("  • Last message content verification");
         tracing::info!("  • Sorting by last activity time");
         tracing::info!("  • DM name resolution from user metadata");
+        tracing::info!("  • Creator's groups auto-accepted (pending_confirmation=false)");
 
         Ok(())
     }
