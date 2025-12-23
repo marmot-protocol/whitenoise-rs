@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -32,6 +32,31 @@ use crate::{
 /// Default timeout for Blossom HTTP operations (download and upload)
 /// Set to 300 seconds to accommodate large image files over slow connections
 const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// An MLS group paired with its account-specific membership data.
+///
+/// This struct combines an MLS group with its `AccountGroup` record (the join table
+/// between accounts and groups). The `AccountGroup` tracks account-specific state
+/// such as user confirmation status (pending, accepted, or declined).
+#[derive(Debug, Clone)]
+pub struct GroupWithMembership {
+    /// The MLS group data from MDK
+    pub group: group_types::Group,
+    /// The account-group relationship (join table record)
+    pub membership: AccountGroup,
+}
+
+impl GroupWithMembership {
+    /// Returns true if this group is pending user confirmation.
+    pub fn is_pending(&self) -> bool {
+        self.membership.is_pending()
+    }
+
+    /// Returns true if this group has been accepted by the user.
+    pub fn is_accepted(&self) -> bool {
+        self.membership.is_accepted()
+    }
+}
 
 impl Whitenoise {
     /// Returns the default Blossom server URL based on build configuration
@@ -276,6 +301,11 @@ impl Whitenoise {
         )
         .await?;
 
+        // Create AccountGroup record for the creator (auto-accepted since they created it)
+        let (account_group, _) =
+            AccountGroup::get_or_create(self, &creator_account.pubkey, &group.mls_group_id).await?;
+        account_group.accept(self).await?;
+
         Ok(group)
     }
 
@@ -301,6 +331,47 @@ impl Whitenoise {
         }
 
         Ok(groups)
+    }
+
+    /// Returns only visible groups for the account (pending + accepted, excluding declined)
+    ///
+    /// This method filters out groups that the user has explicitly declined.
+    /// It first retrieves all active groups (which triggers lazy migration to ensure
+    /// AccountGroup records exist), then filters based on visibility status.
+    ///
+    /// Each returned `GroupWithMembership` pairs the MLS group with its `AccountGroup`
+    /// record, allowing callers to check confirmation status without additional queries.
+    ///
+    /// # Arguments
+    /// * `account` - The account to get visible groups for
+    ///
+    /// # Returns
+    /// * `Ok(Vec<GroupWithMembership>)` - List of visible groups with their membership data
+    /// * `Err(WhitenoiseError)` - If there's an error accessing storage
+    pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
+        // Get all active MDK groups (triggers lazy migration)
+        let all_active_groups = self.groups(account, true).await?;
+
+        // Get visible AccountGroup records (pending + accepted)
+        let visible_account_groups =
+            AccountGroup::visible_for_account(self, &account.pubkey).await?;
+
+        // Build a map for efficient lookup when pairing
+        let memberships_by_id: HashMap<_, _> = visible_account_groups
+            .into_iter()
+            .map(|ag| (ag.mls_group_id.clone(), ag))
+            .collect();
+
+        // Pair each visible MDK group with its membership record
+        Ok(all_active_groups
+            .into_iter()
+            .filter_map(|group| {
+                memberships_by_id
+                    .get(&group.mls_group_id)
+                    .cloned()
+                    .map(|membership| GroupWithMembership { group, membership })
+            })
+            .collect())
     }
 
     /// Retrieves a single group by its MLS group ID
@@ -1806,6 +1877,21 @@ mod tests {
                 admin_pk
             );
         }
+
+        // Verify AccountGroup was created and auto-accepted for the creator
+        let account_group =
+            AccountGroup::get(whitenoise, &creator_account.pubkey, &group.mls_group_id)
+                .await
+                .unwrap();
+        assert!(
+            account_group.is_some(),
+            "AccountGroup should be created for creator"
+        );
+        let account_group = account_group.unwrap();
+        assert!(
+            account_group.is_accepted(),
+            "AccountGroup should be auto-accepted for creator"
+        );
     }
 
     /// Test case: Member/admin validation fails - empty admin list
@@ -2316,6 +2402,92 @@ mod tests {
         );
 
         // All groups should be in a valid state (exact verification depends on state enum implementation)
+    }
+
+    /// Helper to create an MDK group directly without auto-accepting the AccountGroup.
+    /// This allows tests to manually control the AccountGroup state.
+    ///
+    /// Uses `whitenoise.create_group()` internally but deletes the auto-created
+    /// AccountGroup record so tests can create it fresh with the desired state.
+    async fn create_mdk_group_without_auto_accept(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        member_pubkeys: Vec<PublicKey>,
+    ) -> group_types::Group {
+        // Create group normally (this auto-accepts)
+        let config = create_nostr_group_config_data(vec![account.pubkey]);
+        let group = whitenoise
+            .create_group(account, member_pubkeys, config, None)
+            .await
+            .unwrap();
+
+        // Delete the auto-created AccountGroup so tests can recreate with desired state
+        sqlx::query("DELETE FROM accounts_groups WHERE account_pubkey = ? AND mls_group_id = ?")
+            .bind(account.pubkey.to_hex())
+            .bind(group.mls_group_id.as_slice())
+            .execute(&whitenoise.database.pool)
+            .await
+            .unwrap();
+
+        group
+    }
+
+    #[tokio::test]
+    async fn test_visible_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkeys = vec![members[0].0.pubkey];
+
+        // Create 3 MDK groups directly, deleting the auto-accepted AccountGroup
+        let group_accepted =
+            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone())
+                .await;
+        let group_pending =
+            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys.clone())
+                .await;
+        let group_declined =
+            create_mdk_group_without_auto_accept(&whitenoise, &account, member_pubkeys).await;
+
+        // Manually create AccountGroup records with different states:
+        // - group_accepted: user_confirmation = Some(true)
+        // - group_pending: user_confirmation = None (default from get_or_create)
+        // - group_declined: user_confirmation = Some(false)
+
+        let (ag_accepted, _) = whitenoise
+            .get_or_create_account_group(&account, &group_accepted.mls_group_id)
+            .await
+            .unwrap();
+        ag_accepted.accept(&whitenoise).await.unwrap();
+
+        // Just create the record - stays pending (NULL) by default
+        whitenoise
+            .get_or_create_account_group(&account, &group_pending.mls_group_id)
+            .await
+            .unwrap();
+
+        let (ag_declined, _) = whitenoise
+            .get_or_create_account_group(&account, &group_declined.mls_group_id)
+            .await
+            .unwrap();
+        ag_declined.decline(&whitenoise).await.unwrap();
+
+        // Get visible groups - should return accepted + pending, not declined
+        let mut visible = whitenoise.visible_groups(&account).await.unwrap();
+
+        assert_eq!(visible.len(), 2);
+
+        // Sort by membership created_at for deterministic ordering
+        visible.sort_by_key(|gwm| gwm.membership.created_at);
+
+        // Verify correct groups and their states
+        assert_eq!(visible[0].group.mls_group_id, group_accepted.mls_group_id);
+        assert!(visible[0].is_accepted());
+        assert!(!visible[0].is_pending());
+
+        assert_eq!(visible[1].group.mls_group_id, group_pending.mls_group_id);
+        assert!(visible[1].is_pending());
+        assert!(!visible[1].is_accepted());
     }
 
     #[tokio::test]
