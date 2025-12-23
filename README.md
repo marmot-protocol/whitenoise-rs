@@ -6,11 +6,11 @@ A secure, private, and decentralized chat app built on Nostr, using the MLS prot
 
 White Noise aims to be the most secure private chat app on Nostr, with a focus on privacy and security. Under the hood, it uses the [Messaging Layer Security](https://www.rfc-editor.org/rfc/rfc9420.html) (MLS) protocol to manage group communications in a highly secure way. Nostr is used as the transport protocol and as the framework for the ongoing conversation in each chat.
 
-This crate is the core library that powers our Flutter app. It is front-end agnostic and will allow for CLI and other interfaces to operate groups in the future.
+This crate is the core library that powers our [Flutter app](https://github.com/marmot-protocol/whitenoise). It is front-end agnostic and will allow for CLI and other interfaces to operate groups in the future.
 
 ## Status
 
-![CI](https://github.com/parres-hq/whitenoise/actions/workflows/ci.yml/badge.svg?event=push)
+![CI](https://github.com/marmot-protocol/whitenoise-rs/actions/workflows/ci.yml/badge.svg?event=push)
 
 ## The Spec
 
@@ -24,7 +24,7 @@ Coming soon
 
 White Noise is a standard rust crate. Check it out and use it like you would any other crate.
 
-1. Clone the repo: `git clone https://github.com/parres-hq/whitenoise.git` and `cd whitenoise`.
+1. Clone the repo: `git clone https://github.com/marmot-protocol/whitenoise-rs.git` and `cd whitenoise-rs`.
 
 In addition, there are extensive integration tests in the codebase that run through much of the API and functions. Run it with the following
 
@@ -48,7 +48,7 @@ just precommit
 
 To get started contributing you'll need to have the [Rust](https://www.rust-lang.org/tools/install) toolchain installed (version 1.90.0 or later) and [Docker](https://www.docker.com).
 
-1. Clone the repo: `git clone https://github.com/parres-hq/whitenoise.git` and `cd whitenoise`.
+1. Clone the repo: `git clone https://github.com/marmot-protocol/whitenoise-rs.git` and `cd whitenoise-rs`.
 1. Install recommended development tools: `just install-tools` (optional but recommended)
 1. Start the development services (two Nostr relays; nostr-rs-relay and strfry, and a blossom server):
    ```bash
