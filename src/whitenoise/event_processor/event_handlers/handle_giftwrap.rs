@@ -516,4 +516,85 @@ mod tests {
         assert_eq!(group_ids.len(), 1, "Creator should have one group");
         assert!(!relays.is_empty(), "Group should have relays");
     }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_completes() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
+        let group_name = "Test Group";
+
+        // Pre-create AccountGroup to simulate synchronous creation in process_welcome
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        // Run finalize_welcome_with_instance - it should complete without panic
+        // Some operations may fail (e.g., group not in MLS) but the function handles errors gracefully
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Verify AccountGroup still exists and is pending
+        let account_group = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+        assert!(account_group.is_some(), "AccountGroup should exist");
+        assert!(
+            account_group.unwrap().is_pending(),
+            "AccountGroup should still be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_welcome_with_instance_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
+        let group_name = "Idempotent Test Group";
+
+        // Pre-create AccountGroup to simulate synchronous creation in process_welcome
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        // Run twice - should not panic
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            group_name,
+            None,
+            &whitenoise.config.data_dir,
+        )
+        .await;
+
+        // Should still have exactly one AccountGroup
+        let visible = AccountGroup::visible_for_account(&whitenoise, &account.pubkey)
+            .await
+            .unwrap();
+        let matching: Vec<_> = visible
+            .iter()
+            .filter(|ag| ag.mls_group_id == group_id)
+            .collect();
+        assert_eq!(matching.len(), 1, "Should have exactly one AccountGroup");
+    }
 }
