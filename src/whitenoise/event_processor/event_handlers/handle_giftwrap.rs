@@ -441,6 +441,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_giftwrap_creates_account_group_synchronously() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create creator and one member account; setup publishes key packages and contacts
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        // Build a real MLS Welcome giftwrap addressed to the member
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+
+        // Member processes the welcome
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(result.is_ok());
+
+        // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
+        // (not just after background task completes). This prevents race condition
+        // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
+        let mdk = Account::create_mdk(member_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(!groups.is_empty(), "Member should have at least one group");
+
+        let group_id = &groups[0].mls_group_id;
+        let account_group = AccountGroup::get(&whitenoise, &member_account.pubkey, group_id)
+            .await
+            .unwrap();
+
+        assert!(
+            account_group.is_some(),
+            "AccountGroup must exist synchronously after handle_giftwrap"
+        );
+
+        let ag = account_group.unwrap();
+        assert!(
+            ag.is_pending(),
+            "AccountGroup should be pending (user_confirmation = NULL)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_giftwrap_non_welcome_ok() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
