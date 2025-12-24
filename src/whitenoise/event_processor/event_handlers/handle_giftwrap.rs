@@ -52,36 +52,36 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Critical synchronous section: process and auto-accept MLS welcome
-        // This must complete for MLS state consistency
-        let (group_id, group_name) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
 
-            let welcome = mdk
-                .process_welcome(&event.id, &rumor)
-                .map_err(WhitenoiseError::MdkCoreError)?;
-            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
+        // Process the welcome to get group info (but don't accept yet)
+        let welcome = mdk
+            .process_welcome(&event.id, &rumor)
+            .map_err(WhitenoiseError::MdkCoreError)?;
+        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
 
-            // Auto-accept the welcome to finalize MLS membership
-            mdk.accept_welcome(&welcome)
-                .map_err(WhitenoiseError::MdkCoreError)?;
-            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+        let group_id = welcome.mls_group_id.clone();
+        let group_name = welcome.group_name.clone();
 
-            (welcome.mls_group_id, welcome.group_name)
-        };
-
-        // Create AccountGroup synchronously to avoid race condition with Flutter polling.
-        // This must happen before the background task so that when Flutter calls groups(),
-        // the AccountGroup already exists and won't be auto-accepted by lazy migration.
+        // Create AccountGroup BEFORE accept_welcome to prevent race condition.
+        // Once accept_welcome is called, the group becomes ACTIVE and Flutter can
+        // poll groups(). If AccountGroup doesn't exist yet, lazy migration would
+        // auto-accept it. By creating AccountGroup first with user_confirmation = NULL,
+        // we ensure the pending state is preserved.
         let (ag, created) = AccountGroup::get_or_create(self, &account.pubkey, &group_id).await?;
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome",
-            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
+            "AccountGroup created for account {} and group {} (new: {}, confirmation: {:?})",
             account.pubkey.to_hex(),
             hex::encode(group_id.as_slice()),
             created,
             ag.user_confirmation
         );
+
+        // Now accept the welcome to finalize MLS membership
+        mdk.accept_welcome(&welcome)
+            .map_err(WhitenoiseError::MdkCoreError)?;
+        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
 
         // Extract key package event ID for rotation
         let key_package_event_id: Option<EventId> = rumor
