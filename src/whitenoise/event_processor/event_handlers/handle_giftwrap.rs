@@ -70,6 +70,19 @@ impl Whitenoise {
             (welcome.mls_group_id, welcome.group_name)
         };
 
+        // Create AccountGroup synchronously to avoid race condition with Flutter polling.
+        // This must happen before the background task so that when Flutter calls groups(),
+        // the AccountGroup already exists and won't be auto-accepted by lazy migration.
+        let (ag, created) = AccountGroup::get_or_create(self, &account.pubkey, &group_id).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome",
+            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice()),
+            created,
+            ag.user_confirmation
+        );
+
         // Extract key package event ID for rotation
         let key_package_event_id: Option<EventId> = rumor
             .tags
