@@ -165,14 +165,9 @@ impl Whitenoise {
         };
 
         // Run independent operations concurrently
-        let (
-            account_group_result,
-            group_info_result,
-            subscription_result,
-            key_rotation_result,
-            image_sync_result,
-        ) = tokio::join!(
-            Self::create_account_group(whitenoise, account, group_id),
+        // Note: AccountGroup is already created synchronously in process_welcome
+        // to prevent race condition with Flutter polling
+        let (group_info_result, subscription_result, key_rotation_result, image_sync_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
@@ -180,16 +175,6 @@ impl Whitenoise {
         );
 
         // Log any errors (operations are independent, so we log all failures)
-        if let Err(e) = account_group_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to create AccountGroup for account {} and group {}: {}",
-                account.pubkey.to_hex(),
-                hex::encode(group_id.as_slice()),
-                e
-            );
-        }
-
         if let Err(e) = group_info_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
@@ -231,25 +216,6 @@ impl Whitenoise {
             account.pubkey.to_hex(),
             hex::encode(group_id.as_slice())
         );
-    }
-
-    /// Create AccountGroup record for the welcome
-    async fn create_account_group(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let (ag, created) =
-            AccountGroup::get_or_create(whitenoise, &account.pubkey, group_id).await?;
-        tracing::debug!(
-            target: "whitenoise::event_processor::process_welcome::background",
-            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice()),
-            created,
-            ag.user_confirmation
-        );
-        Ok(())
     }
 
     /// Create GroupInformation for the welcome
