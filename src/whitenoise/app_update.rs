@@ -63,6 +63,29 @@ impl std::fmt::Display for Version {
     }
 }
 
+fn extract_version_from_event(event: &Event) -> Option<String> {
+    event.tags.iter().find_map(|tag| {
+        if tag.as_slice().first().map(|s| s.as_str()) == Some("version") {
+            tag.as_slice().get(1).map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn compare_versions(latest_version: &str, current_version: &str) -> Result<AppUpdateInfo> {
+    let latest = Version::from_str(latest_version)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+
+    let current = Version::from_str(current_version)
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+
+    Ok(AppUpdateInfo {
+        version: latest.to_string(),
+        update_available: latest > current,
+    })
+}
+
 /// Checks for available application updates by querying the Zapstore relay.
 ///
 /// This function connects to the Zapstore relay and fetches the latest version
@@ -72,19 +95,6 @@ impl std::fmt::Display for Version {
 /// # Arguments
 ///
 /// * `current_version` - The current application version string in semver format (e.g., "1.2.3")
-///
-/// # Returns
-///
-/// Returns an [`AppUpdateInfo`] containing:
-/// - `version`: The latest available version string
-/// - `update_available`: `true` if the latest version is newer than the current version
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - Failed to connect to the Zapstore relay
-/// - No version events were found
-/// - The version string format is invalid
 pub async fn check_for_app_update(current_version: &str) -> Result<AppUpdateInfo> {
     let client = Client::default();
 
@@ -119,28 +129,10 @@ pub async fn check_for_app_update(current_version: &str) -> Result<AppUpdateInfo
         .max_by_key(|e| e.created_at)
         .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No events found")))?;
 
-    let latest_version_str = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            if tag.as_slice().first().map(|s| s.as_str()) == Some("version") {
-                tag.as_slice().get(1).map(|s| s.to_string())
-            } else {
-                None
-            }
-        })
+    let latest_version_str = extract_version_from_event(&event)
         .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No version tag found")))?;
 
-    let latest = Version::from_str(&latest_version_str)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
-
-    let current = Version::from_str(current_version)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
-
-    Ok(AppUpdateInfo {
-        version: latest.to_string(),
-        update_available: latest > current,
-    })
+    compare_versions(&latest_version_str, current_version)
 }
 
 #[cfg(test)]
@@ -411,5 +403,117 @@ mod tests {
 
         // Verify all characters are valid hex digits
         assert!(WHITE_NOISE_PUBKEY.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Tests for compare_versions helper function
+
+    #[test]
+    fn test_compare_versions_update_available() {
+        let result = compare_versions("2.0.0", "1.0.0").unwrap();
+        assert_eq!(result.version, "2.0.0");
+        assert!(result.update_available);
+    }
+
+    #[test]
+    fn test_compare_versions_no_update() {
+        let result = compare_versions("1.0.0", "1.0.0").unwrap();
+        assert_eq!(result.version, "1.0.0");
+        assert!(!result.update_available);
+    }
+
+    #[test]
+    fn test_compare_versions_current_newer() {
+        let result = compare_versions("1.0.0", "2.0.0").unwrap();
+        assert_eq!(result.version, "1.0.0");
+        assert!(!result.update_available);
+    }
+
+    #[test]
+    fn test_compare_versions_minor_update() {
+        let result = compare_versions("1.2.0", "1.1.0").unwrap();
+        assert_eq!(result.version, "1.2.0");
+        assert!(result.update_available);
+    }
+
+    #[test]
+    fn test_compare_versions_patch_update() {
+        let result = compare_versions("1.0.2", "1.0.1").unwrap();
+        assert_eq!(result.version, "1.0.2");
+        assert!(result.update_available);
+    }
+
+    #[test]
+    fn test_compare_versions_invalid_latest() {
+        let result = compare_versions("invalid", "1.0.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_compare_versions_invalid_current() {
+        let result = compare_versions("1.0.0", "invalid");
+        assert!(result.is_err());
+    }
+
+    /// Tests for extract_version_from_event helper function
+
+    #[test]
+    fn test_extract_version_from_event_valid() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+            .tag(Tag::custom(TagKind::Custom("version".into()), vec!["1.2.3"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let version = extract_version_from_event(&event);
+        assert_eq!(version, Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_version_from_event_no_version_tag() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+            .tag(Tag::custom(TagKind::Custom("other".into()), vec!["value"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let version = extract_version_from_event(&event);
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_event_empty_tags() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let version = extract_version_from_event(&event);
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_event_version_tag_no_value() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+            .tag(Tag::custom(TagKind::Custom("version".into()), Vec::<String>::new()))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let version = extract_version_from_event(&event);
+        assert!(version.is_none());
+    }
+
+    #[test]
+    fn test_extract_version_from_event_multiple_tags() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+            .tag(Tag::custom(TagKind::Custom("name".into()), vec!["whitenoise"]))
+            .tag(Tag::custom(TagKind::Custom("version".into()), vec!["2.0.0"]))
+            .tag(Tag::custom(TagKind::Custom("hash".into()), vec!["abc123"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let version = extract_version_from_event(&event);
+        assert_eq!(version, Some("2.0.0".to_string()));
     }
 }
