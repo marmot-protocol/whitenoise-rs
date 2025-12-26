@@ -460,7 +460,10 @@ mod tests {
     fn test_extract_version_from_event_valid() {
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::Custom(1063), "test content")
-            .tag(Tag::custom(TagKind::Custom("version".into()), vec!["1.2.3"]))
+            .tag(Tag::custom(
+                TagKind::Custom("version".into()),
+                vec!["1.2.3"],
+            ))
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -495,7 +498,10 @@ mod tests {
     fn test_extract_version_from_event_version_tag_no_value() {
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::Custom(1063), "test content")
-            .tag(Tag::custom(TagKind::Custom("version".into()), Vec::<String>::new()))
+            .tag(Tag::custom(
+                TagKind::Custom("version".into()),
+                Vec::<String>::new(),
+            ))
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -507,8 +513,14 @@ mod tests {
     fn test_extract_version_from_event_multiple_tags() {
         let keys = Keys::generate();
         let event = EventBuilder::new(Kind::Custom(1063), "test content")
-            .tag(Tag::custom(TagKind::Custom("name".into()), vec!["whitenoise"]))
-            .tag(Tag::custom(TagKind::Custom("version".into()), vec!["2.0.0"]))
+            .tag(Tag::custom(
+                TagKind::Custom("name".into()),
+                vec!["whitenoise"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("version".into()),
+                vec!["2.0.0"],
+            ))
             .tag(Tag::custom(TagKind::Custom("hash".into()), vec!["abc123"]))
             .sign_with_keys(&keys)
             .unwrap();
