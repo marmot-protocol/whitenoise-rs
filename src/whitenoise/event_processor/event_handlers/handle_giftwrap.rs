@@ -52,23 +52,36 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Critical synchronous section: process and auto-accept MLS welcome
-        // This must complete for MLS state consistency
-        let (group_id, group_name) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
 
-            let welcome = mdk
-                .process_welcome(&event.id, &rumor)
-                .map_err(WhitenoiseError::MdkCoreError)?;
-            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
+        // Process the welcome to get group info (but don't accept yet)
+        let welcome = mdk
+            .process_welcome(&event.id, &rumor)
+            .map_err(WhitenoiseError::MdkCoreError)?;
+        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
 
-            // Auto-accept the welcome to finalize MLS membership
-            mdk.accept_welcome(&welcome)
-                .map_err(WhitenoiseError::MdkCoreError)?;
-            tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+        let group_id = welcome.mls_group_id.clone();
+        let group_name = welcome.group_name.clone();
 
-            (welcome.mls_group_id, welcome.group_name)
-        };
+        // Create AccountGroup BEFORE accept_welcome to prevent race condition.
+        // Once accept_welcome is called, the group becomes ACTIVE and Flutter can
+        // poll groups(). If AccountGroup doesn't exist yet, lazy migration would
+        // auto-accept it. By creating AccountGroup first with user_confirmation = NULL,
+        // we ensure the pending state is preserved.
+        let (ag, created) = AccountGroup::get_or_create(self, &account.pubkey, &group_id).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome",
+            "AccountGroup created for account {} and group {} (new: {}, confirmation: {:?})",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice()),
+            created,
+            ag.user_confirmation
+        );
+
+        // Now accept the welcome to finalize MLS membership
+        mdk.accept_welcome(&welcome)
+            .map_err(WhitenoiseError::MdkCoreError)?;
+        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
 
         // Extract key package event ID for rotation
         let key_package_event_id: Option<EventId> = rumor
@@ -152,14 +165,7 @@ impl Whitenoise {
         };
 
         // Run independent operations concurrently
-        let (
-            account_group_result,
-            group_info_result,
-            subscription_result,
-            key_rotation_result,
-            image_sync_result,
-        ) = tokio::join!(
-            Self::create_account_group(whitenoise, account, group_id),
+        let (group_info_result, subscription_result, key_rotation_result, image_sync_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
@@ -167,16 +173,6 @@ impl Whitenoise {
         );
 
         // Log any errors (operations are independent, so we log all failures)
-        if let Err(e) = account_group_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to create AccountGroup for account {} and group {}: {}",
-                account.pubkey.to_hex(),
-                hex::encode(group_id.as_slice()),
-                e
-            );
-        }
-
         if let Err(e) = group_info_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
@@ -218,25 +214,6 @@ impl Whitenoise {
             account.pubkey.to_hex(),
             hex::encode(group_id.as_slice())
         );
-    }
-
-    /// Create AccountGroup record for the welcome
-    async fn create_account_group(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let (ag, created) =
-            AccountGroup::get_or_create(whitenoise, &account.pubkey, group_id).await?;
-        tracing::debug!(
-            target: "whitenoise::event_processor::process_welcome::background",
-            "AccountGroup ready for account {} and group {} (created: {}, confirmation: {:?})",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice()),
-            created,
-            ag.user_confirmation
-        );
-        Ok(())
     }
 
     /// Create GroupInformation for the welcome
@@ -428,6 +405,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_giftwrap_creates_account_group_synchronously() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create creator and one member account; setup publishes key packages and contacts
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        // Build a real MLS Welcome giftwrap addressed to the member
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+
+        // Member processes the welcome
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(result.is_ok());
+
+        // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
+        // (not just after background task completes). This prevents race condition
+        // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
+        let mdk = Account::create_mdk(member_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(!groups.is_empty(), "Member should have at least one group");
+
+        let group_id = &groups[0].mls_group_id;
+        let account_group = AccountGroup::get(&whitenoise, &member_account.pubkey, group_id)
+            .await
+            .unwrap();
+
+        assert!(
+            account_group.is_some(),
+            "AccountGroup must exist synchronously after handle_giftwrap"
+        );
+
+        let ag = account_group.unwrap();
+        assert!(
+            ag.is_pending(),
+            "AccountGroup should be pending (user_confirmation = NULL)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_giftwrap_non_welcome_ok() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -496,32 +516,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalize_welcome_with_instance_creates_account_group() {
+    async fn test_finalize_welcome_with_instance_completes() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
         let group_name = "Test Group";
 
-        // Run finalize_welcome_with_instance directly (no key package event id)
-        // Some operations may fail (e.g., group not in MLS) but the function should complete
+        // Pre-create AccountGroup to simulate synchronous creation in process_welcome
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        // Run finalize_welcome_with_instance - it should complete without panic
+        // Some operations may fail (e.g., group not in MLS) but the function handles errors gracefully
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
             &group_id,
             group_name,
-            None, // no key package to rotate
+            None,
             &whitenoise.config.data_dir,
         )
         .await;
 
-        // Verify AccountGroup was created (this operation should succeed)
-        use crate::whitenoise::accounts_groups::AccountGroup;
+        // Verify AccountGroup still exists and is pending
         let account_group = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
             .await
             .unwrap();
-        assert!(account_group.is_some(), "AccountGroup should be created");
-        let ag = account_group.unwrap();
-        assert!(ag.is_pending(), "New AccountGroup should be pending");
+        assert!(account_group.is_some(), "AccountGroup should exist");
+        assert!(
+            account_group.unwrap().is_pending(),
+            "AccountGroup should still be pending"
+        );
     }
 
     #[tokio::test]
@@ -531,7 +558,13 @@ mod tests {
         let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
         let group_name = "Idempotent Test Group";
 
-        // Run twice - should not panic (some operations may log errors but that's ok)
+        // Pre-create AccountGroup to simulate synchronous creation in process_welcome
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+
+        // Run twice - should not panic
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
@@ -553,7 +586,6 @@ mod tests {
         .await;
 
         // Should still have exactly one AccountGroup
-        use crate::whitenoise::accounts_groups::AccountGroup;
         let visible = AccountGroup::visible_for_account(&whitenoise, &account.pubkey)
             .await
             .unwrap();
