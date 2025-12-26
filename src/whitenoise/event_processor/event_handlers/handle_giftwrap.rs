@@ -165,8 +165,6 @@ impl Whitenoise {
         };
 
         // Run independent operations concurrently
-        // Note: AccountGroup is already created synchronously in process_welcome
-        // to prevent race condition with Flutter polling
         let (group_info_result, subscription_result, key_rotation_result, image_sync_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
