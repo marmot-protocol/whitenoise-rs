@@ -4,11 +4,31 @@ use std::time::Duration;
 
 use crate::whitenoise::error::{Result, WhitenoiseError};
 
-const ZAPSTORE_RELAY_URL: &str = "wss://relay.zapstore.dev";
-const WHITE_NOISE_PUBKEY: &str = "75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+/// Configuration for checking app updates from Zapstore
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppUpdateConfig {
+    /// The Zapstore relay url. Defaults to wss://relay.zapstore.dev
+    pub relay_url: String,
+    /// The app publisher's pubkey
+    pub publisher_pubkey: String,
+    /// The app identifier (package name). Example: org.parres.whitenoise
+    pub app_identifier: String,
+}
+
+impl Default for AppUpdateConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: "wss://relay.zapstore.dev".to_string(),
+            publisher_pubkey: "75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7"
+                .to_string(),
+            app_identifier: "org.parres.whitenoise".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppUpdateInfo {
     pub version: String,
     pub update_available: bool,
@@ -86,41 +106,49 @@ fn compare_versions(latest_version: &str, current_version: &str) -> Result<AppUp
     })
 }
 
-/// Checks for available application updates by querying the Zapstore relay.
+/// Checks for available application updates by querying the store relay.
 ///
-/// This function connects to the Zapstore relay and fetches the latest version
-/// information for Whitenoise. It compares the latest available version against
+/// This function connects to the provided store relay (defaults to wss://relay.zapstore.dev) and fetches the latest version
+/// information for the app, using the app identifier from the config. It compares the latest available version against
 /// the provided current version to determine if an update is available.
 ///
-/// # Arguments
+/// ## Note
+///
+/// This relies on Kind 1063 from NIP-94 (File Metadata). **However, the NIP does not
+/// explicitly define a "version" tag. We expect the version to be included as a tag
+/// with key "version", e.g., `["version", "1.2.3"]`.** This convention is used by Zapstore
+/// but may not be universal across all app stores.
+///
+/// ## Arguments
 ///
 /// * `current_version` - The current application version string in semver format (e.g., "1.2.3")
-pub async fn check_for_app_update(current_version: &str) -> Result<AppUpdateInfo> {
+/// * `config` - Configuration for the update check
+pub async fn check_for_app_update(
+    current_version: &str,
+    config: &AppUpdateConfig,
+) -> Result<AppUpdateInfo> {
     let client = Client::default();
 
-    let relay_url = RelayUrl::parse(ZAPSTORE_RELAY_URL)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    let relay_url = RelayUrl::parse(&config.relay_url)?;
 
-    client
-        .add_relay(relay_url.clone())
-        .await
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    client.add_relay(relay_url.clone()).await?;
 
     tokio::time::timeout(TIMEOUT, client.connect())
         .await
         .map_err(|_| {
-            WhitenoiseError::Other(anyhow::anyhow!("Timeout connecting to Zapstore relay"))
+            WhitenoiseError::Other(anyhow::anyhow!("Timeout connecting to the store relay"))
         })?;
 
-    let pubkey = PublicKey::from_hex(WHITE_NOISE_PUBKEY)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+    let pubkey = PublicKey::from_hex(&config.publisher_pubkey)?;
 
-    let filter = Filter::new().author(pubkey).kind(Kind::Custom(1063));
+    let filter = Filter::new()
+        .author(pubkey)
+        .kind(Kind::Custom(1063))
+        .identifier(&config.app_identifier);
 
     let events = client
         .fetch_events_from([relay_url.clone()], filter, TIMEOUT)
-        .await
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!(e)))?;
+        .await?;
 
     client.disconnect().await;
 
@@ -140,7 +168,6 @@ mod tests {
     use super::*;
 
     /// Version Parsing Tests (FromStr implementation)
-
     #[test]
     fn test_version_parse_valid() {
         // Test parsing a standard semantic version string "1.2.3"
@@ -196,30 +223,17 @@ mod tests {
     }
 
     #[test]
-    fn test_version_parse_invalid_major() {
-        // Test that parsing fails when major version is not a valid number
-        let result = Version::from_str("abc.2.3");
+    fn test_version_parse_invalid_components() {
+        let cases = [
+            ("abc.2.3", "Invalid major"),
+            ("1.xyz.3", "Invalid minor"),
+            ("1.2.abc", "Invalid patch"),
+        ];
 
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid major");
-    }
-
-    #[test]
-    fn test_version_parse_invalid_minor() {
-        // Test that parsing fails when minor version is not a valid number
-        let result = Version::from_str("1.xyz.3");
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid minor");
-    }
-
-    #[test]
-    fn test_version_parse_invalid_patch() {
-        // Test that parsing fails when patch version is not a valid number
-        let result = Version::from_str("1.2.abc");
-
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid patch");
+        for (input, expected_err) in cases {
+            let result = Version::from_str(input);
+            assert_eq!(result.unwrap_err(), expected_err, "input: {input}");
+        }
     }
 
     #[test]
@@ -252,161 +266,38 @@ mod tests {
     }
 
     #[test]
-    fn test_version_compare_major_greater() {
-        // Test comparison when major version differs (lower major but higher minor/patch)
-        let v1 = Version::from_str("2.0.0").unwrap();
-        let v2 = Version::from_str("1.9.9").unwrap();
+    fn test_version_ordering() {
+        let mut versions: Vec<_> = ["2.0.0", "1.2.3", "1.3.0", "1.9.9", "1.2.4", "1.2.9"]
+            .into_iter()
+            .map(|s| Version::from_str(s).unwrap())
+            .collect();
 
-        assert!(v1 > v2);
-        assert!(v2 < v1);
-        assert_eq!(v1.cmp(&v2), std::cmp::Ordering::Greater);
-    }
+        versions.sort();
 
-    #[test]
-    fn test_version_compare_minor_greater() {
-        // Test comparison when major is equal but minor differs (same major, higher minor)
-        let v1 = Version::from_str("1.3.0").unwrap();
-        let v2 = Version::from_str("1.2.9").unwrap();
-
-        assert!(v1 > v2);
-        assert!(v2 < v1);
-    }
-
-    #[test]
-    fn test_version_compare_patch_greater() {
-        // Test comparison when major and minor are equal but patch differs (same major.minor, higher patch)
-        let v1 = Version::from_str("1.2.4").unwrap();
-        let v2 = Version::from_str("1.2.3").unwrap();
-
-        assert!(v1 > v2);
-        assert!(v2 < v1);
-    }
-
-    #[test]
-    fn test_version_compare_ordering_chain() {
-        // Test a chain of versions to verify correct ordering
-        let v0 = Version::from_str("0.0.1").unwrap();
-        let v1 = Version::from_str("0.1.0").unwrap();
-        let v2 = Version::from_str("1.0.0").unwrap();
-        let v3 = Version::from_str("1.0.1").unwrap();
-        let v4 = Version::from_str("1.1.0").unwrap();
-        let v5 = Version::from_str("2.0.0").unwrap();
-
-        assert!(v0 < v1);
-        assert!(v1 < v2);
-        assert!(v2 < v3);
-        assert!(v3 < v4);
-        assert!(v4 < v5);
+        let sorted: Vec<_> = versions.iter().map(|v| v.to_string()).collect();
+        assert_eq!(
+            sorted,
+            ["1.2.3", "1.2.4", "1.2.9", "1.3.0", "1.9.9", "2.0.0"]
+        );
     }
 
     /// Version Display Tests (Display implementation)
-
     #[test]
     fn test_version_display() {
-        // Test that Display formats the version correctly as "x.y.z"
-        let version = Version::from_str("1.2.3").unwrap();
-
-        assert_eq!(version.to_string(), "1.2.3");
-    }
-
-    #[test]
-    fn test_version_display_zeros() {
-        // Test Display with zero values
-        let version = Version::from_str("0.0.0").unwrap();
-
-        assert_eq!(version.to_string(), "0.0.0");
-    }
-
-    #[test]
-    fn test_version_display_large_numbers() {
-        // Test Display with large numbers
-        let version = Version::from_str("100.200.300").unwrap();
-
-        assert_eq!(version.to_string(), "100.200.300");
-    }
-
-    // Version Clone and Copy Tests (derived traits)
-
-    #[test]
-    fn test_version_clone() {
-        // Test that Clone works correctly (using explicit clone for trait verification)
-        let v1 = Version::from_str("1.2.3").unwrap();
-        #[allow(clippy::clone_on_copy)]
-        let v2 = v1.clone();
-
-        assert_eq!(v1, v2);
-    }
-
-    #[test]
-    fn test_version_copy() {
-        // Test that Copy works correctly (Version implements Copy)
-        let v1 = Version::from_str("1.2.3").unwrap();
-        let v2 = v1;
-
-        assert_eq!(v1, v2);
-        assert_eq!(v1.major, 1);
-    }
-
-    /// AppUpdateInfo Tests
-
-    #[test]
-    fn test_app_update_info_creation() {
-        // Test creating AppUpdateInfo struct
-        let info = AppUpdateInfo {
-            version: "1.2.3".to_string(),
-            update_available: true,
-        };
-
-        assert_eq!(info.version, "1.2.3");
-        assert!(info.update_available);
-    }
-
-    #[test]
-    fn test_app_update_info_clone() {
-        // Test that AppUpdateInfo can be cloned
-        let info1 = AppUpdateInfo {
-            version: "2.0.0".to_string(),
-            update_available: false,
-        };
-        let info2 = info1.clone();
-
-        assert_eq!(info1.version, info2.version);
-        assert_eq!(info1.update_available, info2.update_available);
-    }
-
-    #[test]
-    fn test_app_update_info_debug() {
-        // Test that Debug formatting works (doesn't panic)
-        let info = AppUpdateInfo {
-            version: "1.0.0".to_string(),
-            update_available: true,
-        };
-
-        let debug_str = format!("{:?}", info);
-        assert!(debug_str.contains("AppUpdateInfo"));
-        assert!(debug_str.contains("1.0.0"));
+        for input in ["1.2.3", "0.0.0", "100.200.300"] {
+            let version = Version::from_str(input).unwrap();
+            assert_eq!(version.to_string(), input);
+        }
     }
 
     /// Constants Tests
-
     #[test]
-    fn test_zapstore_relay_url_is_valid() {
-        // Test that the hardcoded relay URL is a valid WebSocket URL and contains zapstore
-        assert!(ZAPSTORE_RELAY_URL.starts_with("wss://"));
-        assert!(ZAPSTORE_RELAY_URL.contains("zapstore"));
-    }
-
-    #[test]
-    fn test_whitenoise_pubkey_is_valid_hex() {
-        // Test that the hardcoded pubkey is valid 64-character hex
-        assert_eq!(WHITE_NOISE_PUBKEY.len(), 64);
-
-        // Verify all characters are valid hex digits
-        assert!(WHITE_NOISE_PUBKEY.chars().all(|c| c.is_ascii_hexdigit()));
+    fn test_default_config_pubkey_is_valid() {
+        let config = AppUpdateConfig::default();
+        PublicKey::from_hex(&config.publisher_pubkey).expect("default pubkey should be valid");
     }
 
     /// Tests for compare_versions helper function
-
     #[test]
     fn test_compare_versions_update_available() {
         let result = compare_versions("2.0.0", "1.0.0").unwrap();
@@ -455,7 +346,6 @@ mod tests {
     }
 
     /// Tests for extract_version_from_event helper function
-
     #[test]
     fn test_extract_version_from_event_valid() {
         let keys = Keys::generate();
