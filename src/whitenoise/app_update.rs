@@ -85,8 +85,13 @@ impl std::fmt::Display for Version {
 
 fn extract_version_from_event(event: &Event) -> Option<String> {
     event.tags.iter().find_map(|tag| {
-        if tag.as_slice().first().map(|s| s.as_str()) == Some("version") {
-            tag.as_slice().get(1).map(|s| s.to_string())
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) == Some("d") {
+            slice.get(1).and_then(|s| {
+                let value = s.as_str();
+                let (_, version) = value.split_once('@')?;
+                Some(version.to_string())
+            })
         } else {
             None
         }
@@ -106,23 +111,11 @@ fn compare_versions(latest_version: &str, current_version: &str) -> Result<AppUp
     })
 }
 
-/// Checks for available application updates by querying the store relay.
+/// Checks for available application updates using release events (Kind 30063 from NIP-51).
 ///
-/// This function connects to the provided store relay (defaults to wss://relay.zapstore.dev) and fetches the latest version
-/// information for the app, using the app identifier from the config. It compares the latest available version against
-/// the provided current version to determine if an update is available.
-///
-/// ## Note
-///
-/// This relies on Kind 1063 from NIP-94 (File Metadata). **However, the NIP does not
-/// explicitly define a "version" tag. We expect the version to be included as a tag
-/// with key "version", e.g., `["version", "1.2.3"]`.** This convention is used by Zapstore
-/// but may not be universal across all app stores.
-///
-/// ## Arguments
-///
-/// * `current_version` - The current application version string in semver format (e.g., "1.2.3")
-/// * `config` - Configuration for the update check
+/// This function connects to the store relay, fetches the latest release artifact event,
+/// and extracts the version from the `d` tag (encoded as `identifier@version`) e.g `"org.parres.whitenoise@0.2.1"`.
+/// It then compares it with the current version to determine if an update is available.
 pub async fn check_for_app_update(
     current_version: &str,
     config: &AppUpdateConfig,
@@ -141,10 +134,16 @@ pub async fn check_for_app_update(
 
     let pubkey = PublicKey::from_hex(&config.publisher_pubkey)?;
 
+    let app_address_tag = format!(
+        "32267:{}:{}",
+        config.publisher_pubkey, config.app_identifier
+    );
+
     let filter = Filter::new()
         .author(pubkey)
-        .kind(Kind::Custom(1063))
-        .identifier(&config.app_identifier);
+        .kind(Kind::Custom(30063))
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::A), app_address_tag)
+        .limit(1);
 
     let events = client
         .fetch_events_from([relay_url.clone()], filter, TIMEOUT)
@@ -152,13 +151,13 @@ pub async fn check_for_app_update(
 
     client.disconnect().await;
 
-    let event = events
-        .into_iter()
-        .max_by_key(|e| e.created_at)
-        .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No events found")))?;
+    let event = events.first().ok_or_else(|| {
+        WhitenoiseError::Other(anyhow::anyhow!("No release events found for app"))
+    })?;
 
-    let latest_version_str = extract_version_from_event(&event)
-        .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("No version tag found")))?;
+    let latest_version_str = extract_version_from_event(event).ok_or_else(|| {
+        WhitenoiseError::Other(anyhow::anyhow!("No version found in release event"))
+    })?;
 
     compare_versions(&latest_version_str, current_version)
 }
@@ -346,13 +345,14 @@ mod tests {
     }
 
     /// Tests for extract_version_from_event helper function
+
     #[test]
     fn test_extract_version_from_event_valid() {
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+        let event = EventBuilder::new(Kind::Custom(30063), "test content")
             .tag(Tag::custom(
-                TagKind::Custom("version".into()),
-                vec!["1.2.3"],
+                TagKind::Custom("d".into()),
+                vec!["org.parres.whitenoise@1.2.3"],
             ))
             .sign_with_keys(&keys)
             .unwrap();
@@ -362,9 +362,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_version_from_event_no_version_tag() {
+    fn test_extract_version_from_event_no_d_tag() {
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+        let event = EventBuilder::new(Kind::Custom(30063), "test content")
             .tag(Tag::custom(TagKind::Custom("other".into()), vec!["value"]))
             .sign_with_keys(&keys)
             .unwrap();
@@ -376,46 +376,11 @@ mod tests {
     #[test]
     fn test_extract_version_from_event_empty_tags() {
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(1063), "test content")
+        let event = EventBuilder::new(Kind::Custom(30063), "test content")
             .sign_with_keys(&keys)
             .unwrap();
 
         let version = extract_version_from_event(&event);
         assert!(version.is_none());
-    }
-
-    #[test]
-    fn test_extract_version_from_event_version_tag_no_value() {
-        let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(1063), "test content")
-            .tag(Tag::custom(
-                TagKind::Custom("version".into()),
-                Vec::<String>::new(),
-            ))
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        let version = extract_version_from_event(&event);
-        assert!(version.is_none());
-    }
-
-    #[test]
-    fn test_extract_version_from_event_multiple_tags() {
-        let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::Custom(1063), "test content")
-            .tag(Tag::custom(
-                TagKind::Custom("name".into()),
-                vec!["whitenoise"],
-            ))
-            .tag(Tag::custom(
-                TagKind::Custom("version".into()),
-                vec!["2.0.0"],
-            ))
-            .tag(Tag::custom(TagKind::Custom("hash".into()), vec!["abc123"]))
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        let version = extract_version_from_event(&event);
-        assert_eq!(version, Some("2.0.0".to_string()));
     }
 }
