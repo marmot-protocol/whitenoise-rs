@@ -110,6 +110,7 @@ pub struct Whitenoise {
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: message_streaming::MessageStreamManager,
+    chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
@@ -132,6 +133,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("storage", &"<REDACTED>")
             .field("message_aggregator", &"<REDACTED>")
             .field("message_stream_manager", &"<REDACTED>")
+            .field("chat_list_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
@@ -204,6 +206,7 @@ impl Whitenoise {
             storage,
             message_aggregator,
             message_stream_manager: message_streaming::MessageStreamManager::default(),
+            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             event_sender,
             shutdown_sender,
             contact_list_guards: DashMap::new(),
@@ -604,6 +607,50 @@ impl Whitenoise {
         })
     }
 
+    /// Subscribe to chat list updates for a specific account.
+    ///
+    /// Returns both an initial snapshot AND a receiver for real-time updates.
+    /// The design eliminates race conditions:
+    /// - Subscription is established BEFORE fetching to capture concurrent updates
+    /// - Any updates that arrived during fetch are merged into `initial_items`
+    /// - The receiver only yields updates AFTER the initial snapshot
+    pub async fn subscribe_to_chat_list(
+        &self,
+        account: &Account,
+    ) -> Result<chat_list_streaming::ChatListSubscription> {
+        let mut updates = self.chat_list_stream_manager.subscribe(&account.pubkey);
+
+        let fetched_items = self.get_chat_list(account).await?;
+
+        let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
+            fetched_items
+                .into_iter()
+                .map(|item| (item.mls_group_id.clone(), item))
+                .collect();
+
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    items_map.insert(update.item.mls_group_id.clone(), update.item);
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Chat list stream closed unexpectedly during subscription"
+                    )));
+                }
+            }
+        }
+
+        let initial_items: Vec<chat_list::ChatListItem> = items_map.into_values().collect();
+
+        Ok(chat_list_streaming::ChatListSubscription {
+            initial_items,
+            updates,
+        })
+    }
+
     /// Get a MediaFiles orchestrator for coordinating storage and database operations
     ///
     /// This provides high-level methods that coordinate between the storage layer
@@ -882,6 +929,7 @@ pub mod test_utils {
             storage,
             message_aggregator,
             message_stream_manager: message_streaming::MessageStreamManager::default(),
+            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             event_sender,
             shutdown_sender,
             contact_list_guards: DashMap::new(),
