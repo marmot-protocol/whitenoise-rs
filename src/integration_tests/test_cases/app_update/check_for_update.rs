@@ -41,7 +41,8 @@ impl TestCase for CheckForUpdateTestCase {
         );
 
         // Call the actual function that connects to the Zapstore relay
-        let update_info = check_for_app_update(&self.current_version).await?;
+        let config = crate::whitenoise::app_update::AppUpdateConfig::default();
+        let update_info = check_for_app_update(&self.current_version, &config).await?;
 
         tracing::info!(
             "✓ Received update info - Latest version: {}, Update available: {}",
