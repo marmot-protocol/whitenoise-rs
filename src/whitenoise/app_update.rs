@@ -45,6 +45,7 @@ impl FromStr for Version {
     type Err = &'static str;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim();
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() != 3 {
             return Err("Invalid version format (expected x.y.z)");
@@ -90,6 +91,9 @@ fn extract_version_from_event(event: &Event) -> Option<String> {
             slice.get(1).and_then(|s| {
                 let value = s.as_str();
                 let (_, version) = value.split_once('@')?;
+                if version.is_empty() {
+                    return None;
+                }
                 Some(version.to_string())
             })
         } else {
@@ -251,6 +255,15 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_version_parse_whitespace() {
+        // Test parsing with leading/trailing whitespace
+        let version = Version::from_str("  1.2.3  ").unwrap();
+        assert_eq!(version.major, 1);
+        assert_eq!(version.minor, 2);
+        assert_eq!(version.patch, 3);
+    }
+
     /// Version Comparison Tests (Ord and PartialOrd implementations)
 
     #[test]
@@ -382,5 +395,29 @@ mod tests {
 
         let version = extract_version_from_event(&event);
         assert!(version.is_none());
+    }
+
+    #[test]
+    fn test_extract_version_invalid_tags() {
+        let keys = Keys::generate();
+        let invalid_cases = vec![
+            vec![],
+            vec!["".to_string()],
+            vec!["invalid_format".to_string()],
+            vec!["app@".to_string()],
+        ];
+
+        for (i, tags) in invalid_cases.into_iter().enumerate() {
+            let event = EventBuilder::new(Kind::Custom(30063), "test content")
+                .tag(Tag::custom(TagKind::Custom("d".into()), tags))
+                .sign_with_keys(&keys)
+                .unwrap();
+
+            assert!(
+                extract_version_from_event(&event).is_none(),
+                "Failed at case index {}",
+                i
+            );
+        }
     }
 }
