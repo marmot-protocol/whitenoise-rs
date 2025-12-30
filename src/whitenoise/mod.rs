@@ -17,6 +17,7 @@ pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
 pub mod chat_list;
+pub mod chat_list_streaming;
 pub mod database;
 pub mod error;
 mod event_processor;
