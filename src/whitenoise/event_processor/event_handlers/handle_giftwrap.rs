@@ -8,6 +8,7 @@ use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     accounts_groups::AccountGroup,
+    chat_list_streaming::ChatListUpdateTrigger,
     error::{Result, WhitenoiseError},
     group_information::GroupInformation,
     relays::Relay,
@@ -180,6 +181,10 @@ impl Whitenoise {
                 hex::encode(group_id.as_slice()),
                 e
             );
+        } else {
+            whitenoise
+                .emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewGroup)
+                .await;
         }
 
         if let Err(e) = subscription_result {

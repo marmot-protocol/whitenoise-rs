@@ -12,6 +12,7 @@ use crate::whitenoise::{
     accounts::Account,
     accounts_groups::AccountGroup,
     aggregated_message::AggregatedMessage,
+    chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
     error::Result,
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessageSummary,
@@ -233,7 +234,6 @@ impl Whitenoise {
     /// - Group doesn't exist in MDK
     /// - GroupInformation doesn't exist (group not fully initialized)
     /// - AccountGroup is declined
-    #[allow(dead_code)] // Used in Commit 4 when emitting from event handlers
     pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
@@ -325,6 +325,111 @@ impl Whitenoise {
             last_message,
             pending_confirmation,
         }))
+    }
+
+    /// Emit a chat list update with the given trigger for a specific account.
+    ///
+    /// Checks for subscribers first to avoid expensive `build_chat_list_item` calls.
+    /// Errors are logged but don't affect the caller.
+    pub(crate) async fn emit_chat_list_update(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        trigger: ChatListUpdateTrigger,
+    ) {
+        if !self
+            .chat_list_stream_manager
+            .has_subscribers(&account.pubkey)
+        {
+            return;
+        }
+
+        self.emit_chat_list_update_for_account(&account.pubkey, group_id, trigger)
+            .await;
+    }
+
+    /// Emit a chat list update to ALL subscribed accounts in a group.
+    ///
+    /// Use this when a shared database modification (like deletion) triggers an
+    /// update that should reach all subscribed accounts, regardless of which
+    /// account's handler detected the change.
+    ///
+    /// This is necessary because event handlers process accounts sequentially,
+    /// and the first handler modifies shared state. Only the first handler can
+    /// correctly detect certain conditions (e.g., "was the deleted message the
+    /// last message?"), so it must emit for all subscribers.
+    pub(crate) async fn emit_chat_list_update_for_group(
+        &self,
+        group_id: &GroupId,
+        trigger: ChatListUpdateTrigger,
+    ) {
+        let account_groups = match AccountGroup::find_by_group(group_id, &self.database).await {
+            Ok(groups) => groups,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::chat_list_streaming",
+                    "Failed to find accounts in group {}: {}",
+                    hex::encode(group_id.as_slice()),
+                    e
+                );
+                return;
+            }
+        };
+
+        for ag in account_groups {
+            if self
+                .chat_list_stream_manager
+                .has_subscribers(&ag.account_pubkey)
+            {
+                self.emit_chat_list_update_for_account(&ag.account_pubkey, group_id, trigger)
+                    .await;
+            }
+        }
+    }
+
+    /// Internal helper to emit a chat list update for a specific account pubkey.
+    async fn emit_chat_list_update_for_account(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        trigger: ChatListUpdateTrigger,
+    ) {
+        let account = match Account::find_by_pubkey(pubkey, &self.database).await {
+            Ok(acc) => acc,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::chat_list_streaming",
+                    "Failed to find account {} for chat list update: {}",
+                    pubkey,
+                    e
+                );
+                return;
+            }
+        };
+
+        match self.build_chat_list_item(&account, group_id).await {
+            Ok(Some(item)) => {
+                self.chat_list_stream_manager
+                    .emit(pubkey, ChatListUpdate { trigger, item });
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    target: "whitenoise::chat_list_streaming",
+                    "Skipped {:?} update for group {} - item not buildable",
+                    trigger,
+                    hex::encode(group_id.as_slice()),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::chat_list_streaming",
+                    "Failed to build chat list item for {:?} in group {}: {}",
+                    trigger,
+                    hex::encode(group_id.as_slice()),
+                    e
+                );
+            }
+        }
     }
 
     async fn build_group_info_map(
@@ -729,7 +834,7 @@ mod tests {
             .unwrap();
 
         let msg1 = ChatMessage {
-            id: format!("{:0>64}", "msg1"),
+            id: format!("{:0>64}", "1"),
             author: creator.pubkey,
             content: "Old".to_string(),
             created_at: Timestamp::from(1000),
@@ -747,7 +852,7 @@ mod tests {
             .unwrap();
 
         let msg2 = ChatMessage {
-            id: format!("{:0>64}", "msg2"),
+            id: format!("{:0>64}", "2"),
             author: creator.pubkey,
             content: "New".to_string(),
             created_at: Timestamp::from(2000),
@@ -906,7 +1011,7 @@ mod tests {
 
         use crate::whitenoise::message_aggregator::ChatMessage;
         let msg = ChatMessage {
-            id: format!("{:0>64}", "msg1"),
+            id: format!("{:0>64}", "1"),
             author: creator.pubkey,
             content: "Hello".to_string(),
             created_at: Timestamp::now(),
@@ -967,7 +1072,7 @@ mod tests {
 
         use crate::whitenoise::message_aggregator::ChatMessage;
         let msg = ChatMessage {
-            id: format!("{:0>64}", "msg1"),
+            id: format!("{:0>64}", "1"),
             author: creator.pubkey,
             content: "Old".to_string(),
             created_at: Timestamp::from(1000),
@@ -1052,7 +1157,7 @@ mod tests {
             .unwrap();
 
         let msg = ChatMessage {
-            id: format!("{:0>64}", "msg1"),
+            id: format!("{:0>64}", "1"),
             author: creator.pubkey,
             content: "Hello World".to_string(),
             created_at: Timestamp::now(),

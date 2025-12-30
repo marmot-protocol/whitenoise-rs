@@ -54,6 +54,9 @@ pub struct ChatMessage {
 /// message data isn't needed. Uses `DateTime<Utc>` for database consistency.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessageSummary {
+    /// Event ID of the message
+    pub message_id: EventId,
+
     /// The MLS group this message belongs to
     pub mls_group_id: GroupId,
 

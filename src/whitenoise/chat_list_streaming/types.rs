@@ -3,7 +3,7 @@ use tokio::sync::broadcast;
 
 use crate::whitenoise::chat_list::ChatListItem;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatListUpdateTrigger {
     NewGroup,
     NewLastMessage,
@@ -26,10 +26,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_trigger_derives_clone_and_eq() {
+    fn update_trigger_derives_copy_and_eq() {
         let trigger = ChatListUpdateTrigger::NewGroup;
-        let cloned = trigger.clone();
-        assert_eq!(trigger, cloned);
+        let copied = trigger; // Copy trait allows implicit copy
+        assert_eq!(trigger, copied);
 
         let trigger2 = ChatListUpdateTrigger::NewLastMessage;
         assert_ne!(trigger, trigger2);

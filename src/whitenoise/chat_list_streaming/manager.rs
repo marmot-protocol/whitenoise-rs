@@ -24,7 +24,6 @@ impl ChatListStreamManager {
             .subscribe()
     }
 
-    #[allow(dead_code)] // Used in Commit 4 when emitting from event handlers
     pub fn emit(&self, account_pubkey: &PublicKey, update: ChatListUpdate) {
         if let Some(sender) = self.streams.get(account_pubkey)
             && sender.send(update).is_err()
@@ -44,7 +43,6 @@ impl ChatListStreamManager {
         }
     }
 
-    #[allow(dead_code)] // Used in Commit 4 when emitting from event handlers
     pub fn has_subscribers(&self, account_pubkey: &PublicKey) -> bool {
         self.streams
             .get(account_pubkey)
