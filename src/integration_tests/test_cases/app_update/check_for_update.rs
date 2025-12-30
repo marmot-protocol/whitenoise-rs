@@ -4,7 +4,7 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::whitenoise::app_update::check_for_app_update;
 
-/// Test case that checks for app updates from the Zapstore relay
+/// Test case that checks for app updates from the store relay
 pub struct CheckForUpdateTestCase {
     current_version: String,
     expect_update_available: Option<bool>,
@@ -40,7 +40,7 @@ impl TestCase for CheckForUpdateTestCase {
             self.current_version
         );
 
-        // Call the actual function that connects to the Zapstore relay
+        // Call the actual function that connects to the store relay
         let config = crate::whitenoise::app_update::AppUpdateConfig::default();
         let update_info = check_for_app_update(&self.current_version, &config).await?;
 
