@@ -36,7 +36,6 @@ pub mod secrets_store;
 pub mod storage;
 pub mod users;
 pub mod utils;
-pub mod welcomes;
 
 use crate::init_tracing;
 use crate::nostr_manager::NostrManager;
