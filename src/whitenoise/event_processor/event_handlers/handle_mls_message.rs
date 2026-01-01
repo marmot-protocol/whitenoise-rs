@@ -6,6 +6,7 @@ use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     aggregated_message::AggregatedMessage,
+    chat_list_streaming::ChatListUpdateTrigger,
     error::{Result, WhitenoiseError},
     media_files::MediaFile,
     message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
@@ -52,6 +53,12 @@ impl Whitenoise {
                         Kind::Custom(9) => {
                             let msg = self.cache_chat_message(&group_id, &message).await?;
                             self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
+                            self.emit_chat_list_update(
+                                account,
+                                &group_id,
+                                ChatListUpdateTrigger::NewLastMessage,
+                            )
+                            .await;
                         }
                         Kind::Reaction => {
                             if let Some(target) = self.cache_reaction(&group_id, &message).await? {
@@ -63,8 +70,26 @@ impl Whitenoise {
                             }
                         }
                         Kind::EventDeletion => {
+                            let last_message_id = self.get_last_message_id(&group_id).await;
+
                             for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
                                 self.emit_message_update(&group_id, trigger, msg);
+                            }
+
+                            // Check if the deleted message was the last message.
+                            // This check must happen AFTER get_last_message_id but the
+                            // result is only valid for the FIRST handler (before cache_deletion
+                            // modifies shared state). We emit for ALL subscribed accounts because
+                            // subsequent handlers will see incorrect post-deletion state.
+                            if let Some(last_message_id) = last_message_id {
+                                let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+                                if deleted_ids.contains(&last_message_id) {
+                                    self.emit_chat_list_update_for_group(
+                                        &group_id,
+                                        ChatListUpdateTrigger::LastMessageDeleted,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                         _ => {
@@ -139,6 +164,15 @@ impl Whitenoise {
     ) {
         self.message_stream_manager
             .emit(group_id, MessageUpdate { trigger, message });
+    }
+
+    /// Gets the ID of the last message in a group (if any).
+    async fn get_last_message_id(&self, group_id: &GroupId) -> Option<String> {
+        AggregatedMessage::find_last_by_group_ids(std::slice::from_ref(group_id), &self.database)
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .map(|s| s.message_id.to_hex())
     }
 
     /// Cache a new chat message and return it for emission.

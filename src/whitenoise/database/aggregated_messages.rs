@@ -586,7 +586,7 @@ impl AggregatedMessage {
         // Correlated subquery to get the last message per group
         // Uses id matching with ORDER BY LIMIT 1 for deterministic results on timestamp ties
         let query = format!(
-            "SELECT mls_group_id, author, content, created_at,
+            "SELECT message_id, mls_group_id, author, content, created_at,
                     json_array_length(media_attachments) as media_count
              FROM aggregated_messages am1
              WHERE kind = 9
@@ -614,6 +614,12 @@ impl AggregatedMessage {
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
+            let message_id_hex: String = row.try_get("message_id")?;
+            let message_id =
+                EventId::from_hex(&message_id_hex).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "message_id".to_string(),
+                    source: Box::new(e),
+                })?;
             let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
             let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
 
@@ -629,6 +635,7 @@ impl AggregatedMessage {
             let media_count: i64 = row.try_get("media_count")?;
 
             let summary = ChatMessageSummary {
+                message_id,
                 mls_group_id,
                 author,
                 author_display_name: None,

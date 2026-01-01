@@ -170,6 +170,23 @@ impl AccountGroup {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Finds all AccountGroups for a specific MLS group.
+    pub(crate) async fn find_by_group(
+        mls_group_id: &GroupId,
+        database: &Database,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, AccountGroupRow>(
+            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
+             FROM accounts_groups
+             WHERE mls_group_id = ?",
+        )
+        .bind(mls_group_id.as_slice())
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// Updates the user_confirmation status for this AccountGroup.
     pub(crate) async fn update_user_confirmation(
         &self,
@@ -414,5 +431,77 @@ mod tests {
         assert_ne!(ag1.id, ag2.id);
         assert_eq!(ag1.mls_group_id, ag2.mls_group_id);
         assert_ne!(ag1.account_pubkey, ag2.account_pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_group_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[15; 32]);
+
+        let result = AccountGroup::find_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_by_group_single_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[16; 32]);
+
+        let (created_ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        let result = AccountGroup::find_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, created_ag.id);
+        assert_eq!(result[0].account_pubkey, account.pubkey);
+        assert_eq!(result[0].mls_group_id, group_id);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_group_multiple_accounts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account1 = whitenoise.create_identity().await.unwrap();
+        let account2 = whitenoise.create_identity().await.unwrap();
+        let account3 = whitenoise.create_identity().await.unwrap();
+        let target_group = GroupId::from_slice(&[17; 32]);
+        let other_group = GroupId::from_slice(&[18; 32]);
+
+        // Add accounts 1 and 2 to the target group
+        AccountGroup::find_or_create(&account1.pubkey, &target_group, &whitenoise.database)
+            .await
+            .unwrap();
+        AccountGroup::find_or_create(&account2.pubkey, &target_group, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Add account 3 to a different group (should not be returned)
+        AccountGroup::find_or_create(&account3.pubkey, &other_group, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = AccountGroup::find_by_group(&target_group, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+
+        let pubkeys: Vec<_> = result.iter().map(|ag| ag.account_pubkey).collect();
+        assert!(pubkeys.contains(&account1.pubkey));
+        assert!(pubkeys.contains(&account2.pubkey));
+        assert!(!pubkeys.contains(&account3.pubkey)); // Should NOT be included
+
+        // All returned should have the target group_id
+        for ag in &result {
+            assert_eq!(ag.mls_group_id, target_group);
+        }
     }
 }
