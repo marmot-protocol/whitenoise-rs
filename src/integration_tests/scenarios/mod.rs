@@ -1,6 +1,7 @@
 pub mod account_management;
 pub mod advanced_messaging;
 pub mod app_settings;
+pub mod app_update;
 pub mod basic_messaging;
 pub mod chat_list;
 pub mod chat_list_streaming;
@@ -16,6 +17,7 @@ pub mod user_discovery;
 pub use account_management::*;
 pub use advanced_messaging::*;
 pub use app_settings::*;
+pub use app_update::*;
 pub use basic_messaging::*;
 pub use chat_list::*;
 pub use chat_list_streaming::*;

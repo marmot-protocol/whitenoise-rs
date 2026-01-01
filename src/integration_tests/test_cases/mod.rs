@@ -1,6 +1,7 @@
 pub mod account_management;
 pub mod advanced_messaging;
 pub mod app_settings;
+pub mod app_update;
 pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod chat_media_upload;
