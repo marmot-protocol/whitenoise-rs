@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
@@ -63,21 +64,19 @@ impl Whitenoise {
 
         let group_id = welcome.mls_group_id.clone();
         let group_name = welcome.group_name.clone();
+        let welcomer_pubkey = welcome.welcomer;
 
-        // Create AccountGroup BEFORE accept_welcome to prevent race condition.
-        // Once accept_welcome is called, the group becomes ACTIVE and Flutter can
-        // poll groups(). If AccountGroup doesn't exist yet, lazy migration would
-        // auto-accept it. By creating AccountGroup first with user_confirmation = NULL,
-        // we ensure the pending state is preserved.
-        let (ag, created) = AccountGroup::get_or_create(self, &account.pubkey, &group_id).await?;
-        tracing::debug!(
-            target: "whitenoise::event_processor::process_welcome",
-            "AccountGroup created for account {} and group {} (new: {}, confirmation: {:?})",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice()),
-            created,
-            ag.user_confirmation
-        );
+        let account_group = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: Some(welcomer_pubkey),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        account_group.save(&self.database).await?;
+        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "New AccountGroup created and saved");
 
         // Now accept the welcome to finalize MLS membership
         mdk.accept_welcome(&welcome)
@@ -103,6 +102,7 @@ impl Whitenoise {
             group_id,
             group_name,
             key_package_event_id,
+            welcomer_pubkey,
             data_dir,
         ));
 
@@ -116,6 +116,7 @@ impl Whitenoise {
         group_id: GroupId,
         group_name: String,
         key_package_event_id: Option<EventId>,
+        welcomer_pubkey: PublicKey,
         data_dir: PathBuf,
     ) {
         let Ok(whitenoise) = Whitenoise::get_instance() else {
@@ -132,6 +133,7 @@ impl Whitenoise {
             &group_id,
             &group_name,
             key_package_event_id,
+            welcomer_pubkey,
             &data_dir,
         )
         .await;
@@ -146,6 +148,7 @@ impl Whitenoise {
         group_id: &GroupId,
         group_name: &str,
         key_package_event_id: Option<EventId>,
+        welcomer_pubkey: PublicKey,
         data_dir: &std::path::Path,
     ) {
         // Get keys early - needed for subscriptions
@@ -166,11 +169,18 @@ impl Whitenoise {
         };
 
         // Run independent operations concurrently
-        let (group_info_result, subscription_result, key_rotation_result, image_sync_result) = tokio::join!(
+        let (
+            group_info_result,
+            subscription_result,
+            key_rotation_result,
+            image_sync_result,
+            welcomer_user_result,
+        ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
+            Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
         );
 
         // Log any errors (operations are independent, so we log all failures)
@@ -209,6 +219,14 @@ impl Whitenoise {
             tracing::warn!(
                 target: "whitenoise::event_processor::process_welcome::background",
                 "Failed to sync group image cache: {}",
+                e
+            );
+        }
+
+        if let Err(e) = welcomer_user_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to ensure welcomer user exists: {}",
                 e
             );
         }
@@ -312,6 +330,16 @@ impl Whitenoise {
         whitenoise
             .sync_group_image_cache_if_needed(account, group_id)
             .await
+    }
+
+    async fn ensure_welcomer_user_exists(
+        whitenoise: &Whitenoise,
+        welcomer_pubkey: PublicKey,
+    ) -> Result<()> {
+        whitenoise
+            .find_or_create_user_by_pubkey(&welcomer_pubkey, crate::UserSyncMode::Background)
+            .await?;
+        Ok(())
     }
 
     /// Helper to get group subscription info (group IDs and relay URLs) for an account.
@@ -450,6 +478,13 @@ mod tests {
             ag.is_pending(),
             "AccountGroup should be pending (user_confirmation = NULL)"
         );
+
+        // Verify welcomer_pubkey is set to the creator's pubkey
+        assert_eq!(
+            ag.welcomer_pubkey,
+            Some(creator_account.pubkey),
+            "AccountGroup.welcomer_pubkey should be the group creator's pubkey"
+        );
     }
 
     #[tokio::test]
@@ -526,6 +561,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = mdk_core::GroupId::from_slice(&[42; 32]);
         let group_name = "Test Group";
+        let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
         // Pre-create AccountGroup to simulate synchronous creation in process_welcome
         use crate::whitenoise::accounts_groups::AccountGroup;
@@ -541,6 +577,7 @@ mod tests {
             &group_id,
             group_name,
             None,
+            welcomer_pubkey,
             &whitenoise.config.data_dir,
         )
         .await;
@@ -562,6 +599,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = mdk_core::GroupId::from_slice(&[44; 32]);
         let group_name = "Idempotent Test Group";
+        let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
         // Pre-create AccountGroup to simulate synchronous creation in process_welcome
         use crate::whitenoise::accounts_groups::AccountGroup;
@@ -576,6 +614,7 @@ mod tests {
             &group_id,
             group_name,
             None,
+            welcomer_pubkey,
             &whitenoise.config.data_dir,
         )
         .await;
@@ -586,6 +625,7 @@ mod tests {
             &group_id,
             group_name,
             None,
+            welcomer_pubkey,
             &whitenoise.config.data_dir,
         )
         .await;

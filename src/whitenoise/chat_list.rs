@@ -50,6 +50,9 @@ pub struct ChatListItem {
     /// `true` = user was invited but hasn't accepted/declined yet
     /// `false` = user has accepted (or created) this group
     pub pending_confirmation: bool,
+
+    /// The public key of the user who invited the account to the group.
+    pub welcomer_pubkey: Option<PublicKey>,
 }
 
 /// Resolves a user's display name from metadata.
@@ -112,7 +115,7 @@ fn assemble_chat_list_items(
     last_message_map: &HashMap<GroupId, ChatMessageSummary>,
     users_by_pubkey: &HashMap<PublicKey, User>,
     image_paths: &HashMap<GroupId, PathBuf>,
-    pending_map: &HashMap<GroupId, bool>,
+    membership_map: &HashMap<GroupId, AccountGroup>,
 ) -> Vec<ChatListItem> {
     groups
         .iter()
@@ -140,10 +143,9 @@ fn assemble_chat_list_items(
                 msg
             });
 
-            let pending_confirmation = pending_map
-                .get(&group.mls_group_id)
-                .copied()
-                .unwrap_or(false);
+            let account_group = membership_map.get(&group.mls_group_id)?;
+            let pending_confirmation = account_group.is_pending();
+            let welcomer_pubkey = account_group.welcomer_pubkey;
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -154,6 +156,7 @@ fn assemble_chat_list_items(
                 group_image_url,
                 last_message,
                 pending_confirmation,
+                welcomer_pubkey,
             })
         })
         .collect()
@@ -195,9 +198,9 @@ impl Whitenoise {
         let group_ids: Vec<GroupId> = groups.iter().map(|g| g.mls_group_id.clone()).collect();
 
         // Build pending status map from membership data
-        let pending_map: HashMap<GroupId, bool> = visible_groups
+        let membership_map: HashMap<GroupId, AccountGroup> = visible_groups
             .iter()
-            .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.is_pending()))
+            .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.membership.clone()))
             .collect();
 
         let group_info_map = self
@@ -218,7 +221,7 @@ impl Whitenoise {
             &last_message_map,
             &users_by_pubkey,
             &image_paths,
-            &pending_map,
+            &membership_map,
         );
         sort_chat_list(&mut items);
 
@@ -252,7 +255,7 @@ impl Whitenoise {
                 Err(_) => return Ok(None), // Group not fully initialized
             };
 
-        // 3. Get AccountGroup for visibility/pending status
+        // 3. Get AccountGroup for visibility/pending status and welcomer pubkey
         let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
         let Some(account_group) = account_group else {
             return Ok(None); // No AccountGroup record
@@ -261,6 +264,7 @@ impl Whitenoise {
             return Ok(None); // Declined
         }
         let pending_confirmation = account_group.is_pending();
+        let welcomer_pubkey = account_group.welcomer_pubkey;
 
         // 4. For DMs: get members, find other user, lookup metadata
         let dm_other_user = if group_info.group_type == GroupType::DirectMessage {
@@ -324,6 +328,7 @@ impl Whitenoise {
             group_image_url,
             last_message,
             pending_confirmation,
+            welcomer_pubkey,
         }))
     }
 
@@ -595,6 +600,7 @@ mod tests {
         assert_eq!(chat_list[0].name, Some("Test group".to_string()));
         assert!(chat_list[0].last_message.is_none());
         assert!(!chat_list[0].pending_confirmation);
+        assert!(chat_list[0].welcomer_pubkey.is_none());
     }
 
     #[tokio::test]
@@ -1135,6 +1141,7 @@ mod tests {
         assert_eq!(item.group_type, GroupType::Group);
         assert!(item.last_message.is_none());
         assert!(!item.pending_confirmation);
+        assert!(item.welcomer_pubkey.is_none());
     }
 
     #[tokio::test]

@@ -10,6 +10,8 @@ pub struct VerifyChatListItemTestCase {
     expected_has_last_message: bool,
     expected_last_message_content: Option<String>,
     expected_pending_confirmation: Option<bool>,
+    expected_welcomer_account: Option<String>,
+    assert_no_welcomer: bool,
 }
 
 impl VerifyChatListItemTestCase {
@@ -21,6 +23,8 @@ impl VerifyChatListItemTestCase {
             expected_has_last_message: false,
             expected_last_message_content: None,
             expected_pending_confirmation: None,
+            expected_welcomer_account: None,
+            assert_no_welcomer: false,
         }
     }
 
@@ -52,6 +56,22 @@ impl VerifyChatListItemTestCase {
     /// Use this for groups created by the account being tested.
     pub fn expecting_not_pending(self) -> Self {
         self.expecting_pending_confirmation(false)
+    }
+
+    /// Verifies the welcomer_pubkey matches the pubkey of the specified account.
+    /// Use this for invited members to verify who invited them.
+    pub fn expecting_welcomer(mut self, welcomer_account_name: &str) -> Self {
+        self.expected_welcomer_account = Some(welcomer_account_name.to_string());
+        self.assert_no_welcomer = false;
+        self
+    }
+
+    /// Verifies there is no welcomer (i.e., creator's own group).
+    /// Use this for groups created by the account being tested.
+    pub fn expecting_no_welcomer(mut self) -> Self {
+        self.assert_no_welcomer = true;
+        self.expected_welcomer_account = None;
+        self
     }
 }
 
@@ -117,6 +137,24 @@ impl TestCase for VerifyChatListItemTestCase {
                 item.pending_confirmation, expected_pending,
                 "Expected pending_confirmation={} but got {}",
                 expected_pending, item.pending_confirmation
+            );
+        }
+
+        // Verify welcomer_pubkey
+        if self.assert_no_welcomer {
+            assert!(
+                item.welcomer_pubkey.is_none(),
+                "Expected no welcomer but got {:?}",
+                item.welcomer_pubkey
+            );
+        } else if let Some(welcomer_account_name) = &self.expected_welcomer_account {
+            let welcomer_account = context.get_account(welcomer_account_name)?;
+            assert_eq!(
+                item.welcomer_pubkey,
+                Some(welcomer_account.pubkey),
+                "Expected welcomer_pubkey to be {}'s pubkey but got {:?}",
+                welcomer_account_name,
+                item.welcomer_pubkey
             );
         }
 

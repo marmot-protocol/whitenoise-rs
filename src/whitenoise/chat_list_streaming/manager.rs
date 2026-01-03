@@ -84,6 +84,7 @@ mod tests {
             group_image_url: None,
             last_message: None,
             pending_confirmation: false,
+            welcomer_pubkey: None,
         }
     }
 

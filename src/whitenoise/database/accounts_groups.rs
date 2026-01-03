@@ -12,6 +12,7 @@ struct AccountGroupRow {
     account_pubkey: PublicKey,
     mls_group_id: GroupId,
     user_confirmation: Option<bool>,
+    welcomer_pubkey: Option<PublicKey>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -30,7 +31,14 @@ where
         let account_pubkey_str: String = row.try_get("account_pubkey")?;
         let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
         let user_confirmation_int: Option<i64> = row.try_get("user_confirmation")?;
-
+        let welcomer_pubkey_str: Option<String> = row.try_get("welcomer_pubkey")?;
+        let welcomer_pubkey = match welcomer_pubkey_str {
+            Some(s) => Some(PublicKey::parse(&s).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "welcomer_pubkey".to_string(),
+                source: Box::new(e),
+            })?),
+            None => None,
+        };
         // Parse pubkey from hex string
         let account_pubkey =
             PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -67,6 +75,7 @@ where
             account_pubkey,
             mls_group_id,
             user_confirmation,
+            welcomer_pubkey,
             created_at,
             updated_at,
         })
@@ -80,6 +89,7 @@ impl From<AccountGroupRow> for AccountGroup {
             account_pubkey: row.account_pubkey,
             mls_group_id: row.mls_group_id,
             user_confirmation: row.user_confirmation,
+            welcomer_pubkey: row.welcomer_pubkey,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -94,7 +104,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
+            "SELECT id, account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at
              FROM accounts_groups
              WHERE account_pubkey = ? AND mls_group_id = ?",
         )
@@ -118,7 +128,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<(Self, bool), sqlx::Error> {
         // Try to create first - this handles the race condition properly
-        match Self::create(account_pubkey, mls_group_id, database).await {
+        match Self::create(account_pubkey, mls_group_id, None, database).await {
             Ok(created) => Ok((created, true)),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Insert failed due to unique constraint - a concurrent task already created the row
@@ -141,7 +151,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
+            "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = 1)",
         )
@@ -159,7 +169,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
+            "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ? AND user_confirmation IS NULL",
         )
@@ -176,7 +186,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at
+            "SELECT *
              FROM accounts_groups
              WHERE mls_group_id = ?",
         )
@@ -202,7 +212,7 @@ impl AccountGroup {
             "UPDATE accounts_groups
              SET user_confirmation = ?, updated_at = ?
              WHERE id = ?
-             RETURNING id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at",
+             RETURNING *",
         )
         .bind(confirmation_int)
         .bind(now_ms)
@@ -213,21 +223,51 @@ impl AccountGroup {
         Ok(row.into())
     }
 
+    /// Saves the AccountGroup to the database (upsert).
+    ///
+    /// - If the record doesn't exist, inserts it
+    /// - If it exists, updates all mutable fields to match the provided values
+    pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
+               user_confirmation = excluded.user_confirmation,
+               welcomer_pubkey = excluded.welcomer_pubkey,
+               updated_at = excluded.updated_at
+             RETURNING *",
+        )
+        .bind(self.account_pubkey.to_hex())
+        .bind(self.mls_group_id.as_slice())
+        .bind(self.user_confirmation.map(|b| if b { 1i64 } else { 0i64 }))
+        .bind(self.welcomer_pubkey.as_ref().map(|pk| pk.to_hex()))
+        .bind(self.created_at.timestamp_millis())
+        .bind(now_ms)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
     async fn create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
+        welcomer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, ?)
-             RETURNING id, account_pubkey, mls_group_id, user_confirmation, created_at, updated_at",
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, ?, ?)
+             RETURNING *",
         )
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
+        .bind(welcomer_pubkey.map(|pk| pk.to_hex()))
         .bind(now_ms)
         .bind(now_ms)
         .fetch_one(&database.pool)
@@ -503,5 +543,69 @@ mod tests {
         for ag in &result {
             assert_eq!(ag.mls_group_id, target_group);
         }
+    }
+
+    #[tokio::test]
+    async fn test_save_creates_new_record() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let welcomer = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[30; 32]);
+
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: Some(welcomer.pubkey),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let saved = ag.save(&whitenoise.database).await.unwrap();
+
+        assert!(saved.id.is_some());
+        assert_eq!(saved.account_pubkey, account.pubkey);
+        assert_eq!(saved.mls_group_id, group_id);
+        assert!(saved.user_confirmation.is_none());
+        assert_eq!(saved.welcomer_pubkey, Some(welcomer.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_save_updates_existing_record() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let welcomer = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[31; 32]);
+
+        // Create initial record with welcomer
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: Some(welcomer.pubkey),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let original = ag.save(&whitenoise.database).await.unwrap();
+        assert_eq!(original.welcomer_pubkey, Some(welcomer.pubkey));
+        assert_eq!(original.user_confirmation, Some(true));
+
+        // Save with None values - should overwrite existing values
+        let update = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let saved = update.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(saved.id, original.id);
+        assert!(saved.user_confirmation.is_none());
+        assert!(saved.welcomer_pubkey.is_none());
     }
 }
