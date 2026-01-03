@@ -478,6 +478,13 @@ mod tests {
             ag.is_pending(),
             "AccountGroup should be pending (user_confirmation = NULL)"
         );
+
+        // Verify welcomer_pubkey is set to the creator's pubkey
+        assert_eq!(
+            ag.welcomer_pubkey,
+            Some(creator_account.pubkey),
+            "AccountGroup.welcomer_pubkey should be the group creator's pubkey"
+        );
     }
 
     #[tokio::test]
