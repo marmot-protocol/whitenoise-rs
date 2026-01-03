@@ -21,6 +21,7 @@ pub struct AccountGroup {
     pub account_pubkey: PublicKey,
     pub mls_group_id: GroupId,
     pub user_confirmation: Option<bool>,
+    pub welcomer_pubkey: Option<PublicKey>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

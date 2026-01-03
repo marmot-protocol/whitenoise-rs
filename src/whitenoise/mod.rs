@@ -525,6 +525,7 @@ impl Whitenoise {
     /// Returns the number of currently running scheduler tasks.
     ///
     /// This is primarily useful for integration testing to verify the scheduler is running.
+    #[cfg(feature = "integration-tests")]
     pub(crate) async fn scheduler_task_count(&self) -> usize {
         self.scheduler_handles.lock().await.len()
     }
