@@ -163,6 +163,26 @@ impl Scenario for ChatListScenario {
             .await?;
 
         // ============================================================
+        // Test 7: Welcomer pubkey verification (invited member's perspective)
+        // ============================================================
+        tracing::info!("Test 7: Verifying welcomer_pubkey for invited member...");
+
+        // Wait for Bob to receive and process the welcome for chat_list_group
+        WaitForWelcomeTestCase::for_account("chat_list_bob", "chat_list_group")
+            .execute(&mut self.context)
+            .await?;
+
+        // Verify Bob's view of the group shows Alice as the welcomer and pending confirmation
+        // Note: Bob also sees Alice's message that was sent in Test 4
+        VerifyChatListItemTestCase::new("chat_list_bob", "chat_list_group")
+            .expecting_name("chat_list_group")
+            .expecting_last_message("Hello from Alice!") // Bob sees Alice's message
+            .expecting_pending_confirmation(true) // Bob hasn't accepted yet
+            .expecting_welcomer("chat_list_alice") // Alice invited Bob
+            .execute(&mut self.context)
+            .await?;
+
+        // ============================================================
         // Summary
         // ============================================================
         tracing::info!("✓ Chat list scenario completed with:");
@@ -173,6 +193,7 @@ impl Scenario for ChatListScenario {
         tracing::info!("  • Sorting by last activity time");
         tracing::info!("  • DM name resolution from user metadata");
         tracing::info!("  • Creator's groups auto-accepted (pending_confirmation=false)");
+        tracing::info!("  • Invited member sees welcomer_pubkey and pending_confirmation=true");
 
         Ok(())
     }
