@@ -643,7 +643,8 @@ impl Whitenoise {
             }
         }
 
-        let initial_items: Vec<chat_list::ChatListItem> = items_map.into_values().collect();
+        let mut initial_items: Vec<chat_list::ChatListItem> = items_map.into_values().collect();
+        chat_list::sort_chat_list(&mut initial_items);
 
         Ok(chat_list_streaming::ChatListSubscription {
             initial_items,
@@ -1716,6 +1717,105 @@ mod tests {
             whitenoise.shutdown().await.unwrap();
             whitenoise.shutdown().await.unwrap();
             whitenoise.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_subscribe_to_chat_list_returns_sorted_initial_items() {
+            use chrono::Utc;
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let creator = whitenoise.create_identity().await.unwrap();
+            let member = whitenoise.create_identity().await.unwrap();
+
+            let base_timestamp = Utc::now().timestamp() as u64;
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = "Group A".to_string();
+            let group_a = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = "Group B".to_string();
+            let group_b = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = "Group C".to_string();
+            let group_c = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = "Group D".to_string();
+            let group_d = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = "Group E".to_string();
+            let group_e = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+
+            let messages = vec![
+                (&group_a, "1", "Message A", base_timestamp - 7200), // -2 hours
+                (&group_b, "2", "Message B", base_timestamp + 7200), // +2 hours
+                (&group_d, "4", "Message D", base_timestamp - 3600), // -1 hour
+                (&group_e, "5", "Message E", base_timestamp + 3600), // +1 hour
+            ];
+
+            for (group, id, content, timestamp) in messages {
+                let msg = message_aggregator::ChatMessage {
+                    id: format!("{:0>64}", id),
+                    author: creator.pubkey,
+                    content: content.to_string(),
+                    created_at: nostr_sdk::Timestamp::from(timestamp),
+                    tags: nostr_sdk::Tags::new(),
+                    is_reply: false,
+                    reply_to_id: None,
+                    is_deleted: false,
+                    content_tokens: vec![],
+                    reactions: message_aggregator::ReactionSummary::default(),
+                    kind: 9,
+                    media_attachments: vec![],
+                };
+                aggregated_message::AggregatedMessage::insert_message(
+                    &msg,
+                    &group.mls_group_id,
+                    &whitenoise.database,
+                )
+                .await
+                .unwrap();
+            }
+
+            let subscription = whitenoise.subscribe_to_chat_list(&creator).await.unwrap();
+
+            let initial_items = subscription.initial_items;
+            assert_eq!(initial_items.len(), 5);
+
+            // Verify items are in descending timestamp order:
+            // B (+2h) -> E (+1h) -> C (~now, no msg) -> D (-1h) -> A (-2h)
+            assert_eq!(
+                initial_items[0].mls_group_id, group_b.mls_group_id,
+                "First: Group B with newest message (+2h)"
+            );
+            assert_eq!(
+                initial_items[1].mls_group_id, group_e.mls_group_id,
+                "Second: Group E (+1h)"
+            );
+            assert_eq!(
+                initial_items[2].mls_group_id, group_c.mls_group_id,
+                "Third: Group C (no messages, created_at ~now)"
+            );
+            assert_eq!(
+                initial_items[3].mls_group_id, group_d.mls_group_id,
+                "Fourth: Group D (-1h)"
+            );
+            assert_eq!(
+                initial_items[4].mls_group_id, group_a.mls_group_id,
+                "Fifth: Group A with oldest message (-2h)"
+            );
         }
     }
 }
