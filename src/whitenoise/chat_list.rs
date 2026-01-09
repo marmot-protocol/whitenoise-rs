@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -53,6 +54,17 @@ pub struct ChatListItem {
 
     /// The public key of the user who invited the account to the group.
     pub welcomer_pubkey: Option<PublicKey>,
+}
+
+impl ChatListItem {
+    fn sort_key(&self) -> (Reverse<DateTime<Utc>>, &GroupId) {
+        let timestamp = self
+            .last_message
+            .as_ref()
+            .map(|m| m.created_at)
+            .unwrap_or(self.created_at);
+        (Reverse(timestamp), &self.mls_group_id)
+    }
 }
 
 /// Resolves a user's display name from metadata.
@@ -164,20 +176,9 @@ fn assemble_chat_list_items(
 
 /// Sorts chat list items by last activity (most recent first).
 /// Groups without messages are sorted by creation date.
-fn sort_chat_list(items: &mut [ChatListItem]) {
-    items.sort_by(|a, b| {
-        let a_time = a
-            .last_message
-            .as_ref()
-            .map(|m| m.created_at)
-            .unwrap_or(a.created_at);
-        let b_time = b
-            .last_message
-            .as_ref()
-            .map(|m| m.created_at)
-            .unwrap_or(b.created_at);
-        b_time.cmp(&a_time) // Descending (most recent first)
-    });
+/// Uses mls_group_id as a tiebreaker for stable ordering when timestamps are identical.
+pub(crate) fn sort_chat_list(items: &mut [ChatListItem]) {
+    items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 }
 
 impl Whitenoise {
@@ -1228,5 +1229,214 @@ mod tests {
         let item = result.unwrap();
         assert_eq!(item.group_type, GroupType::DirectMessage);
         assert_eq!(item.name, Some("Bob".to_string()));
+    }
+
+    #[test]
+    fn test_sort_chat_list_uses_group_id_tiebreaker_without_messages() {
+        use chrono::TimeZone;
+
+        let timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+
+        // Create items in WRONG order with identical timestamps
+        // Without tiebreaker, they'd stay in this wrong order
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[3u8; 32]),
+                name: Some("Group C".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Group A".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[2u8; 32]),
+                name: Some("Group B".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // After sorting, should be ordered by group_id (ascending)
+        // This FAILS without the tiebreaker because items stay in original order
+        assert_eq!(items[0].mls_group_id.as_slice(), &[1u8; 32]);
+        assert_eq!(items[1].mls_group_id.as_slice(), &[2u8; 32]);
+        assert_eq!(items[2].mls_group_id.as_slice(), &[3u8; 32]);
+    }
+
+    #[test]
+    fn test_sort_chat_list_uses_group_id_tiebreaker_with_identical_message_timestamps() {
+        use chrono::TimeZone;
+
+        let timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+        let msg_timestamp = Utc.timestamp_opt(2000, 0).unwrap();
+
+        // Create items with same message timestamp but different group IDs
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[255u8; 32]),
+                name: Some("Group Last".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: Some(ChatMessageSummary {
+                    message_id: nostr_sdk::EventId::all_zeros(),
+                    mls_group_id: GroupId::from_slice(&[255u8; 32]),
+                    author: nostr_sdk::Keys::generate().public_key(),
+                    author_display_name: None,
+                    content: "Test".to_string(),
+                    created_at: msg_timestamp,
+                    media_attachment_count: 0,
+                }),
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Group First".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: Some(ChatMessageSummary {
+                    message_id: nostr_sdk::EventId::all_zeros(),
+                    mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                    author: nostr_sdk::Keys::generate().public_key(),
+                    author_display_name: None,
+                    content: "Test".to_string(),
+                    created_at: msg_timestamp,
+                    media_attachment_count: 0,
+                }),
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[128u8; 32]),
+                name: Some("Group Middle".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: Some(ChatMessageSummary {
+                    message_id: nostr_sdk::EventId::all_zeros(),
+                    mls_group_id: GroupId::from_slice(&[128u8; 32]),
+                    author: nostr_sdk::Keys::generate().public_key(),
+                    author_display_name: None,
+                    content: "Test".to_string(),
+                    created_at: msg_timestamp,
+                    media_attachment_count: 0,
+                }),
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // Should be sorted by group_id when message timestamps are identical
+        // This FAILS without tiebreaker - items stay in wrong order
+        assert_eq!(items[0].mls_group_id.as_slice(), &[1u8; 32]);
+        assert_eq!(items[1].mls_group_id.as_slice(), &[128u8; 32]);
+        assert_eq!(items[2].mls_group_id.as_slice(), &[255u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_sorting_stable_without_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        // Create multiple groups rapidly (same created_at timestamp)
+        let mut groups = Vec::new();
+        for i in 0..3 {
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = format!("Group {}", i);
+            let group = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            groups.push(group);
+        }
+
+        // Fetch chat list multiple times - order should be stable
+        let list1 = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list2 = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(list1.len(), 3);
+        assert_eq!(list2.len(), 3);
+        // Order should be identical across calls
+        for i in 0..3 {
+            assert_eq!(list1[i].mls_group_id, list2[i].mls_group_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorting_stable_with_identical_timestamps() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut groups = Vec::new();
+        for i in 0..3 {
+            let mut config = create_nostr_group_config_data(vec![creator.pubkey]);
+            config.name = format!("Group {}", i);
+            let group = whitenoise
+                .create_group(&creator, vec![member.pubkey], config, None)
+                .await
+                .unwrap();
+            groups.push(group);
+        }
+
+        // Add messages with identical timestamps to all groups
+        let same_timestamp = Timestamp::from(5000);
+        for group in &groups {
+            let msg = ChatMessage {
+                id: format!("{:0>64}", hex::encode(group.mls_group_id.as_slice())),
+                author: creator.pubkey,
+                content: "Test".to_string(),
+                created_at: same_timestamp,
+                tags: nostr_sdk::Tags::new(),
+                is_reply: false,
+                reply_to_id: None,
+                is_deleted: false,
+                content_tokens: vec![],
+                reactions: Default::default(),
+                kind: 9,
+                media_attachments: vec![],
+            };
+            AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Order should be stable when timestamps are identical
+        let list1 = whitenoise.get_chat_list(&creator).await.unwrap();
+        let list2 = whitenoise.get_chat_list(&creator).await.unwrap();
+
+        assert_eq!(list1.len(), 3);
+        for i in 0..3 {
+            assert_eq!(list1[i].mls_group_id, list2[i].mls_group_id);
+        }
     }
 }

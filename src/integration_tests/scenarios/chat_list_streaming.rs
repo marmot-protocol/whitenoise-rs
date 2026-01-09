@@ -13,6 +13,7 @@ pub struct ChatListStreamingScenario {
 
 impl ChatListStreamingScenario {
     const GROUP_NAME: &'static str = "chat_list_stream_group";
+    const INACTIVE_GROUP_NAME: &'static str = "inactive_group";
 
     pub fn new(whitenoise: &'static Whitenoise) -> Self {
         Self {
@@ -145,15 +146,44 @@ impl ChatListStreamingScenario {
         Ok(())
     }
 
-    async fn phase6_verify_subscription_with_existing_items(
-        &mut self,
-    ) -> Result<(), WhitenoiseError> {
-        tracing::info!("=== Phase 6: Verify subscription returns existing items ===");
+    async fn phase6_verify_subscription_ordering(&mut self) -> Result<(), WhitenoiseError> {
+        tracing::info!("=== Phase 6: Verify subscription returns items in correct order ===");
 
-        VerifySubscriptionInitialItemsTestCase::expect_group("stream_creator", Self::GROUP_NAME)
+        // Create a second group (will have created_at = now, but no messages)
+        CreateGroupTestCase::basic()
+            .with_name(Self::INACTIVE_GROUP_NAME)
+            .with_members("stream_creator", vec!["stream_member"])
             .execute(&mut self.context)
             .await?;
 
+        // Pause to ensure timestamp separation (Nostr timestamps are in seconds)
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Send a new message to the original group to ensure it has the most recent activity
+        SendMessageTestCase::basic()
+            .with_sender("stream_creator")
+            .with_group(Self::GROUP_NAME)
+            .with_message_id_key("msg_stream_final")
+            .with_content("Final message for ordering test")
+            .execute(&mut self.context)
+            .await?;
+
+        // Wait for message to be processed
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Verify subscription returns groups in correct order:
+        // 1. GROUP_NAME (has most recent message)
+        // 2. INACTIVE_GROUP_NAME (just created_at, no messages)
+        VerifySubscriptionInitialItemsTestCase::expect_groups_in_order(
+            "stream_creator",
+            vec![Self::GROUP_NAME, Self::INACTIVE_GROUP_NAME],
+        )
+        .execute(&mut self.context)
+        .await?;
+
+        tracing::info!(
+            "✓ Subscription returns items in correct order (most recent activity first)"
+        );
         Ok(())
     }
 }
@@ -172,8 +202,7 @@ impl Scenario for ChatListStreamingScenario {
         self.phase3_test_new_group().await?;
         self.phase4_test_new_last_message().await?;
         self.phase5_test_last_message_deleted().await?;
-        self.phase6_verify_subscription_with_existing_items()
-            .await?;
+        self.phase6_verify_subscription_ordering().await?;
 
         tracing::info!("✓ ChatListStreamingScenario completed successfully");
         Ok(())
