@@ -72,6 +72,7 @@ impl Whitenoise {
             mls_group_id: group_id.clone(),
             user_confirmation: None,
             welcomer_pubkey: Some(welcomer_pubkey),
+            last_read_message_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

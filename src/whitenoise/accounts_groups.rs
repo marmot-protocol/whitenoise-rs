@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
-use nostr_sdk::PublicKey;
+use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, accounts::Account, error::WhitenoiseError};
+use crate::whitenoise::{
+    Whitenoise, accounts::Account, aggregated_message::AggregatedMessage, error::WhitenoiseError,
+};
 
 /// Represents the relationship between an account and an MLS group.
 ///
@@ -22,6 +24,7 @@ pub struct AccountGroup {
     pub mls_group_id: GroupId,
     pub user_confirmation: Option<bool>,
     pub welcomer_pubkey: Option<PublicKey>,
+    pub last_read_message_id: Option<EventId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -108,6 +111,18 @@ impl AccountGroup {
             .await?;
         Ok(updated)
     }
+
+    /// Marks the given message as the last read message for this account-group.
+    pub async fn mark_read(
+        &self,
+        message_id: &EventId,
+        whitenoise: &Whitenoise,
+    ) -> Result<Self, WhitenoiseError> {
+        let updated = self
+            .update_last_read(message_id, &whitenoise.database)
+            .await?;
+        Ok(updated)
+    }
 }
 
 impl Whitenoise {
@@ -158,6 +173,36 @@ impl Whitenoise {
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
         account_group.decline(self).await
+    }
+
+    /// Marks a message as read for the given account.
+    ///
+    /// Looks up the message to find its group, then updates the last_read_message_id
+    /// for that account-group pair.
+    pub async fn mark_message_read(
+        &self,
+        account: &Account,
+        message_id: &EventId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let message = AggregatedMessage::find_by_message_id(message_id, &self.database)
+            .await?
+            .ok_or(WhitenoiseError::MessageNotFound)?;
+
+        let account_group = AccountGroup::get(self, &account.pubkey, &message.mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        account_group.mark_read(message_id, self).await
+    }
+
+    /// Gets the last read message ID for an account in a group.
+    pub async fn get_last_read_message_id(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<Option<EventId>, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
+        Ok(account_group.and_then(|ag| ag.last_read_message_id))
     }
 }
 
@@ -526,5 +571,53 @@ mod tests {
 
         // All should be pending initially
         assert!(ag1.is_pending() && ag2.is_pending() && ag3.is_pending());
+    }
+
+    #[tokio::test]
+    async fn test_mark_message_read_fails_for_nonexistent_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let fake_message_id = EventId::all_zeros();
+
+        let result = whitenoise
+            .mark_message_read(&account, &fake_message_id)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::MessageNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_get_last_read_message_id_returns_none_when_not_set() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[99; 32]);
+
+        // Create account group first
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .get_last_read_message_id(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_last_read_message_id_returns_none_for_nonexistent_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[98; 32]);
+
+        // Don't create account group - it shouldn't exist
+        let result = whitenoise
+            .get_last_read_message_id(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
     }
 }

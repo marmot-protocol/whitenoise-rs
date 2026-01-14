@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
-use nostr_sdk::PublicKey;
+use nostr_sdk::prelude::*;
 
 use super::{Database, utils::parse_timestamp};
 use crate::whitenoise::accounts_groups::AccountGroup;
@@ -13,6 +13,7 @@ struct AccountGroupRow {
     mls_group_id: GroupId,
     user_confirmation: Option<bool>,
     welcomer_pubkey: Option<PublicKey>,
+    last_read_message_id: Option<EventId>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -39,6 +40,18 @@ where
             })?),
             None => None,
         };
+
+        let last_read_message_id_str: Option<String> = row.try_get("last_read_message_id")?;
+        let last_read_message_id = match last_read_message_id_str {
+            Some(hex) => Some(
+                EventId::from_hex(&hex).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "last_read_message_id".to_string(),
+                    source: Box::new(e),
+                })?,
+            ),
+            None => None,
+        };
+
         // Parse pubkey from hex string
         let account_pubkey =
             PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -76,6 +89,7 @@ where
             mls_group_id,
             user_confirmation,
             welcomer_pubkey,
+            last_read_message_id,
             created_at,
             updated_at,
         })
@@ -90,6 +104,7 @@ impl From<AccountGroupRow> for AccountGroup {
             mls_group_id: row.mls_group_id,
             user_confirmation: row.user_confirmation,
             welcomer_pubkey: row.welcomer_pubkey,
+            last_read_message_id: row.last_read_message_id,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -104,7 +119,7 @@ impl AccountGroup {
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "SELECT id, account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at
+            "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ? AND mls_group_id = ?",
         )
@@ -231,11 +246,12 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?)
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
                user_confirmation = excluded.user_confirmation,
                welcomer_pubkey = excluded.welcomer_pubkey,
+               last_read_message_id = excluded.last_read_message_id,
                updated_at = excluded.updated_at
              RETURNING *",
         )
@@ -243,8 +259,33 @@ impl AccountGroup {
         .bind(self.mls_group_id.as_slice())
         .bind(self.user_confirmation.map(|b| if b { 1i64 } else { 0i64 }))
         .bind(self.welcomer_pubkey.as_ref().map(|pk| pk.to_hex()))
+        .bind(self.last_read_message_id.as_ref().map(|id| id.to_hex()))
         .bind(self.created_at.timestamp_millis())
         .bind(now_ms)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Updates the last_read_message_id for this AccountGroup.
+    pub(crate) async fn update_last_read(
+        &self,
+        message_id: &EventId,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET last_read_message_id = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(message_id.to_hex())
+        .bind(now_ms)
+        .bind(id)
         .fetch_one(&database.pool)
         .await?;
 
@@ -558,6 +599,7 @@ mod tests {
             mls_group_id: group_id.clone(),
             user_confirmation: None,
             welcomer_pubkey: Some(welcomer.pubkey),
+            last_read_message_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -585,6 +627,7 @@ mod tests {
             mls_group_id: group_id.clone(),
             user_confirmation: Some(true),
             welcomer_pubkey: Some(welcomer.pubkey),
+            last_read_message_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -599,6 +642,7 @@ mod tests {
             mls_group_id: group_id.clone(),
             user_confirmation: None,
             welcomer_pubkey: None,
+            last_read_message_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -607,5 +651,83 @@ mod tests {
         assert_eq!(saved.id, original.id);
         assert!(saved.user_confirmation.is_none());
         assert!(saved.welcomer_pubkey.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_last_read_stores_message_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[40; 32]);
+        let message_id = EventId::all_zeros();
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(account_group.last_read_message_id.is_none());
+
+        let updated = account_group
+            .update_last_read(&message_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(updated.last_read_message_id, Some(message_id));
+    }
+
+    #[tokio::test]
+    async fn test_update_last_read_overwrites_previous() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[41; 32]);
+        let message_id_1 = EventId::from_hex(&format!("{:0>64}", "1")).unwrap();
+        let message_id_2 = EventId::from_hex(&format!("{:0>64}", "2")).unwrap();
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        let updated = account_group
+            .update_last_read(&message_id_1, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(updated.last_read_message_id, Some(message_id_1));
+
+        let updated = updated
+            .update_last_read(&message_id_2, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(updated.last_read_message_id, Some(message_id_2));
+    }
+
+    #[tokio::test]
+    async fn test_last_read_persists_through_find() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[42; 32]);
+        let message_id = EventId::from_hex(&format!("{:0>64}", "abc")).unwrap();
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        account_group
+            .update_last_read(&message_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Fetch again and verify persistence
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(found.last_read_message_id, Some(message_id));
     }
 }

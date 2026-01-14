@@ -54,6 +54,9 @@ pub struct ChatListItem {
 
     /// The public key of the user who invited the account to the group.
     pub welcomer_pubkey: Option<PublicKey>,
+
+    /// Number of unread messages in this chat
+    pub unread_count: usize,
 }
 
 impl ChatListItem {
@@ -128,6 +131,7 @@ fn assemble_chat_list_items(
     users_by_pubkey: &HashMap<PublicKey, User>,
     image_paths: &HashMap<GroupId, PathBuf>,
     membership_map: &HashMap<GroupId, AccountGroup>,
+    unread_counts: &HashMap<GroupId, usize>,
 ) -> Vec<ChatListItem> {
     groups
         .iter()
@@ -158,6 +162,7 @@ fn assemble_chat_list_items(
             let account_group = membership_map.get(&group.mls_group_id)?;
             let pending_confirmation = account_group.is_pending();
             let welcomer_pubkey = account_group.welcomer_pubkey;
+            let unread_count = *unread_counts.get(&group.mls_group_id).unwrap_or(&0);
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -169,6 +174,7 @@ fn assemble_chat_list_items(
                 last_message,
                 pending_confirmation,
                 welcomer_pubkey,
+                unread_count,
             })
         })
         .collect()
@@ -208,12 +214,20 @@ impl Whitenoise {
             .build_group_info_map(account.pubkey, &group_ids)
             .await?;
         let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map)?;
-        let last_message_map = self.build_last_message_map(&group_ids).await;
+        let last_message_map = self.build_last_message_map(&group_ids).await?;
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
-        let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await;
+        let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
         let image_paths = self
             .resolve_group_images(account, &groups, &group_info_map)
             .await;
+
+        // Compute unread counts for all groups in a single batch query
+        let group_markers: Vec<_> = membership_map
+            .iter()
+            .map(|(gid, ag)| (gid.clone(), ag.last_read_message_id))
+            .collect();
+        let unread_counts =
+            AggregatedMessage::count_unread_for_groups(&group_markers, &self.database).await?;
 
         let mut items = assemble_chat_list_items(
             &groups,
@@ -223,6 +237,7 @@ impl Whitenoise {
             &users_by_pubkey,
             &image_paths,
             &membership_map,
+            &unread_counts,
         );
         sort_chat_list(&mut items);
 
@@ -284,8 +299,7 @@ impl Whitenoise {
             std::slice::from_ref(group_id),
             &self.database,
         )
-        .await
-        .unwrap_or_default();
+        .await?;
         let last_message_summary = last_message_summaries.into_iter().next();
 
         // 6. Lookup message author metadata and build final last_message
@@ -319,7 +333,15 @@ impl Whitenoise {
             }
         };
 
-        // 8. Assemble and return ChatListItem
+        // 8. Compute unread count
+        let unread_count = AggregatedMessage::count_unread_for_group(
+            group_id,
+            account_group.last_read_message_id.as_ref(),
+            &self.database,
+        )
+        .await?;
+
+        // 9. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
             mls_group_id: group_id.clone(),
             name,
@@ -330,6 +352,7 @@ impl Whitenoise {
             last_message,
             pending_confirmation,
             welcomer_pubkey,
+            unread_count,
         }))
     }
 
@@ -479,22 +502,21 @@ impl Whitenoise {
     async fn build_last_message_map(
         &self,
         group_ids: &[GroupId],
-    ) -> HashMap<GroupId, ChatMessageSummary> {
-        AggregatedMessage::find_last_by_group_ids(group_ids, &self.database)
-            .await
-            .unwrap_or_default()
+    ) -> Result<HashMap<GroupId, ChatMessageSummary>> {
+        let summaries =
+            AggregatedMessage::find_last_by_group_ids(group_ids, &self.database).await?;
+        Ok(summaries
             .into_iter()
             .map(|s| (s.mls_group_id.clone(), s))
-            .collect()
+            .collect())
     }
 
-    async fn build_users_by_pubkey(&self, pubkeys: &[PublicKey]) -> HashMap<PublicKey, User> {
-        User::find_by_pubkeys(pubkeys, &self.database)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|u| (u.pubkey, u))
-            .collect()
+    async fn build_users_by_pubkey(
+        &self,
+        pubkeys: &[PublicKey],
+    ) -> Result<HashMap<PublicKey, User>> {
+        let users = User::find_by_pubkeys(pubkeys, &self.database).await?;
+        Ok(users.into_iter().map(|u| (u.pubkey, u)).collect())
     }
 
     /// Resolves image paths for Group-type chats only (DMs use profile picture URLs).
@@ -1250,6 +1272,7 @@ mod tests {
                 last_message: None,
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1261,6 +1284,7 @@ mod tests {
                 last_message: None,
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1272,6 +1296,7 @@ mod tests {
                 last_message: None,
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
         ];
 
@@ -1311,6 +1336,7 @@ mod tests {
                 }),
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1330,6 +1356,7 @@ mod tests {
                 }),
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1349,6 +1376,7 @@ mod tests {
                 }),
                 pending_confirmation: false,
                 welcomer_pubkey: None,
+                unread_count: 0,
             },
         ];
 

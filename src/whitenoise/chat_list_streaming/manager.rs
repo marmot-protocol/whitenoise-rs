@@ -85,6 +85,7 @@ mod tests {
             last_message: None,
             pending_confirmation: false,
             welcomer_pubkey: None,
+            unread_count: 0,
         }
     }
 
