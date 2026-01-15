@@ -88,6 +88,7 @@ impl Scenario for ChatListScenario {
             .expecting_name("chat_list_group") // Name matches context key from with_name()
             .expecting_no_last_message()
             .expecting_not_pending() // Creator's groups are auto-accepted
+            .expecting_unread_count(0) // No messages = no unread
             .execute(&mut self.context)
             .await?;
 
@@ -110,6 +111,7 @@ impl Scenario for ChatListScenario {
         VerifyChatListItemTestCase::new("chat_list_alice", "chat_list_group")
             .expecting_name("chat_list_group")
             .expecting_last_message("Hello from Alice!")
+            .expecting_unread_count(1) // 1 message, none marked as read
             .execute(&mut self.context)
             .await?;
 
@@ -143,6 +145,7 @@ impl Scenario for ChatListScenario {
         // Verify DM has the correct last message
         VerifyChatListItemTestCase::new("chat_list_alice", "chat_list_dm")
             .expecting_last_message("Hello in DM!")
+            .expecting_unread_count(1) // 1 DM message, none marked as read
             .execute(&mut self.context)
             .await?;
 
@@ -179,6 +182,25 @@ impl Scenario for ChatListScenario {
             .expecting_last_message("Hello from Alice!") // Bob sees Alice's message
             .expecting_pending_confirmation(true) // Bob hasn't accepted yet
             .expecting_welcomer("chat_list_alice") // Alice invited Bob
+            .expecting_unread_count(1) // Bob sees 1 unread message from Alice
+            .execute(&mut self.context)
+            .await?;
+
+        // ============================================================
+        // Test 8: Mark message as read and verify unread_count decreases
+        // ============================================================
+        tracing::info!("Test 8: Verifying mark_message_read reduces unread_count...");
+
+        // Alice marks her message in the group as read
+        MarkMessageReadTestCase::new("chat_list_alice", "chat_list_msg1")
+            .execute(&mut self.context)
+            .await?;
+
+        // Verify unread_count is now 0 for Alice in the group
+        VerifyChatListItemTestCase::new("chat_list_alice", "chat_list_group")
+            .expecting_name("chat_list_group")
+            .expecting_last_message("Hello from Alice!")
+            .expecting_unread_count(0) // Now 0 after marking as read
             .execute(&mut self.context)
             .await?;
 
@@ -194,6 +216,7 @@ impl Scenario for ChatListScenario {
         tracing::info!("  • DM name resolution from user metadata");
         tracing::info!("  • Creator's groups auto-accepted (pending_confirmation=false)");
         tracing::info!("  • Invited member sees welcomer_pubkey and pending_confirmation=true");
+        tracing::info!("  • Mark message as read reduces unread_count");
 
         Ok(())
     }

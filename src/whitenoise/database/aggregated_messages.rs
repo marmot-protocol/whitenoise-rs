@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::{GroupId, message_types::Message};
@@ -477,6 +477,152 @@ impl AggregatedMessage {
         .await?;
 
         row.map(Self::row_to_chat_message).transpose()
+    }
+
+    /// Find a message by its EventId only (without requiring group_id).
+    /// Returns the lightweight AggregatedMessage with mls_group_id for lookup purposes.
+    pub async fn find_by_message_id(
+        message_id: &EventId,
+        database: &Database,
+    ) -> Result<Option<AggregatedMessage>> {
+        let row: Option<AggregatedMessageRow> =
+            sqlx::query_as("SELECT * FROM aggregated_messages WHERE message_id = ? AND kind = 9")
+                .bind(message_id.to_hex())
+                .fetch_optional(&database.pool)
+                .await?;
+
+        Ok(row.map(AggregatedMessageRow::into_aggregated_message))
+    }
+
+    /// Count unread messages for a group given its read marker message ID.
+    ///
+    /// If no read marker is provided, returns total non-deleted message count.
+    /// If read marker message doesn't exist, returns total count (safe fallback).
+    pub async fn count_unread_for_group(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        database: &Database,
+    ) -> Result<usize> {
+        let count: i64 = match read_marker {
+            Some(message_id) => {
+                // Count messages after the read marker's timestamp
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM aggregated_messages am
+                     WHERE am.mls_group_id = ?
+                       AND am.kind = 9
+                       AND am.deletion_event_id IS NULL
+                       AND am.created_at > COALESCE(
+                           (SELECT created_at FROM aggregated_messages
+                            WHERE message_id = ? AND mls_group_id = ?),
+                           0
+                       )",
+                )
+                .bind(group_id.as_slice())
+                .bind(message_id.to_hex())
+                .bind(group_id.as_slice())
+                .fetch_one(&database.pool)
+                .await?
+            }
+            None => {
+                // No read marker = all messages are unread
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM aggregated_messages
+                     WHERE mls_group_id = ? AND kind = 9 AND deletion_event_id IS NULL",
+                )
+                .bind(group_id.as_slice())
+                .fetch_one(&database.pool)
+                .await?
+            }
+        };
+
+        Ok(count as usize)
+    }
+
+    /// Count unread messages for multiple groups in a single batch query.
+    ///
+    /// Takes a slice of (group_id, optional_read_marker) pairs and returns a map
+    /// of group_id -> unread_count. Groups with no messages return 0.
+    pub async fn count_unread_for_groups(
+        group_markers: &[(GroupId, Option<EventId>)],
+        database: &Database,
+    ) -> Result<HashMap<GroupId, usize>> {
+        use sqlx::Row;
+
+        if group_markers.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let groups_with_markers: Vec<_> = group_markers
+            .iter()
+            .filter_map(|(gid, marker)| marker.as_ref().map(|m| (gid, m)))
+            .collect();
+
+        let all_group_ids: Vec<Vec<u8>> = group_markers.iter().map(|(g, _)| g.to_vec()).collect();
+        let group_placeholders = "?,".repeat(all_group_ids.len());
+        let group_placeholders = group_placeholders.trim_end_matches(',');
+
+        // Build UNION ALL for marker input, or an empty-result query if no markers
+        let marker_values = if groups_with_markers.is_empty() {
+            "SELECT NULL AS group_id, NULL AS marker_id WHERE 0".to_string()
+        } else {
+            groups_with_markers
+                .iter()
+                .map(|_| "SELECT ? AS group_id, ? AS marker_id")
+                .collect::<Vec<_>>()
+                .join(" UNION ALL ")
+        };
+
+        let query = format!(
+            "WITH marker_input AS (
+                {marker_values}
+             ),
+             marker_timestamps AS (
+                 SELECT mi.group_id, am.created_at
+                 FROM marker_input mi
+                 JOIN aggregated_messages am
+                   ON am.mls_group_id = mi.group_id
+                  AND am.message_id = mi.marker_id
+             )
+             SELECT
+                 am.mls_group_id,
+                 COUNT(*) as count
+             FROM aggregated_messages am
+             LEFT JOIN marker_timestamps mt ON am.mls_group_id = mt.group_id
+             WHERE am.mls_group_id IN ({group_placeholders})
+               AND am.kind = 9
+               AND am.deletion_event_id IS NULL
+               AND am.created_at > COALESCE(mt.created_at, 0)
+             GROUP BY am.mls_group_id"
+        );
+
+        let mut query_builder = sqlx::query(&query);
+
+        for (group_id, marker_id) in &groups_with_markers {
+            query_builder = query_builder.bind(group_id.as_slice());
+            query_builder = query_builder.bind(marker_id.to_hex());
+        }
+
+        for group_id in &all_group_ids {
+            query_builder = query_builder.bind(group_id);
+        }
+
+        let rows = query_builder.fetch_all(&database.pool).await?;
+
+        // Parse results into HashMap
+        let mut results: HashMap<GroupId, usize> = HashMap::new();
+        for row in rows {
+            let group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
+            let group_id = GroupId::from_slice(&group_id_bytes);
+            let count: i64 = row.try_get("count")?;
+            results.insert(group_id, count as usize);
+        }
+
+        // Ensure all input groups are represented (groups with no messages get 0)
+        for (group_id, _) in group_markers {
+            results.entry(group_id.clone()).or_insert(0);
+        }
+
+        Ok(results)
     }
 
     /// Find a cached reaction (kind 7) by its event ID
@@ -1162,5 +1308,322 @@ mod tests {
             assert_eq!(summary.author_display_name, None);
             assert_eq!(summary.author, author);
         }
+    }
+
+    #[tokio::test]
+    async fn test_find_by_message_id_returns_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[70; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let message = create_test_chat_message(70, author);
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let event_id = EventId::from_hex(&message.id).unwrap();
+        let found = AggregatedMessage::find_by_message_id(&event_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.event_id, event_id);
+        assert_eq!(found.mls_group_id, group_id);
+    }
+
+    #[tokio::test]
+    async fn test_find_by_message_id_returns_none_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let fake_id = EventId::all_zeros();
+
+        let found = AggregatedMessage::find_by_message_id(&fake_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_group_no_read_marker_returns_all() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[80; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        for i in 1..=3 {
+            let msg = create_test_chat_message(80 + i, author);
+            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        let count =
+            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_group_with_read_marker() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[90; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let mut messages = Vec::new();
+        for i in 1..=5u8 {
+            let mut msg = create_test_chat_message(90 + i, author);
+            msg.created_at = Timestamp::from(i as u64 * 1000);
+            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+            messages.push(msg);
+        }
+
+        // Read marker at message 2 -> 3 unread (messages 3, 4, 5)
+        let read_marker_id = EventId::from_hex(&messages[1].id).unwrap();
+        let count = AggregatedMessage::count_unread_for_group(
+            &group_id,
+            Some(&read_marker_id),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_group_excludes_deleted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[100; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(100, author);
+        let msg2 = create_test_chat_message(101, author);
+        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Delete msg2
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let count =
+            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert_eq!(count, 1); // Only msg1 counted
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_groups_empty_input() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let result = AggregatedMessage::count_unread_for_groups(&[], &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_groups_no_markers() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group1 = GroupId::from_slice(&[110; 32]);
+        let group2 = GroupId::from_slice(&[111; 32]);
+        let group3 = GroupId::from_slice(&[112; 32]); // Empty group
+
+        for group_id in [&group1, &group2, &group3] {
+            setup_group(group_id, &whitenoise.database).await;
+        }
+
+        let author = Keys::generate().public_key();
+
+        // Group 1: 3 messages
+        for i in 1..=3 {
+            let msg = create_test_chat_message(110 + i, author);
+            AggregatedMessage::insert_message(&msg, &group1, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Group 2: 5 messages
+        for i in 1..=5 {
+            let msg = create_test_chat_message(120 + i, author);
+            AggregatedMessage::insert_message(&msg, &group2, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Group 3: no messages
+
+        let input = vec![
+            (group1.clone(), None),
+            (group2.clone(), None),
+            (group3.clone(), None),
+        ];
+
+        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[&group1], 3);
+        assert_eq!(result[&group2], 5);
+        assert_eq!(result[&group3], 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_groups_with_markers() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group1 = GroupId::from_slice(&[130; 32]);
+        let group2 = GroupId::from_slice(&[131; 32]);
+
+        for group_id in [&group1, &group2] {
+            setup_group(group_id, &whitenoise.database).await;
+        }
+
+        let author = Keys::generate().public_key();
+
+        // Group 1: 5 messages, read marker at message 2
+        let mut group1_messages = Vec::new();
+        for i in 1..=5u8 {
+            let mut msg = create_test_chat_message(130 + i, author);
+            msg.created_at = Timestamp::from(i as u64 * 1000);
+            AggregatedMessage::insert_message(&msg, &group1, &whitenoise.database)
+                .await
+                .unwrap();
+            group1_messages.push(msg);
+        }
+        let marker1 = EventId::from_hex(&group1_messages[1].id).unwrap();
+
+        // Group 2: 4 messages, read marker at message 3
+        let mut group2_messages = Vec::new();
+        for i in 1..=4u8 {
+            let mut msg = create_test_chat_message(140 + i, author);
+            msg.created_at = Timestamp::from(i as u64 * 1000);
+            AggregatedMessage::insert_message(&msg, &group2, &whitenoise.database)
+                .await
+                .unwrap();
+            group2_messages.push(msg);
+        }
+        let marker2 = EventId::from_hex(&group2_messages[2].id).unwrap();
+
+        let input = vec![
+            (group1.clone(), Some(marker1)),
+            (group2.clone(), Some(marker2)),
+        ];
+
+        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[&group1], 3); // Messages 3, 4, 5 unread
+        assert_eq!(result[&group2], 1); // Message 4 unread
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_groups_mixed_markers() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group_with_marker = GroupId::from_slice(&[150; 32]);
+        let group_without_marker = GroupId::from_slice(&[151; 32]);
+        let group_empty = GroupId::from_slice(&[152; 32]);
+
+        for group_id in [&group_with_marker, &group_without_marker, &group_empty] {
+            setup_group(group_id, &whitenoise.database).await;
+        }
+
+        let author = Keys::generate().public_key();
+
+        // Group with marker: 4 messages, read marker at message 2
+        let mut messages = Vec::new();
+        for i in 1..=4u8 {
+            let mut msg = create_test_chat_message(150 + i, author);
+            msg.created_at = Timestamp::from(i as u64 * 1000);
+            AggregatedMessage::insert_message(&msg, &group_with_marker, &whitenoise.database)
+                .await
+                .unwrap();
+            messages.push(msg);
+        }
+        let marker = EventId::from_hex(&messages[1].id).unwrap();
+
+        // Group without marker: 3 messages
+        for i in 1..=3 {
+            let msg = create_test_chat_message(160 + i, author);
+            AggregatedMessage::insert_message(&msg, &group_without_marker, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        let input = vec![
+            (group_with_marker.clone(), Some(marker)),
+            (group_without_marker.clone(), None),
+            (group_empty.clone(), None),
+        ];
+
+        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[&group_with_marker], 2); // Messages 3, 4 unread
+        assert_eq!(result[&group_without_marker], 3); // All unread
+        assert_eq!(result[&group_empty], 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_for_groups_excludes_deleted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group_id = GroupId::from_slice(&[170; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(170, author);
+        let msg2 = create_test_chat_message(171, author);
+        let msg3 = create_test_chat_message(172, author);
+
+        for msg in [&msg1, &msg2, &msg3] {
+            AggregatedMessage::insert_message(msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Delete msg2
+        AggregatedMessage::mark_deleted(
+            &msg2.id,
+            &group_id,
+            &format!("{:0>64}", "del"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let input = vec![(group_id.clone(), None)];
+        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(result[&group_id], 2); // msg1 and msg3, excluding deleted msg2
     }
 }

@@ -12,6 +12,7 @@ pub struct VerifyChatListItemTestCase {
     expected_pending_confirmation: Option<bool>,
     expected_welcomer_account: Option<String>,
     assert_no_welcomer: bool,
+    expected_unread_count: Option<usize>,
 }
 
 impl VerifyChatListItemTestCase {
@@ -25,6 +26,7 @@ impl VerifyChatListItemTestCase {
             expected_pending_confirmation: None,
             expected_welcomer_account: None,
             assert_no_welcomer: false,
+            expected_unread_count: None,
         }
     }
 
@@ -71,6 +73,12 @@ impl VerifyChatListItemTestCase {
     pub fn expecting_no_welcomer(mut self) -> Self {
         self.assert_no_welcomer = true;
         self.expected_welcomer_account = None;
+        self
+    }
+
+    /// Verifies the unread_count field matches the expected value.
+    pub fn expecting_unread_count(mut self, count: usize) -> Self {
+        self.expected_unread_count = Some(count);
         self
     }
 }
@@ -155,6 +163,15 @@ impl TestCase for VerifyChatListItemTestCase {
                 "Expected welcomer_pubkey to be {}'s pubkey but got {:?}",
                 welcomer_account_name,
                 item.welcomer_pubkey
+            );
+        }
+
+        // Verify unread_count
+        if let Some(expected_count) = self.expected_unread_count {
+            assert_eq!(
+                item.unread_count, expected_count,
+                "Expected unread_count={} but got {}",
+                expected_count, item.unread_count
             );
         }
 

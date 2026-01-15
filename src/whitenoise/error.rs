@@ -34,6 +34,9 @@ pub enum WhitenoiseError {
     #[error("Group not found")]
     GroupNotFound,
 
+    #[error("Message not found")]
+    MessageNotFound,
+
     #[error("Group has no relays configured")]
     GroupMissingRelays,
 
