@@ -2,11 +2,12 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 use sqlx::Row;
 use std::collections::HashSet;
+use std::str::FromStr;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
     WhitenoiseError,
-    whitenoise::{accounts::Account, database::users::UserRow, users::User},
+    whitenoise::{accounts::{Account, AccountType}, database::users::UserRow, users::User},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -17,6 +18,8 @@ struct AccountRow {
     pubkey: PublicKey,
     // user_id is the foreign key to the users table
     user_id: i64,
+    // account_type is 'local' or 'external' (for external signer accounts)
+    account_type: AccountType,
     // last_synced_at is the timestamp of the last sync (using the background fetch)
     last_synced_at: Option<DateTime<Utc>>,
     // created_at is the timestamp of the account creation
@@ -36,11 +39,18 @@ where
         let id: i64 = row.try_get("id")?;
         let pubkey_str: String = row.try_get("pubkey")?;
         let user_id: i64 = row.try_get("user_id")?;
+        let account_type_str: String = row.try_get("account_type")?;
 
         // Parse pubkey from hex string
         let pubkey = PublicKey::parse(&pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
             index: "pubkey".to_string(),
             source: Box::new(e),
+        })?;
+
+        // Parse account_type from string
+        let account_type = AccountType::from_str(&account_type_str).map_err(|e| sqlx::Error::ColumnDecode {
+            index: "account_type".to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         })?;
 
         let last_synced_at = match row.try_get::<Option<i64>, _>("last_synced_at")? {
@@ -55,6 +65,7 @@ where
             id,
             pubkey,
             user_id,
+            account_type,
             last_synced_at,
             created_at,
             updated_at,
@@ -69,6 +80,7 @@ impl AccountRow {
             id: Some(self.id),
             pubkey: self.pubkey,
             user_id: self.user_id,
+            account_type: self.account_type,
             last_synced_at: self.last_synced_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -155,6 +167,7 @@ impl Account {
             id: Some(account_row.id),
             user_id: account_row.user_id,
             pubkey: account_row.pubkey,
+            account_type: account_row.account_type,
             last_synced_at: account_row.last_synced_at,
             created_at: account_row.created_at,
             updated_at: account_row.updated_at,
@@ -405,16 +418,18 @@ impl Account {
     /// Returns a [`WhitenoiseError`] if the database operation fails.
     pub(crate) async fn save(&self, database: &Database) -> Result<Account, WhitenoiseError> {
         let account_row = sqlx::query_as::<_, AccountRow>(
-            "INSERT INTO accounts (pubkey, user_id, last_synced_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO accounts (pubkey, user_id, account_type, last_synced_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE
              SET user_id = excluded.user_id,
+                 account_type = excluded.account_type,
                  last_synced_at = excluded.last_synced_at,
                  updated_at = ?
              RETURNING *",
         )
         .bind(self.pubkey.to_hex().as_str())
         .bind(self.user_id)
+        .bind(self.account_type.to_string())
         .bind(self.last_synced_at.map(|ts| ts.timestamp_millis()))
         .bind(self.created_at.timestamp_millis())
         .bind(self.updated_at.timestamp_millis())

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use dashmap::DashMap;
+use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl, ToBech32};
 use tokio::sync::{
     Mutex, OnceCell, Semaphore, broadcast,
@@ -118,6 +119,9 @@ pub struct Whitenoise {
     scheduler_shutdown: watch::Sender<bool>,
     /// Handles for spawned scheduler tasks
     scheduler_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// External signers for accounts using NIP-55 (Amber) or similar.
+    /// Maps account pubkey to their signer implementation.
+    external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -211,6 +215,7 @@ impl Whitenoise {
             contact_list_guards: DashMap::new(),
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
+            external_signers: DashMap::new(),
         };
 
         // Create default relays in the database if they don't exist
@@ -301,22 +306,31 @@ impl Whitenoise {
             return Ok(());
         };
 
-        let keys = whitenoise_ref
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
-
         // Compute shared since for global user subscriptions with 10s lookback buffer
         let since = Self::compute_global_since_timestamp(whitenoise_ref).await?;
 
-        whitenoise_ref
-            .nostr
-            .setup_batched_relay_subscriptions_with_signer(
-                users_with_relays,
-                &default_relays,
-                keys,
-                since,
-            )
-            .await?;
+        // For external signer accounts, we can't get keys from the secret store.
+        // Use the non-signer version of the subscription setup.
+        if signer_account.uses_external_signer() {
+            whitenoise_ref
+                .nostr
+                .setup_batched_relay_subscriptions(users_with_relays, &default_relays, since)
+                .await?;
+        } else {
+            let keys = whitenoise_ref
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+
+            whitenoise_ref
+                .nostr
+                .setup_batched_relay_subscriptions_with_signer(
+                    users_with_relays,
+                    &default_relays,
+                    keys,
+                    since,
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -543,6 +557,39 @@ impl Whitenoise {
         Ok(account.pubkey.to_bech32().unwrap())
     }
 
+    /// Registers an external signer for an account.
+    ///
+    /// This is used for accounts that use external signers like Amber (NIP-55).
+    /// The signer will be used for operations that require signing or decryption,
+    /// such as processing giftwrap events.
+    pub fn register_external_signer(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + 'static,
+    ) {
+        tracing::info!(
+            target: "whitenoise::external_signer",
+            "Registering external signer for account: {}",
+            pubkey.to_hex()
+        );
+        self.external_signers.insert(pubkey, Arc::new(signer));
+    }
+
+    /// Gets the external signer for an account, if one is registered.
+    pub fn get_external_signer(&self, pubkey: &PublicKey) -> Option<Arc<dyn NostrSigner>> {
+        self.external_signers.get(pubkey).map(|r| r.clone())
+    }
+
+    /// Removes the external signer for an account.
+    pub fn remove_external_signer(&self, pubkey: &PublicKey) {
+        tracing::info!(
+            target: "whitenoise::external_signer",
+            "Removing external signer for account: {}",
+            pubkey.to_hex()
+        );
+        self.external_signers.remove(pubkey);
+    }
+
     /// Get a reference to the message aggregator for advanced usage
     /// This allows consumers to access the message aggregator directly for custom processing
     pub fn message_aggregator(&self) -> &message_aggregator::MessageAggregator {
@@ -672,18 +719,30 @@ impl Whitenoise {
             return Ok(());
         };
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+        // For external signer accounts, we can't get keys from the secret store.
+        // Use the non-signer version of the subscription refresh.
+        if signer_account.uses_external_signer() {
+            self.nostr
+                .refresh_user_global_subscriptions(
+                    user.pubkey,
+                    users_with_relays,
+                    &default_relays,
+                )
+                .await?;
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
 
-        self.nostr
-            .refresh_user_global_subscriptions_with_signer(
-                user.pubkey,
-                users_with_relays,
-                &default_relays,
-                keys,
-            )
-            .await?;
+            self.nostr
+                .refresh_user_global_subscriptions_with_signer(
+                    user.pubkey,
+                    users_with_relays,
+                    &default_relays,
+                    keys,
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -936,6 +995,7 @@ pub mod test_utils {
             contact_list_guards: DashMap::new(),
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
+            external_signers: DashMap::new(),
         };
 
         (whitenoise, data_temp, logs_temp)
