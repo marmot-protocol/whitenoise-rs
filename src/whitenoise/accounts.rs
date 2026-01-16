@@ -436,12 +436,13 @@ impl Whitenoise {
         let account = self.persist_account(&account).await?;
         tracing::debug!(target: "whitenoise::login_external", "Created new external signer account");
 
-        // Setup relays for existing account (fetch from network)
+        // Setup relays for external signer account (fetch from network or use defaults)
+        // This does NOT publish - the external signer will handle publishing
         let mut account_mut = account.clone();
         let (nip65_relays, inbox_relays, key_package_relays) = self
-            .setup_relays_for_existing_account(&mut account_mut)
+            .setup_relays_for_external_signer_account(&mut account_mut)
             .await?;
-        tracing::debug!(target: "whitenoise::login_external", "Relays setup");
+        tracing::debug!(target: "whitenoise::login_external", "Relays setup (without publishing)");
 
         let user = account_mut.user(&self.database).await?;
 
@@ -790,6 +791,77 @@ impl Whitenoise {
         }
 
         Ok((nip65_relays, inbox_relays, key_package_relays))
+    }
+
+    /// Sets up relays for an external signer account.
+    ///
+    /// This is similar to `setup_relays_for_existing_account` but does NOT publish
+    /// relay lists (since external signers handle their own publishing).
+    /// It only fetches existing relays or uses defaults and saves them locally.
+    async fn setup_relays_for_external_signer_account(
+        &self,
+        account: &mut Account,
+    ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
+        let default_relays = self.load_default_relays().await?;
+
+        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
+        // We don't publish here - external signer will handle that
+        let nip65_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Nip65,
+                &default_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let inbox_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Inbox,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let key_package_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::KeyPackage,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        Ok((nip65_relays, inbox_relays, key_package_relays))
+    }
+
+    /// Sets up a specific relay type for an external signer account.
+    /// Fetches from network or uses defaults, but never publishes.
+    async fn setup_external_account_relay_type(
+        &self,
+        account: &mut Account,
+        relay_type: RelayType,
+        source_relays: &[Relay],
+        default_relays: &[Relay],
+    ) -> Result<Vec<Relay>> {
+        // Try to fetch existing relay lists first
+        let fetched_relays = self
+            .fetch_existing_relays(account.pubkey, relay_type, source_relays)
+            .await?;
+
+        if fetched_relays.is_empty() {
+            // No existing relay lists - use defaults (don't publish)
+            self.add_relays_to_account(account, default_relays, relay_type)
+                .await?;
+            Ok(default_relays.to_vec())
+        } else {
+            // Found existing relay lists - use them
+            let user = account.user(&self.database).await?;
+            user.add_relays(&fetched_relays, relay_type, &self.database)
+                .await?;
+            Ok(fetched_relays)
+        }
     }
 
     async fn setup_existing_account_relay_type(
