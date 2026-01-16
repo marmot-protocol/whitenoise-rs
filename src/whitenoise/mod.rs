@@ -562,11 +562,7 @@ impl Whitenoise {
     /// This is used for accounts that use external signers like Amber (NIP-55).
     /// The signer will be used for operations that require signing or decryption,
     /// such as processing giftwrap events.
-    pub fn register_external_signer(
-        &self,
-        pubkey: PublicKey,
-        signer: impl NostrSigner + 'static,
-    ) {
+    pub fn register_external_signer(&self, pubkey: PublicKey, signer: impl NostrSigner + 'static) {
         tracing::info!(
             target: "whitenoise::external_signer",
             "Registering external signer for account: {}",
@@ -723,11 +719,7 @@ impl Whitenoise {
         // Use the non-signer version of the subscription refresh.
         if signer_account.uses_external_signer() {
             self.nostr
-                .refresh_user_global_subscriptions(
-                    user.pubkey,
-                    users_with_relays,
-                    &default_relays,
-                )
+                .refresh_user_global_subscriptions(user.pubkey, users_with_relays, &default_relays)
                 .await?;
         } else {
             let keys = self

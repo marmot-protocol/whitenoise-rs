@@ -38,7 +38,10 @@ impl Whitenoise {
             );
             // Arc<dyn NostrSigner> implements NostrSigner, so we can pass it directly
             extract_rumor(&signer, &event).await.map_err(|e| {
-                WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap with external signer: {}", e))
+                WhitenoiseError::Configuration(format!(
+                    "Failed to decrypt giftwrap with external signer: {}",
+                    e
+                ))
             })?
         } else {
             let keys = self
