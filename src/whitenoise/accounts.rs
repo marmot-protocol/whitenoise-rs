@@ -443,14 +443,22 @@ impl Whitenoise {
         // Setup relays for external signer account (fetch from network or use defaults)
         // This does NOT publish - the external signer will handle publishing
         let mut account_mut = account.clone();
-        let (nip65_relays, inbox_relays, key_package_relays) =
-            self.setup_relays_for_external_signer_account(&mut account_mut).await?;
+        let (nip65_relays, inbox_relays, key_package_relays) = self
+            .setup_relays_for_external_signer_account(&mut account_mut)
+            .await?;
         tracing::debug!(target: "whitenoise::login_external", "Relays setup (without publishing)");
 
         let user = account_mut.user(&self.database).await?;
 
         // Activate without publishing (external signer will handle publishing)
-        self.activate_account_without_publishing(&account_mut, &user, &nip65_relays, &inbox_relays, &key_package_relays).await?;
+        self.activate_account_without_publishing(
+            &account_mut,
+            &user,
+            &nip65_relays,
+            &inbox_relays,
+            &key_package_relays,
+        )
+        .await?;
         tracing::debug!(target: "whitenoise::login_external", "Account activated (without publishing)");
 
         tracing::debug!(target: "whitenoise::login_external", "Successfully logged in with external signer: {}", account_mut.pubkey.to_hex());
@@ -1554,6 +1562,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1569,6 +1578,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(last),
             created_at: now,
             updated_at: now,
@@ -1586,6 +1596,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(epochish),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1602,6 +1613,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(future),
             created_at: now,
             updated_at: now,

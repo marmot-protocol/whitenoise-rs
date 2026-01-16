@@ -7,7 +7,11 @@ use std::str::FromStr;
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
     WhitenoiseError,
-    whitenoise::{accounts::{Account, AccountType}, database::users::UserRow, users::User},
+    whitenoise::{
+        accounts::{Account, AccountType},
+        database::users::UserRow,
+        users::User,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -48,10 +52,11 @@ where
         })?;
 
         // Parse account_type from string
-        let account_type = AccountType::from_str(&account_type_str).map_err(|e| sqlx::Error::ColumnDecode {
-            index: "account_type".to_string(),
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-        })?;
+        let account_type =
+            AccountType::from_str(&account_type_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "account_type".to_string(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            })?;
 
         let last_synced_at = match row.try_get::<Option<i64>, _>("last_synced_at")? {
             Some(_) => Some(parse_timestamp(row, "last_synced_at")?),
@@ -819,6 +824,7 @@ mod tests {
             id: Some(1), // Will be overridden by database auto-increment
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: test_last_synced,
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -859,6 +865,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None, // Test with None
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -914,6 +921,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: test_last_synced,
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -964,6 +972,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1061,6 +1070,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1094,6 +1104,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1162,6 +1173,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1229,6 +1241,7 @@ mod tests {
             id: Some(99999), // Non-existent ID
             pubkey: nostr_sdk::Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1257,6 +1270,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1332,6 +1346,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at,
             updated_at,
@@ -1369,6 +1384,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(initial_ms),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1405,6 +1421,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(initial_ms),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1685,6 +1702,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

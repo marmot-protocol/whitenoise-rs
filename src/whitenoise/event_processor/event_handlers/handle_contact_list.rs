@@ -118,7 +118,9 @@ mod tests {
     use nostr_sdk::prelude::*;
 
     use crate::whitenoise::{
-        accounts::Account, database::processed_events::ProcessedEvent, test_utils::*,
+        accounts::{Account, AccountType},
+        database::processed_events::ProcessedEvent,
+        test_utils::*,
         utils::timestamp_to_datetime,
     };
 
@@ -377,6 +379,7 @@ mod tests {
             id: None,
             pubkey: keys.public_key(),
             user_id: 0,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
