@@ -265,7 +265,8 @@ impl Account {
         data_dir: &Path,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
-        let storage = MdkSqliteStorage::new(mls_storage_dir)?;
+        let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+        let storage = MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)?;
         Ok(MDK::new(storage))
     }
 }
