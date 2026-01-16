@@ -522,6 +522,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pubkey TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
+                account_type TEXT NOT NULL DEFAULT 'local',
                 last_synced_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL

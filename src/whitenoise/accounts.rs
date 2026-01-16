@@ -850,14 +850,14 @@ impl Whitenoise {
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
             .await?;
 
+        let user = account.user(&self.database).await?;
         if fetched_relays.is_empty() {
             // No existing relay lists - use defaults (don't publish)
-            self.add_relays_to_account(account, default_relays, relay_type)
+            user.add_relays(default_relays, relay_type, &self.database)
                 .await?;
             Ok(default_relays.to_vec())
         } else {
             // Found existing relay lists - use them
-            let user = account.user(&self.database).await?;
             user.add_relays(&fetched_relays, relay_type, &self.database)
                 .await?;
             Ok(fetched_relays)
