@@ -44,7 +44,41 @@ impl NostrManager {
 
         // 2. Set signer once and process all relays in parallel
         self.with_signer(signer, || async {
-            let futures = relay_user_map.into_iter().map(|(relay_url, users)| async move {
+            self.setup_batched_relay_subscriptions_inner(relay_user_map, since)
+                .await
+        })
+        .await
+    }
+
+    // Sets up subscriptions in batches for all users and their relays (without signer)
+    // Used for external signer accounts.
+    pub(crate) async fn setup_batched_relay_subscriptions(
+        &self,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+        since: Option<Timestamp>,
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions",
+            "Setting up batched relay subscriptions (no signer) (users={}, defaults={})",
+            users_with_relays.len(),
+            default_relays.len()
+        );
+
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+        self.setup_batched_relay_subscriptions_inner(relay_user_map, since)
+            .await
+    }
+
+    // Inner implementation for setting up batched relay subscriptions
+    async fn setup_batched_relay_subscriptions_inner(
+        &self,
+        relay_user_map: std::collections::HashMap<RelayUrl, Vec<PublicKey>>,
+        since: Option<Timestamp>,
+    ) -> Result<()> {
+        let futures = relay_user_map
+            .into_iter()
+            .map(|(relay_url, users)| async move {
                 match self
                     .create_deterministic_batches_for_relay(relay_url.clone(), users, since)
                     .await
@@ -52,7 +86,7 @@ impl NostrManager {
                     Ok(_) => true,
                     Err(e) => {
                         tracing::error!(
-                            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions_with_signer",
+                            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions",
                             error = %e,
                             "Failed to create deterministic batches for relay: {}",
                             relay_url
@@ -62,13 +96,11 @@ impl NostrManager {
                 }
             });
 
-            let results = futures::future::join_all(futures).await;
-            if !results.into_iter().any(|success| success) {
-                return Err(NostrManagerError::NoRelayConnections);
-            }
-            Ok(())
-        })
-        .await
+        let results = futures::future::join_all(futures).await;
+        if !results.into_iter().any(|success| success) {
+            return Err(NostrManagerError::NoRelayConnections);
+        }
+        Ok(())
     }
 
     async fn create_deterministic_batches_for_relay(
@@ -231,31 +263,54 @@ impl NostrManager {
 
         // Set signer once and process all relays in parallel
         self.with_signer(signer, || async {
-            let futures = relay_user_map
-                .into_iter()
-                .filter(|(_, users)| users.contains(&user_pubkey))
-                .map(|(relay_url, users)| async move {
-                    if let Err(e) = self
-                        .refresh_batch_for_relay_containing_user(
-                            relay_url.clone(),
-                            users,
-                            user_pubkey,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
-                            error = %e,
-                            "Failed to refresh batch for relay: {}",
-                            relay_url
-                        );
-                    }
-                });
-
-            futures::future::join_all(futures).await;
-            Ok(())
+            self.refresh_user_global_subscriptions_inner(user_pubkey, relay_user_map)
+                .await
         })
         .await
+    }
+
+    /// Refresh subscriptions for a specific user across all their relays (without signer).
+    /// Used for external signer accounts.
+    pub(crate) async fn refresh_user_global_subscriptions(
+        &self,
+        user_pubkey: PublicKey,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
+            "Refreshing user global subscriptions (no signer)"
+        );
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+        self.refresh_user_global_subscriptions_inner(user_pubkey, relay_user_map)
+            .await
+    }
+
+    /// Inner implementation for refreshing user global subscriptions
+    async fn refresh_user_global_subscriptions_inner(
+        &self,
+        user_pubkey: PublicKey,
+        relay_user_map: std::collections::HashMap<RelayUrl, Vec<PublicKey>>,
+    ) -> Result<()> {
+        let futures = relay_user_map
+            .into_iter()
+            .filter(|(_, users)| users.contains(&user_pubkey))
+            .map(|(relay_url, users)| async move {
+                if let Err(e) = self
+                    .refresh_batch_for_relay_containing_user(relay_url.clone(), users, user_pubkey)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
+                        error = %e,
+                        "Failed to refresh batch for relay: {}",
+                        relay_url
+                    );
+                }
+            });
+
+        futures::future::join_all(futures).await;
+        Ok(())
     }
 
     /// This method rebuilds the subscriptions for all of the relays the user has

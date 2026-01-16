@@ -288,6 +288,35 @@ impl NostrManager {
         .await
     }
 
+    /// Updates account subscriptions without a signer (for external signer accounts).
+    ///
+    /// This version is used for accounts that use external signers (like Amber) where
+    /// the private key is not available locally.
+    pub(crate) async fn update_account_subscriptions(
+        &self,
+        pubkey: PublicKey,
+        user_relays: &[RelayUrl],
+        inbox_relays: &[RelayUrl],
+        group_relays: &[RelayUrl],
+        nostr_group_ids: &[String],
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::update_account_subscriptions",
+            "Updating account subscriptions (no signer) with cleanup for relay changes"
+        );
+        let buffer_time = Timestamp::now() - Duration::from_secs(10);
+        self.unsubscribe_account_subscriptions(&pubkey).await?;
+        self.setup_account_subscriptions(
+            pubkey,
+            user_relays,
+            inbox_relays,
+            group_relays,
+            nostr_group_ids,
+            Some(buffer_time),
+        )
+        .await
+    }
+
     /// Ensures that the signer is unset and all subscriptions are cleared.
     pub(crate) async fn delete_all_data(&self) -> Result<()> {
         tracing::debug!(
