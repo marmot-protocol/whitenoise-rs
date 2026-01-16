@@ -111,18 +111,6 @@ impl AccountGroup {
             .await?;
         Ok(updated)
     }
-
-    /// Marks the given message as the last read message for this account-group.
-    pub async fn mark_read(
-        &self,
-        message_id: &EventId,
-        whitenoise: &Whitenoise,
-    ) -> Result<Self, WhitenoiseError> {
-        let updated = self
-            .update_last_read(message_id, &whitenoise.database)
-            .await?;
-        Ok(updated)
-    }
 }
 
 impl Whitenoise {
@@ -177,8 +165,10 @@ impl Whitenoise {
 
     /// Marks a message as read for the given account.
     ///
-    /// Looks up the message to find its group, then updates the last_read_message_id
-    /// for that account-group pair.
+    /// Looks up the message to find its group, then atomically updates the
+    /// last_read_message_id only if the new message is newer than the current
+    /// read marker. This prevents regression when messages arrive out of order
+    /// or when the UI marks an older message as read after a newer one.
     pub async fn mark_message_read(
         &self,
         account: &Account,
@@ -192,7 +182,17 @@ impl Whitenoise {
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
-        account_group.mark_read(message_id, self).await
+        // Atomic compare-and-update: only advances if newer
+        let message_created_at_ms = message.created_at.timestamp_millis();
+        if let Some(updated) = account_group
+            .update_last_read_if_newer(message_id, message_created_at_ms, &self.database)
+            .await?
+        {
+            return Ok(updated);
+        }
+
+        // Update was skipped (message not newer), return current state
+        Ok(account_group)
     }
 
     /// Gets the last read message ID for an account in a group.
@@ -619,5 +619,202 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mark_message_read_advances_forward() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+        use chrono::Utc;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[100; 32]);
+
+        // Setup: create group_information (FK constraint) and account_group
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Create two messages with different timestamps
+        let now = Utc::now();
+        let older_time = now - chrono::Duration::seconds(10);
+        let newer_time = now;
+
+        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
+        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
+
+        AggregatedMessage::create_for_test(
+            older_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            older_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        AggregatedMessage::create_for_test(
+            newer_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            newer_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Mark older message as read first
+        let ag = whitenoise
+            .mark_message_read(&account, &older_msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(older_msg_id));
+
+        // Mark newer message as read - should update
+        let ag = whitenoise
+            .mark_message_read(&account, &newer_msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(newer_msg_id));
+    }
+
+    #[tokio::test]
+    async fn test_mark_message_read_does_not_regress() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+        use chrono::Utc;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[101; 32]);
+
+        // Setup
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Create two messages with different timestamps
+        let now = Utc::now();
+        let older_time = now - chrono::Duration::seconds(10);
+        let newer_time = now;
+
+        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
+        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "ddd")).unwrap();
+
+        AggregatedMessage::create_for_test(
+            older_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            older_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        AggregatedMessage::create_for_test(
+            newer_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            newer_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Mark NEWER message as read first
+        let ag = whitenoise
+            .mark_message_read(&account, &newer_msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(newer_msg_id));
+
+        // Attempt to mark OLDER message as read - should be a no-op
+        let ag = whitenoise
+            .mark_message_read(&account, &older_msg_id)
+            .await
+            .unwrap();
+        // Should still be the newer message
+        assert_eq!(ag.last_read_message_id, Some(newer_msg_id));
+    }
+
+    #[tokio::test]
+    async fn test_mark_message_read_equal_timestamp_is_noop() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+        use chrono::Utc;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[102; 32]);
+
+        // Setup
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Create two messages with the SAME timestamp
+        let same_time = Utc::now();
+
+        let first_msg_id = EventId::from_hex(&format!("{:0>64}", "eee")).unwrap();
+        let second_msg_id = EventId::from_hex(&format!("{:0>64}", "fff")).unwrap();
+
+        AggregatedMessage::create_for_test(
+            first_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            same_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        AggregatedMessage::create_for_test(
+            second_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            same_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Mark first message as read
+        let ag = whitenoise
+            .mark_message_read(&account, &first_msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(first_msg_id));
+
+        // Mark second message with same timestamp - should NOT update (equal is not newer)
+        let ag = whitenoise
+            .mark_message_read(&account, &second_msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(first_msg_id));
     }
 }

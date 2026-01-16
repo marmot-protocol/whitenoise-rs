@@ -816,6 +816,39 @@ impl AggregatedMessage {
             media_attachments: row.media_attachments,
         })
     }
+
+    /// Create a minimal test message with specific timestamp.
+    /// This is only used for testing the update_last_read timestamp comparison logic.
+    #[cfg(test)]
+    pub(crate) async fn create_for_test(
+        message_id: EventId,
+        group_id: GroupId,
+        author: PublicKey,
+        created_at: DateTime<Utc>,
+        database: &Database,
+    ) -> Result<()> {
+        let empty_tokens = Vec::<SerializableToken>::new();
+        let empty_reactions = ReactionSummary::default();
+        let empty_media = Vec::<MediaFile>::new();
+
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 9, '', '[]', ?, ?, ?)",
+        )
+        .bind(message_id.to_hex())
+        .bind(group_id.as_slice())
+        .bind(author.to_hex())
+        .bind(created_at.timestamp_millis())
+        .bind(serde_json::to_string(&empty_tokens)?)
+        .bind(serde_json::to_string(&empty_reactions)?)
+        .bind(serde_json::to_string(&empty_media)?)
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

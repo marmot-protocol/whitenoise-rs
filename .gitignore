@@ -10,6 +10,7 @@
 vibe-tools.config.json
 .cursor/rules/vibe-tools.mdc
 .goose/memory
+.opencode
 
 # Docker and Rust
 /target

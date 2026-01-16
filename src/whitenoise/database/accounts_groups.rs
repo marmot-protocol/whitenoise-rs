@@ -268,28 +268,48 @@ impl AccountGroup {
         Ok(row.into())
     }
 
-    /// Updates the last_read_message_id for this AccountGroup.
-    pub(crate) async fn update_last_read(
+    /// Atomically updates last_read_message_id only if the new message is newer.
+    ///
+    /// Returns `Some(updated)` if the update was applied, `None` if skipped
+    /// because the new message is not newer than the current read marker.
+    ///
+    /// This is atomic: the timestamp comparison and update happen in a single
+    /// SQL statement, preventing race conditions between concurrent calls.
+    pub(crate) async fn update_last_read_if_newer(
         &self,
         message_id: &EventId,
+        message_created_at_ms: i64,
         database: &Database,
-    ) -> Result<Self, sqlx::Error> {
+    ) -> Result<Option<Self>, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
+        // Atomic compare-and-update: only update if the new message is newer
+        // than the current read marker. Uses a subquery to get the current
+        // marker's timestamp from aggregated_messages, scoped to the same group.
         let row = sqlx::query_as::<_, AccountGroupRow>(
             "UPDATE accounts_groups
              SET last_read_message_id = ?, updated_at = ?
              WHERE id = ?
+               AND (
+                 last_read_message_id IS NULL
+                 OR ? > COALESCE(
+                   (SELECT created_at FROM aggregated_messages
+                    WHERE message_id = accounts_groups.last_read_message_id
+                      AND mls_group_id = accounts_groups.mls_group_id),
+                   0
+                 )
+               )
              RETURNING *",
         )
         .bind(message_id.to_hex())
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .bind(message_created_at_ms)
+        .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row.map(Into::into))
     }
 
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
@@ -654,11 +674,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_last_read_stores_message_id() {
+    async fn test_update_last_read_if_newer_sets_when_null() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[40; 32]);
+
+        // Setup group_information (FK constraint)
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
         let message_id = EventId::all_zeros();
+        let message_time = Utc::now();
+
+        // Create the message
+        AggregatedMessage::create_for_test(
+            message_id,
+            group_id.clone(),
+            account.pubkey,
+            message_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let (account_group, _) =
             AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
@@ -667,46 +712,209 @@ mod tests {
 
         assert!(account_group.last_read_message_id.is_none());
 
+        // Should update when last_read_message_id is NULL
         let updated = account_group
-            .update_last_read(&message_id, &whitenoise.database)
+            .update_last_read_if_newer(
+                &message_id,
+                message_time.timestamp_millis(),
+                &whitenoise.database,
+            )
             .await
             .unwrap();
 
-        assert_eq!(updated.last_read_message_id, Some(message_id));
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().last_read_message_id, Some(message_id));
     }
 
     #[tokio::test]
-    async fn test_update_last_read_overwrites_previous() {
+    async fn test_update_last_read_if_newer_advances_forward() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[41; 32]);
-        let message_id_1 = EventId::from_hex(&format!("{:0>64}", "1")).unwrap();
-        let message_id_2 = EventId::from_hex(&format!("{:0>64}", "2")).unwrap();
+
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let older_time = now - chrono::Duration::seconds(10);
+        let newer_time = now;
+
+        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "1")).unwrap();
+        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "2")).unwrap();
+
+        AggregatedMessage::create_for_test(
+            older_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            older_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        AggregatedMessage::create_for_test(
+            newer_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            newer_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let (account_group, _) =
             AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
 
+        // Set to older message first
         let updated = account_group
-            .update_last_read(&message_id_1, &whitenoise.database)
+            .update_last_read_if_newer(
+                &older_msg_id,
+                older_time.timestamp_millis(),
+                &whitenoise.database,
+            )
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(updated.last_read_message_id, Some(message_id_1));
+        assert_eq!(updated.last_read_message_id, Some(older_msg_id));
 
+        // Should advance to newer message
         let updated = updated
-            .update_last_read(&message_id_2, &whitenoise.database)
+            .update_last_read_if_newer(
+                &newer_msg_id,
+                newer_time.timestamp_millis(),
+                &whitenoise.database,
+            )
             .await
             .unwrap();
-        assert_eq!(updated.last_read_message_id, Some(message_id_2));
+
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().last_read_message_id, Some(newer_msg_id));
+    }
+
+    #[tokio::test]
+    async fn test_update_last_read_if_newer_rejects_older() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let now = Utc::now();
+        let older_time = now - chrono::Duration::seconds(10);
+        let newer_time = now;
+
+        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
+        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
+
+        AggregatedMessage::create_for_test(
+            older_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            older_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        AggregatedMessage::create_for_test(
+            newer_msg_id,
+            group_id.clone(),
+            account.pubkey,
+            newer_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Set to newer message first
+        let updated = account_group
+            .update_last_read_if_newer(
+                &newer_msg_id,
+                newer_time.timestamp_millis(),
+                &whitenoise.database,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.last_read_message_id, Some(newer_msg_id));
+
+        // Should reject older message (returns None)
+        let result = updated
+            .update_last_read_if_newer(
+                &older_msg_id,
+                older_time.timestamp_millis(),
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+
+        // Verify the marker didn't change
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.last_read_message_id, Some(newer_msg_id));
     }
 
     #[tokio::test]
     async fn test_last_read_persists_through_find() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[42; 32]);
+        let group_id = GroupId::from_slice(&[43; 32]);
+
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
         let message_id = EventId::from_hex(&format!("{:0>64}", "abc")).unwrap();
+        let message_time = Utc::now();
+
+        AggregatedMessage::create_for_test(
+            message_id,
+            group_id.clone(),
+            account.pubkey,
+            message_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let (account_group, _) =
             AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
@@ -714,7 +922,11 @@ mod tests {
                 .unwrap();
 
         account_group
-            .update_last_read(&message_id, &whitenoise.database)
+            .update_last_read_if_newer(
+                &message_id,
+                message_time.timestamp_millis(),
+                &whitenoise.database,
+            )
             .await
             .unwrap();
 
