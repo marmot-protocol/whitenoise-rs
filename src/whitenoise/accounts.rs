@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::*;
@@ -16,6 +18,38 @@ use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
+
+/// The type of account authentication.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Default)]
+pub enum AccountType {
+    /// Account with locally stored private key.
+    #[default]
+    Local,
+    /// Account using external signer (e.g., Amber via NIP-55).
+    /// The private key never touches this app.
+    External,
+}
+
+impl fmt::Display for AccountType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccountType::Local => write!(f, "local"),
+            AccountType::External => write!(f, "external"),
+        }
+    }
+}
+
+impl FromStr for AccountType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "local" => Ok(AccountType::Local),
+            "external" => Ok(AccountType::External),
+            _ => Err(format!("Unknown account type: {}", s)),
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AccountError {
@@ -43,9 +77,23 @@ pub struct Account {
     pub id: Option<i64>,
     pub pubkey: PublicKey,
     pub user_id: i64,
+    /// The type of account (local key or external signer).
+    pub account_type: AccountType,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Account {
+    /// Returns true if this account uses an external signer.
+    pub fn uses_external_signer(&self) -> bool {
+        matches!(self.account_type, AccountType::External)
+    }
+
+    /// Returns true if this account has a locally stored private key.
+    pub fn has_local_key(&self) -> bool {
+        matches!(self.account_type, AccountType::Local)
+    }
 }
 
 impl Account {
@@ -62,12 +110,34 @@ impl Account {
             id: None,
             user_id: user.id.unwrap(),
             pubkey: keys.public_key(),
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
         Ok((account, keys))
+    }
+
+    /// Creates a new account for an external signer (pubkey only, no private key).
+    pub(crate) async fn new_external(
+        whitenoise: &Whitenoise,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (user, _created) =
+            User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
+
+        let account = Account {
+            id: None,
+            user_id: user.id.unwrap(),
+            pubkey,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        Ok(account)
     }
 
     /// Convert last_synced_at to a Timestamp applying a lookback buffer.
@@ -341,11 +411,65 @@ impl Whitenoise {
         Ok(account)
     }
 
+    /// Logs in using an external signer (e.g., Amber via NIP-55).
+    ///
+    /// This method creates an account for the given public key without storing any
+    /// private key locally. All signing operations must be performed by the external
+    /// signer and provided back to Whitenoise.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The user's public key obtained from the external signer.
+    ///
+    /// # Note
+    ///
+    /// When using an external signer account, operations that require signing
+    /// (like publishing metadata, relay lists, or sending messages) must use
+    /// the `*_with_signer` variants that accept a `NostrSigner` parameter.
+    pub async fn login_with_external_signer(&self, pubkey: PublicKey) -> Result<Account> {
+        tracing::debug!(target: "whitenoise::login_external", "Logging in with external signer, pubkey: {}", pubkey.to_hex());
+
+        // Check if account already exists
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            tracing::debug!(target: "whitenoise::login_external", "Found existing account");
+            return Ok(existing);
+        }
+
+        // Create new external signer account
+        let account = Account::new_external(self, pubkey).await?;
+        let account = self.persist_account(&account).await?;
+        tracing::debug!(target: "whitenoise::login_external", "Created new external signer account");
+
+        // Setup relays for external signer account (fetch from network or use defaults)
+        // This does NOT publish - the external signer will handle publishing
+        let mut account_mut = account.clone();
+        let (nip65_relays, inbox_relays, key_package_relays) = self
+            .setup_relays_for_external_signer_account(&mut account_mut)
+            .await?;
+        tracing::debug!(target: "whitenoise::login_external", "Relays setup (without publishing)");
+
+        let user = account_mut.user(&self.database).await?;
+
+        // Activate without publishing (external signer will handle publishing)
+        self.activate_account_without_publishing(
+            &account_mut,
+            &user,
+            &nip65_relays,
+            &inbox_relays,
+            &key_package_relays,
+        )
+        .await?;
+        tracing::debug!(target: "whitenoise::login_external", "Account activated (without publishing)");
+
+        tracing::debug!(target: "whitenoise::login_external", "Successfully logged in with external signer: {}", account_mut.pubkey.to_hex());
+        Ok(account_mut)
+    }
+
     /// Logs out the user associated with the given account.
     ///
     /// This method performs the following steps:
     /// - Removes the account from the database.
-    /// - Removes the private key from the secret store.
+    /// - Removes the private key from the secret store (for local accounts only).
     /// - Updates the active account if the logged-out account was active.
     /// - Removes the account from the in-memory accounts list.
     ///
@@ -370,8 +494,10 @@ impl Whitenoise {
         // Delete the account from the database
         account.delete(&self.database).await?;
 
-        // Remove the private key from the secret store
-        self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
+        // Remove the private key from the secret store (only for local accounts)
+        if account.has_local_key() {
+            self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
+        }
 
         Ok(())
     }
@@ -456,6 +582,46 @@ impl Whitenoise {
         self.setup_key_package(account, is_new_account, key_package_relays)
             .await?;
         tracing::debug!(target: "whitenoise::persist_and_activate_account", "Key package setup");
+        Ok(())
+    }
+
+    /// Activates an account without publishing anything (for external signer accounts).
+    /// This sets up relay connections and subscriptions but skips key package publishing.
+    async fn activate_account_without_publishing(
+        &self,
+        account: &Account,
+        user: &User,
+        nip65_relays: &[Relay],
+        inbox_relays: &[Relay],
+        key_package_relays: &[Relay],
+    ) -> Result<()> {
+        let relay_urls: Vec<RelayUrl> = Relay::urls(
+            nip65_relays
+                .iter()
+                .chain(inbox_relays)
+                .chain(key_package_relays),
+        );
+        self.nostr.ensure_relays_connected(&relay_urls).await?;
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Relays connected");
+
+        if let Err(e) = self.refresh_global_subscription_for_user(user).await {
+            tracing::warn!(
+                target: "whitenoise::activate_account_without_publishing",
+                "Failed to refresh global subscription for new user {}: {}",
+                user.pubkey,
+                e
+            );
+        }
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Global subscription refreshed");
+
+        self.setup_subscriptions(account, nip65_relays, inbox_relays)
+            .await?;
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Subscriptions setup");
+
+        // Note: We skip key package setup for external signer accounts.
+        // Key packages need to be published separately with the external signer.
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Skipping key package setup (external signer)");
+
         Ok(())
     }
 
@@ -629,6 +795,77 @@ impl Whitenoise {
         }
 
         Ok((nip65_relays, inbox_relays, key_package_relays))
+    }
+
+    /// Sets up relays for an external signer account.
+    ///
+    /// This is similar to `setup_relays_for_existing_account` but does NOT publish
+    /// relay lists (since external signers handle their own publishing).
+    /// It only fetches existing relays or uses defaults and saves them locally.
+    async fn setup_relays_for_external_signer_account(
+        &self,
+        account: &mut Account,
+    ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
+        let default_relays = self.load_default_relays().await?;
+
+        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
+        // We don't publish here - external signer will handle that
+        let nip65_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Nip65,
+                &default_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let inbox_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Inbox,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let key_package_relays = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::KeyPackage,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        Ok((nip65_relays, inbox_relays, key_package_relays))
+    }
+
+    /// Sets up a specific relay type for an external signer account.
+    /// Fetches from network or uses defaults, but never publishes.
+    async fn setup_external_account_relay_type(
+        &self,
+        account: &mut Account,
+        relay_type: RelayType,
+        source_relays: &[Relay],
+        default_relays: &[Relay],
+    ) -> Result<Vec<Relay>> {
+        // Try to fetch existing relay lists first
+        let fetched_relays = self
+            .fetch_existing_relays(account.pubkey, relay_type, source_relays)
+            .await?;
+
+        let user = account.user(&self.database).await?;
+        if fetched_relays.is_empty() {
+            // No existing relay lists - use defaults (don't publish)
+            user.add_relays(default_relays, relay_type, &self.database)
+                .await?;
+            Ok(default_relays.to_vec())
+        } else {
+            // Found existing relay lists - use them
+            user.add_relays(&fetched_relays, relay_type, &self.database)
+                .await?;
+            Ok(fetched_relays)
+        }
     }
 
     async fn setup_existing_account_relay_type(
@@ -882,21 +1119,37 @@ impl Whitenoise {
             ),
         }
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        // For external signer accounts, we can't get keys from the secret store.
+        // Set up subscriptions without a signer - the signer is only needed for
+        // decryption which will be handled separately for external signers.
+        if account.uses_external_signer() {
+            self.nostr
+                .setup_account_subscriptions(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    since,
+                )
+                .await?;
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        self.nostr
-            .setup_account_subscriptions_with_signer(
-                account.pubkey,
-                &user_relays,
-                &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
-                since,
-                keys,
-            )
-            .await?;
+            self.nostr
+                .setup_account_subscriptions_with_signer(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    since,
+                    keys,
+                )
+                .await?;
+        }
 
         tracing::debug!(
             target: "whitenoise::setup_subscriptions",
@@ -928,21 +1181,35 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        // For external signer accounts, we can't get keys from the secret store.
+        if account.uses_external_signer() {
+            self.nostr
+                .update_account_subscriptions(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                )
+                .await
+                .map_err(WhitenoiseError::from)
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        self.nostr
-            .update_account_subscriptions_with_signer(
-                account.pubkey,
-                &user_relays,
-                &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
-                keys,
-            )
-            .await
-            .map_err(WhitenoiseError::from)
+            self.nostr
+                .update_account_subscriptions_with_signer(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    keys,
+                )
+                .await
+                .map_err(WhitenoiseError::from)
+        }
     }
 }
 
@@ -1295,6 +1562,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1310,6 +1578,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(last),
             created_at: now,
             updated_at: now,
@@ -1327,6 +1596,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(epochish),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1343,6 +1613,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(future),
             created_at: now,
             updated_at: now,
