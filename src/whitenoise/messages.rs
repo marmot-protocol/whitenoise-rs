@@ -44,7 +44,7 @@ impl Whitenoise {
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
         let message_event = mdk.create_message(group_id, inner_event)?;
         let message = mdk
-            .get_message(&event_id)?
+            .get_message(group_id, &event_id)?
             .ok_or(WhitenoiseError::MdkCoreError(
                 mdk_core::error::Error::MessageNotFound,
             ))?;
@@ -79,7 +79,7 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<Vec<MessageWithTokens>> {
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let messages = mdk.get_messages(group_id)?;
+        let messages = mdk.get_messages(group_id, None)?;
         let messages_with_tokens = messages
             .iter()
             .map(|message| MessageWithTokens {
@@ -155,7 +155,7 @@ impl Whitenoise {
             for group_info in groups {
                 total_groups_checked += 1;
 
-                let mdk_messages = mdk.get_messages(&group_info.mls_group_id)?;
+                let mdk_messages = mdk.get_messages(&group_info.mls_group_id, None)?;
 
                 if self
                     .cache_needs_sync(&group_info.mls_group_id, &mdk_messages)
@@ -604,7 +604,7 @@ mod tests {
 
         // Get messages from MDK
         let mdk = Account::create_mdk(creator.pubkey, &whitenoise.config.data_dir).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
 
         // Verify we have 3 messages in MDK
         assert_eq!(mdk_messages.len(), 3);
@@ -685,7 +685,7 @@ mod tests {
 
         // Sync the cache
         let mdk = Account::create_mdk(creator.pubkey, &whitenoise.config.data_dir).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await
@@ -705,7 +705,7 @@ mod tests {
             .unwrap();
 
         // Get updated messages from MDK
-        let mdk_messages = mdk.get_messages(&group.mls_group_id).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         assert_eq!(mdk_messages.len(), 3);
 
         // Cache should need sync now
@@ -844,7 +844,7 @@ mod tests {
 
         // Populate cache
         let mdk = Account::create_mdk(creator.pubkey, &whitenoise.config.data_dir).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await
@@ -911,7 +911,7 @@ mod tests {
 
         // Populate cache
         let mdk = Account::create_mdk(creator.pubkey, &whitenoise.config.data_dir).unwrap();
-        let mdk_messages = mdk.get_messages(&group.mls_group_id).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await
