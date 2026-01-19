@@ -427,8 +427,29 @@ impl Whitenoise {
 
         // Check if account already exists
         if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
-            tracing::debug!(target: "whitenoise::login_external", "Found existing account");
-            return Ok(existing);
+            tracing::debug!(target: "whitenoise::login_external", "Found existing account, re-establishing relays and subscriptions");
+
+            // Setup relays for existing external signer account
+            let mut account_mut = existing.clone();
+            let (nip65_relays, inbox_relays, key_package_relays) = self
+                .setup_relays_for_external_signer_account(&mut account_mut)
+                .await?;
+            tracing::debug!(target: "whitenoise::login_external", "Relays setup for existing account (without publishing)");
+
+            let user = account_mut.user(&self.database).await?;
+
+            // Activate without publishing (external signer will handle publishing)
+            self.activate_account_without_publishing(
+                &account_mut,
+                &user,
+                &nip65_relays,
+                &inbox_relays,
+                &key_package_relays,
+            )
+            .await?;
+            tracing::debug!(target: "whitenoise::login_external", "Existing account activated (without publishing)");
+
+            return Ok(account_mut);
         }
 
         // Create new external signer account

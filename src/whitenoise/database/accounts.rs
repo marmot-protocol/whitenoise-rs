@@ -1716,4 +1716,97 @@ mod tests {
         // Should fail due to closed database
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_save_and_load_external_account_type() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create test account with External account type
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let test_user_id = 999i64;
+        let test_created_at = chrono::Utc::now();
+        let test_updated_at = chrono::Utc::now();
+
+        let account = Account {
+            id: Some(1),
+            pubkey: test_pubkey,
+            user_id: test_user_id,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: test_created_at,
+            updated_at: test_updated_at,
+        };
+
+        // Save the account
+        let result = account.save(&whitenoise.database).await;
+        assert!(result.is_ok());
+
+        // Load the account back and verify account_type is preserved
+        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        assert!(loaded_account.is_ok());
+
+        let loaded = loaded_account.unwrap();
+        assert_eq!(loaded.pubkey, test_pubkey);
+        assert_eq!(loaded.user_id, test_user_id);
+        assert_eq!(loaded.account_type, AccountType::External);
+        assert!(loaded.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_external_account_roundtrip_with_follows() {
+        use crate::whitenoise::users::User;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create test account with External account type
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+        let test_timestamp = chrono::Utc::now();
+
+        let account = Account {
+            id: None,
+            pubkey: account_pubkey,
+            user_id: 1i64,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: test_timestamp,
+            updated_at: test_timestamp,
+        };
+
+        // Save the account
+        account.save(&whitenoise.database).await.unwrap();
+
+        // Create a user to follow
+        let user_pubkey = nostr_sdk::Keys::generate().public_key();
+        let user = User {
+            id: None,
+            pubkey: user_pubkey,
+            metadata: nostr_sdk::Metadata::new()
+                .name("TestUser")
+                .display_name("Test User"),
+            created_at: test_timestamp,
+            updated_at: test_timestamp,
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        // Load the account and add a follow relationship
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+
+        saved_account
+            .follow_user(&saved_user, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify the external account can have follows
+        let follows = saved_account.follows(&whitenoise.database).await.unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0].pubkey, user_pubkey);
+
+        // Verify account_type is still External after all operations
+        assert_eq!(saved_account.account_type, AccountType::External);
+    }
 }
