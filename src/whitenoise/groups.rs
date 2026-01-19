@@ -840,11 +840,13 @@ impl Whitenoise {
             blossom_url
         );
 
-        // Download, verify, decrypt, and cache the image
+        // Download and decrypt the image (MDK handles hash verification internally)
         let encrypted_data = Self::download_blob_from_blossom(&blossom_url, image_hash).await?;
-        Self::verify_blob_hash(&encrypted_data, image_hash)?;
 
-        let decrypted_data = Self::decrypt_group_image(&encrypted_data, image_key, image_nonce)?;
+        let secret_key = Secret::new(*image_key);
+        let secret_nonce = Secret::new(*image_nonce);
+        let decrypted_data =
+            Self::decrypt_group_image(&encrypted_data, Some(image_hash), &secret_key, &secret_nonce)?;
         let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
             WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
         })?;
@@ -1042,31 +1044,20 @@ impl Whitenoise {
             })
     }
 
-    /// Verifies that downloaded blob matches expected hash
-    fn verify_blob_hash(data: &[u8], expected_hash: &[u8; 32]) -> Result<()> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let actual_hash: [u8; 32] = hasher.finalize().into();
-
-        if &actual_hash != expected_hash {
-            return Err(WhitenoiseError::HashMismatch {
-                expected: hex::encode(expected_hash),
-                actual: hex::encode(actual_hash),
-            });
-        }
-
-        Ok(())
-    }
-
     /// Decrypts a group image using the provided key and nonce
     fn decrypt_group_image(
         encrypted_data: &[u8],
-        image_key: &[u8; 32],
-        image_nonce: &[u8; 12],
+        expected_hash: Option<&[u8; 32]>,
+        image_key: &Secret<[u8; 32]>,
+        image_nonce: &Secret<[u8; 12]>,
     ) -> Result<Vec<u8>> {
-        group_image::decrypt_group_image(encrypted_data, image_key, image_nonce).map_err(|e| {
-            WhitenoiseError::ImageDecryptionFailed(format!("Failed to decrypt group image: {}", e))
-        })
+        group_image::decrypt_group_image(encrypted_data, expected_hash, image_key, image_nonce)
+            .map_err(|e| {
+                WhitenoiseError::ImageDecryptionFailed(format!(
+                    "Failed to decrypt group image: {}",
+                    e
+                ))
+            })
     }
 
     /// Downloads and decrypts a chat media blob
