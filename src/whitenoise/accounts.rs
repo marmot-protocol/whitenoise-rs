@@ -431,6 +431,19 @@ impl Whitenoise {
 
             let mut account_mut = existing.clone();
 
+            // Always attempt to remove any locally stored key for external logins
+            // This handles edge cases where a prior migration failed or stale keys remain
+            if let Err(e) = self
+                .secrets_store
+                .remove_private_key_for_pubkey(&account_mut.pubkey)
+            {
+                tracing::debug!(
+                    target: "whitenoise::login_external",
+                    "No local key to remove during external-login: {}",
+                    e
+                );
+            }
+
             // Handle migration from Local to External account type
             if account_mut.account_type != AccountType::External {
                 tracing::info!(
@@ -438,19 +451,6 @@ impl Whitenoise {
                     "Migrating account from {:?} to External",
                     account_mut.account_type
                 );
-
-                // Remove the local private key from secrets store
-                if let Err(e) = self
-                    .secrets_store
-                    .remove_private_key_for_pubkey(&account_mut.pubkey)
-                {
-                    tracing::warn!(
-                        target: "whitenoise::login_external",
-                        "Failed to remove local key during external-login migration: {}",
-                        e
-                    );
-                    // Continue anyway - the key may not exist or may have been removed already
-                }
 
                 // Update account type to External and persist
                 account_mut.account_type = AccountType::External;
@@ -539,9 +539,17 @@ impl Whitenoise {
         // Delete the account from the database
         account.delete(&self.database).await?;
 
-        // Remove the private key from the secret store (only for local accounts)
+        // Remove the private key from the secret store
+        // For local accounts this is required; for external accounts this is best-effort cleanup
         if account.has_local_key() {
             self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
+        } else if let Err(e) = self.secrets_store.remove_private_key_for_pubkey(pubkey) {
+            tracing::debug!(
+                target: "whitenoise::logout",
+                "No local key to remove for external account {}: {}",
+                pubkey,
+                e
+            );
         }
 
         Ok(())
