@@ -429,8 +429,36 @@ impl Whitenoise {
         if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
             tracing::debug!(target: "whitenoise::login_external", "Found existing account, re-establishing relays and subscriptions");
 
-            // Setup relays for existing external signer account
             let mut account_mut = existing.clone();
+
+            // Handle migration from Local to External account type
+            if account_mut.account_type != AccountType::External {
+                tracing::info!(
+                    target: "whitenoise::login_external",
+                    "Migrating account from {:?} to External",
+                    account_mut.account_type
+                );
+
+                // Remove the local private key from secrets store
+                if let Err(e) = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey)
+                {
+                    tracing::warn!(
+                        target: "whitenoise::login_external",
+                        "Failed to remove local key during external-login migration: {}",
+                        e
+                    );
+                    // Continue anyway - the key may not exist or may have been removed already
+                }
+
+                // Update account type to External and persist
+                account_mut.account_type = AccountType::External;
+                account_mut = self.persist_account(&account_mut).await?;
+                tracing::debug!(target: "whitenoise::login_external", "Account migrated to External type");
+            }
+
+            // Setup relays for existing external signer account
             let (nip65_relays, inbox_relays, key_package_relays) = self
                 .setup_relays_for_external_signer_account(&mut account_mut)
                 .await?;
