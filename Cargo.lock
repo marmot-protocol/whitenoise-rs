@@ -5109,6 +5109,7 @@ dependencies = [
  "lightning-invoice",
  "mdk-core",
  "mdk-sqlite-storage",
+ "mdk-storage-traits",
  "mockito",
  "nostr-blossom",
  "nostr-sdk",

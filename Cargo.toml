@@ -35,6 +35,7 @@ mdk-core = { version = "0.5.1", git = "https://github.com/parres-hq/mdk", rev = 
     "mip04",
 ] }
 mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/parres-hq/mdk", rev = "46738bd1e16e0aa78255c7f70b1d90698e968746" }
+mdk-storage-traits = { version = "0.5.1", git = "https://github.com/parres-hq/mdk", rev = "46738bd1e16e0aa78255c7f70b1d90698e968746" }
 
 nwc = "0.43"
 nostr-blossom = "0.43"
