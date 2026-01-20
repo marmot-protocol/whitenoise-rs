@@ -431,19 +431,6 @@ impl Whitenoise {
 
             let mut account_mut = existing.clone();
 
-            // Always attempt to remove any locally stored key for external logins
-            // This handles edge cases where a prior migration failed or stale keys remain
-            if let Err(e) = self
-                .secrets_store
-                .remove_private_key_for_pubkey(&account_mut.pubkey)
-            {
-                tracing::debug!(
-                    target: "whitenoise::login_external",
-                    "No local key to remove during external-login: {}",
-                    e
-                );
-            }
-
             // Handle migration from Local to External account type
             if account_mut.account_type != AccountType::External {
                 tracing::info!(
@@ -452,10 +439,44 @@ impl Whitenoise {
                     account_mut.account_type
                 );
 
-                // Update account type to External and persist
+                // Update account type to External and persist first
                 account_mut.account_type = AccountType::External;
                 account_mut = self.persist_account(&account_mut).await?;
                 tracing::debug!(target: "whitenoise::login_external", "Account migrated to External type");
+
+                // Best-effort removal of local key after successful migration
+                if let Err(e) = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey)
+                {
+                    tracing::debug!(
+                        target: "whitenoise::login_external",
+                        "No local key to remove after migration: {}",
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "whitenoise::login_external",
+                        "Removed local key after migration to External"
+                    );
+                }
+            } else {
+                // Account is already External - still attempt best-effort removal of any stale keys
+                if let Err(e) = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey)
+                {
+                    tracing::debug!(
+                        target: "whitenoise::login_external",
+                        "No stale local key to remove for existing External account: {}",
+                        e
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "whitenoise::login_external",
+                        "Removed stale local key for existing External account"
+                    );
+                }
             }
 
             // Setup relays for existing external signer account
