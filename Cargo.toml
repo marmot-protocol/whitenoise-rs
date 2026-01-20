@@ -63,10 +63,10 @@ nostr-sdk = { version = "0.43", features = [
 
 petname = "2.0.2"
 rand = "0.9"
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.13", features = [
     "multipart",
     "json",
-    "rustls-tls",
+    "rustls",
 ], default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

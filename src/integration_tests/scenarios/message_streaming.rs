@@ -116,8 +116,9 @@ impl MessageStreamingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Wait for all messages to be processed and cached
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Wait for all messages to be processed and cached via relay round-trip
+        // Messages need time to: publish to relay -> come back via subscription -> MLS process -> cache
+        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
 
         Ok(())
     }
