@@ -73,6 +73,7 @@ impl Whitenoise {
             user_confirmation: None,
             welcomer_pubkey: Some(welcomer_pubkey),
             last_read_message_id: None,
+            pin_order: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -57,16 +57,34 @@ pub struct ChatListItem {
 
     /// Number of unread messages in this chat
     pub unread_count: usize,
+
+    /// Pin order for chat list sorting.
+    /// - `None` = not pinned (appears after pinned chats)
+    /// - `Some(n)` = pinned, lower values appear first
+    pub pin_order: Option<i64>,
 }
 
 impl ChatListItem {
-    fn sort_key(&self) -> (Reverse<DateTime<Utc>>, &GroupId) {
+    /// Returns a sort key for ordering chat list items.
+    ///
+    /// Sorting priority:
+    /// 1. Pinned chats first (pin_order is Some)
+    /// 2. Among pinned: lower pin_order values first
+    /// 3. Among unpinned (or same pin_order): by last activity (most recent first)
+    /// 4. Tiebreaker: by group_id for stable ordering
+    fn sort_key(&self) -> (bool, Option<i64>, Reverse<DateTime<Utc>>, &GroupId) {
+        let is_unpinned = self.pin_order.is_none();
         let timestamp = self
             .last_message
             .as_ref()
             .map(|m| m.created_at)
             .unwrap_or(self.created_at);
-        (Reverse(timestamp), &self.mls_group_id)
+        (
+            is_unpinned,
+            self.pin_order,
+            Reverse(timestamp),
+            &self.mls_group_id,
+        )
     }
 }
 
@@ -163,6 +181,7 @@ fn assemble_chat_list_items(
             let pending_confirmation = account_group.is_pending();
             let welcomer_pubkey = account_group.welcomer_pubkey;
             let unread_count = *unread_counts.get(&group.mls_group_id).unwrap_or(&0);
+            let pin_order = account_group.pin_order;
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -175,6 +194,7 @@ fn assemble_chat_list_items(
                 pending_confirmation,
                 welcomer_pubkey,
                 unread_count,
+                pin_order,
             })
         })
         .collect()
@@ -341,7 +361,10 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Assemble and return ChatListItem
+        // 9. Get pin order
+        let pin_order = account_group.pin_order;
+
+        // 10. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
             mls_group_id: group_id.clone(),
             name,
@@ -353,6 +376,7 @@ impl Whitenoise {
             pending_confirmation,
             welcomer_pubkey,
             unread_count,
+            pin_order,
         }))
     }
 
@@ -1273,6 +1297,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1285,6 +1310,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1297,6 +1323,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
         ];
 
@@ -1337,6 +1364,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1357,6 +1385,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1377,6 +1406,7 @@ mod tests {
                 pending_confirmation: false,
                 welcomer_pubkey: None,
                 unread_count: 0,
+                pin_order: None,
             },
         ];
 
@@ -1466,5 +1496,305 @@ mod tests {
         for i in 0..3 {
             assert_eq!(list1[i].mls_group_id, list2[i].mls_group_id);
         }
+    }
+
+    #[test]
+    fn test_sort_chat_list_pinned_before_unpinned() {
+        use chrono::TimeZone;
+
+        let timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Unpinned".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[2u8; 32]),
+                name: Some("Pinned".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(100),
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // Pinned should come first
+        assert_eq!(items[0].name, Some("Pinned".to_string()));
+        assert_eq!(items[1].name, Some("Unpinned".to_string()));
+    }
+
+    #[test]
+    fn test_sort_chat_list_lower_pin_order_first() {
+        use chrono::TimeZone;
+
+        let timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Pin Order 100".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(100),
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[2u8; 32]),
+                name: Some("Pin Order 50".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(50),
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[3u8; 32]),
+                name: Some("Pin Order 200".to_string()),
+                group_type: GroupType::Group,
+                created_at: timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(200),
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // Lower pin_order values should come first
+        assert_eq!(items[0].name, Some("Pin Order 50".to_string()));
+        assert_eq!(items[1].name, Some("Pin Order 100".to_string()));
+        assert_eq!(items[2].name, Some("Pin Order 200".to_string()));
+    }
+
+    #[test]
+    fn test_sort_chat_list_same_pin_order_sorts_by_activity() {
+        use chrono::TimeZone;
+
+        let older_timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+        let newer_timestamp = Utc.timestamp_opt(2000, 0).unwrap();
+
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Older".to_string()),
+                group_type: GroupType::Group,
+                created_at: older_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(100),
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[2u8; 32]),
+                name: Some("Newer".to_string()),
+                group_type: GroupType::Group,
+                created_at: newer_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(100),
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // Same pin_order: newer activity should come first
+        assert_eq!(items[0].name, Some("Newer".to_string()));
+        assert_eq!(items[1].name, Some("Older".to_string()));
+    }
+
+    #[test]
+    fn test_sort_chat_list_mixed_pinned_and_unpinned() {
+        use chrono::TimeZone;
+
+        let old_timestamp = Utc.timestamp_opt(1000, 0).unwrap();
+        let new_timestamp = Utc.timestamp_opt(2000, 0).unwrap();
+
+        let mut items = vec![
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[1u8; 32]),
+                name: Some("Unpinned New".to_string()),
+                group_type: GroupType::Group,
+                created_at: new_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[2u8; 32]),
+                name: Some("Pinned Low".to_string()),
+                group_type: GroupType::Group,
+                created_at: old_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(10),
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[3u8; 32]),
+                name: Some("Unpinned Old".to_string()),
+                group_type: GroupType::Group,
+                created_at: old_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: None,
+            },
+            ChatListItem {
+                mls_group_id: GroupId::from_slice(&[4u8; 32]),
+                name: Some("Pinned High".to_string()),
+                group_type: GroupType::Group,
+                created_at: new_timestamp,
+                group_image_path: None,
+                group_image_url: None,
+                last_message: None,
+                pending_confirmation: false,
+                welcomer_pubkey: None,
+                unread_count: 0,
+                pin_order: Some(20),
+            },
+        ];
+
+        sort_chat_list(&mut items);
+
+        // Expected order:
+        // 1. Pinned Low (pin_order 10)
+        // 2. Pinned High (pin_order 20)
+        // 3. Unpinned New (newer timestamp)
+        // 4. Unpinned Old (older timestamp)
+        assert_eq!(items[0].name, Some("Pinned Low".to_string()));
+        assert_eq!(items[1].name, Some("Pinned High".to_string()));
+        assert_eq!(items[2].name, Some("Unpinned New".to_string()));
+        assert_eq!(items[3].name, Some("Unpinned Old".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_includes_pin_order() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Initially unpinned
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(chat_list.len(), 1);
+        assert!(chat_list[0].pin_order.is_none());
+
+        // Pin the chat
+        whitenoise
+            .set_chat_pin_order(&creator, &group.mls_group_id, Some(42))
+            .await
+            .unwrap();
+
+        // Verify pin_order is included
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(chat_list.len(), 1);
+        assert_eq!(chat_list[0].pin_order, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_sorting_with_pinned_chats() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        // Create 3 groups
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config1.name = "Group A".to_string();
+        let group_a = whitenoise
+            .create_group(&creator, vec![member.pubkey], config1, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "Group B".to_string();
+        let group_b = whitenoise
+            .create_group(&creator, vec![member.pubkey], config2, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let mut config3 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config3.name = "Group C".to_string();
+        let _group_c = whitenoise
+            .create_group(&creator, vec![member.pubkey], config3, None)
+            .await
+            .unwrap();
+
+        // Without pinning: C, B, A (by creation time, most recent first)
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(chat_list[0].name, Some("Group C".to_string()));
+        assert_eq!(chat_list[1].name, Some("Group B".to_string()));
+        assert_eq!(chat_list[2].name, Some("Group A".to_string()));
+
+        // Pin Group A with low order, Group B with high order
+        whitenoise
+            .set_chat_pin_order(&creator, &group_a.mls_group_id, Some(10))
+            .await
+            .unwrap();
+        whitenoise
+            .set_chat_pin_order(&creator, &group_b.mls_group_id, Some(20))
+            .await
+            .unwrap();
+
+        // After pinning: A (pin 10), B (pin 20), C (unpinned)
+        let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(chat_list[0].name, Some("Group A".to_string()));
+        assert_eq!(chat_list[1].name, Some("Group B".to_string()));
+        assert_eq!(chat_list[2].name, Some("Group C".to_string()));
     }
 }
