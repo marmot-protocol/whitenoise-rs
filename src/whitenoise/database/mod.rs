@@ -139,35 +139,89 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes all data by dropping and recreating all tables
+    /// Deletes all data from all tables while preserving the schema
     ///
     /// This method:
     /// - Temporarily disables foreign key constraints
-    /// - Drops all user tables (including migration tracking)
+    /// - Deletes all rows from user tables (preserving schema and migrations)
     /// - Re-enables foreign key constraints
-    /// - Re-runs migrations to recreate the current schema from scratch
+    /// - Resets SQLite auto-increment counters
     /// - Uses a transaction to ensure atomicity
+    ///
+    /// This is safer than DROP TABLE + migrate because:
+    /// 1. It's fully atomic (no two-phase operation)
+    /// 2. Schema is preserved even if interrupted
+    /// 3. No risk of migration failures leaving database in broken state
     pub async fn delete_all_data(&self) -> Result<(), DatabaseError> {
+        // Retry logic for database locking issues
+        let max_retries = 3;
+        let mut last_error = None;
+
+        for attempt in 1..=max_retries {
+            match self.delete_all_data_inner().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // Check if this is a database lock error
+                    let is_lock_error = matches!(&e, DatabaseError::Sqlx(sqlx::Error::Database(db_err))
+                        if db_err.code().map(|c| c == "5" || c == "6").unwrap_or(false));
+
+                    if is_lock_error && attempt < max_retries {
+                        tracing::warn!(
+                            "Database locked during cleanup (attempt {}/{}), retrying...",
+                            attempt,
+                            max_retries
+                        );
+                        // Wait before retrying, with exponential backoff
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            100 * attempt as u64,
+                        ))
+                        .await;
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            DatabaseError::Sqlx(sqlx::Error::Protocol(
+                "Unexpected retry failure".to_string(),
+            ))
+        }))
+    }
+
+    /// Inner implementation of delete_all_data
+    async fn delete_all_data_inner(&self) -> Result<(), DatabaseError> {
         let mut txn = self.pool.begin().await?;
 
-        // Disable foreign key constraints temporarily to allow dropping tables in any order
+        // Disable foreign key constraints temporarily to allow deleting in any order
         sqlx::query("PRAGMA foreign_keys = OFF")
             .execute(&mut *txn)
             .await?;
 
-        // Get all user tables (excluding only SQLite system tables)
+        // Get all user tables (excluding SQLite system tables and migration tracking)
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master
              WHERE type='table'
-             AND name NOT LIKE 'sqlite_%'",
+             AND name NOT LIKE 'sqlite_%'
+             AND name != '_sqlx_migrations'",
         )
         .fetch_all(&mut *txn)
         .await?;
 
-        // Drop all user tables (order doesn't matter with FK constraints disabled)
-        for (table_name,) in tables {
-            let drop_query = format!("DROP TABLE IF EXISTS {}", table_name);
-            sqlx::query(&drop_query).execute(&mut *txn).await?;
+        // Delete all rows from each table (preserves schema)
+        for (table_name,) in &tables {
+            let delete_query = format!("DELETE FROM {}", table_name);
+            sqlx::query(&delete_query).execute(&mut *txn).await?;
+        }
+
+        // Reset auto-increment counters for all tables
+        for (table_name,) in &tables {
+            // This resets the ROWID counter
+            let reset_query = format!("DELETE FROM sqlite_sequence WHERE name = '{}'", table_name);
+            // Ignore errors - table might not have auto-increment
+            let _ = sqlx::query(&reset_query).execute(&mut *txn).await;
         }
 
         // Re-enable foreign key constraints
@@ -176,9 +230,6 @@ impl Database {
             .await?;
 
         txn.commit().await?;
-
-        // Re-run migrations to recreate the current schema
-        MIGRATOR.run(&self.pool).await?;
 
         Ok(())
     }

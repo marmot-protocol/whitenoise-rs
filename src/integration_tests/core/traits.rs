@@ -48,29 +48,38 @@ pub trait Scenario {
         let tests_run = context.tests_count;
         let tests_passed = context.tests_passed;
 
+        // Always run cleanup, regardless of scenario success/failure
+        // This ensures database state is reset for the next scenario
+        let cleanup_result = self.cleanup().await;
+
         match run_result {
             Ok(()) => {
-                tracing::info!(
-                    "✓ {} Scenario completed ({}/{}) in {:?}",
-                    scenario_name,
-                    tests_passed,
-                    tests_run,
-                    duration
-                );
-
-                let cleanup_result = self.cleanup().await;
-                if cleanup_result.is_err() {
+                // Scenario passed - check if cleanup succeeded
+                if let Err(cleanup_err) = cleanup_result {
                     tracing::error!(
                         "✗ {} Scenario cleanup failed: {}",
                         scenario_name,
-                        cleanup_result.err().unwrap()
+                        cleanup_err
                     );
+                    // Fail the scenario if cleanup fails to prevent corrupted state
+                    // from affecting subsequent scenarios
+                    (
+                        ScenarioResult::failed(scenario_name, tests_run, tests_passed, duration),
+                        Some(cleanup_err),
+                    )
+                } else {
+                    tracing::info!(
+                        "✓ {} Scenario completed ({}/{}) in {:?}",
+                        scenario_name,
+                        tests_passed,
+                        tests_run,
+                        duration
+                    );
+                    (
+                        ScenarioResult::new(scenario_name, tests_run, tests_passed, duration),
+                        None,
+                    )
                 }
-
-                (
-                    ScenarioResult::new(scenario_name, tests_run, tests_passed, duration),
-                    None,
-                )
             }
             Err(e) => {
                 tracing::error!(
@@ -80,6 +89,15 @@ pub trait Scenario {
                     duration,
                     e
                 );
+
+                // Log cleanup failure but return the original scenario error
+                if let Err(cleanup_err) = cleanup_result {
+                    tracing::error!(
+                        "✗ {} Scenario cleanup also failed: {}",
+                        scenario_name,
+                        cleanup_err
+                    );
+                }
 
                 (
                     ScenarioResult::failed(scenario_name, tests_run, tests_passed, duration),
@@ -91,6 +109,8 @@ pub trait Scenario {
 
     async fn cleanup(&mut self) -> Result<(), WhitenoiseError> {
         let context = self.context();
+
+        // First, logout all accounts to stop their event processing
         for account in context.accounts.values() {
             if let Err(e) = context.whitenoise.logout(&account.pubkey).await {
                 match e {
@@ -100,9 +120,17 @@ pub trait Scenario {
             }
         }
 
-        context.whitenoise.wipe_database().await?;
+        // Give background tasks time to complete and release database connections
+        // This helps prevent "database is locked" errors during cleanup
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Reset nostr client first to stop any pending subscriptions
         context.whitenoise.reset_nostr_client().await?;
 
+        // Now wipe the database - this has retry logic for lock contention
+        context.whitenoise.wipe_database().await?;
+
+        // Final delay to ensure everything is settled before next scenario
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         Ok(())
