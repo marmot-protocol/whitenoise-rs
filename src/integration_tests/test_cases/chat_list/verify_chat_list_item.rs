@@ -13,6 +13,7 @@ pub struct VerifyChatListItemTestCase {
     expected_welcomer_account: Option<String>,
     assert_no_welcomer: bool,
     expected_unread_count: Option<usize>,
+    expected_pin_order: Option<Option<i64>>,
 }
 
 impl VerifyChatListItemTestCase {
@@ -27,6 +28,7 @@ impl VerifyChatListItemTestCase {
             expected_welcomer_account: None,
             assert_no_welcomer: false,
             expected_unread_count: None,
+            expected_pin_order: None,
         }
     }
 
@@ -79,6 +81,18 @@ impl VerifyChatListItemTestCase {
     /// Verifies the unread_count field matches the expected value.
     pub fn expecting_unread_count(mut self, count: usize) -> Self {
         self.expected_unread_count = Some(count);
+        self
+    }
+
+    /// Verifies the pin_order field matches the expected value.
+    pub fn expecting_pin_order(mut self, order: i64) -> Self {
+        self.expected_pin_order = Some(Some(order));
+        self
+    }
+
+    /// Verifies the chat is not pinned.
+    pub fn expecting_not_pinned(mut self) -> Self {
+        self.expected_pin_order = Some(None);
         self
     }
 }
@@ -172,6 +186,15 @@ impl TestCase for VerifyChatListItemTestCase {
                 item.unread_count, expected_count,
                 "Expected unread_count={} but got {}",
                 expected_count, item.unread_count
+            );
+        }
+
+        // Verify pin_order
+        if let Some(expected_pin_order) = &self.expected_pin_order {
+            assert_eq!(
+                &item.pin_order, expected_pin_order,
+                "Expected pin_order={:?} but got {:?}",
+                expected_pin_order, item.pin_order
             );
         }
 

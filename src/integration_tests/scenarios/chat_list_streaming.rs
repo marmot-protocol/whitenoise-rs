@@ -186,6 +186,44 @@ impl ChatListStreamingScenario {
         );
         Ok(())
     }
+
+    async fn phase7_verify_pin_order_in_subscription(&mut self) -> Result<(), WhitenoiseError> {
+        tracing::info!("=== Phase 7: Verify pin order affects subscription initial items ===");
+
+        // Currently: GROUP_NAME (recent message) comes before INACTIVE_GROUP_NAME
+        // Pin the INACTIVE_GROUP_NAME to make it appear first
+        SetChatPinOrderTestCase::new("stream_creator", Self::INACTIVE_GROUP_NAME)
+            .with_pin_order(100)
+            .execute(&mut self.context)
+            .await?;
+
+        // Verify subscription now returns pinned group first
+        VerifySubscriptionInitialItemsTestCase::expect_groups_in_order(
+            "stream_creator",
+            vec![Self::INACTIVE_GROUP_NAME, Self::GROUP_NAME],
+        )
+        .execute(&mut self.context)
+        .await?;
+
+        tracing::info!("✓ Pinned group appears first in subscription initial items");
+
+        // Also pin GROUP_NAME with lower order (should appear first)
+        SetChatPinOrderTestCase::new("stream_creator", Self::GROUP_NAME)
+            .with_pin_order(50)
+            .execute(&mut self.context)
+            .await?;
+
+        // Verify order: GROUP_NAME (pin_order=50) before INACTIVE_GROUP_NAME (pin_order=100)
+        VerifySubscriptionInitialItemsTestCase::expect_groups_in_order(
+            "stream_creator",
+            vec![Self::GROUP_NAME, Self::INACTIVE_GROUP_NAME],
+        )
+        .execute(&mut self.context)
+        .await?;
+
+        tracing::info!("✓ Lower pin_order appears first in subscription initial items");
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -203,6 +241,7 @@ impl Scenario for ChatListStreamingScenario {
         self.phase4_test_new_last_message().await?;
         self.phase5_test_last_message_deleted().await?;
         self.phase6_verify_subscription_ordering().await?;
+        self.phase7_verify_pin_order_in_subscription().await?;
 
         tracing::info!("✓ ChatListStreamingScenario completed successfully");
         Ok(())
