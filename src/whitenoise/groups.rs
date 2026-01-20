@@ -1280,9 +1280,10 @@ impl Whitenoise {
 
         let blossom_server_url = blossom_server_url.unwrap_or(Self::default_blossom_url());
         // Upload encrypted data to Blossom using the derived keypair
+        // Extract the encrypted data from Secret wrapper for upload
         let descriptor = Self::upload_encrypted_blob_to_blossom(
             &blossom_server_url,
-            prepared.encrypted_data,
+            prepared.encrypted_data.as_ref().clone(),
             image_type.mime_type(),
             &prepared.upload_keypair,
         )
@@ -1340,10 +1341,11 @@ impl Whitenoise {
         }
 
         // Return the metadata needed for group update
+        // Extract raw bytes from Secret wrappers
         Ok((
             prepared.encrypted_hash,
-            prepared.image_key,
-            prepared.image_nonce,
+            *prepared.image_key.as_ref(),
+            *prepared.image_nonce.as_ref(),
         ))
     }
 
