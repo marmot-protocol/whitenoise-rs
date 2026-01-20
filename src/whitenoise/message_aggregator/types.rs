@@ -162,3 +162,215 @@ pub enum ProcessingError {
     #[error("Internal processing error: {0}")]
     Internal(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod aggregator_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_config() {
+            let config = AggregatorConfig::default();
+            assert!(config.normalize_emoji);
+            assert!(!config.enable_debug_logging);
+        }
+
+        #[test]
+        fn test_config_equality() {
+            let config1 = AggregatorConfig::default();
+            let config2 = AggregatorConfig {
+                normalize_emoji: true,
+                enable_debug_logging: false,
+            };
+            assert_eq!(config1, config2);
+        }
+
+        #[test]
+        fn test_config_inequality() {
+            let config1 = AggregatorConfig::default();
+            let config2 = AggregatorConfig {
+                normalize_emoji: false,
+                enable_debug_logging: true,
+            };
+            assert_ne!(config1, config2);
+        }
+    }
+
+    mod reaction_summary_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_reaction_summary() {
+            let summary = ReactionSummary::default();
+            assert!(summary.by_emoji.is_empty());
+            assert!(summary.user_reactions.is_empty());
+        }
+
+        #[test]
+        fn test_reaction_summary_with_data() {
+            let pubkey = PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap();
+
+            let emoji_reaction = EmojiReaction {
+                emoji: "👍".to_string(),
+                count: 1,
+                users: vec![pubkey],
+            };
+
+            let user_reaction = UserReaction {
+                user: pubkey,
+                emoji: "👍".to_string(),
+                created_at: Timestamp::now(),
+            };
+
+            let mut by_emoji = HashMap::new();
+            by_emoji.insert("👍".to_string(), emoji_reaction);
+
+            let summary = ReactionSummary {
+                by_emoji,
+                user_reactions: vec![user_reaction],
+            };
+
+            assert_eq!(summary.by_emoji.len(), 1);
+            assert_eq!(summary.user_reactions.len(), 1);
+            assert_eq!(summary.by_emoji.get("👍").unwrap().count, 1);
+        }
+    }
+
+    mod emoji_reaction_tests {
+        use super::*;
+
+        #[test]
+        fn test_emoji_reaction_creation() {
+            let pubkey = PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap();
+
+            let reaction = EmojiReaction {
+                emoji: "❤️".to_string(),
+                count: 3,
+                users: vec![pubkey],
+            };
+
+            assert_eq!(reaction.emoji, "❤️");
+            assert_eq!(reaction.count, 3);
+            assert_eq!(reaction.users.len(), 1);
+        }
+
+        #[test]
+        fn test_emoji_reaction_equality() {
+            let pubkey = PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap();
+
+            let reaction1 = EmojiReaction {
+                emoji: "👍".to_string(),
+                count: 1,
+                users: vec![pubkey],
+            };
+
+            let reaction2 = EmojiReaction {
+                emoji: "👍".to_string(),
+                count: 1,
+                users: vec![pubkey],
+            };
+
+            assert_eq!(reaction1, reaction2);
+        }
+    }
+
+    mod user_reaction_tests {
+        use super::*;
+
+        #[test]
+        fn test_user_reaction_creation() {
+            let pubkey = PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap();
+            let timestamp = Timestamp::now();
+
+            let reaction = UserReaction {
+                user: pubkey,
+                emoji: "🎉".to_string(),
+                created_at: timestamp,
+            };
+
+            assert_eq!(reaction.user, pubkey);
+            assert_eq!(reaction.emoji, "🎉");
+            assert_eq!(reaction.created_at, timestamp);
+        }
+    }
+
+    mod processing_error_tests {
+        use super::*;
+
+        #[test]
+        fn test_error_display_messages() {
+            assert_eq!(
+                ProcessingError::InvalidReaction.to_string(),
+                "Invalid reaction content"
+            );
+            assert_eq!(
+                ProcessingError::MissingETag.to_string(),
+                "Missing required e-tag in message"
+            );
+            assert_eq!(
+                ProcessingError::InvalidTag.to_string(),
+                "Invalid tag format"
+            );
+            assert_eq!(
+                ProcessingError::InvalidTimestamp.to_string(),
+                "Invalid timestamp"
+            );
+            assert_eq!(
+                ProcessingError::FetchFailed("connection timeout".to_string()).to_string(),
+                "Failed to fetch messages from mdk: connection timeout"
+            );
+            assert_eq!(
+                ProcessingError::Internal("unexpected state".to_string()).to_string(),
+                "Internal processing error: unexpected state"
+            );
+        }
+    }
+
+    mod group_statistics_tests {
+        use super::*;
+
+        #[test]
+        fn test_group_statistics_creation() {
+            let stats = GroupStatistics {
+                message_count: 100,
+                reaction_count: 50,
+                deleted_message_count: 5,
+                memory_usage_bytes: 1024,
+                last_processed_at: Some(Timestamp::now()),
+            };
+
+            assert_eq!(stats.message_count, 100);
+            assert_eq!(stats.reaction_count, 50);
+            assert_eq!(stats.deleted_message_count, 5);
+            assert_eq!(stats.memory_usage_bytes, 1024);
+            assert!(stats.last_processed_at.is_some());
+        }
+
+        #[test]
+        fn test_group_statistics_no_last_processed() {
+            let stats = GroupStatistics {
+                message_count: 0,
+                reaction_count: 0,
+                deleted_message_count: 0,
+                memory_usage_bytes: 0,
+                last_processed_at: None,
+            };
+
+            assert!(stats.last_processed_at.is_none());
+        }
+    }
+}

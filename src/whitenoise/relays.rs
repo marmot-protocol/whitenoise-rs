@@ -178,27 +178,192 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_urls_empty_list() {
-        let relays: Vec<super::Relay> = vec![];
-        let urls = super::Relay::urls(&relays);
-        assert_eq!(urls.len(), 0);
+    mod relay_tests {
+        use super::*;
+
+        #[test]
+        fn test_urls_empty_list() {
+            let relays: Vec<super::super::Relay> = vec![];
+            let urls = super::super::Relay::urls(&relays);
+            assert_eq!(urls.len(), 0);
+        }
+
+        #[test]
+        fn test_urls_extracts_and_preserves_order() {
+            let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
+            let url2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
+            let url3 = RelayUrl::parse("wss://relay3.example.com").unwrap();
+
+            let relays = vec![
+                create_test_relay(&url1),
+                create_test_relay(&url2),
+                create_test_relay(&url3),
+            ];
+
+            let urls = super::super::Relay::urls(&relays);
+
+            assert_eq!(urls, vec![url1, url2, url3]);
+        }
+
+        #[test]
+        fn test_relay_new() {
+            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
+            let relay = Relay::new(&url);
+
+            assert!(relay.id.is_none());
+            assert_eq!(relay.url, url);
+        }
+
+        #[test]
+        fn test_relay_defaults_not_empty() {
+            let defaults = Relay::defaults();
+            assert!(!defaults.is_empty());
+        }
+
+        #[test]
+        fn test_relay_equality() {
+            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
+            let now = Utc::now();
+
+            let relay1 = Relay {
+                id: Some(1),
+                url: url.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+
+            let relay2 = Relay {
+                id: Some(1),
+                url: url.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+
+            assert_eq!(relay1, relay2);
+        }
+
+        #[test]
+        fn test_relay_hash() {
+            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
+            let now = Utc::now();
+
+            let relay = Relay {
+                id: Some(1),
+                url: url.clone(),
+                created_at: now,
+                updated_at: now,
+            };
+
+            let mut set = HashSet::new();
+            set.insert(relay.clone());
+            assert!(set.contains(&relay));
+        }
     }
 
-    #[test]
-    fn test_urls_extracts_and_preserves_order() {
-        let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
-        let url2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
-        let url3 = RelayUrl::parse("wss://relay3.example.com").unwrap();
+    mod relay_type_tests {
+        use super::*;
 
-        let relays = vec![
-            create_test_relay(&url1),
-            create_test_relay(&url2),
-            create_test_relay(&url3),
-        ];
+        #[test]
+        fn test_relay_type_from_str_nip65() {
+            assert_eq!(RelayType::from_str("nip65").unwrap(), RelayType::Nip65);
+            assert_eq!(RelayType::from_str("NIP65").unwrap(), RelayType::Nip65);
+            assert_eq!(RelayType::from_str("Nip65").unwrap(), RelayType::Nip65);
+        }
 
-        let urls = super::Relay::urls(&relays);
+        #[test]
+        fn test_relay_type_from_str_inbox() {
+            assert_eq!(RelayType::from_str("inbox").unwrap(), RelayType::Inbox);
+            assert_eq!(RelayType::from_str("INBOX").unwrap(), RelayType::Inbox);
+            assert_eq!(RelayType::from_str("Inbox").unwrap(), RelayType::Inbox);
+        }
 
-        assert_eq!(urls, vec![url1, url2, url3]);
+        #[test]
+        fn test_relay_type_from_str_key_package() {
+            assert_eq!(
+                RelayType::from_str("key_package").unwrap(),
+                RelayType::KeyPackage
+            );
+            assert_eq!(
+                RelayType::from_str("KEY_PACKAGE").unwrap(),
+                RelayType::KeyPackage
+            );
+        }
+
+        #[test]
+        fn test_relay_type_from_str_invalid() {
+            let result = RelayType::from_str("invalid");
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "Invalid relay type: invalid");
+        }
+
+        #[test]
+        fn test_relay_type_to_u16() {
+            assert_eq!(u16::from(RelayType::Nip65), 10002);
+            assert_eq!(u16::from(RelayType::Inbox), 10050);
+            assert_eq!(u16::from(RelayType::KeyPackage), 10051);
+        }
+
+        #[test]
+        fn test_relay_type_to_string() {
+            assert_eq!(String::from(RelayType::Nip65), "nip65");
+            assert_eq!(String::from(RelayType::Inbox), "inbox");
+            assert_eq!(String::from(RelayType::KeyPackage), "key_package");
+        }
+
+        #[test]
+        fn test_relay_type_to_kind() {
+            assert_eq!(Kind::from(RelayType::Nip65), Kind::RelayList);
+            assert_eq!(Kind::from(RelayType::Inbox), Kind::InboxRelays);
+            assert_eq!(Kind::from(RelayType::KeyPackage), Kind::MlsKeyPackageRelays);
+        }
+
+        #[test]
+        fn test_kind_to_relay_type() {
+            assert_eq!(RelayType::from(Kind::RelayList), RelayType::Nip65);
+            assert_eq!(RelayType::from(Kind::InboxRelays), RelayType::Inbox);
+            assert_eq!(
+                RelayType::from(Kind::MlsKeyPackageRelays),
+                RelayType::KeyPackage
+            );
+        }
+
+        #[test]
+        fn test_kind_to_relay_type_fallback() {
+            // Unknown kinds should fall back to Nip65
+            assert_eq!(RelayType::from(Kind::TextNote), RelayType::Nip65);
+            assert_eq!(RelayType::from(Kind::Metadata), RelayType::Nip65);
+        }
+
+        #[test]
+        fn test_relay_type_roundtrip_via_kind() {
+            // Test that RelayType -> Kind -> RelayType preserves the original value
+            let types = [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage];
+
+            for original in types {
+                let kind = Kind::from(original);
+                let back = RelayType::from(kind);
+                assert_eq!(original, back);
+            }
+        }
+
+        #[test]
+        fn test_relay_type_copy() {
+            let relay_type = RelayType::Inbox;
+            let copied = relay_type;
+            assert_eq!(relay_type, copied);
+        }
+
+        #[test]
+        fn test_relay_type_hash() {
+            let mut set = HashSet::new();
+            set.insert(RelayType::Nip65);
+            set.insert(RelayType::Inbox);
+            set.insert(RelayType::KeyPackage);
+
+            assert_eq!(set.len(), 3);
+            assert!(set.contains(&RelayType::Nip65));
+            assert!(set.contains(&RelayType::Inbox));
+            assert!(set.contains(&RelayType::KeyPackage));
+        }
     }
 }
