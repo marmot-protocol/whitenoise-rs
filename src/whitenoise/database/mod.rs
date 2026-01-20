@@ -171,7 +171,6 @@ impl Database {
                             attempt,
                             max_retries
                         );
-                        // Wait before retrying, with exponential backoff
                         tokio::time::sleep(tokio::time::Duration::from_millis(
                             100 * attempt as u64,
                         ))
