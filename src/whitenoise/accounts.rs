@@ -1812,4 +1812,266 @@ mod tests {
             "Group ID should match the created group"
         );
     }
+
+    #[tokio::test]
+    async fn test_logout_local_account_removes_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a local account directly in the database (bypassing relay setup)
+        let (account, keys) = create_test_account(&whitenoise).await;
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::Local,
+            "Account should be Local type"
+        );
+
+        // Store the key in secrets store
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Verify the key is stored
+        let stored_keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey);
+        assert!(stored_keys.is_ok(), "Key should be stored after login");
+
+        // Logout should remove the key
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // Verify the key was removed
+        let stored_keys_after = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey);
+        assert!(
+            stored_keys_after.is_err(),
+            "Key should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_external_account_cleans_stale_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an external account directly in the database
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account manually (bypassing relay setup)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::External,
+            "Account should be External type"
+        );
+
+        // Manually store a stale key (simulating orphaned key from failed migration)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Verify the stale key is stored
+        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(stored_keys.is_ok(), "Stale key should be stored");
+
+        // Logout should clean up the stale key via best-effort removal
+        whitenoise.logout(&pubkey).await.unwrap();
+
+        // Verify the stale key was removed
+        let stored_keys_after = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            stored_keys_after.is_err(),
+            "Stale key should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_external_account_without_key_succeeds() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an external account directly in the database
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account manually (bypassing relay setup)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::External,
+            "Account should be External type"
+        );
+
+        // Don't store any key - verify there's no key
+        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(stored_keys.is_err(), "No key should be stored");
+
+        // Logout should succeed even with no key to remove
+        let result = whitenoise.logout(&pubkey).await;
+        assert!(
+            result.is_ok(),
+            "Logout should succeed for external account without stored key"
+        );
+    }
+
+    #[test]
+    fn test_has_local_key_returns_true_for_local_account() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.has_local_key(),
+            "Local account should have local key"
+        );
+    }
+
+    #[test]
+    fn test_has_local_key_returns_false_for_external_account() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    #[test]
+    fn test_account_type_from_str_local() {
+        let result: std::result::Result<AccountType, String> = "local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+
+        // Test case insensitivity
+        let result: std::result::Result<AccountType, String> = "LOCAL".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+
+        let result: std::result::Result<AccountType, String> = "Local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+    }
+
+    #[test]
+    fn test_account_type_from_str_external() {
+        let result: std::result::Result<AccountType, String> = "external".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+
+        // Test case insensitivity
+        let result: std::result::Result<AccountType, String> = "EXTERNAL".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+
+        let result: std::result::Result<AccountType, String> = "External".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_from_str_invalid() {
+        let result: std::result::Result<AccountType, String> = "invalid".parse();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unknown account type: invalid");
+
+        let result: std::result::Result<AccountType, String> = "".parse();
+        assert!(result.is_err());
+
+        let result: std::result::Result<AccountType, String> = "123".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_account_type_display() {
+        assert_eq!(format!("{}", AccountType::Local), "local");
+        assert_eq!(format!("{}", AccountType::External), "external");
+    }
+
+    #[test]
+    fn test_account_type_default() {
+        let default_type = AccountType::default();
+        assert_eq!(default_type, AccountType::Local);
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_true_for_external() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.uses_external_signer(),
+            "External account should use external signer"
+        );
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_false_for_local() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not use external signer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_external_creates_external_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        assert_eq!(account.account_type, AccountType::External);
+        assert_eq!(account.pubkey, pubkey);
+        assert!(account.id.is_none()); // Not persisted yet
+        assert!(account.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_generated_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (account, keys) = Account::new(&whitenoise, None).await.unwrap();
+
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, keys.public_key());
+        assert!(account.id.is_none()); // Not persisted yet
+        assert!(account.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_provided_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let provided_keys = create_test_keys();
+
+        let (account, keys) = Account::new(&whitenoise, Some(provided_keys.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, provided_keys.public_key());
+        assert_eq!(keys.public_key(), provided_keys.public_key());
+        assert_eq!(keys.secret_key(), provided_keys.secret_key());
+    }
 }
