@@ -1687,7 +1687,7 @@ impl Whitenoise {
         // Check if group has an image set
         let (image_hash, image_key, image_nonce) =
             match (&group.image_hash, &group.image_key, &group.image_nonce) {
-                (Some(hash), Some(key), Some(nonce)) => (*hash, *key, *nonce),
+                (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
                 _ => return Ok(None), // No image set
             };
 
@@ -1695,7 +1695,7 @@ impl Whitenoise {
         let blossom_url = if let Some(media_file) =
             crate::whitenoise::database::media_files::MediaFile::find_by_hash(
                 &self.database,
-                &image_hash,
+                image_hash,
             )
             .await?
         {
@@ -1712,9 +1712,9 @@ impl Whitenoise {
                 blossom_url,
                 &account.pubkey,
                 &group.mls_group_id,
-                &image_hash,
-                &image_key,
-                &image_nonce,
+                image_hash,
+                image_key.as_ref(),
+                image_nonce.as_ref(),
             )
             .await?;
 
