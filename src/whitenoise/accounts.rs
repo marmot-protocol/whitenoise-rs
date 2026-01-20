@@ -2074,4 +2074,205 @@ mod tests {
         assert_eq!(keys.public_key(), provided_keys.public_key());
         assert_eq!(keys.secret_key(), provided_keys.secret_key());
     }
+
+    /// Comprehensive test for account relay operations including all relay types
+    #[tokio::test]
+    async fn test_account_relay_operations() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create and persist account
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // New account should have no relays
+        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(
+            account
+                .key_package_relays(&whitenoise)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Load and add default relays
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+        #[cfg(debug_assertions)]
+        assert_eq!(default_relays.len(), 2);
+
+        // Add relays for all types
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Nip65)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Inbox)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::KeyPackage)
+            .await
+            .unwrap();
+
+        // Verify all relay types have relays
+        let nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        let inbox = account.relays(RelayType::Inbox, &whitenoise).await.unwrap();
+        let kp = account
+            .relays(RelayType::KeyPackage, &whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(nip65.len(), default_relays.len());
+        assert_eq!(inbox.len(), default_relays.len());
+        assert_eq!(kp.len(), default_relays.len());
+
+        // Test add_relay and remove_relay on individual relays
+        let test_relay = Relay::new(&RelayUrl::parse("wss://test.relay.example").unwrap());
+        let test_relay = Relay::find_or_create_by_url(&test_relay.url, &whitenoise.database)
+            .await
+            .unwrap();
+
+        account
+            .add_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_add = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_add.len(), default_relays.len() + 1);
+
+        account
+            .remove_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_remove = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_remove.len(), default_relays.len());
+    }
+
+    /// Comprehensive test for account CRUD operations
+    #[tokio::test]
+    async fn test_account_crud_operations() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Initially empty
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 0);
+        assert!(whitenoise.all_accounts().await.unwrap().is_empty());
+
+        // Create and persist accounts
+        let (account1, _) = create_test_account(&whitenoise).await;
+        let account1 = whitenoise.persist_account(&account1).await.unwrap();
+        assert!(account1.id.is_some());
+
+        let (account2, _) = create_test_account(&whitenoise).await;
+        let _account2 = whitenoise.persist_account(&account2).await.unwrap();
+
+        // Verify counts and retrieval
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 2);
+        let all = whitenoise.all_accounts().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Find by pubkey
+        let found = whitenoise
+            .find_account_by_pubkey(&account1.pubkey)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, account1.pubkey);
+
+        // Not found for random pubkey
+        let random_pk = Keys::generate().public_key();
+        assert!(whitenoise.find_account_by_pubkey(&random_pk).await.is_err());
+
+        // Test user and metadata retrieval
+        let user = account1.user(&whitenoise.database).await.unwrap();
+        assert_eq!(user.pubkey, account1.pubkey);
+
+        let metadata = account1.metadata(&whitenoise).await.unwrap();
+        assert!(metadata.name.is_none() || metadata.name.as_deref() == Some(""));
+    }
+
+    /// Test account creation for both local and external account types
+    #[tokio::test]
+    async fn test_account_type_creation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account with generated keys
+        let (local_gen, keys_gen) = Account::new(&whitenoise, None).await.unwrap();
+        assert_eq!(local_gen.account_type, AccountType::Local);
+        assert_eq!(local_gen.pubkey, keys_gen.public_key());
+
+        // Local account with provided keys
+        let provided = create_test_keys();
+        let (local_prov, keys_prov) = Account::new(&whitenoise, Some(provided.clone()))
+            .await
+            .unwrap();
+        assert_eq!(local_prov.account_type, AccountType::Local);
+        assert_eq!(keys_prov.public_key(), provided.public_key());
+
+        // External account
+        let ext_pubkey = Keys::generate().public_key();
+        let external = Account::new_external(&whitenoise, ext_pubkey)
+            .await
+            .unwrap();
+        assert_eq!(external.account_type, AccountType::External);
+        assert_eq!(external.pubkey, ext_pubkey);
+        assert!(!external.has_local_key());
+        assert!(external.uses_external_signer());
+    }
+
+    #[test]
+    fn test_create_mdk_success() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let mdk = Account::create_mdk(pubkey, temp_dir.path());
+        assert!(mdk.is_ok());
+    }
+
+    /// Test logout removes keys correctly for both account types
+    #[tokio::test]
+    async fn test_logout_key_cleanup() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account logout removes key
+        let (local_account, keys) = create_test_account(&whitenoise).await;
+        local_account.save(&whitenoise.database).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&local_account.pubkey)
+                .is_ok()
+        );
+        whitenoise.logout(&local_account.pubkey).await.unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&local_account.pubkey)
+                .is_err()
+        );
+
+        // External account logout with stale key cleans up
+        let ext_keys = create_test_keys();
+        let ext_account = Account::new_external(&whitenoise, ext_keys.public_key())
+            .await
+            .unwrap();
+        ext_account.save(&whitenoise.database).await.unwrap();
+        whitenoise
+            .secrets_store
+            .store_private_key(&ext_keys)
+            .unwrap(); // Stale key
+
+        whitenoise.logout(&ext_account.pubkey).await.unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&ext_account.pubkey)
+                .is_err()
+        );
+
+        // External account logout without key succeeds
+        let ext2 = Account::new_external(&whitenoise, Keys::generate().public_key())
+            .await
+            .unwrap();
+        ext2.save(&whitenoise.database).await.unwrap();
+        assert!(whitenoise.logout(&ext2.pubkey).await.is_ok());
+    }
 }

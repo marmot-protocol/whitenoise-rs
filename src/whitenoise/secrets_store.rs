@@ -327,4 +327,77 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_remove_nonexistent_key_succeeds() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Removing a nonexistent key should succeed (idempotent)
+        let result = secrets_store.remove_private_key_for_pubkey(&pubkey);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_store_multiple_keys() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+
+        let keys1 = Keys::generate();
+        let keys2 = Keys::generate();
+        let keys3 = Keys::generate();
+
+        // Store multiple keys
+        secrets_store.store_private_key(&keys1).unwrap();
+        secrets_store.store_private_key(&keys2).unwrap();
+        secrets_store.store_private_key(&keys3).unwrap();
+
+        // All keys should be retrievable
+        let retrieved1 = secrets_store
+            .get_nostr_keys_for_pubkey(&keys1.public_key())
+            .unwrap();
+        let retrieved2 = secrets_store
+            .get_nostr_keys_for_pubkey(&keys2.public_key())
+            .unwrap();
+        let retrieved3 = secrets_store
+            .get_nostr_keys_for_pubkey(&keys3.public_key())
+            .unwrap();
+
+        assert_eq!(retrieved1.public_key(), keys1.public_key());
+        assert_eq!(retrieved2.public_key(), keys2.public_key());
+        assert_eq!(retrieved3.public_key(), keys3.public_key());
+    }
+
+    #[test]
+    fn test_overwrite_existing_key() {
+        let (secrets_store, _temp_dir) = create_test_secrets_store();
+
+        let keys1 = Keys::generate();
+        let pubkey = keys1.public_key();
+
+        // Store the first key
+        secrets_store.store_private_key(&keys1).unwrap();
+
+        // Generate a new key with the same pubkey (impossible in real life, but for testing)
+        // Actually, we'll just verify storing the same key again works
+        secrets_store.store_private_key(&keys1).unwrap();
+
+        // Key should still be retrievable
+        let retrieved = secrets_store.get_nostr_keys_for_pubkey(&pubkey).unwrap();
+        assert_eq!(retrieved.public_key(), pubkey);
+    }
+
+    #[test]
+    fn test_device_key_persistence() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let secrets_store = SecretsStore::new(temp_dir.path());
+
+        // First call creates the device key
+        let device_key1 = secrets_store.get_device_key();
+
+        // Second call should return the same device key
+        let device_key2 = secrets_store.get_device_key();
+
+        assert_eq!(device_key1, device_key2);
+    }
 }
