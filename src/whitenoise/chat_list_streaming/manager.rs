@@ -86,6 +86,7 @@ mod tests {
             pending_confirmation: false,
             welcomer_pubkey: None,
             unread_count: 0,
+            pin_order: None,
         }
     }
 

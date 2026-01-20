@@ -25,6 +25,10 @@ pub struct AccountGroup {
     pub user_confirmation: Option<bool>,
     pub welcomer_pubkey: Option<PublicKey>,
     pub last_read_message_id: Option<EventId>,
+    /// Pin order for chat list sorting.
+    /// - `None` = not pinned (appears after pinned chats)
+    /// - `Some(n)` = pinned, lower values appear first
+    pub pin_order: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -203,6 +207,27 @@ impl Whitenoise {
     ) -> Result<Option<EventId>, WhitenoiseError> {
         let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
         Ok(account_group.and_then(|ag| ag.last_read_message_id))
+    }
+
+    /// Sets the pin order for a chat.
+    ///
+    /// - `None` = unpin the chat
+    /// - `Some(n)` = pin the chat with order n (lower values appear first)
+    pub async fn set_chat_pin_order(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+        pin_order: Option<i64>,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        let updated = account_group
+            .update_pin_order(pin_order, &self.database)
+            .await?;
+
+        Ok(updated)
     }
 }
 
@@ -816,5 +841,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ag.last_read_message_id, Some(first_msg_id));
+    }
+
+    #[tokio::test]
+    async fn test_set_chat_pin_order_pins_chat() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[50; 32]);
+
+        // Create account group first
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+
+        // Pin the chat
+        let pinned = whitenoise
+            .set_chat_pin_order(&account, &group_id, Some(100))
+            .await
+            .unwrap();
+
+        assert_eq!(pinned.pin_order, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_set_chat_pin_order_unpins_chat() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[51; 32]);
+
+        // Create and pin account group
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+        whitenoise
+            .set_chat_pin_order(&account, &group_id, Some(100))
+            .await
+            .unwrap();
+
+        // Unpin the chat
+        let unpinned = whitenoise
+            .set_chat_pin_order(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(unpinned.pin_order.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_chat_pin_order_updates_existing_pin() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[52; 32]);
+
+        // Create and pin account group
+        whitenoise
+            .get_or_create_account_group(&account, &group_id)
+            .await
+            .unwrap();
+        whitenoise
+            .set_chat_pin_order(&account, &group_id, Some(100))
+            .await
+            .unwrap();
+
+        // Update pin order
+        let updated = whitenoise
+            .set_chat_pin_order(&account, &group_id, Some(50))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.pin_order, Some(50));
+    }
+
+    #[tokio::test]
+    async fn test_set_chat_pin_order_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[53; 32]);
+
+        // Don't create account group - it shouldn't exist
+        let result = whitenoise
+            .set_chat_pin_order(&account, &group_id, Some(100))
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
 }

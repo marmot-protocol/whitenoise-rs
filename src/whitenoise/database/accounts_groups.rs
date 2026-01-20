@@ -14,6 +14,7 @@ struct AccountGroupRow {
     user_confirmation: Option<bool>,
     welcomer_pubkey: Option<PublicKey>,
     last_read_message_id: Option<EventId>,
+    pin_order: Option<i64>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -51,6 +52,8 @@ where
             ),
             None => None,
         };
+
+        let pin_order: Option<i64> = row.try_get("pin_order")?;
 
         // Parse pubkey from hex string
         let account_pubkey =
@@ -90,6 +93,7 @@ where
             user_confirmation,
             welcomer_pubkey,
             last_read_message_id,
+            pin_order,
             created_at,
             updated_at,
         })
@@ -105,6 +109,7 @@ impl From<AccountGroupRow> for AccountGroup {
             user_confirmation: row.user_confirmation,
             welcomer_pubkey: row.welcomer_pubkey,
             last_read_message_id: row.last_read_message_id,
+            pin_order: row.pin_order,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -246,12 +251,13 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
                user_confirmation = excluded.user_confirmation,
                welcomer_pubkey = excluded.welcomer_pubkey,
                last_read_message_id = excluded.last_read_message_id,
+               pin_order = excluded.pin_order,
                updated_at = excluded.updated_at
              RETURNING *",
         )
@@ -260,8 +266,33 @@ impl AccountGroup {
         .bind(self.user_confirmation.map(|b| if b { 1i64 } else { 0i64 }))
         .bind(self.welcomer_pubkey.as_ref().map(|pk| pk.to_hex()))
         .bind(self.last_read_message_id.as_ref().map(|id| id.to_hex()))
+        .bind(self.pin_order)
         .bind(self.created_at.timestamp_millis())
         .bind(now_ms)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Updates the pin_order for this AccountGroup.
+    pub(crate) async fn update_pin_order(
+        &self,
+        pin_order: Option<i64>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET pin_order = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(pin_order)
+        .bind(now_ms)
+        .bind(id)
         .fetch_one(&database.pool)
         .await?;
 
@@ -620,6 +651,7 @@ mod tests {
             user_confirmation: None,
             welcomer_pubkey: Some(welcomer.pubkey),
             last_read_message_id: None,
+            pin_order: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -631,6 +663,7 @@ mod tests {
         assert_eq!(saved.mls_group_id, group_id);
         assert!(saved.user_confirmation.is_none());
         assert_eq!(saved.welcomer_pubkey, Some(welcomer.pubkey));
+        assert!(saved.pin_order.is_none());
     }
 
     #[tokio::test]
@@ -648,12 +681,14 @@ mod tests {
             user_confirmation: Some(true),
             welcomer_pubkey: Some(welcomer.pubkey),
             last_read_message_id: None,
+            pin_order: Some(100),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
         let original = ag.save(&whitenoise.database).await.unwrap();
         assert_eq!(original.welcomer_pubkey, Some(welcomer.pubkey));
         assert_eq!(original.user_confirmation, Some(true));
+        assert_eq!(original.pin_order, Some(100));
 
         // Save with None values - should overwrite existing values
         let update = AccountGroup {
@@ -663,6 +698,7 @@ mod tests {
             user_confirmation: None,
             welcomer_pubkey: None,
             last_read_message_id: None,
+            pin_order: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -671,6 +707,7 @@ mod tests {
         assert_eq!(saved.id, original.id);
         assert!(saved.user_confirmation.is_none());
         assert!(saved.welcomer_pubkey.is_none());
+        assert!(saved.pin_order.is_none());
     }
 
     #[tokio::test]
@@ -941,5 +978,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.last_read_message_id, Some(message_id));
+    }
+
+    #[tokio::test]
+    async fn test_update_pin_order_sets_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[60; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(account_group.pin_order.is_none());
+
+        let updated = account_group
+            .update_pin_order(Some(42), &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(updated.pin_order, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_update_pin_order_clears_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[61; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Set pin order first
+        let pinned = account_group
+            .update_pin_order(Some(100), &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(pinned.pin_order, Some(100));
+
+        // Clear pin order
+        let unpinned = pinned
+            .update_pin_order(None, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(unpinned.pin_order.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_pin_order_persists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[62; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+
+        account_group
+            .update_pin_order(Some(77), &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Fetch again and verify persistence
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(found.pin_order, Some(77));
     }
 }
