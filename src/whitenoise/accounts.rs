@@ -2275,4 +2275,199 @@ mod tests {
         ext2.save(&whitenoise.database).await.unwrap();
         assert!(whitenoise.logout(&ext2.pubkey).await.is_ok());
     }
+
+    /// Test upload_profile_picture uploads to blossom server and returns URL
+    /// Requires blossom server running on localhost:3000
+    #[tokio::test]
+    async fn test_upload_profile_picture() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create and persist account with stored keys
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Use the test image file
+        let test_image_path = ".test/fake_image.png";
+
+        // Check if blossom server is available
+        let blossom_url = nostr_sdk::Url::parse("http://localhost:3000").unwrap();
+
+        let result = account
+            .upload_profile_picture(
+                test_image_path,
+                crate::types::ImageType::Png,
+                blossom_url,
+                &whitenoise,
+            )
+            .await;
+
+        // Test should succeed if blossom server is running
+        assert!(
+            result.is_ok(),
+            "upload_profile_picture should succeed. Error: {:?}",
+            result.err()
+        );
+
+        let url = result.unwrap();
+        assert!(
+            url.starts_with("http://localhost:3000"),
+            "Returned URL should be from blossom server"
+        );
+    }
+
+    /// Test upload_profile_picture fails gracefully with non-existent file
+    #[tokio::test]
+    async fn test_upload_profile_picture_nonexistent_file() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        let blossom_url = nostr_sdk::Url::parse("http://localhost:3000").unwrap();
+
+        let result = account
+            .upload_profile_picture(
+                "/nonexistent/path/image.png",
+                crate::types::ImageType::Png,
+                blossom_url,
+                &whitenoise,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "upload_profile_picture should fail for non-existent file"
+        );
+    }
+
+    /// Test login_with_external_signer creates new external account
+    #[tokio::test]
+    async fn test_login_with_external_signer_new_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Login with external signer (new account)
+        let account = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+
+        // Verify account was created correctly
+        assert_eq!(account.pubkey, pubkey);
+        assert_eq!(account.account_type, AccountType::External);
+        assert!(account.id.is_some(), "Account should be persisted");
+        assert!(account.uses_external_signer(), "Should use external signer");
+        assert!(!account.has_local_key(), "Should not have local key");
+
+        // Verify no private key was stored
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "External account should not have stored private key"
+        );
+
+        // Verify relay lists are set up
+        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
+        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+
+        assert!(!nip65.is_empty(), "Should have NIP-65 relays");
+        assert!(!inbox.is_empty(), "Should have inbox relays");
+        assert!(!kp.is_empty(), "Should have key package relays");
+    }
+
+    /// Test login_with_external_signer with existing account re-establishes connections
+    #[tokio::test]
+    async fn test_login_with_external_signer_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // First login - creates new account
+        let account1 = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        assert!(account1.id.is_some());
+
+        // Allow some time for setup
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Second login - should return existing account
+        let account2 = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+
+        assert_eq!(account1.pubkey, account2.pubkey);
+        assert_eq!(account2.account_type, AccountType::External);
+    }
+
+    /// Test login_with_external_signer migrates local account to external
+    #[tokio::test]
+    async fn test_login_with_external_signer_migrates_local_to_external() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // First, create a local account directly
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        let (local_account, _) = Account::new(&whitenoise, Some(keys.clone())).await.unwrap();
+        assert_eq!(local_account.account_type, AccountType::Local);
+        let _local_account = whitenoise.persist_account(&local_account).await.unwrap();
+
+        // Store the key (simulating normal local account creation)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Now login with external signer - should migrate
+        let migrated = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+
+        assert_eq!(migrated.pubkey, pubkey);
+        assert_eq!(
+            migrated.account_type,
+            AccountType::External,
+            "Account should be migrated to External"
+        );
+
+        // Verify local key was removed during migration
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "Local key should be removed during migration to external"
+        );
+    }
+
+    /// Test login_with_external_signer removes stale keys on re-login
+    #[tokio::test]
+    async fn test_login_with_external_signer_removes_stale_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account first
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        whitenoise.persist_account(&account).await.unwrap();
+
+        // Manually store a "stale" key (simulating failed migration or orphaned key)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_ok()
+        );
+
+        // Login with external signer - should clean up stale key
+        whitenoise.login_with_external_signer(pubkey).await.unwrap();
+
+        // Verify stale key was removed
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "Stale key should be removed during external signer login"
+        );
+    }
 }
