@@ -205,6 +205,8 @@ impl<'a> MediaFiles<'a> {
                 blossom_url: upload.blossom_url,
                 nostr_key: upload.nostr_key.as_deref(),
                 file_metadata: upload.file_metadata,
+                nonce: None,            // Group images use key/nonce encryption, not MDK
+                scheme_version: None,   // Group images use key/nonce encryption, not MDK
             },
         )
         .await?;
@@ -352,6 +354,7 @@ impl<'a> MediaFiles<'a> {
             });
 
             // Create MediaFile record (without file yet - empty path until downloaded)
+            // Store nonce and scheme_version for MDK decryption
             MediaFile::save(
                 self.database,
                 group_id,
@@ -365,6 +368,8 @@ impl<'a> MediaFiles<'a> {
                     blossom_url: Some(&reference.url),
                     nostr_key: None, // Chat media uses MDK, not key/nonce
                     file_metadata: file_metadata.as_ref(),
+                    nonce: Some(&hex::encode(reference.nonce)),
+                    scheme_version: Some(&reference.scheme_version),
                 },
             )
             .await?;
