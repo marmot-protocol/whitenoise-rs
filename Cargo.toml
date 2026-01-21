@@ -19,7 +19,7 @@ base64 = "0.22"
 blurhash = "0.2.3"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4.40", features = ["serde"] }
-clap = "4.5.37"
+clap = { version = "4.5.37", features = ["derive"] }
 dashmap = "6.1"
 hex = "0.4"
 image = "0.24"
@@ -61,7 +61,6 @@ nostr-sdk = { version = "0.43", features = [
 #     "nip59",
 # ] }
 
-petname = "2.0.2"
 rand = "0.9"
 reqwest = { version = "0.13", features = [
     "multipart",

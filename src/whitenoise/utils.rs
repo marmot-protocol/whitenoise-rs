@@ -41,15 +41,6 @@ impl Whitenoise {
         let public_key = PublicKey::parse(npub).map_err(|_| WhitenoiseError::InvalidPublicKey)?;
         Ok(public_key.to_hex())
     }
-
-    /// Capitalizes the first letter of a word, leaving the rest unchanged
-    pub(crate) fn capitalize_first_letter(word: &str) -> String {
-        let mut chars = word.chars();
-        match chars.next() {
-            None => String::new(),
-            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        }
-    }
 }
 
 /// Converts a Nostr timestamp to a DateTime<Utc> with proper error handling.
@@ -81,14 +72,6 @@ pub(crate) fn timestamp_to_datetime(
 mod tests {
     use super::*;
     use chrono::Datelike;
-
-    #[test]
-    fn test_capitalize_first_letter() {
-        assert_eq!(Whitenoise::capitalize_first_letter("satoshi"), "Satoshi");
-        assert_eq!(Whitenoise::capitalize_first_letter("5atoshi"), "5atoshi");
-        assert_eq!(Whitenoise::capitalize_first_letter(""), "");
-        assert_eq!(Whitenoise::capitalize_first_letter("ßtraße"), "SStraße");
-    }
 
     #[test]
     fn test_hex_pubkey_from_npub() {

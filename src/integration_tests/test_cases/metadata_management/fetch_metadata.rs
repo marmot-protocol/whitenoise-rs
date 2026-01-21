@@ -23,11 +23,11 @@ impl TestCase for FetchMetadataTestCase {
         let metadata = account.metadata(context.whitenoise).await?;
 
         assert!(
-            metadata.name.is_some(),
-            "Metadata name is missing for account {}",
-            self.account_name
+            metadata.name.is_none(),
+            "New account should have no metadata name set but got: {:?}",
+            metadata.name
         );
-        tracing::info!("✓ Metadata name is present: {:?}", metadata.name);
+        tracing::info!("✓ Metadata name is correctly empty for new account");
 
         tracing::info!("✓ Metadata fetched successfully for {}", self.account_name);
         Ok(())
