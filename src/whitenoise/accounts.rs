@@ -274,8 +274,7 @@ impl Whitenoise {
     /// Creates a new identity (account) for the user.
     ///
     /// This method generates a new keypair, sets up the account with default relay lists,
-    /// creates a metadata event with a generated petname, and fully configures the account
-    /// for use in Whitenoise.
+    /// and fully configures the account for use in Whitenoise.
     pub async fn create_identity(&self) -> Result<Account> {
         let keys = Keys::generate();
         tracing::debug!(target: "whitenoise::create_identity", "Generated new keypair: {}", keys.public_key().to_hex());
@@ -283,7 +282,7 @@ impl Whitenoise {
         let mut account = self.create_base_account_with_private_key(&keys).await?;
         tracing::debug!(target: "whitenoise::create_identity", "Keys stored in secret store and account saved to database");
 
-        let mut user = account.user(&self.database).await?;
+        let user = account.user(&self.database).await?;
 
         let relays = self
             .setup_relays_for_new_account(&mut account, &user)
@@ -293,9 +292,6 @@ impl Whitenoise {
         self.activate_account(&account, &user, true, &relays, &relays, &relays)
             .await?;
         tracing::debug!(target: "whitenoise::create_identity", "Account persisted and activated");
-
-        self.setup_metadata(&account, &mut user).await?;
-        tracing::debug!(target: "whitenoise::create_identity", "Metadata setup");
 
         tracing::debug!(target: "whitenoise::create_identity", "Successfully created new identity: {}", account.pubkey.to_hex());
         Ok(account)
@@ -456,29 +452,6 @@ impl Whitenoise {
         self.setup_key_package(account, is_new_account, key_package_relays)
             .await?;
         tracing::debug!(target: "whitenoise::persist_and_activate_account", "Key package setup");
-        Ok(())
-    }
-
-    async fn setup_metadata(&self, account: &Account, user: &mut User) -> Result<()> {
-        let petname = petname::petname(2, " ")
-            .unwrap_or_else(|| "Anonymous User".to_string())
-            .split_whitespace()
-            .map(Whitenoise::capitalize_first_letter)
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let metadata = Metadata {
-            name: Some(petname.clone()),
-            display_name: Some(petname),
-            ..Default::default()
-        };
-
-        user.metadata = metadata.clone();
-        user.save(&self.database).await?;
-        self.background_publish_account_metadata(account).await?;
-
-        let default_name = "Unknown".to_string();
-        tracing::debug!(target: "whitenoise::setup_metadata", "Created and published metadata with petname: {}", metadata.name.as_ref().unwrap_or(&default_name));
         Ok(())
     }
 
