@@ -1,6 +1,13 @@
 use crate::integration_tests::{
     core::*,
-    test_cases::{chat_list::*, metadata_management::*, shared::*},
+    test_cases::{
+        chat_list::{
+            CreateDmTestCase, MarkMessageReadTestCase, VerifyChatListItemTestCase,
+            VerifyChatListOrderTestCase, VerifyChatListTestCase, VerifyDmChatListItemTestCase,
+        },
+        metadata_management::*,
+        shared::*,
+    },
 };
 use crate::{Whitenoise, WhitenoiseError};
 use async_trait::async_trait;
@@ -205,6 +212,81 @@ impl Scenario for ChatListScenario {
             .await?;
 
         // ============================================================
+        // Test 9: Pin order affects chat list sorting
+        // ============================================================
+        tracing::info!("Test 9: Verifying pin order affects sorting...");
+
+        // Create two groups for pin testing with Alice
+        CreateGroupTestCase::basic()
+            .with_name("pin_group_a")
+            .with_members("chat_list_alice", vec!["chat_list_bob"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Small delay to ensure different creation timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        CreateGroupTestCase::basic()
+            .with_name("pin_group_b")
+            .with_members("chat_list_alice", vec!["chat_list_bob"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Without pinning: B should come before A (more recent creation)
+        VerifyChatListOrderTestCase::new("chat_list_alice")
+            .expecting_order(vec!["pin_group_b", "pin_group_a"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Pin group A with order 100
+        SetChatPinOrderTestCase::new("chat_list_alice", "pin_group_a")
+            .with_pin_order(100)
+            .execute(&mut self.context)
+            .await?;
+
+        // After pinning A: A should come before B (pinned before unpinned)
+        VerifyChatListOrderTestCase::new("chat_list_alice")
+            .expecting_order(vec!["pin_group_a", "pin_group_b"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Pin group B with the same order (100)
+        SetChatPinOrderTestCase::new("chat_list_alice", "pin_group_b")
+            .with_pin_order(100)
+            .execute(&mut self.context)
+            .await?;
+
+        // Both pinned with same order: B should come first (more recent creation)
+        VerifyChatListOrderTestCase::new("chat_list_alice")
+            .expecting_order(vec!["pin_group_b", "pin_group_a"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Change A's pin order to 50 (lower = first)
+        SetChatPinOrderTestCase::new("chat_list_alice", "pin_group_a")
+            .with_pin_order(50)
+            .execute(&mut self.context)
+            .await?;
+
+        // A should now come first (lower pin_order)
+        VerifyChatListOrderTestCase::new("chat_list_alice")
+            .expecting_order(vec!["pin_group_a", "pin_group_b"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Unpin A
+        SetChatPinOrderTestCase::new("chat_list_alice", "pin_group_a")
+            .unpinned()
+            .execute(&mut self.context)
+            .await?;
+
+        // B (pinned) should come before A (unpinned)
+        VerifyChatListOrderTestCase::new("chat_list_alice")
+            .expecting_order(vec!["pin_group_b", "pin_group_a"])
+            .execute(&mut self.context)
+            .await?;
+
+        // ============================================================
         // Summary
         // ============================================================
         tracing::info!("✓ Chat list scenario completed with:");
@@ -217,6 +299,7 @@ impl Scenario for ChatListScenario {
         tracing::info!("  • Creator's groups auto-accepted (pending_confirmation=false)");
         tracing::info!("  • Invited member sees welcomer_pubkey and pending_confirmation=true");
         tracing::info!("  • Mark message as read reduces unread_count");
+        tracing::info!("  • Pin order affects chat list sorting");
 
         Ok(())
     }
