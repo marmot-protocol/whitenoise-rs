@@ -9,6 +9,7 @@ use mdk_core::extension::group_image;
 use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_storage_traits::Secret;
 use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
@@ -994,7 +995,8 @@ impl Whitenoise {
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         // Derive the upload keypair from the image key for cleanup purposes
-        let upload_keypair = group_image::derive_upload_keypair(image_key).map_err(|e| {
+        let secret_key = Secret::new(*image_key);
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
             WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
         })?;
 
@@ -1168,7 +1170,8 @@ impl Whitenoise {
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         // Derive the upload keypair from the image key for cleanup purposes
-        let upload_keypair = group_image::derive_upload_keypair(image_key).map_err(|e| {
+        let secret_key = Secret::new(*image_key);
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
             WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
         })?;
 
