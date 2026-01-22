@@ -62,11 +62,16 @@ nostr-sdk = { version = "0.43", features = [
 # ] }
 
 rand = "0.9"
-reqwest = { version = "0.13", features = [
+reqwest = { version = "0.13.1", features = [
     "multipart",
     "json",
-    "rustls",
+    "rustls-no-provider",
 ], default-features = false }
+# Explicit TLS provider: reqwest 0.13 defaults to aws-lc-rs, but we use ring for
+# compatibility with nostr-blossom (which uses reqwest 0.12 with ring). Having both
+# providers enabled causes a runtime panic, so we use rustls-no-provider above and
+# explicitly select ring here.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10"
