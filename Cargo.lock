@@ -2404,7 +2404,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.5.3"
-source = "git+https://github.com/parres-hq/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
 dependencies = [
  "blurhash",
  "chacha20poly1305",
@@ -2428,7 +2428,7 @@ dependencies = [
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.5.1"
-source = "git+https://github.com/parres-hq/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
 dependencies = [
  "getrandom 0.3.3",
  "hex",
@@ -2449,7 +2449,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.5.1"
-source = "git+https://github.com/parres-hq/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
 dependencies = [
  "nostr",
  "openmls",
@@ -5000,6 +5000,7 @@ dependencies = [
  "lightning-invoice",
  "mdk-core",
  "mdk-sqlite-storage",
+ "mdk-storage-traits",
  "mockito",
  "nostr-blossom",
  "nostr-sdk",
