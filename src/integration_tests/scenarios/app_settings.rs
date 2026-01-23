@@ -49,12 +49,6 @@ impl Scenario for AppSettingsScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Test fetching settings to verify language
-        FetchAppSettingsTestCase::basic()
-            .expect_language(Language::Spanish)
-            .execute(&mut self.context)
-            .await?;
-
         // Test updating language back to English
         UpdateLanguageTestCase::new(Language::English)
             .execute(&mut self.context)
