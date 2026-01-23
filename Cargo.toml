@@ -29,6 +29,7 @@ keyring = { version = "3.6", features = [
     "windows-native",
     "linux-native",
 ] }
+keyring-core = "0.7"
 lightning-invoice = "0.33.1"
 
 mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "4156904c571c8c7ab11054d679ed6907757e67c2", features = [
