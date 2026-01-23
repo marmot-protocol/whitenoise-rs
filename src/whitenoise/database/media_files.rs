@@ -951,6 +951,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_image(), "Failed for MIME type: {}", mime_type);
@@ -971,6 +973,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1002,6 +1006,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_video(), "Failed for MIME type: {}", mime_type);
@@ -1022,6 +1028,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1060,6 +1068,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_audio(), "Failed for MIME type: {}", mime_type);
@@ -1080,6 +1090,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1109,6 +1121,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(media_file.is_document());
@@ -1128,6 +1142,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1157,6 +1173,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
@@ -1177,6 +1195,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
