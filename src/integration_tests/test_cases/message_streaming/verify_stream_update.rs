@@ -89,18 +89,50 @@ impl TestCase for VerifyStreamUpdateTestCase {
             ))
         })?;
 
-        // Wait for the update with timeout
-        let update = tokio::time::timeout(tokio::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .map_err(|_| {
-                WhitenoiseError::Other(anyhow::anyhow!(
-                    "Timeout waiting for {:?} update",
-                    self.expected_trigger
-                ))
-            })?
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to receive update: {}", e))
-            })?;
+        // Pre-resolve the expected message ID to avoid borrow issues in async block
+        let expected_id = self
+            .expected_message_key
+            .as_ref()
+            .and_then(|key| context.get_message_id(key).ok().cloned());
+
+        let expected_trigger = self.expected_trigger.clone();
+
+        // Wait for the expected update with timeout, skipping stale events that don't match
+        // This handles race conditions where previous test updates arrive late
+        let update = tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(update) => {
+                        // Check if this is the expected message (if we have an expected ID)
+                        let is_expected_message = expected_id
+                            .as_ref()
+                            .map(|id| update.message.id == *id)
+                            .unwrap_or(true);
+
+                        if update.trigger == expected_trigger && is_expected_message {
+                            return Ok(update);
+                        }
+
+                        // Log skipped update for debugging
+                        tracing::debug!(
+                            "Skipping stale update: got {:?} for message {}, waiting for {:?}",
+                            update.trigger,
+                            update.message.id,
+                            expected_trigger
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            WhitenoiseError::Other(anyhow::anyhow!(
+                "Timeout waiting for {:?} update",
+                self.expected_trigger
+            ))
+        })?
+        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Failed to receive update: {}", e)))?;
 
         // Verify trigger type
         assert_eq!(

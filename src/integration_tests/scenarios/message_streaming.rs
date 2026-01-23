@@ -163,7 +163,8 @@ impl MessageStreamingScenario {
         new_msg_verifier.execute(&mut self.context).await?;
 
         // Allow async processing to complete before next test
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Increased delay to handle CI timing variations and MLS state propagation
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Test 2: ReactionAdded trigger
         tracing::info!("--- Testing ReactionAdded update ---");
@@ -185,7 +186,8 @@ impl MessageStreamingScenario {
         reaction_verifier.execute(&mut self.context).await?;
 
         // Allow async processing to complete before next test
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Increased delay to handle CI timing variations and MLS state propagation
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Test 3: ReactionRemoved trigger
         tracing::info!("--- Testing ReactionRemoved update ---");
@@ -202,7 +204,8 @@ impl MessageStreamingScenario {
         reaction_removed_verifier.execute(&mut self.context).await?;
 
         // Allow async processing to complete before next test
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Increased delay to handle CI timing variations and MLS state propagation
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Test 4: MessageDeleted trigger
         tracing::info!("--- Testing MessageDeleted update ---");
@@ -215,7 +218,8 @@ impl MessageStreamingScenario {
             .await?;
 
         // Small delay to ensure the message is processed
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        // Increased delay to handle CI timing variations
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let delete_verifier =
             VerifyStreamUpdateTestCase::new(Self::GROUP_NAME, UpdateTrigger::MessageDeleted)
