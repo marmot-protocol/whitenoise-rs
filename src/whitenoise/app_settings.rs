@@ -190,4 +190,52 @@ mod tests {
         let settings = AppSettings::new(ThemeMode::System, Some(Language::Spanish));
         assert_eq!(settings.language, Language::Spanish);
     }
+
+    #[test]
+    fn language_default_is_english() {
+        assert_eq!(Language::default(), Language::English);
+    }
+
+    #[test]
+    fn language_display_round_trips_via_from_str() {
+        for variant in [
+            Language::English,
+            Language::Spanish,
+            Language::French,
+            Language::German,
+            Language::Italian,
+            Language::Portuguese,
+            Language::Russian,
+            Language::Turkish,
+        ] {
+            let round_trip = Language::from_str(&variant.to_string()).unwrap();
+            assert_eq!(round_trip, variant);
+        }
+    }
+
+    #[test]
+    fn language_from_str_accepts_full_names() {
+        assert_eq!(Language::from_str("english").unwrap(), Language::English);
+        assert_eq!(Language::from_str("spanish").unwrap(), Language::Spanish);
+        assert_eq!(Language::from_str("french").unwrap(), Language::French);
+        assert_eq!(Language::from_str("german").unwrap(), Language::German);
+        assert_eq!(Language::from_str("italian").unwrap(), Language::Italian);
+        assert_eq!(Language::from_str("portuguese").unwrap(), Language::Portuguese);
+        assert_eq!(Language::from_str("russian").unwrap(), Language::Russian);
+        assert_eq!(Language::from_str("turkish").unwrap(), Language::Turkish);
+    }
+
+    #[test]
+    fn language_from_str_is_case_insensitive() {
+        assert_eq!(Language::from_str("EN").unwrap(), Language::English);
+        assert_eq!(Language::from_str("SPANISH").unwrap(), Language::Spanish);
+        assert_eq!(Language::from_str("Fr").unwrap(), Language::French);
+    }
+
+    #[test]
+    fn language_from_str_rejects_unknown_value() {
+        assert!(Language::from_str("klingon").is_err());
+        assert!(Language::from_str("").is_err());
+        assert!(Language::from_str("xyz").is_err());
+    }
 }
