@@ -5106,6 +5106,7 @@ dependencies = [
  "indicatif",
  "infer",
  "keyring",
+ "keyring-core",
  "lightning-invoice",
  "mdk-core",
  "mdk-sqlite-storage",
