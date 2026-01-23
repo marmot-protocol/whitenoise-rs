@@ -1,4 +1,5 @@
 use crate::integration_tests::{core::*, test_cases::app_settings::*};
+use crate::whitenoise::app_settings::Language;
 use crate::{ThemeMode, Whitenoise, WhitenoiseError};
 use async_trait::async_trait;
 
@@ -24,6 +25,7 @@ impl Scenario for AppSettingsScenario {
         // Test fetching default settings
         FetchAppSettingsTestCase::basic()
             .expect_theme(ThemeMode::System)
+            .expect_language(Language::English)
             .execute(&mut self.context)
             .await?;
 
@@ -39,6 +41,22 @@ impl Scenario for AppSettingsScenario {
 
         // Test updating back to system mode
         UpdateThemeModeTestCase::to_system()
+            .execute(&mut self.context)
+            .await?;
+
+        // Test updating language to Spanish
+        UpdateLanguageTestCase::new(Language::Spanish)
+            .execute(&mut self.context)
+            .await?;
+
+        // Test fetching settings to verify language
+        FetchAppSettingsTestCase::basic()
+            .expect_language(Language::Spanish)
+            .execute(&mut self.context)
+            .await?;
+
+        // Test updating language back to English
+        UpdateLanguageTestCase::new(Language::English)
             .execute(&mut self.context)
             .await?;
 
