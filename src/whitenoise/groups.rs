@@ -1123,12 +1123,34 @@ impl Whitenoise {
         let mdk = Account::create_mdk(*account_pubkey, data_dir)?;
         let media_manager = mdk.media_manager(group_id.clone());
 
+        // Retrieve nonce and scheme_version from database (required for MDK decryption)
+        let nonce_hex = media_file
+            .nonce
+            .as_ref()
+            .ok_or_else(|| WhitenoiseError::MediaCache("Missing nonce for chat media".to_string()))?;
+        let scheme_version = media_file
+            .scheme_version
+            .as_ref()
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache("Missing scheme_version for chat media".to_string())
+            })?
+            .clone();
+
+        // Decode nonce from hex string to bytes
+        let nonce_bytes = hex::decode(nonce_hex)
+            .map_err(|_| WhitenoiseError::MediaCache("Invalid nonce hex".to_string()))?;
+        let nonce: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| WhitenoiseError::MediaCache("Invalid nonce length".to_string()))?;
+
         let reference = MediaReference {
             url: String::new(),
             original_hash: *original_file_hash,
             mime_type: media_file.mime_type.clone(),
             filename: filename.to_string(),
             dimensions: None, // Not used in decryption (only display metadata)
+            scheme_version,
+            nonce,
         };
 
         media_manager
