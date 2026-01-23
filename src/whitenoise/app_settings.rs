@@ -220,7 +220,10 @@ mod tests {
         assert_eq!(Language::from_str("french").unwrap(), Language::French);
         assert_eq!(Language::from_str("german").unwrap(), Language::German);
         assert_eq!(Language::from_str("italian").unwrap(), Language::Italian);
-        assert_eq!(Language::from_str("portuguese").unwrap(), Language::Portuguese);
+        assert_eq!(
+            Language::from_str("portuguese").unwrap(),
+            Language::Portuguese
+        );
         assert_eq!(Language::from_str("russian").unwrap(), Language::Russian);
         assert_eq!(Language::from_str("turkish").unwrap(), Language::Turkish);
     }
