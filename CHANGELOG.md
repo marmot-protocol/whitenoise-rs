@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Export `Language` enum from crate root for library consumers ([erskingardner])
 - Search for contacts by npub or hex pubkey ([erskingardner])
 - Copy npub button in settings page([josefinalliende])
 - Basic NWC support for paying invoices in messages ([a-mpch], [F3r10], [jgmontoya], [josefinalliende])
