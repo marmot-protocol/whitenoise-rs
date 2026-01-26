@@ -24,6 +24,7 @@ use crate::{
         database::media_files::{FileMetadata, MediaFile},
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
+        mdk_runner::run_mdk_operation,
         media_files::MediaFileUpload,
         relays::Relay,
         users::User,
@@ -217,18 +218,32 @@ impl Whitenoise {
         let group_relays = config.relays.clone();
         let group_name = config.name.clone();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &self.config.data_dir)?;
-        let create_group_result =
-            mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
+        // Clone key_package_events for later use
+        let key_package_events_for_lookup = key_package_events.clone();
 
-        let group_ids = mdk
-            .get_groups()?
-            .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect::<Vec<_>>();
+        // Create group and get groups using MDK in a separate thread
+        let creator_pubkey = creator_account.pubkey;
+        let (group, welcome_rumors, group_ids) = run_mdk_operation(
+            creator_account.pubkey,
+            &self.config.data_dir,
+            move |mdk| {
+                let create_group_result =
+                    mdk.create_group(&creator_pubkey, key_package_events, config)?;
 
-        let group = create_group_result.group;
-        let welcome_rumors = create_group_result.welcome_rumors;
+                let group_ids = mdk
+                    .get_groups()?
+                    .into_iter()
+                    .map(|g| hex::encode(g.nostr_group_id))
+                    .collect::<Vec<_>>();
+
+                let group = create_group_result.group;
+                let welcome_rumors = create_group_result.welcome_rumors;
+
+                Ok((group, welcome_rumors, group_ids))
+            },
+        )
+        .await?;
+        
         if welcome_rumors.len() != members.len() {
             return Err(WhitenoiseError::Other(anyhow::Error::msg(
                 "Welcome rumours are missing for some of the members",
@@ -247,7 +262,7 @@ impl Whitenoise {
                         "No event ID found in welcome rumor"
                     )))?;
 
-            let member_pubkey = key_package_events
+            let member_pubkey = key_package_events_for_lookup
                 .iter()
                 .find(|event| event.id == *key_package_event_id)
                 .map(|event| event.pubkey)
@@ -315,10 +330,14 @@ impl Whitenoise {
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let groups: Vec<group_types::Group> = mdk
-            .get_groups()
-            .map_err(WhitenoiseError::from)?
+        let all_groups: Vec<group_types::Group> = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            |mdk| mdk.get_groups().map_err(Into::into),
+        )
+        .await?;
+
+        let groups: Vec<group_types::Group> = all_groups
             .into_iter()
             .filter(|group| !active_filter || group.state == group_types::GroupState::Active)
             .collect();
@@ -386,11 +405,12 @@ impl Whitenoise {
     /// * `Err(WhitenoiseError::GroupNotFound)` - If the group doesn't exist
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let group = mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let group_id_clone = group_id.clone();
+        let group = run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            mdk.get_group(&group_id_clone).map_err(Into::into)
+        })
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
 
         // Lazy migration: ensure AccountGroup record exists for this group
         if group.state == group_types::GroupState::Active {
@@ -433,12 +453,13 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        Ok(mdk
-            .get_members(group_id)
-            .map_err(WhitenoiseError::from)?
-            .into_iter()
-            .collect::<Vec<PublicKey>>())
+        let group_id_clone = group_id.clone();
+        Ok(run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            mdk.get_members(&group_id_clone).map_err(Into::into)
+        })
+        .await?
+        .into_iter()
+        .collect::<Vec<PublicKey>>())
     }
 
     pub async fn group_admins(
@@ -446,14 +467,15 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        Ok(mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?
-            .admin_pubkeys
-            .into_iter()
-            .collect::<Vec<PublicKey>>())
+        let group_id_clone = group_id.clone();
+        Ok(run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            mdk.get_group(&group_id_clone).map_err(Into::into)
+        })
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?
+        .admin_pubkeys
+        .into_iter()
+        .collect::<Vec<PublicKey>>())
     }
 
     /// Adds new members to an existing MLS group
@@ -511,19 +533,28 @@ impl Whitenoise {
         }
 
         let (relay_urls, evolution_event, welcome_rumors) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+                let group_id_clone = group_id.clone();
+            let key_package_events_clone = key_package_events.clone();
 
-            let update_result = mdk.add_members(group_id, &key_package_events)?;
-            // Merge the pending commit immediately after creating it
-            // This ensures our local state is correct before publishing
-            mdk.merge_pending_commit(group_id)?;
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                let relay_urls = mdk.get_relays(&group_id_clone)?;
+                if relay_urls.is_empty() {
+                    return Err(WhitenoiseError::GroupMissingRelays);
+                }
+                let relay_urls: Vec<nostr_sdk::RelayUrl> = relay_urls.into_iter().collect();
 
-            (
-                relay_urls,
-                update_result.evolution_event,
-                update_result.welcome_rumors,
-            )
+                let update_result = mdk.add_members(&group_id_clone, &key_package_events_clone)?;
+                // Merge the pending commit immediately after creating it
+                // This ensures our local state is correct before publishing
+                mdk.merge_pending_commit(&group_id_clone)?;
+
+                Ok((
+                    relay_urls,
+                    update_result.evolution_event,
+                    update_result.welcome_rumors,
+                ))
+            })
+            .await?
         };
 
         let welcome_rumors = match welcome_rumors {
@@ -613,13 +644,21 @@ impl Whitenoise {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+                let group_id_clone = group_id.clone();
 
-            let update_result = mdk.remove_members(group_id, &members)?;
-            mdk.merge_pending_commit(group_id)?;
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                let relay_urls = mdk.get_relays(&group_id_clone)?;
+                if relay_urls.is_empty() {
+                    return Err(WhitenoiseError::GroupMissingRelays);
+                }
+                let relay_urls: Vec<nostr_sdk::RelayUrl> = relay_urls.into_iter().collect();
 
-            (relay_urls, update_result.evolution_event)
+                let update_result = mdk.remove_members(&group_id_clone, &members)?;
+                mdk.merge_pending_commit(&group_id_clone)?;
+
+                Ok((relay_urls, update_result.evolution_event))
+            })
+            .await?
         };
 
         self.nostr
@@ -643,13 +682,21 @@ impl Whitenoise {
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+                let group_id_clone = group_id.clone();
 
-            let update_result = mdk.update_group_data(group_id, group_data)?;
-            mdk.merge_pending_commit(group_id)?;
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                let relay_urls = mdk.get_relays(&group_id_clone)?;
+                if relay_urls.is_empty() {
+                    return Err(WhitenoiseError::GroupMissingRelays);
+                }
+                let relay_urls: Vec<nostr_sdk::RelayUrl> = relay_urls.into_iter().collect();
 
-            (relay_urls, update_result.evolution_event)
+                let update_result = mdk.update_group_data(&group_id_clone, group_data)?;
+                mdk.merge_pending_commit(&group_id_clone)?;
+
+                Ok((relay_urls, update_result.evolution_event))
+            })
+            .await?
         };
 
         self.nostr
@@ -668,15 +715,24 @@ impl Whitenoise {
     /// * `account` - The account that wants to leave the group
     /// * `group_id` - The ID of the group to leave
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let group_id_clone = group_id.clone();
+        let (relay_urls, evolution_event) = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            move |mdk| {
+                let relay_urls = mdk.get_relays(&group_id_clone)?;
+                if relay_urls.is_empty() {
+                    return Err(WhitenoiseError::GroupMissingRelays);
+                }
+                let relay_urls: Vec<nostr_sdk::RelayUrl> = relay_urls.into_iter().collect();
 
-            // Create a self-removal proposal
-            let update_result = mdk.leave_group(group_id)?;
+                // Create a self-removal proposal
+                let update_result = mdk.leave_group(&group_id_clone)?;
 
-            (relay_urls, update_result.evolution_event)
-        };
+                Ok((relay_urls, update_result.evolution_event))
+            },
+        )
+        .await?;
 
         // Publish the self-removal proposal to the group
         self.nostr
@@ -705,15 +761,15 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        let group: mdk_core::prelude::group_types::Group;
-        {
-            // Get group data to check if it has an image
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            group = mdk
-                .get_group(group_id)
-                .map_err(WhitenoiseError::from)?
-                .ok_or(WhitenoiseError::GroupNotFound)?;
-        }
+        // Get group data to check if it has an image
+        let group_id_clone = group_id.clone();
+        let group: mdk_core::prelude::group_types::Group = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            move |mdk| mdk.get_group(&group_id_clone).map_err(Into::into),
+        )
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
 
         // Check if group has an image set
         let (image_hash, image_key, image_nonce) =
@@ -1120,9 +1176,7 @@ impl Whitenoise {
             Self::download_blob_from_blossom(&blossom_url, &encrypted_hash).await?;
 
         // Decrypt using MDK
-        let mdk = Account::create_mdk(*account_pubkey, data_dir)?;
-        let media_manager = mdk.media_manager(group_id.clone());
-
+        
         // Retrieve nonce and scheme_version from database (required for MDK decryption)
         let nonce_hex = media_file
             .nonce
@@ -1153,11 +1207,17 @@ impl Whitenoise {
             nonce,
         };
 
-        media_manager
-            .decrypt_from_download(&encrypted_data, &reference)
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to decrypt chat media: {}", e))
-            })
+        let group_id_clone = group_id.clone();
+        let encrypted_data_clone = encrypted_data.clone();
+        run_mdk_operation(*account_pubkey, data_dir, move |mdk| {
+            let media_manager = mdk.media_manager(group_id_clone);
+            media_manager
+                .decrypt_from_download(&encrypted_data_clone, &reference)
+                .map_err(|e| {
+                    WhitenoiseError::Other(anyhow::anyhow!("Failed to decrypt chat media: {}", e))
+                })
+        })
+        .await
     }
 
     /// Stores decrypted image to cache and records it in database
@@ -1412,25 +1472,28 @@ impl Whitenoise {
         let original_filename = std::path::Path::new(file_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid file path")))?;
+            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid file path")))?
+            .to_string();
 
         // Use MDK encrypted media manager to prepare the media file for upload
-        // Wrap in a block to ensure MDK and media_manager are dropped before any await points
-        let prepared = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-            let media_manager = mdk.media_manager(group_id.clone());
-
+        let group_id_clone = group_id.clone();
+        let mime_type = media_detection.mime_type().to_string();
+        let options_clone = options.unwrap_or_default();
+        let file_data_clone = file_data.clone();
+        let prepared = run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            let media_manager = mdk.media_manager(group_id_clone);
             media_manager
                 .encrypt_for_upload_with_options(
-                    &file_data,
-                    media_detection.mime_type(),
-                    original_filename,
-                    &options.unwrap_or_default(),
+                    &file_data_clone,
+                    &mime_type,
+                    &original_filename,
+                    &options_clone,
                 )
                 .map_err(|e| {
                     WhitenoiseError::Other(anyhow::anyhow!("Failed to encrypt chat media: {}", e))
-                })?
-        };
+                })
+        })
+        .await?;
 
         let blossom_server_url = blossom_server_url.unwrap_or_else(Self::default_blossom_url);
 
@@ -1674,11 +1737,13 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<PathBuf>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let group = mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let group_id_clone = group_id.clone();
+        let group = run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            mdk.get_group(&group_id_clone)
+                .map_err(WhitenoiseError::from)
+        })
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
 
         self.resolve_group_image_path(account, &group).await
     }

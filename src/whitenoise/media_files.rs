@@ -256,6 +256,17 @@ impl<'a> MediaFiles<'a> {
     where
         S: MdkStorageProvider,
     {
+        Self::parse_imeta_tags_from_event_static(inner_event, media_manager)
+    }
+
+    /// Static version of parse_imeta_tags_from_event for use in closures
+    pub(crate) fn parse_imeta_tags_from_event_static<S>(
+        inner_event: &UnsignedEvent,
+        media_manager: &EncryptedMediaManager<'_, S>,
+    ) -> Result<Vec<ParsedMediaReference>>
+    where
+        S: MdkStorageProvider,
+    {
         let mut parsed = Vec::new();
 
         // Filter for imeta tags and parse using MDK

@@ -14,8 +14,9 @@ use crate::whitenoise::{
     accounts_groups::AccountGroup,
     aggregated_message::AggregatedMessage,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::Result,
+    error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
+    mdk_runner::run_mdk_operation,
     message_aggregator::ChatMessageSummary,
     users::User,
 };
@@ -213,7 +214,7 @@ impl Whitenoise {
         let group_info_map = self
             .build_group_info_map(account.pubkey, &group_ids)
             .await?;
-        let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map)?;
+        let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map).await?;
         let last_message_map = self.build_last_message_map(&group_ids).await?;
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
         let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
@@ -258,9 +259,24 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
-        // 1. Get group from MDK
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let Some(group) = mdk.get_group(group_id)? else {
+        // 1. Get group and members from MDK in a separate thread
+        let group_id_clone = group_id.clone();
+        let (group_opt, members_opt) = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            move |mdk| {
+                let group = mdk.get_group(&group_id_clone)?;
+                let members = if group.is_some() {
+                    Some(mdk.get_members(&group_id_clone)?.into_iter().collect::<Vec<PublicKey>>())
+                } else {
+                    None
+                };
+                Ok((group, members))
+            },
+        )
+        .await?;
+        
+        let Some(group) = group_opt else {
             return Ok(None);
         };
 
@@ -282,11 +298,14 @@ impl Whitenoise {
         let pending_confirmation = account_group.is_pending();
         let welcomer_pubkey = account_group.welcomer_pubkey;
 
-        // 4. For DMs: get members, find other user, lookup metadata
+        // 4. For DMs: find other user, lookup metadata
         let dm_other_user = if group_info.group_type == GroupType::DirectMessage {
-            let members: Vec<PublicKey> = mdk.get_members(group_id)?.into_iter().collect();
-            if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
-                User::find_by_pubkey(&other_pk, &self.database).await.ok()
+            if let Some(members) = members_opt {
+                if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
+                    User::find_by_pubkey(&other_pk, &self.database).await.ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -475,26 +494,42 @@ impl Whitenoise {
     }
 
     /// Identifies the "other user" in each DM group.
-    fn identify_dm_participants(
+    async fn identify_dm_participants(
         &self,
         account: &Account,
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> Result<HashMap<GroupId, PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let mut dm_other_users = HashMap::new();
+        // Collect DM groups that need member lookup
+        let dm_groups: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group_info_map
+                    .get(&group.mls_group_id)
+                    .map(|info| info.group_type == GroupType::DirectMessage)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
 
-        for group in groups {
-            if let Some(info) = group_info_map.get(&group.mls_group_id)
-                && info.group_type == GroupType::DirectMessage
-            {
-                let members: Vec<PublicKey> =
-                    mdk.get_members(&group.mls_group_id)?.into_iter().collect();
-                if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
-                    dm_other_users.insert(group.mls_group_id.clone(), other_pk);
+        // Batch all MDK get_members calls in a separate thread
+        let account_pubkey = account.pubkey;
+        let dm_other_users = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            move |mdk| {
+                let mut dm_other_users = HashMap::new();
+                for group in dm_groups {
+                    let members: Vec<PublicKey> =
+                        mdk.get_members(&group.mls_group_id)?.into_iter().collect();
+                    if let Some(other_pk) = get_dm_other_user(&members, &account_pubkey) {
+                        dm_other_users.insert(group.mls_group_id.clone(), other_pk);
+                    }
                 }
-            }
-        }
+                Ok(dm_other_users)
+            },
+        )
+        .await?;
 
         Ok(dm_other_users)
     }

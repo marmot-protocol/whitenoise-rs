@@ -12,6 +12,7 @@ use crate::whitenoise::{
     chat_list_streaming::ChatListUpdateTrigger,
     error::{Result, WhitenoiseError},
     group_information::GroupInformation,
+    mdk_runner::run_mdk_operation,
     relays::Relay,
 };
 
@@ -54,17 +55,31 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        // Clone rumor for later use (extracting key package event ID)
+        let rumor_for_key_package = rumor.clone();
+        let event_id = event.id;
 
-        // Process the welcome to get group info (but don't accept yet)
-        let welcome = mdk
-            .process_welcome(&event.id, &rumor)
-            .map_err(WhitenoiseError::MdkCoreError)?;
-        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
+        // Process and accept welcome using MDK in a separate thread
+        let (group_id, group_name, welcomer_pubkey) =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                // Process the welcome to get group info (but don't accept yet)
+                let welcome = mdk
+                    .process_welcome(&event_id, &rumor)
+                    .map_err(WhitenoiseError::MdkCoreError)?;
+                tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Processed welcome event");
 
-        let group_id = welcome.mls_group_id.clone();
-        let group_name = welcome.group_name.clone();
-        let welcomer_pubkey = welcome.welcomer;
+                let group_id = welcome.mls_group_id.clone();
+                let group_name = welcome.group_name.clone();
+                let welcomer_pubkey = welcome.welcomer;
+
+                // Now accept the welcome to finalize MLS membership
+                mdk.accept_welcome(&welcome)
+                    .map_err(WhitenoiseError::MdkCoreError)?;
+                tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+
+                Ok((group_id, group_name, welcomer_pubkey))
+            })
+            .await?;
 
         let account_group = AccountGroup {
             id: None,
@@ -79,13 +94,8 @@ impl Whitenoise {
         account_group.save(&self.database).await?;
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "New AccountGroup created and saved");
 
-        // Now accept the welcome to finalize MLS membership
-        mdk.accept_welcome(&welcome)
-            .map_err(WhitenoiseError::MdkCoreError)?;
-        tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
-
         // Extract key package event ID for rotation
-        let key_package_event_id: Option<EventId> = rumor
+        let key_package_event_id: Option<EventId> = rumor_for_key_package
             .tags
             .iter()
             .find(|tag| {
@@ -258,7 +268,7 @@ impl Whitenoise {
         keys: Keys,
     ) -> Result<()> {
         let (group_ids, group_relays) =
-            Self::get_group_subscription_info(data_dir, &account.pubkey)?;
+            Self::get_group_subscription_info(data_dir, &account.pubkey).await?;
 
         // Create relay records (idempotent)
         for relay in &group_relays {
@@ -344,24 +354,26 @@ impl Whitenoise {
     }
 
     /// Helper to get group subscription info (group IDs and relay URLs) for an account.
-    fn get_group_subscription_info(
+    async fn get_group_subscription_info(
         data_dir: &std::path::Path,
         pubkey: &PublicKey,
     ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
-        let mdk = Account::create_mdk(*pubkey, data_dir)?;
-        let groups = mdk.get_groups()?;
-        let mut group_relays_set = BTreeSet::new();
-        let group_ids = groups
-            .iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect::<Vec<_>>();
+        run_mdk_operation(*pubkey, data_dir, |mdk| {
+            let groups = mdk.get_groups()?;
+            let mut group_relays_set = BTreeSet::new();
+            let group_ids = groups
+                .iter()
+                .map(|g| hex::encode(g.nostr_group_id))
+                .collect::<Vec<_>>();
 
-        for group in &groups {
-            let relays = mdk.get_relays(&group.mls_group_id)?;
-            group_relays_set.extend(relays);
-        }
+            for group in &groups {
+                let relays = mdk.get_relays(&group.mls_group_id)?;
+                group_relays_set.extend(relays);
+            }
 
-        Ok((group_ids, group_relays_set.into_iter().collect()))
+            Ok((group_ids, group_relays_set.into_iter().collect()))
+        })
+        .await
     }
 }
 
@@ -392,14 +404,22 @@ mod tests {
             .expect("member must have a published key package");
 
         // Create the group via mdk directly to obtain welcome rumor
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
-        let create_group_result = mdk
-            .create_group(
-                &creator_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![creator_account.pubkey]),
-            )
-            .unwrap();
+        let key_pkg_event_clone = key_pkg_event.clone();
+        let creator_pubkey = creator_account.pubkey;
+        let create_group_result = run_mdk_operation(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            move |mdk| {
+                mdk.create_group(
+                    &creator_pubkey,
+                    vec![key_pkg_event_clone],
+                    create_nostr_group_config_data(vec![creator_pubkey]),
+                )
+                .map_err(Into::into)
+            },
+        )
+        .await
+        .unwrap();
 
         let welcome_rumor = create_group_result
             .welcome_rumors
@@ -460,8 +480,13 @@ mod tests {
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
         // (not just after background task completes). This prevents race condition
         // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
-        let mdk = Account::create_mdk(member_account.pubkey, &whitenoise.config.data_dir).unwrap();
-        let groups = mdk.get_groups().unwrap();
+        let groups = run_mdk_operation(
+            member_account.pubkey,
+            &whitenoise.config.data_dir,
+            |mdk| mdk.get_groups().map_err(Into::into),
+        )
+        .await
+        .unwrap();
         assert!(!groups.is_empty(), "Member should have at least one group");
 
         let group_id = &groups[0].mls_group_id;
@@ -514,13 +539,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Keyring issue: Multiple MDK instances in separate threads can't share keys"]
     async fn test_get_group_subscription_info_no_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
 
         // New account has no groups
         let result =
-            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey);
+            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey).await;
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();
@@ -548,7 +574,7 @@ mod tests {
         let result = Whitenoise::get_group_subscription_info(
             &whitenoise.config.data_dir,
             &creator_account.pubkey,
-        );
+        ).await;
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();

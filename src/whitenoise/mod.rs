@@ -26,6 +26,7 @@ pub mod follows;
 pub mod group_information;
 pub mod groups;
 pub mod key_packages;
+pub mod mdk_runner;
 pub mod media_files;
 pub mod message_aggregator;
 pub mod message_streaming;

@@ -5,7 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, WhitenoiseError, accounts::Account};
+use crate::whitenoise::{Whitenoise, WhitenoiseError, accounts::Account, mdk_runner::run_mdk_operation};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupType {
@@ -86,10 +86,14 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         whitenoise: &Whitenoise,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
-        let group = mdk
-            .get_group(mls_group_id)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let mls_group_id_clone = mls_group_id.clone();
+        let group = run_mdk_operation(account_pubkey, &whitenoise.config.data_dir, move |mdk| {
+            mdk.get_group(&mls_group_id_clone)
+                .map_err(WhitenoiseError::from)
+        })
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
+        
         let (group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(Self::infer_group_type_from_group_name(&group.name)),
@@ -116,7 +120,16 @@ impl GroupInformation {
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect();
 
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
+        // Get all groups from MDK in one operation
+        let all_groups = run_mdk_operation(account_pubkey, &whitenoise.config.data_dir, |mdk| {
+            mdk.get_groups().map_err(WhitenoiseError::from)
+        })
+        .await?;
+        
+        let groups_map: std::collections::HashMap<GroupId, _> = all_groups
+            .into_iter()
+            .map(|g| (g.mls_group_id.clone(), g))
+            .collect();
 
         let mut results = Vec::new();
         for mls_group_id in mls_group_ids {
@@ -124,8 +137,8 @@ impl GroupInformation {
                 results.push(existing_info);
             } else {
                 // Create missing record with a type inferred from the group name
-                let group = mdk
-                    .get_group(mls_group_id)?
+                let group = groups_map
+                    .get(mls_group_id)
                     .ok_or(WhitenoiseError::GroupNotFound)?;
                 let group_type = Self::infer_group_type_from_group_name(&group.name);
                 let (new_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(

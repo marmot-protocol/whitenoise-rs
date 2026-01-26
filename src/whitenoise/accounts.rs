@@ -260,13 +260,28 @@ impl Account {
         Ok(descriptor.url.to_string())
     }
 
-    pub(crate) fn create_mdk(
+    pub(crate) async fn create_mdk(
         pubkey: PublicKey,
         data_dir: &Path,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
         let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
-        let storage = MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)?;
+
+        // Use spawn_blocking to avoid blocking the async runtime.
+        // MDK uses tokio::sync::Mutex::blocking_lock() internally which panics
+        // when called from an async context. spawn_blocking runs the closure
+        // on a dedicated blocking thread pool.
+        let storage = tokio::task::spawn_blocking(move || {
+            MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)
+        })
+        .await
+        .map_err(|e| {
+            AccountError::NostrMlsSqliteStorageError(mdk_sqlite_storage::error::Error::Database(
+                format!("spawn_blocking failed: {}", e),
+            ))
+        })?
+        .map_err(AccountError::NostrMlsSqliteStorageError)?;
+
         Ok(MDK::new(storage))
     }
 }
@@ -827,20 +842,46 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<(Vec<RelayUrl>, Vec<String>)> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let groups = mdk.get_groups()?;
-        let mut group_relays_set = HashSet::new();
-        let mut group_ids = vec![];
+        let pubkey = account.pubkey;
+        let data_dir = self.config.data_dir.clone();
 
-        for group in &groups {
-            let relays = mdk.get_relays(&group.mls_group_id)?;
-            group_relays_set.extend(relays);
-            group_ids.push(hex::encode(group.nostr_group_id));
-        }
+        // Use std::thread::spawn to completely exit the tokio runtime context.
+        // MDK uses tokio::sync::Mutex::blocking_lock() which panics if called
+        // from within any tokio runtime context (including spawn_blocking threads).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
+                let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+                let storage =
+                    MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)?;
+                let mdk = MDK::new(storage);
 
-        let group_relays_urls = group_relays_set.into_iter().collect::<Vec<_>>();
+                let groups = mdk.get_groups()?;
+                let mut group_relays_set = HashSet::new();
+                let mut group_ids = vec![];
 
-        Ok((group_relays_urls, group_ids))
+                for group in &groups {
+                    let relays = mdk.get_relays(&group.mls_group_id)?;
+                    group_relays_set.extend(relays);
+                    group_ids.push(hex::encode(group.nostr_group_id));
+                }
+
+                let group_relays_urls = group_relays_set.into_iter().collect::<Vec<_>>();
+                Ok::<_, WhitenoiseError>((group_relays_urls, group_ids))
+            })();
+            let _ = tx.send(result);
+        });
+
+        // Wait for the result asynchronously
+        let result = tokio::task::spawn_blocking(move || rx.recv())
+            .await
+            .map_err(WhitenoiseError::JoinError)?
+            .map_err(|e| {
+                WhitenoiseError::Configuration(format!("Channel receive error: {}", e))
+            })??;
+
+        Ok(result)
     }
 
     pub(crate) async fn setup_subscriptions(
@@ -959,8 +1000,8 @@ pub mod test_utils {
         TempDir::new().unwrap().path().to_path_buf()
     }
 
-    pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::Account::create_mdk(pubkey, &data_dir()).unwrap()
+    pub async fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
+        super::Account::create_mdk(pubkey, &data_dir()).await.unwrap()
     }
 }
 

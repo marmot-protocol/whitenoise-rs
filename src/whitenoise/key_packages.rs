@@ -1,7 +1,10 @@
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::mdk_runner::run_mdk_operation;
 use crate::whitenoise::relays::Relay;
+use mdk_core::MDK;
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 use std::time::Duration;
 
@@ -12,14 +15,40 @@ impl Whitenoise {
         account: &Account,
         key_package_relays: &[Relay],
     ) -> Result<(String, [Tag; 7])> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-
+        let pubkey = account.pubkey;
+        let data_dir = self.config.data_dir.clone();
         let key_package_relay_urls = Relay::urls(key_package_relays);
-        let result = mdk
-            .create_key_package_for_event(&account.pubkey, key_package_relay_urls)
-            .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
-        Ok(result)
+        // All MDK operations must run outside the tokio runtime context because
+        // MDK uses tokio::sync::Mutex::blocking_lock() which panics in async context.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
+                let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+                let storage =
+                    MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)
+                        .map_err(|e| {
+                            WhitenoiseError::Configuration(format!(
+                                "MdkSqliteStorage error: {}",
+                                e
+                            ))
+                        })?;
+                let mdk = MDK::new(storage);
+
+                mdk.create_key_package_for_event(&pubkey, key_package_relay_urls)
+                    .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))
+            })();
+            let _ = tx.send(result);
+        });
+
+        // Wait for the result asynchronously
+        tokio::task::spawn_blocking(move || rx.recv())
+            .await
+            .map_err(WhitenoiseError::JoinError)?
+            .map_err(|e| {
+                WhitenoiseError::Configuration(format!("Channel receive error: {}", e))
+            })?
     }
 
     /// Publishes the MLS key package for the given account to its key package relays.
@@ -84,9 +113,13 @@ impl Whitenoise {
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
-                let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-                let key_package = mdk.parse_key_package(event)?;
-                mdk.delete_key_package_from_storage(&key_package)?;
+                let event_clone = event.clone();
+                run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                    let key_package = mdk.parse_key_package(&event_clone)?;
+                    mdk.delete_key_package_from_storage(&key_package)?;
+                    Ok(())
+                })
+                .await?;
             }
 
             let key_package_relays = account.key_package_relays(self).await?;
@@ -242,7 +275,7 @@ impl Whitenoise {
 
         // Delete from local storage on initial attempt only
         if delete_mls_stored_keys {
-            self.delete_key_packages_from_storage(account, &key_package_events, original_count)?;
+            self.delete_key_packages_from_storage(account, &key_package_events, original_count).await?;
         }
 
         let mut pending_ids: Vec<EventId> = key_package_events.iter().map(|e| e.id).collect();
@@ -321,38 +354,49 @@ impl Whitenoise {
         Ok((signer, Relay::urls(&key_package_relays)))
     }
 
-    fn delete_key_packages_from_storage(
+    async fn delete_key_packages_from_storage(
         &self,
         account: &Account,
         key_package_events: &[Event],
         initial_count: usize,
     ) -> Result<()> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
-        let mut storage_delete_count = 0;
 
-        for event in key_package_events {
-            match mdk.parse_key_package(event) {
-                Ok(key_package) => match mdk.delete_key_package_from_storage(&key_package) {
-                    Ok(_) => storage_delete_count += 1,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "whitenoise::key_packages",
-                            "Failed to delete key package from storage for event {}: {}",
-                            event.id,
-                            e
-                        );
+        let events_clone = key_package_events.to_vec();
+
+        let storage_delete_count = run_mdk_operation(
+            account.pubkey,
+            &self.config.data_dir,
+            move |mdk| {
+                let mut count = 0;
+                for event in &events_clone {
+                    match mdk.parse_key_package(event) {
+                        Ok(key_package) => {
+                            match mdk.delete_key_package_from_storage(&key_package) {
+                                Ok(_) => count += 1,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "whitenoise::key_packages",
+                                        "Failed to delete key package from storage for event {}: {}",
+                                        event.id,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "whitenoise::key_packages",
+                                "Failed to parse key package for event {}: {}",
+                                event.id,
+                                e
+                            );
+                        }
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::key_packages",
-                        "Failed to parse key package for event {}: {}",
-                        event.id,
-                        e
-                    );
                 }
-            }
-        }
+                Ok::<_, WhitenoiseError>(count)
+            },
+        )
+        .await?;
 
         tracing::debug!(
             target: "whitenoise::key_packages",
