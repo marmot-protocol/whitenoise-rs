@@ -52,6 +52,11 @@ pub use whitenoise::chat_list_streaming::{
     ChatListSubscription, ChatListUpdate, ChatListUpdateTrigger,
 };
 
+// Notification streaming
+pub use whitenoise::notification_streaming::{
+    NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
+};
+
 static TRACING_GUARDS: OnceLock<Mutex<Option<(WorkerGuard, WorkerGuard)>>> = OnceLock::new();
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 

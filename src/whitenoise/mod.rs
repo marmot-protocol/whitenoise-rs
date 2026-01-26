@@ -30,6 +30,7 @@ pub mod media_files;
 pub mod message_aggregator;
 pub mod message_streaming;
 pub mod messages;
+pub mod notification_streaming;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
@@ -110,6 +111,7 @@ pub struct Whitenoise {
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: message_streaming::MessageStreamManager,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
+    notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
@@ -133,6 +135,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("message_aggregator", &"<REDACTED>")
             .field("message_stream_manager", &"<REDACTED>")
             .field("chat_list_stream_manager", &"<REDACTED>")
+            .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
@@ -206,6 +209,7 @@ impl Whitenoise {
             message_aggregator,
             message_stream_manager: message_streaming::MessageStreamManager::default(),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
+            notification_stream_manager: notification_streaming::NotificationStreamManager::default(),
             event_sender,
             shutdown_sender,
             contact_list_guards: DashMap::new(),
@@ -652,6 +656,16 @@ impl Whitenoise {
         })
     }
 
+    /// Subscribe to notification updates across all accounts.
+    ///
+    /// Unlike other subscription methods, this does NOT return initial items.
+    /// Notifications are real-time only
+    pub fn subscribe_to_notifications(&self) -> notification_streaming::NotificationSubscription {
+        notification_streaming::NotificationSubscription {
+            updates: self.notification_stream_manager.subscribe(),
+        }
+    }
+
     /// Get a MediaFiles orchestrator for coordinating storage and database operations
     ///
     /// This provides high-level methods that coordinate between the storage layer
@@ -931,6 +945,8 @@ pub mod test_utils {
             message_aggregator,
             message_stream_manager: message_streaming::MessageStreamManager::default(),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
+            notification_stream_manager: notification_streaming::NotificationStreamManager::default(
+            ),
             event_sender,
             shutdown_sender,
             contact_list_guards: DashMap::new(),
@@ -1717,6 +1733,27 @@ mod tests {
             whitenoise.shutdown().await.unwrap();
             whitenoise.shutdown().await.unwrap();
             whitenoise.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_subscribe_to_notifications_returns_receiver() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // Subscribe should return a subscription with a receiver
+            let subscription = whitenoise.subscribe_to_notifications();
+
+            // The receiver should be empty initially (no pending notifications)
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                subscription.updates.resubscribe().recv(),
+            )
+            .await;
+
+            // Should timeout because there are no notifications yet
+            assert!(
+                result.is_err(),
+                "Should timeout with no pending notifications"
+            );
         }
 
         #[tokio::test]
