@@ -47,7 +47,9 @@ impl NostrManager {
             self.setup_batched_relay_subscriptions_inner(relay_user_map, since)
                 .await
         })
-        .await
+        .await?;
+
+        Ok(())
     }
 
     // Sets up subscriptions in batches for all users and their relays (without signer)

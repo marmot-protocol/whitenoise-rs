@@ -562,17 +562,12 @@ impl Whitenoise {
 
         // Remove the private key from the secret store
         // For local accounts this is required; for external accounts this is best-effort cleanup
-        if account.has_local_key() {
-            self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
-        } else if let Err(e) = self.secrets_store.remove_private_key_for_pubkey(pubkey) {
-            tracing::debug!(
-                target: "whitenoise::logout",
-                "No local key to remove for external account {}: {}",
-                pubkey,
-                e
-            );
+        let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+        match (account.has_local_key(), result) {
+            (true, Err(e)) => return Err(e.into()),  // Local account MUST have key
+            (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
+            _ => {}
         }
-
         Ok(())
     }
 
