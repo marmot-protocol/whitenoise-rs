@@ -5,7 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, WhitenoiseError, accounts::Account, mdk_runner::run_mdk_operation};
+use crate::whitenoise::{Whitenoise, WhitenoiseError, mdk_runner::run_mdk_operation};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupType {
@@ -93,7 +93,7 @@ impl GroupInformation {
         })
         .await?
         .ok_or(WhitenoiseError::GroupNotFound)?;
-        
+
         let (group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(Self::infer_group_type_from_group_name(&group.name)),
@@ -125,7 +125,7 @@ impl GroupInformation {
             mdk.get_groups().map_err(WhitenoiseError::from)
         })
         .await?;
-        
+
         let groups_map: std::collections::HashMap<GroupId, _> = all_groups
             .into_iter()
             .map(|g| (g.mls_group_id.clone(), g))

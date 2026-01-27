@@ -260,6 +260,7 @@ impl Account {
         Ok(descriptor.url.to_string())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn create_mdk(
         pubkey: PublicKey,
         data_dir: &Path,
@@ -1001,7 +1002,9 @@ pub mod test_utils {
     }
 
     pub async fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::Account::create_mdk(pubkey, &data_dir()).await.unwrap()
+        super::Account::create_mdk(pubkey, &data_dir())
+            .await
+            .unwrap()
     }
 }
 

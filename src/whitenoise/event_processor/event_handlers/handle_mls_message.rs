@@ -27,7 +27,7 @@ impl Whitenoise {
         let (result, parsed_references_opt) = run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
             let result = mdk.process_message(&event_clone)
                 .map_err(WhitenoiseError::MdkCoreError)?;
-            
+
             // Parse media references inside the MDK operation to avoid blocking issues
             let parsed_refs = if let Some((group_id, inner_event)) = Self::extract_message_details(&result) {
                 let media_manager = mdk.media_manager(group_id.clone());
@@ -36,11 +36,11 @@ impl Whitenoise {
             } else {
                 None
             };
-            
+
             Ok((result, parsed_refs))
         })
         .await?;
-        
+
         tracing::debug!(
           target: "whitenoise::event_handlers::handle_mls_message",
           "Handled MLS message - Result: {:?}",
@@ -50,11 +50,7 @@ impl Whitenoise {
         // Store media references if any were parsed
         if let Some((group_id, inner_event, parsed_references)) = parsed_references_opt {
             self.media_files()
-                .store_parsed_media_references(
-                    &group_id,
-                    &account.pubkey,
-                    parsed_references,
-                )
+                .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
                 .await?;
 
             // Cache the message and emit updates to subscribers
@@ -73,11 +69,7 @@ impl Whitenoise {
                 }
                 Kind::Reaction => {
                     if let Some(target) = self.cache_reaction(&group_id, &message).await? {
-                        self.emit_message_update(
-                            &group_id,
-                            UpdateTrigger::ReactionAdded,
-                            target,
-                        );
+                        self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
                     }
                 }
                 Kind::EventDeletion => {
@@ -546,12 +538,15 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        
+
         let group_id_clone = group_id.clone();
         let message_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone, inner).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone, inner)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -577,12 +572,15 @@ mod tests {
             "👍".to_string(),
         );
         reaction_inner.ensure_id();
-        
+
         let group_id_clone2 = group_id.clone();
         let reaction_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone2, reaction_inner).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone2, reaction_inner)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -612,12 +610,15 @@ mod tests {
             String::new(),
         );
         deletion_inner.ensure_id();
-        
+
         let group_id_clone3 = group_id.clone();
         let deletion_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone3, deletion_inner).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone3, deletion_inner)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -668,7 +669,10 @@ mod tests {
         let valid_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone, inner).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone, inner)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -722,12 +726,15 @@ mod tests {
             "+".to_string(), // Use simple emoji that won't be normalized
         );
         orphaned_reaction.ensure_id();
-        
+
         let group_id_clone = group_id.clone();
         let reaction_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone, orphaned_reaction).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone, orphaned_reaction)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -760,12 +767,15 @@ mod tests {
             "Late message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        
+
         let group_id_clone2 = group_id.clone();
         let message_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone2, actual_message).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone2, actual_message)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -835,12 +845,15 @@ mod tests {
             "👍".to_string(),
         );
         valid_reaction.ensure_id();
-        
+
         let group_id_clone = group_id.clone();
         let valid_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone, valid_reaction).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone, valid_reaction)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -859,12 +872,15 @@ mod tests {
             "".to_string(), // Empty content is invalid
         );
         invalid_reaction.ensure_id();
-        
+
         let group_id_clone2 = group_id.clone();
         let invalid_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone2, invalid_reaction).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone2, invalid_reaction)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -883,12 +899,15 @@ mod tests {
             "Target message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        
+
         let group_id_clone3 = group_id.clone();
         let message_event = run_mdk_operation(
             creator_account.pubkey,
             &whitenoise.config.data_dir,
-            move |mdk| mdk.create_message(&group_id_clone3, actual_message).map_err(Into::into),
+            move |mdk| {
+                mdk.create_message(&group_id_clone3, actual_message)
+                    .map_err(Into::into)
+            },
         )
         .await
         .unwrap();
@@ -1020,12 +1039,15 @@ mod tests {
                 format!("Message {}", i),
             );
             inner.ensure_id();
-            
+
             let group_id_clone = group.mls_group_id.clone();
             let event = run_mdk_operation(
                 creator_account.pubkey,
                 &whitenoise.config.data_dir,
-                move |mdk| mdk.create_message(&group_id_clone, inner).map_err(Into::into),
+                move |mdk| {
+                    mdk.create_message(&group_id_clone, inner)
+                        .map_err(Into::into)
+                },
             )
             .await
             .unwrap();

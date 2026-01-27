@@ -44,21 +44,16 @@ impl Whitenoise {
 
         // Batch all MDK operations in a separate thread
         let group_id_clone = group_id.clone();
-        let (message_event, message, group_relays) = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            move |mdk| {
+        let (message_event, message, group_relays) =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
                 let message_event = mdk.create_message(&group_id_clone, inner_event)?;
-                let message = mdk
-                    .get_message(&group_id_clone, &event_id)?
-                    .ok_or(WhitenoiseError::MdkCoreError(
-                        mdk_core::error::Error::MessageNotFound,
-                    ))?;
+                let message = mdk.get_message(&group_id_clone, &event_id)?.ok_or(
+                    WhitenoiseError::MdkCoreError(mdk_core::error::Error::MessageNotFound),
+                )?;
                 let group_relays = mdk.get_relays(&group_id_clone)?;
                 Ok((message_event, message, group_relays))
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         // Publish message in background without blocking
         self.nostr.background_publish_event_to(
@@ -93,7 +88,7 @@ impl Whitenoise {
             mdk.get_messages(&group_id_clone, None).map_err(Into::into)
         })
         .await?;
-        
+
         let messages_with_tokens = messages
             .iter()
             .map(|message| MessageWithTokens {
@@ -163,11 +158,9 @@ impl Whitenoise {
         let accounts = Account::all(&self.database).await?;
 
         for account in accounts {
-                // Batch get_groups and get_messages for all groups in a separate thread
-            let groups_with_messages = run_mdk_operation(
-                account.pubkey,
-                &self.config.data_dir,
-                |mdk| {
+            // Batch get_groups and get_messages for all groups in a separate thread
+            let groups_with_messages =
+                run_mdk_operation(account.pubkey, &self.config.data_dir, |mdk| {
                     let groups = mdk.get_groups()?;
                     let mut result = Vec::new();
 
@@ -177,9 +170,8 @@ impl Whitenoise {
                     }
 
                     Ok(result)
-                },
-            )
-            .await?;
+                })
+                .await?;
 
             for (group_info, mdk_messages) in groups_with_messages {
                 total_groups_checked += 1;
@@ -631,13 +623,12 @@ mod tests {
 
         // Get messages from MDK
         let group_id_clone = group.mls_group_id.clone();
-        let mdk_messages = run_mdk_operation(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            move |mdk| mdk.get_messages(&group_id_clone, None).map_err(Into::into),
-        )
-        .await
-        .unwrap();
+        let mdk_messages =
+            run_mdk_operation(creator.pubkey, &whitenoise.config.data_dir, move |mdk| {
+                mdk.get_messages(&group_id_clone, None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
 
         // Verify we have 3 messages in MDK
         assert_eq!(mdk_messages.len(), 3);
@@ -718,13 +709,12 @@ mod tests {
 
         // Sync the cache
         let group_id_clone = group.mls_group_id.clone();
-        let mdk_messages = run_mdk_operation(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            move |mdk| mdk.get_messages(&group_id_clone, None).map_err(Into::into),
-        )
-        .await
-        .unwrap();
+        let mdk_messages =
+            run_mdk_operation(creator.pubkey, &whitenoise.config.data_dir, move |mdk| {
+                mdk.get_messages(&group_id_clone, None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await
@@ -745,13 +735,12 @@ mod tests {
 
         // Get updated messages from MDK
         let group_id_clone2 = group.mls_group_id.clone();
-        let mdk_messages = run_mdk_operation(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            move |mdk| mdk.get_messages(&group_id_clone2, None).map_err(Into::into),
-        )
-        .await
-        .unwrap();
+        let mdk_messages =
+            run_mdk_operation(creator.pubkey, &whitenoise.config.data_dir, move |mdk| {
+                mdk.get_messages(&group_id_clone2, None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
         assert_eq!(mdk_messages.len(), 3);
 
         // Cache should need sync now
@@ -890,13 +879,12 @@ mod tests {
 
         // Populate cache
         let group_id_clone = group.mls_group_id.clone();
-        let mdk_messages = run_mdk_operation(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            move |mdk| mdk.get_messages(&group_id_clone, None).map_err(Into::into),
-        )
-        .await
-        .unwrap();
+        let mdk_messages =
+            run_mdk_operation(creator.pubkey, &whitenoise.config.data_dir, move |mdk| {
+                mdk.get_messages(&group_id_clone, None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await
@@ -963,13 +951,12 @@ mod tests {
 
         // Populate cache
         let group_id_clone = group.mls_group_id.clone();
-        let mdk_messages = run_mdk_operation(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            move |mdk| mdk.get_messages(&group_id_clone, None).map_err(Into::into),
-        )
-        .await
-        .unwrap();
+        let mdk_messages =
+            run_mdk_operation(creator.pubkey, &whitenoise.config.data_dir, move |mdk| {
+                mdk.get_messages(&group_id_clone, None).map_err(Into::into)
+            })
+            .await
+            .unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
             .await

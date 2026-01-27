@@ -29,10 +29,7 @@ impl Whitenoise {
                 let storage =
                     MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)
                         .map_err(|e| {
-                            WhitenoiseError::Configuration(format!(
-                                "MdkSqliteStorage error: {}",
-                                e
-                            ))
+                            WhitenoiseError::Configuration(format!("MdkSqliteStorage error: {}", e))
                         })?;
                 let mdk = MDK::new(storage);
 
@@ -46,9 +43,7 @@ impl Whitenoise {
         tokio::task::spawn_blocking(move || rx.recv())
             .await
             .map_err(WhitenoiseError::JoinError)?
-            .map_err(|e| {
-                WhitenoiseError::Configuration(format!("Channel receive error: {}", e))
-            })?
+            .map_err(|e| WhitenoiseError::Configuration(format!("Channel receive error: {}", e)))?
     }
 
     /// Publishes the MLS key package for the given account to its key package relays.
@@ -275,7 +270,8 @@ impl Whitenoise {
 
         // Delete from local storage on initial attempt only
         if delete_mls_stored_keys {
-            self.delete_key_packages_from_storage(account, &key_package_events, original_count).await?;
+            self.delete_key_packages_from_storage(account, &key_package_events, original_count)
+                .await?;
         }
 
         let mut pending_ids: Vec<EventId> = key_package_events.iter().map(|e| e.id).collect();
@@ -360,7 +356,6 @@ impl Whitenoise {
         key_package_events: &[Event],
         initial_count: usize,
     ) -> Result<()> {
-
         let events_clone = key_package_events.to_vec();
 
         let storage_delete_count = run_mdk_operation(

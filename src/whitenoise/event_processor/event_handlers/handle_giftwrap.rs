@@ -480,11 +480,9 @@ mod tests {
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
         // (not just after background task completes). This prevents race condition
         // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
-        let groups = run_mdk_operation(
-            member_account.pubkey,
-            &whitenoise.config.data_dir,
-            |mdk| mdk.get_groups().map_err(Into::into),
-        )
+        let groups = run_mdk_operation(member_account.pubkey, &whitenoise.config.data_dir, |mdk| {
+            mdk.get_groups().map_err(Into::into)
+        })
         .await
         .unwrap();
         assert!(!groups.is_empty(), "Member should have at least one group");
@@ -546,7 +544,8 @@ mod tests {
 
         // New account has no groups
         let result =
-            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey).await;
+            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey)
+                .await;
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();
@@ -574,7 +573,8 @@ mod tests {
         let result = Whitenoise::get_group_subscription_info(
             &whitenoise.config.data_dir,
             &creator_account.pubkey,
-        ).await;
+        )
+        .await;
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();

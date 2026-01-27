@@ -84,6 +84,7 @@ impl Whitenoise {
     /// # Returns
     /// * `Ok(Vec<nostr_sdk::RelayUrl>)` - Vector of relay URLs
     /// * `Err(WhitenoiseError::GroupMissingRelays)` - If no relays are configured
+    #[allow(dead_code)]
     fn ensure_group_relays(
         mdk: &MDK<MdkSqliteStorage>,
         group_id: &GroupId,
@@ -223,10 +224,8 @@ impl Whitenoise {
 
         // Create group and get groups using MDK in a separate thread
         let creator_pubkey = creator_account.pubkey;
-        let (group, welcome_rumors, group_ids) = run_mdk_operation(
-            creator_account.pubkey,
-            &self.config.data_dir,
-            move |mdk| {
+        let (group, welcome_rumors, group_ids) =
+            run_mdk_operation(creator_account.pubkey, &self.config.data_dir, move |mdk| {
                 let create_group_result =
                     mdk.create_group(&creator_pubkey, key_package_events, config)?;
 
@@ -240,10 +239,9 @@ impl Whitenoise {
                 let welcome_rumors = create_group_result.welcome_rumors;
 
                 Ok((group, welcome_rumors, group_ids))
-            },
-        )
-        .await?;
-        
+            })
+            .await?;
+
         if welcome_rumors.len() != members.len() {
             return Err(WhitenoiseError::Other(anyhow::Error::msg(
                 "Welcome rumours are missing for some of the members",
@@ -330,12 +328,11 @@ impl Whitenoise {
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
-        let all_groups: Vec<group_types::Group> = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            |mdk| mdk.get_groups().map_err(Into::into),
-        )
-        .await?;
+        let all_groups: Vec<group_types::Group> =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, |mdk| {
+                mdk.get_groups().map_err(Into::into)
+            })
+            .await?;
 
         let groups: Vec<group_types::Group> = all_groups
             .into_iter()
@@ -454,12 +451,14 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
         let group_id_clone = group_id.clone();
-        Ok(run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
-            mdk.get_members(&group_id_clone).map_err(Into::into)
-        })
-        .await?
-        .into_iter()
-        .collect::<Vec<PublicKey>>())
+        Ok(
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                mdk.get_members(&group_id_clone).map_err(Into::into)
+            })
+            .await?
+            .into_iter()
+            .collect::<Vec<PublicKey>>(),
+        )
     }
 
     pub async fn group_admins(
@@ -468,14 +467,16 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
         let group_id_clone = group_id.clone();
-        Ok(run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
-            mdk.get_group(&group_id_clone).map_err(Into::into)
-        })
-        .await?
-        .ok_or(WhitenoiseError::GroupNotFound)?
-        .admin_pubkeys
-        .into_iter()
-        .collect::<Vec<PublicKey>>())
+        Ok(
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                mdk.get_group(&group_id_clone).map_err(Into::into)
+            })
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?
+            .admin_pubkeys
+            .into_iter()
+            .collect::<Vec<PublicKey>>(),
+        )
     }
 
     /// Adds new members to an existing MLS group
@@ -533,7 +534,7 @@ impl Whitenoise {
         }
 
         let (relay_urls, evolution_event, welcome_rumors) = {
-                let group_id_clone = group_id.clone();
+            let group_id_clone = group_id.clone();
             let key_package_events_clone = key_package_events.clone();
 
             run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
@@ -644,7 +645,7 @@ impl Whitenoise {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-                let group_id_clone = group_id.clone();
+            let group_id_clone = group_id.clone();
 
             run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
                 let relay_urls = mdk.get_relays(&group_id_clone)?;
@@ -682,7 +683,7 @@ impl Whitenoise {
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-                let group_id_clone = group_id.clone();
+            let group_id_clone = group_id.clone();
 
             run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
                 let relay_urls = mdk.get_relays(&group_id_clone)?;
@@ -716,10 +717,8 @@ impl Whitenoise {
     /// * `group_id` - The ID of the group to leave
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
         let group_id_clone = group_id.clone();
-        let (relay_urls, evolution_event) = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            move |mdk| {
+        let (relay_urls, evolution_event) =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
                 let relay_urls = mdk.get_relays(&group_id_clone)?;
                 if relay_urls.is_empty() {
                     return Err(WhitenoiseError::GroupMissingRelays);
@@ -730,9 +729,8 @@ impl Whitenoise {
                 let update_result = mdk.leave_group(&group_id_clone)?;
 
                 Ok((relay_urls, update_result.evolution_event))
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         // Publish the self-removal proposal to the group
         self.nostr
@@ -763,13 +761,12 @@ impl Whitenoise {
     ) -> Result<()> {
         // Get group data to check if it has an image
         let group_id_clone = group_id.clone();
-        let group: mdk_core::prelude::group_types::Group = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            move |mdk| mdk.get_group(&group_id_clone).map_err(Into::into),
-        )
-        .await?
-        .ok_or(WhitenoiseError::GroupNotFound)?;
+        let group: mdk_core::prelude::group_types::Group =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+                mdk.get_group(&group_id_clone).map_err(Into::into)
+            })
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
 
         // Check if group has an image set
         let (image_hash, image_key, image_nonce) =
@@ -901,8 +898,12 @@ impl Whitenoise {
 
         let secret_key = Secret::new(*image_key);
         let secret_nonce = Secret::new(*image_nonce);
-        let decrypted_data =
-            Self::decrypt_group_image(&encrypted_data, Some(image_hash), &secret_key, &secret_nonce)?;
+        let decrypted_data = Self::decrypt_group_image(
+            &encrypted_data,
+            Some(image_hash),
+            &secret_key,
+            &secret_nonce,
+        )?;
         let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
             WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
         })?;
@@ -1176,12 +1177,11 @@ impl Whitenoise {
             Self::download_blob_from_blossom(&blossom_url, &encrypted_hash).await?;
 
         // Decrypt using MDK
-        
+
         // Retrieve nonce and scheme_version from database (required for MDK decryption)
-        let nonce_hex = media_file
-            .nonce
-            .as_ref()
-            .ok_or_else(|| WhitenoiseError::MediaCache("Missing nonce for chat media".to_string()))?;
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::MediaCache("Missing nonce for chat media".to_string())
+        })?;
         let scheme_version = media_file
             .scheme_version
             .as_ref()
@@ -2270,7 +2270,10 @@ mod tests {
             new_group_data.description.unwrap()
         );
         assert_eq!(updated_group.image_hash, new_group_data.image_hash.unwrap());
-        assert_eq!(updated_group.image_key, new_group_data.image_key.unwrap().map(Secret::new));
+        assert_eq!(
+            updated_group.image_key,
+            new_group_data.image_key.unwrap().map(Secret::new)
+        );
     }
 
     #[cfg(test)]

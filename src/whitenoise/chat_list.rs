@@ -14,7 +14,7 @@ use crate::whitenoise::{
     accounts_groups::AccountGroup,
     aggregated_message::AggregatedMessage,
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
-    error::{Result, WhitenoiseError},
+    error::Result,
     group_information::{GroupInformation, GroupType},
     mdk_runner::run_mdk_operation,
     message_aggregator::ChatMessageSummary,
@@ -214,7 +214,9 @@ impl Whitenoise {
         let group_info_map = self
             .build_group_info_map(account.pubkey, &group_ids)
             .await?;
-        let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map).await?;
+        let dm_other_users = self
+            .identify_dm_participants(account, &groups, &group_info_map)
+            .await?;
         let last_message_map = self.build_last_message_map(&group_ids).await?;
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
         let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
@@ -261,21 +263,22 @@ impl Whitenoise {
     ) -> Result<Option<ChatListItem>> {
         // 1. Get group and members from MDK in a separate thread
         let group_id_clone = group_id.clone();
-        let (group_opt, members_opt) = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            move |mdk| {
+        let (group_opt, members_opt) =
+            run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
                 let group = mdk.get_group(&group_id_clone)?;
                 let members = if group.is_some() {
-                    Some(mdk.get_members(&group_id_clone)?.into_iter().collect::<Vec<PublicKey>>())
+                    Some(
+                        mdk.get_members(&group_id_clone)?
+                            .into_iter()
+                            .collect::<Vec<PublicKey>>(),
+                    )
                 } else {
                     None
                 };
                 Ok((group, members))
-            },
-        )
-        .await?;
-        
+            })
+            .await?;
+
         let Some(group) = group_opt else {
             return Ok(None);
         };
@@ -514,21 +517,17 @@ impl Whitenoise {
 
         // Batch all MDK get_members calls in a separate thread
         let account_pubkey = account.pubkey;
-        let dm_other_users = run_mdk_operation(
-            account.pubkey,
-            &self.config.data_dir,
-            move |mdk| {
-                let mut dm_other_users = HashMap::new();
-                for group in dm_groups {
-                    let members: Vec<PublicKey> =
-                        mdk.get_members(&group.mls_group_id)?.into_iter().collect();
-                    if let Some(other_pk) = get_dm_other_user(&members, &account_pubkey) {
-                        dm_other_users.insert(group.mls_group_id.clone(), other_pk);
-                    }
+        let dm_other_users = run_mdk_operation(account.pubkey, &self.config.data_dir, move |mdk| {
+            let mut dm_other_users = HashMap::new();
+            for group in dm_groups {
+                let members: Vec<PublicKey> =
+                    mdk.get_members(&group.mls_group_id)?.into_iter().collect();
+                if let Some(other_pk) = get_dm_other_user(&members, &account_pubkey) {
+                    dm_other_users.insert(group.mls_group_id.clone(), other_pk);
                 }
-                Ok(dm_other_users)
-            },
-        )
+            }
+            Ok(dm_other_users)
+        })
         .await?;
 
         Ok(dm_other_users)
