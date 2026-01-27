@@ -171,15 +171,6 @@ jobs:
         env:
           RUST_LOG: error
 
-      - name: Integration Test
-        if: matrix.run-integration
-        run: |
-          mkdir -p ./dev/data/integration_test/
-          RUST_LOG=warn,sqlx=info,refinery_core=error,keyring=info,nostr_relay_pool=error,mdk_sqlite_storage=error,tungstenite=error,integration_test=debug \
-          cargo run --bin integration_test --features integration-tests -- \
-          --data-dir ./dev/data/integration_test/ --logs-dir ./dev/data/integration_test/
-          rm -rf ./dev/data/integration_test/
-
       - name: Extract coverage percentage
         if: matrix.run-integration
         id: coverage
@@ -275,6 +266,15 @@ jobs:
               repo: context.repo.repo,
               body: body
             });
+
+      - name: Integration Test
+        if: matrix.run-integration
+        run: |
+          mkdir -p ./dev/data/integration_test/
+          RUST_LOG=warn,sqlx=info,refinery_core=error,keyring=info,nostr_relay_pool=error,mdk_sqlite_storage=error,tungstenite=error,integration_test=debug \
+          cargo run --bin integration_test --features integration-tests -- \
+          --data-dir ./dev/data/integration_test/ --logs-dir ./dev/data/integration_test/
+          rm -rf ./dev/data/integration_test/
 
       - name: Save coverage baseline (master only)
         if: matrix.run-integration && github.ref == 'refs/heads/master' && github.event_name == 'push'
