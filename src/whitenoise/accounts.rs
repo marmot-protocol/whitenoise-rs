@@ -2205,11 +2205,12 @@ mod tests {
         assert_eq!(kp.len(), default_relays.len());
 
         // Test add_relay and remove_relay on individual relays
-        let test_relay = Relay::new(&RelayUrl::parse("wss://test.relay.example").unwrap());
-        let test_relay = Relay::find_or_create_by_url(&test_relay.url, &whitenoise.database)
-            .await
-            .unwrap();
-
+        let test_relay = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://test.relay.example").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         account
             .add_relay(&test_relay, RelayType::Nip65, &whitenoise)
             .await
