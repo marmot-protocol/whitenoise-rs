@@ -72,6 +72,21 @@ pub enum AccountError {
     WhitenoiseNotInitialized,
 }
 
+/// Result of setting up relays for an external signer account.
+///
+/// Contains the relay lists for each type and flags indicating which lists
+/// need to be published (when defaults were used because no existing relays
+/// were found on the network).
+#[derive(Debug)]
+pub(crate) struct ExternalSignerRelaySetup {
+    pub nip65_relays: Vec<Relay>,
+    pub inbox_relays: Vec<Relay>,
+    pub key_package_relays: Vec<Relay>,
+    pub should_publish_nip65: bool,
+    pub should_publish_inbox: bool,
+    pub should_publish_key_package: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: Option<i64>,
@@ -410,125 +425,182 @@ impl Whitenoise {
     /// Logs in using an external signer (e.g., Amber via NIP-55).
     ///
     /// This method creates an account for the given public key without storing any
-    /// private key locally. All signing operations must be performed by the external
-    /// signer and provided back to Whitenoise.
+    /// private key locally. It performs the complete setup:
+    ///
+    /// 1. Creates/updates the account for the given public key
+    /// 2. Sets up relays (fetches existing from network or uses defaults)
+    /// 3. Registers the external signer for ongoing use (e.g., giftwrap decryption)
+    /// 4. Publishes relay lists if using defaults (using the signer)
+    /// 5. Publishes the MLS key package (using the signer)
     ///
     /// # Arguments
     ///
     /// * `pubkey` - The user's public key obtained from the external signer.
-    ///
-    /// # Note
-    ///
-    /// When using an external signer account, operations that require signing
-    /// (like publishing metadata, relay lists, or sending messages) must use
-    /// the `*_with_signer` variants that accept a `NostrSigner` parameter.
-    pub async fn login_with_external_signer(&self, pubkey: PublicKey) -> Result<Account> {
-        tracing::debug!(target: "whitenoise::login_external", "Logging in with external signer, pubkey: {}", pubkey.to_hex());
+    /// * `signer` - The external signer to use for signing operations. Must implement `Clone`.
+    pub async fn login_with_external_signer(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<Account> {
+        tracing::debug!(
+            target: "whitenoise::login_external",
+            "Logging in with external signer, pubkey: {}",
+            pubkey.to_hex()
+        );
 
-        // Check if account already exists
-        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
-            tracing::debug!(target: "whitenoise::login_external", "Found existing account, re-establishing relays and subscriptions");
+        let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
 
-            let mut account_mut = existing.clone();
-
-            // Handle migration from Local to External account type
-            if account_mut.account_type != AccountType::External {
-                tracing::info!(
-                    target: "whitenoise::login_external",
-                    "Migrating account from {:?} to External",
-                    account_mut.account_type
-                );
-
-                // Update account type to External and persist first
-                account_mut.account_type = AccountType::External;
-                account_mut = self.persist_account(&account_mut).await?;
-                tracing::debug!(target: "whitenoise::login_external", "Account migrated to External type");
-
-                // Best-effort removal of local key after successful migration
-                if let Err(e) = self
-                    .secrets_store
-                    .remove_private_key_for_pubkey(&account_mut.pubkey)
-                {
-                    tracing::debug!(
-                        target: "whitenoise::login_external",
-                        "No local key to remove after migration: {}",
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "whitenoise::login_external",
-                        "Removed local key after migration to External"
-                    );
-                }
-            } else {
-                // Account is already External - still attempt best-effort removal of any stale keys
-                if let Err(e) = self
-                    .secrets_store
-                    .remove_private_key_for_pubkey(&account_mut.pubkey)
-                {
-                    tracing::debug!(
-                        target: "whitenoise::login_external",
-                        "No stale local key to remove for existing External account: {}",
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "whitenoise::login_external",
-                        "Removed stale local key for existing External account"
-                    );
-                }
-            }
-
-            // Setup relays for existing external signer account
-            let (nip65_relays, inbox_relays, key_package_relays) = self
-                .setup_relays_for_external_signer_account(&mut account_mut)
-                .await?;
-            tracing::debug!(target: "whitenoise::login_external", "Relays setup for existing account (without publishing)");
-
-            let user = account_mut.user(&self.database).await?;
-
-            // Activate without publishing (external signer will handle publishing)
-            self.activate_account_without_publishing(
-                &account_mut,
-                &user,
-                &nip65_relays,
-                &inbox_relays,
-                &key_package_relays,
-            )
-            .await?;
-            tracing::debug!(target: "whitenoise::login_external", "Existing account activated (without publishing)");
-
-            return Ok(account_mut);
-        }
-
-        // Create new external signer account
-        let account = Account::new_external(self, pubkey).await?;
-        let account = self.persist_account(&account).await?;
-        tracing::debug!(target: "whitenoise::login_external", "Created new external signer account");
-
-        // Setup relays for external signer account (fetch from network or use defaults)
-        // This does NOT publish - the external signer will handle publishing
-        let mut account_mut = account.clone();
-        let (nip65_relays, inbox_relays, key_package_relays) = self
-            .setup_relays_for_external_signer_account(&mut account_mut)
-            .await?;
-        tracing::debug!(target: "whitenoise::login_external", "Relays setup (without publishing)");
-
-        let user = account_mut.user(&self.database).await?;
-
-        // Activate without publishing (external signer will handle publishing)
+        let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
-            &account_mut,
+            &account,
             &user,
-            &nip65_relays,
-            &inbox_relays,
-            &key_package_relays,
+            &relay_setup.nip65_relays,
+            &relay_setup.inbox_relays,
+            &relay_setup.key_package_relays,
         )
         .await?;
-        tracing::debug!(target: "whitenoise::login_external", "Account activated (without publishing)");
 
-        tracing::debug!(target: "whitenoise::login_external", "Successfully logged in with external signer: {}", account_mut.pubkey.to_hex());
-        Ok(account_mut)
+        // Register the signer for ongoing use (e.g., giftwrap decryption)
+        self.register_external_signer(pubkey, signer.clone());
+
+        // Publish relay lists if using defaults
+        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
+
+        if relay_setup.should_publish_nip65 {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing NIP-65 relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &nip65_urls,
+                    RelayType::Nip65,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_inbox {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing inbox relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.inbox_relays),
+                    RelayType::Inbox,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_key_package {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing key package relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.key_package_relays),
+                    RelayType::KeyPackage,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        // Publish the key package
+        tracing::debug!(
+            target: "whitenoise::login_external",
+            "Publishing MLS key package"
+        );
+        self.publish_key_package_for_account_with_signer(&account, signer)
+            .await?;
+
+        tracing::info!(
+            target: "whitenoise::login_external",
+            "Successfully logged in with external signer: {}",
+            account.pubkey.to_hex()
+        );
+
+        Ok(account)
+    }
+
+    /// Sets up an external signer account (creates or updates) and configures relays.
+    /// Also used by tests that need account setup without publishing.
+    async fn setup_external_signer_account(
+        &self,
+        pubkey: PublicKey,
+    ) -> Result<(Account, ExternalSignerRelaySetup)> {
+        // Check if account already exists
+        let mut account =
+            if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+                tracing::debug!(
+                    target: "whitenoise::setup_external_account",
+                    "Found existing account"
+                );
+
+                let mut account_mut = existing.clone();
+
+                // Handle migration from Local to External account type
+                if account_mut.account_type != AccountType::External {
+                    tracing::info!(
+                        target: "whitenoise::setup_external_account",
+                        "Migrating account from {:?} to External",
+                        account_mut.account_type
+                    );
+                    account_mut.account_type = AccountType::External;
+                    account_mut = self.persist_account(&account_mut).await?;
+                }
+
+                // Best-effort removal of any local keys
+                let _ = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey);
+
+                account_mut
+            } else {
+                // Create new external signer account
+                tracing::debug!(
+                    target: "whitenoise::setup_external_account",
+                    "Creating new external signer account"
+                );
+                let account = Account::new_external(self, pubkey).await?;
+                self.persist_account(&account).await?
+            };
+
+        // Setup relays
+        let relay_setup = self
+            .setup_relays_for_external_signer_account(&mut account)
+            .await?;
+
+        Ok((account, relay_setup))
+    }
+
+    /// Test-only: Sets up an external signer account without publishing.
+    ///
+    /// This is used by tests that only need to verify account creation/migration
+    /// logic without needing a real signer for publishing.
+    #[cfg(test)]
+    pub(crate) async fn login_with_external_signer_for_test(
+        &self,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
+
+        let user = account.user(&self.database).await?;
+        self.activate_account_without_publishing(
+            &account,
+            &user,
+            &relay_setup.nip65_relays,
+            &relay_setup.inbox_relays,
+            &relay_setup.key_package_relays,
+        )
+        .await?;
+
+        Ok(account)
     }
 
     /// Logs out the user associated with the given account.
@@ -564,7 +636,7 @@ impl Whitenoise {
         // For local accounts this is required; for external accounts this is best-effort cleanup
         let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
         match (account.has_local_key(), result) {
-            (true, Err(e)) => return Err(e.into()),  // Local account MUST have key
+            (true, Err(e)) => return Err(e.into()), // Local account MUST have key
             (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
             _ => {}
         }
@@ -694,29 +766,6 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn setup_metadata(&self, account: &Account, user: &mut User) -> Result<()> {
-        let petname = petname::petname(2, " ")
-            .unwrap_or_else(|| "Anonymous User".to_string())
-            .split_whitespace()
-            .map(|word| {
-                let mut chars = word.chars();
-                match chars.next() {
-                    None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let default_name = "Anonymous".to_string();
-        let metadata = Metadata::new().name(&petname);
-
-        self.nostr
-            .update_metadata(account, user, &metadata, &self.database)
-            .await?;
-        tracing::debug!(target: "whitenoise::setup_metadata", "Created and published metadata with petname: {}", metadata.name.as_ref().unwrap_or(&default_name));
-        Ok(())
-    }
     async fn persist_account(&self, account: &Account) -> Result<Account> {
         let saved_account = account.save(&self.database).await.map_err(|e| {
             tracing::error!(target: "whitenoise::setup_account", "Failed to save account: {}", e);
@@ -869,17 +918,20 @@ impl Whitenoise {
     /// Sets up relays for an external signer account.
     ///
     /// This is similar to `setup_relays_for_existing_account` but does NOT publish
-    /// relay lists (since external signers handle their own publishing).
+    /// relay lists (the caller with the signer should handle that).
     /// It only fetches existing relays or uses defaults and saves them locally.
+    ///
+    /// Returns the relays for each type and booleans indicating which relay lists
+    /// should be published (true when defaults were used).
     async fn setup_relays_for_external_signer_account(
         &self,
         account: &mut Account,
-    ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
+    ) -> Result<ExternalSignerRelaySetup> {
         let default_relays = self.load_default_relays().await?;
 
         // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
-        // We don't publish here - external signer will handle that
-        let nip65_relays = self
+        // We don't publish here - the caller with the signer will handle that
+        let (nip65_relays, should_publish_nip65) = self
             .setup_external_account_relay_type(
                 account,
                 RelayType::Nip65,
@@ -888,7 +940,7 @@ impl Whitenoise {
             )
             .await?;
 
-        let inbox_relays = self
+        let (inbox_relays, should_publish_inbox) = self
             .setup_external_account_relay_type(
                 account,
                 RelayType::Inbox,
@@ -897,7 +949,7 @@ impl Whitenoise {
             )
             .await?;
 
-        let key_package_relays = self
+        let (key_package_relays, should_publish_key_package) = self
             .setup_external_account_relay_type(
                 account,
                 RelayType::KeyPackage,
@@ -906,18 +958,28 @@ impl Whitenoise {
             )
             .await?;
 
-        Ok((nip65_relays, inbox_relays, key_package_relays))
+        Ok(ExternalSignerRelaySetup {
+            nip65_relays,
+            inbox_relays,
+            key_package_relays,
+            should_publish_nip65,
+            should_publish_inbox,
+            should_publish_key_package,
+        })
     }
 
     /// Sets up a specific relay type for an external signer account.
     /// Fetches from network or uses defaults, but never publishes.
+    ///
+    /// Returns the relays and a boolean indicating whether they should be published
+    /// (true if defaults were used because no existing relays were found).
     async fn setup_external_account_relay_type(
         &self,
         account: &mut Account,
         relay_type: RelayType,
         source_relays: &[Relay],
         default_relays: &[Relay],
-    ) -> Result<Vec<Relay>> {
+    ) -> Result<(Vec<Relay>, bool)> {
         // Try to fetch existing relay lists first
         let fetched_relays = self
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
@@ -925,15 +987,15 @@ impl Whitenoise {
 
         let user = account.user(&self.database).await?;
         if fetched_relays.is_empty() {
-            // No existing relay lists - use defaults (don't publish)
+            // No existing relay lists - use defaults, mark for publishing
             user.add_relays(default_relays, relay_type, &self.database)
                 .await?;
-            Ok(default_relays.to_vec())
+            Ok((default_relays.to_vec(), true))
         } else {
-            // Found existing relay lists - use them
+            // Found existing relay lists - use them, no publishing needed
             user.add_relays(&fetched_relays, relay_type, &self.database)
                 .await?;
-            Ok(fetched_relays)
+            Ok((fetched_relays, false))
         }
     }
 
@@ -2367,7 +2429,10 @@ mod tests {
         let pubkey = keys.public_key();
 
         // Login with external signer (new account)
-        let account = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        let account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
 
         // Verify account was created correctly
         assert_eq!(account.pubkey, pubkey);
@@ -2404,14 +2469,20 @@ mod tests {
         let pubkey = keys.public_key();
 
         // First login - creates new account
-        let account1 = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        let account1 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
         assert!(account1.id.is_some());
 
         // Allow some time for setup
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Second login - should return existing account
-        let account2 = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        let account2 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
 
         assert_eq!(account1.pubkey, account2.pubkey);
         assert_eq!(account2.account_type, AccountType::External);
@@ -2434,7 +2505,10 @@ mod tests {
         whitenoise.secrets_store.store_private_key(&keys).unwrap();
 
         // Now login with external signer - should migrate
-        let migrated = whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        let migrated = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
 
         assert_eq!(migrated.pubkey, pubkey);
         assert_eq!(
@@ -2475,7 +2549,10 @@ mod tests {
         );
 
         // Login with external signer - should clean up stale key
-        whitenoise.login_with_external_signer(pubkey).await.unwrap();
+        whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
 
         // Verify stale key was removed
         assert!(
