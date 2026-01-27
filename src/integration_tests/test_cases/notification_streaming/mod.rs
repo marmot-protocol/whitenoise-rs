@@ -1,0 +1,3 @@
+mod verify_notification_update;
+
+pub use verify_notification_update::VerifyNotificationUpdateTestCase;

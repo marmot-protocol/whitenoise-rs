@@ -8,6 +8,7 @@ pub mod follow_management;
 pub mod group_membership;
 pub mod message_streaming;
 pub mod metadata_management;
+pub mod notification_streaming;
 pub mod scheduler;
 pub mod shared;
 pub mod subscription_processing;

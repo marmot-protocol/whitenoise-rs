@@ -84,6 +84,7 @@ scenario_registry! {
     "message-streaming" => MessageStreamingScenario,
     "chat-list" => ChatListScenario,
     "chat-list-streaming" => ChatListStreamingScenario,
+    "notification-streaming" => NotificationStreamingScenario,
 }
 // ============================================================================
 
@@ -208,6 +209,7 @@ mod tests {
         assert!(parse_scenario_name("message-streaming").is_ok());
         assert!(parse_scenario_name("chat-list").is_ok());
         assert!(parse_scenario_name("chat-list-streaming").is_ok());
+        assert!(parse_scenario_name("notification-streaming").is_ok());
     }
 
     #[test]
@@ -234,7 +236,7 @@ mod tests {
     fn test_get_all_scenario_names() {
         // Test that all scenario names are returned
         let names = get_all_scenario_names();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
         assert!(names.contains(&"account-management"));
         assert!(names.contains(&"basic-messaging"));
         assert!(names.contains(&"user-discovery"));
@@ -242,5 +244,6 @@ mod tests {
         assert!(names.contains(&"message-streaming"));
         assert!(names.contains(&"chat-list"));
         assert!(names.contains(&"chat-list-streaming"));
+        assert!(names.contains(&"notification-streaming"));
     }
 }
