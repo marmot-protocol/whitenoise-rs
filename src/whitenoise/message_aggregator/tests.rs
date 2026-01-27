@@ -104,6 +104,7 @@ mod integration_tests {
             user: keys.public_key(),
             emoji: "❤️".to_string(),
             created_at: Timestamp::now(),
+            reaction_id: EventId::all_zeros(),
         };
 
         let _stats = GroupStatistics {
@@ -150,6 +151,7 @@ mod integration_tests {
             user: user1,
             emoji: "👍".to_string(),
             created_at: Timestamp::now(),
+            reaction_id: EventId::all_zeros(),
         });
 
         // Add an emoji reaction

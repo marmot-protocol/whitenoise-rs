@@ -27,6 +27,7 @@ pub fn process_reaction(
             &message.pubkey,
             &reaction_emoji,
             message.created_at,
+            message.id,
         );
 
         if config.enable_debug_logging {
@@ -117,6 +118,7 @@ pub(crate) fn add_reaction_to_message(
     user: &PublicKey,
     emoji: &str,
     created_at: Timestamp,
+    reaction_id: EventId,
 ) {
     // Remove any existing reaction from this user first (one reaction per user)
     remove_reaction_from_message(target_message, user);
@@ -126,6 +128,7 @@ pub(crate) fn add_reaction_to_message(
         user: *user,
         emoji: emoji.to_string(),
         created_at,
+        reaction_id,
     };
 
     target_message.reactions.user_reactions.push(user_reaction);
@@ -157,6 +160,9 @@ pub(crate) fn add_reaction_to_message(
 mod tests {
     use super::*;
     use crate::whitenoise::message_aggregator::types::ReactionSummary;
+    use mdk_core::prelude::GroupId;
+    use mdk_core::prelude::message_types::{Message, MessageState};
+    use nostr_sdk::UnsignedEvent;
 
     fn create_chat_message(id: &str) -> ChatMessage {
         let keys = Keys::generate();
@@ -211,13 +217,18 @@ mod tests {
         let mut chat_message = create_chat_message("msg1");
         let user = Keys::generate().public_key();
         let created_at = Timestamp::from(1234567890);
+        let reaction_id = EventId::all_zeros();
 
-        add_reaction_to_message(&mut chat_message, &user, "👍", created_at);
+        add_reaction_to_message(&mut chat_message, &user, "👍", created_at, reaction_id);
 
         // Check user reactions
         assert_eq!(chat_message.reactions.user_reactions.len(), 1);
         assert_eq!(chat_message.reactions.user_reactions[0].user, user);
         assert_eq!(chat_message.reactions.user_reactions[0].emoji, "👍");
+        assert_eq!(
+            chat_message.reactions.user_reactions[0].reaction_id,
+            reaction_id
+        );
 
         // Check emoji aggregation
         assert_eq!(chat_message.reactions.by_emoji.len(), 1);
@@ -232,12 +243,16 @@ mod tests {
         let mut chat_message = create_chat_message("msg1");
         let user = Keys::generate().public_key();
         let created_at = Timestamp::from(1234567890);
+        let reaction_id1 = EventId::all_zeros();
+        let reaction_id2 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
 
         // Add first reaction
-        add_reaction_to_message(&mut chat_message, &user, "👍", created_at);
+        add_reaction_to_message(&mut chat_message, &user, "👍", created_at, reaction_id1);
 
         // Replace with different reaction
-        add_reaction_to_message(&mut chat_message, &user, "❤", created_at);
+        add_reaction_to_message(&mut chat_message, &user, "❤", created_at, reaction_id2);
 
         // Should have only one user reaction
         assert_eq!(chat_message.reactions.user_reactions.len(), 1);
@@ -255,9 +270,13 @@ mod tests {
         let user1 = Keys::generate().public_key();
         let user2 = Keys::generate().public_key();
         let created_at = Timestamp::from(1234567890);
+        let reaction_id1 = EventId::all_zeros();
+        let reaction_id2 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
 
-        add_reaction_to_message(&mut chat_message, &user1, "👍", created_at);
-        add_reaction_to_message(&mut chat_message, &user2, "👍", created_at);
+        add_reaction_to_message(&mut chat_message, &user1, "👍", created_at, reaction_id1);
+        add_reaction_to_message(&mut chat_message, &user2, "👍", created_at, reaction_id2);
 
         // Should have two user reactions
         assert_eq!(chat_message.reactions.user_reactions.len(), 2);
@@ -278,9 +297,13 @@ mod tests {
         // Add reactions with different timestamps
         let early_time = Timestamp::from(1000);
         let later_time = Timestamp::from(2000);
+        let reaction_id1 = EventId::all_zeros();
+        let reaction_id2 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
 
-        add_reaction_to_message(&mut chat_message, &user1, "👍", later_time);
-        add_reaction_to_message(&mut chat_message, &user2, "❤", early_time);
+        add_reaction_to_message(&mut chat_message, &user1, "👍", later_time, reaction_id1);
+        add_reaction_to_message(&mut chat_message, &user2, "❤", early_time, reaction_id2);
 
         // Should be sorted by timestamp
         assert_eq!(chat_message.reactions.user_reactions.len(), 2);
@@ -299,17 +322,67 @@ mod tests {
         let mut chat_message = create_chat_message("msg1");
         let user = Keys::generate().public_key();
         let created_at = Timestamp::from(1234567890);
+        let reaction_id1 = EventId::all_zeros();
+        let reaction_id2 =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
 
         // Add reaction
-        add_reaction_to_message(&mut chat_message, &user, "👍", created_at);
+        add_reaction_to_message(&mut chat_message, &user, "👍", created_at, reaction_id1);
         assert_eq!(chat_message.reactions.by_emoji.len(), 1);
 
         // Replace with different reaction (should remove the old one completely)
-        add_reaction_to_message(&mut chat_message, &user, "❤", created_at);
+        add_reaction_to_message(&mut chat_message, &user, "❤", created_at, reaction_id2);
 
         // The 👍 emoji should be completely removed since count reached 0
         assert!(!chat_message.reactions.by_emoji.contains_key("👍"));
         assert!(chat_message.reactions.by_emoji.contains_key("❤"));
         assert_eq!(chat_message.reactions.by_emoji.len(), 1);
+    }
+
+    #[test]
+    fn test_process_reaction_stores_message_id_as_reaction_id() {
+        let target_msg = create_chat_message("target_msg_id");
+        let mut processed_messages = HashMap::new();
+        processed_messages.insert("target_msg_id".to_string(), target_msg);
+
+        let keys = Keys::generate();
+        let reaction_event_id =
+            EventId::from_hex("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+                .unwrap();
+
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["e", "target_msg_id"]).unwrap());
+
+        let inner_event = UnsignedEvent::new(
+            keys.public_key(),
+            Timestamp::from(1234567890),
+            Kind::Reaction,
+            tags.clone(),
+            "👍",
+        );
+
+        let message = Message {
+            id: reaction_event_id,
+            pubkey: keys.public_key(),
+            created_at: Timestamp::from(1234567890),
+            kind: Kind::Reaction,
+            tags,
+            content: "👍".to_string(),
+            mls_group_id: GroupId::from_slice(&[1; 32]),
+            event: inner_event,
+            wrapper_event_id: EventId::all_zeros(),
+            state: MessageState::Processed,
+        };
+
+        let config = AggregatorConfig::default();
+        process_reaction(&message, &mut processed_messages, &config).unwrap();
+
+        let target = processed_messages.get("target_msg_id").unwrap();
+        assert_eq!(target.reactions.user_reactions.len(), 1);
+        assert_eq!(
+            target.reactions.user_reactions[0].reaction_id,
+            reaction_event_id
+        );
     }
 }

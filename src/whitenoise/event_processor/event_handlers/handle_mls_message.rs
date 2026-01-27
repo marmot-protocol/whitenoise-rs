@@ -266,6 +266,7 @@ impl Whitenoise {
             &reaction.pubkey,
             &emoji,
             reaction.created_at,
+            reaction.id,
         );
 
         AggregatedMessage::update_reactions(
@@ -479,6 +480,7 @@ impl Whitenoise {
                 &reaction.author,
                 &reaction_emoji,
                 reaction_timestamp,
+                reaction.event_id,
             );
 
             AggregatedMessage::update_reactions(
