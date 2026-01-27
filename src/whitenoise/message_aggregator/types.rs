@@ -110,6 +110,8 @@ pub struct UserReaction {
 
     /// Timestamp of the reaction
     pub created_at: Timestamp,
+
+    pub reaction_id: EventId,
 }
 
 /// Configuration for the message aggregator
@@ -225,6 +227,7 @@ mod tests {
                 user: pubkey,
                 emoji: "👍".to_string(),
                 created_at: Timestamp::now(),
+                reaction_id: EventId::all_zeros(),
             };
 
             let mut by_emoji = HashMap::new();
@@ -295,16 +298,19 @@ mod tests {
             )
             .unwrap();
             let timestamp = Timestamp::now();
+            let reaction_id = EventId::all_zeros();
 
             let reaction = UserReaction {
                 user: pubkey,
                 emoji: "🎉".to_string(),
                 created_at: timestamp,
+                reaction_id,
             };
 
             assert_eq!(reaction.user, pubkey);
             assert_eq!(reaction.emoji, "🎉");
             assert_eq!(reaction.created_at, timestamp);
+            assert_eq!(reaction.reaction_id, reaction_id);
         }
     }
 
