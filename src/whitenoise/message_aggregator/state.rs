@@ -140,7 +140,7 @@ impl AggregatorState {
         self.groups.retain(|_, state| {
             if let Some(last_processed) = state.last_processed_at {
                 let last_processed_system_time = SystemTime::UNIX_EPOCH +
-                    std::time::Duration::from_secs(last_processed.as_u64());
+                    std::time::Duration::from_secs(last_processed.as_secs());
                 last_processed_system_time > cutoff
             } else {
                 // Keep state without last_processed_at to be safe

@@ -151,7 +151,7 @@ impl TestCase for VerifyLastSyncedTimestampTestCase {
                 // it will still be greater than the baseline last_synced_at
                 if let Some(before_time) = before {
                     let before_timestamp_secs = before_time.timestamp() as u64;
-                    let current_timestamp_secs = Timestamp::now().as_u64();
+                    let current_timestamp_secs = Timestamp::now().as_secs();
 
                     if current_timestamp_secs <= before_timestamp_secs {
                         // Wait enough time to ensure now() > baseline when event gets processed
@@ -169,7 +169,7 @@ impl TestCase for VerifyLastSyncedTimestampTestCase {
 
                 // Use base timestamp + 10 seconds for guaranteed advancement
                 // Even if this gets capped to now(), it should be > baseline due to our wait
-                let event_timestamp = Timestamp::from_secs(base_timestamp.as_u64() + 10);
+                let event_timestamp = Timestamp::from_secs(base_timestamp.as_secs() + 10);
                 self.publish_account_follow_event_with_timestamp(context, pubkey, event_timestamp)
                     .await?;
                 self.assert_advanced(
@@ -182,7 +182,7 @@ impl TestCase for VerifyLastSyncedTimestampTestCase {
             }
             Mode::GlobalMetadataEvent => {
                 // Use base timestamp + 5 seconds (should not affect account sync)
-                let event_timestamp = Timestamp::from_secs(base_timestamp.as_u64() + 5);
+                let event_timestamp = Timestamp::from_secs(base_timestamp.as_secs() + 5);
                 self.publish_global_metadata_event_with_timestamp(context, event_timestamp)
                     .await?;
                 self.assert_unchanged(

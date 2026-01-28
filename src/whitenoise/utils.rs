@@ -57,7 +57,7 @@ impl Whitenoise {
 pub(crate) fn timestamp_to_datetime(
     timestamp: Timestamp,
 ) -> Result<DateTime<Utc>, WhitenoiseError> {
-    let timestamp_secs = timestamp.as_u64();
+    let timestamp_secs = timestamp.as_secs();
 
     // Check if timestamp fits in i64
     if timestamp_secs > i64::MAX as u64 {
