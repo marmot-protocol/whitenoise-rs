@@ -43,6 +43,7 @@ impl FromStr for ThemeMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Language {
+    System,
     English,
     Spanish,
     French,
@@ -55,13 +56,14 @@ pub enum Language {
 
 impl Default for Language {
     fn default() -> Self {
-        Self::English
+        Self::System
     }
 }
 
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Language::System => write!(f, "system"),
             Language::English => write!(f, "en"),
             Language::Spanish => write!(f, "es"),
             Language::French => write!(f, "fr"),
@@ -79,6 +81,7 @@ impl FromStr for Language {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
+            "system" => Ok(Language::System),
             "en" | "english" => Ok(Language::English),
             "es" | "spanish" => Ok(Language::Spanish),
             "fr" | "french" => Ok(Language::French),
@@ -182,7 +185,7 @@ mod tests {
         let settings = AppSettings::new(ThemeMode::Dark, None);
         assert_eq!(settings.id, 1);
         assert_eq!(settings.theme_mode, ThemeMode::Dark);
-        assert_eq!(settings.language, Language::English);
+        assert_eq!(settings.language, Language::System);
     }
 
     #[test]
@@ -192,13 +195,14 @@ mod tests {
     }
 
     #[test]
-    fn language_default_is_english() {
-        assert_eq!(Language::default(), Language::English);
+    fn language_default_is_system() {
+        assert_eq!(Language::default(), Language::System);
     }
 
     #[test]
     fn language_display_round_trips_via_from_str() {
         for variant in [
+            Language::System,
             Language::English,
             Language::Spanish,
             Language::French,

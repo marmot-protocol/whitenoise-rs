@@ -25,7 +25,7 @@ impl Scenario for AppSettingsScenario {
         // Test fetching default settings
         FetchAppSettingsTestCase::basic()
             .expect_theme(ThemeMode::System)
-            .expect_language(Language::English)
+            .expect_language(Language::System)
             .execute(&mut self.context)
             .await?;
 
