@@ -52,6 +52,12 @@ impl Whitenoise {
                     match message.kind {
                         Kind::Custom(9) => {
                             let msg = self.cache_chat_message(&group_id, &message).await?;
+                            let group_name =
+                                mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                            self.emit_new_message_notification(
+                                account, &group_id, &msg, group_name,
+                            )
+                            .await;
                             self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
                             self.emit_chat_list_update(
                                 account,
