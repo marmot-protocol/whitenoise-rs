@@ -100,7 +100,7 @@ impl Whitenoise {
                     Kind::ContactList | Kind::MlsGroupMessage => {
                         // Cap timestamp to prevent future corruption
                         let safe_timestamp = cap_timestamp_to_now(event.created_at);
-                        let created_ms = (safe_timestamp.as_u64() as i64) * 1000;
+                        let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
 
                         if let Err(e) = Account::update_last_synced_max(
                             &account.pubkey,
@@ -134,7 +134,7 @@ impl Whitenoise {
                         {
                             Ok(Some(rumor_timestamp)) => {
                                 let safe_timestamp = cap_timestamp_to_now(rumor_timestamp);
-                                let created_ms = (safe_timestamp.as_u64() as i64) * 1000;
+                                let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
 
                                 if let Err(e) = Account::update_last_synced_max(
                                     &account.pubkey,
@@ -155,7 +155,7 @@ impl Whitenoise {
                                         "Updated last_synced_at (if older) for {} with rumor timestamp {} (ms) [capped from original {}]",
                                         account.pubkey.to_hex(),
                                         created_ms,
-                                        rumor_timestamp.as_u64() * 1000
+                                        rumor_timestamp.as_secs() * 1000
                                     );
                                 }
                             }

@@ -151,6 +151,7 @@ impl Whitenoise {
             mls_group_id: group_id.clone(),
             event: inner_event,
             wrapper_event_id: event_id, // Reuse event_id as placeholder, we don't need it
+            epoch: None,
             state: mdk_core::prelude::message_types::MessageState::Processed,
         })
     }
@@ -885,6 +886,7 @@ mod tests {
             mls_group_id: group_id.clone(),
             event: inner_event.clone(),
             wrapper_event_id: EventId::all_zeros(),
+            epoch: None,
             state: mdk_core::prelude::message_types::MessageState::Processed,
         };
 

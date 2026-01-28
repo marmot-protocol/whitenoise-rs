@@ -846,7 +846,7 @@ impl Whitenoise {
             Some(ts) => tracing::debug!(
                 target: "whitenoise::setup_subscriptions",
                 "Computed per-account since={}s (10s buffer) for {}",
-                ts.as_u64(),
+                ts.as_secs(),
                 account.pubkey.to_hex()
             ),
             None => tracing::debug!(
@@ -1290,7 +1290,7 @@ mod tests {
         };
         let ts = account.since_timestamp(10).unwrap();
         let expected_secs = (last.timestamp().max(0) as u64).saturating_sub(10);
-        assert_eq!(ts.as_u64(), expected_secs);
+        assert_eq!(ts.as_secs(), expected_secs);
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let ts = account.since_timestamp(10).unwrap();
-        assert_eq!(ts.as_u64(), 0);
+        assert_eq!(ts.as_secs(), 0);
     }
 
     #[test]
@@ -1333,7 +1333,7 @@ mod tests {
         let min_expected = before_secs.saturating_sub(buffer);
         let max_expected = after_secs.saturating_sub(buffer);
 
-        let actual = ts.as_u64();
+        let actual = ts.as_secs();
         assert!(actual >= min_expected && actual <= max_expected);
     }
 

@@ -872,8 +872,8 @@ mod tests {
         // Verify messages are ordered by created_at
         for i in 0..fetched_messages.len() - 1 {
             assert!(
-                fetched_messages[i].created_at.as_u64()
-                    <= fetched_messages[i + 1].created_at.as_u64(),
+                fetched_messages[i].created_at.as_secs()
+                    <= fetched_messages[i + 1].created_at.as_secs(),
                 "Messages should be ordered by timestamp"
             );
         }
