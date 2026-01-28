@@ -449,7 +449,7 @@ impl MediaFile {
              RETURNING id, mls_group_id, account_pubkey, file_path,
                        original_file_hash, encrypted_file_hash,
                        mime_type, media_type, blossom_url, nostr_key,
-                       file_metadata, created_at",
+                       file_metadata, nonce, scheme_version, created_at",
         )
         .bind(path_str)
         .bind(id)
