@@ -345,13 +345,13 @@ impl Whitenoise {
         let since = accounts
             .iter()
             .filter_map(|a| a.since_timestamp(BUFFER_SECS))
-            .min_by_key(|t| t.as_u64());
+            .min_by_key(|t| t.as_secs());
 
         if let Some(ts) = since {
             tracing::info!(
                 target: "whitenoise::setup_global_users_subscriptions",
                 "Global subscriptions using since={} ({}s buffer)",
-                ts.as_u64(), BUFFER_SECS
+                ts.as_secs(), BUFFER_SECS
             );
         } else {
             tracing::warn!(

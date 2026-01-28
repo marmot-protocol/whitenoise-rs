@@ -232,7 +232,7 @@ mod tests {
         let same_ts_contact = Keys::generate().public_key();
 
         let current_timestamp = Timestamp::now();
-        let older_timestamp = Timestamp::from(current_timestamp.as_u64() - 3600);
+        let older_timestamp = Timestamp::from(current_timestamp.as_secs() - 3600);
 
         // Process the "current" event
         let current_event =
@@ -282,9 +282,9 @@ mod tests {
         let first_contact = Keys::generate().public_key();
         let second_contact = Keys::generate().public_key();
 
-        let t1 = Timestamp::from(Timestamp::now().as_u64() - 3600);
+        let t1 = Timestamp::from(Timestamp::now().as_secs() - 3600);
         let t2 = Timestamp::now();
-        let t3 = Timestamp::from(Timestamp::now().as_u64() + 1);
+        let t3 = Timestamp::from(Timestamp::now().as_secs() + 1);
 
         // Process first event
         let first_event = build_contact_list_event(&keys, &[first_contact], Some(t1)).await;

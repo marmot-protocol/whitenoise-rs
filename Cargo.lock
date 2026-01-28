@@ -877,15 +877,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
-name = "doxygen-rs"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "415b6ec780d34dcf624666747194393603d0373b7141eef01d12ee58881507d9"
-dependencies = [
- "phf",
-]
-
-[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1061,16 +1052,6 @@ name = "find-msvc-tools"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8591b0bcc8a98a64310a2fae1bb3e9b8564dd10e381e6e28010fde8e8e8568db"
-
-[[package]]
-name = "flatbuffers"
-version = "25.12.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
-dependencies = [
- "bitflags 2.9.4",
- "rustc_version",
-]
 
 [[package]]
 name = "flate2"
@@ -1410,40 +1391,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "heed"
-version = "0.20.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d4f449bab7320c56003d37732a917e18798e2f1709d80263face2b4f9436ddb"
-dependencies = [
- "bitflags 2.9.4",
- "byteorder",
- "heed-traits",
- "heed-types",
- "libc",
- "lmdb-master-sys",
- "once_cell",
- "page_size",
- "synchronoise",
- "url",
-]
-
-[[package]]
-name = "heed-traits"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb3130048d404c57ce5a1ac61a903696e8fcde7e8c2991e9fcfc1f27c3ef74ff"
-
-[[package]]
-name = "heed-types"
-version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d3f528b053a6d700b2734eabcd0fd49cb8230647aa72958467527b0b7917114"
-dependencies = [
- "byteorder",
- "heed-traits",
-]
 
 [[package]]
 name = "hex"
@@ -2345,17 +2292,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "241eaef5fd12c88705a01fc1066c48c4b36e0dd4377dcdc7ec3942cea7a69956"
 
 [[package]]
-name = "lmdb-master-sys"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "864808e0b19fb6dd3b70ba94ee671b82fce17554cf80aeb0a155c65bb08027df"
-dependencies = [
- "cc",
- "doxygen-rs",
- "libc",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2404,7 +2340,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.5.3"
-source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=4156904c571c8c7ab11054d679ed6907757e67c2#4156904c571c8c7ab11054d679ed6907757e67c2"
 dependencies = [
  "blurhash",
  "chacha20poly1305",
@@ -2428,7 +2364,7 @@ dependencies = [
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.5.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=4156904c571c8c7ab11054d679ed6907757e67c2#4156904c571c8c7ab11054d679ed6907757e67c2"
 dependencies = [
  "getrandom 0.3.3",
  "hex",
@@ -2449,7 +2385,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.5.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=46738bd1e16e0aa78255c7f70b1d90698e968746#46738bd1e16e0aa78255c7f70b1d90698e968746"
+source = "git+https://github.com/marmot-protocol/mdk?rev=4156904c571c8c7ab11054d679ed6907757e67c2#4156904c571c8c7ab11054d679ed6907757e67c2"
 dependencies = [
  "nostr",
  "openmls",
@@ -2551,9 +2487,9 @@ checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
 
 [[package]]
 name = "nostr"
-version = "0.43.1"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62a97d745f1bd8d5e05a978632bbb87b0614567d5142906fe7c86fb2440faac6"
+checksum = "3aa5e3b6a278ed061835fe1ee293b71641e6bf8b401cfe4e1834bbf4ef0a34e1"
 dependencies = [
  "aes",
  "base64",
@@ -2564,6 +2500,7 @@ dependencies = [
  "chacha20",
  "chacha20poly1305",
  "getrandom 0.2.16",
+ "hex",
  "instant",
  "scrypt",
  "secp256k1",
@@ -2575,9 +2512,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-blossom"
-version = "0.43.0"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb09560e29d780eb3d79e166c1620c8681bc163e7bb9b9bffdda8ad6c824a056"
+checksum = "8d49532bc6c655ac58b90279647430d041616c718119138213b40a053c90f6e2"
 dependencies = [
  "base64",
  "nostr",
@@ -2587,39 +2524,34 @@ dependencies = [
 
 [[package]]
 name = "nostr-database"
-version = "0.43.0"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c75a8c2175d2785ba73cfddef21d1e30da5fbbdf158569b6808ba44973a15b"
+checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
 dependencies = [
- "flatbuffers",
  "lru",
  "nostr",
  "tokio",
 ]
 
 [[package]]
-name = "nostr-lmdb"
-version = "0.43.0"
+name = "nostr-gossip"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03e20688047b2114906ba84cce26c955e6cd079c10fc7328bc2618dc8031fb17"
+checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
 dependencies = [
- "async-utility",
- "heed",
  "nostr",
- "nostr-database",
- "tokio",
- "tracing",
 ]
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.43.1"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b2f43b70d13dfc50508a13cd902e11f4625312b2ce0e4b7c4c2283fd04001bd"
+checksum = "4b1073ccfbaea5549fb914a9d52c68dab2aecda61535e5143dd73e95445a804b"
 dependencies = [
  "async-utility",
  "async-wsocket",
  "atomic-destructor",
+ "hex",
  "lru",
  "negentropy",
  "nostr",
@@ -2630,16 +2562,17 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.43.0"
+version = "0.44.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "599f8963d6a1522a13b1a2b0ea6e168acfc367706606f1d33fa595e91fa22db0"
+checksum = "471732576710e779b64f04c55e3f8b5292f865fea228436daf19694f0bf70393"
 dependencies = [
  "async-utility",
  "nostr",
  "nostr-database",
- "nostr-lmdb",
+ "nostr-gossip",
  "nostr-relay-pool",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2716,9 +2649,9 @@ dependencies = [
 
 [[package]]
 name = "nwc"
-version = "0.43.1"
+version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86d5fc9d1a00916c5619b10c7eb028df2e10616bf3bccd0df17aa1f0c552f53a"
+checksum = "f651e3c28dd9da0873151233e804a92b6240a1db1260f3c9d727950adb8e9036"
 dependencies = [
  "nostr",
  "nostr-relay-pool",
@@ -2854,16 +2787,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "page_size"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2933,48 +2856,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "phf"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
-dependencies = [
- "phf_macros",
- "phf_shared",
-]
-
-[[package]]
-name = "phf_generator"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
-dependencies = [
- "phf_shared",
- "rand 0.8.5",
-]
-
-[[package]]
-name = "phf_macros"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f84ac04429c13a7ff43785d75ad27569f2951ce0ffd30a3321230db2fc727216"
-dependencies = [
- "phf_generator",
- "phf_shared",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
-]
 
 [[package]]
 name = "pin-project-lite"
@@ -4198,15 +4079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "synchronoise"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dbc01390fc626ce8d1cffe3376ded2b72a11bb70e1c75f404a210e4daa4def2"
-dependencies = [
- "crossbeam-queue",
-]
-
-[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5033,22 +4905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5056,12 +4912,6 @@ checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-core"

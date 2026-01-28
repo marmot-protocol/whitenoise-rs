@@ -235,7 +235,7 @@ impl AggregatedMessage {
         for message in &events {
             let created_at = timestamp_to_datetime(message.created_at).map_err(|_| {
                 DatabaseError::InvalidTimestamp {
-                    timestamp: message.created_at.as_u64() as i64,
+                    timestamp: message.created_at.as_secs() as i64,
                 }
             })?;
 
@@ -302,7 +302,7 @@ impl AggregatedMessage {
     ) -> Result<()> {
         let created_at = timestamp_to_datetime(message.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
-                timestamp: message.created_at.as_u64() as i64,
+                timestamp: message.created_at.as_secs() as i64,
             }
         })?;
 
@@ -343,7 +343,7 @@ impl AggregatedMessage {
     ) -> Result<()> {
         let created_at = timestamp_to_datetime(reaction.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
-                timestamp: reaction.created_at.as_u64() as i64,
+                timestamp: reaction.created_at.as_secs() as i64,
             }
         })?;
 
@@ -381,7 +381,7 @@ impl AggregatedMessage {
     ) -> Result<()> {
         let created_at = timestamp_to_datetime(deletion.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
-                timestamp: deletion.created_at.as_u64() as i64,
+                timestamp: deletion.created_at.as_secs() as i64,
             }
         })?;
 

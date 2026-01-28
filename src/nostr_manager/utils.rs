@@ -21,7 +21,7 @@ pub(crate) fn is_event_timestamp_valid(event: &Event) -> bool {
 /// to account for NIP-59 backdated timestamps
 pub(crate) fn adjust_since_for_giftwrap(since: Option<Timestamp>) -> Option<Timestamp> {
     since.map(|ts| {
-        let secs = ts.as_u64();
+        let secs = ts.as_secs();
         let lookback = GIFTWRAP_LOOKBACK_BUFFER.as_secs();
         let adjusted = secs.saturating_sub(lookback);
         Timestamp::from(adjusted)
@@ -527,9 +527,9 @@ mod tests {
         // Current timestamp should be returned (may be slightly different due to timing)
         // Allow for small timing differences
         let diff = if result >= now {
-            result.as_u64() - now.as_u64()
+            result.as_secs() - now.as_secs()
         } else {
-            now.as_u64() - result.as_u64()
+            now.as_secs() - result.as_secs()
         };
         assert!(diff <= 1); // Allow 1 second difference
     }
