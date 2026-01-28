@@ -98,6 +98,7 @@ tempfile = "3.19.1"
 indicatif = { version = "0.18.3", optional = true }
 
 [dev-dependencies]
+keyring-core = "0.7"
 mockito = "1.2"
 
 [features]

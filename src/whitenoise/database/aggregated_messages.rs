@@ -1223,6 +1223,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: chrono::Utc::now(),
             },
             MediaFile {
@@ -1237,6 +1239,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: chrono::Utc::now(),
             },
         ];
