@@ -498,7 +498,6 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Build a non-welcome rumor and giftwrap it to the account
-        // Note: In nostr-sdk 0.44+, the rumor author must match the seal signer
         let sender_keys = create_test_keys();
         let mut rumor = UnsignedEvent::new(
             sender_keys.public_key(), // Use sender's pubkey (must match seal signer)
