@@ -79,6 +79,13 @@ impl TestCase for VerifyDmChatListItemTestCase {
             "DM profile picture URL should match other user's picture"
         );
 
+        // Verify dm_peer_pubkey is set to the other user
+        assert_eq!(
+            item.dm_peer_pubkey,
+            Some(other_user_account.pubkey),
+            "DM dm_peer_pubkey should be the other user's pubkey"
+        );
+
         tracing::info!(
             "✓ DM chat list item '{}' verification passed",
             self.dm_group_context_name

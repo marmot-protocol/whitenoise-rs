@@ -87,6 +87,7 @@ mod tests {
             welcomer_pubkey: None,
             unread_count: 0,
             pin_order: None,
+            dm_peer_pubkey: None,
         }
     }
 
