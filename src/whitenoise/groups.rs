@@ -845,8 +845,12 @@ impl Whitenoise {
 
         let secret_key = Secret::new(*image_key);
         let secret_nonce = Secret::new(*image_nonce);
-        let decrypted_data =
-            Self::decrypt_group_image(&encrypted_data, Some(image_hash), &secret_key, &secret_nonce)?;
+        let decrypted_data = Self::decrypt_group_image(
+            &encrypted_data,
+            Some(image_hash),
+            &secret_key,
+            &secret_nonce,
+        )?;
         let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
             WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
         })?;
@@ -1124,10 +1128,9 @@ impl Whitenoise {
         let media_manager = mdk.media_manager(group_id.clone());
 
         // Retrieve nonce and scheme_version from database (required for MDK decryption)
-        let nonce_hex = media_file
-            .nonce
-            .as_ref()
-            .ok_or_else(|| WhitenoiseError::MediaCache("Missing nonce for chat media".to_string()))?;
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::MediaCache("Missing nonce for chat media".to_string())
+        })?;
         let scheme_version = media_file
             .scheme_version
             .as_ref()
@@ -2205,7 +2208,10 @@ mod tests {
             new_group_data.description.unwrap()
         );
         assert_eq!(updated_group.image_hash, new_group_data.image_hash.unwrap());
-        assert_eq!(updated_group.image_key, new_group_data.image_key.unwrap().map(Secret::new));
+        assert_eq!(
+            updated_group.image_key,
+            new_group_data.image_key.unwrap().map(Secret::new)
+        );
     }
 
     #[cfg(test)]

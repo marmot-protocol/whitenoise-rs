@@ -61,8 +61,8 @@ pub(crate) struct MediaFileRow {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
-    pub nonce: Option<String>,               // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<String>,      // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 
@@ -153,8 +153,8 @@ pub struct MediaFileParams<'a> {
     pub blossom_url: Option<&'a str>,
     pub nostr_key: Option<&'a str>,
     pub file_metadata: Option<&'a FileMetadata>,
-    pub nonce: Option<&'a str>,                   // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<&'a str>,          // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<&'a str>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
 }
 
 /// Represents a cached media file
@@ -171,8 +171,8 @@ pub struct MediaFile {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
-    pub nonce: Option<String>,               // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<String>,      // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 

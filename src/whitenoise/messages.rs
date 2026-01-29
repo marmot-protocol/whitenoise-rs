@@ -43,11 +43,11 @@ impl Whitenoise {
 
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
         let message_event = mdk.create_message(group_id, inner_event)?;
-        let message = mdk
-            .get_message(group_id, &event_id)?
-            .ok_or(WhitenoiseError::MdkCoreError(
-                mdk_core::error::Error::MessageNotFound,
-            ))?;
+        let message =
+            mdk.get_message(group_id, &event_id)?
+                .ok_or(WhitenoiseError::MdkCoreError(
+                    mdk_core::error::Error::MessageNotFound,
+                ))?;
         let group_relays = mdk.get_relays(group_id)?;
 
         // Publish message in background without blocking
