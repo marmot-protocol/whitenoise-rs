@@ -22,7 +22,7 @@ pub use whitenoise::{Whitenoise, WhitenoiseConfig};
 pub use whitenoise::error::WhitenoiseError;
 
 // Account and user management
-pub use whitenoise::accounts::Account;
+pub use whitenoise::accounts::{Account, AccountType};
 pub use whitenoise::users::{User, UserSyncMode};
 
 // Settings and configuration

@@ -34,6 +34,39 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Publishes the MLS key package using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// key package event before publishing.
+    pub async fn publish_key_package_for_account_with_signer(
+        &self,
+        account: &Account,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<()> {
+        let relays = account.key_package_relays(self).await?;
+
+        if relays.is_empty() {
+            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+        }
+
+        let (encoded_key_package, tags) = self.encoded_key_package(account, &relays).await?;
+        let relays_urls = Relay::urls(&relays);
+
+        let result = self
+            .nostr
+            .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
+            .await?;
+
+        tracing::debug!(
+            target: "whitenoise::publish_key_package_with_signer",
+            "Published key package with external signer: {:?}",
+            result
+        );
+
+        Ok(())
+    }
+
     pub(crate) async fn publish_key_package_to_relays(
         &self,
         account: &Account,
