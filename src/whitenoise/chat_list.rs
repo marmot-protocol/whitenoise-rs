@@ -62,6 +62,10 @@ pub struct ChatListItem {
     /// - `None` = not pinned (appears after pinned chats)
     /// - `Some(n)` = pinned, lower values appear first
     pub pin_order: Option<i64>,
+
+    /// For DMs: the public key of the other participant.
+    /// `None` for Group chats.
+    pub dm_peer_pubkey: Option<PublicKey>,
 }
 
 impl ChatListItem {
@@ -156,16 +160,16 @@ fn assemble_chat_list_items(
         .filter_map(|group| {
             let group_info = group_info_map.get(&group.mls_group_id)?;
 
-            let dm_other_user = dm_other_users
+            let dm_peer_user = dm_other_users
                 .get(&group.mls_group_id)
                 .and_then(|pk| users_by_pubkey.get(pk));
 
-            let name = resolve_chat_name(group, &group_info.group_type, dm_other_user);
+            let name = resolve_chat_name(group, &group_info.group_type, dm_peer_user);
 
             let (group_image_path, group_image_url) = match group_info.group_type {
                 GroupType::Group => (image_paths.get(&group.mls_group_id).cloned(), None),
                 GroupType::DirectMessage => {
-                    let url = dm_other_user
+                    let url = dm_peer_user
                         .and_then(|u| u.metadata.picture.as_ref().map(|url| url.to_string()));
                     (None, url)
                 }
@@ -195,6 +199,7 @@ fn assemble_chat_list_items(
                 welcomer_pubkey,
                 unread_count,
                 pin_order,
+                dm_peer_pubkey: dm_peer_user.map(|u| u.pubkey),
             })
         })
         .collect()
@@ -303,15 +308,16 @@ impl Whitenoise {
         let welcomer_pubkey = account_group.welcomer_pubkey;
 
         // 4. For DMs: get members, find other user, lookup metadata
-        let dm_other_user = if group_info.group_type == GroupType::DirectMessage {
+        let (dm_peer_pubkey, dm_other_user) = if group_info.group_type == GroupType::DirectMessage {
             let members: Vec<PublicKey> = mdk.get_members(group_id)?.into_iter().collect();
             if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
-                User::find_by_pubkey(&other_pk, &self.database).await.ok()
+                let user = User::find_by_pubkey(&other_pk, &self.database).await.ok();
+                (Some(other_pk), user)
             } else {
-                None
+                (None, None)
             }
         } else {
-            None
+            (None, None)
         };
 
         // 5. Get last message
@@ -377,6 +383,7 @@ impl Whitenoise {
             welcomer_pubkey,
             unread_count,
             pin_order,
+            dm_peer_pubkey,
         }))
     }
 
@@ -648,6 +655,8 @@ mod tests {
         assert!(chat_list[0].last_message.is_none());
         assert!(!chat_list[0].pending_confirmation);
         assert!(chat_list[0].welcomer_pubkey.is_none());
+        // Groups should not have dm_peer_pubkey
+        assert!(chat_list[0].dm_peer_pubkey.is_none());
     }
 
     #[tokio::test]
@@ -684,6 +693,8 @@ mod tests {
             chat_list[0].name
         );
         assert!(!chat_list[0].pending_confirmation);
+        // DM should have the other user's pubkey
+        assert_eq!(chat_list[0].dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[tokio::test]
@@ -716,6 +727,8 @@ mod tests {
         // Should use display_name, not name
         assert_eq!(chat_list[0].name, Some("Bob Display".to_string()));
         assert!(!chat_list[0].pending_confirmation);
+        // DM should have the other user's pubkey
+        assert_eq!(chat_list[0].dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[tokio::test]
@@ -747,6 +760,8 @@ mod tests {
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Bob Name".to_string()));
         assert!(!chat_list[0].pending_confirmation);
+        // DM should have the other user's pubkey
+        assert_eq!(chat_list[0].dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[tokio::test]
@@ -780,6 +795,8 @@ mod tests {
         assert_eq!(chat_list.len(), 1);
         assert_eq!(chat_list[0].name, Some("Fallback Name".to_string()));
         assert!(!chat_list[0].pending_confirmation);
+        // DM should have the other user's pubkey
+        assert_eq!(chat_list[0].dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[tokio::test]
@@ -1012,6 +1029,8 @@ mod tests {
         );
         assert!(chat_list[0].group_image_path.is_none());
         assert!(!chat_list[0].pending_confirmation);
+        // DM should have the other user's pubkey
+        assert_eq!(chat_list[0].dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[tokio::test]
@@ -1037,6 +1056,8 @@ mod tests {
         assert_eq!(chat_list[0].group_type, GroupType::Group);
         assert!(chat_list[0].group_image_url.is_none());
         assert!(!chat_list[0].pending_confirmation);
+        // Groups should not have dm_peer_pubkey
+        assert!(chat_list[0].dm_peer_pubkey.is_none());
     }
 
     #[tokio::test]
@@ -1189,6 +1210,8 @@ mod tests {
         assert!(item.last_message.is_none());
         assert!(!item.pending_confirmation);
         assert!(item.welcomer_pubkey.is_none());
+        // Groups should not have dm_peer_pubkey
+        assert!(item.dm_peer_pubkey.is_none());
     }
 
     #[tokio::test]
@@ -1275,6 +1298,8 @@ mod tests {
         let item = result.unwrap();
         assert_eq!(item.group_type, GroupType::DirectMessage);
         assert_eq!(item.name, Some("Bob".to_string()));
+        // DM should have the other user's pubkey
+        assert_eq!(item.dm_peer_pubkey, Some(member.pubkey));
     }
 
     #[test]
@@ -1298,6 +1323,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1311,6 +1337,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1324,6 +1351,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
         ];
 
@@ -1365,6 +1393,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1386,6 +1415,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1407,6 +1437,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
         ];
 
@@ -1517,6 +1548,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1530,6 +1562,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(100),
+                dm_peer_pubkey: None,
             },
         ];
 
@@ -1559,6 +1592,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(100),
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1572,6 +1606,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(50),
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1585,6 +1620,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(200),
+                dm_peer_pubkey: None,
             },
         ];
 
@@ -1616,6 +1652,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(100),
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1629,6 +1666,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(100),
+                dm_peer_pubkey: None,
             },
         ];
 
@@ -1659,6 +1697,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1672,6 +1711,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(10),
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1685,6 +1725,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: None,
+                dm_peer_pubkey: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[4u8; 32]),
@@ -1698,6 +1739,7 @@ mod tests {
                 welcomer_pubkey: None,
                 unread_count: 0,
                 pin_order: Some(20),
+                dm_peer_pubkey: None,
             },
         ];
 
