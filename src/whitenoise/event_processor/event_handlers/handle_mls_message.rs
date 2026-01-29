@@ -13,6 +13,15 @@ use crate::whitenoise::{
     message_streaming::{MessageUpdate, UpdateTrigger},
 };
 
+// Event kind values for message caching.
+// These are defined in the Nostr protocol (NIPs) and won't change.
+// We match on u16 values instead of Kind enum variants because nostr-sdk 0.44+
+// canonicalizes to named variants (Kind::ChatMessage) instead of Kind::Custom(9),
+// which causes pattern match failures.
+const KIND_CHAT_MESSAGE: u16 = 9;
+const KIND_REACTION: u16 = 7;
+const KIND_EVENT_DELETION: u16 = 5;
+
 impl Whitenoise {
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
         tracing::debug!(
@@ -49,8 +58,8 @@ impl Whitenoise {
                     // Cache the message and emit updates to subscribers
                     let message = Self::build_message_from_event(&group_id, inner_event)?;
 
-                    match message.kind {
-                        Kind::Custom(9) => {
+                    match message.kind.as_u16() {
+                        KIND_CHAT_MESSAGE => {
                             let msg = self.cache_chat_message(&group_id, &message).await?;
                             let group_name =
                                 mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
@@ -66,7 +75,7 @@ impl Whitenoise {
                             )
                             .await;
                         }
-                        Kind::Reaction => {
+                        KIND_REACTION => {
                             if let Some(target) = self.cache_reaction(&group_id, &message).await? {
                                 self.emit_message_update(
                                     &group_id,
@@ -75,7 +84,7 @@ impl Whitenoise {
                                 );
                             }
                         }
-                        Kind::EventDeletion => {
+                        KIND_EVENT_DELETION => {
                             let last_message_id = self.get_last_message_id(&group_id).await;
 
                             for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
