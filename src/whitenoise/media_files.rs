@@ -205,8 +205,8 @@ impl<'a> MediaFiles<'a> {
                 blossom_url: upload.blossom_url,
                 nostr_key: upload.nostr_key.as_deref(),
                 file_metadata: upload.file_metadata,
-                nonce: None,            // Group images use key/nonce encryption, not MDK
-                scheme_version: None,   // Group images use key/nonce encryption, not MDK
+                nonce: None,          // Group images use key/nonce encryption, not MDK
+                scheme_version: None, // Group images use key/nonce encryption, not MDK
             },
         )
         .await?;

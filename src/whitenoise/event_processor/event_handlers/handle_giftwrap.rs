@@ -498,8 +498,9 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // Build a non-welcome rumor and giftwrap it to the account
+        let sender_keys = create_test_keys();
         let mut rumor = UnsignedEvent::new(
-            account.pubkey,
+            sender_keys.public_key(), // Use sender's pubkey (must match seal signer)
             Timestamp::now(),
             Kind::TextNote,
             vec![],
@@ -507,14 +508,12 @@ mod tests {
         );
         rumor.ensure_id();
 
-        // Any signer works; encryption targets receiver's pubkey
-        let sender_keys = create_test_keys();
         let giftwrap_event = EventBuilder::gift_wrap(&sender_keys, &account.pubkey, rumor, vec![])
             .await
             .unwrap();
 
         let result = whitenoise.handle_giftwrap(&account, giftwrap_event).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
     }
 
     #[tokio::test]

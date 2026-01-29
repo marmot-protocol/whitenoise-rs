@@ -50,7 +50,7 @@ impl Whitenoise {
                     let message = Self::build_message_from_event(&group_id, inner_event)?;
 
                     match message.kind {
-                        Kind::Custom(9) => {
+                        Kind::ChatMessage => {
                             let msg = self.cache_chat_message(&group_id, &message).await?;
                             let group_name =
                                 mdk.get_group(&group_id).ok().flatten().map(|g| g.name);

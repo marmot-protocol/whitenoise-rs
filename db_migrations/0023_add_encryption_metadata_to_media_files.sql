@@ -1,4 +1,4 @@
--- Migration 0021: Add encryption metadata to media_files for MIP-04 decryption
+-- Migration 0023: Add encryption metadata to media_files for MIP-04 decryption
 --
 -- This migration adds nonce and scheme_version columns required for MDK's
 -- decrypt_from_download() function. These values are extracted from the IMETA tag

@@ -31,11 +31,11 @@ keyring = { version = "3.6", features = [
 ] }
 lightning-invoice = "0.33.1"
 
-mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "4156904c571c8c7ab11054d679ed6907757e67c2", features = [
+mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb", features = [
     "mip04",
 ] }
-mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "4156904c571c8c7ab11054d679ed6907757e67c2" }
-mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "4156904c571c8c7ab11054d679ed6907757e67c2" }
+mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb" }
+mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb" }
 
 nwc = "0.44"
 nostr-blossom = "0.44"
@@ -98,6 +98,7 @@ tempfile = "3.19.1"
 indicatif = { version = "0.18.3", optional = true }
 
 [dev-dependencies]
+keyring-core = "0.7"
 mockito = "1.2"
 
 [features]

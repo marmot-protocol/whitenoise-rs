@@ -845,8 +845,12 @@ impl Whitenoise {
 
         let secret_key = Secret::new(*image_key);
         let secret_nonce = Secret::new(*image_nonce);
-        let decrypted_data =
-            Self::decrypt_group_image(&encrypted_data, Some(image_hash), &secret_key, &secret_nonce)?;
+        let decrypted_data = Self::decrypt_group_image(
+            &encrypted_data,
+            Some(image_hash),
+            &secret_key,
+            &secret_nonce,
+        )?;
         let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
             WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
         })?;
@@ -1124,10 +1128,9 @@ impl Whitenoise {
         let media_manager = mdk.media_manager(group_id.clone());
 
         // Retrieve nonce and scheme_version from database (required for MDK decryption)
-        let nonce_hex = media_file
-            .nonce
-            .as_ref()
-            .ok_or_else(|| WhitenoiseError::MediaCache("Missing nonce for chat media".to_string()))?;
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::MediaCache("Missing nonce for chat media".to_string())
+        })?;
         let scheme_version = media_file
             .scheme_version
             .as_ref()
@@ -1834,7 +1837,7 @@ mod tests {
         assert_eq!(group.name, config.name);
         assert_eq!(group.description, config.description);
         assert_eq!(group.image_hash, config.image_hash);
-        assert_eq!(group.image_key, config.image_key);
+        assert_eq!(group.image_key, config.image_key.map(Secret::new));
 
         // Verify admin configuration
         assert_eq!(group.admin_pubkeys.len(), admin_pubkeys.len());
@@ -2173,8 +2176,10 @@ mod tests {
             image_hash: Some(Some([3u8; 32])), // 32-byte hash for new image
             image_key: Some(Some([4u8; 32])),  // 32-byte encryption key
             image_nonce: Some(Some([5u8; 12])), // 12-byte nonce
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         let update_result = whitenoise
@@ -2203,7 +2208,10 @@ mod tests {
             new_group_data.description.unwrap()
         );
         assert_eq!(updated_group.image_hash, new_group_data.image_hash.unwrap());
-        assert_eq!(updated_group.image_key, new_group_data.image_key.unwrap());
+        assert_eq!(
+            updated_group.image_key,
+            new_group_data.image_key.unwrap().map(Secret::new)
+        );
     }
 
     #[cfg(test)]
@@ -2680,8 +2688,10 @@ mod tests {
             image_hash: Some(Some(hash)),
             image_key: Some(Some(key)),
             image_nonce: Some(Some(nonce)),
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         let update_result = whitenoise
@@ -2702,8 +2712,8 @@ mod tests {
             .expect("Updated group not found");
 
         assert_eq!(updated_group.image_hash, Some(hash));
-        assert_eq!(updated_group.image_key, Some(key));
-        assert_eq!(updated_group.image_nonce, Some(nonce));
+        assert_eq!(updated_group.image_key, Some(Secret::new(key)));
+        assert_eq!(updated_group.image_nonce, Some(Secret::new(nonce)));
 
         // Verify the image was cached immediately after upload by retrieving it
         // (should be instant since it's cached)
@@ -2802,8 +2812,10 @@ mod tests {
             image_hash: Some(Some(hash)),
             image_key: Some(Some(key)),
             image_nonce: Some(Some(nonce)),
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         whitenoise

@@ -61,8 +61,8 @@ pub(crate) struct MediaFileRow {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
-    pub nonce: Option<String>,               // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<String>,      // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 
@@ -153,8 +153,8 @@ pub struct MediaFileParams<'a> {
     pub blossom_url: Option<&'a str>,
     pub nostr_key: Option<&'a str>,
     pub file_metadata: Option<&'a FileMetadata>,
-    pub nonce: Option<&'a str>,                   // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<&'a str>,          // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<&'a str>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
 }
 
 /// Represents a cached media file
@@ -171,8 +171,8 @@ pub struct MediaFile {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
-    pub nonce: Option<String>,               // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<String>,      // Encryption version (e.g., "mip04-v2", for chat_media)
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 
@@ -449,7 +449,7 @@ impl MediaFile {
              RETURNING id, mls_group_id, account_pubkey, file_path,
                        original_file_hash, encrypted_file_hash,
                        mime_type, media_type, blossom_url, nostr_key,
-                       file_metadata, created_at",
+                       file_metadata, nonce, scheme_version, created_at",
         )
         .bind(path_str)
         .bind(id)
@@ -951,6 +951,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_image(), "Failed for MIME type: {}", mime_type);
@@ -971,6 +973,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1002,6 +1006,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_video(), "Failed for MIME type: {}", mime_type);
@@ -1022,6 +1028,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1060,6 +1068,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_audio(), "Failed for MIME type: {}", mime_type);
@@ -1080,6 +1090,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1109,6 +1121,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(media_file.is_document());
@@ -1128,6 +1142,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1157,6 +1173,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
@@ -1177,6 +1195,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
