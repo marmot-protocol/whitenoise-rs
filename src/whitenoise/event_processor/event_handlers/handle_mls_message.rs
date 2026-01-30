@@ -207,7 +207,7 @@ impl Whitenoise {
 
         tracing::debug!(
             target: "whitenoise::cache",
-            "Cached kind 9 message {} in group {}",
+            "Cached ChatMessage {} in group {}",
             message.id,
             hex::encode(group_id.as_slice())
         );
