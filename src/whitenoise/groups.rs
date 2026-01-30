@@ -963,6 +963,8 @@ impl Whitenoise {
             blossom_url: existing_record.blossom_url.as_deref(),
             nostr_key: existing_record.nostr_key.clone(),
             file_metadata: metadata_ref,
+            nonce: existing_record.nonce.as_deref().map(|s| s.to_string()),
+            scheme_version: existing_record.scheme_version.as_deref(),
         };
 
         self.media_files()
@@ -1015,6 +1017,8 @@ impl Whitenoise {
             blossom_url: None,
             nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         self.media_files()
@@ -1200,6 +1204,8 @@ impl Whitenoise {
             blossom_url: Some(blossom_url.as_str()),
             nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         self.media_files()
@@ -1345,6 +1351,8 @@ impl Whitenoise {
             blossom_url: Some(descriptor.url.as_str()),
             nostr_key: Some(prepared.upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         if let Err(e) = self
@@ -1490,6 +1498,8 @@ impl Whitenoise {
             blossom_url: Some(descriptor.url.as_str()),
             nostr_key: Some(upload_keys_hex),
             file_metadata: file_metadata.as_ref(),
+            nonce: Some(hex::encode(prepared.nonce)),
+            scheme_version: Some("mip04-v2"),
         };
 
         let media_file = self
