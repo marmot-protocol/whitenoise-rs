@@ -2,11 +2,16 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 use sqlx::Row;
 use std::collections::HashSet;
+use std::str::FromStr;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
     WhitenoiseError,
-    whitenoise::{accounts::Account, database::users::UserRow, users::User},
+    whitenoise::{
+        accounts::{Account, AccountType},
+        database::users::UserRow,
+        users::User,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
@@ -17,6 +22,8 @@ struct AccountRow {
     pubkey: PublicKey,
     // user_id is the foreign key to the users table
     user_id: i64,
+    // account_type is 'local' or 'external' (for external signer accounts)
+    account_type: AccountType,
     // last_synced_at is the timestamp of the last sync (using the background fetch)
     last_synced_at: Option<DateTime<Utc>>,
     // created_at is the timestamp of the account creation
@@ -36,12 +43,20 @@ where
         let id: i64 = row.try_get("id")?;
         let pubkey_str: String = row.try_get("pubkey")?;
         let user_id: i64 = row.try_get("user_id")?;
+        let account_type_str: String = row.try_get("account_type")?;
 
         // Parse pubkey from hex string
         let pubkey = PublicKey::parse(&pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
             index: "pubkey".to_string(),
             source: Box::new(e),
         })?;
+
+        // Parse account_type from string
+        let account_type =
+            AccountType::from_str(&account_type_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "account_type".to_string(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            })?;
 
         let last_synced_at = match row.try_get::<Option<i64>, _>("last_synced_at")? {
             Some(_) => Some(parse_timestamp(row, "last_synced_at")?),
@@ -55,6 +70,7 @@ where
             id,
             pubkey,
             user_id,
+            account_type,
             last_synced_at,
             created_at,
             updated_at,
@@ -69,6 +85,7 @@ impl AccountRow {
             id: Some(self.id),
             pubkey: self.pubkey,
             user_id: self.user_id,
+            account_type: self.account_type,
             last_synced_at: self.last_synced_at,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -155,6 +172,7 @@ impl Account {
             id: Some(account_row.id),
             user_id: account_row.user_id,
             pubkey: account_row.pubkey,
+            account_type: account_row.account_type,
             last_synced_at: account_row.last_synced_at,
             created_at: account_row.created_at,
             updated_at: account_row.updated_at,
@@ -405,16 +423,18 @@ impl Account {
     /// Returns a [`WhitenoiseError`] if the database operation fails.
     pub(crate) async fn save(&self, database: &Database) -> Result<Account, WhitenoiseError> {
         let account_row = sqlx::query_as::<_, AccountRow>(
-            "INSERT INTO accounts (pubkey, user_id, last_synced_at, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?)
+            "INSERT INTO accounts (pubkey, user_id, account_type, last_synced_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE
              SET user_id = excluded.user_id,
+                 account_type = excluded.account_type,
                  last_synced_at = excluded.last_synced_at,
                  updated_at = ?
              RETURNING *",
         )
         .bind(self.pubkey.to_hex().as_str())
         .bind(self.user_id)
+        .bind(self.account_type.to_string())
         .bind(self.last_synced_at.map(|ts| ts.timestamp_millis()))
         .bind(self.created_at.timestamp_millis())
         .bind(self.updated_at.timestamp_millis())
@@ -502,6 +522,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pubkey TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
+                account_type TEXT NOT NULL DEFAULT 'local',
                 last_synced_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -804,6 +825,7 @@ mod tests {
             id: Some(1), // Will be overridden by database auto-increment
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: test_last_synced,
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -844,6 +866,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None, // Test with None
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -899,6 +922,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: test_user_id,
+            account_type: AccountType::Local,
             last_synced_at: test_last_synced,
             created_at: test_created_at,
             updated_at: test_updated_at,
@@ -949,6 +973,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1046,6 +1071,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1079,6 +1105,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1147,6 +1174,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: account_user_id,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1214,6 +1242,7 @@ mod tests {
             id: Some(99999), // Non-existent ID
             pubkey: nostr_sdk::Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1242,6 +1271,7 @@ mod tests {
             id: Some(1),
             pubkey: account_pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: test_timestamp,
             updated_at: test_timestamp,
@@ -1317,6 +1347,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at,
             updated_at,
@@ -1354,6 +1385,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(initial_ms),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1390,6 +1422,7 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(initial_ms),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1670,6 +1703,7 @@ mod tests {
             id: Some(1),
             pubkey: test_pubkey,
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -1681,5 +1715,98 @@ mod tests {
 
         // Should fail due to closed database
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_external_account_type() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create test account with External account type
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let test_user_id = 999i64;
+        let test_created_at = chrono::Utc::now();
+        let test_updated_at = chrono::Utc::now();
+
+        let account = Account {
+            id: Some(1),
+            pubkey: test_pubkey,
+            user_id: test_user_id,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: test_created_at,
+            updated_at: test_updated_at,
+        };
+
+        // Save the account
+        let result = account.save(&whitenoise.database).await;
+        assert!(result.is_ok());
+
+        // Load the account back and verify account_type is preserved
+        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        assert!(loaded_account.is_ok());
+
+        let loaded = loaded_account.unwrap();
+        assert_eq!(loaded.pubkey, test_pubkey);
+        assert_eq!(loaded.user_id, test_user_id);
+        assert_eq!(loaded.account_type, AccountType::External);
+        assert!(loaded.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_external_account_roundtrip_with_follows() {
+        use crate::whitenoise::users::User;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create test account with External account type
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+        let test_timestamp = chrono::Utc::now();
+
+        let account = Account {
+            id: None,
+            pubkey: account_pubkey,
+            user_id: 1i64,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: test_timestamp,
+            updated_at: test_timestamp,
+        };
+
+        // Save the account
+        account.save(&whitenoise.database).await.unwrap();
+
+        // Create a user to follow
+        let user_pubkey = nostr_sdk::Keys::generate().public_key();
+        let user = User {
+            id: None,
+            pubkey: user_pubkey,
+            metadata: nostr_sdk::Metadata::new()
+                .name("TestUser")
+                .display_name("Test User"),
+            created_at: test_timestamp,
+            updated_at: test_timestamp,
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        // Load the account and add a follow relationship
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+
+        saved_account
+            .follow_user(&saved_user, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify the external account can have follows
+        let follows = saved_account.follows(&whitenoise.database).await.unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0].pubkey, user_pubkey);
+
+        // Verify account_type is still External after all operations
+        assert_eq!(saved_account.account_type, AccountType::External);
     }
 }
