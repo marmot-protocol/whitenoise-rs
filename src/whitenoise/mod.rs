@@ -146,6 +146,29 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    /// Initializes the mock keyring store for testing environments.
+    ///
+    /// This function must be called before creating any MDK instances in test/CI environments
+    /// where no platform keyring is available. It uses `keyring_core::mock::Store` which
+    /// stores credentials in memory only.
+    ///
+    /// This function is safe to call multiple times - it will only initialize once per process.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Call this at the start of your integration test binary
+    /// Whitenoise::initialize_mock_keyring_store();
+    /// ```
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub fn initialize_mock_keyring_store() {
+        use std::sync::OnceLock;
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+    }
+
     /// Initializes the Whitenoise application with the provided configuration.
     ///
     /// This method sets up the necessary data and log directories, configures logging,

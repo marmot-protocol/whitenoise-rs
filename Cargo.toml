@@ -29,6 +29,8 @@ keyring = { version = "3.6", features = [
     "windows-native",
     "linux-native",
 ] }
+# keyring-core is needed for mock store in integration tests
+keyring-core = { version = "0.7", optional = true }
 lightning-invoice = "0.33.1"
 
 mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb", features = [
@@ -104,7 +106,7 @@ mockito = "1.2"
 [features]
 default = []
 # Feature flag for integration tests - enables IDE support without including in production
-integration-tests = []
+integration-tests = ["keyring-core"]
 # Feature flag for performance benchmarks - depends on integration-tests to reuse infrastructure
 benchmark-tests = ["integration-tests", "indicatif"]
 
