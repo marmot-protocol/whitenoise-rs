@@ -96,6 +96,48 @@ impl Whitenoise {
         event_id: &EventId,
         delete_mls_stored_keys: bool,
     ) -> Result<bool> {
+        let signer = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        self.delete_key_package_for_account_internal(
+            account,
+            event_id,
+            delete_mls_stored_keys,
+            signer,
+        )
+        .await
+    }
+
+    /// Deletes the key package from the relays using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// deletion event before publishing.
+    ///
+    /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    pub async fn delete_key_package_for_account_with_signer(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<bool> {
+        self.delete_key_package_for_account_internal(
+            account,
+            event_id,
+            delete_mls_stored_keys,
+            signer,
+        )
+        .await
+    }
+
+    async fn delete_key_package_for_account_internal(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<bool> {
         let key_package_filter = Filter::new()
             .id(*event_id)
             .kind(Kind::MlsKeyPackage)
@@ -111,9 +153,6 @@ impl Whitenoise {
         while let Some(event) = key_package_stream.next().await {
             key_package_events.push(event);
         }
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
@@ -225,8 +264,49 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
         let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
-        self.delete_key_packages_for_account(account, key_package_events, delete_mls_stored_keys, 1)
-            .await
+        let signer = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            1,
+            signer,
+        )
+        .await
+    }
+
+    /// Deletes all key package events from relays using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// deletion events before publishing.
+    ///
+    /// # Arguments
+    ///
+    /// * `account` - The account to delete key packages for
+    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
+    /// * `signer` - The external signer to use for signing deletion events
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of key packages that were successfully deleted.
+    pub async fn delete_all_key_packages_for_account_with_signer(
+        &self,
+        account: &Account,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<usize> {
+        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            1,
+            signer,
+        )
+        .await
     }
 
     /// Deletes the specified key package events from relays for the given account.
@@ -251,6 +331,27 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         max_retries: u32,
     ) -> Result<usize> {
+        let signer = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            max_retries,
+            signer,
+        )
+        .await
+    }
+
+    async fn delete_key_packages_for_account_internal(
+        &self,
+        account: &Account,
+        key_package_events: Vec<Event>,
+        delete_mls_stored_keys: bool,
+        max_retries: u32,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<usize> {
         if key_package_events.is_empty() {
             tracing::debug!(
                 target: "whitenoise::key_packages",
@@ -271,7 +372,7 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
-        let (signer, relay_urls) = self.prepare_key_package_deletion_context(account).await?;
+        let relay_urls = self.prepare_key_package_relay_urls(account).await?;
 
         // Delete from local storage on initial attempt only
         if delete_mls_stored_keys {
@@ -291,7 +392,7 @@ impl Whitenoise {
                 );
             }
 
-            self.publish_key_package_deletion_with_context(
+            self.publish_key_package_deletion_with_signer(
                 &pending_ids,
                 &relay_urls,
                 signer.clone(),
@@ -338,20 +439,14 @@ impl Whitenoise {
         Ok(deleted_count)
     }
 
-    async fn prepare_key_package_deletion_context(
-        &self,
-        account: &Account,
-    ) -> Result<(Keys, Vec<RelayUrl>)> {
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+    async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        Ok((signer, Relay::urls(&key_package_relays)))
+        Ok(Relay::urls(&key_package_relays))
     }
 
     fn delete_key_packages_from_storage(
@@ -397,11 +492,11 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn publish_key_package_deletion_with_context(
+    async fn publish_key_package_deletion_with_signer(
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: Keys,
+        signer: impl NostrSigner + 'static,
         context: &str,
     ) -> Result<()> {
         match self
