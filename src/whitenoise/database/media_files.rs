@@ -61,6 +61,8 @@ pub(crate) struct MediaFileRow {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 
@@ -116,6 +118,9 @@ where
             .try_get::<Option<String>, _>("file_metadata")?
             .and_then(|json_str| serde_json::from_str(&json_str).ok());
 
+        let nonce: Option<String> = row.try_get("nonce")?;
+        let scheme_version: Option<String> = row.try_get("scheme_version")?;
+
         let created_at = parse_timestamp(row, "created_at")?;
 
         Ok(Self {
@@ -130,6 +135,8 @@ where
             blossom_url,
             nostr_key,
             file_metadata,
+            nonce,
+            scheme_version,
             created_at,
         })
     }
@@ -146,6 +153,8 @@ pub struct MediaFileParams<'a> {
     pub blossom_url: Option<&'a str>,
     pub nostr_key: Option<&'a str>,
     pub file_metadata: Option<&'a FileMetadata>,
+    pub nonce: Option<&'a str>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
 }
 
 /// Represents a cached media file
@@ -162,6 +171,8 @@ pub struct MediaFile {
     pub blossom_url: Option<String>,
     pub nostr_key: Option<String>,
     pub file_metadata: Option<FileMetadata>,
+    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
 }
 
@@ -179,6 +190,8 @@ impl From<MediaFileRow> for MediaFile {
             blossom_url: val.blossom_url,
             nostr_key: val.nostr_key,
             file_metadata: val.file_metadata,
+            nonce: val.nonce,
+            scheme_version: val.scheme_version,
             created_at: val.created_at,
         }
     }
@@ -207,7 +220,7 @@ impl MediaFile {
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, created_at
+                    file_metadata, nonce, scheme_version, created_at
              FROM media_files
              WHERE encrypted_file_hash = ?
              LIMIT 1",
@@ -261,15 +274,15 @@ impl MediaFile {
                 mls_group_id, account_pubkey, file_path,
                 original_file_hash, encrypted_file_hash,
                 mime_type, media_type, blossom_url, nostr_key,
-                file_metadata, created_at
+                file_metadata, nonce, scheme_version, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (mls_group_id, encrypted_file_hash, account_pubkey)
             DO NOTHING
             RETURNING id, mls_group_id, account_pubkey, file_path,
                       original_file_hash, encrypted_file_hash,
                       mime_type, media_type, blossom_url, nostr_key,
-                      file_metadata, created_at",
+                      file_metadata, nonce, scheme_version, created_at",
         )
         .bind(mls_group_id.as_slice())
         .bind(&account_pubkey_hex)
@@ -281,6 +294,8 @@ impl MediaFile {
         .bind(params.blossom_url)
         .bind(params.nostr_key)
         .bind(file_metadata_json)
+        .bind(params.nonce)
+        .bind(params.scheme_version)
         .bind(now_ms)
         .fetch_optional(&database.pool)
         .await
@@ -295,7 +310,7 @@ impl MediaFile {
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, created_at
+                    file_metadata, nonce, scheme_version, created_at
              FROM media_files
              WHERE mls_group_id = ? AND encrypted_file_hash = ? AND account_pubkey = ?
              LIMIT 1",
@@ -326,7 +341,7 @@ impl MediaFile {
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, created_at
+                    file_metadata, nonce, scheme_version, created_at
              FROM media_files
              WHERE mls_group_id = ?",
         )
@@ -382,7 +397,7 @@ impl MediaFile {
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, created_at
+                    file_metadata, nonce, scheme_version, created_at
              FROM media_files
              WHERE original_file_hash = ? AND mls_group_id = ? AND account_pubkey = ?
              LIMIT 1",
@@ -434,7 +449,7 @@ impl MediaFile {
              RETURNING id, mls_group_id, account_pubkey, file_path,
                        original_file_hash, encrypted_file_hash,
                        mime_type, media_type, blossom_url, nostr_key,
-                       file_metadata, created_at",
+                       file_metadata, nonce, scheme_version, created_at",
         )
         .bind(path_str)
         .bind(id)
@@ -534,6 +549,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -579,6 +596,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob1"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -601,6 +620,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob2"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -656,6 +677,8 @@ mod tests {
                 blossom_url: Some("https://blossom.example.com/hash42"),
                 nostr_key: None,
                 file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -675,6 +698,8 @@ mod tests {
                 blossom_url: Some("https://another-server.com/hash42"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -787,6 +812,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob1a"),
                 nostr_key: Some("nostr_key_1a"),
                 file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -805,6 +832,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob1b"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -828,6 +857,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob2"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -920,6 +951,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_image(), "Failed for MIME type: {}", mime_type);
@@ -940,6 +973,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -971,6 +1006,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_video(), "Failed for MIME type: {}", mime_type);
@@ -991,6 +1028,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1029,6 +1068,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(media_file.is_audio(), "Failed for MIME type: {}", mime_type);
@@ -1049,6 +1090,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1078,6 +1121,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(media_file.is_document());
@@ -1097,6 +1142,8 @@ mod tests {
                 blossom_url: None,
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
                 created_at: Utc::now(),
             };
             assert!(
@@ -1126,6 +1173,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
@@ -1146,6 +1195,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
             created_at: Utc::now(),
         };
         assert!(!media_file.is_image());
@@ -1188,6 +1239,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob"),
                 nostr_key: Some("test_key"),
                 file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -1299,6 +1352,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob1"),
                 nostr_key: Some("test_key_1"),
                 file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -1318,6 +1373,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob2"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -1339,6 +1396,8 @@ mod tests {
                 blossom_url: Some("https://example.com/group_img"),
                 nostr_key: Some("group_key"),
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -1444,6 +1503,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await
@@ -1463,6 +1524,8 @@ mod tests {
                 blossom_url: Some("https://example.com/blob"),
                 nostr_key: None,
                 file_metadata: None,
+                nonce: None,
+                scheme_version: None,
             },
         )
         .await

@@ -29,17 +29,19 @@ keyring = { version = "3.6", features = [
     "windows-native",
     "linux-native",
 ] }
+# keyring-core is needed for mock store in integration tests
+keyring-core = { version = "0.7", optional = true }
 lightning-invoice = "0.33.1"
 
-mdk-core = { version = "0.5.1", git = "https://github.com/parres-hq/mdk", rev = "f46875ec6fbe1cd616e9dfb4d2aa10f56044e58c", features = [
+mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb", features = [
     "mip04",
 ] }
-mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/parres-hq/mdk", rev = "f46875ec6fbe1cd616e9dfb4d2aa10f56044e58c" }
+mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb" }
+mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "7c3157c803746f79a9399b9f4a3e2ff7f0064beb" }
 
-nwc = "0.43"
-nostr-blossom = "0.43"
-nostr-sdk = { version = "0.43", features = [
-    "lmdb",
+nwc = "0.44"
+nostr-blossom = "0.44"
+nostr-sdk = { version = "0.44", features = [
     "nip04",
     "nip44",
     "nip47",
@@ -98,12 +100,13 @@ tempfile = "3.19.1"
 indicatif = { version = "0.18.3", optional = true }
 
 [dev-dependencies]
+keyring-core = "0.7"
 mockito = "1.2"
 
 [features]
 default = []
 # Feature flag for integration tests - enables IDE support without including in production
-integration-tests = []
+integration-tests = ["keyring-core"]
 # Feature flag for performance benchmarks - depends on integration-tests to reuse infrastructure
 benchmark-tests = ["integration-tests", "indicatif"]
 

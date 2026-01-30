@@ -322,6 +322,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_persists_settings() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let settings = AppSettings::new(ThemeMode::System, None);
+        settings.save(&whitenoise.database).await.unwrap();
+
+        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(loaded.id, settings.id);
+        assert_eq!(loaded.theme_mode, settings.theme_mode);
+        assert_eq!(loaded.language, settings.language);
+    }
+
+    #[tokio::test]
+    async fn test_update_theme_mode_changes_value() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Ensure default settings exist
+        AppSettings::find_or_create_default(&whitenoise.database)
+            .await
+            .unwrap();
+
+        AppSettings::update_theme_mode(ThemeMode::Dark, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(loaded.theme_mode, ThemeMode::Dark);
+    }
+
+    #[tokio::test]
+    async fn test_update_language_changes_value() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Ensure default settings exist
+        AppSettings::find_or_create_default(&whitenoise.database)
+            .await
+            .unwrap();
+
+        AppSettings::update_language(Language::Spanish, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(loaded.language, Language::Spanish);
+    }
+
+    #[tokio::test]
     async fn test_find_or_create_default_handles_row_not_found() {
         use crate::whitenoise::test_utils::create_mock_whitenoise;
 

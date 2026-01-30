@@ -110,6 +110,12 @@ pub(crate) struct MediaFileUpload<'a> {
     pub nostr_key: Option<String>,
     /// Optional file metadata (original filename, dimensions, blurhash, duration, etc.)
     pub file_metadata: Option<&'a FileMetadata>,
+    /// Encryption nonce (hex-encoded, for chat_media with MDK encryption)
+    /// None for group images (which use key/nonce encryption), Some for chat media
+    pub nonce: Option<String>,
+    /// Encryption scheme version (e.g., "mip04-v2", for chat_media with MDK encryption)
+    /// None for group images, Some for chat media
+    pub scheme_version: Option<&'a str>,
 }
 
 /// High-level media files orchestration layer
@@ -205,6 +211,8 @@ impl<'a> MediaFiles<'a> {
                 blossom_url: upload.blossom_url,
                 nostr_key: upload.nostr_key.as_deref(),
                 file_metadata: upload.file_metadata,
+                nonce: upload.nonce.as_deref(),
+                scheme_version: upload.scheme_version,
             },
         )
         .await?;
@@ -352,6 +360,7 @@ impl<'a> MediaFiles<'a> {
             });
 
             // Create MediaFile record (without file yet - empty path until downloaded)
+            // Store nonce and scheme_version for MDK decryption
             MediaFile::save(
                 self.database,
                 group_id,
@@ -365,6 +374,8 @@ impl<'a> MediaFiles<'a> {
                     blossom_url: Some(&reference.url),
                     nostr_key: None, // Chat media uses MDK, not key/nonce
                     file_metadata: file_metadata.as_ref(),
+                    nonce: Some(&hex::encode(reference.nonce)),
+                    scheme_version: Some(&reference.scheme_version),
                 },
             )
             .await?;
@@ -438,6 +449,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
         };
         let media_file = media_files
             .store_and_record(&pubkey, &group_id, "test.jpg", upload)
@@ -461,6 +474,8 @@ mod tests {
             blossom_url: None,
             nostr_key: None,
             file_metadata: None,
+            nonce: None,
+            scheme_version: None,
         };
         let media_file2 = media_files
             .store_and_record(&pubkey, &group_id, "test.jpg", upload2)

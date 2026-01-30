@@ -155,7 +155,7 @@ fn find_expired_packages(packages: &[Event]) -> Vec<Event> {
 
     packages
         .iter()
-        .filter(|p| now.as_u64().saturating_sub(p.created_at.as_u64()) >= max_age_secs)
+        .filter(|p| now.as_secs().saturating_sub(p.created_at.as_secs()) >= max_age_secs)
         .cloned()
         .collect()
 }

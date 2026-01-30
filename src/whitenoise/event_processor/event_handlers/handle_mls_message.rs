@@ -50,7 +50,7 @@ impl Whitenoise {
                     let message = Self::build_message_from_event(&group_id, inner_event)?;
 
                     match message.kind {
-                        Kind::Custom(9) => {
+                        Kind::ChatMessage => {
                             let msg = self.cache_chat_message(&group_id, &message).await?;
                             let group_name =
                                 mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
@@ -157,6 +157,7 @@ impl Whitenoise {
             mls_group_id: group_id.clone(),
             event: inner_event,
             wrapper_event_id: event_id, // Reuse event_id as placeholder, we don't need it
+            epoch: None, // Epoch not needed for reactions - they reference existing messages
             state: mdk_core::prelude::message_types::MessageState::Processed,
         })
     }
@@ -206,7 +207,7 @@ impl Whitenoise {
 
         tracing::debug!(
             target: "whitenoise::cache",
-            "Cached kind 9 message {} in group {}",
+            "Cached ChatMessage {} in group {}",
             message.id,
             hex::encode(group_id.as_slice())
         );
@@ -891,6 +892,7 @@ mod tests {
             mls_group_id: group_id.clone(),
             event: inner_event.clone(),
             wrapper_event_id: EventId::all_zeros(),
+            epoch: None, // Epoch not needed for test message
             state: mdk_core::prelude::message_types::MessageState::Processed,
         };
 

@@ -24,6 +24,10 @@ struct Args {
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
 
+    // Initialize mock keyring store for integration tests
+    // This is required for MDK database encryption in test environments
+    Whitenoise::initialize_mock_keyring_store();
+
     tracing::info!("=== Starting Whitenoise Integration Test Suite ===");
 
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir);

@@ -11,7 +11,7 @@ impl Whitenoise {
         &self,
         account: &Account,
         key_package_relays: &[Relay],
-    ) -> Result<(String, [Tag; 4])> {
+    ) -> Result<(String, [Tag; 7])> {
         let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
