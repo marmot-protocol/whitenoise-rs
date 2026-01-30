@@ -91,9 +91,7 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
 
         // Get nonce from media_file (required for MIP-04 v2)
         let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
-            WhitenoiseError::Configuration(
-                "Chat media must have nonce for MIP-04 v2".to_string(),
-            )
+            WhitenoiseError::Configuration("Chat media must have nonce for MIP-04 v2".to_string())
         })?;
 
         let imeta_tag = self.build_imeta_tag(
