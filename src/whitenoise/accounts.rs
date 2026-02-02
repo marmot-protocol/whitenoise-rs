@@ -2179,6 +2179,60 @@ mod tests {
         );
     }
 
+    /// Test Account struct serialization/deserialization with JSON
+    #[tokio::test]
+    async fn test_account_json_serialization_roundtrip() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create both types of accounts
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        // Serialize and deserialize external account
+        let external_json = serde_json::to_string(&external_account).unwrap();
+        let external_deserialized: Account = serde_json::from_str(&external_json).unwrap();
+        assert_eq!(external_account.pubkey, external_deserialized.pubkey);
+        assert_eq!(
+            external_account.account_type,
+            external_deserialized.account_type
+        );
+        assert_eq!(external_deserialized.account_type, AccountType::External);
+
+        // Serialize and deserialize local account
+        let local_json = serde_json::to_string(&local_account).unwrap();
+        let local_deserialized: Account = serde_json::from_str(&local_json).unwrap();
+        assert_eq!(local_account.pubkey, local_deserialized.pubkey);
+        assert_eq!(local_account.account_type, local_deserialized.account_type);
+        assert_eq!(local_deserialized.account_type, AccountType::Local);
+    }
+
+    /// Test Account debug formatting includes account_type
+    #[tokio::test]
+    async fn test_account_debug_includes_account_type() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        let external_debug = format!("{:?}", external_account);
+        let local_debug = format!("{:?}", local_account);
+
+        assert!(
+            external_debug.contains("External"),
+            "External account debug should contain 'External': {}",
+            external_debug
+        );
+        assert!(
+            local_debug.contains("Local"),
+            "Local account debug should contain 'Local': {}",
+            local_debug
+        );
+    }
+
     /// Test Account::new_external properly sets up external account without relay fetch
     #[tokio::test]
     async fn test_new_external_sets_correct_fields() {

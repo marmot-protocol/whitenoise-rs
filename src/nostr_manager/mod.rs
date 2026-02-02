@@ -583,4 +583,45 @@ mod subscription_monitoring_tests {
         // Should return false when relay is not in the client pool
         assert!(!result);
     }
+
+    /// Test update_account_subscriptions with empty relays
+    #[tokio::test]
+    async fn test_update_account_subscriptions_empty_relays() {
+        let (event_sender, _receiver) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let empty_relays: Vec<RelayUrl> = vec![];
+        let empty_group_ids: Vec<String> = vec![];
+
+        // Update subscriptions with empty relays - may fail or succeed depending on impl
+        let result = nostr_manager
+            .update_account_subscriptions(
+                pubkey,
+                &empty_relays,
+                &empty_relays,
+                &empty_relays,
+                &empty_group_ids,
+            )
+            .await;
+
+        // The function should complete without panicking
+        // It may return an error for no relays, which is acceptable
+        if let Err(ref e) = result {
+            // Error is acceptable - just verify it's a reasonable error
+            let err_msg = format!("{:?}", e);
+            assert!(
+                err_msg.contains("relay")
+                    || err_msg.contains("Relay")
+                    || err_msg.contains("connection"),
+                "Error should be relay-related: {}",
+                err_msg
+            );
+        }
+        // Success is also acceptable
+    }
 }
