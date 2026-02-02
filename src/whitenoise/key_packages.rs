@@ -42,7 +42,11 @@ impl Whitenoise {
         account: &Account,
         key_package_relays: &[Relay],
     ) -> Result<(String, [Tag; 7])> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
         let result = mdk
@@ -186,7 +190,11 @@ impl Whitenoise {
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
-                let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+                let mdk = Account::create_mdk(
+                    account.pubkey,
+                    &self.config.data_dir,
+                    &self.config.keyring_service,
+                )?;
                 let key_package = mdk.parse_key_package(event)?;
                 mdk.delete_key_package_from_storage(&key_package)?;
             }
@@ -489,7 +497,11 @@ impl Whitenoise {
         key_package_events: &[Event],
         initial_count: usize,
     ) -> Result<()> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
         let mut storage_delete_count = 0;
 
         for event in key_package_events {

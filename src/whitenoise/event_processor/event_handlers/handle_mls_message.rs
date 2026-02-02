@@ -21,7 +21,11 @@ impl Whitenoise {
           account.pubkey.to_hex()
         );
 
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
         match mdk.process_message(&event) {
             Ok(result) => {
                 tracing::debug!(
@@ -542,7 +546,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let group_id = &group.mls_group_id;
 
         // Test 1: Regular message (Kind 9)
@@ -641,7 +650,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let mut inner = UnsignedEvent::new(
             creator_account.pubkey,
             Timestamp::now(),
@@ -687,7 +701,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let group_id = &group.mls_group_id;
 
         // Create a message ID that doesn't exist yet (simulating out-of-order delivery)
@@ -786,7 +805,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let group_id = &group.mls_group_id;
 
         let future_message_id = EventId::all_zeros();
@@ -952,7 +976,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
 
         // Send multiple messages
         for i in 1..=3 {

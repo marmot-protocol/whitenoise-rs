@@ -86,7 +86,11 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         whitenoise: &Whitenoise,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account_pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )?;
         let group = mdk
             .get_group(mls_group_id)?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -116,7 +120,11 @@ impl GroupInformation {
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect();
 
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account_pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )?;
 
         let mut results = Vec::new();
         for mls_group_id in mls_group_ids {

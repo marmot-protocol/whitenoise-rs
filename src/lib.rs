@@ -16,7 +16,7 @@ pub mod integration_tests;
 
 // Core types
 pub use types::{ImageType, MessageWithTokens};
-pub use whitenoise::{Whitenoise, WhitenoiseConfig};
+pub use whitenoise::{DEFAULT_KEYRING_SERVICE, Whitenoise, WhitenoiseConfig};
 
 // Error handling
 pub use whitenoise::error::WhitenoiseError;

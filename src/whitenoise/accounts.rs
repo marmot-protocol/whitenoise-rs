@@ -348,10 +348,11 @@ impl Account {
     pub(crate) fn create_mdk(
         pubkey: PublicKey,
         data_dir: &Path,
+        keyring_service: &str,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
         let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
-        let storage = MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)?;
+        let storage = MdkSqliteStorage::new(mls_storage_dir, keyring_service, &db_key_id)?;
         Ok(MDK::new(storage))
     }
 }
@@ -1229,7 +1230,11 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<(Vec<RelayUrl>, Vec<String>)> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
         let groups = mdk.get_groups()?;
         let mut group_relays_set = HashSet::new();
         let mut group_ids = vec![];
@@ -1392,7 +1397,8 @@ pub mod test_utils {
     }
 
     pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::Account::create_mdk(pubkey, &data_dir()).unwrap()
+        super::Account::create_mdk(pubkey, &data_dir(), super::super::DEFAULT_KEYRING_SERVICE)
+            .unwrap()
     }
 }
 
@@ -2638,7 +2644,11 @@ mod tests {
     fn test_create_mdk_success() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let pubkey = Keys::generate().public_key();
-        let mdk = Account::create_mdk(pubkey, temp_dir.path());
+        let mdk = Account::create_mdk(
+            pubkey,
+            temp_dir.path(),
+            crate::whitenoise::DEFAULT_KEYRING_SERVICE,
+        );
         assert!(mdk.is_ok());
     }
 

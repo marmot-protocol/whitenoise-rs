@@ -284,7 +284,11 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
         // 1. Get group from MDK
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
         let Some(group) = mdk.get_group(group_id)? else {
             return Ok(None);
         };
@@ -512,7 +516,11 @@ impl Whitenoise {
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> Result<HashMap<GroupId, PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
         let mut dm_other_users = HashMap::new();
 
         for group in groups {

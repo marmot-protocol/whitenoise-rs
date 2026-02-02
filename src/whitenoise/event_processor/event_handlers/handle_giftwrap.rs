@@ -75,7 +75,11 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = Account::create_mdk(
+            account.pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service,
+        )?;
 
         // Process the welcome to get group info (but don't accept yet)
         let welcome = mdk
@@ -200,7 +204,13 @@ impl Whitenoise {
             welcomer_user_result,
         ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::setup_group_subscriptions(whitenoise, account, data_dir, keys),
+            Self::setup_group_subscriptions(
+                whitenoise,
+                account,
+                data_dir,
+                keys,
+                &whitenoise.config.keyring_service
+            ),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
@@ -281,9 +291,10 @@ impl Whitenoise {
         account: &Account,
         data_dir: &std::path::Path,
         keys: Keys,
+        keyring_service: &str,
     ) -> Result<()> {
         let (group_ids, group_relays) =
-            Self::get_group_subscription_info(data_dir, &account.pubkey)?;
+            Self::get_group_subscription_info(data_dir, &account.pubkey, keyring_service)?;
 
         // Create relay records (idempotent)
         for relay in &group_relays {
@@ -372,8 +383,9 @@ impl Whitenoise {
     fn get_group_subscription_info(
         data_dir: &std::path::Path,
         pubkey: &PublicKey,
+        keyring_service: &str,
     ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
-        let mdk = Account::create_mdk(*pubkey, data_dir)?;
+        let mdk = Account::create_mdk(*pubkey, data_dir, keyring_service)?;
         let groups = mdk.get_groups()?;
         let mut group_relays_set = BTreeSet::new();
         let group_ids = groups
@@ -417,7 +429,12 @@ mod tests {
             .expect("member must have a published key package");
 
         // Create the group via mdk directly to obtain welcome rumor
-        let mdk = Account::create_mdk(creator_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            creator_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let create_group_result = mdk
             .create_group(
                 &creator_account.pubkey,
@@ -485,7 +502,12 @@ mod tests {
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
         // (not just after background task completes). This prevents race condition
         // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
-        let mdk = Account::create_mdk(member_account.pubkey, &whitenoise.config.data_dir).unwrap();
+        let mdk = Account::create_mdk(
+            member_account.pubkey,
+            &whitenoise.config.data_dir,
+            &whitenoise.config.keyring_service,
+        )
+        .unwrap();
         let groups = mdk.get_groups().unwrap();
         assert!(!groups.is_empty(), "Member should have at least one group");
 
@@ -543,8 +565,11 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // New account has no groups
-        let result =
-            Whitenoise::get_group_subscription_info(&whitenoise.config.data_dir, &account.pubkey);
+        let result = Whitenoise::get_group_subscription_info(
+            &whitenoise.config.data_dir,
+            &account.pubkey,
+            &whitenoise.config.keyring_service,
+        );
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();
@@ -572,6 +597,7 @@ mod tests {
         let result = Whitenoise::get_group_subscription_info(
             &whitenoise.config.data_dir,
             &creator_account.pubkey,
+            &whitenoise.config.keyring_service,
         );
         assert!(result.is_ok());
 

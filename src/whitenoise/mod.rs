@@ -43,6 +43,9 @@ use crate::init_tracing;
 use crate::nostr_manager::NostrManager;
 
 use crate::types::ProcessableEvent;
+
+/// Default keyring service identifier used by MDK for SQLCipher key management.
+pub const DEFAULT_KEYRING_SERVICE: &str = "com.whitenoise.app";
 use accounts::*;
 use app_settings::*;
 use database::*;
@@ -62,6 +65,10 @@ pub struct WhitenoiseConfig {
 
     /// Configuration for the message aggregator
     pub message_aggregator_config: Option<message_aggregator::AggregatorConfig>,
+
+    /// Keyring service identifier for MDK SQLCipher key management.
+    /// Defaults to [`DEFAULT_KEYRING_SERVICE`].
+    pub keyring_service: String,
 }
 
 impl WhitenoiseConfig {
@@ -78,6 +85,7 @@ impl WhitenoiseConfig {
             data_dir: formatted_data_dir,
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
+            keyring_service: DEFAULT_KEYRING_SERVICE.to_string(),
         }
     }
 
@@ -99,6 +107,7 @@ impl WhitenoiseConfig {
             data_dir: formatted_data_dir,
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
+            keyring_service: DEFAULT_KEYRING_SERVICE.to_string(),
         }
     }
 }
