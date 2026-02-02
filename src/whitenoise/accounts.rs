@@ -2126,6 +2126,205 @@ mod tests {
         assert!(account.last_synced_at.is_none());
     }
 
+    /// Test that external account helper methods work correctly (uses_external_signer, has_local_key)
+    #[tokio::test]
+    async fn test_external_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create external account directly (doesn't need relay)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Test helper methods
+        assert!(
+            account.uses_external_signer(),
+            "External account should report using external signer"
+        );
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    /// Test that local account helper methods return correct values
+    #[tokio::test]
+    async fn test_local_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create local account
+        let (account, _keys) = Account::new(&whitenoise, None).await.unwrap();
+
+        // Test helper methods
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not report using external signer"
+        );
+        assert!(
+            account.has_local_key(),
+            "Local account should report having local key"
+        );
+    }
+
+    /// Test Account::new_external properly sets up external account without relay fetch
+    #[tokio::test]
+    async fn test_new_external_sets_correct_fields() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Verify all fields are correctly set
+        assert_eq!(account.pubkey, pubkey);
+        assert_eq!(account.account_type, AccountType::External);
+        assert!(account.id.is_none(), "New account should not be persisted");
+        assert!(account.last_synced_at.is_none());
+        assert!(account.user_id > 0, "Should have a valid user_id");
+    }
+
+    /// Test external account persists correctly to database
+    #[tokio::test]
+    async fn test_external_account_database_roundtrip() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create and persist external account
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let persisted = whitenoise.persist_account(&account).await.unwrap();
+
+        // Verify persisted correctly
+        assert!(persisted.id.is_some());
+        assert_eq!(persisted.account_type, AccountType::External);
+
+        // Find it back
+        let found = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, pubkey);
+        assert_eq!(found.account_type, AccountType::External);
+    }
+
+    /// Test that secrets store doesn't have keys for external accounts
+    #[tokio::test]
+    async fn test_external_account_no_keys_in_secrets_store() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create external account (doesn't store any keys)
+        let _account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Verify no keys in secrets store for this pubkey
+        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            result.is_err(),
+            "External account creation should not store any keys"
+        );
+    }
+
+    /// Test that external signer login doesn't store any private key
+    #[tokio::test]
+    async fn test_login_with_external_signer_has_no_local_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Login with external signer
+        let _account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Verify no keys stored in secrets store
+        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            result.is_err(),
+            "External signer account should not have local keys"
+        );
+    }
+
+    /// Test setup_external_signer_account handles fresh account
+    #[tokio::test]
+    async fn test_setup_external_signer_account_fresh() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Setup external signer account
+        let (account, relay_setup) = whitenoise
+            .setup_external_signer_account(pubkey)
+            .await
+            .unwrap();
+
+        // Verify account created correctly
+        assert_eq!(account.account_type, AccountType::External);
+        assert_eq!(account.pubkey, pubkey);
+
+        // For fresh account with no existing relays, should_publish flags should be true
+        // (since defaults are used)
+        assert!(
+            relay_setup.should_publish_nip65
+                || relay_setup.should_publish_inbox
+                || relay_setup.should_publish_key_package
+                || !relay_setup.nip65_relays.is_empty(),
+            "Relay setup should have relays or publish flags"
+        );
+    }
+
+    /// Test login_with_external_signer_for_test is idempotent
+    #[tokio::test]
+    async fn test_login_with_external_signer_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Login twice with same pubkey
+        let account1 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+        let account2 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Should be the same account
+        assert_eq!(account1.pubkey, account2.pubkey);
+        assert_eq!(account1.account_type, account2.account_type);
+
+        // Should still only have one account
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(
+            count, 1,
+            "Should have exactly one account after duplicate login"
+        );
+    }
+
+    /// Test that Account helper methods work correctly for external accounts
+    #[tokio::test]
+    async fn test_external_account_helper_methods() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Test helper methods
+        assert!(
+            account.uses_external_signer(),
+            "External account should report using external signer"
+        );
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
     #[tokio::test]
     async fn test_new_creates_local_account_with_generated_keys() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2563,5 +2762,87 @@ mod tests {
                 .is_err(),
             "Stale key should be removed during external signer login"
         );
+    }
+
+    // AccountType Serialization Tests
+    #[test]
+    fn test_account_type_json_serialization() {
+        // Test Local serializes correctly
+        let local = AccountType::Local;
+        let json = serde_json::to_string(&local).unwrap();
+        assert_eq!(json, "\"Local\"");
+
+        // Test External serializes correctly
+        let external = AccountType::External;
+        let json = serde_json::to_string(&external).unwrap();
+        assert_eq!(json, "\"External\"");
+    }
+
+    #[test]
+    fn test_account_type_json_deserialization() {
+        // Test Local deserializes correctly
+        let local: AccountType = serde_json::from_str("\"Local\"").unwrap();
+        assert_eq!(local, AccountType::Local);
+
+        // Test External deserializes correctly
+        let external: AccountType = serde_json::from_str("\"External\"").unwrap();
+        assert_eq!(external, AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_serialization_roundtrip() {
+        // Test roundtrip for Local
+        let original_local = AccountType::Local;
+        let serialized = serde_json::to_string(&original_local).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(original_local, deserialized);
+
+        // Test roundtrip for External
+        let original_external = AccountType::External;
+        let serialized = serde_json::to_string(&original_external).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(original_external, deserialized);
+    }
+
+    #[test]
+    fn test_account_type_equality_and_hash() {
+        use std::collections::HashSet;
+
+        // Test equality
+        assert_eq!(AccountType::Local, AccountType::Local);
+        assert_eq!(AccountType::External, AccountType::External);
+        assert_ne!(AccountType::Local, AccountType::External);
+
+        // Test hashability (can be used in HashSet)
+        let mut set = HashSet::new();
+        set.insert(AccountType::Local);
+        set.insert(AccountType::External);
+        assert_eq!(set.len(), 2);
+
+        // Inserting duplicate should not increase size
+        set.insert(AccountType::Local);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_account_type_clone() {
+        let local = AccountType::Local;
+        let cloned = local.clone();
+        assert_eq!(local, cloned);
+
+        let external = AccountType::External;
+        let cloned = external.clone();
+        assert_eq!(external, cloned);
+    }
+
+    #[test]
+    fn test_account_type_debug() {
+        let local = AccountType::Local;
+        let debug_str = format!("{:?}", local);
+        assert!(debug_str.contains("Local"));
+
+        let external = AccountType::External;
+        let debug_str = format!("{:?}", external);
+        assert!(debug_str.contains("External"));
     }
 }

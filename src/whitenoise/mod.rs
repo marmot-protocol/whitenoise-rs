@@ -1870,4 +1870,124 @@ mod tests {
             );
         }
     }
+
+    // External Signer Registry Tests
+    mod external_signer_tests {
+        use super::*;
+        use nostr_sdk::Keys;
+
+        /// Helper to create a test signer using Keys (which implements NostrSigner)
+        fn create_test_signer() -> (Keys, PublicKey) {
+            let keys = Keys::generate();
+            let pubkey = keys.public_key();
+            (keys, pubkey)
+        }
+
+        #[tokio::test]
+        async fn test_register_and_get_external_signer() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer, pubkey) = create_test_signer();
+
+            // Register signer
+            whitenoise.register_external_signer(pubkey, signer);
+
+            // Verify we can retrieve it
+            let retrieved = whitenoise.get_external_signer(&pubkey);
+            assert!(retrieved.is_some(), "Signer should be registered");
+
+            // Verify it's the correct signer by checking pubkey
+            let retrieved_signer = retrieved.unwrap();
+            let retrieved_pubkey = retrieved_signer.get_public_key().await.unwrap();
+            assert_eq!(retrieved_pubkey, pubkey);
+        }
+
+        #[tokio::test]
+        async fn test_get_external_signer_not_found() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let random_pubkey = Keys::generate().public_key();
+
+            // Try to get signer that doesn't exist
+            let result = whitenoise.get_external_signer(&random_pubkey);
+            assert!(
+                result.is_none(),
+                "Should return None for unregistered signer"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_remove_external_signer() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer, pubkey) = create_test_signer();
+
+            // Register and verify
+            whitenoise.register_external_signer(pubkey, signer);
+            assert!(whitenoise.get_external_signer(&pubkey).is_some());
+
+            // Remove and verify
+            whitenoise.remove_external_signer(&pubkey);
+            assert!(
+                whitenoise.get_external_signer(&pubkey).is_none(),
+                "Signer should be removed"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_external_signer_overwrites_existing() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer1, pubkey1) = create_test_signer();
+            let (signer2, pubkey2) = create_test_signer();
+
+            // Register first signer with pubkey1
+            whitenoise.register_external_signer(pubkey1, signer1);
+
+            // Register second signer with same pubkey1 (should overwrite)
+            whitenoise.register_external_signer(pubkey1, signer2);
+
+            // Verify second signer is active (has pubkey2's signing capability)
+            let retrieved = whitenoise.get_external_signer(&pubkey1).unwrap();
+            let retrieved_pubkey = retrieved.get_public_key().await.unwrap();
+            // The retrieved signer should return pubkey2 since signer2 was registered
+            assert_eq!(retrieved_pubkey, pubkey2);
+        }
+
+        #[tokio::test]
+        async fn test_multiple_signers_different_pubkeys() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer1, pubkey1) = create_test_signer();
+            let (signer2, pubkey2) = create_test_signer();
+
+            // Register both signers with their respective pubkeys
+            whitenoise.register_external_signer(pubkey1, signer1);
+            whitenoise.register_external_signer(pubkey2, signer2);
+
+            // Verify both are retrievable
+            let retrieved1 = whitenoise.get_external_signer(&pubkey1);
+            let retrieved2 = whitenoise.get_external_signer(&pubkey2);
+
+            assert!(retrieved1.is_some(), "First signer should be registered");
+            assert!(retrieved2.is_some(), "Second signer should be registered");
+
+            // Verify correct pubkeys
+            assert_eq!(retrieved1.unwrap().get_public_key().await.unwrap(), pubkey1);
+            assert_eq!(retrieved2.unwrap().get_public_key().await.unwrap(), pubkey2);
+        }
+
+        #[tokio::test]
+        async fn test_remove_one_signer_leaves_others() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer1, pubkey1) = create_test_signer();
+            let (signer2, pubkey2) = create_test_signer();
+
+            // Register both
+            whitenoise.register_external_signer(pubkey1, signer1);
+            whitenoise.register_external_signer(pubkey2, signer2);
+
+            // Remove first signer
+            whitenoise.remove_external_signer(&pubkey1);
+
+            // Verify first is gone, second remains
+            assert!(whitenoise.get_external_signer(&pubkey1).is_none());
+            assert!(whitenoise.get_external_signer(&pubkey2).is_some());
+        }
+    }
 }
