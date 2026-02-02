@@ -16,6 +16,10 @@
 -- See: MDK MediaReference struct requirements
 -- See: MIP-04 specification https://github.com/marmot-protocol/marmot/blob/master/04.md
 
+-- Delete legacy chat_media records that lack encryption metadata
+-- Group images are preserved as they use a different encryption scheme (key/nonce)
+DELETE FROM media_files WHERE media_type = 'chat_media';
+
 -- Add nonce column
 -- NULL for existing records and group_images (which use key/nonce encryption, not MDK)
 -- Required for chat_media going forward
