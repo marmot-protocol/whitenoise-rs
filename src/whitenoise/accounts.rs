@@ -3053,6 +3053,13 @@ mod tests {
     async fn test_publish_relay_lists_with_signer_publishes_when_flags_true() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create an external account first - required for event tracking
+        let _account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
 
         // Load default relays to have valid relay URLs
         let default_relays = whitenoise.load_default_relays().await.unwrap();
