@@ -3,9 +3,39 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::Relay;
 use nostr_sdk::prelude::*;
+use std::sync::Arc;
 use std::time::Duration;
 
 impl Whitenoise {
+    /// Gets the appropriate signer for an account.
+    ///
+    /// For external accounts (Amber/NIP-55), returns the stored external signer.
+    /// For local accounts, returns the keys from the secrets store.
+    ///
+    /// Returns an error if no signer is available for the account.
+    fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
+        // First check for a registered external signer
+        if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
+            tracing::debug!(
+                target: "whitenoise::key_packages",
+                "Using external signer for account {}",
+                account.pubkey.to_hex()
+            );
+            return Ok(external_signer);
+        }
+
+        // Fall back to local keys from secrets store
+        let keys = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        tracing::debug!(
+            target: "whitenoise::key_packages",
+            "Using local keys for account {}",
+            account.pubkey.to_hex()
+        );
+        Ok(Arc::new(keys))
+    }
+
     /// Helper method to create and encode a key package for the given account.
     pub(crate) async fn encoded_key_package(
         &self,
@@ -34,6 +64,39 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Publishes the MLS key package using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// key package event before publishing.
+    pub async fn publish_key_package_for_account_with_signer(
+        &self,
+        account: &Account,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<()> {
+        let relays = account.key_package_relays(self).await?;
+
+        if relays.is_empty() {
+            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+        }
+
+        let (encoded_key_package, tags) = self.encoded_key_package(account, &relays).await?;
+        let relays_urls = Relay::urls(&relays);
+
+        let result = self
+            .nostr
+            .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
+            .await?;
+
+        tracing::debug!(
+            target: "whitenoise::publish_key_package_with_signer",
+            "Published key package with external signer: {:?}",
+            result
+        );
+
+        Ok(())
+    }
+
     pub(crate) async fn publish_key_package_to_relays(
         &self,
         account: &Account,
@@ -41,9 +104,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let (encoded_key_package, tags) = self.encoded_key_package(account, relays).await?;
         let relays_urls = Relay::urls(relays);
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let result = self
             .nostr
             .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
@@ -56,12 +117,56 @@ impl Whitenoise {
 
     /// Deletes the key package from the relays for the given account.
     ///
+    /// Automatically uses the appropriate signer for the account:
+    /// - For external accounts (Amber/NIP-55): uses the registered external signer
+    /// - For local accounts: uses keys from the secrets store
+    ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
     pub async fn delete_key_package_for_account(
         &self,
         account: &Account,
         event_id: &EventId,
         delete_mls_stored_keys: bool,
+    ) -> Result<bool> {
+        let signer = self.get_signer_for_account(account)?;
+        self.delete_key_package_for_account_internal(
+            account,
+            event_id,
+            delete_mls_stored_keys,
+            signer,
+        )
+        .await
+    }
+
+    /// Deletes the key package from the relays using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// deletion event before publishing.
+    ///
+    /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    pub async fn delete_key_package_for_account_with_signer(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<bool> {
+        self.delete_key_package_for_account_internal(
+            account,
+            event_id,
+            delete_mls_stored_keys,
+            signer,
+        )
+        .await
+    }
+
+    async fn delete_key_package_for_account_internal(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + 'static,
     ) -> Result<bool> {
         let key_package_filter = Filter::new()
             .id(*event_id)
@@ -78,9 +183,6 @@ impl Whitenoise {
         while let Some(event) = key_package_stream.next().await {
             key_package_events.push(event);
         }
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
         if let Some(event) = key_package_events.first() {
             if delete_mls_stored_keys {
@@ -169,6 +271,10 @@ impl Whitenoise {
     /// the deletions by refetching and returns the actual count of deleted key packages.
     /// Optionally, it can also delete the MLS stored keys from local storage.
     ///
+    /// Automatically uses the appropriate signer for the account:
+    /// - For external accounts (Amber/NIP-55): uses the registered external signer
+    /// - For local accounts: uses keys from the secrets store
+    ///
     /// # Arguments
     ///
     /// * `account` - The account to delete key packages for
@@ -192,14 +298,57 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
         let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
-        self.delete_key_packages_for_account(account, key_package_events, delete_mls_stored_keys, 1)
-            .await
+        let signer = self.get_signer_for_account(account)?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            1,
+            signer,
+        )
+        .await
+    }
+
+    /// Deletes all key package events from relays using an external signer.
+    ///
+    /// This is used for external signer accounts (like Amber/NIP-55) where the
+    /// private key is not available locally. The signer is used to sign the
+    /// deletion events before publishing.
+    ///
+    /// # Arguments
+    ///
+    /// * `account` - The account to delete key packages for
+    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
+    /// * `signer` - The external signer to use for signing deletion events
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of key packages that were successfully deleted.
+    pub async fn delete_all_key_packages_for_account_with_signer(
+        &self,
+        account: &Account,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<usize> {
+        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            1,
+            signer,
+        )
+        .await
     }
 
     /// Deletes the specified key package events from relays for the given account.
     ///
     /// This method publishes batch deletion events and retries up to `max_retries` times
     /// if some packages fail to delete. Storage deletion happens only on the initial attempt.
+    ///
+    /// Automatically uses the appropriate signer for the account:
+    /// - For external accounts (Amber/NIP-55): uses the registered external signer
+    /// - For local accounts: uses keys from the secrets store
     ///
     /// # Arguments
     ///
@@ -217,6 +366,25 @@ impl Whitenoise {
         key_package_events: Vec<Event>,
         delete_mls_stored_keys: bool,
         max_retries: u32,
+    ) -> Result<usize> {
+        let signer = self.get_signer_for_account(account)?;
+        self.delete_key_packages_for_account_internal(
+            account,
+            key_package_events,
+            delete_mls_stored_keys,
+            max_retries,
+            signer,
+        )
+        .await
+    }
+
+    async fn delete_key_packages_for_account_internal(
+        &self,
+        account: &Account,
+        key_package_events: Vec<Event>,
+        delete_mls_stored_keys: bool,
+        max_retries: u32,
+        signer: impl NostrSigner + Clone + 'static,
     ) -> Result<usize> {
         if key_package_events.is_empty() {
             tracing::debug!(
@@ -238,7 +406,7 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
-        let (signer, relay_urls) = self.prepare_key_package_deletion_context(account).await?;
+        let relay_urls = self.prepare_key_package_relay_urls(account).await?;
 
         // Delete from local storage on initial attempt only
         if delete_mls_stored_keys {
@@ -258,7 +426,7 @@ impl Whitenoise {
                 );
             }
 
-            self.publish_key_package_deletion_with_context(
+            self.publish_key_package_deletion_with_signer(
                 &pending_ids,
                 &relay_urls,
                 signer.clone(),
@@ -305,20 +473,14 @@ impl Whitenoise {
         Ok(deleted_count)
     }
 
-    async fn prepare_key_package_deletion_context(
-        &self,
-        account: &Account,
-    ) -> Result<(Keys, Vec<RelayUrl>)> {
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+    async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        Ok((signer, Relay::urls(&key_package_relays)))
+        Ok(Relay::urls(&key_package_relays))
     }
 
     fn delete_key_packages_from_storage(
@@ -364,11 +526,11 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn publish_key_package_deletion_with_context(
+    async fn publish_key_package_deletion_with_signer(
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: Keys,
+        signer: impl NostrSigner + 'static,
         context: &str,
     ) -> Result<()> {
         match self
@@ -403,6 +565,245 @@ impl Whitenoise {
                 );
                 Err(e.into())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::whitenoise::accounts::AccountType;
+    use crate::whitenoise::test_utils::*;
+    use chrono::Utc;
+    use nostr_sdk::Keys;
+
+    fn create_local_account_struct() -> Account {
+        Account {
+            id: Some(1),
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn create_external_account_struct() -> Account {
+        Account {
+            id: Some(2),
+            pubkey: Keys::generate().public_key(),
+            user_id: 2,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_for_local_account_with_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an account and store keys in secrets store
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        whitenoise
+            .secrets_store
+            .store_private_key(&keys)
+            .expect("Should store keys");
+
+        let account = Account {
+            id: Some(1),
+            pubkey,
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Should successfully get signer
+        let signer = whitenoise.get_signer_for_account(&account);
+        assert!(
+            signer.is_ok(),
+            "Should get signer for local account with keys"
+        );
+
+        // Verify signer returns correct pubkey
+        let signer = signer.unwrap();
+        let signer_pubkey = signer.get_public_key().await.unwrap();
+        assert_eq!(signer_pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_for_local_account_without_keys_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a local account without storing keys
+        let account = create_local_account_struct();
+
+        // Should fail to get signer (no keys in secrets store)
+        let result = whitenoise.get_signer_for_account(&account);
+        assert!(
+            result.is_err(),
+            "Should fail for local account without keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_for_external_account_with_registered_signer() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create external account
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let account = Account {
+            id: Some(1),
+            pubkey,
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Register external signer
+        whitenoise.register_external_signer(pubkey, keys.clone());
+
+        // Should get the registered external signer
+        let result = whitenoise.get_signer_for_account(&account);
+        assert!(
+            result.is_ok(),
+            "Should get signer for external account with registered signer"
+        );
+
+        let signer = result.unwrap();
+        let signer_pubkey = signer.get_public_key().await.unwrap();
+        assert_eq!(signer_pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_for_external_account_without_signer_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create external account without registering signer
+        let account = create_external_account_struct();
+
+        // Should fail (no external signer registered, no local keys)
+        let result = whitenoise.get_signer_for_account(&account);
+        assert!(
+            result.is_err(),
+            "Should fail for external account without registered signer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_prefers_external_signer_over_local_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create account with both local keys and registered external signer
+        let local_keys = Keys::generate();
+        let external_keys = Keys::generate();
+        let pubkey = local_keys.public_key();
+
+        // Store local keys
+        whitenoise
+            .secrets_store
+            .store_private_key(&local_keys)
+            .expect("Should store keys");
+
+        // Register external signer for same pubkey
+        whitenoise.register_external_signer(pubkey, external_keys.clone());
+
+        let account = Account {
+            id: Some(1),
+            pubkey,
+            user_id: 1,
+            account_type: AccountType::Local, // Even for local account type
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Should prefer external signer
+        let signer = whitenoise.get_signer_for_account(&account).unwrap();
+        let signer_pubkey = signer.get_public_key().await.unwrap();
+
+        // External signer has different keys, so pubkey will be from external_keys
+        assert_eq!(
+            signer_pubkey,
+            external_keys.public_key(),
+            "Should use external signer when available"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_key_package_relay_urls_with_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an account with key package relays using test helper
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        // Setup relays
+        let user = account.user(&whitenoise.database).await.unwrap();
+        let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://test.relay.com").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        user.add_relay(&relay, crate::RelayType::KeyPackage, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Should return relay URLs
+        let urls = whitenoise.prepare_key_package_relay_urls(&account).await;
+        assert!(urls.is_ok());
+        let urls = urls.unwrap();
+        assert!(!urls.is_empty());
+        assert!(urls.iter().any(|u| u.as_str().contains("test.relay.com")));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_key_package_relay_urls_empty_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an account without any key package relays using test helper
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        // Don't add any key package relays - account from create_test_account has no relays
+
+        // Should fail with AccountMissingKeyPackageRelays error
+        let result = whitenoise.prepare_key_package_relay_urls(&account).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WhitenoiseError::AccountMissingKeyPackageRelays => {}
+            other => panic!(
+                "Expected AccountMissingKeyPackageRelays error, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_without_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an account without any key package relays using test helper
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        // Attempt to publish key package without relays
+        let result = whitenoise.publish_key_package_for_account(&account).await;
+
+        // Should fail with AccountMissingKeyPackageRelays error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WhitenoiseError::AccountMissingKeyPackageRelays => {}
+            other => panic!(
+                "Expected AccountMissingKeyPackageRelays error, got: {:?}",
+                other
+            ),
         }
     }
 }

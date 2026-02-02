@@ -23,13 +23,34 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
-
-        let unwrapped = extract_rumor(&keys, &event).await.map_err(|e| {
-            WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
-        })?;
+        // For external signer accounts, use the registered signer.
+        // For local accounts, use the keys from the secrets store.
+        let unwrapped = if account.uses_external_signer() {
+            let signer = self.get_external_signer(&account.pubkey).ok_or_else(|| {
+                WhitenoiseError::Configuration(format!(
+                    "No external signer registered for account: {}",
+                    account.pubkey.to_hex()
+                ))
+            })?;
+            tracing::debug!(
+                target: "whitenoise::event_handlers::handle_giftwrap",
+                "Using external signer for giftwrap decryption"
+            );
+            // Arc<dyn NostrSigner> implements NostrSigner, so we can pass it directly
+            extract_rumor(&signer, &event).await.map_err(|e| {
+                WhitenoiseError::Configuration(format!(
+                    "Failed to decrypt giftwrap with external signer: {}",
+                    e
+                ))
+            })?
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&account.pubkey)?;
+            extract_rumor(&keys, &event).await.map_err(|e| {
+                WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
+            })?
+        };
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {

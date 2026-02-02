@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::*;
@@ -16,6 +18,38 @@ use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
+
+/// The type of account authentication.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Default)]
+pub enum AccountType {
+    /// Account with locally stored private key.
+    #[default]
+    Local,
+    /// Account using external signer (e.g., Amber via NIP-55).
+    /// The private key never touches this app.
+    External,
+}
+
+impl fmt::Display for AccountType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccountType::Local => write!(f, "local"),
+            AccountType::External => write!(f, "external"),
+        }
+    }
+}
+
+impl FromStr for AccountType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "local" => Ok(AccountType::Local),
+            "external" => Ok(AccountType::External),
+            _ => Err(format!("Unknown account type: {}", s)),
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AccountError {
@@ -38,14 +72,43 @@ pub enum AccountError {
     WhitenoiseNotInitialized,
 }
 
+/// Result of setting up relays for an external signer account.
+///
+/// Contains the relay lists for each type and flags indicating which lists
+/// need to be published (when defaults were used because no existing relays
+/// were found on the network).
+#[derive(Debug)]
+pub(crate) struct ExternalSignerRelaySetup {
+    pub nip65_relays: Vec<Relay>,
+    pub inbox_relays: Vec<Relay>,
+    pub key_package_relays: Vec<Relay>,
+    pub should_publish_nip65: bool,
+    pub should_publish_inbox: bool,
+    pub should_publish_key_package: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: Option<i64>,
     pub pubkey: PublicKey,
     pub user_id: i64,
+    /// The type of account (local key or external signer).
+    pub account_type: AccountType,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Account {
+    /// Returns true if this account uses an external signer.
+    pub fn uses_external_signer(&self) -> bool {
+        matches!(self.account_type, AccountType::External)
+    }
+
+    /// Returns true if this account has a locally stored private key.
+    pub fn has_local_key(&self) -> bool {
+        matches!(self.account_type, AccountType::Local)
+    }
 }
 
 impl Account {
@@ -62,12 +125,34 @@ impl Account {
             id: None,
             user_id: user.id.unwrap(),
             pubkey: keys.public_key(),
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
         Ok((account, keys))
+    }
+
+    /// Creates a new account for an external signer (pubkey only, no private key).
+    pub(crate) async fn new_external(
+        whitenoise: &Whitenoise,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (user, _created) =
+            User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
+
+        let account = Account {
+            id: None,
+            user_id: user.id.unwrap(),
+            pubkey,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        Ok(account)
     }
 
     /// Convert last_synced_at to a Timestamp applying a lookback buffer.
@@ -337,11 +422,226 @@ impl Whitenoise {
         Ok(account)
     }
 
+    /// Logs in using an external signer (e.g., Amber via NIP-55).
+    ///
+    /// This method creates an account for the given public key without storing any
+    /// private key locally. It performs the complete setup:
+    ///
+    /// 1. Creates/updates the account for the given public key
+    /// 2. Sets up relays (fetches existing from network or uses defaults)
+    /// 3. Registers the external signer for ongoing use (e.g., giftwrap decryption)
+    /// 4. Publishes relay lists if using defaults (using the signer)
+    /// 5. Publishes the MLS key package (using the signer)
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` - The user's public key obtained from the external signer.
+    /// * `signer` - The external signer to use for signing operations. Must implement `Clone`.
+    pub async fn login_with_external_signer(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<Account> {
+        tracing::debug!(
+            target: "whitenoise::login_external",
+            "Logging in with external signer, pubkey: {}",
+            pubkey.to_hex()
+        );
+
+        self.validate_signer_pubkey(&pubkey, &signer).await?;
+
+        let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
+
+        let user = account.user(&self.database).await?;
+        self.activate_account_without_publishing(
+            &account,
+            &user,
+            &relay_setup.nip65_relays,
+            &relay_setup.inbox_relays,
+            &relay_setup.key_package_relays,
+        )
+        .await?;
+
+        self.register_external_signer(pubkey, signer.clone());
+        self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
+            .await?;
+
+        tracing::debug!(
+            target: "whitenoise::login_external",
+            "Publishing MLS key package"
+        );
+        self.publish_key_package_for_account_with_signer(&account, signer)
+            .await?;
+
+        tracing::info!(
+            target: "whitenoise::login_external",
+            "Successfully logged in with external signer: {}",
+            account.pubkey.to_hex()
+        );
+
+        Ok(account)
+    }
+
+    /// Sets up an external signer account (creates or updates) and configures relays.
+    /// Also used by tests that need account setup without publishing.
+    async fn setup_external_signer_account(
+        &self,
+        pubkey: PublicKey,
+    ) -> Result<(Account, ExternalSignerRelaySetup)> {
+        // Check if account already exists
+        let mut account =
+            if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+                tracing::debug!(
+                    target: "whitenoise::setup_external_account",
+                    "Found existing account"
+                );
+
+                let mut account_mut = existing.clone();
+
+                // Handle migration from Local to External account type
+                if account_mut.account_type != AccountType::External {
+                    tracing::info!(
+                        target: "whitenoise::setup_external_account",
+                        "Migrating account from {:?} to External",
+                        account_mut.account_type
+                    );
+                    account_mut.account_type = AccountType::External;
+                    account_mut = self.persist_account(&account_mut).await?;
+                }
+
+                // Best-effort removal of any local keys
+                let _ = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey);
+
+                account_mut
+            } else {
+                // Create new external signer account
+                tracing::debug!(
+                    target: "whitenoise::setup_external_account",
+                    "Creating new external signer account"
+                );
+                let account = Account::new_external(self, pubkey).await?;
+                self.persist_account(&account).await?
+            };
+
+        // Setup relays
+        let relay_setup = self
+            .setup_relays_for_external_signer_account(&mut account)
+            .await?;
+
+        Ok((account, relay_setup))
+    }
+
+    /// Validates that an external signer's pubkey matches the expected pubkey.
+    ///
+    /// This prevents publishing relay lists or key packages under a wrong identity.
+    async fn validate_signer_pubkey(
+        &self,
+        expected_pubkey: &PublicKey,
+        signer: &impl NostrSigner,
+    ) -> Result<()> {
+        let signer_pubkey = signer.get_public_key().await.map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("Failed to get signer pubkey: {}", e))
+        })?;
+        if signer_pubkey != *expected_pubkey {
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "External signer pubkey mismatch: expected {}, got {}",
+                expected_pubkey.to_hex(),
+                signer_pubkey.to_hex()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Publishes relay lists using an external signer based on the relay setup configuration.
+    ///
+    /// Publishes NIP-65, inbox, and key package relay lists only if they need to be
+    /// published (i.e., using defaults rather than existing user-configured lists).
+    async fn publish_relay_lists_with_signer(
+        &self,
+        relay_setup: &ExternalSignerRelaySetup,
+        signer: impl NostrSigner + Clone,
+    ) -> Result<()> {
+        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
+
+        if relay_setup.should_publish_nip65 {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing NIP-65 relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &nip65_urls,
+                    RelayType::Nip65,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_inbox {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing inbox relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.inbox_relays),
+                    RelayType::Inbox,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_key_package {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing key package relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.key_package_relays),
+                    RelayType::KeyPackage,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Test-only: Sets up an external signer account without publishing.
+    ///
+    /// This is used by tests that only need to verify account creation/migration
+    /// logic without needing a real signer for publishing.
+    #[cfg(test)]
+    pub(crate) async fn login_with_external_signer_for_test(
+        &self,
+        pubkey: PublicKey,
+    ) -> Result<Account> {
+        let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
+
+        let user = account.user(&self.database).await?;
+        self.activate_account_without_publishing(
+            &account,
+            &user,
+            &relay_setup.nip65_relays,
+            &relay_setup.inbox_relays,
+            &relay_setup.key_package_relays,
+        )
+        .await?;
+
+        Ok(account)
+    }
+
     /// Logs out the user associated with the given account.
     ///
     /// This method performs the following steps:
     /// - Removes the account from the database.
-    /// - Removes the private key from the secret store.
+    /// - Removes the private key from the secret store (for local accounts only).
     /// - Updates the active account if the logged-out account was active.
     /// - Removes the account from the in-memory accounts list.
     ///
@@ -367,8 +667,13 @@ impl Whitenoise {
         account.delete(&self.database).await?;
 
         // Remove the private key from the secret store
-        self.secrets_store.remove_private_key_for_pubkey(pubkey)?;
-
+        // For local accounts this is required; for external accounts this is best-effort cleanup
+        let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+        match (account.has_local_key(), result) {
+            (true, Err(e)) => return Err(e.into()), // Local account MUST have key
+            (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
+            _ => {}
+        }
         Ok(())
     }
 
@@ -452,6 +757,46 @@ impl Whitenoise {
         self.setup_key_package(account, is_new_account, key_package_relays)
             .await?;
         tracing::debug!(target: "whitenoise::persist_and_activate_account", "Key package setup");
+        Ok(())
+    }
+
+    /// Activates an account without publishing anything (for external signer accounts).
+    /// This sets up relay connections and subscriptions but skips key package publishing.
+    async fn activate_account_without_publishing(
+        &self,
+        account: &Account,
+        user: &User,
+        nip65_relays: &[Relay],
+        inbox_relays: &[Relay],
+        key_package_relays: &[Relay],
+    ) -> Result<()> {
+        let relay_urls: Vec<RelayUrl> = Relay::urls(
+            nip65_relays
+                .iter()
+                .chain(inbox_relays)
+                .chain(key_package_relays),
+        );
+        self.nostr.ensure_relays_connected(&relay_urls).await?;
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Relays connected");
+
+        if let Err(e) = self.refresh_global_subscription_for_user(user).await {
+            tracing::warn!(
+                target: "whitenoise::activate_account_without_publishing",
+                "Failed to refresh global subscription for new user {}: {}",
+                user.pubkey,
+                e
+            );
+        }
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Global subscription refreshed");
+
+        self.setup_subscriptions(account, nip65_relays, inbox_relays)
+            .await?;
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Subscriptions setup");
+
+        // Note: We skip key package setup for external signer accounts.
+        // Key packages need to be published separately with the external signer.
+        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Skipping key package setup (external signer)");
+
         Ok(())
     }
 
@@ -602,6 +947,90 @@ impl Whitenoise {
         }
 
         Ok((nip65_relays, inbox_relays, key_package_relays))
+    }
+
+    /// Sets up relays for an external signer account.
+    ///
+    /// This is similar to `setup_relays_for_existing_account` but does NOT publish
+    /// relay lists (the caller with the signer should handle that).
+    /// It only fetches existing relays or uses defaults and saves them locally.
+    ///
+    /// Returns the relays for each type and booleans indicating which relay lists
+    /// should be published (true when defaults were used).
+    async fn setup_relays_for_external_signer_account(
+        &self,
+        account: &mut Account,
+    ) -> Result<ExternalSignerRelaySetup> {
+        let default_relays = self.load_default_relays().await?;
+
+        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
+        // We don't publish here - the caller with the signer will handle that
+        let (nip65_relays, should_publish_nip65) = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Nip65,
+                &default_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let (inbox_relays, should_publish_inbox) = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::Inbox,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        let (key_package_relays, should_publish_key_package) = self
+            .setup_external_account_relay_type(
+                account,
+                RelayType::KeyPackage,
+                &nip65_relays,
+                &default_relays,
+            )
+            .await?;
+
+        Ok(ExternalSignerRelaySetup {
+            nip65_relays,
+            inbox_relays,
+            key_package_relays,
+            should_publish_nip65,
+            should_publish_inbox,
+            should_publish_key_package,
+        })
+    }
+
+    /// Sets up a specific relay type for an external signer account.
+    /// Fetches from network or uses defaults, but never publishes.
+    ///
+    /// Returns the relays and a boolean indicating whether they should be published
+    /// (true if defaults were used because no existing relays were found).
+    async fn setup_external_account_relay_type(
+        &self,
+        account: &mut Account,
+        relay_type: RelayType,
+        source_relays: &[Relay],
+        default_relays: &[Relay],
+    ) -> Result<(Vec<Relay>, bool)> {
+        // Try to fetch existing relay lists first
+        let fetched_relays = self
+            .fetch_existing_relays(account.pubkey, relay_type, source_relays)
+            .await?;
+
+        let user = account.user(&self.database).await?;
+        if fetched_relays.is_empty() {
+            // No existing relay lists - use defaults, mark for publishing
+            user.add_relays(default_relays, relay_type, &self.database)
+                .await?;
+            Ok((default_relays.to_vec(), true))
+        } else {
+            // Found existing relay lists - use them, no publishing needed
+            user.add_relays(&fetched_relays, relay_type, &self.database)
+                .await?;
+            Ok((fetched_relays, false))
+        }
     }
 
     async fn setup_existing_account_relay_type(
@@ -855,21 +1284,37 @@ impl Whitenoise {
             ),
         }
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        // For external signer accounts, we can't get keys from the secret store.
+        // Set up subscriptions without a signer - the signer is only needed for
+        // decryption which will be handled separately for external signers.
+        if account.uses_external_signer() {
+            self.nostr
+                .setup_account_subscriptions(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    since,
+                )
+                .await?;
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        self.nostr
-            .setup_account_subscriptions_with_signer(
-                account.pubkey,
-                &user_relays,
-                &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
-                since,
-                keys,
-            )
-            .await?;
+            self.nostr
+                .setup_account_subscriptions_with_signer(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    since,
+                    keys,
+                )
+                .await?;
+        }
 
         tracing::debug!(
             target: "whitenoise::setup_subscriptions",
@@ -901,21 +1346,35 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        // For external signer accounts, we can't get keys from the secret store.
+        if account.uses_external_signer() {
+            self.nostr
+                .update_account_subscriptions(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                )
+                .await
+                .map_err(WhitenoiseError::from)
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        self.nostr
-            .update_account_subscriptions_with_signer(
-                account.pubkey,
-                &user_relays,
-                &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
-                keys,
-            )
-            .await
-            .map_err(WhitenoiseError::from)
+            self.nostr
+                .update_account_subscriptions_with_signer(
+                    account.pubkey,
+                    &user_relays,
+                    &inbox_relays,
+                    &group_relays_urls,
+                    &nostr_group_ids,
+                    keys,
+                )
+                .await
+                .map_err(WhitenoiseError::from)
+        }
     }
 }
 
@@ -1268,6 +1727,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1283,6 +1743,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(last),
             created_at: now,
             updated_at: now,
@@ -1300,6 +1761,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(epochish),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1316,6 +1778,7 @@ mod tests {
             id: None,
             pubkey: Keys::generate().public_key(),
             user_id: 1,
+            account_type: AccountType::Local,
             last_synced_at: Some(future),
             created_at: now,
             updated_at: now,
@@ -1460,5 +1923,1179 @@ mod tests {
             hex::encode(group.nostr_group_id),
             "Group ID should match the created group"
         );
+    }
+
+    #[tokio::test]
+    async fn test_logout_local_account_removes_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a local account directly in the database (bypassing relay setup)
+        let (account, keys) = create_test_account(&whitenoise).await;
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::Local,
+            "Account should be Local type"
+        );
+
+        // Store the key in secrets store
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Verify the key is stored
+        let stored_keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey);
+        assert!(stored_keys.is_ok(), "Key should be stored after login");
+
+        // Logout should remove the key
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // Verify the key was removed
+        let stored_keys_after = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey);
+        assert!(
+            stored_keys_after.is_err(),
+            "Key should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_external_account_cleans_stale_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an external account directly in the database
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account manually (bypassing relay setup)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::External,
+            "Account should be External type"
+        );
+
+        // Manually store a stale key (simulating orphaned key from failed migration)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Verify the stale key is stored
+        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(stored_keys.is_ok(), "Stale key should be stored");
+
+        // Logout should clean up the stale key via best-effort removal
+        whitenoise.logout(&pubkey).await.unwrap();
+
+        // Verify the stale key was removed
+        let stored_keys_after = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            stored_keys_after.is_err(),
+            "Stale key should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_external_account_without_key_succeeds() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an external account directly in the database
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account manually (bypassing relay setup)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        account.save(&whitenoise.database).await.unwrap();
+
+        assert_eq!(
+            account.account_type,
+            AccountType::External,
+            "Account should be External type"
+        );
+
+        // Don't store any key - verify there's no key
+        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(stored_keys.is_err(), "No key should be stored");
+
+        // Logout should succeed even with no key to remove
+        let result = whitenoise.logout(&pubkey).await;
+        assert!(
+            result.is_ok(),
+            "Logout should succeed for external account without stored key"
+        );
+    }
+
+    #[test]
+    fn test_has_local_key_returns_true_for_local_account() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.has_local_key(),
+            "Local account should have local key"
+        );
+    }
+
+    #[test]
+    fn test_has_local_key_returns_false_for_external_account() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    #[test]
+    fn test_account_type_from_str_local() {
+        let result: std::result::Result<AccountType, String> = "local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+
+        // Test case insensitivity
+        let result: std::result::Result<AccountType, String> = "LOCAL".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+
+        let result: std::result::Result<AccountType, String> = "Local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+    }
+
+    #[test]
+    fn test_account_type_from_str_external() {
+        let result: std::result::Result<AccountType, String> = "external".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+
+        // Test case insensitivity
+        let result: std::result::Result<AccountType, String> = "EXTERNAL".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+
+        let result: std::result::Result<AccountType, String> = "External".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_from_str_invalid() {
+        let result: std::result::Result<AccountType, String> = "invalid".parse();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unknown account type: invalid");
+
+        let result: std::result::Result<AccountType, String> = "".parse();
+        assert!(result.is_err());
+
+        let result: std::result::Result<AccountType, String> = "123".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_account_type_display() {
+        assert_eq!(format!("{}", AccountType::Local), "local");
+        assert_eq!(format!("{}", AccountType::External), "external");
+    }
+
+    #[test]
+    fn test_account_type_default() {
+        let default_type = AccountType::default();
+        assert_eq!(default_type, AccountType::Local);
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_true_for_external() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.uses_external_signer(),
+            "External account should use external signer"
+        );
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_false_for_local() {
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not use external signer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_external_creates_external_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        assert_eq!(account.account_type, AccountType::External);
+        assert_eq!(account.pubkey, pubkey);
+        assert!(account.id.is_none()); // Not persisted yet
+        assert!(account.last_synced_at.is_none());
+    }
+
+    /// Test that external account helper methods work correctly (uses_external_signer, has_local_key)
+    #[tokio::test]
+    async fn test_external_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create external account directly (doesn't need relay)
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Test helper methods
+        assert!(
+            account.uses_external_signer(),
+            "External account should report using external signer"
+        );
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    /// Test that local account helper methods return correct values
+    #[tokio::test]
+    async fn test_local_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create local account
+        let (account, _keys) = Account::new(&whitenoise, None).await.unwrap();
+
+        // Test helper methods
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not report using external signer"
+        );
+        assert!(
+            account.has_local_key(),
+            "Local account should report having local key"
+        );
+    }
+
+    /// Test Account struct serialization/deserialization with JSON
+    #[tokio::test]
+    async fn test_account_json_serialization_roundtrip() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create both types of accounts
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        // Serialize and deserialize external account
+        let external_json = serde_json::to_string(&external_account).unwrap();
+        let external_deserialized: Account = serde_json::from_str(&external_json).unwrap();
+        assert_eq!(external_account.pubkey, external_deserialized.pubkey);
+        assert_eq!(
+            external_account.account_type,
+            external_deserialized.account_type
+        );
+        assert_eq!(external_deserialized.account_type, AccountType::External);
+
+        // Serialize and deserialize local account
+        let local_json = serde_json::to_string(&local_account).unwrap();
+        let local_deserialized: Account = serde_json::from_str(&local_json).unwrap();
+        assert_eq!(local_account.pubkey, local_deserialized.pubkey);
+        assert_eq!(local_account.account_type, local_deserialized.account_type);
+        assert_eq!(local_deserialized.account_type, AccountType::Local);
+    }
+
+    /// Test Account debug formatting includes account_type
+    #[tokio::test]
+    async fn test_account_debug_includes_account_type() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        let external_debug = format!("{:?}", external_account);
+        let local_debug = format!("{:?}", local_account);
+
+        assert!(
+            external_debug.contains("External"),
+            "External account debug should contain 'External': {}",
+            external_debug
+        );
+        assert!(
+            local_debug.contains("Local"),
+            "Local account debug should contain 'Local': {}",
+            local_debug
+        );
+    }
+
+    /// Test Account::new_external properly sets up external account without relay fetch
+    #[tokio::test]
+    async fn test_new_external_sets_correct_fields() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Verify all fields are correctly set
+        assert_eq!(account.pubkey, pubkey);
+        assert_eq!(account.account_type, AccountType::External);
+        assert!(account.id.is_none(), "New account should not be persisted");
+        assert!(account.last_synced_at.is_none());
+        assert!(account.user_id > 0, "Should have a valid user_id");
+    }
+
+    /// Test external account persists correctly to database
+    #[tokio::test]
+    async fn test_external_account_database_roundtrip() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create and persist external account
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let persisted = whitenoise.persist_account(&account).await.unwrap();
+
+        // Verify persisted correctly
+        assert!(persisted.id.is_some());
+        assert_eq!(persisted.account_type, AccountType::External);
+
+        // Find it back
+        let found = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, pubkey);
+        assert_eq!(found.account_type, AccountType::External);
+    }
+
+    /// Test that secrets store doesn't have keys for external accounts
+    #[tokio::test]
+    async fn test_external_account_no_keys_in_secrets_store() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create external account (doesn't store any keys)
+        let _account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+
+        // Verify no keys in secrets store for this pubkey
+        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            result.is_err(),
+            "External account creation should not store any keys"
+        );
+    }
+
+    /// Test that login_with_external_signer rejects mismatched signer pubkey
+    #[tokio::test]
+    async fn test_login_with_external_signer_rejects_mismatched_pubkey() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create two different key pairs
+        let expected_keys = Keys::generate();
+        let wrong_keys = Keys::generate();
+        let expected_pubkey = expected_keys.public_key();
+
+        // Try to login with expected_pubkey but provide wrong_keys as signer
+        // This should fail because the signer's pubkey doesn't match
+        let result = whitenoise
+            .login_with_external_signer(expected_pubkey, wrong_keys)
+            .await;
+
+        assert!(result.is_err(), "Should reject mismatched signer pubkey");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("pubkey mismatch"),
+            "Error should mention pubkey mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test that login_with_external_signer accepts matching signer pubkey
+    #[tokio::test]
+    async fn test_login_with_external_signer_accepts_matching_pubkey() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Login with matching pubkey and signer - validation should pass
+        // Note: This test may still fail later due to relay connections,
+        // but the pubkey validation itself should succeed
+        let result = whitenoise.login_with_external_signer(pubkey, keys).await;
+
+        // If it fails, it should NOT be due to pubkey mismatch
+        if let Err(ref e) = result {
+            let err_msg = format!("{}", e);
+            assert!(
+                !err_msg.contains("pubkey mismatch"),
+                "Should not fail due to pubkey mismatch when keys match"
+            );
+        }
+        // Success is also acceptable (if relays are connected)
+    }
+
+    /// Test that external signer login doesn't store any private key
+    #[tokio::test]
+    async fn test_login_with_external_signer_has_no_local_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Login with external signer
+        let _account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Verify no keys stored in secrets store
+        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            result.is_err(),
+            "External signer account should not have local keys"
+        );
+    }
+
+    /// Test setup_external_signer_account handles fresh account
+    #[tokio::test]
+    async fn test_setup_external_signer_account_fresh() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Setup external signer account
+        let (account, relay_setup) = whitenoise
+            .setup_external_signer_account(pubkey)
+            .await
+            .unwrap();
+
+        // Verify account created correctly
+        assert_eq!(account.account_type, AccountType::External);
+        assert_eq!(account.pubkey, pubkey);
+
+        // For fresh account with no existing relays, should_publish flags should be true
+        // (since defaults are used)
+        assert!(
+            relay_setup.should_publish_nip65
+                || relay_setup.should_publish_inbox
+                || relay_setup.should_publish_key_package
+                || !relay_setup.nip65_relays.is_empty(),
+            "Relay setup should have relays or publish flags"
+        );
+    }
+
+    /// Test login_with_external_signer_for_test is idempotent
+    #[tokio::test]
+    async fn test_login_with_external_signer_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Login twice with same pubkey
+        let account1 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+        let account2 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Should be the same account
+        assert_eq!(account1.pubkey, account2.pubkey);
+        assert_eq!(account1.account_type, account2.account_type);
+
+        // Should still only have one account
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(
+            count, 1,
+            "Should have exactly one account after duplicate login"
+        );
+    }
+
+    /// Test that Account helper methods work correctly for external accounts
+    #[tokio::test]
+    async fn test_external_account_helper_methods() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Test helper methods
+        assert!(
+            account.uses_external_signer(),
+            "External account should report using external signer"
+        );
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_generated_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (account, keys) = Account::new(&whitenoise, None).await.unwrap();
+
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, keys.public_key());
+        assert!(account.id.is_none()); // Not persisted yet
+        assert!(account.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_provided_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let provided_keys = create_test_keys();
+
+        let (account, keys) = Account::new(&whitenoise, Some(provided_keys.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, provided_keys.public_key());
+        assert_eq!(keys.public_key(), provided_keys.public_key());
+        assert_eq!(keys.secret_key(), provided_keys.secret_key());
+    }
+
+    /// Comprehensive test for account relay operations including all relay types
+    #[tokio::test]
+    async fn test_account_relay_operations() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create and persist account
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // New account should have no relays
+        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(
+            account
+                .key_package_relays(&whitenoise)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Load and add default relays
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+        #[cfg(debug_assertions)]
+        assert_eq!(default_relays.len(), 2);
+
+        // Add relays for all types
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Nip65)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Inbox)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::KeyPackage)
+            .await
+            .unwrap();
+
+        // Verify all relay types have relays
+        let nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        let inbox = account.relays(RelayType::Inbox, &whitenoise).await.unwrap();
+        let kp = account
+            .relays(RelayType::KeyPackage, &whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(nip65.len(), default_relays.len());
+        assert_eq!(inbox.len(), default_relays.len());
+        assert_eq!(kp.len(), default_relays.len());
+
+        // Test add_relay and remove_relay on individual relays
+        let test_relay = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://test.relay.example").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        account
+            .add_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_add = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_add.len(), default_relays.len() + 1);
+
+        account
+            .remove_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_remove = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_remove.len(), default_relays.len());
+    }
+
+    /// Comprehensive test for account CRUD operations
+    #[tokio::test]
+    async fn test_account_crud_operations() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Initially empty
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 0);
+        assert!(whitenoise.all_accounts().await.unwrap().is_empty());
+
+        // Create and persist accounts
+        let (account1, _) = create_test_account(&whitenoise).await;
+        let account1 = whitenoise.persist_account(&account1).await.unwrap();
+        assert!(account1.id.is_some());
+
+        let (account2, _) = create_test_account(&whitenoise).await;
+        let _account2 = whitenoise.persist_account(&account2).await.unwrap();
+
+        // Verify counts and retrieval
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 2);
+        let all = whitenoise.all_accounts().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Find by pubkey
+        let found = whitenoise
+            .find_account_by_pubkey(&account1.pubkey)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, account1.pubkey);
+
+        // Not found for random pubkey
+        let random_pk = Keys::generate().public_key();
+        assert!(whitenoise.find_account_by_pubkey(&random_pk).await.is_err());
+
+        // Test user and metadata retrieval
+        let user = account1.user(&whitenoise.database).await.unwrap();
+        assert_eq!(user.pubkey, account1.pubkey);
+
+        let metadata = account1.metadata(&whitenoise).await.unwrap();
+        assert!(metadata.name.is_none() || metadata.name.as_deref() == Some(""));
+    }
+
+    /// Test account creation for both local and external account types
+    #[tokio::test]
+    async fn test_account_type_creation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account with generated keys
+        let (local_gen, keys_gen) = Account::new(&whitenoise, None).await.unwrap();
+        assert_eq!(local_gen.account_type, AccountType::Local);
+        assert_eq!(local_gen.pubkey, keys_gen.public_key());
+
+        // Local account with provided keys
+        let provided = create_test_keys();
+        let (local_prov, keys_prov) = Account::new(&whitenoise, Some(provided.clone()))
+            .await
+            .unwrap();
+        assert_eq!(local_prov.account_type, AccountType::Local);
+        assert_eq!(keys_prov.public_key(), provided.public_key());
+
+        // External account
+        let ext_pubkey = Keys::generate().public_key();
+        let external = Account::new_external(&whitenoise, ext_pubkey)
+            .await
+            .unwrap();
+        assert_eq!(external.account_type, AccountType::External);
+        assert_eq!(external.pubkey, ext_pubkey);
+        assert!(!external.has_local_key());
+        assert!(external.uses_external_signer());
+    }
+
+    #[test]
+    fn test_create_mdk_success() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let pubkey = Keys::generate().public_key();
+        let mdk = Account::create_mdk(pubkey, temp_dir.path());
+        assert!(mdk.is_ok());
+    }
+
+    /// Test logout removes keys correctly for both account types
+    #[tokio::test]
+    async fn test_logout_key_cleanup() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account logout removes key
+        let (local_account, keys) = create_test_account(&whitenoise).await;
+        local_account.save(&whitenoise.database).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&local_account.pubkey)
+                .is_ok()
+        );
+        whitenoise.logout(&local_account.pubkey).await.unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&local_account.pubkey)
+                .is_err()
+        );
+
+        // External account logout with stale key cleans up
+        let ext_keys = create_test_keys();
+        let ext_account = Account::new_external(&whitenoise, ext_keys.public_key())
+            .await
+            .unwrap();
+        ext_account.save(&whitenoise.database).await.unwrap();
+        whitenoise
+            .secrets_store
+            .store_private_key(&ext_keys)
+            .unwrap(); // Stale key
+
+        whitenoise.logout(&ext_account.pubkey).await.unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&ext_account.pubkey)
+                .is_err()
+        );
+
+        // External account logout without key succeeds
+        let ext2 = Account::new_external(&whitenoise, Keys::generate().public_key())
+            .await
+            .unwrap();
+        ext2.save(&whitenoise.database).await.unwrap();
+        assert!(whitenoise.logout(&ext2.pubkey).await.is_ok());
+    }
+
+    /// Test upload_profile_picture uploads to blossom server and returns URL
+    /// Requires blossom server running on localhost:3000
+    #[ignore]
+    #[tokio::test]
+    async fn test_upload_profile_picture() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create and persist account with stored keys
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Use the test image file
+        let test_image_path = ".test/fake_image.png";
+
+        // Check if blossom server is available
+        let blossom_url = nostr_sdk::Url::parse("http://localhost:3000").unwrap();
+
+        let result = account
+            .upload_profile_picture(
+                test_image_path,
+                crate::types::ImageType::Png,
+                blossom_url,
+                &whitenoise,
+            )
+            .await;
+
+        // Test should succeed if blossom server is running
+        assert!(
+            result.is_ok(),
+            "upload_profile_picture should succeed. Error: {:?}",
+            result.err()
+        );
+
+        let url = result.unwrap();
+        assert!(
+            url.starts_with("http://localhost:3000"),
+            "Returned URL should be from blossom server"
+        );
+    }
+
+    /// Test upload_profile_picture fails gracefully with non-existent file
+    #[ignore]
+    #[tokio::test]
+    async fn test_upload_profile_picture_nonexistent_file() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        let blossom_url = nostr_sdk::Url::parse("http://localhost:3000").unwrap();
+
+        let result = account
+            .upload_profile_picture(
+                "/nonexistent/path/image.png",
+                crate::types::ImageType::Png,
+                blossom_url,
+                &whitenoise,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "upload_profile_picture should fail for non-existent file"
+        );
+    }
+
+    /// Test login_with_external_signer creates new external account
+    #[tokio::test]
+    async fn test_login_with_external_signer_new_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Login with external signer (new account)
+        let account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Verify account was created correctly
+        assert_eq!(account.pubkey, pubkey);
+        assert_eq!(account.account_type, AccountType::External);
+        assert!(account.id.is_some(), "Account should be persisted");
+        assert!(account.uses_external_signer(), "Should use external signer");
+        assert!(!account.has_local_key(), "Should not have local key");
+
+        // Verify no private key was stored
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "External account should not have stored private key"
+        );
+
+        // Verify relay lists are set up
+        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
+        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+
+        assert!(!nip65.is_empty(), "Should have NIP-65 relays");
+        assert!(!inbox.is_empty(), "Should have inbox relays");
+        assert!(!kp.is_empty(), "Should have key package relays");
+    }
+
+    /// Test login_with_external_signer with existing account re-establishes connections
+    #[tokio::test]
+    async fn test_login_with_external_signer_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // First login - creates new account
+        let account1 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+        assert!(account1.id.is_some());
+
+        // Allow some time for setup
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Second login - should return existing account
+        let account2 = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(account1.pubkey, account2.pubkey);
+        assert_eq!(account2.account_type, AccountType::External);
+    }
+
+    /// Test login_with_external_signer migrates local account to external
+    #[tokio::test]
+    async fn test_login_with_external_signer_migrates_local_to_external() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // First, create a local account directly
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        let (local_account, _) = Account::new(&whitenoise, Some(keys.clone())).await.unwrap();
+        assert_eq!(local_account.account_type, AccountType::Local);
+        let _local_account = whitenoise.persist_account(&local_account).await.unwrap();
+
+        // Store the key (simulating normal local account creation)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Now login with external signer - should migrate
+        let migrated = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(migrated.pubkey, pubkey);
+        assert_eq!(
+            migrated.account_type,
+            AccountType::External,
+            "Account should be migrated to External"
+        );
+
+        // Verify local key was removed during migration
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "Local key should be removed during migration to external"
+        );
+    }
+
+    /// Test login_with_external_signer removes stale keys on re-login
+    #[tokio::test]
+    async fn test_login_with_external_signer_removes_stale_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create external account first
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        whitenoise.persist_account(&account).await.unwrap();
+
+        // Manually store a "stale" key (simulating failed migration or orphaned key)
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_ok()
+        );
+
+        // Login with external signer - should clean up stale key
+        whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Verify stale key was removed
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&pubkey)
+                .is_err(),
+            "Stale key should be removed during external signer login"
+        );
+    }
+
+    // AccountType Serialization Tests
+    #[test]
+    fn test_account_type_json_serialization() {
+        // Test Local serializes correctly
+        let local = AccountType::Local;
+        let json = serde_json::to_string(&local).unwrap();
+        assert_eq!(json, "\"Local\"");
+
+        // Test External serializes correctly
+        let external = AccountType::External;
+        let json = serde_json::to_string(&external).unwrap();
+        assert_eq!(json, "\"External\"");
+    }
+
+    #[test]
+    fn test_account_type_json_deserialization() {
+        // Test Local deserializes correctly
+        let local: AccountType = serde_json::from_str("\"Local\"").unwrap();
+        assert_eq!(local, AccountType::Local);
+
+        // Test External deserializes correctly
+        let external: AccountType = serde_json::from_str("\"External\"").unwrap();
+        assert_eq!(external, AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_serialization_roundtrip() {
+        // Test roundtrip for Local
+        let original_local = AccountType::Local;
+        let serialized = serde_json::to_string(&original_local).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(original_local, deserialized);
+
+        // Test roundtrip for External
+        let original_external = AccountType::External;
+        let serialized = serde_json::to_string(&original_external).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(original_external, deserialized);
+    }
+
+    #[test]
+    fn test_account_type_equality_and_hash() {
+        use std::collections::HashSet;
+
+        // Test equality
+        assert_eq!(AccountType::Local, AccountType::Local);
+        assert_eq!(AccountType::External, AccountType::External);
+        assert_ne!(AccountType::Local, AccountType::External);
+
+        // Test hashability (can be used in HashSet)
+        let mut set = HashSet::new();
+        set.insert(AccountType::Local);
+        set.insert(AccountType::External);
+        assert_eq!(set.len(), 2);
+
+        // Inserting duplicate should not increase size
+        set.insert(AccountType::Local);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_account_type_clone() {
+        let local = AccountType::Local;
+        let cloned = local.clone();
+        assert_eq!(local, cloned);
+
+        let external = AccountType::External;
+        let cloned = external.clone();
+        assert_eq!(external, cloned);
+    }
+
+    #[test]
+    fn test_account_type_debug() {
+        let local = AccountType::Local;
+        let debug_str = format!("{:?}", local);
+        assert!(debug_str.contains("Local"));
+
+        let external = AccountType::External;
+        let debug_str = format!("{:?}", external);
+        assert!(debug_str.contains("External"));
+    }
+
+    /// Test that validate_signer_pubkey succeeds when pubkeys match
+    #[tokio::test]
+    async fn test_validate_signer_pubkey_matching() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Should succeed when signer's pubkey matches expected pubkey
+        let result = whitenoise.validate_signer_pubkey(&pubkey, &keys).await;
+        assert!(result.is_ok(), "Should succeed with matching pubkeys");
+    }
+
+    /// Test that validate_signer_pubkey fails when pubkeys don't match
+    #[tokio::test]
+    async fn test_validate_signer_pubkey_mismatched() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let expected_keys = Keys::generate();
+        let wrong_keys = Keys::generate();
+        let expected_pubkey = expected_keys.public_key();
+
+        // Should fail when signer's pubkey doesn't match expected pubkey
+        let result = whitenoise
+            .validate_signer_pubkey(&expected_pubkey, &wrong_keys)
+            .await;
+
+        assert!(result.is_err(), "Should fail with mismatched pubkeys");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("pubkey mismatch"),
+            "Error should mention pubkey mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test that publish_relay_lists_with_signer skips publishing when all flags are false
+    #[tokio::test]
+    async fn test_publish_relay_lists_with_signer_skips_when_flags_false() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        // Create relay setup with all publish flags set to false
+        let relay_setup = ExternalSignerRelaySetup {
+            nip65_relays: vec![],
+            inbox_relays: vec![],
+            key_package_relays: vec![],
+            should_publish_nip65: false,
+            should_publish_inbox: false,
+            should_publish_key_package: false,
+        };
+
+        // Should succeed without attempting any network operations
+        let result = whitenoise
+            .publish_relay_lists_with_signer(&relay_setup, keys)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when no publishing is needed"
+        );
+    }
+
+    /// Test that publish_relay_lists_with_signer attempts publishing when flags are true
+    #[tokio::test]
+    async fn test_publish_relay_lists_with_signer_publishes_when_flags_true() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create an external account first - required for event tracking
+        let _account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Load default relays to have valid relay URLs
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+
+        // Create relay setup with all publish flags set to true
+        let relay_setup = ExternalSignerRelaySetup {
+            nip65_relays: default_relays.clone(),
+            inbox_relays: default_relays.clone(),
+            key_package_relays: default_relays,
+            should_publish_nip65: true,
+            should_publish_inbox: true,
+            should_publish_key_package: true,
+        };
+
+        // This may fail due to relay connectivity in test environment,
+        // but it exercises the code path that attempts publishing
+        let result = whitenoise
+            .publish_relay_lists_with_signer(&relay_setup, keys)
+            .await;
+
+        // We accept either success (if relays are connected) or
+        // specific network errors (if relays are not connected)
+        // The important thing is the method doesn't panic and
+        // correctly handles the flags
+        if let Err(ref e) = result {
+            let err_msg = format!("{}", e);
+            // These are acceptable errors in a test environment without relay connections
+            let acceptable_errors = err_msg.contains("relay")
+                || err_msg.contains("connection")
+                || err_msg.contains("timeout")
+                || err_msg.contains("Timeout");
+            assert!(
+                acceptable_errors || result.is_ok(),
+                "Unexpected error: {}",
+                err_msg
+            );
+        }
     }
 }

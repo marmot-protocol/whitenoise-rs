@@ -44,7 +44,43 @@ impl NostrManager {
 
         // 2. Set signer once and process all relays in parallel
         self.with_signer(signer, || async {
-            let futures = relay_user_map.into_iter().map(|(relay_url, users)| async move {
+            self.setup_batched_relay_subscriptions_inner(relay_user_map, since)
+                .await
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    // Sets up subscriptions in batches for all users and their relays (without signer)
+    // Used for external signer accounts.
+    pub(crate) async fn setup_batched_relay_subscriptions(
+        &self,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+        since: Option<Timestamp>,
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions",
+            "Setting up batched relay subscriptions (no signer) (users={}, defaults={})",
+            users_with_relays.len(),
+            default_relays.len()
+        );
+
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+        self.setup_batched_relay_subscriptions_inner(relay_user_map, since)
+            .await
+    }
+
+    // Inner implementation for setting up batched relay subscriptions
+    async fn setup_batched_relay_subscriptions_inner(
+        &self,
+        relay_user_map: std::collections::HashMap<RelayUrl, Vec<PublicKey>>,
+        since: Option<Timestamp>,
+    ) -> Result<()> {
+        let futures = relay_user_map
+            .into_iter()
+            .map(|(relay_url, users)| async move {
                 match self
                     .create_deterministic_batches_for_relay(relay_url.clone(), users, since)
                     .await
@@ -52,7 +88,7 @@ impl NostrManager {
                     Ok(_) => true,
                     Err(e) => {
                         tracing::error!(
-                            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions_with_signer",
+                            target: "whitenoise::nostr_manager::setup_batched_relay_subscriptions",
                             error = %e,
                             "Failed to create deterministic batches for relay: {}",
                             relay_url
@@ -62,13 +98,11 @@ impl NostrManager {
                 }
             });
 
-            let results = futures::future::join_all(futures).await;
-            if !results.into_iter().any(|success| success) {
-                return Err(NostrManagerError::NoRelayConnections);
-            }
-            Ok(())
-        })
-        .await
+        let results = futures::future::join_all(futures).await;
+        if !results.into_iter().any(|success| success) {
+            return Err(NostrManagerError::NoRelayConnections);
+        }
+        Ok(())
     }
 
     async fn create_deterministic_batches_for_relay(
@@ -231,31 +265,54 @@ impl NostrManager {
 
         // Set signer once and process all relays in parallel
         self.with_signer(signer, || async {
-            let futures = relay_user_map
-                .into_iter()
-                .filter(|(_, users)| users.contains(&user_pubkey))
-                .map(|(relay_url, users)| async move {
-                    if let Err(e) = self
-                        .refresh_batch_for_relay_containing_user(
-                            relay_url.clone(),
-                            users,
-                            user_pubkey,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
-                            error = %e,
-                            "Failed to refresh batch for relay: {}",
-                            relay_url
-                        );
-                    }
-                });
-
-            futures::future::join_all(futures).await;
-            Ok(())
+            self.refresh_user_global_subscriptions_inner(user_pubkey, relay_user_map)
+                .await
         })
         .await
+    }
+
+    /// Refresh subscriptions for a specific user across all their relays (without signer).
+    /// Used for external signer accounts.
+    pub(crate) async fn refresh_user_global_subscriptions(
+        &self,
+        user_pubkey: PublicKey,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
+            "Refreshing user global subscriptions (no signer)"
+        );
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+        self.refresh_user_global_subscriptions_inner(user_pubkey, relay_user_map)
+            .await
+    }
+
+    /// Inner implementation for refreshing user global subscriptions
+    async fn refresh_user_global_subscriptions_inner(
+        &self,
+        user_pubkey: PublicKey,
+        relay_user_map: std::collections::HashMap<RelayUrl, Vec<PublicKey>>,
+    ) -> Result<()> {
+        let futures = relay_user_map
+            .into_iter()
+            .filter(|(_, users)| users.contains(&user_pubkey))
+            .map(|(relay_url, users)| async move {
+                if let Err(e) = self
+                    .refresh_batch_for_relay_containing_user(relay_url.clone(), users, user_pubkey)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
+                        error = %e,
+                        "Failed to refresh batch for relay: {}",
+                        relay_url
+                    );
+                }
+            });
+
+        futures::future::join_all(futures).await;
+        Ok(())
     }
 
     /// This method rebuilds the subscriptions for all of the relays the user has
@@ -615,5 +672,133 @@ mod tests {
 
         // Batch ID should be within valid range
         assert!(batch_id_1 < batch_count);
+    }
+
+    /// Test setup_batched_relay_subscriptions (no signer version) with empty users
+    #[tokio::test]
+    async fn test_setup_batched_relay_subscriptions_no_signer_empty_users() {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)> = vec![];
+        let default_relays: Vec<RelayUrl> = vec![];
+
+        // With empty users and no relays, should fail with NoRelayConnections
+        let result = nostr_manager
+            .setup_batched_relay_subscriptions(users_with_relays, &default_relays, None)
+            .await;
+
+        // Should error because there are no relay connections to establish
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            NostrManagerError::NoRelayConnections
+        ));
+    }
+
+    /// Test that no-signer version works the same as with-signer version for empty inputs
+    #[tokio::test]
+    async fn test_setup_batched_relay_subscriptions_no_signer_single_user() {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let users_with_relays = vec![(pubkey, vec![])];
+        let default_relays: Vec<RelayUrl> = vec![];
+
+        // With user but no relays, should fail with NoRelayConnections
+        let result = nostr_manager
+            .setup_batched_relay_subscriptions(users_with_relays, &default_relays, None)
+            .await;
+
+        // Should error because there are no relay connections
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            NostrManagerError::NoRelayConnections
+        ));
+    }
+
+    /// Test refresh_user_global_subscriptions (no signer version)
+    #[tokio::test]
+    async fn test_refresh_user_global_subscriptions_empty_relays() {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)> = vec![];
+        let default_relays: Vec<RelayUrl> = vec![];
+
+        // With empty relays, should handle gracefully
+        let result = nostr_manager
+            .refresh_user_global_subscriptions(pubkey, users_with_relays, &default_relays)
+            .await;
+
+        // Should succeed but do nothing (no relays to connect to)
+        assert!(result.is_ok());
+    }
+
+    /// Test group_users_by_relay helper function
+    #[tokio::test]
+    async fn test_group_users_by_relay() {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey1 = Keys::generate().public_key();
+        let pubkey2 = Keys::generate().public_key();
+        let relay1 = RelayUrl::parse("wss://relay1.test.com").unwrap();
+        let relay2 = RelayUrl::parse("wss://relay2.test.com").unwrap();
+
+        let users_with_relays = vec![
+            (pubkey1, vec![relay1.clone(), relay2.clone()]),
+            (pubkey2, vec![relay2.clone()]),
+        ];
+        let default_relays: Vec<RelayUrl> = vec![];
+
+        let grouped = nostr_manager.group_users_by_relay(users_with_relays, &default_relays);
+
+        // relay1 should have 1 user (pubkey1)
+        assert_eq!(grouped.get(&relay1).map(|v| v.len()), Some(1));
+        // relay2 should have 2 users (pubkey1 and pubkey2)
+        assert_eq!(grouped.get(&relay2).map(|v| v.len()), Some(2));
+    }
+
+    /// Test group_users_by_relay with default relays
+    #[tokio::test]
+    async fn test_group_users_by_relay_with_defaults() {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey1 = Keys::generate().public_key();
+        let default_relay = RelayUrl::parse("wss://default.relay.com").unwrap();
+
+        // User with no relays should use defaults
+        let users_with_relays = vec![(pubkey1, vec![])];
+        let default_relays = vec![default_relay.clone()];
+
+        let grouped = nostr_manager.group_users_by_relay(users_with_relays, &default_relays);
+
+        // User with no relays should be grouped under default relay
+        assert_eq!(grouped.get(&default_relay).map(|v| v.len()), Some(1));
     }
 }

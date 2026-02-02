@@ -288,6 +288,35 @@ impl NostrManager {
         .await
     }
 
+    /// Updates account subscriptions without a signer (for external signer accounts).
+    ///
+    /// This version is used for accounts that use external signers (like Amber) where
+    /// the private key is not available locally.
+    pub(crate) async fn update_account_subscriptions(
+        &self,
+        pubkey: PublicKey,
+        user_relays: &[RelayUrl],
+        inbox_relays: &[RelayUrl],
+        group_relays: &[RelayUrl],
+        nostr_group_ids: &[String],
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::update_account_subscriptions",
+            "Updating account subscriptions (no signer) with cleanup for relay changes"
+        );
+        let buffer_time = Timestamp::now() - Duration::from_secs(10);
+        self.unsubscribe_account_subscriptions(&pubkey).await?;
+        self.setup_account_subscriptions(
+            pubkey,
+            user_relays,
+            inbox_relays,
+            group_relays,
+            nostr_group_ids,
+            Some(buffer_time),
+        )
+        .await
+    }
+
     /// Ensures that the signer is unset and all subscriptions are cleared.
     pub(crate) async fn delete_all_data(&self) -> Result<()> {
         tracing::debug!(
@@ -553,5 +582,46 @@ mod subscription_monitoring_tests {
 
         // Should return false when relay is not in the client pool
         assert!(!result);
+    }
+
+    /// Test update_account_subscriptions with empty relays
+    #[tokio::test]
+    async fn test_update_account_subscriptions_empty_relays() {
+        let (event_sender, _receiver) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let empty_relays: Vec<RelayUrl> = vec![];
+        let empty_group_ids: Vec<String> = vec![];
+
+        // Update subscriptions with empty relays - may fail or succeed depending on impl
+        let result = nostr_manager
+            .update_account_subscriptions(
+                pubkey,
+                &empty_relays,
+                &empty_relays,
+                &empty_relays,
+                &empty_group_ids,
+            )
+            .await;
+
+        // The function should complete without panicking
+        // It may return an error for no relays, which is acceptable
+        if let Err(ref e) = result {
+            // Error is acceptable - just verify it's a reasonable error
+            let err_msg = format!("{:?}", e);
+            assert!(
+                err_msg.contains("relay")
+                    || err_msg.contains("Relay")
+                    || err_msg.contains("connection"),
+                "Error should be relay-related: {}",
+                err_msg
+            );
+        }
+        // Success is also acceptable
     }
 }
