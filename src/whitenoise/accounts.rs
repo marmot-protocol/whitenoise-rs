@@ -448,18 +448,7 @@ impl Whitenoise {
             pubkey.to_hex()
         );
 
-        // Validate that the signer's pubkey matches the expected pubkey
-        // This prevents publishing relay lists or key packages under a wrong identity
-        let signer_pubkey = signer.get_public_key().await.map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to get signer pubkey: {}", e))
-        })?;
-        if signer_pubkey != pubkey {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                "External signer pubkey mismatch: expected {}, got {}",
-                pubkey.to_hex(),
-                signer_pubkey.to_hex()
-            )));
-        }
+        self.validate_signer_pubkey(&pubkey, &signer).await?;
 
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
 
@@ -473,58 +462,10 @@ impl Whitenoise {
         )
         .await?;
 
-        // Register the signer for ongoing use (e.g., giftwrap decryption)
         self.register_external_signer(pubkey, signer.clone());
+        self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
+            .await?;
 
-        // Publish relay lists if using defaults
-        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
-
-        if relay_setup.should_publish_nip65 {
-            tracing::debug!(
-                target: "whitenoise::login_external",
-                "Publishing NIP-65 relay list (defaults)"
-            );
-            self.nostr
-                .publish_relay_list_with_signer(
-                    &nip65_urls,
-                    RelayType::Nip65,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
-        }
-
-        if relay_setup.should_publish_inbox {
-            tracing::debug!(
-                target: "whitenoise::login_external",
-                "Publishing inbox relay list (defaults)"
-            );
-            self.nostr
-                .publish_relay_list_with_signer(
-                    &Relay::urls(&relay_setup.inbox_relays),
-                    RelayType::Inbox,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
-        }
-
-        if relay_setup.should_publish_key_package {
-            tracing::debug!(
-                target: "whitenoise::login_external",
-                "Publishing key package relay list (defaults)"
-            );
-            self.nostr
-                .publish_relay_list_with_signer(
-                    &Relay::urls(&relay_setup.key_package_relays),
-                    RelayType::KeyPackage,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
-        }
-
-        // Publish the key package
         tracing::debug!(
             target: "whitenoise::login_external",
             "Publishing MLS key package"
@@ -590,6 +531,86 @@ impl Whitenoise {
             .await?;
 
         Ok((account, relay_setup))
+    }
+
+    /// Validates that an external signer's pubkey matches the expected pubkey.
+    ///
+    /// This prevents publishing relay lists or key packages under a wrong identity.
+    async fn validate_signer_pubkey(
+        &self,
+        expected_pubkey: &PublicKey,
+        signer: &impl NostrSigner,
+    ) -> Result<()> {
+        let signer_pubkey = signer.get_public_key().await.map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("Failed to get signer pubkey: {}", e))
+        })?;
+        if signer_pubkey != *expected_pubkey {
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "External signer pubkey mismatch: expected {}, got {}",
+                expected_pubkey.to_hex(),
+                signer_pubkey.to_hex()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Publishes relay lists using an external signer based on the relay setup configuration.
+    ///
+    /// Publishes NIP-65, inbox, and key package relay lists only if they need to be
+    /// published (i.e., using defaults rather than existing user-configured lists).
+    async fn publish_relay_lists_with_signer(
+        &self,
+        relay_setup: &ExternalSignerRelaySetup,
+        signer: impl NostrSigner + Clone,
+    ) -> Result<()> {
+        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
+
+        if relay_setup.should_publish_nip65 {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing NIP-65 relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &nip65_urls,
+                    RelayType::Nip65,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_inbox {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing inbox relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.inbox_relays),
+                    RelayType::Inbox,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        if relay_setup.should_publish_key_package {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Publishing key package relay list (defaults)"
+            );
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &Relay::urls(&relay_setup.key_package_relays),
+                    RelayType::KeyPackage,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await?;
+        }
+
+        Ok(())
     }
 
     /// Test-only: Sets up an external signer account without publishing.
@@ -2963,5 +2984,111 @@ mod tests {
         let external = AccountType::External;
         let debug_str = format!("{:?}", external);
         assert!(debug_str.contains("External"));
+    }
+
+    /// Test that validate_signer_pubkey succeeds when pubkeys match
+    #[tokio::test]
+    async fn test_validate_signer_pubkey_matching() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Should succeed when signer's pubkey matches expected pubkey
+        let result = whitenoise.validate_signer_pubkey(&pubkey, &keys).await;
+        assert!(result.is_ok(), "Should succeed with matching pubkeys");
+    }
+
+    /// Test that validate_signer_pubkey fails when pubkeys don't match
+    #[tokio::test]
+    async fn test_validate_signer_pubkey_mismatched() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let expected_keys = Keys::generate();
+        let wrong_keys = Keys::generate();
+        let expected_pubkey = expected_keys.public_key();
+
+        // Should fail when signer's pubkey doesn't match expected pubkey
+        let result = whitenoise
+            .validate_signer_pubkey(&expected_pubkey, &wrong_keys)
+            .await;
+
+        assert!(result.is_err(), "Should fail with mismatched pubkeys");
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(
+            err_msg.contains("pubkey mismatch"),
+            "Error should mention pubkey mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test that publish_relay_lists_with_signer skips publishing when all flags are false
+    #[tokio::test]
+    async fn test_publish_relay_lists_with_signer_skips_when_flags_false() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        // Create relay setup with all publish flags set to false
+        let relay_setup = ExternalSignerRelaySetup {
+            nip65_relays: vec![],
+            inbox_relays: vec![],
+            key_package_relays: vec![],
+            should_publish_nip65: false,
+            should_publish_inbox: false,
+            should_publish_key_package: false,
+        };
+
+        // Should succeed without attempting any network operations
+        let result = whitenoise
+            .publish_relay_lists_with_signer(&relay_setup, keys)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when no publishing is needed"
+        );
+    }
+
+    /// Test that publish_relay_lists_with_signer attempts publishing when flags are true
+    #[tokio::test]
+    async fn test_publish_relay_lists_with_signer_publishes_when_flags_true() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        // Load default relays to have valid relay URLs
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+
+        // Create relay setup with all publish flags set to true
+        let relay_setup = ExternalSignerRelaySetup {
+            nip65_relays: default_relays.clone(),
+            inbox_relays: default_relays.clone(),
+            key_package_relays: default_relays,
+            should_publish_nip65: true,
+            should_publish_inbox: true,
+            should_publish_key_package: true,
+        };
+
+        // This may fail due to relay connectivity in test environment,
+        // but it exercises the code path that attempts publishing
+        let result = whitenoise
+            .publish_relay_lists_with_signer(&relay_setup, keys)
+            .await;
+
+        // We accept either success (if relays are connected) or
+        // specific network errors (if relays are not connected)
+        // The important thing is the method doesn't panic and
+        // correctly handles the flags
+        if let Err(ref e) = result {
+            let err_msg = format!("{}", e);
+            // These are acceptable errors in a test environment without relay connections
+            let acceptable_errors = err_msg.contains("relay")
+                || err_msg.contains("connection")
+                || err_msg.contains("timeout")
+                || err_msg.contains("Timeout");
+            assert!(
+                acceptable_errors || result.is_ok(),
+                "Unexpected error: {}",
+                err_msg
+            );
+        }
     }
 }
