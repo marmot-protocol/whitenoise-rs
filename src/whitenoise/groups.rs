@@ -9,6 +9,7 @@ use mdk_core::extension::group_image;
 use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_storage_traits::Secret;
 use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
@@ -839,11 +840,17 @@ impl Whitenoise {
             blossom_url
         );
 
-        // Download, verify, decrypt, and cache the image
+        // Download and decrypt the image (MDK handles hash verification internally)
         let encrypted_data = Self::download_blob_from_blossom(&blossom_url, image_hash).await?;
-        Self::verify_blob_hash(&encrypted_data, image_hash)?;
 
-        let decrypted_data = Self::decrypt_group_image(&encrypted_data, image_key, image_nonce)?;
+        let secret_key = Secret::new(*image_key);
+        let secret_nonce = Secret::new(*image_nonce);
+        let decrypted_data = Self::decrypt_group_image(
+            &encrypted_data,
+            Some(image_hash),
+            &secret_key,
+            &secret_nonce,
+        )?;
         let image_type = ImageType::detect(&decrypted_data).map_err(|e| {
             WhitenoiseError::UnsupportedMediaFormat(format!("Failed to detect image type: {}", e))
         })?;
@@ -956,6 +963,8 @@ impl Whitenoise {
             blossom_url: existing_record.blossom_url.as_deref(),
             nostr_key: existing_record.nostr_key.clone(),
             file_metadata: metadata_ref,
+            nonce: existing_record.nonce.as_deref().map(|s| s.to_string()),
+            scheme_version: existing_record.scheme_version.as_deref(),
         };
 
         self.media_files()
@@ -994,7 +1003,8 @@ impl Whitenoise {
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         // Derive the upload keypair from the image key for cleanup purposes
-        let upload_keypair = group_image::derive_upload_keypair(image_key).map_err(|e| {
+        let secret_key = Secret::new(*image_key);
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
             WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
         })?;
 
@@ -1007,6 +1017,8 @@ impl Whitenoise {
             blossom_url: None,
             nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         self.media_files()
@@ -1040,31 +1052,20 @@ impl Whitenoise {
             })
     }
 
-    /// Verifies that downloaded blob matches expected hash
-    fn verify_blob_hash(data: &[u8], expected_hash: &[u8; 32]) -> Result<()> {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let actual_hash: [u8; 32] = hasher.finalize().into();
-
-        if &actual_hash != expected_hash {
-            return Err(WhitenoiseError::HashMismatch {
-                expected: hex::encode(expected_hash),
-                actual: hex::encode(actual_hash),
-            });
-        }
-
-        Ok(())
-    }
-
     /// Decrypts a group image using the provided key and nonce
     fn decrypt_group_image(
         encrypted_data: &[u8],
-        image_key: &[u8; 32],
-        image_nonce: &[u8; 12],
+        expected_hash: Option<&[u8; 32]>,
+        image_key: &Secret<[u8; 32]>,
+        image_nonce: &Secret<[u8; 12]>,
     ) -> Result<Vec<u8>> {
-        group_image::decrypt_group_image(encrypted_data, image_key, image_nonce).map_err(|e| {
-            WhitenoiseError::ImageDecryptionFailed(format!("Failed to decrypt group image: {}", e))
-        })
+        group_image::decrypt_group_image(encrypted_data, expected_hash, image_key, image_nonce)
+            .map_err(|e| {
+                WhitenoiseError::ImageDecryptionFailed(format!(
+                    "Failed to decrypt group image: {}",
+                    e
+                ))
+            })
     }
 
     /// Downloads and decrypts a chat media blob
@@ -1130,12 +1131,33 @@ impl Whitenoise {
         let mdk = Account::create_mdk(*account_pubkey, data_dir)?;
         let media_manager = mdk.media_manager(group_id.clone());
 
+        // Retrieve nonce and scheme_version from database (required for MDK decryption)
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::MediaCache("Missing nonce for chat media".to_string())
+        })?;
+        let scheme_version = media_file
+            .scheme_version
+            .as_ref()
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache("Missing scheme_version for chat media".to_string())
+            })?
+            .clone();
+
+        // Decode nonce from hex string to bytes
+        let nonce_bytes = hex::decode(nonce_hex)
+            .map_err(|_| WhitenoiseError::MediaCache("Invalid nonce hex".to_string()))?;
+        let nonce: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| WhitenoiseError::MediaCache("Invalid nonce length".to_string()))?;
+
         let reference = MediaReference {
             url: String::new(),
             original_hash: *original_file_hash,
             mime_type: media_file.mime_type.clone(),
             filename: filename.to_string(),
             dimensions: None, // Not used in decryption (only display metadata)
+            scheme_version,
+            nonce,
         };
 
         media_manager
@@ -1168,7 +1190,8 @@ impl Whitenoise {
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         // Derive the upload keypair from the image key for cleanup purposes
-        let upload_keypair = group_image::derive_upload_keypair(image_key).map_err(|e| {
+        let secret_key = Secret::new(*image_key);
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
             WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
         })?;
 
@@ -1181,6 +1204,8 @@ impl Whitenoise {
             blossom_url: Some(blossom_url.as_str()),
             nostr_key: Some(upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         self.media_files()
@@ -1280,9 +1305,10 @@ impl Whitenoise {
 
         let blossom_server_url = blossom_server_url.unwrap_or(Self::default_blossom_url());
         // Upload encrypted data to Blossom using the derived keypair
+        // Extract the encrypted data from Secret wrapper for upload
         let descriptor = Self::upload_encrypted_blob_to_blossom(
             &blossom_server_url,
-            prepared.encrypted_data,
+            prepared.encrypted_data.as_ref().clone(),
             image_type.mime_type(),
             &prepared.upload_keypair,
         )
@@ -1325,6 +1351,8 @@ impl Whitenoise {
             blossom_url: Some(descriptor.url.as_str()),
             nostr_key: Some(prepared.upload_keypair.secret_key().to_secret_hex()),
             file_metadata: None,
+            nonce: None, // Group images use key/nonce encryption, not MDK
+            scheme_version: None,
         };
 
         if let Err(e) = self
@@ -1340,10 +1368,11 @@ impl Whitenoise {
         }
 
         // Return the metadata needed for group update
+        // Extract raw bytes from Secret wrappers
         Ok((
             prepared.encrypted_hash,
-            prepared.image_key,
-            prepared.image_nonce,
+            *prepared.image_key.as_ref(),
+            *prepared.image_nonce.as_ref(),
         ))
     }
 
@@ -1469,6 +1498,8 @@ impl Whitenoise {
             blossom_url: Some(descriptor.url.as_str()),
             nostr_key: Some(upload_keys_hex),
             file_metadata: file_metadata.as_ref(),
+            nonce: Some(hex::encode(prepared.nonce)),
+            scheme_version: Some("mip04-v2"),
         };
 
         let media_file = self
@@ -1687,7 +1718,7 @@ impl Whitenoise {
         // Check if group has an image set
         let (image_hash, image_key, image_nonce) =
             match (&group.image_hash, &group.image_key, &group.image_nonce) {
-                (Some(hash), Some(key), Some(nonce)) => (*hash, *key, *nonce),
+                (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
                 _ => return Ok(None), // No image set
             };
 
@@ -1695,7 +1726,7 @@ impl Whitenoise {
         let blossom_url = if let Some(media_file) =
             crate::whitenoise::database::media_files::MediaFile::find_by_hash(
                 &self.database,
-                &image_hash,
+                image_hash,
             )
             .await?
         {
@@ -1712,9 +1743,9 @@ impl Whitenoise {
                 blossom_url,
                 &account.pubkey,
                 &group.mls_group_id,
-                &image_hash,
-                &image_key,
-                &image_nonce,
+                image_hash,
+                image_key.as_ref(),
+                image_nonce.as_ref(),
             )
             .await?;
 
@@ -1816,7 +1847,7 @@ mod tests {
         assert_eq!(group.name, config.name);
         assert_eq!(group.description, config.description);
         assert_eq!(group.image_hash, config.image_hash);
-        assert_eq!(group.image_key, config.image_key);
+        assert_eq!(group.image_key, config.image_key.map(Secret::new));
 
         // Verify admin configuration
         assert_eq!(group.admin_pubkeys.len(), admin_pubkeys.len());
@@ -2155,8 +2186,10 @@ mod tests {
             image_hash: Some(Some([3u8; 32])), // 32-byte hash for new image
             image_key: Some(Some([4u8; 32])),  // 32-byte encryption key
             image_nonce: Some(Some([5u8; 12])), // 12-byte nonce
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         let update_result = whitenoise
@@ -2185,7 +2218,10 @@ mod tests {
             new_group_data.description.unwrap()
         );
         assert_eq!(updated_group.image_hash, new_group_data.image_hash.unwrap());
-        assert_eq!(updated_group.image_key, new_group_data.image_key.unwrap());
+        assert_eq!(
+            updated_group.image_key,
+            new_group_data.image_key.unwrap().map(Secret::new)
+        );
     }
 
     #[cfg(test)]
@@ -2662,8 +2698,10 @@ mod tests {
             image_hash: Some(Some(hash)),
             image_key: Some(Some(key)),
             image_nonce: Some(Some(nonce)),
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         let update_result = whitenoise
@@ -2684,8 +2722,8 @@ mod tests {
             .expect("Updated group not found");
 
         assert_eq!(updated_group.image_hash, Some(hash));
-        assert_eq!(updated_group.image_key, Some(key));
-        assert_eq!(updated_group.image_nonce, Some(nonce));
+        assert_eq!(updated_group.image_key, Some(Secret::new(key)));
+        assert_eq!(updated_group.image_nonce, Some(Secret::new(nonce)));
 
         // Verify the image was cached immediately after upload by retrieving it
         // (should be instant since it's cached)
@@ -2784,8 +2822,10 @@ mod tests {
             image_hash: Some(Some(hash)),
             image_key: Some(Some(key)),
             image_nonce: Some(Some(nonce)),
+            image_upload_key: None,
             admins: None,
             relays: None,
+            nostr_group_id: None,
         };
 
         whitenoise

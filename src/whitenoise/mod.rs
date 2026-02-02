@@ -150,6 +150,29 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    /// Initializes the mock keyring store for testing environments.
+    ///
+    /// This function must be called before creating any MDK instances in test/CI environments
+    /// where no platform keyring is available. It uses `keyring_core::mock::Store` which
+    /// stores credentials in memory only.
+    ///
+    /// This function is safe to call multiple times - it will only initialize once per process.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Call this at the start of your integration test binary
+    /// Whitenoise::initialize_mock_keyring_store();
+    /// ```
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub fn initialize_mock_keyring_store() {
+        use std::sync::OnceLock;
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+    }
+
     /// Initializes the Whitenoise application with the provided configuration.
     ///
     /// This method sets up the necessary data and log directories, configures logging,
@@ -363,13 +386,13 @@ impl Whitenoise {
         let since = accounts
             .iter()
             .filter_map(|a| a.since_timestamp(BUFFER_SECS))
-            .min_by_key(|t| t.as_u64());
+            .min_by_key(|t| t.as_secs());
 
         if let Some(ts) = since {
             tracing::info!(
                 target: "whitenoise::setup_global_users_subscriptions",
                 "Global subscriptions using since={} ({}s buffer)",
-                ts.as_u64(), BUFFER_SECS
+                ts.as_secs(), BUFFER_SECS
             );
         } else {
             tracing::warn!(
@@ -938,6 +961,13 @@ pub mod test_utils {
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
     pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+        // Initialize mock keyring store for tests (only once per process)
+        use std::sync::OnceLock;
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+
         // Wait for local relays to be ready in test environment
         wait_for_test_relays().await;
 

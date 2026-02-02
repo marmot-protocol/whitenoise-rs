@@ -313,7 +313,7 @@ mod contact_list_logic_tests {
             PublicKey::from_hex("991896cee597dd975c3b87266981387498bffa408fad05dc1ad578269805b702")
                 .unwrap()
         );
-        assert_eq!(event.created_at.as_u64(), 1752141958);
+        assert_eq!(event.created_at.as_secs(), 1752141958);
 
         // Check that tags are correctly parsed
         assert_eq!(event.tags.len(), 5);

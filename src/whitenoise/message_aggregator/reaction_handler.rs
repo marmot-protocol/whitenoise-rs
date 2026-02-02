@@ -372,6 +372,7 @@ mod tests {
             mls_group_id: GroupId::from_slice(&[1; 32]),
             event: inner_event,
             wrapper_event_id: EventId::all_zeros(),
+            epoch: None,
             state: MessageState::Processed,
         };
 

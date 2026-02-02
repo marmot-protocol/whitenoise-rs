@@ -29,14 +29,15 @@ impl ReceiveMessageWithMediaTestCase {
     }
 
     /// Build imeta tag per MIP-04 spec
-    /// Format: `["imeta", "url <blossom_url>", "x <hash>", "m <mime_type>", "filename <name>", "v <version>"]`
-    /// Note: MIP-04 requires filename and version fields
+    /// Format: `["imeta", "url <blossom_url>", "m <mime_type>", "filename <name>", "x <hash>", "n <nonce>", "v <version>"]`
+    /// Note: MIP-04 requires url, m, filename, x, n, and v fields
     fn build_imeta_tag(
         &self,
         original_hash_hex: &str,
         blossom_url: &str,
         mime_type: &str,
         filename: Option<&str>,
+        nonce_hex: &str,
     ) -> Result<Tag, WhitenoiseError> {
         let parts = vec![
             "imeta".to_string(),
@@ -44,7 +45,8 @@ impl ReceiveMessageWithMediaTestCase {
             format!("m {}", mime_type),
             format!("filename {}", filename.unwrap_or("image.jpg")),
             format!("x {}", original_hash_hex),
-            format!("v mip04-v1"),
+            format!("n {}", nonce_hex),
+            format!("v mip04-v2"),
         ];
 
         Tag::parse(parts).map_err(|e| {
@@ -87,11 +89,17 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             .as_ref()
             .and_then(|meta| meta.original_filename.as_deref());
 
+        // Get nonce from media_file (required for MIP-04 v2)
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::Configuration("Chat media must have nonce for MIP-04 v2".to_string())
+        })?;
+
         let imeta_tag = self.build_imeta_tag(
             &original_hash_hex,
             blossom_url,
             &media_file.mime_type,
             filename,
+            nonce_hex,
         )?;
 
         tracing::info!("✓ Built imeta tag with original_hash={}", original_hash_hex);
