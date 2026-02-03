@@ -6,6 +6,45 @@ use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Checks if a key package event has the required encoding tag.
+///
+/// Per MIP-00/MIP-02, key packages must have an explicit `["encoding", "base64"]` tag.
+/// Key packages without this tag are considered outdated and should be rotated.
+///
+/// # Arguments
+///
+/// * `event` - The key package event to check
+///
+/// # Returns
+///
+/// Returns `true` if the event has the required encoding tag, `false` otherwise.
+pub(crate) fn has_encoding_tag(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        tag.kind() == TagKind::Custom("encoding".into()) && tag.content() == Some("base64")
+    })
+}
+
+/// Returns key packages that are missing the required encoding tag.
+///
+/// These outdated packages were published before the MIP-00/MIP-02 encoding tag
+/// requirement was enforced. They should be deleted and replaced with new
+/// key packages that include the proper `["encoding", "base64"]` tag.
+///
+/// # Arguments
+///
+/// * `packages` - The key package events to check
+///
+/// # Returns
+///
+/// A vector of key package events that are missing the encoding tag.
+pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
+    packages
+        .iter()
+        .filter(|p| !has_encoding_tag(p))
+        .cloned()
+        .collect()
+}
+
 impl Whitenoise {
     /// Gets the appropriate signer for an account.
     ///
@@ -575,7 +614,7 @@ mod tests {
     use crate::whitenoise::accounts::AccountType;
     use crate::whitenoise::test_utils::*;
     use chrono::Utc;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag};
 
     fn create_local_account_struct() -> Account {
         Account {
@@ -805,5 +844,108 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// Creates a mock key package event with the encoding tag
+    fn create_key_package_event_with_encoding_tag(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// Creates a mock key package event without the encoding tag (outdated)
+    fn create_key_package_event_without_encoding_tag(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_true_when_present() {
+        let keys = Keys::generate();
+        let event = create_key_package_event_with_encoding_tag(&keys);
+
+        assert!(
+            has_encoding_tag(&event),
+            "Should return true when encoding tag is present"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_false_when_missing() {
+        let keys = Keys::generate();
+        let event = create_key_package_event_without_encoding_tag(&keys);
+
+        assert!(
+            !has_encoding_tag(&event),
+            "Should return false when encoding tag is missing"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_false_for_wrong_value() {
+        let keys = Keys::generate();
+        // Create event with encoding tag but wrong value
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["hex"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            !has_encoding_tag(&event),
+            "Should return false when encoding tag has wrong value"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_only_packages_without_tag() {
+        let keys = Keys::generate();
+        let with_tag = create_key_package_event_with_encoding_tag(&keys);
+        let without_tag = create_key_package_event_without_encoding_tag(&keys);
+
+        let packages = vec![with_tag.clone(), without_tag.clone()];
+        let outdated = find_outdated_packages(&packages);
+
+        assert_eq!(
+            outdated.len(),
+            1,
+            "Should find exactly one outdated package"
+        );
+        assert_eq!(
+            outdated[0].id, without_tag.id,
+            "Outdated package should be the one without encoding tag"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_empty_when_all_have_tag() {
+        let keys = Keys::generate();
+        let event1 = create_key_package_event_with_encoding_tag(&keys);
+        let event2 = create_key_package_event_with_encoding_tag(&keys);
+
+        let packages = vec![event1, event2];
+        let outdated = find_outdated_packages(&packages);
+
+        assert!(
+            outdated.is_empty(),
+            "Should return empty when all packages have encoding tag"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_all_when_none_have_tag() {
+        let keys = Keys::generate();
+        let event1 = create_key_package_event_without_encoding_tag(&keys);
+        let event2 = create_key_package_event_without_encoding_tag(&keys);
+
+        let packages = vec![event1, event2];
+        let outdated = find_outdated_packages(&packages);
+
+        assert_eq!(
+            outdated.len(),
+            2,
+            "Should return all packages when none have encoding tag"
+        );
     }
 }
