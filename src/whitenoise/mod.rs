@@ -192,6 +192,14 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+        // Validate keyring_service is not empty or whitespace
+        let keyring_service = config.keyring_service.trim();
+        if keyring_service.is_empty() {
+            return Err(WhitenoiseError::Configuration(
+                "keyring_service cannot be empty or whitespace".to_string(),
+            ));
+        }
+
         // Create event processing channels
         let (event_sender, event_receiver) = mpsc::channel(500);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
@@ -1265,11 +1273,42 @@ mod tests {
             let mut config = WhitenoiseConfig::new(data_dir, logs_dir);
 
             // Default should be the constant
-            assert_eq!(config.keyring_service, "com.whitenoise.app");
+            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
 
             // Override at init time
             config.keyring_service = "com.other.app".to_string();
             assert_eq!(config.keyring_service, "com.other.app");
+        }
+
+        #[tokio::test]
+        async fn test_initialize_whitenoise_rejects_empty_keyring_service() {
+            use tempfile::TempDir;
+
+            let data_temp = TempDir::new().unwrap();
+            let logs_temp = TempDir::new().unwrap();
+            let mut config = WhitenoiseConfig::new(data_temp.path(), logs_temp.path());
+
+            // Test empty string
+            config.keyring_service = "".to_string();
+            let result = Whitenoise::initialize_whitenoise(config.clone()).await;
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("keyring_service cannot be empty")
+            );
+
+            // Test whitespace only
+            config.keyring_service = "   ".to_string();
+            let result = Whitenoise::initialize_whitenoise(config).await;
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("keyring_service cannot be empty")
+            );
         }
     }
 

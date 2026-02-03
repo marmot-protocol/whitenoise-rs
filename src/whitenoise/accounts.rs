@@ -1412,7 +1412,14 @@ pub mod test_utils {
     }
 
     pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::Account::create_mdk_for_tests(pubkey, &data_dir())
+        // Initialize mock keyring store (only once per process)
+        use std::sync::OnceLock;
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+
+        super::Account::create_mdk(pubkey, &data_dir(), super::super::DEFAULT_KEYRING_SERVICE)
             .unwrap()
     }
 }
@@ -3154,10 +3161,10 @@ mod tests {
 
         // Create MDK without encryption (bypasses keyring for CI)
         let result = Account::create_mdk_for_tests(pubkey, &data_dir);
-        
+
         // Should succeed without keyring
         assert!(result.is_ok(), "Expected success when creating test MDK");
-        
+
         // Verify the MDK is functional by checking we can get groups
         let mdk = result.unwrap();
         let groups_result = mdk.get_groups();
