@@ -948,4 +948,39 @@ mod tests {
             "Should return all packages when none have encoding tag"
         );
     }
+
+    #[test]
+    fn test_find_outdated_packages_handles_empty_list() {
+        let packages: Vec<Event> = vec![];
+        let outdated = find_outdated_packages(&packages);
+
+        assert!(
+            outdated.is_empty(),
+            "Should return empty when given empty list"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_with_multiple_tags() {
+        let keys = Keys::generate();
+        // Create event with multiple tags including encoding tag
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_protocol_version".into()),
+                ["1.0"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x0001"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(TagKind::Custom("client".into()), ["MDK/0.5.3"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            has_encoding_tag(&event),
+            "Should find encoding tag among multiple tags"
+        );
+    }
 }
