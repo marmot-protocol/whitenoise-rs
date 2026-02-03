@@ -1211,6 +1211,7 @@ mod tests {
                 assert_eq!(config.data_dir, data_dir.join("release"));
                 assert_eq!(config.logs_dir, logs_dir.join("release"));
             }
+            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
         }
 
         #[test]
@@ -1224,11 +1225,13 @@ mod tests {
                 config.message_aggregator_config,
                 cloned_config.message_aggregator_config
             );
+            assert_eq!(config.keyring_service, cloned_config.keyring_service);
 
             let debug_str = format!("{:?}", config);
             assert!(debug_str.contains("data_dir"));
             assert!(debug_str.contains("logs_dir"));
             assert!(debug_str.contains("message_aggregator_config"));
+            assert!(debug_str.contains("keyring_service"));
         }
 
         #[test]
@@ -1252,6 +1255,21 @@ mod tests {
             let aggregator_config = config.message_aggregator_config.unwrap();
             assert!(!aggregator_config.normalize_emoji);
             assert!(aggregator_config.enable_debug_logging);
+            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
+        }
+
+        #[test]
+        fn test_whitenoise_config_custom_keyring_service() {
+            let data_dir = std::path::Path::new("/test/data");
+            let logs_dir = std::path::Path::new("/test/logs");
+            let mut config = WhitenoiseConfig::new(data_dir, logs_dir);
+
+            // Default should be the constant
+            assert_eq!(config.keyring_service, "com.whitenoise.app");
+
+            // Override at init time
+            config.keyring_service = "com.other.app".to_string();
+            assert_eq!(config.keyring_service, "com.other.app");
         }
     }
 
