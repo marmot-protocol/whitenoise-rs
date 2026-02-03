@@ -2664,6 +2664,13 @@ mod tests {
 
     #[test]
     fn test_create_mdk_success() {
+        // Initialize mock keyring so this test passes on headless CI (e.g. Ubuntu)
+        use std::sync::OnceLock;
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let pubkey = Keys::generate().public_key();
         let result = Account::create_mdk(
@@ -2671,14 +2678,7 @@ mod tests {
             temp_dir.path(),
             crate::whitenoise::DEFAULT_KEYRING_SERVICE,
         );
-        // May fail in environments without keyring access (e.g. headless CI)
-        if let Err(e) = &result {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("keyring") || msg.contains("Keyring") || msg.contains("secret"),
-                "Unexpected error: {msg}",
-            );
-        }
+        assert!(result.is_ok(), "create_mdk failed: {:?}", result.err());
     }
 
     /// Test logout removes keys correctly for both account types
