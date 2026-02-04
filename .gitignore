@@ -14,6 +14,9 @@
 .continue/
 .github-copilot/
 Plans/
+.repomix-*.txt
+vibe-tools.config.json
+.goose/memory
 
 # Docker and Rust
 /target
