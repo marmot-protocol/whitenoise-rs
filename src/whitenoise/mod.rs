@@ -39,13 +39,14 @@ pub mod storage;
 pub mod users;
 pub mod utils;
 
+use mdk_core::prelude::MDK;
+use mdk_sqlite_storage::MdkSqliteStorage;
+
 use crate::init_tracing;
 use crate::nostr_manager::NostrManager;
 
 use crate::types::ProcessableEvent;
 
-/// Default keyring service identifier used by MDK for SQLCipher key management.
-pub const DEFAULT_KEYRING_SERVICE: &str = "com.whitenoise.app";
 use accounts::*;
 use app_settings::*;
 use database::*;
@@ -67,12 +68,13 @@ pub struct WhitenoiseConfig {
     pub message_aggregator_config: Option<message_aggregator::AggregatorConfig>,
 
     /// Keyring service identifier for MDK SQLCipher key management.
-    /// Defaults to [`DEFAULT_KEYRING_SERVICE`].
-    pub keyring_service: String,
+    /// Each application using this crate must provide a unique identifier
+    /// to avoid key collisions in the system keyring.
+    pub keyring_service_id: String,
 }
 
 impl WhitenoiseConfig {
-    pub fn new(data_dir: &Path, logs_dir: &Path) -> Self {
+    pub fn new(data_dir: &Path, logs_dir: &Path, keyring_service_id: &str) -> Self {
         let env_suffix = if cfg!(debug_assertions) {
             "dev"
         } else {
@@ -85,7 +87,7 @@ impl WhitenoiseConfig {
             data_dir: formatted_data_dir,
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
-            keyring_service: DEFAULT_KEYRING_SERVICE.to_string(),
+            keyring_service_id: keyring_service_id.to_string(),
         }
     }
 
@@ -93,6 +95,7 @@ impl WhitenoiseConfig {
     pub fn new_with_aggregator_config(
         data_dir: &Path,
         logs_dir: &Path,
+        keyring_service_id: &str,
         aggregator_config: message_aggregator::AggregatorConfig,
     ) -> Self {
         let env_suffix = if cfg!(debug_assertions) {
@@ -107,7 +110,7 @@ impl WhitenoiseConfig {
             data_dir: formatted_data_dir,
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
-            keyring_service: DEFAULT_KEYRING_SERVICE.to_string(),
+            keyring_service_id: keyring_service_id.to_string(),
         }
     }
 }
@@ -182,6 +185,19 @@ impl Whitenoise {
         });
     }
 
+    /// Creates an MDK instance for the given account public key using this
+    /// instance's configured data directory and keyring service identifier.
+    pub(crate) fn create_mdk_for_account(
+        &self,
+        pubkey: PublicKey,
+    ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
+        Account::create_mdk(
+            pubkey,
+            &self.config.data_dir,
+            &self.config.keyring_service_id,
+        )
+    }
+
     /// Initializes the Whitenoise application with the provided configuration.
     ///
     /// This method sets up the necessary data and log directories, configures logging,
@@ -192,11 +208,11 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
-        // Validate keyring_service is not empty or whitespace
-        let keyring_service = config.keyring_service.trim();
-        if keyring_service.is_empty() {
+        // Validate keyring_service_id is not empty or whitespace
+        let keyring_service_id = config.keyring_service_id.trim();
+        if keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
-                "keyring_service cannot be empty or whitespace".to_string(),
+                "keyring_service_id cannot be empty or whitespace".to_string(),
             ));
         }
 
@@ -952,7 +968,11 @@ pub mod test_utils {
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");
         let logs_temp_dir = TempDir::new().expect("Failed to create temp logs dir");
-        let config = WhitenoiseConfig::new(data_temp_dir.path(), logs_temp_dir.path());
+        let config = WhitenoiseConfig::new(
+            data_temp_dir.path(),
+            logs_temp_dir.path(),
+            "com.whitenoise.test",
+        );
         (config, data_temp_dir, logs_temp_dir)
     }
 
@@ -1210,7 +1230,7 @@ mod tests {
         fn test_whitenoise_config_new() {
             let data_dir = std::path::Path::new("/test/data");
             let logs_dir = std::path::Path::new("/test/logs");
-            let config = WhitenoiseConfig::new(data_dir, logs_dir);
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.test.app");
 
             if cfg!(debug_assertions) {
                 assert_eq!(config.data_dir, data_dir.join("dev"));
@@ -1219,7 +1239,7 @@ mod tests {
                 assert_eq!(config.data_dir, data_dir.join("release"));
                 assert_eq!(config.logs_dir, logs_dir.join("release"));
             }
-            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
+            assert_eq!(config.keyring_service_id, "com.test.app");
         }
 
         #[test]
@@ -1233,13 +1253,13 @@ mod tests {
                 config.message_aggregator_config,
                 cloned_config.message_aggregator_config
             );
-            assert_eq!(config.keyring_service, cloned_config.keyring_service);
+            assert_eq!(config.keyring_service_id, cloned_config.keyring_service_id);
 
             let debug_str = format!("{:?}", config);
             assert!(debug_str.contains("data_dir"));
             assert!(debug_str.contains("logs_dir"));
             assert!(debug_str.contains("message_aggregator_config"));
-            assert!(debug_str.contains("keyring_service"));
+            assert!(debug_str.contains("keyring_service_id"));
         }
 
         #[test]
@@ -1256,6 +1276,7 @@ mod tests {
             let config = WhitenoiseConfig::new_with_aggregator_config(
                 data_dir,
                 logs_dir,
+                "com.test.app",
                 custom_config.clone(),
             );
 
@@ -1263,51 +1284,46 @@ mod tests {
             let aggregator_config = config.message_aggregator_config.unwrap();
             assert!(!aggregator_config.normalize_emoji);
             assert!(aggregator_config.enable_debug_logging);
-            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
+            assert_eq!(config.keyring_service_id, "com.test.app");
         }
 
         #[test]
-        fn test_whitenoise_config_custom_keyring_service() {
+        fn test_whitenoise_config_keyring_service_id_is_required() {
             let data_dir = std::path::Path::new("/test/data");
             let logs_dir = std::path::Path::new("/test/logs");
-            let mut config = WhitenoiseConfig::new(data_dir, logs_dir);
-
-            // Default should be the constant
-            assert_eq!(config.keyring_service, DEFAULT_KEYRING_SERVICE);
-
-            // Override at init time
-            config.keyring_service = "com.other.app".to_string();
-            assert_eq!(config.keyring_service, "com.other.app");
+            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.myapp.custom");
+            assert_eq!(config.keyring_service_id, "com.myapp.custom");
         }
 
         #[tokio::test]
-        async fn test_initialize_whitenoise_rejects_empty_keyring_service() {
+        async fn test_initialize_whitenoise_rejects_empty_keyring_service_id() {
             use tempfile::TempDir;
 
             let data_temp = TempDir::new().unwrap();
             let logs_temp = TempDir::new().unwrap();
-            let mut config = WhitenoiseConfig::new(data_temp.path(), logs_temp.path());
+            let mut config =
+                WhitenoiseConfig::new(data_temp.path(), logs_temp.path(), "com.test.app");
 
             // Test empty string
-            config.keyring_service = "".to_string();
+            config.keyring_service_id = "".to_string();
             let result = Whitenoise::initialize_whitenoise(config.clone()).await;
             assert!(result.is_err());
             assert!(
                 result
                     .unwrap_err()
                     .to_string()
-                    .contains("keyring_service cannot be empty")
+                    .contains("keyring_service_id cannot be empty")
             );
 
             // Test whitespace only
-            config.keyring_service = "   ".to_string();
+            config.keyring_service_id = "   ".to_string();
             let result = Whitenoise::initialize_whitenoise(config).await;
             assert!(result.is_err());
             assert!(
                 result
                     .unwrap_err()
                     .to_string()
-                    .contains("keyring_service cannot be empty")
+                    .contains("keyring_service_id cannot be empty")
             );
         }
     }

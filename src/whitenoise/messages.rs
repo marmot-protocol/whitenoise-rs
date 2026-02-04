@@ -41,11 +41,7 @@ impl Whitenoise {
         let (inner_event, event_id) =
             self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
 
-        let mdk = Account::create_mdk(
-            account.pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service,
-        )?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let message_event = mdk.create_message(group_id, inner_event)?;
         let message =
             mdk.get_message(group_id, &event_id)?
@@ -82,11 +78,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<MessageWithTokens>> {
-        let mdk = Account::create_mdk(
-            account.pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service,
-        )?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let messages = mdk.get_messages(group_id, None)?;
         let messages_with_tokens = messages
             .iter()
@@ -157,11 +149,7 @@ impl Whitenoise {
         let accounts = Account::all(&self.database).await?;
 
         for account in accounts {
-            let mdk = Account::create_mdk(
-                account.pubkey,
-                &self.config.data_dir,
-                &self.config.keyring_service,
-            )?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let groups = mdk.get_groups()?;
 
             for group_info in groups {
@@ -615,12 +603,7 @@ mod tests {
             .unwrap();
 
         // Get messages from MDK
-        let mdk = Account::create_mdk(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
 
         // Verify we have 3 messages in MDK
@@ -701,12 +684,7 @@ mod tests {
             .unwrap();
 
         // Sync the cache
-        let mdk = Account::create_mdk(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
@@ -865,12 +843,7 @@ mod tests {
         }
 
         // Populate cache
-        let mdk = Account::create_mdk(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
@@ -937,12 +910,7 @@ mod tests {
             .unwrap();
 
         // Populate cache
-        let mdk = Account::create_mdk(
-            creator.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)

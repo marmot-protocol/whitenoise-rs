@@ -75,11 +75,7 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        let mdk = Account::create_mdk(
-            account.pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service,
-        )?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         // Process the welcome to get group info (but don't accept yet)
         let welcome = mdk
@@ -209,7 +205,7 @@ impl Whitenoise {
                 account,
                 data_dir,
                 keys,
-                &whitenoise.config.keyring_service
+                &whitenoise.config.keyring_service_id
             ),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
@@ -291,10 +287,10 @@ impl Whitenoise {
         account: &Account,
         data_dir: &std::path::Path,
         keys: Keys,
-        keyring_service: &str,
+        keyring_service_id: &str,
     ) -> Result<()> {
         let (group_ids, group_relays) =
-            Self::get_group_subscription_info(data_dir, &account.pubkey, keyring_service)?;
+            Self::get_group_subscription_info(data_dir, &account.pubkey, keyring_service_id)?;
 
         // Create relay records (idempotent)
         for relay in &group_relays {
@@ -383,9 +379,9 @@ impl Whitenoise {
     fn get_group_subscription_info(
         data_dir: &std::path::Path,
         pubkey: &PublicKey,
-        keyring_service: &str,
+        keyring_service_id: &str,
     ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
-        let mdk = Account::create_mdk(*pubkey, data_dir, keyring_service)?;
+        let mdk = Account::create_mdk(*pubkey, data_dir, keyring_service_id)?;
         let groups = mdk.get_groups()?;
         let mut group_relays_set = BTreeSet::new();
         let group_ids = groups
@@ -429,12 +425,9 @@ mod tests {
             .expect("member must have a published key package");
 
         // Create the group via mdk directly to obtain welcome rumor
-        let mdk = Account::create_mdk(
-            creator_account.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
         let create_group_result = mdk
             .create_group(
                 &creator_account.pubkey,
@@ -502,12 +495,9 @@ mod tests {
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
         // (not just after background task completes). This prevents race condition
         // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
-        let mdk = Account::create_mdk(
-            member_account.pubkey,
-            &whitenoise.config.data_dir,
-            &whitenoise.config.keyring_service,
-        )
-        .unwrap();
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
         let groups = mdk.get_groups().unwrap();
         assert!(!groups.is_empty(), "Member should have at least one group");
 
@@ -568,7 +558,7 @@ mod tests {
         let result = Whitenoise::get_group_subscription_info(
             &whitenoise.config.data_dir,
             &account.pubkey,
-            &whitenoise.config.keyring_service,
+            &whitenoise.config.keyring_service_id,
         );
         assert!(result.is_ok());
 
@@ -597,7 +587,7 @@ mod tests {
         let result = Whitenoise::get_group_subscription_info(
             &whitenoise.config.data_dir,
             &creator_account.pubkey,
-            &whitenoise.config.keyring_service,
+            &whitenoise.config.keyring_service_id,
         );
         assert!(result.is_ok());
 
