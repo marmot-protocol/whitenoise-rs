@@ -355,21 +355,6 @@ impl Account {
         let storage = MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?;
         Ok(MDK::new(storage))
     }
-
-    /// Create an MDK instance without encryption (for testing only).
-    ///
-    /// This bypasses the keyring requirement, allowing tests to run in CI environments
-    /// without keyring access. Uses `MdkSqliteStorage::new_unencrypted()` which is
-    /// intended for development/testing purposes.
-    #[cfg(test)]
-    pub(crate) fn create_mdk_for_tests(
-        pubkey: PublicKey,
-        data_dir: &Path,
-    ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
-        let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
-        let storage = MdkSqliteStorage::new_unencrypted(mls_storage_dir)?;
-        Ok(MDK::new(storage))
-    }
 }
 
 impl Whitenoise {
@@ -3136,29 +3121,5 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let result = Account::create_mdk(pubkey, file.path(), "test.service");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_mdk_for_tests_success() {
-        use tempfile::TempDir;
-
-        // Create a test key
-        let keys = Keys::generate();
-        let pubkey = keys.public_key();
-
-        // Create a temporary directory for the test
-        let temp_dir = TempDir::new().unwrap();
-        let data_dir = temp_dir.path().to_path_buf();
-
-        // Create MDK without encryption (bypasses keyring for CI)
-        let result = Account::create_mdk_for_tests(pubkey, &data_dir);
-
-        // Should succeed without keyring
-        assert!(result.is_ok(), "Expected success when creating test MDK");
-
-        // Verify the MDK is functional by checking we can get groups
-        let mdk = result.unwrap();
-        let groups_result = mdk.get_groups();
-        assert!(groups_result.is_ok(), "MDK should be functional");
     }
 }
