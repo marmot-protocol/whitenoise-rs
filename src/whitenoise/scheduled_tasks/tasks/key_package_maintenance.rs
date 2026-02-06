@@ -602,31 +602,98 @@ mod tests {
     }
 
     #[test]
-    fn test_find_outdated_packages_filters_correctly() {
+    fn test_find_expired_packages_identifies_old_packages() {
         let keys = Keys::generate();
 
-        // Create event with encoding tag
-        let with_tag = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
-            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+        // Create a fresh event (just created)
+        let fresh = EventBuilder::new(Kind::MlsKeyPackage, "fresh")
             .sign_with_keys(&keys)
             .unwrap();
 
-        // Create event without encoding tag
-        let without_tag = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        // Create an expired event (31 days old)
+        let expired_timestamp = Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        let expired = EventBuilder::new(Kind::MlsKeyPackage, "expired")
+            .custom_created_at(expired_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
 
-        let packages = vec![with_tag.clone(), without_tag.clone()];
-        let outdated = find_outdated_packages(&packages);
+        let packages = vec![fresh.clone(), expired.clone()];
+        let result = find_expired_packages(&packages);
+
+        assert_eq!(result.len(), 1, "Should find exactly one expired package");
+        assert_eq!(
+            result[0].id, expired.id,
+            "Expired package should be the old one"
+        );
+    }
+
+    #[test]
+    fn test_find_expired_packages_returns_empty_when_all_fresh() {
+        let keys = Keys::generate();
+
+        let fresh1 = EventBuilder::new(Kind::MlsKeyPackage, "fresh1")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let fresh2 = EventBuilder::new(Kind::MlsKeyPackage, "fresh2")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![fresh1, fresh2];
+        let result = find_expired_packages(&packages);
+
+        assert!(
+            result.is_empty(),
+            "Should return empty when all packages are fresh"
+        );
+    }
+
+    #[test]
+    fn test_find_expired_packages_handles_empty_list() {
+        let packages: Vec<Event> = vec![];
+        let result = find_expired_packages(&packages);
+
+        assert!(result.is_empty(), "Should return empty for empty input");
+    }
+
+    #[test]
+    fn test_find_expired_packages_boundary_not_expired_at_29_days() {
+        let keys = Keys::generate();
+
+        // 29 days old - should NOT be expired (threshold is 30 days)
+        let almost_expired_timestamp = Timestamp::now() - Duration::from_secs(29 * 24 * 60 * 60);
+        let almost_expired = EventBuilder::new(Kind::MlsKeyPackage, "almost")
+            .custom_created_at(almost_expired_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![almost_expired];
+        let result = find_expired_packages(&packages);
+
+        assert!(
+            result.is_empty(),
+            "Package at 29 days should not be considered expired"
+        );
+    }
+
+    #[test]
+    fn test_find_expired_packages_boundary_expired_at_30_days() {
+        let keys = Keys::generate();
+
+        // Exactly 30 days old - should be expired (>= threshold)
+        let expired_timestamp = Timestamp::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        let at_threshold = EventBuilder::new(Kind::MlsKeyPackage, "threshold")
+            .custom_created_at(expired_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![at_threshold.clone()];
+        let result = find_expired_packages(&packages);
 
         assert_eq!(
-            outdated.len(),
+            result.len(),
             1,
-            "Should find exactly one outdated package"
+            "Package at exactly 30 days should be considered expired"
         );
-        assert_eq!(
-            outdated[0].id, without_tag.id,
-            "Should identify the package without encoding tag as outdated"
-        );
+        assert_eq!(result[0].id, at_threshold.id);
     }
 }
