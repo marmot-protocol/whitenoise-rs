@@ -11,7 +11,7 @@
 -- content hash, not the encrypted hash. This migration ensures we can store and use
 -- both hashes correctly.
 --
--- See: MIP-04 specification https://github.com/marmot-protocol/marmot/blob/master/04.md
+-- See: MIP-04 specification https://github.com/parres-hq/marmot/blob/master/04.md
 -- See: MDK decrypt_from_download() requires original_hash for key derivation
 
 -- Step 1: Rename file_hash to encrypted_file_hash for explicit naming
