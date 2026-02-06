@@ -1,9 +1,3 @@
----
-description:
-globs: *.rs
-alwaysApply: true
----
-
 # Code style
 
 This is a description of a coding style that every contributor **must** follow.
@@ -170,6 +164,82 @@ mod x;
 
 use x::Y;
 ```
+
+## Import Placement
+
+**CRITICAL**: All `use` statements must be placed at the **top** of their containing scope. This applies to:
+
+1. **Module/file level**: All imports at the top of the file
+2. **Test modules** (`#[cfg(test)] mod tests { ... }`): All imports at the top of the test module
+3. **Nested test modules**: All imports at the top of each nested module
+4. **Conditionally-compiled functions** (`#[cfg(unix)]`): Move the conditional import to the top of the file/module with the same `#[cfg(...)]` attribute
+
+**Never place `use` statements inside functions, methods, or other blocks.**
+
+```rust
+// GOOD - imports at file/module top
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use crate::util::NostrTagFormat;
+
+#[cfg(unix)]
+fn set_permissions(path: &Path) -> Result<(), Error> {
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+// BAD - import inside function
+#[cfg(unix)]
+fn set_permissions(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;  // ❌ WRONG!
+
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+```
+
+```rust
+// GOOD - test module imports at module top
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use mdk_storage_traits::groups::GroupStorage;
+    use nostr::EventId;
+
+    use super::*;
+
+    #[test]
+    fn test_something() {
+        // No imports here - they're at the module top
+        let groups = storage.all_groups().unwrap();
+    }
+}
+
+// BAD - imports inside test functions
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_something() {
+        use mdk_storage_traits::groups::GroupStorage;  // ❌ WRONG!
+        use nostr::EventId;  // ❌ WRONG!
+
+        let groups = storage.all_groups().unwrap();
+    }
+}
+```
+
+**Rationale:**
+- Easier to see all dependencies at a glance
+- Avoids duplicate imports across multiple methods/tests
+- Consistent with Rust community standards
+- Better IDE support and auto-import functionality
+- Cleaner diffs when adding/removing code
 
 ## If-let
 

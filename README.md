@@ -14,7 +14,7 @@ This crate is the core library that powers our [Flutter app](https://github.com/
 
 ## The Spec
 
-White Noise is an implementation of the [NIP-EE](https://github.com/nostr-protocol/nips/blob/master/EE.md) spec.
+White Noise implements the [Marmot protocol](https://github.com/marmot-protocol/marmot), which brings MLS group messaging to Nostr.
 
 ## Releases
 

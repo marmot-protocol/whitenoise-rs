@@ -22,6 +22,14 @@ This project uses `cargo audit` to scan for known security vulnerabilities in de
 - **Risk Assessment**: Low - basic functionality that is unlikely to introduce security issues
 - **Mitigation**: Will be resolved when rust-nostr updates to an alternative time library
 
+#### RUSTSEC-2026-0002: lru unsound
+- **Component**: `lru` crate (transitive dependency via nostr-sdk)
+- **Severity**: Warning (unsound)
+- **Issue**: The `lru` crate has a soundness issue
+- **Justification**: This is a transitive dependency from the nostr-sdk ecosystem. We do not use the lru crate directly.
+- **Risk Assessment**: Low - awaiting upstream fix in nostr-sdk
+- **Mitigation**: Will be resolved when nostr-sdk updates to a fixed version of lru
+
 ## Running Security Audits
 
 To run the security audit:
