@@ -15,6 +15,7 @@ pub mod accounts;
 pub mod accounts_groups;
 pub mod aggregated_messages;
 pub mod app_settings;
+pub mod cached_graph_users;
 pub mod group_information;
 pub mod media_files;
 pub mod processed_events;

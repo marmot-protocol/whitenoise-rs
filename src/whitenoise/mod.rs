@@ -17,6 +17,7 @@ pub mod accounts;
 pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
+pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod database;
@@ -36,6 +37,7 @@ pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
 pub mod storage;
+pub mod user_search;
 pub mod users;
 pub mod utils;
 
@@ -327,8 +329,10 @@ impl Whitenoise {
         Self::start_event_processing_loop(whitenoise_ref, event_receiver, shutdown_receiver).await;
 
         // Register and start scheduled background tasks
-        let tasks: Vec<Arc<dyn scheduled_tasks::Task>> =
-            vec![Arc::new(scheduled_tasks::KeyPackageMaintenance)];
+        let tasks: Vec<Arc<dyn scheduled_tasks::Task>> = vec![
+            Arc::new(scheduled_tasks::KeyPackageMaintenance),
+            Arc::new(scheduled_tasks::CachedGraphUserCleanup),
+        ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
             whitenoise_ref,
             scheduler_shutdown_rx,
