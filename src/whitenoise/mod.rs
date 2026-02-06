@@ -998,12 +998,7 @@ pub mod test_utils {
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
     pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
-        // Initialize mock keyring store for tests (only once per process)
-        use std::sync::OnceLock;
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
+        Whitenoise::initialize_mock_keyring_store();
 
         // Wait for local relays to be ready in test environment
         wait_for_test_relays().await;

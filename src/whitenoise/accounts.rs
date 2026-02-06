@@ -1393,13 +1393,7 @@ pub mod test_utils {
     }
 
     pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        // Initialize mock keyring store (only once per process)
-        use std::sync::OnceLock;
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
-
+        super::super::Whitenoise::initialize_mock_keyring_store();
         super::Account::create_mdk(pubkey, &data_dir(), "com.whitenoise.test").unwrap()
     }
 }
@@ -2645,11 +2639,7 @@ mod tests {
     #[test]
     fn test_create_mdk_success() {
         // Initialize mock keyring so this test passes on headless CI (e.g. Ubuntu)
-        use std::sync::OnceLock;
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
+        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
 
         let temp_dir = tempfile::TempDir::new().unwrap();
         let pubkey = Keys::generate().public_key();

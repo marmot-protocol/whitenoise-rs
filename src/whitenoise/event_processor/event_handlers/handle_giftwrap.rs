@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use chrono::Utc;
 use mdk_core::GroupId;
@@ -116,8 +115,6 @@ impl Whitenoise {
             .and_then(|tag| tag.content())
             .and_then(|content| EventId::parse(content).ok());
 
-        let data_dir = self.config.data_dir.clone();
-
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
         tokio::spawn(Self::background_finalize_welcome(
@@ -126,7 +123,6 @@ impl Whitenoise {
             group_name,
             key_package_event_id,
             welcomer_pubkey,
-            data_dir,
         ));
 
         Ok(())
@@ -140,7 +136,6 @@ impl Whitenoise {
         group_name: String,
         key_package_event_id: Option<EventId>,
         welcomer_pubkey: PublicKey,
-        data_dir: PathBuf,
     ) {
         let Ok(whitenoise) = Whitenoise::get_instance() else {
             tracing::error!(
@@ -157,7 +152,6 @@ impl Whitenoise {
             &group_name,
             key_package_event_id,
             welcomer_pubkey,
-            &data_dir,
         )
         .await;
     }
@@ -172,7 +166,6 @@ impl Whitenoise {
         group_name: &str,
         key_package_event_id: Option<EventId>,
         welcomer_pubkey: PublicKey,
-        data_dir: &std::path::Path,
     ) {
         // Get keys early - needed for subscriptions
         let keys = match whitenoise
@@ -200,13 +193,7 @@ impl Whitenoise {
             welcomer_user_result,
         ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::setup_group_subscriptions(
-                whitenoise,
-                account,
-                data_dir,
-                keys,
-                &whitenoise.config.keyring_service_id
-            ),
+            Self::setup_group_subscriptions(whitenoise, account, keys),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
@@ -285,12 +272,10 @@ impl Whitenoise {
     async fn setup_group_subscriptions(
         whitenoise: &Whitenoise,
         account: &Account,
-        data_dir: &std::path::Path,
         keys: Keys,
-        keyring_service_id: &str,
     ) -> Result<()> {
         let (group_ids, group_relays) =
-            Self::get_group_subscription_info(data_dir, &account.pubkey, keyring_service_id)?;
+            Self::get_group_subscription_info(whitenoise, &account.pubkey)?;
 
         // Create relay records (idempotent)
         for relay in &group_relays {
@@ -377,11 +362,10 @@ impl Whitenoise {
 
     /// Helper to get group subscription info (group IDs and relay URLs) for an account.
     fn get_group_subscription_info(
-        data_dir: &std::path::Path,
+        whitenoise: &Whitenoise,
         pubkey: &PublicKey,
-        keyring_service_id: &str,
     ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
-        let mdk = Account::create_mdk(*pubkey, data_dir, keyring_service_id)?;
+        let mdk = whitenoise.create_mdk_for_account(*pubkey)?;
         let groups = mdk.get_groups()?;
         let mut group_relays_set = BTreeSet::new();
         let group_ids = groups
@@ -555,11 +539,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
 
         // New account has no groups
-        let result = Whitenoise::get_group_subscription_info(
-            &whitenoise.config.data_dir,
-            &account.pubkey,
-            &whitenoise.config.keyring_service_id,
-        );
+        let result = Whitenoise::get_group_subscription_info(&whitenoise, &account.pubkey);
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();
@@ -584,11 +564,7 @@ mod tests {
             .unwrap();
 
         // Creator should now have one group with relays
-        let result = Whitenoise::get_group_subscription_info(
-            &whitenoise.config.data_dir,
-            &creator_account.pubkey,
-            &whitenoise.config.keyring_service_id,
-        );
+        let result = Whitenoise::get_group_subscription_info(&whitenoise, &creator_account.pubkey);
         assert!(result.is_ok());
 
         let (group_ids, relays) = result.unwrap();
@@ -619,7 +595,6 @@ mod tests {
             group_name,
             None,
             welcomer_pubkey,
-            &whitenoise.config.data_dir,
         )
         .await;
 
@@ -656,7 +631,6 @@ mod tests {
             group_name,
             None,
             welcomer_pubkey,
-            &whitenoise.config.data_dir,
         )
         .await;
 
@@ -667,7 +641,6 @@ mod tests {
             group_name,
             None,
             welcomer_pubkey,
-            &whitenoise.config.data_dir,
         )
         .await;
 
