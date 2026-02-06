@@ -1398,6 +1398,8 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crate::whitenoise::accounts::Account;
     use crate::whitenoise::test_utils::*;
@@ -2636,10 +2638,16 @@ mod tests {
 
     #[test]
     fn test_create_mdk_success() {
+        // Initialize mock keyring store (only once per process)
+        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
+        MOCK_STORE_INIT.get_or_init(|| {
+            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+        });
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let pubkey = Keys::generate().public_key();
         let mdk = Account::create_mdk(pubkey, temp_dir.path());
-        assert!(mdk.is_ok());
+        assert!(mdk.is_ok(), "create_mdk failed: {:?}", mdk.err());
     }
 
     /// Test logout removes keys correctly for both account types
