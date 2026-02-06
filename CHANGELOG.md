@@ -102,11 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 <!-- Tags -->
-[Unreleased]: https://github.com/erskingardner/whitenoise/compare/v0.1.0-alpha.3...HEAD
-[v0.1.0-alpha.3]: https://github.com/erskingardner/whitenoise/releases/tag/v0.1.0-alpha.3
-[v0.1.0-alpha.2]: https://github.com/erskingardner/whitenoise/releases/tag/v0.1.0-alpha.2
-[v0.1.0-alpha.1]: https://github.com/erskingardner/whitenoise/releases/tag/v0.1.0-alpha.1
-[v0.1.0-alpha]: https://github.com/erskingardner/whitenoise/releases/tag/v0.1.0-alpha
+[Unreleased]: https://github.com/marmot-protocol/whitenoise-rs/compare/v0.1.0-alpha.3...HEAD
+[v0.1.0-alpha.3]: https://github.com/marmot-protocol/whitenoise-rs/releases/tag/v0.1.0-alpha.3
+[v0.1.0-alpha.2]: https://github.com/marmot-protocol/whitenoise-rs/releases/tag/v0.1.0-alpha.2
+[v0.1.0-alpha.1]: https://github.com/marmot-protocol/whitenoise-rs/releases/tag/v0.1.0-alpha.1
+[v0.1.0-alpha]: https://github.com/marmot-protocol/whitenoise-rs/releases/tag/v0.1.0-alpha
 
 
 <!-- Categories
