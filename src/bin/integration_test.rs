@@ -30,7 +30,11 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     tracing::info!("=== Starting Whitenoise Integration Test Suite ===");
 
-    let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir);
+    let config = WhitenoiseConfig::new(
+        &args.data_dir,
+        &args.logs_dir,
+        "com.whitenoise.integration-test",
+    );
     if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
         tracing::error!("Failed to initialize Whitenoise: {}", err);
         std::process::exit(1);

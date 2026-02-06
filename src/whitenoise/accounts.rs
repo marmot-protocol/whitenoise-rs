@@ -348,10 +348,11 @@ impl Account {
     pub(crate) fn create_mdk(
         pubkey: PublicKey,
         data_dir: &Path,
+        keyring_service_id: &str,
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         let mls_storage_dir = data_dir.join("mls").join(pubkey.to_hex());
         let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
-        let storage = MdkSqliteStorage::new(mls_storage_dir, "com.whitenoise.app", &db_key_id)?;
+        let storage = MdkSqliteStorage::new(mls_storage_dir, keyring_service_id, &db_key_id)?;
         Ok(MDK::new(storage))
     }
 }
@@ -1229,7 +1230,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<(Vec<RelayUrl>, Vec<String>)> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
         let mut group_relays_set = HashSet::new();
         let mut group_ids = vec![];
@@ -1392,7 +1393,8 @@ pub mod test_utils {
     }
 
     pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
-        super::Account::create_mdk(pubkey, &data_dir()).unwrap()
+        super::super::Whitenoise::initialize_mock_keyring_store();
+        super::Account::create_mdk(pubkey, &data_dir(), "com.whitenoise.test").unwrap()
     }
 }
 
@@ -2636,10 +2638,13 @@ mod tests {
 
     #[test]
     fn test_create_mdk_success() {
+        // Initialize mock keyring so this test passes on headless CI (e.g. Ubuntu)
+        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
+
         let temp_dir = tempfile::TempDir::new().unwrap();
         let pubkey = Keys::generate().public_key();
-        let mdk = Account::create_mdk(pubkey, temp_dir.path());
-        assert!(mdk.is_ok());
+        let result = Account::create_mdk(pubkey, temp_dir.path(), "com.whitenoise.test");
+        assert!(result.is_ok(), "create_mdk failed: {:?}", result.err());
     }
 
     /// Test logout removes keys correctly for both account types
@@ -3098,5 +3103,13 @@ mod tests {
                 err_msg
             );
         }
+    }
+
+    #[test]
+    fn test_create_mdk_with_invalid_path() {
+        let pubkey = Keys::generate().public_key();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let result = Account::create_mdk(pubkey, file.path(), "test.service");
+        assert!(result.is_err());
     }
 }
