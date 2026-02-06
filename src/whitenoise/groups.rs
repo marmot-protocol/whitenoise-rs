@@ -217,7 +217,7 @@ impl Whitenoise {
         let group_relays = config.relays.clone();
         let group_name = config.name.clone();
 
-        let mdk = Account::create_mdk(creator_account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
         let create_group_result =
             mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
 
@@ -315,7 +315,7 @@ impl Whitenoise {
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups: Vec<group_types::Group> = mdk
             .get_groups()
             .map_err(WhitenoiseError::from)?
@@ -386,7 +386,7 @@ impl Whitenoise {
     /// * `Err(WhitenoiseError::GroupNotFound)` - If the group doesn't exist
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let group = mdk
             .get_group(group_id)
             .map_err(WhitenoiseError::from)?
@@ -433,7 +433,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_members(group_id)
             .map_err(WhitenoiseError::from)?
@@ -446,7 +446,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_group(group_id)
             .map_err(WhitenoiseError::from)?
@@ -511,7 +511,7 @@ impl Whitenoise {
         }
 
         let (relay_urls, evolution_event, welcome_rumors) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.add_members(group_id, &key_package_events)?;
@@ -613,7 +613,7 @@ impl Whitenoise {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.remove_members(group_id, &members)?;
@@ -643,7 +643,7 @@ impl Whitenoise {
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
         let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.update_group_data(group_id, group_data)?;
@@ -669,7 +669,7 @@ impl Whitenoise {
     /// * `group_id` - The ID of the group to leave
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
         let (relay_urls, evolution_event) = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             // Create a self-removal proposal
@@ -708,7 +708,7 @@ impl Whitenoise {
         let group: mdk_core::prelude::group_types::Group;
         {
             // Get group data to check if it has an image
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             group = mdk
                 .get_group(group_id)
                 .map_err(WhitenoiseError::from)?
@@ -1086,6 +1086,7 @@ impl Whitenoise {
     async fn download_and_decrypt_chat_media_blob(
         account_pubkey: &PublicKey,
         data_dir: &Path,
+        keyring_service_id: &str,
         group_id: &GroupId,
         media_file: &MediaFile,
         original_file_hash: &[u8; 32],
@@ -1128,7 +1129,7 @@ impl Whitenoise {
             Self::download_blob_from_blossom(&blossom_url, &encrypted_hash).await?;
 
         // Decrypt using MDK
-        let mdk = Account::create_mdk(*account_pubkey, data_dir)?;
+        let mdk = Account::create_mdk(*account_pubkey, data_dir, keyring_service_id)?;
         let media_manager = mdk.media_manager(group_id.clone());
 
         // Retrieve nonce and scheme_version from database (required for MDK decryption)
@@ -1428,7 +1429,7 @@ impl Whitenoise {
         // Use MDK encrypted media manager to prepare the media file for upload
         // Wrap in a block to ensure MDK and media_manager are dropped before any await points
         let prepared = {
-            let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
             let media_manager = mdk.media_manager(group_id.clone());
 
             media_manager
@@ -1589,6 +1590,7 @@ impl Whitenoise {
         let decrypted_data = Self::download_and_decrypt_chat_media_blob(
             &account.pubkey,
             &self.config.data_dir,
+            &self.config.keyring_service_id,
             group_id,
             &media_file,
             original_file_hash,
@@ -1687,7 +1689,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<PathBuf>> {
-        let mdk = Account::create_mdk(account.pubkey, &self.config.data_dir)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let group = mdk
             .get_group(group_id)
             .map_err(WhitenoiseError::from)?

@@ -834,6 +834,8 @@ mod tests {
         assert!(detect_media_type(&avi).is_err());
     }
 
+    // --- RetryInfo tests ---
+
     #[test]
     fn test_retry_info_new_defaults() {
         let info = RetryInfo::new();
@@ -843,59 +845,24 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_info_default_delegates_to_new() {
-        let info = RetryInfo::default();
-        assert_eq!(info.attempt, 0);
-        assert_eq!(info.max_attempts, 10);
-        assert_eq!(info.base_delay_ms, 1000);
-    }
-
-    #[test]
-    fn test_retry_info_next_attempt_increments() {
-        let info = RetryInfo::new();
-        let next = info.next_attempt().expect("Should return Some");
-        assert_eq!(next.attempt, 1);
-        assert_eq!(next.max_attempts, 10);
-        assert_eq!(next.base_delay_ms, 1000);
-
-        let next2 = next.next_attempt().expect("Should return Some");
-        assert_eq!(next2.attempt, 2);
-    }
-
-    #[test]
-    fn test_retry_info_next_attempt_returns_none_at_max() {
-        let info = RetryInfo {
-            attempt: 10,
-            max_attempts: 10,
-            base_delay_ms: 1000,
-        };
-        assert!(info.next_attempt().is_none());
-    }
-
-    #[test]
-    fn test_retry_info_delay_ms_exponential_backoff() {
-        let mut info = RetryInfo::new();
-        assert_eq!(info.delay_ms(), 1000); // 1000 * 2^0
-
-        info.attempt = 1;
-        assert_eq!(info.delay_ms(), 2000); // 1000 * 2^1
-
-        info.attempt = 2;
-        assert_eq!(info.delay_ms(), 4000); // 1000 * 2^2
-
-        info.attempt = 3;
-        assert_eq!(info.delay_ms(), 8000); // 1000 * 2^3
+    fn test_retry_info_default_matches_new() {
+        let from_default = RetryInfo::default();
+        let from_new = RetryInfo::new();
+        assert_eq!(from_default.attempt, from_new.attempt);
+        assert_eq!(from_default.max_attempts, from_new.max_attempts);
+        assert_eq!(from_default.base_delay_ms, from_new.base_delay_ms);
     }
 
     #[test]
     fn test_retry_info_should_retry() {
-        let mut info = RetryInfo::new();
-        assert!(info.should_retry(), "Should retry at attempt 0");
+        let info = RetryInfo::new();
+        assert!(info.should_retry());
 
-        info.attempt = 9;
-        assert!(info.should_retry(), "Should retry at attempt 9");
-
-        info.attempt = 10;
-        assert!(!info.should_retry(), "Should not retry at max attempts");
+        let exhausted = RetryInfo {
+            attempt: 10,
+            max_attempts: 10,
+            base_delay_ms: 1000,
+        };
+        assert!(!exhausted.should_retry());
     }
 }

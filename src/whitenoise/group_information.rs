@@ -5,7 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, WhitenoiseError, accounts::Account};
+use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GroupType {
@@ -86,7 +86,7 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         whitenoise: &Whitenoise,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
+        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
         let group = mdk
             .get_group(mls_group_id)?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -116,7 +116,7 @@ impl GroupInformation {
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect();
 
-        let mdk = Account::create_mdk(account_pubkey, &whitenoise.config.data_dir)?;
+        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
 
         let mut results = Vec::new();
         for mls_group_id in mls_group_ids {
