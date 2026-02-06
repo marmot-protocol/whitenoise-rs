@@ -181,6 +181,7 @@ Errors are centralized in `src/whitenoise/error.rs` as the `WhitenoiseError` enu
 - **Engine**: SQLite via `sqlx`
 - **Migrations**: Located in `db_migrations/`, named with sequential prefix (`0001_`, `0002_`, ...). Migrations run automatically on database initialization.
 - **Adding a migration**: Create a new `.sql` file with the next sequential number. The migration will run automatically the next time the database is opened.
+- **NEVER modify an existing migration file**: SQLx computes a SHA-384 checksum of the entire file contents (including comments and whitespace) when a migration is first applied, and stores it in the `_sqlx_migrations` table. On every subsequent run, it compares the file's current checksum against the stored one. Any change — even fixing a typo in a comment or updating a URL — will cause a `VersionMismatch` error and break every database that already applied that migration. If you need to correct something, create a new migration instead.
 - **Pattern**: Each domain has a corresponding file in `src/whitenoise/database/` (e.g., `database/accounts.rs`, `database/users.rs`) that contains all SQL operations for that domain.
 
 ## Integration Tests
