@@ -248,7 +248,7 @@ impl Whitenoise {
                 .await?;
 
         // Create SecretsStore
-        let secrets_store = SecretsStore::new(data_dir);
+        let secrets_store = SecretsStore::new();
 
         // Create Storage
         let storage = storage::Storage::new(data_dir).await?;
@@ -1017,7 +1017,7 @@ pub mod test_utils {
                 .await
                 .unwrap(),
         );
-        let secrets_store = SecretsStore::new(&config.data_dir);
+        let secrets_store = SecretsStore::new();
 
         // Create channels but don't start processing loop to avoid network calls
         let (event_sender, _event_receiver) = mpsc::channel(10);
