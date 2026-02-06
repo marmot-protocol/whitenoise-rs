@@ -5,12 +5,15 @@
 /dev/data
 
 
-# AI stuff
-.repomix-*.txt
-vibe-tools.config.json
-.cursor/rules/vibe-tools.mdc
-.goose/memory
-.opencode
+# AI Agent files and directories
+.claude/
+.cursor/
+.opencode/
+.aider/
+.cody/
+.continue/
+.github-copilot/
+Plans/
 
 # Docker and Rust
 /target
@@ -27,3 +30,7 @@ coverage/
 
 # Benchmark results
 benchmark_results/
+
+# Git worktrees
+/trees/*
+!/trees/.gitkeep

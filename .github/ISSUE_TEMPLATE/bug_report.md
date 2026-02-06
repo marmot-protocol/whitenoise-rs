@@ -7,7 +7,7 @@ assignees: ''
 
 ---
 
-🚨 **If you're reporting a bug for the White Noise mobile app, please add the issue to the app repo. https://github.com/parres-hq/whitenoise_flutter/issues** 🚨
+🚨 **If you're reporting a bug for the White Noise mobile app, please add the issue to the app repo. https://github.com/marmot-protocol/whitenoise_flutter/issues** 🚨
 
 **Describe the bug**
 A clear and concise description of what the bug is.
