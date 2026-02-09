@@ -160,9 +160,8 @@ fn assemble_chat_list_items(
         .filter_map(|group| {
             let group_info = group_info_map.get(&group.mls_group_id)?;
 
-            let dm_peer_user = dm_other_users
-                .get(&group.mls_group_id)
-                .and_then(|pk| users_by_pubkey.get(pk));
+            let dm_peer_pubkey = dm_other_users.get(&group.mls_group_id).copied();
+            let dm_peer_user = dm_peer_pubkey.and_then(|pk| users_by_pubkey.get(&pk));
 
             let name = resolve_chat_name(group, &group_info.group_type, dm_peer_user);
 
@@ -199,7 +198,7 @@ fn assemble_chat_list_items(
                 welcomer_pubkey,
                 unread_count,
                 pin_order,
-                dm_peer_pubkey: dm_peer_user.map(|u| u.pubkey),
+                dm_peer_pubkey,
             })
         })
         .collect()
@@ -238,7 +237,7 @@ impl Whitenoise {
         let group_info_map = self
             .build_group_info_map(account.pubkey, &group_ids)
             .await?;
-        let dm_other_users = self.identify_dm_participants(account, &groups, &group_info_map)?;
+        let dm_other_users = self.identify_dm_participants(account).await?;
         let last_message_map = self.build_last_message_map(&group_ids).await?;
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
         let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
@@ -505,29 +504,15 @@ impl Whitenoise {
             .collect())
     }
 
-    /// Identifies the "other user" in each DM group.
-    fn identify_dm_participants(
+    /// Identifies the "other user" in each DM group using the persisted
+    /// `dm_peer_pubkey` column, avoiding per-group MDK membership lookups.
+    async fn identify_dm_participants(
         &self,
         account: &Account,
-        groups: &[group_types::Group],
-        group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> Result<HashMap<GroupId, PublicKey>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let mut dm_other_users = HashMap::new();
-
-        for group in groups {
-            if let Some(info) = group_info_map.get(&group.mls_group_id)
-                && info.group_type == GroupType::DirectMessage
-            {
-                let members: Vec<PublicKey> =
-                    mdk.get_members(&group.mls_group_id)?.into_iter().collect();
-                if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
-                    dm_other_users.insert(group.mls_group_id.clone(), other_pk);
-                }
-            }
-        }
-
-        Ok(dm_other_users)
+        let pairs =
+            AccountGroup::find_dm_peers_for_account(&account.pubkey, &self.database).await?;
+        Ok(pairs.into_iter().collect())
     }
 
     async fn build_last_message_map(
