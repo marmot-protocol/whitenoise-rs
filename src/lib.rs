@@ -57,6 +57,12 @@ pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
 
+// User search
+pub use whitenoise::user_search::{
+    MatchQuality, MatchResult, MatchedField, SearchUpdateTrigger, UserSearchResult,
+    UserSearchSubscription, UserSearchUpdate,
+};
+
 static TRACING_GUARDS: OnceLock<Mutex<Option<(WorkerGuard, WorkerGuard)>>> = OnceLock::new();
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
