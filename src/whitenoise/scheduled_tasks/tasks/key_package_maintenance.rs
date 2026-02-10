@@ -400,13 +400,25 @@ mod tests {
         // Run maintenance - should rotate the expired package
         let task = KeyPackageMaintenance;
         task.execute(whitenoise).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Verify rotation occurred
-        let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
-            .unwrap();
+        // Verify rotation occurred.  The relay may need a moment to process the
+        // deletion event (kind-5), so retry the check a few times before failing.
+        let mut expired_still_exists = true;
+        let mut after = Vec::new();
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            after = whitenoise
+                .fetch_all_key_packages_for_account(&account)
+                .await
+                .unwrap();
+
+            expired_still_exists = after.iter().any(|e| e.id == expired_event_id);
+            if !expired_still_exists {
+                break;
+            }
+        }
 
         // Should have at least one package (the new one)
         assert!(
@@ -415,7 +427,6 @@ mod tests {
         );
 
         // The expired package should be gone
-        let expired_still_exists = after.iter().any(|e| e.id == expired_event_id);
         assert!(
             !expired_still_exists,
             "Expired key package should have been deleted"
