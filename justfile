@@ -161,11 +161,28 @@ check-docs:
 check:
     @bash scripts/check-all.sh
 
-# Run pre-commit checks (linting, formatting, docs, tests, integration tests)
-precommit: check test int-test
+# Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
+precommit:
+    @just _run-quiet "check-fmt"    "fmt"
+    @just _run-quiet "check-docs"   "docs"
+    @just _run-quiet "check-clippy" "clippy"
+    @just _run-quiet "test"         "tests"
+    @just _run-quiet "int-test"     "integration tests"
+    @echo "PRECOMMIT PASSED"
 
-# Quick pre-commit (skip integration tests)
-precommit-quick: check test
+# Pre-commit checks with verbose output (shows all command output)
+precommit-verbose: check test int-test
+
+# Quick pre-commit: quiet mode, skip integration tests (recommended for agents/CI)
+precommit-quick:
+    @just _run-quiet "check-fmt"    "fmt"
+    @just _run-quiet "check-docs"   "docs"
+    @just _run-quiet "check-clippy" "clippy"
+    @just _run-quiet "test"         "tests"
+    @echo "PRECOMMIT PASSED"
+
+# Quick pre-commit with verbose output
+precommit-quick-verbose: check test
 
 # Check for outdated dependencies
 outdated:
@@ -252,3 +269,23 @@ docker-logs:
 # Publish a NIP-89 handler
 publish-nip89:
     ./scripts/publish_nip89_handler.sh
+
+######################
+# Helper Recipes
+######################
+
+# Run a recipe quietly, showing only name and pass/fail status (internal use)
+[private]
+_run-quiet recipe label:
+    #!/usr/bin/env bash
+    TMPFILE=$(mktemp)
+    trap 'rm -f "$TMPFILE"' EXIT
+    printf "%-25s" "{{label}}..."
+    if just {{recipe}} > "$TMPFILE" 2>&1; then
+        echo "✓"
+    else
+        echo "✗"
+        echo ""
+        cat "$TMPFILE"
+        exit 1
+    fi
