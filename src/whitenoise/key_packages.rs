@@ -62,16 +62,16 @@ impl Whitenoise {
         account: &Account,
         packages: Vec<Event>,
     ) -> Vec<Event> {
-        let mdk = match Account::create_mdk(account.pubkey, &self.config.data_dir) {
+        let mdk = match self.create_mdk_for_account(account.pubkey) {
             Ok(mdk) => mdk,
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::key_packages",
-                    "Failed to create MDK for account {}, cannot filter packages: {}",
+                    "Failed to create MDK for account {}, skipping all packages: {}",
                     account.pubkey.to_hex(),
                     e
                 );
-                return packages;
+                return Vec::new();
             }
         };
 
