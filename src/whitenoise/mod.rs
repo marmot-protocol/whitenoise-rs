@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use dashmap::DashMap;
@@ -177,7 +177,6 @@ impl Whitenoise {
     /// This function is safe to call multiple times; only the first call has
     /// an effect.
     fn initialize_keyring_store() {
-        use std::sync::OnceLock;
         static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
         KEYRING_STORE_INIT.get_or_init(|| {
             // In test / integration-test builds, always use the mock store so
