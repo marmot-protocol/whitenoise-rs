@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use dashmap::DashMap;
@@ -164,13 +164,90 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    /// Initializes the keyring-core credential store.
+    ///
+    /// `mdk-sqlite-storage` and [`SecretsStore`] both use `keyring-core` to store
+    /// secret key material.  Unlike the `keyring` crate (v3), `keyring-core` does
+    /// **not** auto-detect a platform backend — callers must register one via
+    /// `keyring_core::set_default_store()` before any `Entry` operations.
+    ///
+    /// In test and integration-test builds the mock (in-memory) store is used so
+    /// that unit tests never touch the real platform keychain.
+    ///
+    /// This function is safe to call multiple times; only the first call has
+    /// an effect.
+    fn initialize_keyring_store() {
+        static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
+        KEYRING_STORE_INIT.get_or_init(|| {
+            // In test / integration-test builds, always use the mock store so
+            // tests never interact with the real platform keychain.
+            #[cfg(any(test, feature = "integration-tests"))]
+            {
+                keyring_core::set_default_store(
+                    keyring_core::mock::Store::new()
+                        .expect("Failed to create mock credential store"),
+                );
+            }
+
+            #[cfg(not(any(test, feature = "integration-tests")))]
+            {
+                #[cfg(target_os = "macos")]
+                {
+                    let store = apple_native_keyring_store::keychain::Store::new()
+                        .expect("Failed to create macOS Keychain credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(target_os = "ios")]
+                {
+                    let store = apple_native_keyring_store::protected::Store::new()
+                        .expect("Failed to create iOS protected-data credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let store = windows_native_keyring_store::Store::new()
+                        .expect("Failed to create Windows credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let store = linux_keyutils_keyring_store::Store::new()
+                        .expect("Failed to create Linux keyutils credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(target_os = "android")]
+                {
+                    let store = android_native_keyring_store::Store::new()
+                        .expect("Failed to create Android credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "windows",
+                    target_os = "linux",
+                    target_os = "android",
+                )))]
+                {
+                    compile_error!(
+                        "No keyring-core credential store available for this target OS. \
+                         Add a platform-specific store crate to Cargo.toml and handle it \
+                         in initialize_keyring_store()."
+                    );
+                }
+            }
+        });
+    }
+
     /// Initializes the mock keyring store for testing environments.
     ///
-    /// This function must be called before creating any MDK instances in test/CI environments
-    /// where no platform keyring is available. It uses `keyring_core::mock::Store` which
-    /// stores credentials in memory only.
+    /// This is a convenience alias for external callers (e.g. the integration
+    /// test binary) that need to set up the mock store before
+    /// `initialize_whitenoise()` is called.  In practice
+    /// `initialize_keyring_store()` already uses the mock store in test builds,
+    /// so this simply ensures it has been called.
     ///
-    /// This function is safe to call multiple times - it will only initialize once per process.
+    /// This function is safe to call multiple times.
     ///
     /// # Example
     ///
@@ -180,11 +257,7 @@ impl Whitenoise {
     /// ```
     #[cfg(any(test, feature = "integration-tests"))]
     pub fn initialize_mock_keyring_store() {
-        use std::sync::OnceLock;
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
+        Self::initialize_keyring_store();
     }
 
     /// Creates an MDK instance for the given account public key using this
@@ -210,8 +283,12 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+        // Ensure keyring-core has a credential store before any MDK or
+        // SecretsStore operations attempt to create or read keyring entries.
+        Self::initialize_keyring_store();
+
         // Validate keyring_service_id is not empty or whitespace
-        let keyring_service_id = config.keyring_service_id.trim();
+        let keyring_service_id = config.keyring_service_id.trim().to_string();
         if keyring_service_id.is_empty() {
             return Err(WhitenoiseError::Configuration(
                 "keyring_service_id cannot be empty or whitespace".to_string(),
@@ -249,8 +326,8 @@ impl Whitenoise {
             NostrManager::new(event_sender.clone(), Arc::new(WhitenoiseEventTracker::new(database.clone())), NostrManager::default_timeout())
                 .await?;
 
-        // Create SecretsStore
-        let secrets_store = SecretsStore::new(data_dir);
+        // Create SecretsStore backed by the platform keyring-core store
+        let secrets_store = SecretsStore::new(&keyring_service_id);
 
         // Create Storage
         let storage = storage::Storage::new(data_dir).await?;
@@ -1021,7 +1098,7 @@ pub mod test_utils {
                 .await
                 .unwrap(),
         );
-        let secrets_store = SecretsStore::new(&config.data_dir);
+        let secrets_store = SecretsStore::new(&config.keyring_service_id);
 
         // Create channels but don't start processing loop to avoid network calls
         let (event_sender, _event_receiver) = mpsc::channel(10);
