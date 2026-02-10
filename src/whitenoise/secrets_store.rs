@@ -143,8 +143,9 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::whitenoise::Whitenoise;
+
+    use super::*;
 
     fn create_test_secrets_store() -> SecretsStore {
         Whitenoise::initialize_mock_keyring_store();
