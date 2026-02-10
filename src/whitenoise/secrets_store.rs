@@ -141,19 +141,10 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
-
-    fn ensure_mock_store() {
-        static MOCK_STORE_INIT: OnceLock<()> = OnceLock::new();
-        MOCK_STORE_INIT.get_or_init(|| {
-            keyring_core::set_default_store(
-                keyring_core::mock::Store::new().expect("Failed to create mock credential store"),
-            );
-        });
-    }
+    use crate::whitenoise::Whitenoise;
 
     fn create_test_secrets_store() -> SecretsStore {
-        ensure_mock_store();
+        Whitenoise::initialize_mock_keyring_store();
         SecretsStore::new("com.whitenoise.test")
     }
 
