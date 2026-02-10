@@ -10,6 +10,9 @@ pub enum SecretsStoreError {
     #[error("Keyring not initialized: {0}")]
     KeyringNotInitialized(String),
 
+    #[error("Keyring storage unavailable: {0}")]
+    KeyringUnavailable(String),
+
     #[error("Key error: {0}")]
     KeyError(#[from] nostr_sdk::key::Error),
 
@@ -132,7 +135,7 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
     match e {
         KeyringError::NoDefaultStore => SecretsStoreError::KeyringNotInitialized(e.to_string()),
         KeyringError::NoStorageAccess(ref err) => {
-            SecretsStoreError::KeyringNotInitialized(err.to_string())
+            SecretsStoreError::KeyringUnavailable(err.to_string())
         }
         other => SecretsStoreError::KeyringError(other.to_string()),
     }
