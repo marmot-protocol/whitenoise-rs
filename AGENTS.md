@@ -45,7 +45,7 @@ The precommit commands default to **quiet mode** which shows minimal pass/fail o
 
 **Agents should use `just precommit-quick` (or `just precommit` if Docker is running).** On success the output looks like:
 
-```
+```text
 fmt...                   ✓
 docs...                  ✓
 clippy...                ✓
