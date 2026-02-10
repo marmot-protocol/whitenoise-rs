@@ -232,45 +232,7 @@ async fn rotate_expired_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
-    use nostr_sdk::{Client, EventBuilder, EventId, FromBech32, Keys, Kind, SecretKey};
-
-    /// Publishes a key package with a backdated timestamp for testing rotation.
-    async fn publish_backdated_key_package(
-        whitenoise: &Whitenoise,
-        account: &crate::whitenoise::accounts::Account,
-        relays: &[Relay],
-        days_old: u64,
-    ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
-        let (encoded_key_package, tags) = whitenoise.encoded_key_package(account, relays).await?;
-
-        let nsec = whitenoise.export_account_nsec(account).await?;
-        let secret_key =
-            SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Other(e.into()))?;
-        let keys = Keys::new(secret_key);
-
-        let backdated = Timestamp::now() - Duration::from_secs(days_old * 24 * 60 * 60);
-
-        let event = EventBuilder::new(Kind::MlsKeyPackage, &encoded_key_package)
-            .tags(tags.to_vec())
-            .custom_created_at(backdated)
-            .sign_with_keys(&keys)
-            .map_err(|e| WhitenoiseError::Other(e.into()))?;
-
-        let event_id = event.id;
-
-        let client = Client::default();
-        for relay in relays {
-            client.add_relay(relay.url.as_str()).await?;
-        }
-        client.connect().await;
-        client.set_signer(keys).await;
-        client.send_event(&event).await?;
-        client.disconnect().await;
-
-        Ok(event_id)
-    }
 
     #[test]
     fn test_task_properties() {
@@ -292,144 +254,52 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_execute_publishes_key_package_when_none_exist() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+    #[test]
+    fn test_find_expired_packages_returns_old_packages() {
+        let keys = nostr_sdk::Keys::generate();
 
-        // Create account (automatically sets up key package relays)
-        let account = whitenoise.create_identity().await.unwrap();
-
-        // Delete any existing key packages to start clean
-        whitenoise
-            .delete_all_key_packages_for_account(&account, true)
-            .await
+        // Create an event with a timestamp 31 days in the past
+        let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        let old_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old")
+            .custom_created_at(old_timestamp)
+            .sign_with_keys(&keys)
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Verify no packages exist
-        let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
+        // Create an event with a fresh timestamp
+        let fresh_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh")
+            .sign_with_keys(&keys)
             .unwrap();
-        assert!(before.is_empty(), "Should start with no key packages");
 
-        // Run maintenance
-        let task = KeyPackageMaintenance;
-        task.execute(whitenoise).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let packages = vec![old_event.clone(), fresh_event.clone()];
+        let expired = find_expired_packages(&packages);
 
-        // Should have published a key package
-        let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
-            .unwrap();
-        assert!(
-            !after.is_empty(),
-            "Maintenance should have published a key package"
-        );
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, old_event.id);
     }
 
-    #[tokio::test]
-    async fn test_execute_leaves_fresh_packages_alone() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+    #[test]
+    fn test_find_expired_packages_returns_empty_when_all_fresh() {
+        let keys = nostr_sdk::Keys::generate();
 
-        // Create account (this automatically publishes a key package)
-        let account = whitenoise.create_identity().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
+        let fresh1 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh1")
+            .sign_with_keys(&keys)
             .unwrap();
-        assert!(!before.is_empty(), "Account should have a key package");
-        let original_ids: std::collections::HashSet<_> = before.iter().map(|e| e.id).collect();
-
-        // Run maintenance
-        let task = KeyPackageMaintenance;
-        task.execute(whitenoise).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Should still have the same key packages (not rotated since they're fresh)
-        let after = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
+        let fresh2 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh2")
+            .sign_with_keys(&keys)
             .unwrap();
-        let after_ids: std::collections::HashSet<_> = after.iter().map(|e| e.id).collect();
 
-        assert_eq!(
-            original_ids, after_ids,
-            "Fresh key packages should not be rotated"
-        );
+        let expired = find_expired_packages(&[fresh1, fresh2]);
+        assert!(expired.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_execute_rotates_expired_packages() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
-
-        // Create account and get its key package relays
-        let account = whitenoise.create_identity().await.unwrap();
-        let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
-
-        // Delete any existing key packages
-        whitenoise
-            .delete_all_key_packages_for_account(&account, true)
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Publish a backdated key package (31 days old, exceeds 30-day threshold)
-        let expired_event_id = publish_backdated_key_package(whitenoise, &account, &kp_relays, 31)
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // Verify we have the expired package
-        let before = whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await
-            .unwrap();
-        assert_eq!(before.len(), 1, "Should have exactly one key package");
-        assert_eq!(
-            before[0].id, expired_event_id,
-            "Should be our expired package"
-        );
-
-        // Run maintenance - should rotate the expired package
-        let task = KeyPackageMaintenance;
-        task.execute(whitenoise).await.unwrap();
-
-        // Verify rotation occurred.  The relay may need a moment to process the
-        // deletion event (kind-5), so retry the check a few times before failing.
-        let mut expired_still_exists = true;
-        let mut after = Vec::new();
-
-        for _ in 0..5 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            after = whitenoise
-                .fetch_all_key_packages_for_account(&account)
-                .await
-                .unwrap();
-
-            expired_still_exists = after.iter().any(|e| e.id == expired_event_id);
-            if !expired_still_exists {
-                break;
-            }
-        }
-
-        // Should have at least one package (the new one)
-        assert!(
-            !after.is_empty(),
-            "Should have a key package after rotation"
-        );
-
-        // The expired package should be gone
-        assert!(
-            !expired_still_exists,
-            "Expired key package should have been deleted"
-        );
+    #[test]
+    fn test_find_expired_packages_handles_empty_input() {
+        let expired = find_expired_packages(&[]);
+        assert!(expired.is_empty());
     }
+
+    // NOTE: Relay-dependent tests (publish when none exist, leave fresh
+    // packages alone, rotate expired packages) live in the integration test
+    // suite at src/integration_tests/test_cases/scheduler/key_package_maintenance.rs
+    // and are exercised via `just int-test scheduler`.
 }
