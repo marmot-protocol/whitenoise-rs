@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1.88"
-base64 = "0.22"
 blurhash = "0.2.3"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4.40", features = ["serde"] }
@@ -24,13 +23,7 @@ dashmap = "6.1"
 hex = "0.4"
 image = "0.24"
 infer = "0.19"
-keyring = { version = "3.6", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-] }
-# keyring-core is needed for mock store in integration tests
-keyring-core = { version = "0.7", optional = true }
+keyring-core = "0.7"
 lightning-invoice = "0.33.1"
 
 mdk-core = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "bf4b8226ee6a59d5e63b5ee8bb60c0b49fce4327", features = [
@@ -93,20 +86,33 @@ futures = "0.3"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1.16.0", features = ["v4"] }
 base64ct = "=1.7.3"
 dotenvy = "0.15"
 tempfile = "3.19.1"
 indicatif = { version = "0.18.3", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "0.2", features = ["protected"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "0.5"
+
 [dev-dependencies]
-keyring-core = "0.7"
 mockito = "1.2"
 
 [features]
 default = []
 # Feature flag for integration tests - enables IDE support without including in production
-integration-tests = ["keyring-core"]
+integration-tests = []
 # Feature flag for performance benchmarks - depends on integration-tests to reuse infrastructure
 benchmark-tests = ["integration-tests", "indicatif"]
 
