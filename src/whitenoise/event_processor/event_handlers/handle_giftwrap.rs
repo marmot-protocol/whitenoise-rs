@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use chrono::Utc;
 use mdk_core::GroupId;
@@ -179,16 +180,13 @@ impl Whitenoise {
         key_package_event_id: Option<EventId>,
         welcomer_pubkey: PublicKey,
     ) {
-        // Get keys early - needed for subscriptions
-        let keys = match whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)
-        {
-            Ok(k) => k,
+        // Get signer early - needed for subscriptions
+        let signer = match whitenoise.get_signer_for_account(account) {
+            Ok(s) => s,
             Err(e) => {
                 tracing::error!(
                     target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to get keys for account {}: {}",
+                    "Failed to get signer for account {}: {}",
                     account.pubkey.to_hex(),
                     e
                 );
@@ -205,7 +203,7 @@ impl Whitenoise {
             welcomer_user_result,
         ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::setup_group_subscriptions(whitenoise, account, keys),
+            Self::setup_group_subscriptions(whitenoise, account, signer),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
@@ -284,7 +282,7 @@ impl Whitenoise {
     async fn setup_group_subscriptions(
         whitenoise: &Whitenoise,
         account: &Account,
-        keys: Keys,
+        signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
         let (group_ids, group_relays) =
             Self::get_group_subscription_info(whitenoise, &account.pubkey)?;
@@ -307,7 +305,7 @@ impl Whitenoise {
                 account.pubkey,
                 &group_relays,
                 &group_ids,
-                keys,
+                signer,
             )
             .await?;
 

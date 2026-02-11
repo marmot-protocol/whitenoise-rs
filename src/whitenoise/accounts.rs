@@ -327,9 +327,7 @@ impl Account {
         whitenoise: &Whitenoise,
     ) -> Result<String> {
         let client = BlossomClient::new(server);
-        let keys = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&self.pubkey)?;
+        let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;
 
         let descriptor = client
@@ -337,7 +335,7 @@ impl Account {
                 data,
                 Some(image_type.mime_type().to_string()),
                 None,
-                Some(&keys),
+                Some(&signer),
             )
             .await
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
@@ -939,9 +937,7 @@ impl Whitenoise {
         account: &mut Account,
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
         let default_relays = self.load_default_relays().await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         // NIP-65 must be fetched first because Inbox and KeyPackage use the
         // discovered NIP-65 relays as their query source.
@@ -975,16 +971,26 @@ impl Whitenoise {
         // Publish any relay lists that need publishing concurrently.
         let nip65_publish = async {
             if should_publish_nip65 {
-                self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                    .await
+                self.publish_relay_list(
+                    &nip65_relays,
+                    RelayType::Nip65,
+                    &nip65_relays,
+                    signer.clone(),
+                )
+                .await
             } else {
                 Ok(())
             }
         };
         let inbox_publish = async {
             if should_publish_inbox {
-                self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                    .await
+                self.publish_relay_list(
+                    &inbox_relays,
+                    RelayType::Inbox,
+                    &nip65_relays,
+                    signer.clone(),
+                )
+                .await
             } else {
                 Ok(())
             }
@@ -995,7 +1001,7 @@ impl Whitenoise {
                     &key_package_relays,
                     RelayType::KeyPackage,
                     &nip65_relays,
-                    &keys,
+                    signer,
                 )
                 .await
             } else {
@@ -1170,17 +1176,12 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
         target_relays: &[Relay],
-        keys: &Keys,
+        signer: impl NostrSigner + 'static,
     ) -> Result<()> {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.nostr
-            .publish_relay_list_with_signer(
-                &relays_urls,
-                relay_type,
-                &target_relays_urls,
-                keys.clone(),
-            )
+            .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, signer)
             .await?;
         Ok(())
     }
@@ -1191,9 +1192,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let user = account.user(&self.database).await?;
         let relays = account.nip65_relays(self).await?;
 
@@ -1232,9 +1231,7 @@ impl Whitenoise {
         } else {
             account.relays(relay_type, self).await?
         };
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let target_relays = if relay_type == RelayType::Nip65 {
             relays.clone()
         } else {
@@ -1248,7 +1245,12 @@ impl Whitenoise {
             let target_relays_urls = Relay::urls(&target_relays);
 
             nostr
-                .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, keys)
+                .publish_relay_list_with_signer(
+                    &relays_urls,
+                    relay_type,
+                    &target_relays_urls,
+                    signer,
+                )
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts", "Successfully published relay list for account: {:?}", account_clone.pubkey);
@@ -1264,9 +1266,7 @@ impl Whitenoise {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
         let relays = account.nip65_relays(self).await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
 
@@ -1275,7 +1275,7 @@ impl Whitenoise {
 
             let relays_urls = Relay::urls(&relays);
             nostr
-                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, keys)
+                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts", "Successfully published follow list for account: {:?}", account_clone.pubkey);

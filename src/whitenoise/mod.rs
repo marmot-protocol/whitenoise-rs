@@ -700,6 +700,9 @@ impl Whitenoise {
     }
 
     pub async fn export_account_nsec(&self, account: &Account) -> Result<String> {
+        if account.uses_external_signer() {
+            return Err(WhitenoiseError::ExternalSignerCannotExportNsec);
+        }
         Ok(self
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?
@@ -729,6 +732,35 @@ impl Whitenoise {
     /// Gets the external signer for an account, if one is registered.
     pub fn get_external_signer(&self, pubkey: &PublicKey) -> Option<Arc<dyn NostrSigner>> {
         self.external_signers.get(pubkey).map(|r| r.clone())
+    }
+
+    /// Gets the appropriate signer for an account.
+    ///
+    /// For external accounts (Amber/NIP-55), returns the stored external signer.
+    /// For local accounts, returns the keys from the secrets store.
+    ///
+    /// Returns an error if no signer is available for the account.
+    pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
+        // First check for a registered external signer
+        if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
+            tracing::debug!(
+                target: "whitenoise::signer",
+                "Using external signer for account {}",
+                account.pubkey.to_hex()
+            );
+            return Ok(external_signer);
+        }
+
+        // Fall back to local keys from secrets store
+        let keys = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        tracing::debug!(
+            target: "whitenoise::signer",
+            "Using local keys for account {}",
+            account.pubkey.to_hex()
+        );
+        Ok(Arc::new(keys))
     }
 
     /// Removes the external signer for an account.
