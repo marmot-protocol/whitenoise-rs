@@ -294,7 +294,7 @@ impl Whitenoise {
             .await
             .map_err(WhitenoiseError::from)?;
 
-        GroupInformation::create_for_group(
+        let group_info = GroupInformation::create_for_group(
             self,
             &group.mls_group_id.clone(),
             group_type,
@@ -302,9 +302,21 @@ impl Whitenoise {
         )
         .await?;
 
+        // For DM groups, the peer is the single member we're creating the group with
+        let dm_peer = if group_info.group_type == GroupType::DirectMessage {
+            member_pubkeys.first()
+        } else {
+            None
+        };
+
         // Create AccountGroup record for the creator (auto-accepted since they created it)
-        let (account_group, _) =
-            AccountGroup::get_or_create(self, &creator_account.pubkey, &group.mls_group_id).await?;
+        let (account_group, _) = AccountGroup::get_or_create(
+            self,
+            &creator_account.pubkey,
+            &group.mls_group_id,
+            dm_peer,
+        )
+        .await?;
         account_group.accept(self).await?;
 
         Ok(group)
@@ -406,13 +418,16 @@ impl Whitenoise {
     ///
     /// If a new record is created for an existing active group, it's automatically
     /// accepted since the user is already a member.
+    ///
+    /// Note: this does not populate `dm_peer_pubkey` for DM groups. The startup
+    /// backfill (`backfill_dm_peer_pubkeys`) handles that on next launch.
     async fn ensure_account_group_exists(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
         let (ag, was_created) =
-            AccountGroup::get_or_create(self, &account.pubkey, group_id).await?;
+            AccountGroup::get_or_create(self, &account.pubkey, group_id, None).await?;
 
         // If this is a newly created record for an existing active group,
         // auto-accept it since the user is already a member
@@ -2493,19 +2508,19 @@ mod tests {
         // - group_declined: user_confirmation = Some(false)
 
         let (ag_accepted, _) = whitenoise
-            .get_or_create_account_group(&account, &group_accepted.mls_group_id)
+            .get_or_create_account_group(&account, &group_accepted.mls_group_id, None)
             .await
             .unwrap();
         ag_accepted.accept(&whitenoise).await.unwrap();
 
         // Just create the record - stays pending (NULL) by default
         whitenoise
-            .get_or_create_account_group(&account, &group_pending.mls_group_id)
+            .get_or_create_account_group(&account, &group_pending.mls_group_id, None)
             .await
             .unwrap();
 
         let (ag_declined, _) = whitenoise
-            .get_or_create_account_group(&account, &group_declined.mls_group_id)
+            .get_or_create_account_group(&account, &group_declined.mls_group_id, None)
             .await
             .unwrap();
         ag_declined.decline(&whitenoise).await.unwrap();

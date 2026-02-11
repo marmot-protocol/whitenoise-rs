@@ -398,6 +398,15 @@ impl Whitenoise {
             "Message cache synchronization complete"
         );
 
+        // Backfill dm_peer_pubkey for existing DM groups missing it
+        if let Err(e) = whitenoise_ref.backfill_dm_peer_pubkeys().await {
+            tracing::warn!(
+                target: "whitenoise::initialize_whitenoise",
+                "DM peer pubkey backfill failed (non-fatal): {}",
+                e
+            );
+        }
+
         tracing::debug!(
             target: "whitenoise::initialize_whitenoise",
             "Starting event processing loop for loaded accounts"

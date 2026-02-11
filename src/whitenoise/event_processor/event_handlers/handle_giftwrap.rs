@@ -10,7 +10,7 @@ use crate::whitenoise::{
     accounts_groups::AccountGroup,
     chat_list_streaming::ChatListUpdateTrigger,
     error::{Result, WhitenoiseError},
-    group_information::GroupInformation,
+    group_information::{GroupInformation, GroupType},
     relays::Relay,
 };
 
@@ -86,6 +86,17 @@ impl Whitenoise {
         let group_name = welcome.group_name.clone();
         let welcomer_pubkey = welcome.welcomer;
 
+        // For DM groups (empty name), the welcomer is the other participant.
+        // In the Marmot protocol, DM welcomes are always sent by the initiator,
+        // who is the only other member in a two-party DM group.
+        let dm_peer_pubkey = if GroupInformation::infer_group_type_from_group_name(&group_name)
+            == GroupType::DirectMessage
+        {
+            Some(welcomer_pubkey)
+        } else {
+            None
+        };
+
         let account_group = AccountGroup {
             id: None,
             account_pubkey: account.pubkey,
@@ -94,6 +105,7 @@ impl Whitenoise {
             welcomer_pubkey: Some(welcomer_pubkey),
             last_read_message_id: None,
             pin_order: None,
+            dm_peer_pubkey,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -402,6 +414,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
@@ -598,8 +611,7 @@ mod tests {
         let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
         // Pre-create AccountGroup to simulate synchronous creation in process_welcome
-        use crate::whitenoise::accounts_groups::AccountGroup;
-        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id, None)
             .await
             .unwrap();
 
@@ -635,8 +647,7 @@ mod tests {
         let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
 
         // Pre-create AccountGroup to simulate synchronous creation in process_welcome
-        use crate::whitenoise::accounts_groups::AccountGroup;
-        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id)
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id, None)
             .await
             .unwrap();
 

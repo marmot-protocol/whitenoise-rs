@@ -29,6 +29,9 @@ pub struct AccountGroup {
     /// - `None` = not pinned (appears after pinned chats)
     /// - `Some(n)` = pinned, lower values appear first
     pub pin_order: Option<i64>,
+    /// For DM groups: the other participant's pubkey from this account's perspective.
+    /// `None` for regular group chats.
+    pub dm_peer_pubkey: Option<PublicKey>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -58,13 +61,22 @@ impl AccountGroup {
 
     /// Creates or retrieves an AccountGroup for the given account and group.
     /// New records are created with user_confirmation = None (pending).
+    ///
+    /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
+    /// so it can be persisted for efficient lookups.
     pub async fn get_or_create(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
+        dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(Self, bool), WhitenoiseError> {
-        let (account_group, was_created) =
-            Self::find_or_create(account_pubkey, mls_group_id, &whitenoise.database).await?;
+        let (account_group, was_created) = Self::find_or_create(
+            account_pubkey,
+            mls_group_id,
+            dm_peer_pubkey,
+            &whitenoise.database,
+        )
+        .await?;
         Ok((account_group, was_created))
     }
 
@@ -107,6 +119,22 @@ impl AccountGroup {
         Ok(updated)
     }
 
+    /// Finds the latest DM group between the given account and peer.
+    ///
+    /// Uses the persisted `dm_peer_pubkey` column for an efficient single-query
+    /// lookup without requiring MLS/MDK calls. Returns the group ID of the most
+    /// recently created visible DM group with this peer, or `None` if none exists.
+    pub async fn find_latest_dm_group_with_peer(
+        whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
+        peer_pubkey: &PublicKey,
+    ) -> Result<Option<GroupId>, WhitenoiseError> {
+        let group_id =
+            Self::find_dm_group_id_by_peer(account_pubkey, peer_pubkey, &whitenoise.database)
+                .await?;
+        Ok(group_id)
+    }
+
     /// Declines this group invite by setting user_confirmation to false.
     /// The group will be hidden from the UI but remains in MLS.
     pub async fn decline(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
@@ -119,12 +147,16 @@ impl AccountGroup {
 
 impl Whitenoise {
     /// Gets or creates an AccountGroup for the given account and MLS group.
+    ///
+    /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
+    /// so it can be persisted for efficient lookups.
     pub async fn get_or_create_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
+        dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(AccountGroup, bool), WhitenoiseError> {
-        AccountGroup::get_or_create(self, &account.pubkey, mls_group_id).await
+        AccountGroup::get_or_create(self, &account.pubkey, mls_group_id, dm_peer_pubkey).await
     }
 
     /// Gets all visible AccountGroups for the given account.
@@ -229,12 +261,81 @@ impl Whitenoise {
 
         Ok(updated)
     }
+
+    /// Returns the group ID of the latest DM group between the account and the
+    /// given peer, or `None` if no DM group exists between them.
+    pub async fn get_dm_group_with_peer(
+        &self,
+        account: &Account,
+        peer_pubkey: &PublicKey,
+    ) -> Result<Option<GroupId>, WhitenoiseError> {
+        AccountGroup::find_latest_dm_group_with_peer(self, &account.pubkey, peer_pubkey).await
+    }
+
+    /// Backfills the `dm_peer_pubkey` column for existing DM groups that are
+    /// missing it.
+    ///
+    /// Uses a targeted SQL query to find only visible DM groups with NULL
+    /// `dm_peer_pubkey`, then resolves the peer from MLS membership. Intended
+    /// to be called once at startup.
+    pub(crate) async fn backfill_dm_peer_pubkeys(&self) -> Result<(), WhitenoiseError> {
+        let accounts = crate::whitenoise::accounts::Account::all(&self.database).await?;
+
+        for account in &accounts {
+            let group_ids =
+                AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &self.database).await?;
+
+            if group_ids.is_empty() {
+                continue;
+            }
+
+            let mdk = match self.create_mdk_for_account(account.pubkey) {
+                Ok(mdk) => mdk,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::accounts_groups",
+                        "Failed to create MDK for account {}: {}",
+                        account.pubkey, e
+                    );
+                    continue;
+                }
+            };
+
+            for group_id in group_ids {
+                let members = match mdk.get_members(&group_id) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let peer = members.iter().find(|pk| **pk != account.pubkey);
+                if let Some(peer_pubkey) = peer
+                    && let Err(e) = AccountGroup::update_dm_peer_pubkey(
+                        &account.pubkey,
+                        &group_id,
+                        peer_pubkey,
+                        &self.database,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::accounts_groups",
+                        "Failed to backfill dm_peer_pubkey for group {}: {}",
+                        hex::encode(group_id.as_slice()),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::group_information::GroupType;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     #[tokio::test]
     async fn test_account_group_visibility_methods() {
@@ -244,7 +345,7 @@ mod tests {
 
         // Create a pending group
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -269,7 +370,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[2; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -289,7 +390,7 @@ mod tests {
 
         // Create pending group
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -310,7 +411,7 @@ mod tests {
 
         // Create pending group
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -333,18 +434,18 @@ mod tests {
         let group_id3 = GroupId::from_slice(&[7; 32]); // declined
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1)
+            .get_or_create_account_group(&account, &group_id1, None)
             .await
             .unwrap();
 
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2)
+            .get_or_create_account_group(&account, &group_id2, None)
             .await
             .unwrap();
         ag2.accept(&whitenoise).await.unwrap();
 
         let (ag3, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id3)
+            .get_or_create_account_group(&account, &group_id3, None)
             .await
             .unwrap();
         ag3.decline(&whitenoise).await.unwrap();
@@ -370,12 +471,12 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[9; 32]); // accepted
 
         let (_, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1)
+            .get_or_create_account_group(&account, &group_id1, None)
             .await
             .unwrap();
 
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2)
+            .get_or_create_account_group(&account, &group_id2, None)
             .await
             .unwrap();
         ag2.accept(&whitenoise).await.unwrap();
@@ -440,7 +541,7 @@ mod tests {
 
         // Create an account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -463,14 +564,14 @@ mod tests {
 
         // First call creates
         let (_, was_created1) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
         assert!(was_created1);
 
         // Second call finds existing
         let (_, was_created2) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
         assert!(!was_created2);
@@ -485,11 +586,11 @@ mod tests {
 
         // Both accounts can have the same group
         let (ag1, _) = whitenoise
-            .get_or_create_account_group(&account1, &group_id)
+            .get_or_create_account_group(&account1, &group_id, None)
             .await
             .unwrap();
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account2, &group_id)
+            .get_or_create_account_group(&account2, &group_id, None)
             .await
             .unwrap();
 
@@ -513,11 +614,11 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[18; 32]);
 
         let (ag1, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id1)
+            .get_or_create_account_group(&account, &group_id1, None)
             .await
             .unwrap();
         let (ag2, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id2)
+            .get_or_create_account_group(&account, &group_id2, None)
             .await
             .unwrap();
 
@@ -540,7 +641,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[19; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -559,7 +660,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[20; 32]);
 
         let (pending_group, _) = whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -578,15 +679,15 @@ mod tests {
 
         // Create 3 groups for the same account
         let (ag1, c1) = whitenoise
-            .get_or_create_account_group(&account, &group_id1)
+            .get_or_create_account_group(&account, &group_id1, None)
             .await
             .unwrap();
         let (ag2, c2) = whitenoise
-            .get_or_create_account_group(&account, &group_id2)
+            .get_or_create_account_group(&account, &group_id2, None)
             .await
             .unwrap();
         let (ag3, c3) = whitenoise
-            .get_or_create_account_group(&account, &group_id3)
+            .get_or_create_account_group(&account, &group_id3, None)
             .await
             .unwrap();
 
@@ -619,7 +720,7 @@ mod tests {
 
         // Create account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -665,7 +766,7 @@ mod tests {
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -731,7 +832,7 @@ mod tests {
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -798,7 +899,7 @@ mod tests {
         .await
         .unwrap();
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -851,7 +952,7 @@ mod tests {
 
         // Create account group first
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
 
@@ -872,7 +973,7 @@ mod tests {
 
         // Create and pin account group
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
         whitenoise
@@ -897,7 +998,7 @@ mod tests {
 
         // Create and pin account group
         whitenoise
-            .get_or_create_account_group(&account, &group_id)
+            .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
         whitenoise
@@ -926,5 +1027,174 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_returns_none_when_no_dms() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let other = whitenoise.create_identity().await.unwrap();
+
+        let result = whitenoise
+            .get_dm_group_with_peer(&account, &other.pubkey)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_finds_existing_dm() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(group.mls_group_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_ignores_regular_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        // Create a regular group (not a DM) with the same member
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_returns_latest_dm() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        // Create first DM
+        let mut config1 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config1.name = String::new();
+        let _older_group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config1,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        // Small delay to ensure different timestamps
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Create second DM with the same peer
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config2.name = String::new();
+        let newer_group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config2,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(newer_group.mls_group_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_ignores_declined_dms() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        // Decline the group
+        whitenoise
+            .decline_account_group(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .get_dm_group_with_peer(&creator, &member.pubkey)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_dm_group_with_peer_wrong_peer_returns_none() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+        let stranger = whitenoise.create_identity().await.unwrap();
+
+        let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
+        config.name = String::new();
+        whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                config,
+                Some(GroupType::DirectMessage),
+            )
+            .await
+            .unwrap();
+
+        // Search for a DM with a different user
+        let result = whitenoise
+            .get_dm_group_with_peer(&creator, &stranger.pubkey)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
     }
 }

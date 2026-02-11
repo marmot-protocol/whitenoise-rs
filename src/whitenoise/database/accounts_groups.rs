@@ -15,6 +15,7 @@ struct AccountGroupRow {
     welcomer_pubkey: Option<PublicKey>,
     last_read_message_id: Option<EventId>,
     pin_order: Option<i64>,
+    dm_peer_pubkey: Option<PublicKey>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -55,6 +56,15 @@ where
 
         let pin_order: Option<i64> = row.try_get("pin_order")?;
 
+        let dm_peer_pubkey_str: Option<String> = row.try_get("dm_peer_pubkey")?;
+        let dm_peer_pubkey = match dm_peer_pubkey_str {
+            Some(s) => Some(PublicKey::parse(&s).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "dm_peer_pubkey".to_string(),
+                source: Box::new(e),
+            })?),
+            None => None,
+        };
+
         // Parse pubkey from hex string
         let account_pubkey =
             PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -94,6 +104,7 @@ where
             welcomer_pubkey,
             last_read_message_id,
             pin_order,
+            dm_peer_pubkey,
             created_at,
             updated_at,
         })
@@ -102,7 +113,7 @@ where
 
 impl From<AccountGroupRow> for AccountGroup {
     fn from(row: AccountGroupRow) -> Self {
-        AccountGroup {
+        Self {
             id: Some(row.id),
             account_pubkey: row.account_pubkey,
             mls_group_id: row.mls_group_id,
@@ -110,6 +121,7 @@ impl From<AccountGroupRow> for AccountGroup {
             welcomer_pubkey: row.welcomer_pubkey,
             last_read_message_id: row.last_read_message_id,
             pin_order: row.pin_order,
+            dm_peer_pubkey: row.dm_peer_pubkey,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -145,10 +157,11 @@ impl AccountGroup {
     pub(crate) async fn find_or_create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
+        dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<(Self, bool), sqlx::Error> {
         // Try to create first - this handles the race condition properly
-        match Self::create(account_pubkey, mls_group_id, None, database).await {
+        match Self::create(account_pubkey, mls_group_id, None, dm_peer_pubkey, database).await {
             Ok(created) => Ok((created, true)),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Insert failed due to unique constraint - a concurrent task already created the row
@@ -251,13 +264,18 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, dm_peer_pubkey, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
                user_confirmation = excluded.user_confirmation,
                welcomer_pubkey = excluded.welcomer_pubkey,
                last_read_message_id = excluded.last_read_message_id,
                pin_order = excluded.pin_order,
+               -- Write-once: preserve existing dm_peer_pubkey if already set.
+               -- Many code paths construct AccountGroup without knowing the DM peer
+               -- (e.g. lazy migration), so we only fill this on first write and
+               -- never overwrite a correct value with NULL.
+               dm_peer_pubkey = COALESCE(accounts_groups.dm_peer_pubkey, excluded.dm_peer_pubkey),
                updated_at = excluded.updated_at
              RETURNING *",
         )
@@ -267,6 +285,7 @@ impl AccountGroup {
         .bind(self.welcomer_pubkey.as_ref().map(|pk| pk.to_hex()))
         .bind(self.last_read_message_id.as_ref().map(|id| id.to_hex()))
         .bind(self.pin_order)
+        .bind(self.dm_peer_pubkey.as_ref().map(|pk| pk.to_hex()))
         .bind(self.created_at.timestamp_millis())
         .bind(now_ms)
         .fetch_one(&database.pool)
@@ -343,23 +362,140 @@ impl AccountGroup {
         Ok(row.map(Into::into))
     }
 
+    /// Finds the most recently created visible DM group between an account and a peer.
+    ///
+    /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup
+    /// without requiring MLS/MDK calls. Returns `None` if no DM group exists
+    /// between these users, or if the group has been declined.
+    pub(crate) async fn find_dm_group_id_by_peer(
+        account_pubkey: &PublicKey,
+        peer_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<Option<GroupId>, sqlx::Error> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT ag.mls_group_id
+             FROM accounts_groups ag
+             WHERE ag.account_pubkey = ?
+               AND ag.dm_peer_pubkey = ?
+               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)
+             ORDER BY ag.created_at DESC
+             LIMIT 1",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(peer_pubkey.to_hex())
+        .fetch_optional(&database.pool)
+        .await?;
+
+        Ok(row.map(|(bytes,)| GroupId::from_slice(&bytes)))
+    }
+
+    /// Returns DM peer pubkeys for all visible DM groups belonging to an account.
+    ///
+    /// Returns `(mls_group_id, dm_peer_pubkey)` pairs for groups where
+    /// `dm_peer_pubkey` is populated and the group is visible (not declined).
+    pub(crate) async fn find_dm_peers_for_account(
+        account_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<Vec<(GroupId, PublicKey)>, sqlx::Error> {
+        let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+            "SELECT ag.mls_group_id, ag.dm_peer_pubkey
+             FROM accounts_groups ag
+             WHERE ag.account_pubkey = ?
+               AND ag.dm_peer_pubkey IS NOT NULL
+               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)",
+        )
+        .bind(account_pubkey.to_hex())
+        .fetch_all(&database.pool)
+        .await?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for (group_id_bytes, peer_hex) in rows {
+            let group_id = GroupId::from_slice(&group_id_bytes);
+            match PublicKey::parse(&peer_hex) {
+                Ok(pk) => results.push((group_id, pk)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::database::accounts_groups",
+                        "Skipping row with invalid dm_peer_pubkey '{}': {}",
+                        peer_hex, e
+                    );
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Finds visible DM groups for an account that are missing `dm_peer_pubkey`.
+    ///
+    /// Used by the startup backfill to identify records that need population.
+    /// Pushes all filtering to SQL (joins with `group_information`) so the caller
+    /// only receives rows that actually need MDK membership resolution.
+    pub(crate) async fn find_dm_groups_missing_peer(
+        account_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<Vec<GroupId>, sqlx::Error> {
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT ag.mls_group_id
+             FROM accounts_groups ag
+             INNER JOIN group_information gi ON ag.mls_group_id = gi.mls_group_id
+             WHERE ag.account_pubkey = ?
+               AND ag.dm_peer_pubkey IS NULL
+               AND gi.group_type = 'direct_message'
+               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)",
+        )
+        .bind(account_pubkey.to_hex())
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(bytes,)| GroupId::from_slice(&bytes))
+            .collect())
+    }
+
+    /// Updates the dm_peer_pubkey for a specific account-group record.
+    ///
+    /// Used by the startup backfill to populate the column for existing DM groups.
+    pub(crate) async fn update_dm_peer_pubkey(
+        account_pubkey: &PublicKey,
+        mls_group_id: &GroupId,
+        dm_peer_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE accounts_groups
+             SET dm_peer_pubkey = ?, updated_at = ?
+             WHERE account_pubkey = ? AND mls_group_id = ? AND dm_peer_pubkey IS NULL",
+        )
+        .bind(dm_peer_pubkey.to_hex())
+        .bind(Utc::now().timestamp_millis())
+        .bind(account_pubkey.to_hex())
+        .bind(mls_group_id.as_slice())
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
     async fn create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         welcomer_pubkey: Option<&PublicKey>,
+        dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, ?, ?)
+            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, dm_peer_pubkey, created_at, updated_at)
+             VALUES (?, ?, NULL, ?, ?, ?, ?)
              RETURNING *",
         )
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
         .bind(welcomer_pubkey.map(|pk| pk.to_hex()))
+        .bind(dm_peer_pubkey.map(|pk| pk.to_hex()))
         .bind(now_ms)
         .bind(now_ms)
         .fetch_one(&database.pool)
@@ -372,6 +508,7 @@ impl AccountGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
 
     #[tokio::test]
@@ -398,7 +535,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[2; 32]);
 
         let (account_group, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -417,14 +554,14 @@ mod tests {
 
         // First create
         let (original, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(was_created);
 
         // Second call should find existing
         let (found, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -439,7 +576,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[4; 32]);
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -461,7 +598,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[5; 32]);
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -482,15 +619,15 @@ mod tests {
         let group_id3 = GroupId::from_slice(&[10; 32]); // Will be declined
 
         let (_ag1, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id1, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id1, None, &whitenoise.database)
                 .await
                 .unwrap();
         let (ag2, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id2, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id2, None, &whitenoise.database)
                 .await
                 .unwrap();
         let (ag3, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id3, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id3, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -522,11 +659,11 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[12; 32]); // Will be accepted
 
         let (_, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id1, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id1, None, &whitenoise.database)
                 .await
                 .unwrap();
         let (ag2, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id2, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id2, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -550,11 +687,11 @@ mod tests {
         let group_id = GroupId::from_slice(&[14; 32]);
 
         let (ag1, created1) =
-            AccountGroup::find_or_create(&account1.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account1.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         let (ag2, created2) =
-            AccountGroup::find_or_create(&account2.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account2.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -584,7 +721,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[16; 32]);
 
         let (created_ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -608,15 +745,15 @@ mod tests {
         let other_group = GroupId::from_slice(&[18; 32]);
 
         // Add accounts 1 and 2 to the target group
-        AccountGroup::find_or_create(&account1.pubkey, &target_group, &whitenoise.database)
+        AccountGroup::find_or_create(&account1.pubkey, &target_group, None, &whitenoise.database)
             .await
             .unwrap();
-        AccountGroup::find_or_create(&account2.pubkey, &target_group, &whitenoise.database)
+        AccountGroup::find_or_create(&account2.pubkey, &target_group, None, &whitenoise.database)
             .await
             .unwrap();
 
         // Add account 3 to a different group (should not be returned)
-        AccountGroup::find_or_create(&account3.pubkey, &other_group, &whitenoise.database)
+        AccountGroup::find_or_create(&account3.pubkey, &other_group, None, &whitenoise.database)
             .await
             .unwrap();
 
@@ -652,6 +789,7 @@ mod tests {
             welcomer_pubkey: Some(welcomer.pubkey),
             last_read_message_id: None,
             pin_order: None,
+            dm_peer_pubkey: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -682,6 +820,7 @@ mod tests {
             welcomer_pubkey: Some(welcomer.pubkey),
             last_read_message_id: None,
             pin_order: Some(100),
+            dm_peer_pubkey: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -699,6 +838,7 @@ mod tests {
             welcomer_pubkey: None,
             last_read_message_id: None,
             pin_order: None,
+            dm_peer_pubkey: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -743,7 +883,7 @@ mod tests {
         .unwrap();
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -808,7 +948,7 @@ mod tests {
         .unwrap();
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -883,7 +1023,7 @@ mod tests {
         .unwrap();
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -954,7 +1094,7 @@ mod tests {
         .unwrap();
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -987,7 +1127,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[60; 32]);
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -1008,7 +1148,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[61; 32]);
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -1035,7 +1175,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[62; 32]);
 
         let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, &whitenoise.database)
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
 
@@ -1055,5 +1195,176 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.pin_order, Some(77));
+    }
+
+    #[tokio::test]
+    async fn test_find_dm_groups_missing_peer_returns_dm_without_peer() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[70; 32]);
+
+        // Create group_information with DirectMessage type
+        GroupInformation::create_for_group(
+            &whitenoise,
+            &group_id,
+            Some(GroupType::DirectMessage),
+            "",
+        )
+        .await
+        .unwrap();
+
+        // Create account_group WITHOUT dm_peer_pubkey (simulates pre-migration state)
+        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let missing =
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], group_id);
+    }
+
+    #[tokio::test]
+    async fn test_find_dm_groups_missing_peer_excludes_groups_with_peer() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let peer = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[71; 32]);
+
+        // Create group_information with DirectMessage type
+        GroupInformation::create_for_group(
+            &whitenoise,
+            &group_id,
+            Some(GroupType::DirectMessage),
+            "",
+        )
+        .await
+        .unwrap();
+
+        // Create account_group WITH dm_peer_pubkey (already populated)
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            Some(&peer.pubkey),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let missing =
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_find_dm_groups_missing_peer_excludes_regular_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[72; 32]);
+
+        // Create group_information with Group type (not DM)
+        GroupInformation::create_for_group(
+            &whitenoise,
+            &group_id,
+            Some(GroupType::Group),
+            "Team Chat",
+        )
+        .await
+        .unwrap();
+
+        // Create account_group without dm_peer_pubkey
+        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let missing =
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Should not include regular groups even if dm_peer_pubkey is NULL
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_dm_peer_pubkey_sets_peer() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let peer = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[73; 32]);
+
+        // Create account_group without dm_peer_pubkey
+        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Update the dm_peer_pubkey
+        AccountGroup::update_dm_peer_pubkey(
+            &account.pubkey,
+            &group_id,
+            &peer.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Verify it was set
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(found.dm_peer_pubkey, Some(peer.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_update_dm_peer_pubkey_does_not_overwrite_existing() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let original_peer = whitenoise.create_identity().await.unwrap();
+        let new_peer = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[74; 32]);
+
+        // Create account_group WITH dm_peer_pubkey already set
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            Some(&original_peer.pubkey),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Try to update with a different peer
+        AccountGroup::update_dm_peer_pubkey(
+            &account.pubkey,
+            &group_id,
+            &new_peer.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Verify original peer is preserved (WHERE clause includes dm_peer_pubkey IS NULL)
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(found.dm_peer_pubkey, Some(original_peer.pubkey));
     }
 }
