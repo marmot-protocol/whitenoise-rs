@@ -71,7 +71,7 @@ impl ConsumedKeyPackage {
         Ok(rows
             .into_iter()
             .map(
-                |(id, account_pubkey, key_package_hash_ref, consumed_at)| ConsumedKeyPackage {
+                |(id, account_pubkey, key_package_hash_ref, consumed_at)| Self {
                     id,
                     account_pubkey,
                     key_package_hash_ref,
@@ -106,9 +106,10 @@ impl ConsumedKeyPackage {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nostr_sdk::Keys;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
 
     async fn setup_test_db() -> Database {
         let pool = SqlitePoolOptions::new()
