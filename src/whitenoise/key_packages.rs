@@ -1,10 +1,13 @@
-use crate::whitenoise::Whitenoise;
-use crate::whitenoise::accounts::Account;
-use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::relays::Relay;
-use nostr_sdk::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
+
+use nostr_sdk::prelude::*;
+
+use crate::whitenoise::Whitenoise;
+use crate::whitenoise::accounts::Account;
+use crate::whitenoise::database::consumed_key_packages::ConsumedKeyPackage;
+use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::relays::Relay;
 
 impl Whitenoise {
     /// Gets the appropriate signer for an account.
@@ -521,6 +524,51 @@ impl Whitenoise {
             "Deleted {} out of {} key packages from MLS storage",
             storage_delete_count,
             initial_count
+        );
+
+        Ok(())
+    }
+
+    /// Fetches a key package event from relays, computes its hash_ref, and stores
+    /// it in the `consumed_key_packages` table for delayed local key material cleanup.
+    pub(crate) async fn track_consumed_key_package(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+    ) -> Result<()> {
+        let key_package_filter = Filter::new()
+            .id(*event_id)
+            .kind(Kind::MlsKeyPackage)
+            .author(account.pubkey);
+
+        let mut stream = self
+            .nostr
+            .client
+            .stream_events(key_package_filter, Duration::from_secs(5))
+            .await?;
+
+        let event = match stream.next().await {
+            Some(event) => event,
+            None => {
+                tracing::debug!(
+                    target: "whitenoise::key_packages",
+                    "Key package event {} not found on relays, cannot track for cleanup",
+                    event_id.to_hex()
+                );
+                return Ok(());
+            }
+        };
+
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let key_package = mdk.parse_key_package(&event)?;
+        let hash_ref_bytes = mdk.compute_key_package_hash_ref(&key_package)?;
+
+        ConsumedKeyPackage::track(&account.pubkey, &hash_ref_bytes, &self.database).await?;
+
+        tracing::debug!(
+            target: "whitenoise::key_packages",
+            "Tracked consumed key package {} for delayed cleanup",
+            event_id.to_hex()
         );
 
         Ok(())

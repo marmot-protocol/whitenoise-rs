@@ -883,6 +883,7 @@ mod tests {
             wrapper_event_id: EventId::all_zeros(),
             epoch: None, // Epoch not needed for test message
             state: mdk_core::prelude::message_types::MessageState::Processed,
+            processed_at: Timestamp::now(),
         };
 
         let result = MessageProcessingResult::ApplicationMessage(message);

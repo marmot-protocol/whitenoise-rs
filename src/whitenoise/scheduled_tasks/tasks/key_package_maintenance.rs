@@ -6,11 +6,17 @@ use nostr_sdk::{Event, Timestamp};
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
+use crate::whitenoise::database::consumed_key_packages::ConsumedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::scheduled_tasks::Task;
 
 /// Maximum age for a key package before it should be rotated (30 days).
 const KEY_PACKAGE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Quiet period before cleaning up consumed key package local key material.
+/// After this many seconds with no new welcomes for an account, it's safe
+/// to delete local key material for consumed key packages.
+const CONSUMED_KP_QUIET_PERIOD_SECS: i64 = 30;
 
 /// Maximum number of accounts to process concurrently.
 const MAX_CONCURRENT_ACCOUNTS: usize = 5;
@@ -49,7 +55,7 @@ impl Task for KeyPackageMaintenance {
         let mut skipped = 0usize;
         let mut errors = 0usize;
 
-        let results: Vec<MaintenanceResult> = stream::iter(accounts)
+        let results: Vec<MaintenanceResult> = stream::iter(accounts.clone())
             .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
@@ -94,6 +100,49 @@ impl Task for KeyPackageMaintenance {
             skipped,
             errors
         );
+
+        // Phase 2: Clean up local key material for consumed key packages
+        let cleanup_results: Vec<(String, Result<usize, WhitenoiseError>)> = stream::iter(accounts)
+            .map(|account| async move {
+                let pubkey_hex = account.pubkey.to_hex();
+                let result = cleanup_consumed_key_packages(whitenoise, &account).await;
+                (pubkey_hex, result)
+            })
+            .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
+            .collect()
+            .await;
+
+        let mut total_cleaned = 0usize;
+        for (pubkey_hex, result) in cleanup_results {
+            match result {
+                Ok(0) => {}
+                Ok(cleaned) => {
+                    total_cleaned += cleaned;
+                    tracing::info!(
+                        target: "whitenoise::scheduler::key_package_maintenance",
+                        "Cleaned up {} consumed key package(s) for account {}",
+                        cleaned,
+                        pubkey_hex
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::scheduler::key_package_maintenance",
+                        "Failed to clean up consumed key packages for account {}: {}",
+                        pubkey_hex,
+                        e
+                    );
+                }
+            }
+        }
+
+        if total_cleaned > 0 {
+            tracing::info!(
+                target: "whitenoise::scheduler::key_package_maintenance",
+                "Consumed key package cleanup: {} total cleaned",
+                total_cleaned
+            );
+        }
 
         Ok(())
     }
@@ -227,6 +276,64 @@ async fn rotate_expired_packages(
             MaintenanceResult::Rotated { deleted: 0 }
         }
     }
+}
+
+/// Cleans up local MLS key material for consumed key packages after the quiet period.
+///
+/// Checks if the account has consumed key packages where the quiet period has elapsed
+/// (no new welcomes in the last 30 seconds), then deletes local key material using
+/// the cached serialized hash_ref.
+async fn cleanup_consumed_key_packages(
+    whitenoise: &Whitenoise,
+    account: &Account,
+) -> Result<usize, WhitenoiseError> {
+    let eligible = ConsumedKeyPackage::find_eligible_for_cleanup(
+        &account.pubkey,
+        CONSUMED_KP_QUIET_PERIOD_SECS,
+        &whitenoise.database,
+    )
+    .await?;
+
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::debug!(
+        target: "whitenoise::scheduler::key_package_maintenance",
+        "Found {} consumed key package(s) eligible for cleanup for account {}",
+        eligible.len(),
+        account.pubkey.to_hex()
+    );
+
+    let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+    let mut cleaned = 0usize;
+
+    for consumed in &eligible {
+        match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
+            Ok(()) => {
+                if let Err(e) = ConsumedKeyPackage::delete(consumed.id, &whitenoise.database).await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::scheduler::key_package_maintenance",
+                        "Deleted key material but failed to remove tracking record {}: {}",
+                        consumed.id,
+                        e
+                    );
+                }
+                cleaned += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Failed to delete local key material for consumed key package {}: {}",
+                    consumed.id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(cleaned)
 }
 
 #[cfg(test)]

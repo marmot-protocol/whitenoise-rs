@@ -796,12 +796,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(messages.len(), 5);
-        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         for i in 1..=5 {
+            let expected = format!("Startup test {}", i);
             assert!(
-                contents.contains(&format!("Startup test {}", i)),
-                "Missing 'Startup test {}' in cached messages",
-                i
+                contents.iter().any(|c| c.contains(&expected)),
+                "Missing '{}' in cached messages",
+                expected
             );
         }
 
@@ -864,13 +865,17 @@ mod tests {
         // Verify we got all 3 messages
         assert_eq!(fetched_messages.len(), 3);
 
-        // Verify content (messages may not be in creation order when timestamps are equal)
-        let contents: Vec<String> = fetched_messages.iter().map(|m| m.content.clone()).collect();
+        // Verify content (order not guaranteed for same-second messages)
+        let contents: Vec<&str> = fetched_messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         for i in 1..=3 {
+            let expected = format!("Cache test {}", i);
             assert!(
-                contents.contains(&format!("Cache test {}", i)),
-                "Missing 'Cache test {}' in fetched messages",
-                i
+                contents.iter().any(|c| c.contains(&expected)),
+                "Missing '{}' in cached messages",
+                expected
             );
         }
 

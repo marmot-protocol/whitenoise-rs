@@ -375,6 +375,7 @@ mod tests {
             wrapper_event_id: EventId::all_zeros(),
             epoch: None,
             state: MessageState::Processed,
+            processed_at: Timestamp::from(1234567890),
         };
 
         let config = AggregatorConfig::default();

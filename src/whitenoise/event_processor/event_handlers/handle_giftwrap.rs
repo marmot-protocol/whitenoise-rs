@@ -302,7 +302,10 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Handle key package rotation after welcome
+    /// Handle key package rotation after welcome.
+    ///
+    /// Caches the key package hash_ref for delayed local cleanup, then deletes
+    /// the key package from relays and publishes a fresh replacement.
     async fn rotate_key_package(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -315,6 +318,20 @@ impl Whitenoise {
             );
             return Ok(());
         };
+
+        // Cache the hash_ref before relay deletion so we can clean up local
+        // key material later via the maintenance task.
+        if let Err(e) = whitenoise
+            .track_consumed_key_package(account, &kp_event_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to track consumed key package {}: {}",
+                kp_event_id.to_hex(),
+                e
+            );
+        }
 
         if whitenoise
             .delete_key_package_for_account(account, &kp_event_id, false)
