@@ -34,6 +34,27 @@ The `just` recipes pass specific flags (`--all-features`, `--all-targets`, `-D w
 | Quick pre-commit (checks + unit tests) | `just precommit-quick` |
 | Full pre-commit (checks + unit tests + integration) | `just precommit` |
 
+### Quiet vs Verbose Commands
+
+The precommit commands default to **quiet mode** which shows minimal pass/fail output per step. This is optimized for AI agents and CI where only failures need detail.
+
+- `just precommit` — quiet mode, full checks including integration tests
+- `just precommit-quick` — quiet mode, skip integration tests
+- `just precommit-verbose` — verbose mode, full checks including integration tests
+- `just precommit-quick-verbose` — verbose mode, skip integration tests
+
+**Agents should use `just precommit-quick` (or `just precommit` if Docker is running).** On success the output looks like:
+
+```text
+fmt...                   ✓
+docs...                  ✓
+clippy...                ✓
+tests...                 ✓
+PRECOMMIT PASSED
+```
+
+On failure, the failing step prints its full output for diagnosis before exiting.
+
 ### Integration Tests (require Docker)
 
 Docker Compose services **must** be running before running integration tests:
@@ -209,7 +230,7 @@ CI runs on push to `master` and on all PRs. The pipeline includes:
 6. **Coverage regression check** (PRs that decrease coverage are blocked)
 7. **Nightly Rust check** (informational only, allowed to fail)
 
-Before submitting work, run at minimum `just precommit-quick` (or `just precommit` if Docker is running).
+Before submitting work, run at minimum `just precommit-quick` (or `just precommit` if Docker is running). Both commands use quiet mode by default; add `-verbose` suffix for full output.
 
 ## MLS Protocol Documentation and Resources
 
