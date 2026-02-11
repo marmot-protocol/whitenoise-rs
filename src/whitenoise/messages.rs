@@ -796,8 +796,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(messages.len(), 5);
-        for (i, msg) in messages.iter().enumerate() {
-            assert!(msg.content.contains(&format!("Startup test {}", i + 1)));
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=5 {
+            assert!(
+                contents.contains(&format!("Startup test {}", i)),
+                "Missing 'Startup test {}' in cached messages",
+                i
+            );
         }
 
         // Running startup sync again should be idempotent
@@ -859,13 +864,13 @@ mod tests {
         // Verify we got all 3 messages
         assert_eq!(fetched_messages.len(), 3);
 
-        // Verify content
-        for (i, msg) in fetched_messages.iter().enumerate() {
+        // Verify content (messages may not be in creation order when timestamps are equal)
+        let contents: Vec<String> = fetched_messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=3 {
             assert!(
-                msg.content.contains(&format!("Cache test {}", i + 1)),
-                "Message {} should contain 'Cache test {}'",
-                i,
-                i + 1
+                contents.contains(&format!("Cache test {}", i)),
+                "Missing 'Cache test {}' in fetched messages",
+                i
             );
         }
 

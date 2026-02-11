@@ -366,6 +366,7 @@ mod tests {
             id: reaction_event_id,
             pubkey: keys.public_key(),
             created_at: Timestamp::from(1234567890),
+            processed_at: Timestamp::from(1234567890),
             kind: Kind::Reaction,
             tags,
             content: "👍".to_string(),

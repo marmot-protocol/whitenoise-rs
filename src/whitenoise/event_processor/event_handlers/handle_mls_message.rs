@@ -31,7 +31,9 @@ impl Whitenoise {
                 );
 
                 // Extract and store media references synchronously
-                if let Some((group_id, inner_event)) = Self::extract_message_details(&result) {
+                if let Some((group_id, inner_event, message)) =
+                    Self::extract_message_details(&result)
+                {
                     let parsed_references = {
                         let media_manager = mdk.media_manager(group_id.clone());
                         self.media_files()
@@ -45,9 +47,6 @@ impl Whitenoise {
                             parsed_references,
                         )
                         .await?;
-
-                    // Cache the message and emit updates to subscribers
-                    let message = Self::build_message_from_event(&group_id, inner_event)?;
 
                     match message.kind {
                         Kind::ChatMessage => {
@@ -122,44 +121,25 @@ impl Whitenoise {
         }
     }
 
-    /// Extracts group_id and inner_event from MessageProcessingResult
+    /// Extracts group_id, inner_event, and the full Message from a processing result.
     ///
     /// Returns Some if the result contains an application message with inner event content,
     /// None otherwise (e.g., for commits, proposals, or other non-message results).
+    /// The returned Message preserves all MDK-set fields (processed_at, epoch, state, etc.).
     fn extract_message_details(
         result: &MessageProcessingResult,
-    ) -> Option<(mdk_core::prelude::GroupId, UnsignedEvent)> {
+    ) -> Option<(mdk_core::prelude::GroupId, UnsignedEvent, Message)> {
         match result {
             MessageProcessingResult::ApplicationMessage(message) => {
                 // The message.event is the decrypted rumor (UnsignedEvent) from the MLS message
-                Some((message.mls_group_id.clone(), message.event.clone()))
+                Some((
+                    message.mls_group_id.clone(),
+                    message.event.clone(),
+                    message.clone(),
+                ))
             }
             _ => None,
         }
-    }
-
-    /// Build a Message struct from an UnsignedEvent.
-    fn build_message_from_event(group_id: &GroupId, inner_event: UnsignedEvent) -> Result<Message> {
-        let event_id = inner_event.id.ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!(
-                "Inner event missing ID in group {}",
-                hex::encode(group_id.as_slice())
-            ))
-        })?;
-
-        Ok(Message {
-            id: event_id,
-            pubkey: inner_event.pubkey,
-            created_at: inner_event.created_at,
-            kind: inner_event.kind,
-            tags: inner_event.tags.clone(),
-            content: inner_event.content.clone(),
-            mls_group_id: group_id.clone(),
-            event: inner_event,
-            wrapper_event_id: event_id, // Reuse event_id as placeholder, we don't need it
-            epoch: None, // Epoch not needed for reactions - they reference existing messages
-            state: mdk_core::prelude::message_types::MessageState::Processed,
-        })
     }
 
     /// Emit a message update to all subscribers of a group.
@@ -894,6 +874,7 @@ mod tests {
             id: inner_event.id.unwrap(),
             pubkey,
             created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
             kind: Kind::Custom(9),
             tags: Tags::new(),
             content: "Test".to_string(),
@@ -907,9 +888,11 @@ mod tests {
         let result = MessageProcessingResult::ApplicationMessage(message);
         let extracted = Whitenoise::extract_message_details(&result);
         assert!(extracted.is_some(), "Should extract application message");
-        let (extracted_group_id, extracted_event) = extracted.unwrap();
+        let (extracted_group_id, extracted_event, extracted_message) = extracted.unwrap();
         assert_eq!(extracted_group_id, group_id);
         assert_eq!(extracted_event.content, "Test");
+        assert_eq!(extracted_message.content, "Test");
+        assert_eq!(extracted_message.mls_group_id, group_id);
 
         // Test extract_message_details with non-ApplicationMessage
         let commit_result = MessageProcessingResult::Commit {
