@@ -49,56 +49,22 @@ impl Task for KeyPackageMaintenance {
             return Ok(());
         }
 
-        let mut checked = 0usize;
-        let mut published = 0usize;
-        let mut rotated = 0usize;
-        let mut skipped = 0usize;
-        let mut errors = 0usize;
-
         let results: Vec<MaintenanceResult> = stream::iter(accounts.clone())
             .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
             .await;
 
-        // Summarize results
-        for result in results {
-            checked += 1;
-            match result {
-                MaintenanceResult::Fresh => {}
-                MaintenanceResult::Published => {
-                    published += 1;
-                }
-                MaintenanceResult::Rotated { deleted } => {
-                    rotated += 1;
-                    tracing::debug!(
-                        target: "whitenoise::scheduled_tasks::key_package_maintenance",
-                        "Rotated key package, deleted {} old one(s)",
-                        deleted
-                    );
-                }
-                MaintenanceResult::Skipped => {
-                    skipped += 1;
-                }
-                MaintenanceResult::Error(e) => {
-                    errors += 1;
-                    tracing::warn!(
-                        target: "whitenoise::scheduled_tasks::key_package_maintenance",
-                        "Error during key package maintenance: {}",
-                        e
-                    );
-                }
-            }
-        }
+        let summary = summarize_maintenance_results(results);
 
         tracing::info!(
             target: "whitenoise::scheduled_tasks::key_package_maintenance",
             "Key package maintenance completed: {} checked, {} published, {} rotated, {} skipped, {} errors",
-            checked,
-            published,
-            rotated,
-            skipped,
-            errors
+            summary.checked,
+            summary.published,
+            summary.rotated,
+            summary.skipped,
+            summary.errors
         );
 
         // Phase 2: Clean up local key material for consumed key packages
@@ -112,29 +78,7 @@ impl Task for KeyPackageMaintenance {
             .collect()
             .await;
 
-        let mut total_cleaned = 0usize;
-        for (pubkey_hex, result) in cleanup_results {
-            match result {
-                Ok(0) => {}
-                Ok(cleaned) => {
-                    total_cleaned += cleaned;
-                    tracing::info!(
-                        target: "whitenoise::scheduled_tasks::key_package_maintenance",
-                        "Cleaned up {} consumed key package(s) for account {}",
-                        cleaned,
-                        pubkey_hex
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::scheduled_tasks::key_package_maintenance",
-                        "Failed to clean up consumed key packages for account {}: {}",
-                        pubkey_hex,
-                        e
-                    );
-                }
-            }
-        }
+        let total_cleaned = summarize_cleanup_results(cleanup_results);
 
         if total_cleaned > 0 {
             tracing::info!(
@@ -159,6 +103,74 @@ enum MaintenanceResult {
     Skipped,
     /// An error occurred
     Error(WhitenoiseError),
+}
+
+/// Summary counters from Phase 1 maintenance results.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MaintenanceSummary {
+    checked: usize,
+    published: usize,
+    rotated: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+/// Tallies Phase 1 maintenance results into summary counters.
+fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> MaintenanceSummary {
+    let mut summary = MaintenanceSummary::default();
+    for result in results {
+        summary.checked += 1;
+        match result {
+            MaintenanceResult::Fresh => {}
+            MaintenanceResult::Published => summary.published += 1,
+            MaintenanceResult::Rotated { deleted } => {
+                summary.rotated += 1;
+                tracing::debug!(
+                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    "Rotated key package, deleted {} old one(s)",
+                    deleted
+                );
+            }
+            MaintenanceResult::Skipped => summary.skipped += 1,
+            MaintenanceResult::Error(e) => {
+                summary.errors += 1;
+                tracing::warn!(
+                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    "Error during key package maintenance: {}",
+                    e
+                );
+            }
+        }
+    }
+    summary
+}
+
+/// Tallies Phase 2 cleanup results, logging per-account outcomes.
+fn summarize_cleanup_results(results: Vec<(String, Result<usize, WhitenoiseError>)>) -> usize {
+    let mut total_cleaned = 0usize;
+    for (pubkey_hex, result) in results {
+        match result {
+            Ok(0) => {}
+            Ok(cleaned) => {
+                total_cleaned += cleaned;
+                tracing::info!(
+                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    "Cleaned up {} consumed key package(s) for account {}",
+                    cleaned,
+                    pubkey_hex
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    "Failed to clean up consumed key packages for account {}: {}",
+                    pubkey_hex,
+                    e
+                );
+            }
+        }
+    }
+    total_cleaned
 }
 
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
@@ -403,6 +415,75 @@ mod tests {
     fn test_find_expired_packages_handles_empty_input() {
         let expired = find_expired_packages(&[]);
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_empty() {
+        let summary = summarize_maintenance_results(vec![]);
+        assert_eq!(summary, MaintenanceSummary::default());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_mixed() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Published,
+            MaintenanceResult::Rotated { deleted: 3 },
+            MaintenanceResult::Skipped,
+            MaintenanceResult::Error(WhitenoiseError::AccountNotFound),
+            MaintenanceResult::Fresh,
+        ];
+
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 6);
+        assert_eq!(summary.published, 1);
+        assert_eq!(summary.rotated, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_all_fresh() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+        ];
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 3);
+        assert_eq!(summary.published, 0);
+    }
+
+    #[test]
+    fn test_summarize_cleanup_results_empty() {
+        assert_eq!(summarize_cleanup_results(vec![]), 0);
+    }
+
+    #[test]
+    fn test_summarize_cleanup_results_mixed() {
+        let results = vec![
+            ("a".to_string(), Ok(0)),
+            ("b".to_string(), Ok(3)),
+            ("c".to_string(), Ok(2)),
+            ("d".to_string(), Err(WhitenoiseError::AccountNotFound)),
+        ];
+        assert_eq!(summarize_cleanup_results(results), 5);
+    }
+
+    #[test]
+    fn test_summarize_cleanup_results_all_errors() {
+        let results = vec![
+            ("a".to_string(), Err(WhitenoiseError::AccountNotFound)),
+            ("b".to_string(), Err(WhitenoiseError::AccountNotFound)),
+        ];
+        assert_eq!(summarize_cleanup_results(results), 0);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(KEY_PACKAGE_MAX_AGE, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(CONSUMED_KP_QUIET_PERIOD_SECS, 30);
+        assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
     }
 
     // NOTE: Relay-dependent tests (publish when none exist, leave fresh
