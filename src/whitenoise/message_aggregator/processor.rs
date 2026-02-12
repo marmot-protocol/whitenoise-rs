@@ -261,6 +261,12 @@ fn extract_media_attachments(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use chrono::Utc;
+    use mdk_core::prelude::GroupId;
+    use mdk_core::prelude::message_types::{Message, MessageState};
+
     use super::*;
     use crate::nostr_manager::parser::MockParser;
 
@@ -479,10 +485,6 @@ mod tests {
     }
 
     fn create_test_media_file(original_hash: Option<Vec<u8>>) -> MediaFile {
-        use chrono::Utc;
-        use mdk_core::prelude::GroupId;
-        use std::path::PathBuf;
-
         MediaFile {
             id: Some(1),
             mls_group_id: GroupId::from_slice(&[1; 32]),
@@ -502,9 +504,6 @@ mod tests {
     }
 
     fn create_test_message(keys: &Keys, kind: Kind, tags: Tags, content: &str) -> Message {
-        use mdk_core::prelude::GroupId;
-        use mdk_core::prelude::message_types::{Message, MessageState};
-
         let inner_event = nostr_sdk::UnsignedEvent::new(
             keys.public_key(),
             Timestamp::now(),

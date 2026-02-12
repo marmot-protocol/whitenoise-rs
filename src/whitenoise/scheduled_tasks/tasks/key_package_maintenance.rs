@@ -35,7 +35,7 @@ impl Task for KeyPackageMaintenance {
 
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
         tracing::debug!(
-            target: "whitenoise::scheduled_tasks::key_package_maintenance",
+            target: "whitenoise::scheduler::key_package_maintenance",
             "Starting key package maintenance"
         );
 
@@ -43,7 +43,7 @@ impl Task for KeyPackageMaintenance {
 
         if accounts.is_empty() {
             tracing::debug!(
-                target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                target: "whitenoise::scheduler::key_package_maintenance",
                 "No accounts found, skipping"
             );
             return Ok(());
@@ -58,7 +58,7 @@ impl Task for KeyPackageMaintenance {
         let summary = summarize_maintenance_results(results);
 
         tracing::info!(
-            target: "whitenoise::scheduled_tasks::key_package_maintenance",
+            target: "whitenoise::scheduler::key_package_maintenance",
             "Key package maintenance completed: {} checked, {} published, {} rotated, {} skipped, {} errors",
             summary.checked,
             summary.published,
@@ -82,7 +82,7 @@ impl Task for KeyPackageMaintenance {
 
         if total_cleaned > 0 {
             tracing::info!(
-                target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                target: "whitenoise::scheduler::key_package_maintenance",
                 "Consumed key package cleanup: {} total cleaned",
                 total_cleaned
             );
@@ -126,7 +126,7 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
             MaintenanceResult::Rotated { deleted } => {
                 summary.rotated += 1;
                 tracing::debug!(
-                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    target: "whitenoise::scheduler::key_package_maintenance",
                     "Rotated key package, deleted {} old one(s)",
                     deleted
                 );
@@ -135,7 +135,7 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
             MaintenanceResult::Error(e) => {
                 summary.errors += 1;
                 tracing::warn!(
-                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    target: "whitenoise::scheduler::key_package_maintenance",
                     "Error during key package maintenance: {}",
                     e
                 );
@@ -154,7 +154,7 @@ fn summarize_cleanup_results(results: Vec<(String, Result<usize, WhitenoiseError
             Ok(cleaned) => {
                 total_cleaned += cleaned;
                 tracing::info!(
-                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    target: "whitenoise::scheduler::key_package_maintenance",
                     "Cleaned up {} consumed key package(s) for account {}",
                     cleaned,
                     pubkey_hex
@@ -162,7 +162,7 @@ fn summarize_cleanup_results(results: Vec<(String, Result<usize, WhitenoiseError
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    target: "whitenoise::scheduler::key_package_maintenance",
                     "Failed to clean up consumed key packages for account {}: {}",
                     pubkey_hex,
                     e
@@ -178,7 +178,7 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
         Ok(packages) => packages,
         Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {
             tracing::debug!(
-                target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                target: "whitenoise::scheduler::key_package_maintenance",
                 "Account {} has no key package relays configured, skipping",
                 account.pubkey.to_hex()
             );
@@ -197,7 +197,7 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
 
     if expired_packages.is_empty() {
         tracing::debug!(
-            target: "whitenoise::scheduled_tasks::key_package_maintenance",
+            target: "whitenoise::scheduler::key_package_maintenance",
             "Account {} has {} fresh key package(s)",
             account.pubkey.to_hex(),
             packages.len()
@@ -224,7 +224,7 @@ fn find_expired_packages(packages: &[Event]) -> Vec<Event> {
 /// Publishes a new key package when account has none.
 async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     tracing::info!(
-        target: "whitenoise::scheduled_tasks::key_package_maintenance",
+        target: "whitenoise::scheduler::key_package_maintenance",
         "Account {} has no key packages, publishing new one",
         account.pubkey.to_hex()
     );
@@ -232,7 +232,7 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
     match whitenoise.publish_key_package_for_account(account).await {
         Ok(()) => {
             tracing::info!(
-                target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                target: "whitenoise::scheduler::key_package_maintenance",
                 "Published key package for account {}",
                 account.pubkey.to_hex()
             );
@@ -250,7 +250,7 @@ async fn rotate_expired_packages(
     expired_packages: Vec<Event>,
 ) -> MaintenanceResult {
     tracing::info!(
-        target: "whitenoise::scheduled_tasks::key_package_maintenance",
+        target: "whitenoise::scheduler::key_package_maintenance",
         "Account {} has {} expired key package(s), rotating",
         account.pubkey.to_hex(),
         expired_packages.len()
@@ -265,7 +265,7 @@ async fn rotate_expired_packages(
     }
 
     tracing::debug!(
-        target: "whitenoise::scheduled_tasks::key_package_maintenance",
+        target: "whitenoise::scheduler::key_package_maintenance",
         "Published new key package for account {}, now deleting {} expired one(s)",
         account.pubkey.to_hex(),
         expired_packages.len()
@@ -280,7 +280,7 @@ async fn rotate_expired_packages(
         Err(e) => {
             // Log but don't fail - we successfully published a new one
             tracing::warn!(
-                target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                target: "whitenoise::scheduler::key_package_maintenance",
                 "Failed to delete expired key packages for account {}: {}",
                 account.pubkey.to_hex(),
                 e
@@ -311,7 +311,7 @@ async fn cleanup_consumed_key_packages(
     }
 
     tracing::debug!(
-        target: "whitenoise::scheduled_tasks::key_package_maintenance",
+        target: "whitenoise::scheduler::key_package_maintenance",
         "Found {} consumed key package(s) eligible for cleanup for account {}",
         eligible.len(),
         account.pubkey.to_hex()
@@ -330,7 +330,7 @@ async fn cleanup_consumed_key_packages(
                 .await
                 {
                     tracing::warn!(
-                        target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                        target: "whitenoise::scheduler::key_package_maintenance",
                         "Deleted key material but failed to mark record {}: {}",
                         consumed.id,
                         e
@@ -340,7 +340,7 @@ async fn cleanup_consumed_key_packages(
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "whitenoise::scheduled_tasks::key_package_maintenance",
+                    target: "whitenoise::scheduler::key_package_maintenance",
                     "Failed to delete local key material for consumed key package {}: {}",
                     consumed.id,
                     e
