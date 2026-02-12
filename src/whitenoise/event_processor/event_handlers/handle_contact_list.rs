@@ -178,65 +178,67 @@ impl Whitenoise {
     /// Fetches relay lists and metadata for a batch of users with bounded
     /// concurrency. Returns the number of users successfully fetched.
     ///
-    /// Checks the cancellation signal before starting each user fetch and
-    /// stops early if cancelled (e.g. on logout).
+    /// Uses `take_while` on the stream to stop yielding new items when
+    /// cancellation is signalled (e.g. on logout). Any in-flight fetches
+    /// finish naturally, but no new futures are created.
     async fn fetch_users_batch(
         whitenoise: &Whitenoise,
         pubkeys: &[PublicKey],
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> usize {
         let results: Vec<bool> = stream::iter(pubkeys.iter().copied())
-            .map(|pubkey| {
+            .take_while({
                 let cancel_rx = cancel_rx.clone();
-                async move {
-                    // Check cancellation before starting this user's fetch
-                    if let Some(rx) = &cancel_rx
-                        && *rx.borrow()
-                    {
-                        tracing::debug!(
+                move |_| {
+                    let cancelled = cancel_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
+                    async move {
+                        if cancelled {
+                            tracing::debug!(
+                                target: "whitenoise::handle_contact_list",
+                                "Background fetch cancelled, stopping"
+                            );
+                        }
+                        !cancelled
+                    }
+                }
+            })
+            .map(|pubkey| async move {
+                let user = match User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await
+                {
+                    Ok((user, _)) => user,
+                    Err(e) => {
+                        tracing::warn!(
                             target: "whitenoise::handle_contact_list",
-                            "Background fetch cancelled, stopping"
+                            "Failed to find/create user {}: {}",
+                            pubkey.to_hex(),
+                            e
                         );
                         return false;
                     }
+                };
 
-                    let user =
-                        match User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await {
-                            Ok((user, _)) => user,
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "whitenoise::handle_contact_list",
-                                    "Failed to find/create user {}: {}",
-                                    pubkey.to_hex(),
-                                    e
-                                );
-                                return false;
-                            }
-                        };
-
-                    // Fetch relay lists then metadata (serial per user since
-                    // metadata fetch benefits from knowing the user's relays)
-                    if let Err(e) = user.update_relay_lists(whitenoise).await {
-                        tracing::warn!(
-                            target: "whitenoise::handle_contact_list",
-                            "Failed to fetch relay lists for {}: {}",
-                            pubkey.to_hex(),
-                            e
-                        );
-                    }
-
-                    let mut user_for_metadata = user.clone();
-                    if let Err(e) = user_for_metadata.sync_metadata(whitenoise).await {
-                        tracing::warn!(
-                            target: "whitenoise::handle_contact_list",
-                            "Failed to fetch metadata for {}: {}",
-                            pubkey.to_hex(),
-                            e
-                        );
-                    }
-
-                    true
+                // Fetch relay lists then metadata (serial per user since
+                // metadata fetch benefits from knowing the user's relays)
+                if let Err(e) = user.update_relay_lists(whitenoise).await {
+                    tracing::warn!(
+                        target: "whitenoise::handle_contact_list",
+                        "Failed to fetch relay lists for {}: {}",
+                        pubkey.to_hex(),
+                        e
+                    );
                 }
+
+                let mut user_for_metadata = user.clone();
+                if let Err(e) = user_for_metadata.sync_metadata(whitenoise).await {
+                    tracing::warn!(
+                        target: "whitenoise::handle_contact_list",
+                        "Failed to fetch metadata for {}: {}",
+                        pubkey.to_hex(),
+                        e
+                    );
+                }
+
+                true
             })
             .buffer_unordered(CONTACT_LIST_FETCH_CONCURRENCY)
             .collect()
