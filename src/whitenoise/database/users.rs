@@ -101,39 +101,32 @@ impl User {
             "SELECT u.pubkey, r.url
              FROM users u
              LEFT JOIN user_relays ur ON u.id = ur.user_id AND ur.relay_type = ?
-             LEFT JOIN relays r ON ur.relay_id = r.id
-             ORDER BY u.pubkey",
+             LEFT JOIN relays r ON ur.relay_id = r.id",
         )
         .bind(&relay_type_str)
         .fetch_all(&database.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        // Group relay URLs by pubkey, preserving insertion order
+        // Group relay URLs by pubkey
         let mut map: HashMap<String, Vec<RelayUrl>> = HashMap::new();
-        let mut order: Vec<String> = Vec::new();
 
         for (pubkey_hex, relay_url) in rows {
-            if !map.contains_key(&pubkey_hex) {
-                order.push(pubkey_hex.clone());
-                map.insert(pubkey_hex.clone(), Vec::new());
-            }
+            let relays = map.entry(pubkey_hex).or_default();
             if let Some(url_str) = relay_url
                 && let Ok(url) = RelayUrl::parse(&url_str)
             {
-                map.get_mut(&pubkey_hex).unwrap().push(url);
+                relays.push(url);
             }
         }
 
-        let mut result = Vec::with_capacity(order.len());
-        for pubkey_hex in order {
-            let pubkey =
-                PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
-            let relay_urls = map.remove(&pubkey_hex).unwrap_or_default();
-            result.push((pubkey, relay_urls));
-        }
-
-        Ok(result)
+        map.into_iter()
+            .map(|(pubkey_hex, relay_urls)| {
+                let pubkey =
+                    PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
+                Ok((pubkey, relay_urls))
+            })
+            .collect()
     }
 
     /// Finds an existing user by public key or creates a new one if not found.
