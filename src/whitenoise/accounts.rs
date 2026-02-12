@@ -398,6 +398,16 @@ impl Whitenoise {
         let pubkey = keys.public_key();
         tracing::debug!(target: "whitenoise::login", "Logging in with pubkey: {}", pubkey.to_hex());
 
+        // If this account is already logged in, return it as-is.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            tracing::debug!(
+                target: "whitenoise::login",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(existing);
+        }
+
         let mut account = self.create_base_account_with_private_key(&keys).await?;
         tracing::debug!(target: "whitenoise::login", "Keys stored in secret store and account saved to database");
 
@@ -449,6 +459,16 @@ impl Whitenoise {
             "Logging in with external signer, pubkey: {}",
             pubkey.to_hex()
         );
+
+        // If this account is already logged in, return it as-is.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            tracing::debug!(
+                target: "whitenoise::login_external",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(existing);
+        }
 
         self.validate_signer_pubkey(&pubkey, &signer).await?;
 
