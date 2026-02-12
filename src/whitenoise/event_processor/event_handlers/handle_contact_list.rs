@@ -159,17 +159,16 @@ impl Whitenoise {
                 total
             );
 
-            // Refresh the global subscription once after all users are processed,
-            // rather than once per user. We use a dummy user since the method
-            // rebuilds the subscription for all known users anyway.
+            // Refresh all global subscriptions once after all users are
+            // processed. This refreshes every batch on every relay so that
+            // newly discovered users (who may be spread across many different
+            // relay batches) are properly subscribed to.
             if fetched > 0
-                && let Ok((user, _)) =
-                    User::find_or_create_by_pubkey(&pubkeys[0], &whitenoise.database).await
-                && let Err(e) = whitenoise.refresh_global_subscription_for_user(&user).await
+                && let Err(e) = whitenoise.refresh_all_global_subscriptions().await
             {
                 tracing::warn!(
                     target: "whitenoise::handle_contact_list",
-                    "Failed to refresh global subscription after batch fetch: {}",
+                    "Failed to refresh global subscriptions after batch fetch: {}",
                     e
                 );
             }

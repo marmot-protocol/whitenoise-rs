@@ -903,6 +903,44 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Refreshes global subscriptions for ALL batches across ALL relays.
+    ///
+    /// Unlike `refresh_global_subscription_for_user` which only refreshes
+    /// batches containing a specific user, this refreshes every batch on every
+    /// relay. Use after bulk user discovery (e.g. contact list processing)
+    /// where new users may be spread across many different relay batches.
+    pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
+        let users_with_relays = User::all_users_with_relay_urls(self).await?;
+        let default_relays: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+
+        let Some(signer_account) = Account::first(&self.database).await? else {
+            tracing::info!(
+                target: "whitenoise::refresh_all_global_subscriptions",
+                "No signer account found, skipping global subscription refresh"
+            );
+            return Ok(());
+        };
+
+        if signer_account.uses_external_signer() {
+            self.nostr
+                .refresh_all_global_subscriptions(users_with_relays, &default_relays)
+                .await?;
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+
+            self.nostr
+                .refresh_all_global_subscriptions_with_signer(
+                    users_with_relays,
+                    &default_relays,
+                    keys,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_account_subscriptions(&self, account: &Account) -> Result<()> {
         let is_operational = self.is_account_subscriptions_operational(account).await?;
 
