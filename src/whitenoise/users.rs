@@ -476,16 +476,7 @@ impl User {
     pub(crate) async fn all_users_with_relay_urls(
         whitenoise: &Whitenoise,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>> {
-        let users = User::all(&whitenoise.database).await?;
-        let mut users_with_relays = Vec::new();
-
-        for user in users {
-            let relays = user.relays(RelayType::Nip65, &whitenoise.database).await?;
-            let relay_urls: Vec<RelayUrl> = Relay::urls(&relays);
-            users_with_relays.push((user.pubkey, relay_urls));
-        }
-
-        Ok(users_with_relays)
+        User::all_with_nip65_relay_urls(&whitenoise.database).await
     }
 
     /// Determines whether metadata should be updated based on comprehensive event processing logic.

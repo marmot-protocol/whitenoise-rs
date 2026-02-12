@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Metadata, PublicKey};
+use nostr_sdk::{Metadata, PublicKey, RelayUrl};
 
 use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
 use crate::{
@@ -75,6 +77,7 @@ impl From<UserRow> for User {
 }
 
 impl User {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn all(database: &Database) -> Result<Vec<User>, WhitenoiseError> {
         let user_rows = sqlx::query_as::<_, UserRow>("SELECT * FROM users")
             .fetch_all(&database.pool)
@@ -82,6 +85,55 @@ impl User {
             .map_err(DatabaseError::Sqlx)?;
 
         Ok(user_rows.into_iter().map(Self::from).collect())
+    }
+
+    /// Fetches all users with their NIP-65 relay URLs in a single query.
+    ///
+    /// This uses a LEFT JOIN to avoid the N+1 query problem of fetching
+    /// each user's relays individually. Users with no NIP-65 relays are
+    /// included with an empty relay URL list.
+    pub(crate) async fn all_with_nip65_relay_urls(
+        database: &Database,
+    ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>, WhitenoiseError> {
+        let relay_type_str = String::from(RelayType::Nip65);
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT u.pubkey, r.url
+             FROM users u
+             LEFT JOIN user_relays ur ON u.id = ur.user_id AND ur.relay_type = ?
+             LEFT JOIN relays r ON ur.relay_id = r.id
+             ORDER BY u.pubkey",
+        )
+        .bind(&relay_type_str)
+        .fetch_all(&database.pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+
+        // Group relay URLs by pubkey, preserving insertion order
+        let mut map: HashMap<String, Vec<RelayUrl>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+
+        for (pubkey_hex, relay_url) in rows {
+            if !map.contains_key(&pubkey_hex) {
+                order.push(pubkey_hex.clone());
+                map.insert(pubkey_hex.clone(), Vec::new());
+            }
+            if let Some(url_str) = relay_url
+                && let Ok(url) = RelayUrl::parse(&url_str)
+            {
+                map.get_mut(&pubkey_hex).unwrap().push(url);
+            }
+        }
+
+        let mut result = Vec::with_capacity(order.len());
+        for pubkey_hex in order {
+            let pubkey =
+                PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
+            let relay_urls = map.remove(&pubkey_hex).unwrap_or_default();
+            result.push((pubkey, relay_urls));
+        }
+
+        Ok(result)
     }
 
     /// Finds an existing user by public key or creates a new one if not found.
