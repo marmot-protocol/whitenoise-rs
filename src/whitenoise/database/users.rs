@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use nostr_sdk::{Metadata, PublicKey, RelayUrl};
 
@@ -101,32 +99,34 @@ impl User {
             "SELECT u.pubkey, r.url
              FROM users u
              LEFT JOIN user_relays ur ON u.id = ur.user_id AND ur.relay_type = ?
-             LEFT JOIN relays r ON ur.relay_id = r.id",
+             LEFT JOIN relays r ON ur.relay_id = r.id
+             ORDER BY u.pubkey",
         )
         .bind(&relay_type_str)
         .fetch_all(&database.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        // Group relay URLs by pubkey
-        let mut map: HashMap<String, Vec<RelayUrl>> = HashMap::new();
+        // Rows arrive sorted by pubkey, so we can group in a single pass
+        // without a HashMap.
+        let mut result: Vec<(PublicKey, Vec<RelayUrl>)> = Vec::new();
+        let mut current_pubkey: Option<String> = None;
 
         for (pubkey_hex, relay_url) in rows {
-            let relays = map.entry(pubkey_hex).or_default();
+            if current_pubkey.as_ref() != Some(&pubkey_hex) {
+                let pk =
+                    PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
+                result.push((pk, Vec::new()));
+                current_pubkey = Some(pubkey_hex);
+            }
             if let Some(url_str) = relay_url
                 && let Ok(url) = RelayUrl::parse(&url_str)
             {
-                relays.push(url);
+                result.last_mut().unwrap().1.push(url);
             }
         }
 
-        map.into_iter()
-            .map(|(pubkey_hex, relay_urls)| {
-                let pubkey =
-                    PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
-                Ok((pubkey, relay_urls))
-            })
-            .collect()
+        Ok(result)
     }
 
     /// Finds an existing user by public key or creates a new one if not found.
