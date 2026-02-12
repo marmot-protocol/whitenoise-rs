@@ -901,7 +901,8 @@ impl Whitenoise {
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
+        // NIP-65 must be fetched first because Inbox and KeyPackage use the
+        // discovered NIP-65 relays as their query source.
         let (nip65_relays, should_publish_nip65) = self
             .setup_existing_account_relay_type(
                 account,
@@ -911,42 +912,58 @@ impl Whitenoise {
             )
             .await?;
 
-        let (inbox_relays, should_publish_inbox) = self
-            .setup_existing_account_relay_type(
+        // Inbox and KeyPackage fetches are independent — run them concurrently.
+        let (inbox_result, key_package_result) = tokio::join!(
+            self.setup_existing_account_relay_type(
                 account,
                 RelayType::Inbox,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
-
-        let (key_package_relays, should_publish_key_package) = self
-            .setup_existing_account_relay_type(
+            ),
+            self.setup_existing_account_relay_type(
                 account,
                 RelayType::KeyPackage,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
+            ),
+        );
+        let (inbox_relays, should_publish_inbox) = inbox_result?;
+        let (key_package_relays, should_publish_key_package) = key_package_result?;
 
-        // Only publish relay lists that need publishing (when using defaults as fallback)
-        if should_publish_nip65 {
-            self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                .await?;
-        }
-        if should_publish_inbox {
-            self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                .await?;
-        }
-        if should_publish_key_package {
-            self.publish_relay_list(
-                &key_package_relays,
-                RelayType::KeyPackage,
-                &nip65_relays,
-                &keys,
-            )
-            .await?;
-        }
+        // Publish any relay lists that need publishing concurrently.
+        let nip65_publish = async {
+            if should_publish_nip65 {
+                self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if should_publish_inbox {
+                self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if should_publish_key_package {
+                self.publish_relay_list(
+                    &key_package_relays,
+                    RelayType::KeyPackage,
+                    &nip65_relays,
+                    &keys,
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let (r1, r2, r3) = tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+        r1?;
+        r2?;
+        r3?;
 
         Ok((nip65_relays, inbox_relays, key_package_relays))
     }
@@ -965,8 +982,8 @@ impl Whitenoise {
     ) -> Result<ExternalSignerRelaySetup> {
         let default_relays = self.load_default_relays().await?;
 
-        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
-        // We don't publish here - the caller with the signer will handle that
+        // NIP-65 must be fetched first because Inbox and KeyPackage use the
+        // discovered NIP-65 relays as their query source.
         let (nip65_relays, should_publish_nip65) = self
             .setup_external_account_relay_type(
                 account,
@@ -976,23 +993,23 @@ impl Whitenoise {
             )
             .await?;
 
-        let (inbox_relays, should_publish_inbox) = self
-            .setup_external_account_relay_type(
+        // Inbox and KeyPackage fetches are independent — run them concurrently.
+        let (inbox_result, key_package_result) = tokio::join!(
+            self.setup_external_account_relay_type(
                 account,
                 RelayType::Inbox,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
-
-        let (key_package_relays, should_publish_key_package) = self
-            .setup_external_account_relay_type(
+            ),
+            self.setup_external_account_relay_type(
                 account,
                 RelayType::KeyPackage,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
+            ),
+        );
+        let (inbox_relays, should_publish_inbox) = inbox_result?;
+        let (key_package_relays, should_publish_key_package) = key_package_result?;
 
         Ok(ExternalSignerRelaySetup {
             nip65_relays,
@@ -1011,7 +1028,7 @@ impl Whitenoise {
     /// (true if defaults were used because no existing relays were found).
     async fn setup_external_account_relay_type(
         &self,
-        account: &mut Account,
+        account: &Account,
         relay_type: RelayType,
         source_relays: &[Relay],
         default_relays: &[Relay],
@@ -1037,7 +1054,7 @@ impl Whitenoise {
 
     async fn setup_existing_account_relay_type(
         &self,
-        account: &mut Account,
+        account: &Account,
         relay_type: RelayType,
         source_relays: &[Relay],
         default_relays: &[Relay],
