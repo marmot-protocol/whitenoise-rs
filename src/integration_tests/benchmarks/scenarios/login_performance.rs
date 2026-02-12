@@ -111,9 +111,12 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
                     let dev_relays = dev_relays.clone();
                     let relay_urls = relay_urls_for_follows.clone();
                     async move {
-                        let result: Result<(), WhitenoiseError> = async {
-                            let test_client = create_test_client(&dev_relays, keys).await?;
+                        let test_client = match create_test_client(&dev_relays, keys).await {
+                            Ok(client) => client,
+                            Err(e) => return (i, Some(e.to_string())),
+                        };
 
+                        let result: Result<(), WhitenoiseError> = async {
                             publish_test_metadata(
                                 &test_client,
                                 &format!("Follow User {}", i),
@@ -122,16 +125,16 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
                             .await?;
 
                             publish_relay_lists(&test_client, relay_urls).await?;
-
-                            test_client.disconnect().await;
                             Ok(())
                         }
                         .await;
 
-                        if let Err(e) = &result {
-                            (i, Some(e.to_string()))
-                        } else {
-                            (i, None)
+                        // Always disconnect, regardless of publish success/failure
+                        test_client.disconnect().await;
+
+                        match result {
+                            Ok(()) => (i, None),
+                            Err(e) => (i, Some(e.to_string())),
                         }
                     }
                 })

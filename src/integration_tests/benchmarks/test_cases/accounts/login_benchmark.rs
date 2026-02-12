@@ -43,6 +43,13 @@ impl BenchmarkTestCase for LoginBenchmark {
         context: &mut ScenarioContext,
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = context.tests_count as usize;
+        if iteration >= self.prepared_keys.len() {
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "Login benchmark iteration {} exceeds prepared keys count ({})",
+                iteration,
+                self.prepared_keys.len()
+            )));
+        }
         let keys = &self.prepared_keys[iteration];
 
         // Time the login operation
