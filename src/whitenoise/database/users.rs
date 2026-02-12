@@ -75,7 +75,7 @@ impl From<UserRow> for User {
 }
 
 impl User {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) async fn all(database: &Database) -> Result<Vec<User>, WhitenoiseError> {
         let user_rows = sqlx::query_as::<_, UserRow>("SELECT * FROM users")
             .fetch_all(&database.pool)

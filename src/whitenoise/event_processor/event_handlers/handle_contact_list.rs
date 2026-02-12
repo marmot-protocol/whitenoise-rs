@@ -186,24 +186,19 @@ impl Whitenoise {
         pubkeys: &[PublicKey],
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> usize {
-        let cancel_rx = Arc::new(tokio::sync::Mutex::new(cancel_rx));
-
         let results: Vec<bool> = stream::iter(pubkeys.iter().copied())
             .map(|pubkey| {
                 let cancel_rx = cancel_rx.clone();
                 async move {
                     // Check cancellation before starting this user's fetch
+                    if let Some(rx) = &cancel_rx
+                        && *rx.borrow()
                     {
-                        let guard = cancel_rx.lock().await;
-                        if let Some(rx) = guard.as_ref()
-                            && *rx.borrow()
-                        {
-                            tracing::debug!(
-                                target: "whitenoise::handle_contact_list",
-                                "Background fetch cancelled, stopping"
-                            );
-                            return false;
-                        }
+                        tracing::debug!(
+                            target: "whitenoise::handle_contact_list",
+                            "Background fetch cancelled, stopping"
+                        );
+                        return false;
                     }
 
                     let user =

@@ -102,60 +102,55 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
 
         // Publish metadata + relay lists for each follow user concurrently
         let dev_relays = context.dev_relays.clone();
-        let relay_urls_for_follows = relay_urls.clone();
-        let total_follows = self.follow_count;
 
-        let errors: Vec<(usize, WhitenoiseError)> =
-            stream::iter(follow_keys.into_iter().enumerate())
-                .map(|(i, keys)| {
-                    let dev_relays = dev_relays.clone();
-                    let relay_urls = relay_urls_for_follows.clone();
-                    async move {
-                        let test_client = match create_test_client(&dev_relays, keys).await {
-                            Ok(client) => client,
-                            Err(e) => return (i, Some(e.to_string())),
-                        };
+        let error_count: usize = stream::iter(follow_keys.into_iter().enumerate())
+            .map(|(i, keys)| {
+                let dev_relays = dev_relays.clone();
+                let relay_urls = relay_urls.clone();
+                async move {
+                    let test_client = match create_test_client(&dev_relays, keys).await {
+                        Ok(client) => client,
+                        Err(e) => return Some(e.to_string()),
+                    };
 
-                        let result: Result<(), WhitenoiseError> = async {
-                            publish_test_metadata(
-                                &test_client,
-                                &format!("Follow User {}", i),
-                                "Followed user for login benchmark",
-                            )
-                            .await?;
+                    let result: Result<(), WhitenoiseError> = async {
+                        publish_test_metadata(
+                            &test_client,
+                            &format!("Follow User {}", i),
+                            "Followed user for login benchmark",
+                        )
+                        .await?;
 
-                            publish_relay_lists(&test_client, relay_urls).await?;
-                            Ok(())
-                        }
-                        .await;
-
-                        // Always disconnect, regardless of publish success/failure
-                        test_client.disconnect().await;
-
-                        match result {
-                            Ok(()) => (i, None),
-                            Err(e) => (i, Some(e.to_string())),
-                        }
+                        publish_relay_lists(&test_client, relay_urls).await?;
+                        Ok(())
                     }
-                })
-                .buffer_unordered(SETUP_CONCURRENCY)
-                .filter_map(|(i, err)| async move {
-                    err.map(|msg| (i, WhitenoiseError::Other(anyhow::anyhow!(msg))))
-                })
-                .collect()
-                .await;
+                    .await;
 
-        if !errors.is_empty() {
+                    // Always disconnect, regardless of publish success/failure
+                    test_client.disconnect().await;
+
+                    match result {
+                        Ok(()) => None,
+                        Err(e) => Some(e.to_string()),
+                    }
+                }
+            })
+            .buffer_unordered(SETUP_CONCURRENCY)
+            .filter_map(|err| async { err })
+            .count()
+            .await;
+
+        if error_count > 0 {
             tracing::warn!(
                 "Failed to publish data for {} follow users (continuing with partial setup)",
-                errors.len()
+                error_count
             );
         }
 
         tracing::info!(
             "Published data for {}/{} follow users",
-            total_follows - errors.len(),
-            total_follows
+            self.follow_count - error_count,
+            self.follow_count
         );
 
         // Pre-generate keypairs and publish prerequisite events for each
