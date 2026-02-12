@@ -612,7 +612,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -979,7 +979,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2318,9 +2318,9 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
 name = "lru"
-version = "0.16.1"
+version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfe949189f46fabb938b3a9a0be30fdd93fd8a09260da863399a8cf3db756ec8"
+checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
 
 [[package]]
 name = "lru-slab"
@@ -2350,7 +2350,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.5.3"
-source = "git+https://github.com/marmot-protocol/mdk?rev=ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1#ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1"
+source = "git+https://github.com/marmot-protocol/mdk?rev=b2268aa#b2268aa0bf77282058899b0ac12074f139a538b0"
 dependencies = [
  "blurhash",
  "chacha20poly1305",
@@ -2374,7 +2374,7 @@ dependencies = [
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.5.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1#ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1"
+source = "git+https://github.com/marmot-protocol/mdk?rev=b2268aa#b2268aa0bf77282058899b0ac12074f139a538b0"
 dependencies = [
  "getrandom 0.3.3",
  "hex",
@@ -2395,7 +2395,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.5.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1#ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1"
+source = "git+https://github.com/marmot-protocol/mdk?rev=b2268aa#b2268aa0bf77282058899b0ac12074f139a538b0"
 dependencies = [
  "nostr",
  "openmls",
@@ -3455,7 +3455,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3512,7 +3512,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4107,7 +4107,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4920,7 +4920,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

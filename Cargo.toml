@@ -26,11 +26,11 @@ infer = "0.19"
 keyring-core = "0.7"
 lightning-invoice = "0.33.1"
 
-mdk-core = { version = "0.5.3", git = "https://github.com/marmot-protocol/mdk", rev = "ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1", features = [
+mdk-core = { version = "0.5.3", git = "https://github.com/marmot-protocol/mdk", rev = "b2268aa", features = [
     "mip04",
 ] }
-mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1" }
-mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "ada4b6b0ec00fb753ce5251b9f6d7cd42cd505e1" }
+mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "b2268aa" }
+mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "b2268aa" }
 
 nwc = "0.44"
 nostr-blossom = "0.44"

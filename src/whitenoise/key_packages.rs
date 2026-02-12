@@ -5,7 +5,7 @@ use nostr_sdk::prelude::*;
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::consumed_key_packages::ConsumedKeyPackage;
+use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::Relay;
 
@@ -40,11 +40,14 @@ impl Whitenoise {
     }
 
     /// Helper method to create and encode a key package for the given account.
+    ///
+    /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
+    /// is the serialized hash_ref of the key package for lifecycle tracking.
     pub(crate) async fn encoded_key_package(
         &self,
         account: &Account,
         key_package_relays: &[Relay],
-    ) -> Result<(String, Vec<Tag>)> {
+    ) -> Result<(String, Vec<Tag>, Vec<u8>)> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
@@ -83,13 +86,31 @@ impl Whitenoise {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        let (encoded_key_package, tags) = self.encoded_key_package(account, &relays).await?;
+        let (encoded_key_package, tags, hash_ref) =
+            self.encoded_key_package(account, &relays).await?;
         let relays_urls = Relay::urls(&relays);
 
         let result = self
             .nostr
             .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
             .await?;
+
+        // Track the published key package for lifecycle management
+        if !result.success.is_empty()
+            && let Err(e) = PublishedKeyPackage::create(
+                &account.pubkey,
+                &hash_ref,
+                &result.id().to_hex(),
+                &self.database,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::publish_key_package_with_signer",
+                "Published key package but failed to track it: {}",
+                e
+            );
+        }
 
         tracing::debug!(
             target: "whitenoise::publish_key_package_with_signer",
@@ -105,13 +126,31 @@ impl Whitenoise {
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let (encoded_key_package, tags) = self.encoded_key_package(account, relays).await?;
+        let (encoded_key_package, tags, hash_ref) =
+            self.encoded_key_package(account, relays).await?;
         let relays_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
         let result = self
             .nostr
             .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
             .await?;
+
+        // Track the published key package for lifecycle management
+        if !result.success.is_empty()
+            && let Err(e) = PublishedKeyPackage::create(
+                &account.pubkey,
+                &hash_ref,
+                &result.id().to_hex(),
+                &self.database,
+            )
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::publish_key_package_to_relays",
+                "Published key package but failed to track it: {}",
+                e
+            );
+        }
 
         tracing::debug!(target: "whitenoise::publish_key_package_to_relays", "Published key package to relays: {:?}", result);
 
@@ -171,43 +210,57 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<bool> {
-        let key_package_filter = Filter::new()
-            .id(*event_id)
-            .kind(Kind::MlsKeyPackage)
-            .author(account.pubkey);
+        // Delete local MLS key material using the hash_ref stored at publish time.
+        // This avoids a relay round-trip to fetch and parse the key package event.
+        if delete_mls_stored_keys {
+            match PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &event_id.to_hex(),
+                &self.database,
+            )
+            .await
+            {
+                Ok(Some(pkg)) if !pkg.key_material_deleted => {
+                    let mdk = self.create_mdk_for_account(account.pubkey)?;
+                    mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)?;
+                }
+                Ok(Some(_)) => {
+                    tracing::debug!(
+                        target: "whitenoise::key_packages",
+                        "Key material already deleted for event {}, skipping local deletion",
+                        event_id
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "No published key package record found for event {}, cannot delete local key material",
+                        event_id
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Failed to look up published key package for event {}: {}",
+                        event_id,
+                        e
+                    );
+                }
+            }
+        }
 
-        let mut key_package_stream = self
+        let key_package_relays = account.key_package_relays(self).await?;
+        if key_package_relays.is_empty() {
+            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+        }
+
+        let key_package_relays_urls = Relay::urls(&key_package_relays);
+
+        let result = self
             .nostr
-            .client
-            .stream_events(key_package_filter, Duration::from_secs(5))
+            .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
             .await?;
-
-        let mut key_package_events = Vec::new();
-        while let Some(event) = key_package_stream.next().await {
-            key_package_events.push(event);
-        }
-
-        if let Some(event) = key_package_events.first() {
-            if delete_mls_stored_keys {
-                let mdk = self.create_mdk_for_account(account.pubkey)?;
-                let key_package = mdk.parse_key_package(event)?;
-                mdk.delete_key_package_from_storage(&key_package)?;
-            }
-
-            let key_package_relays = account.key_package_relays(self).await?;
-            if key_package_relays.is_empty() {
-                return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
-            }
-
-            let key_package_relays_urls = Relay::urls(&key_package_relays);
-
-            let result = self
-                .nostr
-                .publish_event_deletion_with_signer(&event.id, &key_package_relays_urls, signer)
-                .await?;
-            return Ok(!result.success.is_empty());
-        }
-        Ok(false)
+        Ok(!result.success.is_empty())
     }
 
     /// Finds and returns all key package events for the given account from its key package relays.
@@ -524,51 +577,6 @@ impl Whitenoise {
             "Deleted {} out of {} key packages from MLS storage",
             storage_delete_count,
             initial_count
-        );
-
-        Ok(())
-    }
-
-    /// Fetches a key package event from relays, computes its hash_ref, and stores
-    /// it in the `consumed_key_packages` table for delayed local key material cleanup.
-    pub(crate) async fn track_consumed_key_package(
-        &self,
-        account: &Account,
-        event_id: &EventId,
-    ) -> Result<()> {
-        let key_package_filter = Filter::new()
-            .id(*event_id)
-            .kind(Kind::MlsKeyPackage)
-            .author(account.pubkey);
-
-        let mut stream = self
-            .nostr
-            .client
-            .stream_events(key_package_filter, Duration::from_secs(5))
-            .await?;
-
-        let event = match stream.next().await {
-            Some(event) => event,
-            None => {
-                tracing::debug!(
-                    target: "whitenoise::key_packages",
-                    "Key package event {} not found on relays, cannot track for cleanup",
-                    event_id.to_hex()
-                );
-                return Ok(());
-            }
-        };
-
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let key_package = mdk.parse_key_package(&event)?;
-        let hash_ref_bytes = mdk.compute_key_package_hash_ref(&key_package)?;
-
-        ConsumedKeyPackage::track(&account.pubkey, &hash_ref_bytes, &self.database).await?;
-
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Tracked consumed key package {} for delayed cleanup",
-            event_id.to_hex()
         );
 
         Ok(())

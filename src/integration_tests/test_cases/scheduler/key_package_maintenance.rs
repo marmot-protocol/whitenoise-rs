@@ -157,7 +157,7 @@ async fn publish_backdated_key_package(
     days_old: u64,
 ) -> Result<EventId, WhitenoiseError> {
     // Get the encoded key package and tags
-    let (encoded_key_package, tags) = context
+    let (encoded_key_package, tags, _hash_ref) = context
         .whitenoise
         .encoded_key_package(account, relays)
         .await?;

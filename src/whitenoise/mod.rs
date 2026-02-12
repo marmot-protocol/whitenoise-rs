@@ -1284,7 +1284,7 @@ pub mod test_utils {
             accounts.push((account.clone(), keys.clone()));
             // publish keypackage to relays
             let key_package_relays = account.key_package_relays(whitenoise).await.unwrap();
-            let (ekp, tags) = whitenoise
+            let (ekp, tags, hash_ref) = whitenoise
                 .encoded_key_package(&account, &key_package_relays)
                 .await
                 .unwrap();
@@ -1292,11 +1292,22 @@ pub mod test_utils {
             let key_package_relays_urls =
                 Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
 
-            let _ = whitenoise
+            let result = whitenoise
                 .nostr
                 .publish_key_package_with_signer(&ekp, &key_package_relays_urls, &tags, keys)
                 .await
                 .unwrap();
+
+            // Track the published key package for lifecycle management in tests
+            if !result.success.is_empty() {
+                let _ = crate::whitenoise::database::published_key_packages::PublishedKeyPackage::create(
+                    &account.pubkey,
+                    &hash_ref,
+                    &result.id().to_hex(),
+                    &whitenoise.database,
+                )
+                .await;
+            }
         }
         accounts
     }

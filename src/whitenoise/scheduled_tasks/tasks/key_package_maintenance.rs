@@ -6,7 +6,7 @@ use nostr_sdk::{Event, Timestamp};
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::consumed_key_packages::ConsumedKeyPackage;
+use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::scheduled_tasks::Task;
 
@@ -294,12 +294,12 @@ async fn rotate_expired_packages(
 ///
 /// Checks if the account has consumed key packages where the quiet period has elapsed
 /// (no new welcomes in the last 30 seconds), then deletes local key material using
-/// the cached serialized hash_ref.
+/// the hash_ref stored at publish time and marks the row as cleaned.
 async fn cleanup_consumed_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,
 ) -> Result<usize, WhitenoiseError> {
-    let eligible = ConsumedKeyPackage::find_eligible_for_cleanup(
+    let eligible = PublishedKeyPackage::find_eligible_for_cleanup(
         &account.pubkey,
         CONSUMED_KP_QUIET_PERIOD_SECS,
         &whitenoise.database,
@@ -323,11 +323,15 @@ async fn cleanup_consumed_key_packages(
     for consumed in &eligible {
         match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
             Ok(()) => {
-                if let Err(e) = ConsumedKeyPackage::delete(consumed.id, &whitenoise.database).await
+                if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
+                    consumed.id,
+                    &whitenoise.database,
+                )
+                .await
                 {
                     tracing::warn!(
                         target: "whitenoise::scheduled_tasks::key_package_maintenance",
-                        "Deleted key material but failed to remove tracking record {}: {}",
+                        "Deleted key material but failed to mark record {}: {}",
                         consumed.id,
                         e
                     );
