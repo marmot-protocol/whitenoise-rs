@@ -1742,6 +1742,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_login_double_login_returns_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let first_account = whitenoise
+            .login(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Login again with the same key without logging out
+        let second_account = whitenoise
+            .login(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Should return the same account, not create a new one
+        assert_eq!(first_account.id, second_account.id);
+        assert_eq!(first_account.pubkey, second_account.pubkey);
+
+        // Should still have exactly one account in the database
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(count, 1, "Double login should not create a second account");
+    }
+
+    #[tokio::test]
+    async fn test_create_identity_creates_cancellation_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        assert!(
+            whitenoise
+                .background_task_cancellation
+                .contains_key(&account.pubkey),
+            "activate_account should create a cancellation channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_signals_and_removes_cancellation_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Subscribe to the cancellation channel before logout
+        let cancel_rx = whitenoise
+            .background_task_cancellation
+            .get(&account.pubkey)
+            .expect("cancellation channel should exist after login")
+            .value()
+            .subscribe();
+
+        // Initially not cancelled
+        assert!(
+            !*cancel_rx.borrow(),
+            "should not be cancelled before logout"
+        );
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // After logout, the channel should have been signalled
+        assert!(
+            *cancel_rx.borrow(),
+            "logout should signal cancellation to running background tasks"
+        );
+
+        // And the entry should be removed from the map
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&account.pubkey),
+            "logout should remove the cancellation channel entry"
+        );
+    }
+
+    #[tokio::test]
     async fn test_multiple_accounts_each_have_proper_setup() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
