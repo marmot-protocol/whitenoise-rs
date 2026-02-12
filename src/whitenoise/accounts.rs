@@ -655,6 +655,12 @@ impl Whitenoise {
     pub async fn logout(&self, pubkey: &PublicKey) -> Result<()> {
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
 
+        // Cancel any running background tasks (contact list user fetches, etc.)
+        // before tearing down subscriptions and relay connections.
+        if let Some((_, cancel_tx)) = self.background_task_cancellation.remove(pubkey) {
+            let _ = cancel_tx.send(true);
+        }
+
         // Unsubscribe from account-specific subscriptions before logout
         if let Err(e) = self.nostr.unsubscribe_account_subscriptions(pubkey).await {
             tracing::warn!(
@@ -736,6 +742,13 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        // Create a fresh cancellation channel for this account's background tasks.
+        // Any previous channel (from a prior login) is replaced, which also drops
+        // any stale receivers.
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        self.background_task_cancellation
+            .insert(account.pubkey, cancel_tx);
+
         let relay_urls: Vec<RelayUrl> = Relay::urls(
             nip65_relays
                 .iter()
@@ -772,6 +785,10 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        self.background_task_cancellation
+            .insert(account.pubkey, cancel_tx);
+
         let relay_urls: Vec<RelayUrl> = Relay::urls(
             nip65_relays
                 .iter()

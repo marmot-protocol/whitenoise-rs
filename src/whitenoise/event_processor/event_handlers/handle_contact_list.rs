@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
 use nostr_sdk::prelude::*;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{
     nostr_manager::NostrManager,
@@ -14,6 +15,13 @@ use crate::{
         utils::timestamp_to_datetime,
     },
 };
+
+/// Maximum number of concurrent user data fetches when processing a contact list.
+/// Each fetch does ~4 network round-trips (3 relay list + 1 metadata), so 35
+/// concurrent fetches means ~140 in-flight requests — well within the relay
+/// pool's internal channel capacity (1024) while balancing login speed against
+/// follow list population time.
+const CONTACT_LIST_FETCH_CONCURRENCY: usize = 35;
 
 impl Whitenoise {
     pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
@@ -29,7 +37,7 @@ impl Whitenoise {
             .update_follows_from_event(contacts.clone(), &self.database)
             .await?;
 
-        self.schedule_background_user_fetch(&newly_created).await;
+        self.schedule_background_user_fetch(&newly_created, &account.pubkey);
 
         self.nostr
             .event_tracker
@@ -97,19 +105,150 @@ impl Whitenoise {
         }
     }
 
-    async fn schedule_background_user_fetch(&self, pubkeys: &[PublicKey]) {
-        for pubkey in pubkeys {
-            if let Ok((user, _)) = User::find_or_create_by_pubkey(pubkey, &self.database).await
-                && let Err(e) = self.background_fetch_user_data(&user).await
+    /// Spawns a single background task that fetches relay lists and metadata for
+    /// newly discovered users from a contact list, with bounded concurrency and
+    /// cancellation support.
+    ///
+    /// Instead of spawning one unbounded task per user (which overwhelms the
+    /// relay pool), this processes users in a stream with at most
+    /// [`CONTACT_LIST_FETCH_CONCURRENCY`] fetches in flight at any time.
+    ///
+    /// `refresh_global_subscription_for_user` is called once after the entire
+    /// batch completes, rather than per-user.
+    fn schedule_background_user_fetch(&self, pubkeys: &[PublicKey], account_pubkey: &PublicKey) {
+        if pubkeys.is_empty() {
+            return;
+        }
+
+        let pubkeys = pubkeys.to_vec();
+        let total = pubkeys.len();
+
+        // Get a cancellation receiver for this account so the batch stops if
+        // the account logs out.
+        let cancel_rx = self
+            .background_task_cancellation
+            .get(account_pubkey)
+            .map(|entry| entry.value().subscribe());
+
+        tokio::spawn(async move {
+            let whitenoise = match Whitenoise::get_instance() {
+                Ok(wn) => wn,
+                Err(e) => {
+                    tracing::error!(
+                        target: "whitenoise::handle_contact_list",
+                        "Failed to get Whitenoise instance for background fetch: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+
+            tracing::info!(
+                target: "whitenoise::handle_contact_list",
+                "Starting background fetch for {} new users (concurrency: {})",
+                total,
+                CONTACT_LIST_FETCH_CONCURRENCY
+            );
+
+            let fetched = Self::fetch_users_batch(whitenoise, &pubkeys, cancel_rx).await;
+
+            tracing::info!(
+                target: "whitenoise::handle_contact_list",
+                "Background fetch complete: {}/{} users fetched",
+                fetched,
+                total
+            );
+
+            // Refresh the global subscription once after all users are processed,
+            // rather than once per user. We use a dummy user since the method
+            // rebuilds the subscription for all known users anyway.
+            if fetched > 0
+                && let Ok((user, _)) =
+                    User::find_or_create_by_pubkey(&pubkeys[0], &whitenoise.database).await
+                && let Err(e) = whitenoise.refresh_global_subscription_for_user(&user).await
             {
                 tracing::warn!(
                     target: "whitenoise::handle_contact_list",
-                    "Failed to schedule background fetch for {}: {}",
-                    pubkey.to_hex(),
+                    "Failed to refresh global subscription after batch fetch: {}",
                     e
                 );
             }
-        }
+        });
+    }
+
+    /// Fetches relay lists and metadata for a batch of users with bounded
+    /// concurrency. Returns the number of users successfully fetched.
+    ///
+    /// Checks the cancellation signal before starting each user fetch and
+    /// stops early if cancelled (e.g. on logout).
+    async fn fetch_users_batch(
+        whitenoise: &Whitenoise,
+        pubkeys: &[PublicKey],
+        cancel_rx: Option<watch::Receiver<bool>>,
+    ) -> usize {
+        let cancel_rx = Arc::new(tokio::sync::Mutex::new(cancel_rx));
+
+        let results: Vec<bool> = stream::iter(pubkeys.iter().copied())
+            .map(|pubkey| {
+                let cancel_rx = cancel_rx.clone();
+                async move {
+                    // Check cancellation before starting this user's fetch
+                    {
+                        let guard = cancel_rx.lock().await;
+                        if let Some(rx) = guard.as_ref()
+                            && *rx.borrow()
+                        {
+                            tracing::debug!(
+                                target: "whitenoise::handle_contact_list",
+                                "Background fetch cancelled, stopping"
+                            );
+                            return false;
+                        }
+                    }
+
+                    let user =
+                        match User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await {
+                            Ok((user, _)) => user,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "whitenoise::handle_contact_list",
+                                    "Failed to find/create user {}: {}",
+                                    pubkey.to_hex(),
+                                    e
+                                );
+                                return false;
+                            }
+                        };
+
+                    // Fetch relay lists then metadata (serial per user since
+                    // metadata fetch benefits from knowing the user's relays)
+                    if let Err(e) = user.update_relay_lists(whitenoise).await {
+                        tracing::warn!(
+                            target: "whitenoise::handle_contact_list",
+                            "Failed to fetch relay lists for {}: {}",
+                            pubkey.to_hex(),
+                            e
+                        );
+                    }
+
+                    let mut user_for_metadata = user.clone();
+                    if let Err(e) = user_for_metadata.sync_metadata(whitenoise).await {
+                        tracing::warn!(
+                            target: "whitenoise::handle_contact_list",
+                            "Failed to fetch metadata for {}: {}",
+                            pubkey.to_hex(),
+                            e
+                        );
+                    }
+
+                    true
+                }
+            })
+            .buffer_unordered(CONTACT_LIST_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        results.iter().filter(|&&ok| ok).count()
     }
 }
 

@@ -138,6 +138,10 @@ pub struct Whitenoise {
     /// External signers for accounts using NIP-55 (Amber) or similar.
     /// Maps account pubkey to their signer implementation.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
+    /// Per-account cancellation signals for background tasks (e.g. contact list
+    /// user fetches). Sending `true` tells all background tasks for that account
+    /// to stop. A new channel is created on login and signalled on logout.
+    background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -355,6 +359,7 @@ impl Whitenoise {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            background_task_cancellation: DashMap::new(),
         };
 
         // Create default relays in the database if they don't exist
@@ -1156,6 +1161,7 @@ pub mod test_utils {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            background_task_cancellation: DashMap::new(),
         };
 
         (whitenoise, data_temp, logs_temp)
