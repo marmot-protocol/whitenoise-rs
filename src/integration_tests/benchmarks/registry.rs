@@ -1,6 +1,6 @@
 use crate::integration_tests::benchmarks::scenarios::{
-    IdentityCreationBenchmark, MessageAggregationBenchmark, MessagingPerformanceBenchmark,
-    UserDiscoveryBenchmark,
+    IdentityCreationBenchmark, LoginPerformanceBenchmark, MessageAggregationBenchmark,
+    MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -57,6 +57,7 @@ macro_rules! benchmark_registry {
 // ============================================================================
 benchmark_registry! {
     "identity-creation" => IdentityCreationBenchmark::default(),
+    "login-performance" => LoginPerformanceBenchmark::default(),
     "messaging-performance" => MessagingPerformanceBenchmark::default(),
     "message-aggregation" => MessageAggregationBenchmark::default(),
     "user-discovery-blocking" => UserDiscoveryBenchmark::with_blocking_mode(),
@@ -164,6 +165,7 @@ mod tests {
     fn test_parse_valid_scenario_names() {
         // Test all valid scenario names can be parsed and instantiated
         assert!(parse_and_instantiate("identity-creation").is_ok());
+        assert!(parse_and_instantiate("login-performance").is_ok());
         assert!(parse_and_instantiate("messaging-performance").is_ok());
         assert!(parse_and_instantiate("message-aggregation").is_ok());
         assert!(parse_and_instantiate("user-discovery-blocking").is_ok());
@@ -174,6 +176,7 @@ mod tests {
     fn test_parse_case_insensitive() {
         // Test case insensitivity
         assert!(parse_and_instantiate("IDENTITY-CREATION").is_ok());
+        assert!(parse_and_instantiate("LOGIN-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("Message-Aggregation").is_ok());
         assert!(parse_and_instantiate("USER-DISCOVERY-BLOCKING").is_ok());
@@ -195,8 +198,9 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
         assert!(names.contains(&"identity-creation"));
+        assert!(names.contains(&"login-performance"));
         assert!(names.contains(&"messaging-performance"));
         assert!(names.contains(&"message-aggregation"));
         assert!(names.contains(&"user-discovery-blocking"));
