@@ -796,36 +796,36 @@ impl Whitenoise {
 
     /// Cancel a pending login and clean up all partial state.
     ///
-    /// Deletes the account from the database and removes the private key from
-    /// the keychain. Safe to call even if no login is pending (returns `Ok`).
+    /// Only performs cleanup when a login is actually pending for the given
+    /// pubkey (i.e. `login_start` was called but not yet completed). If no
+    /// login is pending this is a no-op and returns `Ok(())`.
     pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
-        self.pending_logins.remove(pubkey);
+        // Only clean up if there was actually a pending login for this pubkey.
+        if self.pending_logins.remove(pubkey).is_none() {
+            tracing::debug!(
+                target: "whitenoise::login_cancel",
+                "No pending login for {}, nothing to cancel",
+                pubkey.to_hex()
+            );
+            return Ok(());
+        }
 
         // Remove any stashed external signer for this pubkey.
         self.remove_external_signer(pubkey);
 
         // Clean up the partial account if it exists.
-        match Account::find_by_pubkey(pubkey, &self.database).await {
-            Ok(account) => {
-                account
-                    .delete(&self.database)
-                    .await
-                    .map_err(LoginError::from)?;
-                // Best-effort removal of the keychain entry.
-                let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
-                tracing::info!(
-                    target: "whitenoise::login_cancel",
-                    "Cleaned up partial login for {}",
-                    pubkey.to_hex()
-                );
-            }
-            Err(_) => {
-                tracing::debug!(
-                    target: "whitenoise::login_cancel",
-                    "No account to clean up for {}",
-                    pubkey.to_hex()
-                );
-            }
+        if let Ok(account) = Account::find_by_pubkey(pubkey, &self.database).await {
+            account
+                .delete(&self.database)
+                .await
+                .map_err(LoginError::from)?;
+            // Best-effort removal of the keychain entry.
+            let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+            tracing::info!(
+                target: "whitenoise::login_cancel",
+                "Cleaned up partial login for {}",
+                pubkey.to_hex()
+            );
         }
         Ok(())
     }
@@ -4080,5 +4080,259 @@ mod tests {
             result.unwrap_err(),
             LoginError::InvalidKeyFormat(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_login_start_valid_key_no_relays() {
+        // In the mock environment with no relay servers, login_start should
+        // either return NeedsRelayLists or an error (relay connection failure).
+        // Both are acceptable -- the key thing is it doesn't panic and the
+        // account is created.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await;
+
+        match result {
+            Ok(login_result) => {
+                // NeedsRelayLists is the expected happy case in a no-relay env.
+                assert_eq!(login_result.status, LoginStatus::NeedsRelayLists);
+                assert_eq!(login_result.account.pubkey, pubkey);
+                assert!(whitenoise.pending_logins.contains(&pubkey));
+                // Clean up
+                let _ = whitenoise.login_cancel(&pubkey).await;
+            }
+            Err(e) => {
+                // Relay connection errors are acceptable in the mock env.
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("relay")
+                        || err_msg.contains("connection")
+                        || err_msg.contains("timeout"),
+                    "Unexpected error: {}",
+                    err_msg
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_login_cancel_with_pending_login() {
+        // Start a login (which creates a partial account), then cancel it.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Manually create a partial account and mark as pending to simulate
+        // what login_start does, avoiding relay connection issues in the mock.
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(pubkey);
+
+        // Verify account exists.
+        assert!(
+            whitenoise.find_account_by_pubkey(&pubkey).await.is_ok(),
+            "Account should exist before cancel"
+        );
+
+        // Cancel should clean up everything.
+        let result = whitenoise.login_cancel(&pubkey).await;
+        assert!(result.is_ok());
+
+        // Account should be gone.
+        assert!(
+            whitenoise.find_account_by_pubkey(&pubkey).await.is_err(),
+            "Account should be deleted after cancel"
+        );
+        // Pending login should be cleared.
+        assert!(
+            !whitenoise.pending_logins.contains(&pubkey),
+            "Pending login should be removed after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_cancel_pending_but_no_account_in_db() {
+        // Edge case: pubkey is in pending_logins but no account exists in DB
+        // (e.g., account creation failed but pending was inserted).
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        // Insert into pending_logins without creating an account.
+        whitenoise.pending_logins.insert(pubkey);
+
+        let result = whitenoise.login_cancel(&pubkey).await;
+        assert!(result.is_ok());
+        assert!(!whitenoise.pending_logins.contains(&pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_login_cancel_does_not_delete_non_pending_account() {
+        // Verify that login_cancel does NOT delete an account that isn't
+        // in the pending set (protects fully-activated accounts).
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create an account but don't add to pending_logins.
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+
+        let result = whitenoise.login_cancel(&pubkey).await;
+        assert!(result.is_ok());
+
+        // Account should still exist since it wasn't pending.
+        assert!(
+            whitenoise.find_account_by_pubkey(&pubkey).await.is_ok(),
+            "Non-pending account should not be deleted by login_cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_external_signer_publish_defaults_without_start_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        let result = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LoginError::NoLoginInProgress));
+    }
+
+    #[tokio::test]
+    async fn test_login_external_signer_custom_relay_without_start_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let result = whitenoise
+            .login_external_signer_with_custom_relay(&pubkey, relay_url)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LoginError::NoLoginInProgress));
+    }
+
+    #[tokio::test]
+    async fn test_login_external_signer_publish_defaults_no_signer() {
+        // Pubkey is in pending_logins but no signer was registered.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        // Simulate pending state without a registered signer.
+        whitenoise.pending_logins.insert(pubkey);
+
+        let result = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoginError::Internal(msg) => {
+                assert!(
+                    msg.contains("External signer not found"),
+                    "Expected 'External signer not found' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected LoginError::Internal, got: {:?}", other),
+        }
+
+        // Clean up
+        whitenoise.pending_logins.remove(&pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_login_external_signer_custom_relay_no_signer() {
+        // Pubkey is in pending_logins but no signer was registered.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        whitenoise.pending_logins.insert(pubkey);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let result = whitenoise
+            .login_external_signer_with_custom_relay(&pubkey, relay_url)
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            LoginError::Internal(msg) => {
+                assert!(
+                    msg.contains("External signer not found"),
+                    "Expected 'External signer not found' error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected LoginError::Internal, got: {:?}", other),
+        }
+
+        whitenoise.pending_logins.remove(&pubkey);
+    }
+
+    #[test]
+    fn test_login_result_debug() {
+        let keys = Keys::generate();
+        let account = Account {
+            id: Some(1),
+            pubkey: keys.public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let result = LoginResult {
+            account,
+            status: LoginStatus::Complete,
+        };
+        let debug = format!("{:?}", result);
+        assert!(!debug.is_empty());
+        assert!(debug.contains("Complete"));
+    }
+
+    #[test]
+    fn test_login_result_clone() {
+        let keys = Keys::generate();
+        let account = Account {
+            id: Some(1),
+            pubkey: keys.public_key(),
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let result = LoginResult {
+            account: account.clone(),
+            status: LoginStatus::NeedsRelayLists,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.status, LoginStatus::NeedsRelayLists);
+        assert_eq!(cloned.account.pubkey, account.pubkey);
+    }
+
+    #[test]
+    fn test_login_error_timeout_display() {
+        let err = LoginError::Timeout("relay fetch took 30s".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Login operation timed out: relay fetch took 30s"
+        );
+    }
+
+    #[test]
+    fn test_login_error_internal_display() {
+        let err = LoginError::Internal("unexpected DB error".to_string());
+        assert_eq!(err.to_string(), "Login error: unexpected DB error");
+    }
+
+    #[test]
+    fn test_login_error_no_login_in_progress_display() {
+        let err = LoginError::NoLoginInProgress;
+        assert_eq!(err.to_string(), "No login in progress for this account");
     }
 }
