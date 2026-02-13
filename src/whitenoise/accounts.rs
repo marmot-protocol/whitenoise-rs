@@ -1009,7 +1009,7 @@ impl Whitenoise {
                     &key_package_relays,
                     RelayType::KeyPackage,
                     &nip65_relays,
-                    signer,
+                    signer.clone(),
                 )
                 .await
             } else {
