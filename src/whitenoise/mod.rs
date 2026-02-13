@@ -464,28 +464,16 @@ impl Whitenoise {
         // Compute shared since for global user subscriptions with 10s lookback buffer
         let since = Self::compute_global_since_timestamp(whitenoise_ref).await?;
 
-        // For external signer accounts, we can't get keys from the secret store.
-        // Use the non-signer version of the subscription setup.
-        if signer_account.uses_external_signer() {
-            whitenoise_ref
-                .nostr
-                .setup_batched_relay_subscriptions(users_with_relays, &default_relays, since)
-                .await?;
-        } else {
-            let keys = whitenoise_ref
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
-
-            whitenoise_ref
-                .nostr
-                .setup_batched_relay_subscriptions_with_signer(
-                    users_with_relays,
-                    &default_relays,
-                    keys,
-                    since,
-                )
-                .await?;
-        }
+        let signer = whitenoise_ref.get_signer_for_account(&signer_account)?;
+        whitenoise_ref
+            .nostr
+            .setup_batched_relay_subscriptions_with_signer(
+                users_with_relays,
+                &default_relays,
+                signer,
+                since,
+            )
+            .await?;
         Ok(())
     }
 
@@ -912,26 +900,15 @@ impl Whitenoise {
             return Ok(());
         };
 
-        // For external signer accounts, we can't get keys from the secret store.
-        // Use the non-signer version of the subscription refresh.
-        if signer_account.uses_external_signer() {
-            self.nostr
-                .refresh_user_global_subscriptions(user.pubkey, users_with_relays, &default_relays)
-                .await?;
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
-
-            self.nostr
-                .refresh_user_global_subscriptions_with_signer(
-                    user.pubkey,
-                    users_with_relays,
-                    &default_relays,
-                    keys,
-                )
-                .await?;
-        }
+        let signer = self.get_signer_for_account(&signer_account)?;
+        self.nostr
+            .refresh_user_global_subscriptions_with_signer(
+                user.pubkey,
+                users_with_relays,
+                &default_relays,
+                signer,
+            )
+            .await?;
         Ok(())
     }
 

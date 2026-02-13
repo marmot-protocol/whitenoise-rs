@@ -288,10 +288,9 @@ impl NostrManager {
         .await
     }
 
-    /// Updates account subscriptions without a signer (for external signer accounts).
-    ///
-    /// This version is used for accounts that use external signers (like Amber) where
-    /// the private key is not available locally.
+    /// Updates account subscriptions without a signer.
+    /// Only used in tests; production code always uses the _with_signer variant.
+    #[cfg(test)]
     pub(crate) async fn update_account_subscriptions(
         &self,
         pubkey: PublicKey,

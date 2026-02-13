@@ -477,6 +477,10 @@ impl Whitenoise {
 
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
 
+        // Register the signer before activating the account so that subscription
+        // setup can use it for NIP-42 AUTH on relays that require it.
+        self.register_external_signer(pubkey, signer.clone());
+
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
             &account,
@@ -487,7 +491,6 @@ impl Whitenoise {
         )
         .await?;
 
-        self.register_external_signer(pubkey, signer.clone());
         self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
             .await?;
 
@@ -648,6 +651,11 @@ impl Whitenoise {
         pubkey: PublicKey,
     ) -> Result<Account> {
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
+
+        // Register a mock signer so subscription setup can proceed.
+        // In production, the real signer is registered before activation.
+        let mock_keys = Keys::generate();
+        self.register_external_signer(pubkey, mock_keys);
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
@@ -1345,37 +1353,18 @@ impl Whitenoise {
             ),
         }
 
-        // For external signer accounts, we can't get keys from the secret store.
-        // Set up subscriptions without a signer - the signer is only needed for
-        // decryption which will be handled separately for external signers.
-        if account.uses_external_signer() {
-            self.nostr
-                .setup_account_subscriptions(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    since,
-                )
-                .await?;
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account.pubkey)?;
-
-            self.nostr
-                .setup_account_subscriptions_with_signer(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    since,
-                    keys,
-                )
-                .await?;
-        }
+        let signer = self.get_signer_for_account(account)?;
+        self.nostr
+            .setup_account_subscriptions_with_signer(
+                account.pubkey,
+                &user_relays,
+                &inbox_relays,
+                &group_relays_urls,
+                &nostr_group_ids,
+                since,
+                signer,
+            )
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -1407,35 +1396,18 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        // For external signer accounts, we can't get keys from the secret store.
-        if account.uses_external_signer() {
-            self.nostr
-                .update_account_subscriptions(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                )
-                .await
-                .map_err(WhitenoiseError::from)
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account.pubkey)?;
-
-            self.nostr
-                .update_account_subscriptions_with_signer(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    keys,
-                )
-                .await
-                .map_err(WhitenoiseError::from)
-        }
+        let signer = self.get_signer_for_account(account)?;
+        self.nostr
+            .update_account_subscriptions_with_signer(
+                account.pubkey,
+                &user_relays,
+                &inbox_relays,
+                &group_relays_urls,
+                &nostr_group_ids,
+                signer,
+            )
+            .await
+            .map_err(WhitenoiseError::from)
     }
 }
 
