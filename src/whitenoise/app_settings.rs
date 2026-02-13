@@ -245,4 +245,54 @@ mod tests {
         assert!(Language::from_str("").is_err());
         assert!(Language::from_str("xyz").is_err());
     }
+
+    #[test]
+    fn theme_mode_default_is_system() {
+        assert_eq!(ThemeMode::default(), ThemeMode::System);
+    }
+
+    #[test]
+    fn app_settings_default_uses_system_theme_and_language() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.id, 1);
+        assert_eq!(settings.theme_mode, ThemeMode::System);
+        assert_eq!(settings.language, Language::System);
+    }
+
+    #[tokio::test]
+    async fn test_whitenoise_app_settings() {
+        use crate::whitenoise::test_utils::*;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let settings = whitenoise.app_settings().await.unwrap();
+        // Default settings are created during initialization via DB migration.
+        // The migration sets theme_mode='system' and language='en' (English).
+        assert_eq!(settings.theme_mode, ThemeMode::System);
+        assert_eq!(settings.language, Language::English);
+    }
+
+    #[tokio::test]
+    async fn test_whitenoise_update_theme_mode() {
+        use crate::whitenoise::test_utils::*;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        // Ensure defaults exist first.
+        let _ = whitenoise.app_settings().await.unwrap();
+
+        whitenoise.update_theme_mode(ThemeMode::Dark).await.unwrap();
+        let settings = whitenoise.app_settings().await.unwrap();
+        assert_eq!(settings.theme_mode, ThemeMode::Dark);
+    }
+
+    #[tokio::test]
+    async fn test_whitenoise_update_language() {
+        use crate::whitenoise::test_utils::*;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let _ = whitenoise.app_settings().await.unwrap();
+
+        whitenoise.update_language(Language::Spanish).await.unwrap();
+        let settings = whitenoise.app_settings().await.unwrap();
+        assert_eq!(settings.language, Language::Spanish);
+    }
 }

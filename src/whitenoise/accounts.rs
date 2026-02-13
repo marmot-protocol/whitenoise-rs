@@ -4018,6 +4018,70 @@ mod tests {
         assert!(debug.contains("NeedsRelayLists"));
     }
 
+    // -----------------------------------------------------------------------
+    // Account relay convenience method tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_account_relay_convenience_methods() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        // Initially all relay types should be empty.
+        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(
+            account
+                .key_package_relays(&whitenoise)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Add relays to each type.
+        let user = account.user(&whitenoise.database).await.unwrap();
+        let url1 = RelayUrl::parse("wss://nip65.example.com").unwrap();
+        let url2 = RelayUrl::parse("wss://inbox.example.com").unwrap();
+        let url3 = RelayUrl::parse("wss://kp.example.com").unwrap();
+        let relay1 = whitenoise.find_or_create_relay_by_url(&url1).await.unwrap();
+        let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
+        let relay3 = whitenoise.find_or_create_relay_by_url(&url3).await.unwrap();
+
+        user.add_relays(&[relay1], RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relays(&[relay2], RelayType::Inbox, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relays(&[relay3], RelayType::KeyPackage, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify each convenience method returns the right relays.
+        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(nip65.len(), 1);
+        assert_eq!(nip65[0].url, url1);
+
+        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].url, url2);
+
+        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        assert_eq!(kp.len(), 1);
+        assert_eq!(kp[0].url, url3);
+
+        // Also test the generic relays() method.
+        let all_nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        assert_eq!(all_nip65.len(), 1);
+        assert_eq!(all_nip65[0].url, url1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LoginError / LoginResult / LoginStatus tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_login_error_from_key_error() {
         // Simulate a bad key parse
