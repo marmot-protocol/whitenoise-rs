@@ -303,7 +303,7 @@ impl Account {
         whitenoise
             .background_publish_account_relay_list(self, relay_type, None)
             .await?;
-        tracing::debug!(target: "whitenoise::accounts::add_relay", "Added relay to account: {:?}", relay.url);
+        tracing::debug!(target: "whitenoise::accounts", "Added relay to account: {:?}", relay.url);
 
         Ok(())
     }
@@ -334,7 +334,7 @@ impl Account {
         whitenoise
             .background_publish_account_relay_list(self, relay_type, None)
             .await?;
-        tracing::debug!(target: "whitenoise::accounts::remove_relay", "Removed relay from account: {:?}", relay.url);
+        tracing::debug!(target: "whitenoise::accounts", "Removed relay from account: {:?}", relay.url);
         Ok(())
     }
 
@@ -367,7 +367,7 @@ impl Account {
         metadata: &Metadata,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
-        tracing::debug!(target: "whitenoise::accounts::update_metadata", "Updating metadata for account: {:?}", self.pubkey);
+        tracing::debug!(target: "whitenoise::accounts", "Updating metadata for account: {:?}", self.pubkey);
         let mut user = self.user(&whitenoise.database).await?;
         user.metadata = metadata.clone();
         user.save(&whitenoise.database).await?;
@@ -427,23 +427,23 @@ impl Whitenoise {
     /// and fully configures the account for use in Whitenoise.
     pub async fn create_identity(&self) -> Result<Account> {
         let keys = Keys::generate();
-        tracing::debug!(target: "whitenoise::create_identity", "Generated new keypair: {}", keys.public_key().to_hex());
+        tracing::debug!(target: "whitenoise::accounts", "Generated new keypair: {}", keys.public_key().to_hex());
 
         let mut account = self.create_base_account_with_private_key(&keys).await?;
-        tracing::debug!(target: "whitenoise::create_identity", "Keys stored in secret store and account saved to database");
+        tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
 
         let user = account.user(&self.database).await?;
 
         let relays = self
             .setup_relays_for_new_account(&mut account, &user)
             .await?;
-        tracing::debug!(target: "whitenoise::create_identity", "Relays setup");
+        tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
         self.activate_account(&account, &user, true, &relays, &relays, &relays)
             .await?;
-        tracing::debug!(target: "whitenoise::create_identity", "Account persisted and activated");
+        tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
-        tracing::debug!(target: "whitenoise::create_identity", "Successfully created new identity: {}", account.pubkey.to_hex());
+        tracing::debug!(target: "whitenoise::accounts", "Successfully created new identity: {}", account.pubkey.to_hex());
         Ok(account)
     }
 
@@ -459,17 +459,31 @@ impl Whitenoise {
     pub async fn login(&self, nsec_or_hex_privkey: String) -> Result<Account> {
         let keys = Keys::parse(&nsec_or_hex_privkey)?;
         let pubkey = keys.public_key();
-        tracing::debug!(target: "whitenoise::login", "Logging in with pubkey: {}", pubkey.to_hex());
+        tracing::debug!(target: "whitenoise::accounts", "Logging in with pubkey: {}", pubkey.to_hex());
+
+        // If this account is already logged in, return it as-is. The session
+        // (relay connections, subscriptions, cancellation channel, background
+        // tasks) was set up during the original login and is still active —
+        // re-running activate_account would create duplicate subscriptions and
+        // needlessly kill in-progress background tasks.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(existing);
+        }
 
         let mut account = self.create_base_account_with_private_key(&keys).await?;
-        tracing::debug!(target: "whitenoise::login", "Keys stored in secret store and account saved to database");
+        tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
 
         // Always check for existing relay lists when logging in, even if the user is
         // newly created in our database, because the keypair might already exist in
         // the Nostr ecosystem with published relay lists from other apps
         let (nip65_relays, inbox_relays, key_package_relays) =
             self.setup_relays_for_existing_account(&mut account).await?;
-        tracing::debug!(target: "whitenoise::login", "Relays setup");
+        tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
         let user = account.user(&self.database).await?;
         self.activate_account(
@@ -481,9 +495,9 @@ impl Whitenoise {
             &key_package_relays,
         )
         .await?;
-        tracing::debug!(target: "whitenoise::login", "Account persisted and activated");
+        tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
-        tracing::debug!(target: "whitenoise::login", "Successfully logged in: {}", account.pubkey.to_hex());
+        tracing::debug!(target: "whitenoise::accounts", "Successfully logged in: {}", account.pubkey.to_hex());
         Ok(account)
     }
 
@@ -508,10 +522,21 @@ impl Whitenoise {
         signer: impl NostrSigner + Clone + 'static,
     ) -> Result<Account> {
         tracing::debug!(
-            target: "whitenoise::login_external",
+            target: "whitenoise::accounts",
             "Logging in with external signer, pubkey: {}",
             pubkey.to_hex()
         );
+
+        // If this account is already logged in, return it as-is (see comment
+        // in login() for rationale on not re-activating).
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(existing);
+        }
 
         self.validate_signer_pubkey(&pubkey, &signer).await?;
 
@@ -532,14 +557,14 @@ impl Whitenoise {
             .await?;
 
         tracing::debug!(
-            target: "whitenoise::login_external",
+            target: "whitenoise::accounts",
             "Publishing MLS key package"
         );
         self.publish_key_package_for_account_with_signer(&account, signer)
             .await?;
 
         tracing::info!(
-            target: "whitenoise::login_external",
+            target: "whitenoise::accounts",
             "Successfully logged in with external signer: {}",
             account.pubkey.to_hex()
         );
@@ -1182,7 +1207,7 @@ impl Whitenoise {
         let mut account =
             if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
                 tracing::debug!(
-                    target: "whitenoise::setup_external_account",
+                    target: "whitenoise::accounts",
                     "Found existing account"
                 );
 
@@ -1191,7 +1216,7 @@ impl Whitenoise {
                 // Handle migration from Local to External account type
                 if account_mut.account_type != AccountType::External {
                     tracing::info!(
-                        target: "whitenoise::setup_external_account",
+                        target: "whitenoise::accounts",
                         "Migrating account from {:?} to External",
                         account_mut.account_type
                     );
@@ -1208,7 +1233,7 @@ impl Whitenoise {
             } else {
                 // Create new external signer account
                 tracing::debug!(
-                    target: "whitenoise::setup_external_account",
+                    target: "whitenoise::accounts",
                     "Creating new external signer account"
                 );
                 let account = Account::new_external(self, pubkey).await?;
@@ -1257,7 +1282,7 @@ impl Whitenoise {
 
         if relay_setup.should_publish_nip65 {
             tracing::debug!(
-                target: "whitenoise::login_external",
+                target: "whitenoise::accounts",
                 "Publishing NIP-65 relay list (defaults)"
             );
             self.nostr
@@ -1272,7 +1297,7 @@ impl Whitenoise {
 
         if relay_setup.should_publish_inbox {
             tracing::debug!(
-                target: "whitenoise::login_external",
+                target: "whitenoise::accounts",
                 "Publishing inbox relay list (defaults)"
             );
             self.nostr
@@ -1287,7 +1312,7 @@ impl Whitenoise {
 
         if relay_setup.should_publish_key_package {
             tracing::debug!(
-                target: "whitenoise::login_external",
+                target: "whitenoise::accounts",
                 "Publishing key package relay list (defaults)"
             );
             self.nostr
@@ -1343,10 +1368,16 @@ impl Whitenoise {
     pub async fn logout(&self, pubkey: &PublicKey) -> Result<()> {
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
 
+        // Cancel any running background tasks (contact list user fetches, etc.)
+        // before tearing down subscriptions and relay connections.
+        if let Some((_, cancel_tx)) = self.background_task_cancellation.remove(pubkey) {
+            let _ = cancel_tx.send(true);
+        }
+
         // Unsubscribe from account-specific subscriptions before logout
         if let Err(e) = self.nostr.unsubscribe_account_subscriptions(pubkey).await {
             tracing::warn!(
-                target: "whitenoise::logout",
+                target: "whitenoise::accounts",
                 "Failed to unsubscribe from account subscriptions for {}: {}",
                 pubkey, e
             );
@@ -1406,7 +1437,7 @@ impl Whitenoise {
         let (account, _keys) = Account::new(self, Some(keys.clone())).await?;
 
         self.secrets_store.store_private_key(keys).map_err(|e| {
-            tracing::error!(target: "whitenoise::setup_account", "Failed to store private key: {}", e);
+            tracing::error!(target: "whitenoise::accounts", "Failed to store private key: {}", e);
             e
         })?;
 
@@ -1424,6 +1455,13 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        // Create a fresh cancellation channel for this account's background tasks.
+        // Any previous channel (from a prior login) is replaced, which also drops
+        // any stale receivers.
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        self.background_task_cancellation
+            .insert(account.pubkey, cancel_tx);
+
         let relay_urls: Vec<RelayUrl> = Relay::urls(
             nip65_relays
                 .iter()
@@ -1431,22 +1469,22 @@ impl Whitenoise {
                 .chain(key_package_relays),
         );
         self.nostr.ensure_relays_connected(&relay_urls).await?;
-        tracing::debug!(target: "whitenoise::persist_and_activate_account", "Relays connected");
+        tracing::debug!(target: "whitenoise::accounts", "Relays connected");
         if let Err(e) = self.refresh_global_subscription_for_user(user).await {
             tracing::warn!(
-                target: "whitenoise::persist_and_activate_account",
+                target: "whitenoise::accounts",
                 "Failed to refresh global subscription for new user {}: {}",
                 user.pubkey,
                 e
             );
         }
-        tracing::debug!(target: "whitenoise::persist_and_activate_account", "Global subscription refreshed for account user");
+        tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed for account user");
         self.setup_subscriptions(account, nip65_relays, inbox_relays)
             .await?;
-        tracing::debug!(target: "whitenoise::persist_and_activate_account", "Subscriptions setup");
+        tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
         self.setup_key_package(account, is_new_account, key_package_relays)
             .await?;
-        tracing::debug!(target: "whitenoise::persist_and_activate_account", "Key package setup");
+        tracing::debug!(target: "whitenoise::accounts", "Key package setup");
         Ok(())
     }
 
@@ -1460,6 +1498,10 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        let (cancel_tx, _) = tokio::sync::watch::channel(false);
+        self.background_task_cancellation
+            .insert(account.pubkey, cancel_tx);
+
         let relay_urls: Vec<RelayUrl> = Relay::urls(
             nip65_relays
                 .iter()
@@ -1467,39 +1509,39 @@ impl Whitenoise {
                 .chain(key_package_relays),
         );
         self.nostr.ensure_relays_connected(&relay_urls).await?;
-        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Relays connected");
+        tracing::debug!(target: "whitenoise::accounts", "Relays connected");
 
         if let Err(e) = self.refresh_global_subscription_for_user(user).await {
             tracing::warn!(
-                target: "whitenoise::activate_account_without_publishing",
+                target: "whitenoise::accounts",
                 "Failed to refresh global subscription for new user {}: {}",
                 user.pubkey,
                 e
             );
         }
-        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Global subscription refreshed");
+        tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed");
 
         self.setup_subscriptions(account, nip65_relays, inbox_relays)
             .await?;
-        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Subscriptions setup");
+        tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
 
         // Note: We skip key package setup for external signer accounts.
         // Key packages need to be published separately with the external signer.
-        tracing::debug!(target: "whitenoise::activate_account_without_publishing", "Skipping key package setup (external signer)");
+        tracing::debug!(target: "whitenoise::accounts", "Skipping key package setup (external signer)");
 
         Ok(())
     }
 
     async fn persist_account(&self, account: &Account) -> Result<Account> {
         let saved_account = account.save(&self.database).await.map_err(|e| {
-            tracing::error!(target: "whitenoise::setup_account", "Failed to save account: {}", e);
+            tracing::error!(target: "whitenoise::accounts", "Failed to save account: {}", e);
             // Try to clean up stored private key
             if let Err(cleanup_err) = self.secrets_store.remove_private_key_for_pubkey(&account.pubkey) {
-                tracing::error!(target: "whitenoise::setup_account", "Failed to cleanup private key after account save failure: {}", cleanup_err);
+                tracing::error!(target: "whitenoise::accounts", "Failed to cleanup private key after account save failure: {}", cleanup_err);
             }
             e
         })?;
-        tracing::debug!(target: "whitenoise::setup_account", "Account saved to database");
+        tracing::debug!(target: "whitenoise::accounts", "Account saved to database");
         Ok(saved_account)
     }
 
@@ -1511,7 +1553,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let mut key_package_event = None;
         if !is_new_account {
-            tracing::debug!(target: "whitenoise::setup_key_package", "Found {} key package relays", key_package_relays.len());
+            tracing::debug!(target: "whitenoise::accounts", "Found {} key package relays", key_package_relays.len());
             let relays_urls = Relay::urls(key_package_relays);
             key_package_event = self
                 .nostr
@@ -1521,7 +1563,7 @@ impl Whitenoise {
         if key_package_event.is_none() {
             self.publish_key_package_to_relays(account, key_package_relays)
                 .await?;
-            tracing::debug!(target: "whitenoise::setup_account", "Published key package");
+            tracing::debug!(target: "whitenoise::accounts", "Published key package");
         }
         Ok(())
     }
@@ -1589,7 +1631,8 @@ impl Whitenoise {
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;
 
-        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
+        // NIP-65 must be fetched first because Inbox and KeyPackage use the
+        // discovered NIP-65 relays as their query source.
         let (nip65_relays, should_publish_nip65) = self
             .setup_existing_account_relay_type(
                 account,
@@ -1599,42 +1642,58 @@ impl Whitenoise {
             )
             .await?;
 
-        let (inbox_relays, should_publish_inbox) = self
-            .setup_existing_account_relay_type(
+        // Inbox and KeyPackage fetches are independent — run them concurrently.
+        let (inbox_result, key_package_result) = tokio::join!(
+            self.setup_existing_account_relay_type(
                 account,
                 RelayType::Inbox,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
-
-        let (key_package_relays, should_publish_key_package) = self
-            .setup_existing_account_relay_type(
+            ),
+            self.setup_existing_account_relay_type(
                 account,
                 RelayType::KeyPackage,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
+            ),
+        );
+        let (inbox_relays, should_publish_inbox) = inbox_result?;
+        let (key_package_relays, should_publish_key_package) = key_package_result?;
 
-        // Only publish relay lists that need publishing (when using defaults as fallback)
-        if should_publish_nip65 {
-            self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                .await?;
-        }
-        if should_publish_inbox {
-            self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                .await?;
-        }
-        if should_publish_key_package {
-            self.publish_relay_list(
-                &key_package_relays,
-                RelayType::KeyPackage,
-                &nip65_relays,
-                &keys,
-            )
-            .await?;
-        }
+        // Publish any relay lists that need publishing concurrently.
+        let nip65_publish = async {
+            if should_publish_nip65 {
+                self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if should_publish_inbox {
+                self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if should_publish_key_package {
+                self.publish_relay_list(
+                    &key_package_relays,
+                    RelayType::KeyPackage,
+                    &nip65_relays,
+                    &keys,
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let (r1, r2, r3) = tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+        r1?;
+        r2?;
+        r3?;
 
         Ok((nip65_relays, inbox_relays, key_package_relays))
     }
@@ -1653,8 +1712,8 @@ impl Whitenoise {
     ) -> Result<ExternalSignerRelaySetup> {
         let default_relays = self.load_default_relays().await?;
 
-        // Existing accounts: Try to fetch existing relay lists, use defaults as fallback
-        // We don't publish here - the caller with the signer will handle that
+        // NIP-65 must be fetched first because Inbox and KeyPackage use the
+        // discovered NIP-65 relays as their query source.
         let (nip65_relays, should_publish_nip65) = self
             .setup_external_account_relay_type(
                 account,
@@ -1664,23 +1723,23 @@ impl Whitenoise {
             )
             .await?;
 
-        let (inbox_relays, should_publish_inbox) = self
-            .setup_external_account_relay_type(
+        // Inbox and KeyPackage fetches are independent — run them concurrently.
+        let (inbox_result, key_package_result) = tokio::join!(
+            self.setup_external_account_relay_type(
                 account,
                 RelayType::Inbox,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
-
-        let (key_package_relays, should_publish_key_package) = self
-            .setup_external_account_relay_type(
+            ),
+            self.setup_external_account_relay_type(
                 account,
                 RelayType::KeyPackage,
                 &nip65_relays,
                 &default_relays,
-            )
-            .await?;
+            ),
+        );
+        let (inbox_relays, should_publish_inbox) = inbox_result?;
+        let (key_package_relays, should_publish_key_package) = key_package_result?;
 
         Ok(ExternalSignerRelaySetup {
             nip65_relays,
@@ -1699,7 +1758,7 @@ impl Whitenoise {
     /// (true if defaults were used because no existing relays were found).
     async fn setup_external_account_relay_type(
         &self,
-        account: &mut Account,
+        account: &Account,
         relay_type: RelayType,
         source_relays: &[Relay],
         default_relays: &[Relay],
@@ -1725,7 +1784,7 @@ impl Whitenoise {
 
     async fn setup_existing_account_relay_type(
         &self,
-        account: &mut Account,
+        account: &Account,
         relay_type: RelayType,
         source_relays: &[Relay],
         default_relays: &[Relay],
@@ -1796,7 +1855,7 @@ impl Whitenoise {
         self.background_publish_account_relay_list(account, relay_type, Some(relays))
             .await?;
 
-        tracing::debug!(target: "whitenoise::add_relays_to_account", "Added {} relays of type {:?} to account", relays.len(), relay_type);
+        tracing::debug!(target: "whitenoise::accounts", "Added {} relays of type {:?} to account", relays.len(), relay_type);
 
         Ok(())
     }
@@ -1834,7 +1893,7 @@ impl Whitenoise {
         let relays = account.nip65_relays(self).await?;
 
         tokio::spawn(async move {
-            tracing::debug!(target: "whitenoise::accounts::background_publish_user_metadata", "Background task: Publishing metadata for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing metadata for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
 
@@ -1842,7 +1901,7 @@ impl Whitenoise {
                 .publish_metadata_with_signer(&user.metadata, &relays_urls, signer)
                 .await?;
 
-            tracing::debug!(target: "whitenoise::accounts::background_publish_user_metadata", "Successfully published metadata for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Successfully published metadata for account: {:?}", account_clone.pubkey);
             Ok::<(), WhitenoiseError>(())
         });
         Ok(())
@@ -1878,7 +1937,7 @@ impl Whitenoise {
         };
 
         tokio::spawn(async move {
-            tracing::debug!(target: "whitenoise::accounts::background_publish_account_relay_list", "Background task: Publishing relay list for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing relay list for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
             let target_relays_urls = Relay::urls(&target_relays);
@@ -1887,7 +1946,7 @@ impl Whitenoise {
                 .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, keys)
                 .await?;
 
-            tracing::debug!(target: "whitenoise::accounts::background_publish_account_relay_list", "Successfully published relay list for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Successfully published relay list for account: {:?}", account_clone.pubkey);
             Ok::<(), WhitenoiseError>(())
         });
         Ok(())
@@ -1907,14 +1966,14 @@ impl Whitenoise {
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
 
         tokio::spawn(async move {
-            tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Background task: Publishing follow list for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing follow list for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
             nostr
                 .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, keys)
                 .await?;
 
-            tracing::debug!(target: "whitenoise::accounts::background_publish_account_follow_list", "Successfully published follow list for account: {:?}", account_clone.pubkey);
+            tracing::debug!(target: "whitenoise::accounts", "Successfully published follow list for account: {:?}", account_clone.pubkey);
             Ok::<(), WhitenoiseError>(())
         });
         Ok(())
@@ -1948,7 +2007,7 @@ impl Whitenoise {
         inbox_relays: &[Relay],
     ) -> Result<()> {
         tracing::debug!(
-            target: "whitenoise::setup_subscriptions",
+            target: "whitenoise::accounts",
             "Setting up subscriptions for account: {:?}",
             account
         );
@@ -1969,13 +2028,13 @@ impl Whitenoise {
         let since = account.since_timestamp(10);
         match since {
             Some(ts) => tracing::debug!(
-                target: "whitenoise::setup_subscriptions",
+                target: "whitenoise::accounts",
                 "Computed per-account since={}s (10s buffer) for {}",
                 ts.as_secs(),
                 account.pubkey.to_hex()
             ),
             None => tracing::debug!(
-                target: "whitenoise::setup_subscriptions",
+                target: "whitenoise::accounts",
                 "Computed per-account since=None (unsynced) for {}",
                 account.pubkey.to_hex()
             ),
@@ -2014,7 +2073,7 @@ impl Whitenoise {
         }
 
         tracing::debug!(
-            target: "whitenoise::setup_subscriptions",
+            target: "whitenoise::accounts",
             "Subscriptions setup"
         );
         Ok(())
@@ -2031,7 +2090,7 @@ impl Whitenoise {
     /// * `account` - The account to refresh subscriptions for
     pub(crate) async fn refresh_account_subscriptions(&self, account: &Account) -> Result<()> {
         tracing::debug!(
-            target: "whitenoise::refresh_account_subscriptions",
+            target: "whitenoise::accounts",
             "Refreshing account subscriptions for account: {:?}",
             account.pubkey
         );
@@ -2374,6 +2433,82 @@ mod tests {
         assert_eq!(
             account1.pubkey, account2.pubkey,
             "Same keys should result in same account"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_double_login_returns_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let first_account = whitenoise
+            .login(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Login again with the same key without logging out
+        let second_account = whitenoise
+            .login(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Should return the same account, not create a new one
+        assert_eq!(first_account.id, second_account.id);
+        assert_eq!(first_account.pubkey, second_account.pubkey);
+
+        // Should still have exactly one account in the database
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(count, 1, "Double login should not create a second account");
+    }
+
+    #[tokio::test]
+    async fn test_create_identity_creates_cancellation_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        assert!(
+            whitenoise
+                .background_task_cancellation
+                .contains_key(&account.pubkey),
+            "activate_account should create a cancellation channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_signals_and_removes_cancellation_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Subscribe to the cancellation channel before logout
+        let cancel_rx = whitenoise
+            .background_task_cancellation
+            .get(&account.pubkey)
+            .expect("cancellation channel should exist after login")
+            .value()
+            .subscribe();
+
+        // Initially not cancelled
+        assert!(
+            !*cancel_rx.borrow(),
+            "should not be cancelled before logout"
+        );
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // After logout, the channel should have been signalled
+        assert!(
+            *cancel_rx.borrow(),
+            "logout should signal cancellation to running background tasks"
+        );
+
+        // And the entry should be removed from the map
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&account.pubkey),
+            "logout should remove the cancellation channel entry"
         );
     }
 
@@ -3136,6 +3271,32 @@ mod tests {
             count, 1,
             "Should have exactly one account after duplicate login"
         );
+    }
+
+    #[tokio::test]
+    async fn test_login_with_external_signer_double_login_returns_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // First login via test helper (sets up account in DB without needing relays)
+        let first_account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Second login via the real method — should hit the double-login guard
+        // and return early without doing any relay work
+        let second_account = whitenoise
+            .login_with_external_signer(pubkey, keys)
+            .await
+            .unwrap();
+
+        assert_eq!(first_account.id, second_account.id);
+        assert_eq!(first_account.pubkey, second_account.pubkey);
+
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(count, 1, "Double login should not create a second account");
     }
 
     /// Test that Account helper methods work correctly for external accounts

@@ -138,6 +138,10 @@ pub struct Whitenoise {
     /// External signers for accounts using NIP-55 (Amber) or similar.
     /// Maps account pubkey to their signer implementation.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
+    /// Per-account cancellation signals for background tasks (e.g. contact list
+    /// user fetches). Sending `true` tells all background tasks for that account
+    /// to stop. A new channel is created on login and signalled on logout.
+    background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
     /// Pubkeys with a login in progress (between login_start and
     /// login_publish_default_relays / login_with_custom_relay / login_cancel).
     pending_logins: DashSet<PublicKey>,
@@ -358,6 +362,7 @@ impl Whitenoise {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            background_task_cancellation: DashMap::new(),
             pending_logins: DashSet::new(),
         };
 
@@ -902,6 +907,44 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Refreshes global subscriptions for ALL batches across ALL relays.
+    ///
+    /// Unlike `refresh_global_subscription_for_user` which only refreshes
+    /// batches containing a specific user, this refreshes every batch on every
+    /// relay. Use after bulk user discovery (e.g. contact list processing)
+    /// where new users may be spread across many different relay batches.
+    pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
+        let users_with_relays = User::all_users_with_relay_urls(self).await?;
+        let default_relays: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+
+        let Some(signer_account) = Account::first(&self.database).await? else {
+            tracing::info!(
+                target: "whitenoise::refresh_all_global_subscriptions",
+                "No signer account found, skipping global subscription refresh"
+            );
+            return Ok(());
+        };
+
+        if signer_account.uses_external_signer() {
+            self.nostr
+                .refresh_all_global_subscriptions(users_with_relays, &default_relays)
+                .await?;
+        } else {
+            let keys = self
+                .secrets_store
+                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
+
+            self.nostr
+                .refresh_all_global_subscriptions_with_signer(
+                    users_with_relays,
+                    &default_relays,
+                    keys,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_account_subscriptions(&self, account: &Account) -> Result<()> {
         let is_operational = self.is_account_subscriptions_operational(account).await?;
 
@@ -1160,6 +1203,7 @@ pub mod test_utils {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            background_task_cancellation: DashMap::new(),
             pending_logins: DashSet::new(),
         };
 
@@ -2227,6 +2271,22 @@ mod tests {
             // Verify first is gone, second remains
             assert!(whitenoise.get_external_signer(&pubkey1).is_none());
             assert!(whitenoise.get_external_signer(&pubkey2).is_some());
+        }
+    }
+
+    mod subscription_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_refresh_all_global_subscriptions_no_account_returns_ok() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // With no accounts in the database, should return Ok (early return)
+            let result = whitenoise.refresh_all_global_subscriptions().await;
+            assert!(
+                result.is_ok(),
+                "refresh_all_global_subscriptions should succeed with no accounts"
+            );
         }
     }
 }
