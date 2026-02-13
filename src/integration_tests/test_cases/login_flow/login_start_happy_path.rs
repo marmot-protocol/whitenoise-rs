@@ -1,7 +1,8 @@
-use crate::integration_tests::core::*;
-use crate::{LoginStatus, RelayType, WhitenoiseError};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
+
+use crate::integration_tests::core::*;
+use crate::{LoginStatus, RelayType, WhitenoiseError};
 
 /// Tests the happy path: relay lists exist on the network, so `login_start`
 /// completes the full login in a single call.

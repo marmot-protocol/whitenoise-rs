@@ -1,6 +1,7 @@
+use async_trait::async_trait;
+
 use crate::integration_tests::{core::*, test_cases::login_flow::*};
 use crate::{Whitenoise, WhitenoiseError};
-use async_trait::async_trait;
 
 /// Integration test scenario for the multi-step login flow.
 ///

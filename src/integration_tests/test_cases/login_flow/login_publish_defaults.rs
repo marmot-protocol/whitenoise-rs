@@ -1,6 +1,7 @@
+use async_trait::async_trait;
+
 use crate::integration_tests::core::*;
 use crate::{LoginStatus, RelayType, WhitenoiseError};
-use async_trait::async_trait;
 
 /// After `login_start` returned `NeedsRelayLists`, this test case calls
 /// `login_publish_default_relays` to publish defaults and complete the login.

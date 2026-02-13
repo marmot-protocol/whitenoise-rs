@@ -1,7 +1,8 @@
-use crate::integration_tests::core::*;
-use crate::{LoginStatus, WhitenoiseError};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
+
+use crate::integration_tests::core::*;
+use crate::{LoginStatus, WhitenoiseError};
 
 /// Tests that `login_cancel` cleans up partial login state: the account
 /// record is deleted from the DB and the keychain entry is removed.

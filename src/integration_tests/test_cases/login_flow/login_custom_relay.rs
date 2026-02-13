@@ -1,7 +1,8 @@
-use crate::integration_tests::core::*;
-use crate::{LoginStatus, RelayType, WhitenoiseError};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
+
+use crate::integration_tests::core::*;
+use crate::{LoginStatus, RelayType, WhitenoiseError};
 
 /// Tests the custom relay flow: `login_start` returns `NeedsRelayLists`,
 /// then `login_with_custom_relay` finds relay lists on a user-provided relay

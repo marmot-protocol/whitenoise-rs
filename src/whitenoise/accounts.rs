@@ -618,9 +618,9 @@ impl Whitenoise {
 
         match self
             .try_discover_relay_lists(&mut account, &default_relays)
-            .await
+            .await?
         {
-            Ok(relays) => {
+            Some(relays) => {
                 // Happy path: relay lists found, complete the login.
                 self.complete_login(&account, &relays.0, &relays.1, &relays.2)
                     .await?;
@@ -634,7 +634,7 @@ impl Whitenoise {
                     status: LoginStatus::Complete,
                 })
             }
-            Err(_) => {
+            None => {
                 // No NIP-65 relay list found. Mark as pending so the continuation
                 // methods know there is a login in progress.
                 self.pending_logins.insert(pubkey);
@@ -762,9 +762,9 @@ impl Whitenoise {
 
         match self
             .try_discover_relay_lists(&mut account, &source_relays)
-            .await
+            .await?
         {
-            Ok(relays) => {
+            Some(relays) => {
                 self.complete_login(&account, &relays.0, &relays.1, &relays.2)
                     .await?;
                 self.pending_logins.remove(pubkey);
@@ -779,7 +779,7 @@ impl Whitenoise {
                     status: LoginStatus::Complete,
                 })
             }
-            Err(_) => {
+            None => {
                 tracing::info!(
                     target: "whitenoise::login_with_custom_relay",
                     "No relay lists found on {} for {}",
@@ -800,6 +800,9 @@ impl Whitenoise {
     /// the keychain. Safe to call even if no login is pending (returns `Ok`).
     pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
         self.pending_logins.remove(pubkey);
+
+        // Remove any stashed external signer for this pubkey.
+        self.remove_external_signer(pubkey);
 
         // Clean up the partial account if it exists.
         match Account::find_by_pubkey(pubkey, &self.database).await {
@@ -835,11 +838,14 @@ impl Whitenoise {
     ///
     /// Behaves like [`Whitenoise::login_start`] but takes a public key and a
     /// [`NostrSigner`] instead of a private key string.
-    pub async fn login_external_signer_start(
+    pub async fn login_external_signer_start<S>(
         &self,
         pubkey: PublicKey,
-        signer: impl NostrSigner + Clone + 'static,
-    ) -> core::result::Result<LoginResult, LoginError> {
+        signer: S,
+    ) -> core::result::Result<LoginResult, LoginError>
+    where
+        S: NostrSigner + Clone + 'static,
+    {
         tracing::debug!(
             target: "whitenoise::login_external_signer_start",
             "Starting external signer login for {}",
@@ -859,9 +865,9 @@ impl Whitenoise {
 
         match self
             .try_discover_relay_lists(&mut account, &default_relays)
-            .await
+            .await?
         {
-            Ok(relays) => {
+            Some(relays) => {
                 // Happy path -- complete the login using the external signer.
                 self.complete_external_signer_login(
                     &account, &relays.0, &relays.1, &relays.2, signer,
@@ -877,7 +883,7 @@ impl Whitenoise {
                     status: LoginStatus::Complete,
                 })
             }
-            Err(_) => {
+            None => {
                 // Stash the signer so continuation methods can use it.
                 self.register_external_signer(pubkey, signer);
                 self.pending_logins.insert(pubkey);
@@ -988,9 +994,9 @@ impl Whitenoise {
 
         match self
             .try_discover_relay_lists(&mut account, &source_relays)
-            .await
+            .await?
         {
-            Ok(relays) => {
+            Some(relays) => {
                 self.complete_external_signer_login(
                     &account, &relays.0, &relays.1, &relays.2, signer,
                 )
@@ -1007,7 +1013,7 @@ impl Whitenoise {
                     status: LoginStatus::Complete,
                 })
             }
-            Err(_) => {
+            None => {
                 tracing::info!(
                     target: "whitenoise::login_external_signer_with_custom_relay",
                     "No relay lists found on {} for {}",
@@ -1035,11 +1041,17 @@ impl Whitenoise {
     /// Returns `Err` if the NIP-65 list is not found (the primary relay list
     /// that everything else depends on). If NIP-65 is found but Inbox or
     /// KeyPackage are not, defaults are used for those types.
+    /// Attempt to discover all three relay list types from the network.
+    ///
+    /// Returns `Ok(Some(...))` when NIP-65 relays are found (Inbox and
+    /// KeyPackage fall back to defaults if not found independently).
+    /// Returns `Ok(None)` when the NIP-65 list is simply not published.
+    /// Returns `Err` for real failures (network errors, DB errors, etc.).
     async fn try_discover_relay_lists(
         &self,
         account: &mut Account,
         source_relays: &[Relay],
-    ) -> core::result::Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>), LoginError> {
+    ) -> core::result::Result<Option<(Vec<Relay>, Vec<Relay>, Vec<Relay>)>, LoginError> {
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
 
         // Step 1: Fetch NIP-65 relay list from the source relays.
@@ -1049,9 +1061,7 @@ impl Whitenoise {
             .map_err(LoginError::from)?;
 
         if nip65_relays.is_empty() {
-            return Err(LoginError::Internal(
-                "No NIP-65 relay list found on the queried relays".to_string(),
-            ));
+            return Ok(None);
         }
 
         let user = account
@@ -1090,11 +1100,11 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
-        Ok((
+        Ok(Some((
             nip65_relays,
             inbox_relays.to_vec(),
             key_package_relays.to_vec(),
-        ))
+        )))
     }
 
     /// Activate a local-key account after relay lists have been resolved.
@@ -1122,14 +1132,17 @@ impl Whitenoise {
     }
 
     /// Activate an external-signer account after relay lists have been resolved.
-    async fn complete_external_signer_login(
+    async fn complete_external_signer_login<S>(
         &self,
         account: &Account,
         nip65_relays: &[Relay],
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
-        signer: impl NostrSigner + Clone + 'static,
-    ) -> core::result::Result<(), LoginError> {
+        signer: S,
+    ) -> core::result::Result<(), LoginError>
+    where
+        S: NostrSigner + Clone + 'static,
+    {
         let user = account
             .user(&self.database)
             .await

@@ -16,11 +16,16 @@ Plan for addressing relay connection failures during login and providing structu
 
 When a user logs in with an nsec that has no published relay lists (kind 10002/10050/10051), login fails with:
 
-```
+```text
 Nostr manager error: Client Error: relay not found
 ```
 
-The root cause is an ordering issue in the login flow. `setup_relays_for_existing_account()` (accounts.rs:907) calls `fetch_existing_relays()` which uses `client.fetch_events_from()`. This nostr-sdk method requires relay URLs to already be in the client's relay pool. But `ensure_relays_connected()` -- which adds relays to the pool -- only runs later in `activate_account()` (accounts.rs:745).
+The root cause is an ordering issue in the login flow. `setup_relays_for_existing_account()` calls `fetch_existing_relays()` which uses nostr-sdk's `client.fetch_events_from()`. This method requires relay URLs to already be in the client's relay pool. But `ensure_relays_connected()` -- which adds relays to the pool -- only runs later in `activate_account()`.
+
+**Key symbols in the call chain:**
+- `setup_relays_for_existing_account()` → `fetch_existing_relays()` → `client.fetch_events_from()` — the failing path
+- `ensure_relays_connected()` — adds relays to the client pool (called too late, inside `activate_account()`)
+- `create_identity()` → `setup_relays_for_new_account()` — NOT affected (never calls `fetch_events_from`)
 
 There is also a secondary failure path: if the NIP-65 fetch succeeds and returns non-default relays (e.g. `wss://relay.snort.social`), the code then tries to fetch Inbox/KeyPackage lists FROM those NIP-65 relays, which are not in the pool.
 
@@ -38,7 +43,7 @@ The Flutter app cannot distinguish between invalid key format, network failures,
 
 ### Error flow: Rust crate -> FRB bridge -> Flutter
 
-```
+```text
 WhitenoiseError (whitenoise-rs)
   |
   | .to_string()
@@ -56,7 +61,7 @@ Dart ApiError.whitenoise(message: String)  (Flutter app)
 
 ### Login flow sequence
 
-```
+```text
 login(nsec)
   1. Keys::parse(nsec)                           -- can fail: InvalidKey
   2. create_base_account_with_private_key(keys)   -- DB + keychain
@@ -224,7 +229,7 @@ pub async fn login_external_signer_with_custom_relay(
 ### Login flow diagrams
 
 **Happy path (relay lists found):**
-```
+```text
 Flutter                          whitenoise-rs
   |                                   |
   |-- login_start(nsec) ------------->|
@@ -241,7 +246,7 @@ Flutter                          whitenoise-rs
 ```
 
 **No relay lists found -- user picks defaults:**
-```
+```text
 Flutter                          whitenoise-rs
   |                                   |
   |-- login_start(nsec) ------------->|
@@ -264,7 +269,7 @@ Flutter                          whitenoise-rs
 ```
 
 **No relay lists found -- user provides custom relay:**
-```
+```text
 Flutter                          whitenoise-rs
   |                                   |
   |-- login_start(nsec) ------------->|
@@ -293,7 +298,7 @@ Flutter                          whitenoise-rs
 ```
 
 **User cancels:**
-```
+```text
 Flutter                          whitenoise-rs
   |                                   |
   |-- login_start(nsec) ------------->|

@@ -1,7 +1,8 @@
-use crate::integration_tests::core::*;
-use crate::{LoginStatus, WhitenoiseError};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
+
+use crate::integration_tests::core::*;
+use crate::{LoginStatus, WhitenoiseError};
 
 /// Tests that `login_start` returns `NeedsRelayLists` when the user has no
 /// relay lists published on the network.
