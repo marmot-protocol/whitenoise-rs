@@ -109,6 +109,14 @@ impl From<WhitenoiseError> for LoginError {
             WhitenoiseError::NostrManager(NostrManagerError::NoRelayConnections) => {
                 Self::NoRelayConnections
             }
+            // nostr-sdk timeouts surface as Client errors with "timeout" in
+            // the message. This is the best we can do without a dedicated
+            // Timeout variant in NostrManagerError.
+            WhitenoiseError::NostrManager(NostrManagerError::Client(ref e))
+                if e.to_string().to_lowercase().contains("timeout") =>
+            {
+                Self::Timeout(err.to_string())
+            }
             other => Self::Internal(other.to_string()),
         }
     }
@@ -1035,17 +1043,16 @@ impl Whitenoise {
     /// Attempt to discover all three relay list types from the network.
     ///
     /// Fetches NIP-65 relays from `source_relays`, then uses the discovered
-    /// NIP-65 relays to fetch Inbox and KeyPackage lists. Saves all found relays
-    /// to the database.
+    /// NIP-65 relays to fetch Inbox and KeyPackage lists. Saves all found
+    /// relays to the database.
     ///
-    /// Returns `Err` if the NIP-65 list is not found (the primary relay list
-    /// that everything else depends on). If NIP-65 is found but Inbox or
-    /// KeyPackage are not, defaults are used for those types.
-    /// Attempt to discover all three relay list types from the network.
+    /// Returns `Ok(Some((nip65, inbox, key_package)))` when the NIP-65 list is
+    /// found. Inbox and KeyPackage fall back to defaults if not found
+    /// independently.
     ///
-    /// Returns `Ok(Some(...))` when NIP-65 relays are found (Inbox and
-    /// KeyPackage fall back to defaults if not found independently).
-    /// Returns `Ok(None)` when the NIP-65 list is simply not published.
+    /// Returns `Ok(None)` when the NIP-65 list is simply not published on the
+    /// queried relays.
+    ///
     /// Returns `Err` for real failures (network errors, DB errors, etc.).
     async fn try_discover_relay_lists(
         &self,
@@ -1172,31 +1179,34 @@ impl Whitenoise {
         &self,
         pubkey: PublicKey,
     ) -> core::result::Result<(Account, User), LoginError> {
-        let account = if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
-            let mut account_mut = existing.clone();
-            if account_mut.account_type != AccountType::External {
-                tracing::info!(
-                    target: "whitenoise::setup_external_account",
-                    "Migrating account from {:?} to External",
-                    account_mut.account_type
-                );
-                account_mut.account_type = AccountType::External;
-                account_mut = self
-                    .persist_account(&account_mut)
+        let account = match Account::find_by_pubkey(&pubkey, &self.database).await {
+            Ok(existing) => {
+                let mut account_mut = existing.clone();
+                if account_mut.account_type != AccountType::External {
+                    tracing::info!(
+                        target: "whitenoise::setup_external_account",
+                        "Migrating account from {:?} to External",
+                        account_mut.account_type
+                    );
+                    account_mut.account_type = AccountType::External;
+                    account_mut = self
+                        .persist_account(&account_mut)
+                        .await
+                        .map_err(LoginError::from)?;
+                }
+                let _ = self
+                    .secrets_store
+                    .remove_private_key_for_pubkey(&account_mut.pubkey);
+                account_mut
+            }
+            Err(_) => {
+                let account = Account::new_external(self, pubkey)
                     .await
                     .map_err(LoginError::from)?;
+                self.persist_account(&account)
+                    .await
+                    .map_err(LoginError::from)?
             }
-            let _ = self
-                .secrets_store
-                .remove_private_key_for_pubkey(&account_mut.pubkey);
-            account_mut
-        } else {
-            let account = Account::new_external(self, pubkey)
-                .await
-                .map_err(LoginError::from)?;
-            self.persist_account(&account)
-                .await
-                .map_err(LoginError::from)?
         };
 
         let user = account
@@ -4027,11 +4037,19 @@ mod tests {
     }
 
     #[test]
-    fn test_login_error_from_whitenoise_error_other() {
-        let wn_err = WhitenoiseError::AccountNotFound;
+    fn test_login_error_from_whitenoise_error_non_timeout_client() {
+        // A Client error that does NOT contain "timeout" should map to Internal.
+        let client_err = nostr_sdk::client::Error::Signer(nostr_sdk::signer::SignerError::backend(
+            std::io::Error::other("some signer error"),
+        ));
+        let nostr_mgr_err = crate::nostr_manager::NostrManagerError::Client(client_err);
+        let wn_err = WhitenoiseError::NostrManager(nostr_mgr_err);
         let login_err = LoginError::from(wn_err);
-        assert!(matches!(login_err, LoginError::Internal(_)));
-        assert!(login_err.to_string().contains("Account not found"));
+        assert!(
+            matches!(login_err, LoginError::Internal(_)),
+            "Expected Internal for non-timeout client error, got: {:?}",
+            login_err
+        );
     }
 
     #[tokio::test]
