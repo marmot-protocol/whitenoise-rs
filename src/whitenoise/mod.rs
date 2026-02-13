@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl, ToBech32};
 use tokio::sync::{
@@ -138,6 +138,9 @@ pub struct Whitenoise {
     /// External signers for accounts using NIP-55 (Amber) or similar.
     /// Maps account pubkey to their signer implementation.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
+    /// Pubkeys with a login in progress (between login_start and
+    /// login_publish_default_relays / login_with_custom_relay / login_cancel).
+    pending_logins: DashSet<PublicKey>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -355,6 +358,7 @@ impl Whitenoise {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            pending_logins: DashSet::new(),
         };
 
         // Create default relays in the database if they don't exist
@@ -1156,6 +1160,7 @@ pub mod test_utils {
             scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
+            pending_logins: DashSet::new(),
         };
 
         (whitenoise, data_temp, logs_temp)

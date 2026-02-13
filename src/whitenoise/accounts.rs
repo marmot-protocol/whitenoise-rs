@@ -51,6 +51,69 @@ impl FromStr for AccountType {
     }
 }
 
+/// The status of a login attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginStatus {
+    /// Login completed successfully. Account is fully activated with relay lists,
+    /// subscriptions, and a published key package.
+    Complete,
+    /// Relay lists were not found on the network. The account exists in a partial
+    /// state and the caller must resolve relay lists before login can complete.
+    /// Use `login_publish_default_relays` or `login_with_custom_relay` to continue,
+    /// or `login_cancel` to clean up.
+    NeedsRelayLists,
+}
+
+/// The result of a login attempt.
+#[derive(Clone, Debug)]
+pub struct LoginResult {
+    /// The account that was created or found.
+    pub account: Account,
+    /// Whether login completed or needs further action.
+    pub status: LoginStatus,
+}
+
+/// Errors specific to the login flow.
+#[derive(Error, Debug)]
+pub enum LoginError {
+    /// The provided private key is not valid (bad format, bad encoding, etc.).
+    #[error("Invalid private key format: {0}")]
+    InvalidKeyFormat(String),
+
+    /// Could not connect to any relay to fetch or publish data.
+    #[error("Failed to connect to any relays")]
+    NoRelayConnections,
+
+    /// The operation timed out.
+    #[error("Login operation timed out: {0}")]
+    Timeout(String),
+
+    /// No partial login in progress for the given pubkey.
+    #[error("No login in progress for this account")]
+    NoLoginInProgress,
+
+    /// An internal error that doesn't fit the above categories.
+    #[error("Login error: {0}")]
+    Internal(String),
+}
+
+impl From<nostr_sdk::key::Error> for LoginError {
+    fn from(err: nostr_sdk::key::Error) -> Self {
+        Self::InvalidKeyFormat(err.to_string())
+    }
+}
+
+impl From<WhitenoiseError> for LoginError {
+    fn from(err: WhitenoiseError) -> Self {
+        match err {
+            WhitenoiseError::NostrManager(NostrManagerError::NoRelayConnections) => {
+                Self::NoRelayConnections
+            }
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum AccountError {
     #[error("Failed to parse public key: {0}")]
@@ -483,6 +546,631 @@ impl Whitenoise {
 
         Ok(account)
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-step login API
+    // -----------------------------------------------------------------------
+
+    /// Step 1 of the multi-step login flow.
+    ///
+    /// Parses the private key, creates/updates the account in the database and
+    /// keychain, then attempts to discover existing relay lists from the network.
+    ///
+    /// **Happy path:** relay lists are found on the network and the account is
+    /// fully activated (subscriptions, key package, etc.). Returns
+    /// [`LoginStatus::Complete`].
+    ///
+    /// **No relay lists found:** the account is left in a *partial* state and
+    /// [`LoginStatus::NeedsRelayLists`] is returned. The caller must then invoke
+    /// one of:
+    /// - [`Whitenoise::login_publish_default_relays`] -- publish default relay lists
+    /// - [`Whitenoise::login_with_custom_relay`] -- search a user-provided relay
+    /// - [`Whitenoise::login_cancel`] -- abort and clean up
+    pub async fn login_start(
+        &self,
+        nsec_or_hex_privkey: String,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        let keys = Keys::parse(&nsec_or_hex_privkey)
+            .map_err(|e| LoginError::InvalidKeyFormat(e.to_string()))?;
+        let pubkey = keys.public_key();
+        tracing::debug!(
+            target: "whitenoise::login_start",
+            "Starting login for pubkey: {}",
+            pubkey.to_hex()
+        );
+
+        let mut account = self
+            .create_base_account_with_private_key(&keys)
+            .await
+            .map_err(LoginError::from)?;
+        tracing::debug!(
+            target: "whitenoise::login_start",
+            "Account created in DB and key stored in keychain"
+        );
+
+        // Try to discover relay lists from the network via default relays.
+        let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+
+        match self
+            .try_discover_relay_lists(&mut account, &default_relays)
+            .await
+        {
+            Ok(relays) => {
+                // Happy path: relay lists found, complete the login.
+                self.complete_login(&account, &relays.0, &relays.1, &relays.2)
+                    .await?;
+                tracing::info!(
+                    target: "whitenoise::login_start",
+                    "Login complete for {}",
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                })
+            }
+            Err(_) => {
+                // No NIP-65 relay list found. Mark as pending so the continuation
+                // methods know there is a login in progress.
+                self.pending_logins.insert(pubkey);
+                tracing::info!(
+                    target: "whitenoise::login_start",
+                    "No relay lists found for {}; awaiting user decision",
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::NeedsRelayLists,
+                })
+            }
+        }
+    }
+
+    /// Step 2a: publish default relay lists and complete login.
+    ///
+    /// Called after [`Whitenoise::login_start`] returned [`LoginStatus::NeedsRelayLists`].
+    /// Publishes all three relay list events (10002, 10050, 10051) with the
+    /// default relays, then activates the account.
+    pub async fn login_publish_default_relays(
+        &self,
+        pubkey: &PublicKey,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        if !self.pending_logins.contains(pubkey) {
+            return Err(LoginError::NoLoginInProgress);
+        }
+        tracing::debug!(
+            target: "whitenoise::login_publish_default_relays",
+            "Publishing default relay lists for {}",
+            pubkey.to_hex()
+        );
+
+        let account = Account::find_by_pubkey(pubkey, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+        let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+        let keys = self
+            .secrets_store
+            .get_nostr_keys_for_pubkey(pubkey)
+            .map_err(|e| LoginError::Internal(e.to_string()))?;
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Assign defaults for all three relay types.
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            user.add_relays(&default_relays, relay_type, &self.database)
+                .await
+                .map_err(LoginError::from)?;
+        }
+
+        // Publish all three relay list events.
+        self.publish_relay_list(&default_relays, RelayType::Nip65, &default_relays, &keys)
+            .await
+            .map_err(LoginError::from)?;
+        self.publish_relay_list(&default_relays, RelayType::Inbox, &default_relays, &keys)
+            .await
+            .map_err(LoginError::from)?;
+        self.publish_relay_list(
+            &default_relays,
+            RelayType::KeyPackage,
+            &default_relays,
+            &keys,
+        )
+        .await
+        .map_err(LoginError::from)?;
+
+        tracing::debug!(
+            target: "whitenoise::login_publish_default_relays",
+            "Relay lists published, activating account"
+        );
+
+        self.complete_login(&account, &default_relays, &default_relays, &default_relays)
+            .await?;
+
+        self.pending_logins.remove(pubkey);
+        tracing::info!(
+            target: "whitenoise::login_publish_default_relays",
+            "Login complete for {}",
+            pubkey.to_hex()
+        );
+        Ok(LoginResult {
+            account,
+            status: LoginStatus::Complete,
+        })
+    }
+
+    /// Step 2b: search a user-provided relay for existing relay lists.
+    ///
+    /// Called after [`Whitenoise::login_start`] returned [`LoginStatus::NeedsRelayLists`].
+    /// Connects to `relay_url`, fetches the NIP-65 list, and (if found) fetches
+    /// Inbox and KeyPackage lists from the discovered NIP-65 relays.
+    ///
+    /// If relay lists are found the account is activated and
+    /// [`LoginStatus::Complete`] is returned. If nothing is found,
+    /// [`LoginStatus::NeedsRelayLists`] is returned so the caller can re-prompt.
+    pub async fn login_with_custom_relay(
+        &self,
+        pubkey: &PublicKey,
+        relay_url: RelayUrl,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        if !self.pending_logins.contains(pubkey) {
+            return Err(LoginError::NoLoginInProgress);
+        }
+        tracing::debug!(
+            target: "whitenoise::login_with_custom_relay",
+            "Searching for relay lists on {} for {}",
+            relay_url,
+            pubkey.to_hex()
+        );
+
+        let mut account = Account::find_by_pubkey(pubkey, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Create a Relay object for the user-provided URL.
+        let custom_relay = self
+            .find_or_create_relay_by_url(&relay_url)
+            .await
+            .map_err(LoginError::from)?;
+        let source_relays = vec![custom_relay];
+
+        match self
+            .try_discover_relay_lists(&mut account, &source_relays)
+            .await
+        {
+            Ok(relays) => {
+                self.complete_login(&account, &relays.0, &relays.1, &relays.2)
+                    .await?;
+                self.pending_logins.remove(pubkey);
+                tracing::info!(
+                    target: "whitenoise::login_with_custom_relay",
+                    "Login complete for {} (found lists on {})",
+                    pubkey.to_hex(),
+                    relay_url
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                })
+            }
+            Err(_) => {
+                tracing::info!(
+                    target: "whitenoise::login_with_custom_relay",
+                    "No relay lists found on {} for {}",
+                    relay_url,
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::NeedsRelayLists,
+                })
+            }
+        }
+    }
+
+    /// Cancel a pending login and clean up all partial state.
+    ///
+    /// Deletes the account from the database and removes the private key from
+    /// the keychain. Safe to call even if no login is pending (returns `Ok`).
+    pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
+        self.pending_logins.remove(pubkey);
+
+        // Clean up the partial account if it exists.
+        match Account::find_by_pubkey(pubkey, &self.database).await {
+            Ok(account) => {
+                account
+                    .delete(&self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+                // Best-effort removal of the keychain entry.
+                let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+                tracing::info!(
+                    target: "whitenoise::login_cancel",
+                    "Cleaned up partial login for {}",
+                    pubkey.to_hex()
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "whitenoise::login_cancel",
+                    "No account to clean up for {}",
+                    pubkey.to_hex()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-step login for external signers
+    // -----------------------------------------------------------------------
+
+    /// Step 1 for external signer login.
+    ///
+    /// Behaves like [`Whitenoise::login_start`] but takes a public key and a
+    /// [`NostrSigner`] instead of a private key string.
+    pub async fn login_external_signer_start(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        tracing::debug!(
+            target: "whitenoise::login_external_signer_start",
+            "Starting external signer login for {}",
+            pubkey.to_hex()
+        );
+
+        self.validate_signer_pubkey(&pubkey, &signer)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Create/update the account for this pubkey.
+        let (mut account, _) = self
+            .setup_external_signer_account_without_relays(pubkey)
+            .await?;
+
+        let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+
+        match self
+            .try_discover_relay_lists(&mut account, &default_relays)
+            .await
+        {
+            Ok(relays) => {
+                // Happy path -- complete the login using the external signer.
+                self.complete_external_signer_login(
+                    &account, &relays.0, &relays.1, &relays.2, signer,
+                )
+                .await?;
+                tracing::info!(
+                    target: "whitenoise::login_external_signer_start",
+                    "Login complete for {}",
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                })
+            }
+            Err(_) => {
+                // Stash the signer so continuation methods can use it.
+                self.register_external_signer(pubkey, signer);
+                self.pending_logins.insert(pubkey);
+                tracing::info!(
+                    target: "whitenoise::login_external_signer_start",
+                    "No relay lists found for {}; awaiting user decision",
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::NeedsRelayLists,
+                })
+            }
+        }
+    }
+
+    /// Step 2a for external signer: publish default relay lists and complete login.
+    pub async fn login_external_signer_publish_default_relays(
+        &self,
+        pubkey: &PublicKey,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        if !self.pending_logins.contains(pubkey) {
+            return Err(LoginError::NoLoginInProgress);
+        }
+
+        let signer = self
+            .get_external_signer(pubkey)
+            .ok_or(LoginError::Internal(
+                "External signer not found for pending login".to_string(),
+            ))?;
+
+        let account = Account::find_by_pubkey(pubkey, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+        let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Assign defaults.
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            user.add_relays(&default_relays, relay_type, &self.database)
+                .await
+                .map_err(LoginError::from)?;
+        }
+
+        // Publish via the external signer.
+        let nip65_urls = Relay::urls(&default_relays);
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            self.nostr
+                .publish_relay_list_with_signer(
+                    &nip65_urls,
+                    relay_type,
+                    &nip65_urls,
+                    signer.clone(),
+                )
+                .await
+                .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
+        }
+
+        self.complete_external_signer_login(
+            &account,
+            &default_relays,
+            &default_relays,
+            &default_relays,
+            signer,
+        )
+        .await?;
+
+        self.pending_logins.remove(pubkey);
+        tracing::info!(
+            target: "whitenoise::login_external_signer_publish_default_relays",
+            "Login complete for {}",
+            pubkey.to_hex()
+        );
+        Ok(LoginResult {
+            account,
+            status: LoginStatus::Complete,
+        })
+    }
+
+    /// Step 2b for external signer: search a custom relay for existing relay lists.
+    pub async fn login_external_signer_with_custom_relay(
+        &self,
+        pubkey: &PublicKey,
+        relay_url: RelayUrl,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        if !self.pending_logins.contains(pubkey) {
+            return Err(LoginError::NoLoginInProgress);
+        }
+
+        let signer = self
+            .get_external_signer(pubkey)
+            .ok_or(LoginError::Internal(
+                "External signer not found for pending login".to_string(),
+            ))?;
+
+        let mut account = Account::find_by_pubkey(pubkey, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        let custom_relay = self
+            .find_or_create_relay_by_url(&relay_url)
+            .await
+            .map_err(LoginError::from)?;
+        let source_relays = vec![custom_relay];
+
+        match self
+            .try_discover_relay_lists(&mut account, &source_relays)
+            .await
+        {
+            Ok(relays) => {
+                self.complete_external_signer_login(
+                    &account, &relays.0, &relays.1, &relays.2, signer,
+                )
+                .await?;
+                self.pending_logins.remove(pubkey);
+                tracing::info!(
+                    target: "whitenoise::login_external_signer_with_custom_relay",
+                    "Login complete for {} (found lists on {})",
+                    pubkey.to_hex(),
+                    relay_url
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                })
+            }
+            Err(_) => {
+                tracing::info!(
+                    target: "whitenoise::login_external_signer_with_custom_relay",
+                    "No relay lists found on {} for {}",
+                    relay_url,
+                    pubkey.to_hex()
+                );
+                Ok(LoginResult {
+                    account,
+                    status: LoginStatus::NeedsRelayLists,
+                })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared helpers for multi-step login
+    // -----------------------------------------------------------------------
+
+    /// Attempt to discover all three relay list types from the network.
+    ///
+    /// Fetches NIP-65 relays from `source_relays`, then uses the discovered
+    /// NIP-65 relays to fetch Inbox and KeyPackage lists. Saves all found relays
+    /// to the database.
+    ///
+    /// Returns `Err` if the NIP-65 list is not found (the primary relay list
+    /// that everything else depends on). If NIP-65 is found but Inbox or
+    /// KeyPackage are not, defaults are used for those types.
+    async fn try_discover_relay_lists(
+        &self,
+        account: &mut Account,
+        source_relays: &[Relay],
+    ) -> core::result::Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>), LoginError> {
+        let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+
+        // Step 1: Fetch NIP-65 relay list from the source relays.
+        let nip65_relays = self
+            .fetch_existing_relays(account.pubkey, RelayType::Nip65, source_relays)
+            .await
+            .map_err(LoginError::from)?;
+
+        if nip65_relays.is_empty() {
+            return Err(LoginError::Internal(
+                "No NIP-65 relay list found on the queried relays".to_string(),
+            ));
+        }
+
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+        user.add_relays(&nip65_relays, RelayType::Nip65, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Step 2: Fetch Inbox relays from the discovered NIP-65 relays.
+        let inbox_relays = self
+            .fetch_existing_relays(account.pubkey, RelayType::Inbox, &nip65_relays)
+            .await
+            .map_err(LoginError::from)?;
+        let inbox_relays = if inbox_relays.is_empty() {
+            &default_relays
+        } else {
+            &inbox_relays
+        };
+        user.add_relays(inbox_relays, RelayType::Inbox, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Step 3: Fetch KeyPackage relays from the discovered NIP-65 relays.
+        let key_package_relays = self
+            .fetch_existing_relays(account.pubkey, RelayType::KeyPackage, &nip65_relays)
+            .await
+            .map_err(LoginError::from)?;
+        let key_package_relays = if key_package_relays.is_empty() {
+            &default_relays
+        } else {
+            &key_package_relays
+        };
+        user.add_relays(key_package_relays, RelayType::KeyPackage, &self.database)
+            .await
+            .map_err(LoginError::from)?;
+
+        Ok((
+            nip65_relays,
+            inbox_relays.to_vec(),
+            key_package_relays.to_vec(),
+        ))
+    }
+
+    /// Activate a local-key account after relay lists have been resolved.
+    async fn complete_login(
+        &self,
+        account: &Account,
+        nip65_relays: &[Relay],
+        inbox_relays: &[Relay],
+        key_package_relays: &[Relay],
+    ) -> core::result::Result<(), LoginError> {
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+        self.activate_account(
+            account,
+            &user,
+            false,
+            nip65_relays,
+            inbox_relays,
+            key_package_relays,
+        )
+        .await
+        .map_err(LoginError::from)
+    }
+
+    /// Activate an external-signer account after relay lists have been resolved.
+    async fn complete_external_signer_login(
+        &self,
+        account: &Account,
+        nip65_relays: &[Relay],
+        inbox_relays: &[Relay],
+        key_package_relays: &[Relay],
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> core::result::Result<(), LoginError> {
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+        self.activate_account_without_publishing(
+            account,
+            &user,
+            nip65_relays,
+            inbox_relays,
+            key_package_relays,
+        )
+        .await
+        .map_err(LoginError::from)?;
+
+        self.register_external_signer(account.pubkey, signer.clone());
+
+        self.publish_key_package_for_account_with_signer(account, signer)
+            .await
+            .map_err(LoginError::from)?;
+
+        Ok(())
+    }
+
+    /// Create/update an external signer account record without setting up relays.
+    /// Used by the multi-step external signer login flow.
+    async fn setup_external_signer_account_without_relays(
+        &self,
+        pubkey: PublicKey,
+    ) -> core::result::Result<(Account, User), LoginError> {
+        let account = if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+            let mut account_mut = existing.clone();
+            if account_mut.account_type != AccountType::External {
+                tracing::info!(
+                    target: "whitenoise::setup_external_account",
+                    "Migrating account from {:?} to External",
+                    account_mut.account_type
+                );
+                account_mut.account_type = AccountType::External;
+                account_mut = self
+                    .persist_account(&account_mut)
+                    .await
+                    .map_err(LoginError::from)?;
+            }
+            let _ = self
+                .secrets_store
+                .remove_private_key_for_pubkey(&account_mut.pubkey);
+            account_mut
+        } else {
+            let account = Account::new_external(self, pubkey)
+                .await
+                .map_err(LoginError::from)?;
+            self.persist_account(&account)
+                .await
+                .map_err(LoginError::from)?
+        };
+
+        let user = account
+            .user(&self.database)
+            .await
+            .map_err(LoginError::from)?;
+        Ok((account, user))
+    }
+
+    // -----------------------------------------------------------------------
+    // Original methods (preserved for backward compatibility during transition)
+    // -----------------------------------------------------------------------
 
     /// Sets up an external signer account (creates or updates) and configures relays.
     /// Also used by tests that need account setup without publishing.
@@ -1068,6 +1756,13 @@ impl Whitenoise {
         source_relays: &[Relay],
     ) -> Result<Vec<Relay>> {
         let source_relay_urls = Relay::urls(source_relays);
+        // Ensure source relays are in the client pool before attempting to fetch.
+        // Without this, fetch_events_from will fail with RelayNotFound if the
+        // relays haven't been added to the pool yet (e.g. during login before
+        // activate_account runs).
+        self.nostr
+            .ensure_relays_connected(&source_relay_urls)
+            .await?;
         let relay_event = self
             .nostr
             .fetch_user_relays(pubkey, relay_type, &source_relay_urls)
@@ -3111,5 +3806,105 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let result = Account::create_mdk(pubkey, file.path(), "test.service");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // LoginError / LoginResult / LoginStatus tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_login_status_equality() {
+        assert_eq!(LoginStatus::Complete, LoginStatus::Complete);
+        assert_eq!(LoginStatus::NeedsRelayLists, LoginStatus::NeedsRelayLists);
+        assert_ne!(LoginStatus::Complete, LoginStatus::NeedsRelayLists);
+    }
+
+    #[test]
+    fn test_login_status_clone() {
+        let status = LoginStatus::NeedsRelayLists;
+        let cloned = status.clone();
+        assert_eq!(status, cloned);
+    }
+
+    #[test]
+    fn test_login_status_debug() {
+        let debug = format!("{:?}", LoginStatus::Complete);
+        assert!(debug.contains("Complete"));
+        let debug = format!("{:?}", LoginStatus::NeedsRelayLists);
+        assert!(debug.contains("NeedsRelayLists"));
+    }
+
+    #[test]
+    fn test_login_error_from_key_error() {
+        // Simulate a bad key parse
+        let key_result = Keys::parse("not-a-valid-nsec");
+        assert!(key_result.is_err());
+        let login_err = LoginError::from(key_result.unwrap_err());
+        assert!(matches!(login_err, LoginError::InvalidKeyFormat(_)));
+    }
+
+    #[test]
+    fn test_login_error_from_whitenoise_error_relay() {
+        let wn_err = WhitenoiseError::NostrManager(
+            crate::nostr_manager::NostrManagerError::NoRelayConnections,
+        );
+        let login_err = LoginError::from(wn_err);
+        assert!(matches!(login_err, LoginError::NoRelayConnections));
+    }
+
+    #[test]
+    fn test_login_error_from_whitenoise_error_other() {
+        let wn_err = WhitenoiseError::AccountNotFound;
+        let login_err = LoginError::from(wn_err);
+        assert!(matches!(login_err, LoginError::Internal(_)));
+        assert!(login_err.to_string().contains("Account not found"));
+    }
+
+    #[tokio::test]
+    async fn test_login_cancel_no_account_is_ok() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        // Cancelling when no login is in progress should succeed silently.
+        let result = whitenoise.login_cancel(&pubkey).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_login_publish_default_relays_without_start_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        let result = whitenoise.login_publish_default_relays(&pubkey).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LoginError::NoLoginInProgress));
+    }
+
+    #[tokio::test]
+    async fn test_login_with_custom_relay_without_start_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let result = whitenoise.login_with_custom_relay(&pubkey, relay_url).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), LoginError::NoLoginInProgress));
+    }
+
+    #[test]
+    fn test_login_error_debug() {
+        let err = LoginError::NoRelayConnections;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("NoRelayConnections"));
+    }
+
+    #[tokio::test]
+    async fn test_login_start_invalid_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let result = whitenoise
+            .login_start("definitely-not-a-valid-key".to_string())
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            LoginError::InvalidKeyFormat(_)
+        ));
     }
 }

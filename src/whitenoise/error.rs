@@ -4,7 +4,9 @@ use thiserror::Error;
 use crate::{
     nostr_manager::NostrManagerError,
     whitenoise::{
-        accounts::AccountError, database::DatabaseError, message_aggregator::ProcessingError,
+        accounts::{AccountError, LoginError},
+        database::DatabaseError,
+        message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
     },
 };
@@ -93,6 +95,9 @@ pub enum WhitenoiseError {
 
     #[error("Account error: {0}")]
     Account(#[from] AccountError),
+
+    #[error("Login error: {0}")]
+    Login(#[from] LoginError),
 
     #[error("SQLx error: {0}")]
     SqlxError(#[from] sqlx::Error),
@@ -342,5 +347,41 @@ mod tests {
         // Debug impl should work without panicking
         let debug_str = format!("{:?}", err);
         assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn login_error_converts_to_whitenoise_error() {
+        use crate::whitenoise::accounts::LoginError;
+
+        let login_err = LoginError::InvalidKeyFormat("bad key".to_string());
+        let err: WhitenoiseError = login_err.into();
+        assert!(matches!(err, WhitenoiseError::Login(_)));
+        assert!(err.to_string().contains("bad key"));
+    }
+
+    #[test]
+    fn login_error_display_messages() {
+        use crate::whitenoise::accounts::LoginError;
+
+        assert_eq!(
+            LoginError::InvalidKeyFormat("not an nsec".to_string()).to_string(),
+            "Invalid private key format: not an nsec"
+        );
+        assert_eq!(
+            LoginError::NoRelayConnections.to_string(),
+            "Failed to connect to any relays"
+        );
+        assert_eq!(
+            LoginError::Timeout("relay fetch".to_string()).to_string(),
+            "Login operation timed out: relay fetch"
+        );
+        assert_eq!(
+            LoginError::NoLoginInProgress.to_string(),
+            "No login in progress for this account"
+        );
+        assert_eq!(
+            LoginError::Internal("something broke".to_string()).to_string(),
+            "Login error: something broke"
+        );
     }
 }
