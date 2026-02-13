@@ -2268,4 +2268,20 @@ mod tests {
             assert!(whitenoise.get_external_signer(&pubkey2).is_some());
         }
     }
+
+    mod subscription_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_refresh_all_global_subscriptions_no_account_returns_ok() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // With no accounts in the database, should return Ok (early return)
+            let result = whitenoise.refresh_all_global_subscriptions().await;
+            assert!(
+                result.is_ok(),
+                "refresh_all_global_subscriptions should succeed with no accounts"
+            );
+        }
+    }
 }

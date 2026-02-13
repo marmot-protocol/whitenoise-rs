@@ -2578,6 +2578,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_login_with_external_signer_double_login_returns_existing_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // First login via test helper (sets up account in DB without needing relays)
+        let first_account = whitenoise
+            .login_with_external_signer_for_test(pubkey)
+            .await
+            .unwrap();
+
+        // Second login via the real method — should hit the double-login guard
+        // and return early without doing any relay work
+        let second_account = whitenoise
+            .login_with_external_signer(pubkey, keys)
+            .await
+            .unwrap();
+
+        assert_eq!(first_account.id, second_account.id);
+        assert_eq!(first_account.pubkey, second_account.pubkey);
+
+        let count = whitenoise.get_accounts_count().await.unwrap();
+        assert_eq!(count, 1, "Double login should not create a second account");
+    }
+
     /// Test that Account helper methods work correctly for external accounts
     #[tokio::test]
     async fn test_external_account_helper_methods() {
