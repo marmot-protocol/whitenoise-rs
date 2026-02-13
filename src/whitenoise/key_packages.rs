@@ -223,6 +223,16 @@ impl Whitenoise {
                 Ok(Some(pkg)) if !pkg.key_material_deleted => {
                     let mdk = self.create_mdk_for_account(account.pubkey)?;
                     mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)?;
+                    if let Err(e) =
+                        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &self.database).await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::key_packages",
+                            "Deleted key material but failed to mark record {}: {}",
+                            pkg.id,
+                            e
+                        );
+                    }
                 }
                 Ok(Some(_)) => {
                     tracing::debug!(
@@ -622,6 +632,21 @@ impl Whitenoise {
                 Err(e.into())
             }
         }
+    }
+
+    /// Looks up a published key package record by account and event ID.
+    ///
+    /// Integration-test helper for verifying lifecycle states (consumed_at,
+    /// key_material_deleted) without exposing the raw database handle.
+    #[cfg(feature = "integration-tests")]
+    pub async fn find_published_key_package_for_testing(
+        &self,
+        account_pubkey: &nostr_sdk::PublicKey,
+        event_id: &str,
+    ) -> Result<Option<PublishedKeyPackage>> {
+        PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.database)
+            .await
+            .map_err(|e| WhitenoiseError::Other(e.into()))
     }
 }
 

@@ -1,6 +1,4 @@
 -- Track the full lifecycle of every published KeyPackage from creation through cleanup.
--- Replaces the consumed_key_packages approach: instead of fetching the hash_ref
--- from relays at Welcome time, we store it at publish time (local-only, no relay round-trip).
 
 CREATE TABLE published_key_packages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -19,6 +19,61 @@ pub struct PublishedKeyPackage {
     pub created_at: i64,
 }
 
+/// Internal row type for database mapping.
+struct PublishedKeyPackageRow {
+    id: i64,
+    account_pubkey: String,
+    key_package_hash_ref: Vec<u8>,
+    event_id: String,
+    consumed_at: Option<i64>,
+    key_material_deleted: bool,
+    created_at: i64,
+}
+
+impl<'r, R> sqlx::FromRow<'r, R> for PublishedKeyPackageRow
+where
+    R: sqlx::Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
+        let id: i64 = row.try_get("id")?;
+        let account_pubkey: String = row.try_get("account_pubkey")?;
+        let key_package_hash_ref: Vec<u8> = row.try_get("key_package_hash_ref")?;
+        let event_id: String = row.try_get("event_id")?;
+        let consumed_at: Option<i64> = row.try_get("consumed_at")?;
+        let key_material_deleted: bool = row.try_get("key_material_deleted")?;
+        let created_at: i64 = row.try_get("created_at")?;
+
+        Ok(Self {
+            id,
+            account_pubkey,
+            key_package_hash_ref,
+            event_id,
+            consumed_at,
+            key_material_deleted,
+            created_at,
+        })
+    }
+}
+
+impl From<PublishedKeyPackageRow> for PublishedKeyPackage {
+    fn from(row: PublishedKeyPackageRow) -> Self {
+        Self {
+            id: row.id,
+            account_pubkey: row.account_pubkey,
+            key_package_hash_ref: row.key_package_hash_ref,
+            event_id: row.event_id,
+            consumed_at: row.consumed_at,
+            key_material_deleted: row.key_material_deleted,
+            created_at: row.created_at,
+        }
+    }
+}
+
 impl PublishedKeyPackage {
     /// Records a published key package for lifecycle tracking.
     ///
@@ -59,7 +114,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
-        let row = sqlx::query_as::<_, (i64, String, Vec<u8>, String, Option<i64>, bool, i64)>(
+        let row = sqlx::query_as::<_, PublishedKeyPackageRow>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ? AND event_id = ?",
@@ -69,27 +124,7 @@ impl PublishedKeyPackage {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(
-            |(
-                id,
-                account_pubkey,
-                key_package_hash_ref,
-                event_id,
-                consumed_at,
-                key_material_deleted,
-                created_at,
-            )| {
-                Self {
-                    id,
-                    account_pubkey,
-                    key_package_hash_ref,
-                    event_id,
-                    consumed_at,
-                    key_material_deleted,
-                    created_at,
-                }
-            },
-        ))
+        Ok(row.map(PublishedKeyPackage::from))
     }
 
     /// Marks a published key package as consumed (used by a Welcome).
@@ -129,7 +164,7 @@ impl PublishedKeyPackage {
         quiet_period_secs: i64,
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
-        let rows = sqlx::query_as::<_, (i64, String, Vec<u8>, String, Option<i64>, bool, i64)>(
+        let rows = sqlx::query_as::<_, PublishedKeyPackageRow>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ?
@@ -149,30 +184,7 @@ impl PublishedKeyPackage {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    account_pubkey,
-                    key_package_hash_ref,
-                    event_id,
-                    consumed_at,
-                    key_material_deleted,
-                    created_at,
-                )| {
-                    Self {
-                        id,
-                        account_pubkey,
-                        key_package_hash_ref,
-                        event_id,
-                        consumed_at,
-                        key_material_deleted,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(PublishedKeyPackage::from).collect())
     }
 
     /// Marks a published key package's key material as deleted.
@@ -188,19 +200,6 @@ impl PublishedKeyPackage {
             .execute(&database.pool)
             .await?;
         Ok(())
-    }
-
-    /// Removes all published key package records for an account.
-    #[allow(dead_code)]
-    pub(crate) async fn delete_all_for_account(
-        account_pubkey: &PublicKey,
-        database: &Database,
-    ) -> Result<u64, DatabaseError> {
-        let result = sqlx::query("DELETE FROM published_key_packages WHERE account_pubkey = ?")
-            .bind(account_pubkey.to_hex())
-            .execute(&database.pool)
-            .await?;
-        Ok(result.rows_affected())
     }
 }
 
@@ -568,32 +567,6 @@ mod tests {
             result.is_none(),
             "Should not find account 2's event under account 1"
         );
-    }
-
-    #[tokio::test]
-    async fn test_delete_all_for_account() {
-        let db = setup_test_db().await;
-        let pubkey = Keys::generate().public_key();
-
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], "event1", &db)
-            .await
-            .unwrap();
-        PublishedKeyPackage::create(&pubkey, &[4, 5, 6], "event2", &db)
-            .await
-            .unwrap();
-
-        let deleted = PublishedKeyPackage::delete_all_for_account(&pubkey, &db)
-            .await
-            .unwrap();
-        assert_eq!(deleted, 2);
-
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM published_key_packages WHERE account_pubkey = ?")
-                .bind(pubkey.to_hex())
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(count.0, 0);
     }
 
     #[tokio::test]
