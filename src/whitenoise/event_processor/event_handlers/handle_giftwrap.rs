@@ -224,7 +224,12 @@ impl Whitenoise {
                 .emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewGroup)
                 .await;
             whitenoise
-                .emit_group_invite_notification(account, group_id, group_name, welcomer_pubkey)
+                .emit_group_invite_notification_if_enabled(
+                    account,
+                    group_id,
+                    group_name,
+                    welcomer_pubkey,
+                )
                 .await;
         }
 
