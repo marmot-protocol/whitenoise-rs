@@ -476,16 +476,7 @@ impl User {
     pub(crate) async fn all_users_with_relay_urls(
         whitenoise: &Whitenoise,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>> {
-        let users = User::all(&whitenoise.database).await?;
-        let mut users_with_relays = Vec::new();
-
-        for user in users {
-            let relays = user.relays(RelayType::Nip65, &whitenoise.database).await?;
-            let relay_urls: Vec<RelayUrl> = Relay::urls(&relays);
-            users_with_relays.push((user.pubkey, relay_urls));
-        }
-
-        Ok(users_with_relays)
+        Self::all_with_nip65_relay_urls(&whitenoise.database).await
     }
 
     /// Determines whether metadata should be updated based on comprehensive event processing logic.
@@ -1121,6 +1112,189 @@ mod tests {
         assert_eq!(users_with_relays.len(), 1);
         assert_eq!(users_with_relays[0].0, test_pubkey);
         assert_eq!(users_with_relays[0].1, vec![relay_url]);
+    }
+
+    #[tokio::test]
+    async fn test_all_users_with_relay_urls_multiple_users_multiple_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create two users, each with two NIP-65 relays
+        let pubkey_a = nostr_sdk::Keys::generate().public_key();
+        let pubkey_b = nostr_sdk::Keys::generate().public_key();
+
+        let user_a = User {
+            id: None,
+            pubkey: pubkey_a,
+            metadata: Metadata::new().name("User A"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .save(&whitenoise.database)
+        .await
+        .unwrap();
+
+        let user_b = User {
+            id: None,
+            pubkey: pubkey_b,
+            metadata: Metadata::new().name("User B"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .save(&whitenoise.database)
+        .await
+        .unwrap();
+
+        let relay1 = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://relay1.example.com").unwrap())
+            .await
+            .unwrap();
+        let relay2 = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://relay2.example.com").unwrap())
+            .await
+            .unwrap();
+        let relay3 = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://relay3.example.com").unwrap())
+            .await
+            .unwrap();
+
+        user_a
+            .add_relay(&relay1, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        user_a
+            .add_relay(&relay2, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        user_b
+            .add_relay(&relay2, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        user_b
+            .add_relay(&relay3, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Find each user's entry (order is by pubkey hex, not insertion order)
+        let a_entry = results.iter().find(|(pk, _)| *pk == pubkey_a).unwrap();
+        let b_entry = results.iter().find(|(pk, _)| *pk == pubkey_b).unwrap();
+
+        assert_eq!(a_entry.1.len(), 2);
+        assert!(
+            a_entry
+                .1
+                .contains(&RelayUrl::parse("wss://relay1.example.com").unwrap())
+        );
+        assert!(
+            a_entry
+                .1
+                .contains(&RelayUrl::parse("wss://relay2.example.com").unwrap())
+        );
+
+        assert_eq!(b_entry.1.len(), 2);
+        assert!(
+            b_entry
+                .1
+                .contains(&RelayUrl::parse("wss://relay2.example.com").unwrap())
+        );
+        assert!(
+            b_entry
+                .1
+                .contains(&RelayUrl::parse("wss://relay3.example.com").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_users_with_relay_urls_user_with_no_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a user with NIP-65 relays and one without
+        let pubkey_with = nostr_sdk::Keys::generate().public_key();
+        let pubkey_without = nostr_sdk::Keys::generate().public_key();
+
+        let user_with = User {
+            id: None,
+            pubkey: pubkey_with,
+            metadata: Metadata::new().name("Has Relays"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .save(&whitenoise.database)
+        .await
+        .unwrap();
+
+        User {
+            id: None,
+            pubkey: pubkey_without,
+            metadata: Metadata::new().name("No Relays"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .save(&whitenoise.database)
+        .await
+        .unwrap();
+
+        let relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://relay.example.com").unwrap())
+            .await
+            .unwrap();
+        user_with
+            .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        assert_eq!(results.len(), 2, "Both users should appear in results");
+
+        let with_entry = results.iter().find(|(pk, _)| *pk == pubkey_with).unwrap();
+        let without_entry = results
+            .iter()
+            .find(|(pk, _)| *pk == pubkey_without)
+            .unwrap();
+
+        assert_eq!(with_entry.1.len(), 1);
+        assert!(
+            without_entry.1.is_empty(),
+            "User with no NIP-65 relays should have empty relay list"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_users_with_relay_urls_non_nip65_relays_excluded() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a user with only Inbox and KeyPackage relays (no NIP-65)
+        let pubkey = nostr_sdk::Keys::generate().public_key();
+        let user = User {
+            id: None,
+            pubkey,
+            metadata: Metadata::new().name("Inbox Only"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+        .save(&whitenoise.database)
+        .await
+        .unwrap();
+
+        let relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://inbox.example.com").unwrap())
+            .await
+            .unwrap();
+        user.add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let results = User::all_users_with_relay_urls(&whitenoise).await.unwrap();
+        assert_eq!(results.len(), 1, "User should appear in results");
+        assert!(
+            results[0].1.is_empty(),
+            "Non-NIP-65 relays should not be included"
+        );
     }
 
     #[tokio::test]

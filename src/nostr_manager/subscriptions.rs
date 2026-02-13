@@ -288,6 +288,46 @@ impl NostrManager {
             .await
     }
 
+    /// Refresh subscriptions for all batches across all relays (with signer).
+    ///
+    /// Unlike `refresh_user_global_subscriptions_with_signer`, this refreshes
+    /// every batch on every relay — not just the batches containing a specific
+    /// user. Use this after bulk user discovery (e.g. processing a large contact
+    /// list) where new users may be spread across many different relay batches.
+    pub(crate) async fn refresh_all_global_subscriptions_with_signer(
+        &self,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+        signer: impl NostrSigner + 'static,
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::subscriptions",
+            "Refreshing all global subscriptions with signer"
+        );
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+
+        self.with_signer(signer, || async {
+            self.refresh_all_global_subscriptions_inner(relay_user_map)
+                .await
+        })
+        .await
+    }
+
+    /// Refresh subscriptions for all batches across all relays (without signer).
+    pub(crate) async fn refresh_all_global_subscriptions(
+        &self,
+        users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
+        default_relays: &[RelayUrl],
+    ) -> Result<()> {
+        tracing::debug!(
+            target: "whitenoise::nostr_manager::subscriptions",
+            "Refreshing all global subscriptions (no signer)"
+        );
+        let relay_user_map = self.group_users_by_relay(users_with_relays, default_relays);
+        self.refresh_all_global_subscriptions_inner(relay_user_map)
+            .await
+    }
+
     /// Inner implementation for refreshing user global subscriptions
     async fn refresh_user_global_subscriptions_inner(
         &self,
@@ -303,9 +343,34 @@ impl NostrManager {
                     .await
                 {
                     tracing::error!(
-                        target: "whitenoise::nostr_manager::refresh_user_global_subscriptions",
+                        target: "whitenoise::nostr_manager::subscriptions",
                         error = %e,
                         "Failed to refresh batch for relay: {}",
+                        relay_url
+                    );
+                }
+            });
+
+        futures::future::join_all(futures).await;
+        Ok(())
+    }
+
+    /// Refreshes all batches across all relays.
+    async fn refresh_all_global_subscriptions_inner(
+        &self,
+        relay_user_map: std::collections::HashMap<RelayUrl, Vec<PublicKey>>,
+    ) -> Result<()> {
+        let futures = relay_user_map
+            .into_iter()
+            .map(|(relay_url, users)| async move {
+                if let Err(e) = self
+                    .refresh_all_batches_for_relay(relay_url.clone(), users)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::nostr_manager::subscriptions",
+                        error = %e,
+                        "Failed to refresh batches for relay: {}",
                         relay_url
                     );
                 }
@@ -359,6 +424,46 @@ impl NostrManager {
             return Err(NostrManagerError::NoRelayConnections);
         }
 
+        Ok(())
+    }
+
+    /// Refreshes all batches for a given relay.
+    async fn refresh_all_batches_for_relay(
+        &self,
+        relay_url: RelayUrl,
+        users: Vec<PublicKey>,
+    ) -> Result<()> {
+        let batch_count = self.calculate_batch_count(users.len());
+
+        let mut batches: Vec<Vec<PublicKey>> = vec![Vec::new(); batch_count];
+        for user in users {
+            let batch_id = self.user_to_batch_id(&user, batch_count);
+            batches[batch_id].push(user);
+        }
+
+        let batch_futures = batches
+            .into_iter()
+            .enumerate()
+            .filter(|(_, batch_users)| !batch_users.is_empty())
+            .map(|(batch_id, batch_users)| {
+                let relay_url = relay_url.clone();
+                async move {
+                    if let Err(e) = self
+                        .refresh_batch_subscription(relay_url.clone(), batch_id, batch_users)
+                        .await
+                    {
+                        tracing::error!(
+                            target: "whitenoise::nostr_manager::subscriptions",
+                            error = %e,
+                            "Failed to refresh batch {} for relay: {}",
+                            batch_id,
+                            relay_url
+                        );
+                    }
+                }
+            });
+
+        futures::future::join_all(batch_futures).await;
         Ok(())
     }
 
