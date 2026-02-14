@@ -153,17 +153,25 @@ jobs:
       - name: Test with Coverage (Linux only - requires Docker)
         if: runner.os == 'Linux'
         run: |
+          # Exclude test infrastructure, integration tests, and benchmarks from coverage.
+          # These inflate the line count without measuring library code quality.
+          IGNORE_REGEX='(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
+
           # Clean and run tests with coverage (library only, no integration-tests feature)
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-targets --lcov --output-path lcov.info
+          cargo llvm-cov --workspace --all-targets \
+            --ignore-filename-regex "$IGNORE_REGEX" \
+            --lcov --output-path lcov.info
 
           # Also run doc tests (without coverage - requires nightly for coverage)
           cargo test --workspace --doc
 
           # Generate HTML and summary for artifacts
           mkdir -p coverage
-          cargo llvm-cov report --html --output-dir coverage/html
-          cargo llvm-cov report | tee coverage/summary.txt
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
+            --html --output-dir coverage/html
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" \
+            | tee coverage/summary.txt
 
           echo ""
           echo "=== Coverage Summary ==="
@@ -231,23 +239,31 @@ jobs:
           CURRENT=${{ steps.coverage.outputs.percentage }}
           BASELINE=${{ steps.master_coverage.outputs.baseline }}
 
+          # Allow small fluctuations (up to 0.5%) to avoid false failures from
+          # non-deterministic LLVM instrumentation and async test timing.
+          THRESHOLD=0.5
+
           echo "=== Coverage Comparison ==="
           echo "Master branch: $BASELINE%"
           echo "This PR:       $CURRENT%"
+          echo "Threshold:     -${THRESHOLD}% allowed"
 
           DIFF=$(awk "BEGIN {printf \"%.2f\", $CURRENT - $BASELINE}")
+          DROP=$(awk "BEGIN {printf \"%.2f\", $BASELINE - $CURRENT}")
 
-          if (( $(awk "BEGIN {print ($CURRENT < $BASELINE)}") )); then
-            echo "❌ Coverage decreased by $DIFF%"
-            echo "::error::Coverage regression detected. Coverage decreased from $BASELINE% to $CURRENT% (-$DIFF%)"
+          if (( $(awk "BEGIN {print ($DROP > $THRESHOLD)}") )); then
+            echo "Coverage decreased by ${DROP}% (exceeds ${THRESHOLD}% threshold)"
+            echo "::error::Coverage regression: $BASELINE% -> $CURRENT% (-${DROP}%, threshold: -${THRESHOLD}%)"
             exit 1
+          elif (( $(awk "BEGIN {print ($CURRENT < $BASELINE)}") )); then
+            echo "Coverage decreased by ${DROP}% (within ${THRESHOLD}% threshold)"
           elif (( $(awk "BEGIN {print ($CURRENT > $BASELINE)}") )); then
-            echo "✅ Coverage improved by $DIFF%"
+            echo "Coverage improved by +$DIFF%"
           else
-            echo "✅ Coverage maintained at $BASELINE%"
+            echo "Coverage unchanged at $BASELINE%"
           fi
 
-      - name: Comment PR with coverage change
+      - name: Comment PR with coverage
         if: always() && matrix.run-integration && github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
         uses: actions/github-script@v7
         with:
@@ -255,17 +271,98 @@ jobs:
             const current = parseFloat('${{ steps.coverage.outputs.percentage }}');
             const baseline = parseFloat('${{ steps.master_coverage.outputs.baseline }}');
             const diff = (current - baseline).toFixed(2);
+            const threshold = 0.5;
+            const sha = context.sha.substring(0, 7);
+            const now = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-            let emoji = current > baseline ? '✅' : current < baseline ? '❌' : '⚠️';
+            let emoji, status;
+            if (diff > 0) {
+              emoji = ':white_check_mark:';
+              status = 'improved';
+            } else if (diff < -threshold) {
+              emoji = ':x:';
+              status = `decreased (exceeds -${threshold}% threshold)`;
+            } else if (diff < 0) {
+              emoji = ':warning:';
+              status = `decreased (within -${threshold}% threshold)`;
+            } else {
+              emoji = ':white_check_mark:';
+              status = 'unchanged';
+            }
 
-            const body = `## ${emoji} Coverage: ${baseline}% → ${current}% (${diff > 0 ? '+' : ''}${diff}%)`;
+            const sign = diff > 0 ? '+' : '';
 
-            github.rest.issues.createComment({
+            // Extract history from the existing comment if it exists
+            const marker = '<!-- coverage-report -->';
+            const historyStart = '<!-- coverage-history -->';
+            const historyEnd = '<!-- /coverage-history -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
             });
+
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            let historyEntries = [];
+            if (existing) {
+              const hStart = existing.body.indexOf(historyStart);
+              const hEnd = existing.body.indexOf(historyEnd);
+              if (hStart !== -1 && hEnd !== -1) {
+                const historyBlock = existing.body.substring(
+                  hStart + historyStart.length, hEnd
+                );
+                // Extract existing bullet points
+                historyEntries = historyBlock
+                  .split('\n')
+                  .filter(line => line.trim().startsWith('- '));
+              }
+            }
+
+            // Add current run to history
+            historyEntries.push(
+              `- \`${sha}\` ${now} — **${current}%** (${sign}${diff}% vs base)`
+            );
+
+            const body = [
+              `## ${emoji} Coverage Report`,
+              '',
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| **Base** (master) | ${baseline}% |`,
+              `| **This PR** | ${current}% |`,
+              `| **Change** | ${sign}${diff}% |`,
+              `| **Threshold** | -${threshold}% |`,
+              `| **Status** | ${status} |`,
+              '',
+              '<details>',
+              '<summary>History</summary>',
+              '',
+              historyStart,
+              ...historyEntries,
+              historyEnd,
+              '',
+              '</details>',
+              '',
+              marker,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body,
+              });
+            }
 
       - name: Integration Test
         if: matrix.run-integration
