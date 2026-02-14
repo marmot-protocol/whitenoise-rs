@@ -248,10 +248,13 @@ jobs:
           echo "This PR:       $CURRENT%"
           echo "Threshold:     -${THRESHOLD}% allowed"
 
+          # Rounded values for display only
           DIFF=$(awk "BEGIN {printf \"%.2f\", $CURRENT - $BASELINE}")
           DROP=$(awk "BEGIN {printf \"%.2f\", $BASELINE - $CURRENT}")
 
-          if (( $(awk "BEGIN {print ($DROP > $THRESHOLD)}") )); then
+          # Threshold checks use full-precision awk expressions to avoid
+          # rounding masking small regressions (e.g. 0.504% rounding to 0.50%).
+          if (( $(awk "BEGIN {print (($BASELINE - $CURRENT) > $THRESHOLD)}") )); then
             echo "Coverage decreased by ${DROP}% (exceeds ${THRESHOLD}% threshold)"
             echo "::error::Coverage regression: $BASELINE% -> $CURRENT% (-${DROP}%, threshold: -${THRESHOLD}%)"
             exit 1
