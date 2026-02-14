@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-step login API (`login_start`, `login_publish_default_relays`, `login_with_custom_relay`, `login_cancel`) that gracefully handles missing relay lists instead of crashing ([erskingardner])
+- `LoginError` enum, `LoginResult` struct, and `LoginStatus` enum for structured login error handling across the FFI boundary ([erskingardner])
+- Equivalent multi-step login API for external signer accounts ([erskingardner])
+- Integration test scenario (`login-flow`) covering happy path, no relays, publish defaults, custom relay, and cancel flows ([erskingardner])
+
+### Fixed
+
+- Login no longer crashes with "relay not found" when the user has no published relay lists ([erskingardner])
+
+### Added
+
 - Export `Language` enum from crate root for library consumers ([erskingardner])
 - Search for contacts by npub or hex pubkey ([erskingardner])
 - Copy npub button in settings page([josefinalliende])
