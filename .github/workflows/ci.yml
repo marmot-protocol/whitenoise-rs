@@ -273,19 +273,20 @@ jobs:
           script: |
             const current = parseFloat('${{ steps.coverage.outputs.percentage }}');
             const baseline = parseFloat('${{ steps.master_coverage.outputs.baseline }}');
-            const diff = (current - baseline).toFixed(2);
+            const rawDiff = current - baseline;
+            const displayDiff = rawDiff.toFixed(2);
             const threshold = 0.5;
             const sha = context.sha.substring(0, 7);
             const now = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
             let emoji, status;
-            if (diff > 0) {
+            if (rawDiff > 0) {
               emoji = ':white_check_mark:';
               status = 'improved';
-            } else if (diff < -threshold) {
+            } else if (rawDiff < -threshold) {
               emoji = ':x:';
               status = `decreased (exceeds -${threshold}% threshold)`;
-            } else if (diff < 0) {
+            } else if (rawDiff < 0) {
               emoji = ':warning:';
               status = `decreased (within -${threshold}% threshold)`;
             } else {
@@ -293,7 +294,7 @@ jobs:
               status = 'unchanged';
             }
 
-            const sign = diff > 0 ? '+' : '';
+            const sign = rawDiff > 0 ? '+' : '';
 
             // Extract history from the existing comment if it exists
             const marker = '<!-- coverage-report -->';
@@ -325,7 +326,7 @@ jobs:
 
             // Add current run to history
             historyEntries.push(
-              `- \`${sha}\` ${now} — **${current}%** (${sign}${diff}% vs base)`
+              `- \`${sha}\` ${now} — **${current}%** (${sign}${displayDiff}% vs base)`
             );
 
             const body = [
@@ -335,7 +336,7 @@ jobs:
               `|--------|-------|`,
               `| **Base** (master) | ${baseline}% |`,
               `| **This PR** | ${current}% |`,
-              `| **Change** | ${sign}${diff}% |`,
+              `| **Change** | ${sign}${displayDiff}% |`,
               `| **Threshold** | -${threshold}% |`,
               `| **Status** | ${status} |`,
               '',
