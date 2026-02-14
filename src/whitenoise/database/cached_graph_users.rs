@@ -10,6 +10,7 @@ use crate::{
 };
 
 /// Internal row type for database mapping.
+#[derive(Debug)]
 struct CachedGraphUserRow {
     id: i64,
     pubkey: PublicKey,
@@ -17,15 +18,6 @@ struct CachedGraphUserRow {
     follows: Vec<PublicKey>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for CachedGraphUserRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedGraphUserRow")
-            .field("pubkey", &self.pubkey)
-            .finish()
-    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for CachedGraphUserRow

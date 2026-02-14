@@ -45,22 +45,13 @@ pub enum UserSyncMode {
     Background,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct User {
     pub id: Option<i64>,
     pub pubkey: PublicKey,
     pub metadata: Metadata,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for User {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("User")
-            .field("pubkey", &self.pubkey)
-            .finish()
-    }
 }
 
 impl User {

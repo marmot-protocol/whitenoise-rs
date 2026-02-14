@@ -14,7 +14,7 @@ use crate::{
     },
 };
 
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 struct AccountRow {
     // id is the primary key
     id: i64,
@@ -30,16 +30,6 @@ struct AccountRow {
     created_at: DateTime<Utc>,
     // updated_at is the timestamp of the last update
     updated_at: DateTime<Utc>,
-}
-
-/// Custom Debug to prevent internal fields from leaking into SQLx query logs.
-impl std::fmt::Debug for AccountRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AccountRow")
-            .field("pubkey", &self.pubkey)
-            .field("account_type", &self.account_type)
-            .finish()
-    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AccountRow

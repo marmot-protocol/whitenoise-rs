@@ -6,7 +6,7 @@ use nostr_sdk::prelude::*;
 ///
 /// This type contains the core fields needed for event handling (reactions, deletions, etc.)
 /// without the full processing that `ChatMessage` provides.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AggregatedMessage {
     /// Database row ID
     pub id: i64,
@@ -22,18 +22,6 @@ pub struct AggregatedMessage {
     pub created_at: DateTime<Utc>,
     /// Tags from the event
     pub tags: Tags,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for AggregatedMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AggregatedMessage")
-            .field("event_id", &self.event_id)
-            .field("mls_group_id", &self.mls_group_id)
-            .field("author", &self.author)
-            .field("created_at", &self.created_at)
-            .finish()
-    }
 }
 
 #[cfg(test)]
@@ -87,7 +75,7 @@ mod tests {
 
         let debug_str = format!("{:?}", msg);
         assert!(debug_str.contains("AggregatedMessage"));
-        // Content is redacted in custom Debug impl
-        assert!(!debug_str.contains("Test content"));
+        assert!(debug_str.contains("42")); // id
+        assert!(debug_str.contains("Test content"));
     }
 }

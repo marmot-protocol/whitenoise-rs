@@ -21,7 +21,7 @@ use crate::whitenoise::{
 };
 
 /// Summary of a chat/group for the chat list screen
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatListItem {
     /// MLS group identifier
     pub mls_group_id: GroupId,
@@ -66,19 +66,6 @@ pub struct ChatListItem {
     /// For DMs: the public key of the other participant.
     /// `None` for Group chats.
     pub dm_peer_pubkey: Option<PublicKey>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for ChatListItem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatListItem")
-            .field("mls_group_id", &self.mls_group_id)
-            .field("group_type", &self.group_type)
-            .field("pending_confirmation", &self.pending_confirmation)
-            .field("unread_count", &self.unread_count)
-            .field("pin_order", &self.pin_order)
-            .finish()
-    }
 }
 
 impl ChatListItem {

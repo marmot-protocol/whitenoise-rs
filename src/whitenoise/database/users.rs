@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-#[derive(PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub(crate) struct UserRow {
     // id is the primary key
     pub id: i64,
@@ -22,15 +22,6 @@ pub(crate) struct UserRow {
     pub created_at: DateTime<Utc>,
     // updated_at is the timestamp of the last update
     pub updated_at: DateTime<Utc>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for UserRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UserRow")
-            .field("pubkey", &self.pubkey)
-            .finish()
-    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for UserRow

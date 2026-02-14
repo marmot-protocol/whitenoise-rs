@@ -10,19 +10,10 @@ pub enum ChatListUpdateTrigger {
     LastMessageDeleted,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatListUpdate {
     pub trigger: ChatListUpdateTrigger,
     pub item: ChatListItem,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for ChatListUpdate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatListUpdate")
-            .field("trigger", &self.trigger)
-            .finish()
-    }
 }
 
 pub struct ChatListSubscription {

@@ -39,20 +39,12 @@ const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
 /// This struct combines an MLS group with its `AccountGroup` record (the join table
 /// between accounts and groups). The `AccountGroup` tracks account-specific state
 /// such as user confirmation status (pending, accepted, or declined).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GroupWithMembership {
     /// The MLS group data from MDK
     pub group: group_types::Group,
     /// The account-group relationship (join table record)
     pub membership: AccountGroup,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for GroupWithMembership {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GroupWithMembership")
-            .finish_non_exhaustive()
-    }
 }
 
 impl GroupWithMembership {

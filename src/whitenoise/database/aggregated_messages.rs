@@ -15,6 +15,7 @@ use crate::whitenoise::{
 
 type Result<T> = std::result::Result<T, DatabaseError>;
 
+#[derive(Debug)]
 struct AggregatedMessageRow {
     pub id: i64,
     pub message_id: EventId,
@@ -29,17 +30,6 @@ struct AggregatedMessageRow {
     pub content_tokens: Vec<SerializableToken>,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for AggregatedMessageRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AggregatedMessageRow")
-            .field("message_id", &self.message_id)
-            .field("mls_group_id", &self.mls_group_id)
-            .field("kind", &self.kind)
-            .finish()
-    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AggregatedMessageRow

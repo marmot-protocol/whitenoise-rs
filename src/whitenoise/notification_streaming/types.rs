@@ -14,7 +14,7 @@ pub enum NotificationTrigger {
 }
 
 /// User information for notification display.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationUser {
     pub pubkey: PublicKey,
     /// Display name from metadata (display_name or name)
@@ -23,17 +23,8 @@ pub struct NotificationUser {
     pub picture_url: Option<String>,
 }
 
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for NotificationUser {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotificationUser")
-            .field("pubkey", &self.pubkey)
-            .finish()
-    }
-}
-
 /// Represents a notification update.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationUpdate {
     /// What triggered this notification
     pub trigger: NotificationTrigger,
@@ -51,16 +42,6 @@ pub struct NotificationUpdate {
     pub content: String,
     /// When the event occurred
     pub timestamp: DateTime<Utc>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for NotificationUpdate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotificationUpdate")
-            .field("mls_group_id", &self.mls_group_id)
-            .field("trigger", &self.trigger)
-            .finish()
-    }
 }
 
 /// Subscription handle for notification updates.

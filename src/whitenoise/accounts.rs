@@ -158,7 +158,7 @@ pub(crate) struct ExternalSignerRelaySetup {
     pub should_publish_key_package: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: Option<i64>,
     pub pubkey: PublicKey,
@@ -168,18 +168,6 @@ pub struct Account {
     pub last_synced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Custom Debug impl that only shows pubkey and account_type.
-/// Prevents accidental leakage of internal fields (user_id, timestamps)
-/// into log output via SQLx query logging or tracing formatters.
-impl std::fmt::Debug for Account {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Account")
-            .field("pubkey", &self.pubkey)
-            .field("account_type", &self.account_type)
-            .finish()
-    }
 }
 
 impl Account {
@@ -3097,9 +3085,7 @@ mod tests {
         assert_eq!(local_deserialized.account_type, AccountType::Local);
     }
 
-    /// Test Account debug formatting only shows pubkey and account_type.
-    /// Internal fields (user_id, timestamps) must NOT appear in debug output
-    /// to prevent accidental leakage into logs.
+    /// Test Account debug formatting includes account_type
     #[tokio::test]
     async fn test_account_debug_includes_account_type() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -3112,7 +3098,6 @@ mod tests {
         let external_debug = format!("{:?}", external_account);
         let local_debug = format!("{:?}", local_account);
 
-        // Should include pubkey and account_type.
         assert!(
             external_debug.contains("External"),
             "External account debug should contain 'External': {}",
@@ -3122,28 +3107,6 @@ mod tests {
             local_debug.contains("Local"),
             "Local account debug should contain 'Local': {}",
             local_debug
-        );
-
-        // Must NOT include internal fields that could leak to logs.
-        assert!(
-            !external_debug.contains("user_id"),
-            "Account debug must not contain user_id: {}",
-            external_debug
-        );
-        assert!(
-            !external_debug.contains("last_synced_at"),
-            "Account debug must not contain last_synced_at: {}",
-            external_debug
-        );
-        assert!(
-            !external_debug.contains("created_at"),
-            "Account debug must not contain created_at: {}",
-            external_debug
-        );
-        assert!(
-            !external_debug.contains("updated_at"),
-            "Account debug must not contain updated_at: {}",
-            external_debug
         );
     }
 

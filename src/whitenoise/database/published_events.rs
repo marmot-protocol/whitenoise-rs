@@ -4,21 +4,12 @@ use nostr_sdk::EventId;
 use super::{Database, DatabaseError, utils::parse_timestamp};
 
 /// Row structure for published_events table
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PublishedEvent {
     pub id: i64,
     pub event_id: EventId,
     pub account_id: i64,
     pub created_at: DateTime<Utc>,
-}
-
-/// Custom Debug impl to prevent sensitive data from leaking into logs.
-impl std::fmt::Debug for PublishedEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PublishedEvent")
-            .field("event_id", &self.event_id)
-            .finish()
-    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for PublishedEvent
