@@ -51,7 +51,6 @@ impl Default for RetryInfo {
 }
 
 /// Events that can be processed by the Whitenoise event processing system
-#[derive(Debug)]
 pub enum ProcessableEvent {
     /// A Nostr event with an optional subscription ID for account-aware processing
     NostrEvent {
@@ -61,6 +60,19 @@ pub enum ProcessableEvent {
     },
     /// A relay message for logging/monitoring purposes
     RelayMessage(RelayUrl, String),
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for ProcessableEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NostrEvent { .. } => f.debug_struct("ProcessableEvent::NostrEvent").finish(),
+            Self::RelayMessage(relay_url, _) => f
+                .debug_struct("ProcessableEvent::RelayMessage")
+                .field("relay_url", relay_url)
+                .finish(),
+        }
+    }
 }
 
 impl ProcessableEvent {
@@ -74,10 +86,17 @@ impl ProcessableEvent {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct MessageWithTokens {
     pub message: message_types::Message,
     pub tokens: Vec<SerializableToken>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for MessageWithTokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageWithTokens").finish()
+    }
 }
 
 impl MessageWithTokens {

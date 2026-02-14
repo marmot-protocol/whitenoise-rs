@@ -3,15 +3,15 @@
 //! This module defines the structures and interfaces for future stateful
 //! implementation that will support incremental updates and persistent state.
 
-use std::collections::HashMap;
-use std::time::SystemTime;
 use mdk_core::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::SystemTime;
 
-use super::types::{ChatMessage, GroupStatistics, AggregatorConfig};
+use super::types::{AggregatorConfig, ChatMessage, GroupStatistics};
 
 /// Internal state for a specific group's message aggregation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct GroupState {
     /// Processed messages by message ID
     pub messages: HashMap<String, ChatMessage>,
@@ -28,6 +28,15 @@ pub(crate) struct GroupState {
     /// Dirty flag to track when state needs persistence
     #[serde(skip)]
     pub needs_persistence: bool,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for GroupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroupState")
+            .field("message_count", &self.messages.len())
+            .finish()
+    }
 }
 
 impl GroupState {
@@ -51,16 +60,19 @@ impl GroupState {
     /// Update statistics based on current state
     pub fn update_statistics(&mut self) {
         self.stats.message_count = self.messages.len();
-        self.stats.deleted_message_count = self.messages.values()
-            .filter(|msg| msg.is_deleted)
-            .count();
+        self.stats.deleted_message_count =
+            self.messages.values().filter(|msg| msg.is_deleted).count();
 
-        self.stats.reaction_count = self.messages.values()
+        self.stats.reaction_count = self
+            .messages
+            .values()
             .map(|msg| msg.reactions.user_reactions.len())
             .sum();
 
         // Rough memory usage calculation
-        self.stats.memory_usage_bytes = self.messages.values()
+        self.stats.memory_usage_bytes = self
+            .messages
+            .values()
             .map(|msg| estimate_message_size(msg))
             .sum();
 
@@ -79,7 +91,6 @@ impl GroupState {
 }
 
 /// Per-group aggregator state with isolation guarantees
-#[derive(Debug)]
 pub(crate) struct AggregatorState {
     /// State per group, ensuring no cross-group contamination
     pub groups: HashMap<GroupId, GroupState>,
@@ -89,6 +100,15 @@ pub(crate) struct AggregatorState {
 
     /// Last cleanup timestamp
     pub last_cleanup: Option<SystemTime>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for AggregatorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AggregatorState")
+            .field("group_count", &self.groups.len())
+            .finish()
+    }
 }
 
 impl AggregatorState {
@@ -103,7 +123,9 @@ impl AggregatorState {
 
     /// Get or create state for a specific group
     pub fn get_or_create_group(&mut self, group_id: &GroupId) -> &mut GroupState {
-        self.groups.entry(group_id.clone()).or_insert_with(GroupState::new)
+        self.groups
+            .entry(group_id.clone())
+            .or_insert_with(GroupState::new)
     }
 
     /// Remove state for a specific group
@@ -113,14 +135,16 @@ impl AggregatorState {
 
     /// Get statistics for all groups
     pub fn get_all_statistics(&self) -> HashMap<GroupId, GroupStatistics> {
-        self.groups.iter()
+        self.groups
+            .iter()
             .map(|(group_id, state)| (group_id.clone(), state.stats.clone()))
             .collect()
     }
 
     /// Find groups that need persistence
     pub fn groups_needing_persistence(&self) -> Vec<GroupId> {
-        self.groups.iter()
+        self.groups
+            .iter()
             .filter(|(_, state)| state.needs_persistence)
             .map(|(group_id, _)| group_id.clone())
             .collect()
@@ -135,12 +159,13 @@ impl AggregatorState {
 
     /// Clean up old or unused state
     pub fn cleanup_old_state(&mut self, max_age_days: u64) {
-        let cutoff = SystemTime::now() - std::time::Duration::from_secs(max_age_days * 24 * 60 * 60);
+        let cutoff =
+            SystemTime::now() - std::time::Duration::from_secs(max_age_days * 24 * 60 * 60);
 
         self.groups.retain(|_, state| {
             if let Some(last_processed) = state.last_processed_at {
-                let last_processed_system_time = SystemTime::UNIX_EPOCH +
-                    std::time::Duration::from_secs(last_processed.as_secs());
+                let last_processed_system_time = SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(last_processed.as_secs());
                 last_processed_system_time > cutoff
             } else {
                 // Keep state without last_processed_at to be safe
@@ -166,8 +191,8 @@ fn estimate_message_size(message: &ChatMessage) -> usize {
     let tokens_size = message.content_tokens.len() * 32; // Rough estimate
 
     // Estimate reactions size
-    let reactions_size = message.reactions.user_reactions.len() * 64 +
-                        message.reactions.by_emoji.len() * 48;
+    let reactions_size =
+        message.reactions.user_reactions.len() * 64 + message.reactions.by_emoji.len() * 48;
 
     base_size + content_size + id_size + reply_id_size + tokens_size + reactions_size
 }
@@ -195,7 +220,11 @@ pub enum StateError {
 
 impl AggregatorState {
     /// Persist state for a specific group to disk
-    pub async fn persist_group_state(&mut self, group_id: &GroupId, path: &std::path::Path) -> Result<(), StateError> {
+    pub async fn persist_group_state(
+        &mut self,
+        group_id: &GroupId,
+        path: &std::path::Path,
+    ) -> Result<(), StateError> {
         if let Some(state) = self.groups.get_mut(group_id) {
             // TODO: Add bincode dependency for serialization
             // let serialized = bincode::serialize(state)
@@ -213,7 +242,11 @@ impl AggregatorState {
     }
 
     /// Load persisted state for a specific group from disk
-    pub async fn load_group_state(&mut self, group_id: &GroupId, path: &std::path::Path) -> Result<(), StateError> {
+    pub async fn load_group_state(
+        &mut self,
+        group_id: &GroupId,
+        path: &std::path::Path,
+    ) -> Result<(), StateError> {
         let group_path = path.join(format!("group_{}.state", hex::encode(group_id.as_slice())));
 
         if !group_path.exists() {
@@ -245,7 +278,11 @@ impl AggregatorState {
     }
 
     /// Clear all cached/persisted state for a specific group
-    pub async fn clear_group_state(&mut self, group_id: &GroupId, path: &std::path::Path) -> Result<(), StateError> {
+    pub async fn clear_group_state(
+        &mut self,
+        group_id: &GroupId,
+        path: &std::path::Path,
+    ) -> Result<(), StateError> {
         // Remove from memory
         self.groups.remove(group_id);
 
@@ -377,7 +414,9 @@ mod tests {
         assert!(!state.groups.contains_key(&group_id));
 
         // Should be gone from disk
-        let group_path = temp_dir.path().join(format!("group_{}.state", hex::encode(group_id.as_slice())));
+        let group_path = temp_dir
+            .path()
+            .join(format!("group_{}.state", hex::encode(group_id.as_slice())));
         assert!(!group_path.exists());
     }
 }

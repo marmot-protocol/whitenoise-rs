@@ -17,7 +17,7 @@ use crate::whitenoise::{
 /// - `None` = pending (auto-joined but awaiting user decision)
 /// - `Some(true)` = accepted
 /// - `Some(false)` = declined (hidden from UI)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AccountGroup {
     pub id: Option<i64>,
     pub account_pubkey: PublicKey,
@@ -34,6 +34,17 @@ pub struct AccountGroup {
     pub dm_peer_pubkey: Option<PublicKey>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for AccountGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountGroup")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("user_confirmation", &self.user_confirmation)
+            .finish()
+    }
 }
 
 impl AccountGroup {

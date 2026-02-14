@@ -6,7 +6,7 @@ use super::{Database, utils::parse_timestamp};
 use crate::whitenoise::accounts_groups::AccountGroup;
 
 /// Internal database row representation for accounts_groups table
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[derive(PartialEq, Eq, Clone, Hash)]
 struct AccountGroupRow {
     id: i64,
     account_pubkey: PublicKey,
@@ -18,6 +18,17 @@ struct AccountGroupRow {
     dm_peer_pubkey: Option<PublicKey>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for AccountGroupRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountGroupRow")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("user_confirmation", &self.user_confirmation)
+            .finish()
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AccountGroupRow

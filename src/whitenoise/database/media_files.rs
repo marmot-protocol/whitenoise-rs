@@ -48,7 +48,7 @@ impl FileMetadata {
 }
 
 /// Internal database row representation for media_files table
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MediaFileRow {
     pub id: i64,
     pub mls_group_id: GroupId,
@@ -64,6 +64,19 @@ pub(crate) struct MediaFileRow {
     pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
     pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for MediaFileRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFileRow")
+            .field("id", &self.id)
+            .field("account_pubkey", &self.account_pubkey)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("mime_type", &self.mime_type)
+            .field("media_type", &self.media_type)
+            .finish()
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for MediaFileRow
@@ -143,7 +156,7 @@ where
 }
 
 /// Parameters for saving a media file
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MediaFileParams<'a> {
     pub file_path: &'a Path,
     pub original_file_hash: Option<&'a [u8; 32]>, // SHA-256 of decrypted content (for chat_media with MDK)
@@ -157,8 +170,18 @@ pub struct MediaFileParams<'a> {
     pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
 }
 
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for MediaFileParams<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFileParams")
+            .field("mime_type", &self.mime_type)
+            .field("media_type", &self.media_type)
+            .finish()
+    }
+}
+
 /// Represents a cached media file
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaFile {
     pub id: Option<i64>,
     pub mls_group_id: GroupId,
@@ -174,6 +197,19 @@ pub struct MediaFile {
     pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
     pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
     pub created_at: DateTime<Utc>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for MediaFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFile")
+            .field("id", &self.id)
+            .field("account_pubkey", &self.account_pubkey)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("mime_type", &self.mime_type)
+            .field("media_type", &self.media_type)
+            .finish()
+    }
 }
 
 impl From<MediaFileRow> for MediaFile {

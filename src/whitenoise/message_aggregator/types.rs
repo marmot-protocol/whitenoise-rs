@@ -9,7 +9,7 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::media_files::MediaFile;
 
 /// Represents an aggregated chat message ready for frontend display
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     /// Unique identifier of the message
     pub id: String,
@@ -48,11 +48,23 @@ pub struct ChatMessage {
     pub media_attachments: Vec<MediaFile>,
 }
 
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for ChatMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatMessage")
+            .field("id", &self.id)
+            .field("author", &self.author)
+            .field("kind", &self.kind)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
 /// Lightweight message summary for previews (chat list).
 ///
 /// This is a subset of `ChatMessage` optimized for display contexts where full
 /// message data isn't needed. Uses `DateTime<Utc>` for database consistency.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessageSummary {
     /// Event ID of the message
     pub message_id: EventId,
@@ -76,6 +88,19 @@ pub struct ChatMessageSummary {
     pub media_attachment_count: usize,
 }
 
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for ChatMessageSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatMessageSummary")
+            .field("message_id", &self.message_id)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("author", &self.author)
+            .field("created_at", &self.created_at)
+            .field("media_attachment_count", &self.media_attachment_count)
+            .finish()
+    }
+}
+
 /// Summary of reactions on a message
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ReactionSummary {
@@ -87,7 +112,7 @@ pub struct ReactionSummary {
 }
 
 /// Details for a specific emoji reaction
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct EmojiReaction {
     /// The emoji or reaction symbol
     pub emoji: String,
@@ -99,8 +124,18 @@ pub struct EmojiReaction {
     pub users: Vec<PublicKey>,
 }
 
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for EmojiReaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmojiReaction")
+            .field("emoji", &self.emoji)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
 /// Individual user's reaction
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserReaction {
     /// User who made the reaction
     pub user: PublicKey,
@@ -112,6 +147,15 @@ pub struct UserReaction {
     pub created_at: Timestamp,
 
     pub reaction_id: EventId,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for UserReaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserReaction")
+            .field("emoji", &self.emoji)
+            .finish()
+    }
 }
 
 /// Configuration for the message aggregator

@@ -32,13 +32,22 @@ pub enum UpdateTrigger {
 /// Always contains the complete, current state of the affected message.
 /// The `message` field is always the BASE message (kind 9), never a reaction
 /// or deletion event directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MessageUpdate {
     /// What triggered this update.
     pub trigger: UpdateTrigger,
 
     /// The complete, current state of the affected message.
     pub message: ChatMessage,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for MessageUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageUpdate")
+            .field("trigger", &self.trigger)
+            .finish()
+    }
 }
 
 /// Result of subscribing to group messages.

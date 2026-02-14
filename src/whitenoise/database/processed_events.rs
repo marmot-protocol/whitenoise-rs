@@ -5,7 +5,7 @@ use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::whitenoise::{error::WhitenoiseError, relays::RelayType};
 
 /// Row structure for processed_events table
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub struct ProcessedEvent {
     pub id: i64,
     pub event_id: EventId,
@@ -14,6 +14,15 @@ pub struct ProcessedEvent {
     pub event_created_at: Option<DateTime<Utc>>,
     pub event_kind: Option<Kind>,
     pub author: Option<PublicKey>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for ProcessedEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessedEvent")
+            .field("event_id", &self.event_id)
+            .finish()
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for ProcessedEvent

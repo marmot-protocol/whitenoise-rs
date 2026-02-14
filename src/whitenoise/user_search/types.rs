@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 use super::matcher::{MatchQuality, MatchedField};
 
 /// A single search result with metadata and social distance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserSearchResult {
     /// The user's public key.
     pub pubkey: PublicKey,
@@ -21,6 +21,15 @@ pub struct UserSearchResult {
     pub best_field: MatchedField,
     /// Which metadata fields matched the query (useful for UI highlighting).
     pub matched_fields: Vec<MatchedField>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for UserSearchResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSearchResult")
+            .field("pubkey", &self.pubkey)
+            .finish()
+    }
 }
 
 impl UserSearchResult {
@@ -37,7 +46,7 @@ impl UserSearchResult {
 }
 
 /// Parameters for a user search request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UserSearchParams {
     /// The query string to search for.
     pub query: String,
@@ -47,6 +56,15 @@ pub struct UserSearchParams {
     pub radius_start: u8,
     /// Ending radius for the search (inclusive).
     pub radius_end: u8,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for UserSearchParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSearchParams")
+            .field("searcher_pubkey", &self.searcher_pubkey)
+            .finish()
+    }
 }
 
 /// What triggered a search update.
@@ -87,7 +105,7 @@ pub enum SearchUpdateTrigger {
 }
 
 /// A streaming update during user search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserSearchUpdate {
     /// What triggered this update.
     pub trigger: SearchUpdateTrigger,
@@ -98,6 +116,16 @@ pub struct UserSearchUpdate {
 
     /// Total results found so far.
     pub total_result_count: usize,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for UserSearchUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSearchUpdate")
+            .field("trigger", &self.trigger)
+            .field("total_result_count", &self.total_result_count)
+            .finish()
+    }
 }
 
 /// Result of starting a user search.

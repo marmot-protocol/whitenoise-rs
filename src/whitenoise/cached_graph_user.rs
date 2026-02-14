@@ -21,7 +21,7 @@ pub const DEFAULT_CACHE_TTL_HOURS: i64 = 24;
 ///
 /// These are cached BEFORE any search filtering - they represent the "search space".
 /// This is NOT a User - it doesn't trigger subscriptions or background syncing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CachedGraphUser {
     /// Database ID (None before save, Some after).
     pub id: Option<i64>,
@@ -35,6 +35,15 @@ pub struct CachedGraphUser {
     pub created_at: DateTime<Utc>,
     /// When this cache entry was last updated.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Custom Debug impl to prevent sensitive data from leaking into logs.
+impl std::fmt::Debug for CachedGraphUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedGraphUser")
+            .field("pubkey", &self.pubkey)
+            .finish()
+    }
 }
 
 impl CachedGraphUser {
