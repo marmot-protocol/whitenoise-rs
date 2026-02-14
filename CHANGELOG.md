@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Better handling of long messages in chat ([josefinalliende])
 
+### Fixed
+
+- Fix key package publish reliability: detect failed relay publishes and retry with exponential backoff so accounts are never left with zero key packages ([mubarakcoded])
+
 ## [v0.1.0-alpha.3] - 2025-02-20
 
 ### Added
@@ -98,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [jgmontoya]: <https://github.com/jgmontoya> (nostr:npub1jgm0ntzjr03wuzj5788llhed7l6fst05um4ej2r86ueaa08etv6sgd669p)
 [a-mpch]: <https://github.com/a-mpch> (nostr:npub1mpchxagw3kaglylnyajzjmghdj63vly9q5eu7d62fl72f2gz8xfqk6nwkd)
 [F3r10]: <https://github.com/F3r10>
+[mubarakcoded]: <https://github.com/mubarakcoded> (nostr:npub1mlyye6fpsqnkuxwv3nzzf3cmrau8x6z3fhh095246me87ya0aprsun609q)
 
 
 
