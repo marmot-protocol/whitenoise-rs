@@ -1,6 +1,7 @@
+use async_trait::async_trait;
+
 use crate::integration_tests::{core::*, test_cases::scheduler::*};
 use crate::{Whitenoise, WhitenoiseError};
-use async_trait::async_trait;
 
 /// Integration test scenario for verifying the scheduler and its tasks.
 ///

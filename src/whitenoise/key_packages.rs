@@ -648,6 +648,39 @@ impl Whitenoise {
             .await
             .map_err(|e| WhitenoiseError::Other(e.into()))
     }
+
+    /// Backdates the `consumed_at` timestamp for a published key package.
+    ///
+    /// Integration-test helper that shifts `consumed_at` into the past so the
+    /// maintenance task considers it eligible for cleanup without waiting the
+    /// full quiet period.
+    #[cfg(feature = "integration-tests")]
+    pub async fn backdate_consumed_at_for_testing(
+        &self,
+        account_pubkey: &nostr_sdk::PublicKey,
+        event_id: &str,
+        age_secs: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
+             WHERE account_pubkey = ? AND event_id = ?",
+        )
+        .bind(age_secs)
+        .bind(account_pubkey.to_hex())
+        .bind(event_id)
+        .execute(&self.database.pool)
+        .await
+        .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
+
+        tracing::debug!(
+            target: "whitenoise::key_packages",
+            "Backdated consumed_at by {}s for KP event {} (TEST ONLY)",
+            age_secs,
+            event_id
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

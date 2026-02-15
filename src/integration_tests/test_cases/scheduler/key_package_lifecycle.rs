@@ -1,10 +1,9 @@
-use std::time::Duration;
+use async_trait::async_trait;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::integration_tests::test_cases::shared::{CreateGroupTestCase, WaitForWelcomeTestCase};
 use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
-use async_trait::async_trait;
 
 /// Verifies the full key package lifecycle:
 /// 1. Publishing a KP tracks it in `published_key_packages`
@@ -41,7 +40,7 @@ impl TestCase for KeyPackageLifecycleTestCase {
         tracing::info!("✓ Created member: {}", member.pubkey.to_hex());
 
         // Wait for initial key package publishing to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Verify the member has at least one published KP tracked in the DB
         let member_kps = context
@@ -123,13 +122,14 @@ impl TestCase for KeyPackageLifecycleTestCase {
         // ============================================================
         // Phase 3: Run maintenance and verify cleanup
         // ============================================================
-        tracing::info!("Waiting for quiet period before running maintenance cleanup...");
+        tracing::info!("Running maintenance cleanup...");
 
-        // The quiet period is 30 seconds in production. We need to wait for it
-        // to elapse so the maintenance task considers the KP eligible for cleanup.
-        // Use a shorter poll loop — the consumed_at was set moments ago, so we
-        // wait slightly beyond the quiet period.
-        tokio::time::sleep(Duration::from_secs(35)).await;
+        // Backdate consumed_at so the quiet period check passes immediately,
+        // avoiding a 35-second real-time wait in the test suite.
+        context
+            .whitenoise
+            .backdate_consumed_at_for_testing(&member.pubkey, &kp_event_id, 60)
+            .await?;
 
         // Run the maintenance task
         let task = KeyPackageMaintenance;
