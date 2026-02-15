@@ -239,29 +239,18 @@ jobs:
           CURRENT=${{ steps.coverage.outputs.percentage }}
           BASELINE=${{ steps.master_coverage.outputs.baseline }}
 
-          # Allow small fluctuations (up to 0.5%) to avoid false failures from
-          # non-deterministic LLVM instrumentation and async test timing.
-          THRESHOLD=0.5
-
           echo "=== Coverage Comparison ==="
           echo "Master branch: $BASELINE%"
           echo "This PR:       $CURRENT%"
-          echo "Threshold:     -${THRESHOLD}% allowed"
 
-          # Rounded values for display only
           DIFF=$(awk "BEGIN {printf \"%.2f\", $CURRENT - $BASELINE}")
-          DROP=$(awk "BEGIN {printf \"%.2f\", $BASELINE - $CURRENT}")
 
-          # Threshold checks use full-precision awk expressions to avoid
-          # rounding masking small regressions (e.g. 0.504% rounding to 0.50%).
-          if (( $(awk "BEGIN {print (($BASELINE - $CURRENT) > $THRESHOLD)}") )); then
-            echo "Coverage decreased by ${DROP}% (exceeds ${THRESHOLD}% threshold)"
-            echo "::error::Coverage regression: $BASELINE% -> $CURRENT% (-${DROP}%, threshold: -${THRESHOLD}%)"
+          if (( $(awk "BEGIN {print ($CURRENT < $BASELINE)}") )); then
+            echo "Coverage decreased by ${DIFF}%"
+            echo "::error::Coverage regression: $BASELINE% -> $CURRENT% (${DIFF}%)"
             exit 1
-          elif (( $(awk "BEGIN {print ($CURRENT < $BASELINE)}") )); then
-            echo "Coverage decreased by ${DROP}% (within ${THRESHOLD}% threshold)"
           elif (( $(awk "BEGIN {print ($CURRENT > $BASELINE)}") )); then
-            echo "Coverage improved by +$DIFF%"
+            echo "Coverage improved by +${DIFF}%"
           else
             echo "Coverage unchanged at $BASELINE%"
           fi
@@ -275,25 +264,10 @@ jobs:
             const baseline = parseFloat('${{ steps.master_coverage.outputs.baseline }}');
             const rawDiff = current - baseline;
             const displayDiff = rawDiff.toFixed(2);
-            const threshold = 0.5;
             const sha = context.sha.substring(0, 7);
             const now = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-            let emoji, status;
-            if (rawDiff > 0) {
-              emoji = ':white_check_mark:';
-              status = 'improved';
-            } else if (rawDiff < -threshold) {
-              emoji = ':x:';
-              status = `decreased (exceeds -${threshold}% threshold)`;
-            } else if (rawDiff < 0) {
-              emoji = ':warning:';
-              status = `decreased (within -${threshold}% threshold)`;
-            } else {
-              emoji = ':white_check_mark:';
-              status = 'unchanged';
-            }
-
+            const emoji = rawDiff > 0 ? ':white_check_mark:' : rawDiff < 0 ? ':x:' : ':white_check_mark:';
             const sign = rawDiff > 0 ? '+' : '';
 
             // Extract history from the existing comment if it exists
@@ -330,15 +304,7 @@ jobs:
             );
 
             const body = [
-              `## ${emoji} Coverage Report`,
-              '',
-              `| Metric | Value |`,
-              `|--------|-------|`,
-              `| **Base** (master) | ${baseline}% |`,
-              `| **This PR** | ${current}% |`,
-              `| **Change** | ${sign}${displayDiff}% |`,
-              `| **Threshold** | -${threshold}% |`,
-              `| **Status** | ${status} |`,
+              `## ${emoji} Coverage: ${baseline}% → ${current}% (${sign}${displayDiff}%)`,
               '',
               '<details>',
               '<summary>History</summary>',
