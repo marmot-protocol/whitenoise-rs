@@ -73,6 +73,17 @@ pub struct LoginResult {
     pub status: LoginStatus,
 }
 
+/// The three relay lists discovered (or defaulted) during login.
+#[derive(Debug, Clone)]
+pub struct DiscoveredRelayLists {
+    /// NIP-65 relay list (kind 10002).
+    pub nip65: Vec<Relay>,
+    /// Inbox relays (kind 10050).
+    pub inbox: Vec<Relay>,
+    /// Key-package relays (kind 10051).
+    pub key_package: Vec<Relay>,
+}
+
 /// Errors specific to the login flow.
 #[derive(Debug, Error)]
 pub enum LoginError {
@@ -109,13 +120,8 @@ impl From<WhitenoiseError> for LoginError {
             WhitenoiseError::NostrManager(NostrManagerError::NoRelayConnections) => {
                 Self::NoRelayConnections
             }
-            // nostr-sdk timeouts surface as Client errors with "timeout" in
-            // the message. This is the best we can do without a dedicated
-            // Timeout variant in NostrManagerError.
-            WhitenoiseError::NostrManager(NostrManagerError::Client(ref e))
-                if e.to_string().to_lowercase().contains("timeout") =>
-            {
-                Self::Timeout(err.to_string())
+            WhitenoiseError::NostrManager(NostrManagerError::Timeout) => {
+                Self::Timeout("relay operation timed out".to_string())
             }
             other => Self::Internal(other.to_string()),
         }
@@ -630,7 +636,7 @@ impl Whitenoise {
         {
             Some(relays) => {
                 // Happy path: relay lists found, complete the login.
-                self.complete_login(&account, &relays.0, &relays.1, &relays.2)
+                self.complete_login(&account, &relays.nip65, &relays.inbox, &relays.key_package)
                     .await?;
                 tracing::info!(
                     target: "whitenoise::accounts",
@@ -773,7 +779,7 @@ impl Whitenoise {
             .await?
         {
             Some(relays) => {
-                self.complete_login(&account, &relays.0, &relays.1, &relays.2)
+                self.complete_login(&account, &relays.nip65, &relays.inbox, &relays.key_package)
                     .await?;
                 self.pending_logins.remove(pubkey);
                 tracing::info!(
@@ -878,7 +884,11 @@ impl Whitenoise {
             Some(relays) => {
                 // Happy path -- complete the login using the external signer.
                 self.complete_external_signer_login(
-                    &account, &relays.0, &relays.1, &relays.2, signer,
+                    &account,
+                    &relays.nip65,
+                    &relays.inbox,
+                    &relays.key_package,
+                    signer,
                 )
                 .await?;
                 tracing::info!(
@@ -1006,7 +1016,11 @@ impl Whitenoise {
         {
             Some(relays) => {
                 self.complete_external_signer_login(
-                    &account, &relays.0, &relays.1, &relays.2, signer,
+                    &account,
+                    &relays.nip65,
+                    &relays.inbox,
+                    &relays.key_package,
+                    signer,
                 )
                 .await?;
                 self.pending_logins.remove(pubkey);
@@ -1058,7 +1072,7 @@ impl Whitenoise {
         &self,
         account: &mut Account,
         source_relays: &[Relay],
-    ) -> core::result::Result<Option<(Vec<Relay>, Vec<Relay>, Vec<Relay>)>, LoginError> {
+    ) -> core::result::Result<Option<DiscoveredRelayLists>, LoginError> {
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
 
         // Step 1: Fetch NIP-65 relay list from the source relays.
@@ -1117,7 +1131,11 @@ impl Whitenoise {
         let inbox_relays = inbox_result?;
         let key_package_relays = key_package_result?;
 
-        Ok(Some((nip65_relays, inbox_relays, key_package_relays)))
+        Ok(Some(DiscoveredRelayLists {
+            nip65: nip65_relays,
+            inbox: inbox_relays,
+            key_package: key_package_relays,
+        }))
     }
 
     /// Activate a local-key account after relay lists have been resolved.
@@ -4107,8 +4125,22 @@ mod tests {
     }
 
     #[test]
+    fn test_login_error_from_whitenoise_error_timeout() {
+        // A relay Timeout should map to LoginError::Timeout via the dedicated
+        // NostrManagerError::Timeout variant (no string matching).
+        let nostr_mgr_err = crate::nostr_manager::NostrManagerError::Timeout;
+        let wn_err = WhitenoiseError::NostrManager(nostr_mgr_err);
+        let login_err = LoginError::from(wn_err);
+        assert!(
+            matches!(login_err, LoginError::Timeout(_)),
+            "Expected Timeout, got: {:?}",
+            login_err
+        );
+    }
+
+    #[test]
     fn test_login_error_from_whitenoise_error_non_timeout_client() {
-        // A Client error that does NOT contain "timeout" should map to Internal.
+        // A Client error that is NOT a timeout should map to Internal.
         let client_err = nostr_sdk::client::Error::Signer(nostr_sdk::signer::SignerError::backend(
             std::io::Error::other("some signer error"),
         ));
