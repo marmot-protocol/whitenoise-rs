@@ -607,7 +607,7 @@ impl Whitenoise {
             .map_err(|e| LoginError::InvalidKeyFormat(e.to_string()))?;
         let pubkey = keys.public_key();
         tracing::debug!(
-            target: "whitenoise::login_start",
+            target: "whitenoise::accounts",
             "Starting login for pubkey: {}",
             pubkey.to_hex()
         );
@@ -617,7 +617,7 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
         tracing::debug!(
-            target: "whitenoise::login_start",
+            target: "whitenoise::accounts",
             "Account created in DB and key stored in keychain"
         );
 
@@ -633,7 +633,7 @@ impl Whitenoise {
                 self.complete_login(&account, &relays.0, &relays.1, &relays.2)
                     .await?;
                 tracing::info!(
-                    target: "whitenoise::login_start",
+                    target: "whitenoise::accounts",
                     "Login complete for {}",
                     pubkey.to_hex()
                 );
@@ -647,7 +647,7 @@ impl Whitenoise {
                 // methods know there is a login in progress.
                 self.pending_logins.insert(pubkey);
                 tracing::info!(
-                    target: "whitenoise::login_start",
+                    target: "whitenoise::accounts",
                     "No relay lists found for {}; awaiting user decision",
                     pubkey.to_hex()
                 );
@@ -672,7 +672,7 @@ impl Whitenoise {
             return Err(LoginError::NoLoginInProgress);
         }
         tracing::debug!(
-            target: "whitenoise::login_publish_default_relays",
+            target: "whitenoise::accounts",
             "Publishing default relay lists for {}",
             pubkey.to_hex()
         );
@@ -714,7 +714,7 @@ impl Whitenoise {
         .map_err(LoginError::from)?;
 
         tracing::debug!(
-            target: "whitenoise::login_publish_default_relays",
+            target: "whitenoise::accounts",
             "Relay lists published, activating account"
         );
 
@@ -723,7 +723,7 @@ impl Whitenoise {
 
         self.pending_logins.remove(pubkey);
         tracing::info!(
-            target: "whitenoise::login_publish_default_relays",
+            target: "whitenoise::accounts",
             "Login complete for {}",
             pubkey.to_hex()
         );
@@ -751,7 +751,7 @@ impl Whitenoise {
             return Err(LoginError::NoLoginInProgress);
         }
         tracing::debug!(
-            target: "whitenoise::login_with_custom_relay",
+            target: "whitenoise::accounts",
             "Searching for relay lists on {} for {}",
             relay_url,
             pubkey.to_hex()
@@ -777,7 +777,7 @@ impl Whitenoise {
                     .await?;
                 self.pending_logins.remove(pubkey);
                 tracing::info!(
-                    target: "whitenoise::login_with_custom_relay",
+                    target: "whitenoise::accounts",
                     "Login complete for {} (found lists on {})",
                     pubkey.to_hex(),
                     relay_url
@@ -789,7 +789,7 @@ impl Whitenoise {
             }
             None => {
                 tracing::info!(
-                    target: "whitenoise::login_with_custom_relay",
+                    target: "whitenoise::accounts",
                     "No relay lists found on {} for {}",
                     relay_url,
                     pubkey.to_hex()
@@ -811,7 +811,7 @@ impl Whitenoise {
         // Only clean up if there was actually a pending login for this pubkey.
         if self.pending_logins.remove(pubkey).is_none() {
             tracing::debug!(
-                target: "whitenoise::login_cancel",
+                target: "whitenoise::accounts",
                 "No pending login for {}, nothing to cancel",
                 pubkey.to_hex()
             );
@@ -830,7 +830,7 @@ impl Whitenoise {
             // Best-effort removal of the keychain entry.
             let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
             tracing::info!(
-                target: "whitenoise::login_cancel",
+                target: "whitenoise::accounts",
                 "Cleaned up partial login for {}",
                 pubkey.to_hex()
             );
@@ -855,7 +855,7 @@ impl Whitenoise {
         S: NostrSigner + Clone + 'static,
     {
         tracing::debug!(
-            target: "whitenoise::login_external_signer_start",
+            target: "whitenoise::accounts",
             "Starting external signer login for {}",
             pubkey.to_hex()
         );
@@ -882,7 +882,7 @@ impl Whitenoise {
                 )
                 .await?;
                 tracing::info!(
-                    target: "whitenoise::login_external_signer_start",
+                    target: "whitenoise::accounts",
                     "Login complete for {}",
                     pubkey.to_hex()
                 );
@@ -896,7 +896,7 @@ impl Whitenoise {
                 self.register_external_signer(pubkey, signer);
                 self.pending_logins.insert(pubkey);
                 tracing::info!(
-                    target: "whitenoise::login_external_signer_start",
+                    target: "whitenoise::accounts",
                     "No relay lists found for {}; awaiting user decision",
                     pubkey.to_hex()
                 );
@@ -964,7 +964,7 @@ impl Whitenoise {
 
         self.pending_logins.remove(pubkey);
         tracing::info!(
-            target: "whitenoise::login_external_signer_publish_default_relays",
+            target: "whitenoise::accounts",
             "Login complete for {}",
             pubkey.to_hex()
         );
@@ -1011,7 +1011,7 @@ impl Whitenoise {
                 .await?;
                 self.pending_logins.remove(pubkey);
                 tracing::info!(
-                    target: "whitenoise::login_external_signer_with_custom_relay",
+                    target: "whitenoise::accounts",
                     "Login complete for {} (found lists on {})",
                     pubkey.to_hex(),
                     relay_url
@@ -1023,7 +1023,7 @@ impl Whitenoise {
             }
             None => {
                 tracing::info!(
-                    target: "whitenoise::login_external_signer_with_custom_relay",
+                    target: "whitenoise::accounts",
                     "No relay lists found on {} for {}",
                     relay_url,
                     pubkey.to_hex()
@@ -1079,39 +1079,45 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
-        // Step 2: Fetch Inbox relays from the discovered NIP-65 relays.
-        let inbox_relays = self
-            .fetch_existing_relays(account.pubkey, RelayType::Inbox, &nip65_relays)
-            .await
-            .map_err(LoginError::from)?;
-        let inbox_relays = if inbox_relays.is_empty() {
-            &default_relays
-        } else {
-            &inbox_relays
-        };
-        user.add_relays(inbox_relays, RelayType::Inbox, &self.database)
-            .await
-            .map_err(LoginError::from)?;
+        // Steps 2 & 3: Fetch Inbox and KeyPackage relays concurrently from the
+        // discovered NIP-65 relays. These are independent network operations.
+        let pubkey = account.pubkey;
+        let (inbox_result, key_package_result) = tokio::join!(
+            async {
+                let relays = self
+                    .fetch_existing_relays(pubkey, RelayType::Inbox, &nip65_relays)
+                    .await
+                    .map_err(LoginError::from)?;
+                let relays = if relays.is_empty() {
+                    default_relays.clone()
+                } else {
+                    relays
+                };
+                user.add_relays(&relays, RelayType::Inbox, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+                Ok::<Vec<Relay>, LoginError>(relays)
+            },
+            async {
+                let relays = self
+                    .fetch_existing_relays(pubkey, RelayType::KeyPackage, &nip65_relays)
+                    .await
+                    .map_err(LoginError::from)?;
+                let relays = if relays.is_empty() {
+                    default_relays.clone()
+                } else {
+                    relays
+                };
+                user.add_relays(&relays, RelayType::KeyPackage, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+                Ok::<Vec<Relay>, LoginError>(relays)
+            },
+        );
+        let inbox_relays = inbox_result?;
+        let key_package_relays = key_package_result?;
 
-        // Step 3: Fetch KeyPackage relays from the discovered NIP-65 relays.
-        let key_package_relays = self
-            .fetch_existing_relays(account.pubkey, RelayType::KeyPackage, &nip65_relays)
-            .await
-            .map_err(LoginError::from)?;
-        let key_package_relays = if key_package_relays.is_empty() {
-            &default_relays
-        } else {
-            &key_package_relays
-        };
-        user.add_relays(key_package_relays, RelayType::KeyPackage, &self.database)
-            .await
-            .map_err(LoginError::from)?;
-
-        Ok(Some((
-            nip65_relays,
-            inbox_relays.to_vec(),
-            key_package_relays.to_vec(),
-        )))
+        Ok(Some((nip65_relays, inbox_relays, key_package_relays)))
     }
 
     /// Activate a local-key account after relay lists have been resolved.
@@ -1184,7 +1190,7 @@ impl Whitenoise {
                 let mut account_mut = existing.clone();
                 if account_mut.account_type != AccountType::External {
                     tracing::info!(
-                        target: "whitenoise::setup_external_account",
+                        target: "whitenoise::accounts",
                         "Migrating account from {:?} to External",
                         account_mut.account_type
                     );

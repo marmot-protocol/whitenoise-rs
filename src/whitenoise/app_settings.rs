@@ -167,6 +167,8 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    use crate::whitenoise::test_utils::*;
+
     #[test]
     fn theme_mode_display_round_trips_via_from_str() {
         for variant in [ThemeMode::Light, ThemeMode::Dark, ThemeMode::System] {
@@ -261,8 +263,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitenoise_app_settings() {
-        use crate::whitenoise::test_utils::*;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let settings = whitenoise.app_settings().await.unwrap();
         // Default settings are created during initialization via DB migration.
@@ -273,8 +273,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitenoise_update_theme_mode() {
-        use crate::whitenoise::test_utils::*;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         // Ensure defaults exist first.
         let _ = whitenoise.app_settings().await.unwrap();
@@ -286,8 +284,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_whitenoise_update_language() {
-        use crate::whitenoise::test_utils::*;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let _ = whitenoise.app_settings().await.unwrap();
 

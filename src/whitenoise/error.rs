@@ -170,6 +170,8 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    use crate::whitenoise::accounts::LoginError;
+
     #[test]
     fn io_errors_convert_into_filesystem_variant() {
         let io_error = std::io::Error::other("disk error");
@@ -351,8 +353,6 @@ mod tests {
 
     #[test]
     fn login_error_converts_to_whitenoise_error() {
-        use crate::whitenoise::accounts::LoginError;
-
         let login_err = LoginError::InvalidKeyFormat("bad key".to_string());
         let err: WhitenoiseError = login_err.into();
         assert!(matches!(err, WhitenoiseError::Login(_)));
@@ -361,8 +361,6 @@ mod tests {
 
     #[test]
     fn login_error_display_messages() {
-        use crate::whitenoise::accounts::LoginError;
-
         assert_eq!(
             LoginError::InvalidKeyFormat("not an nsec".to_string()).to_string(),
             "Invalid private key format: not an nsec"
