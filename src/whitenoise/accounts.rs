@@ -20,7 +20,7 @@ use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 /// The type of account authentication.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum AccountType {
     /// Account with locally stored private key.
     #[default]
@@ -52,7 +52,7 @@ impl FromStr for AccountType {
 }
 
 /// The status of a login attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginStatus {
     /// Login completed successfully. Account is fully activated with relay lists,
     /// subscriptions, and a published key package.
@@ -65,7 +65,7 @@ pub enum LoginStatus {
 }
 
 /// The result of a login attempt.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct LoginResult {
     /// The account that was created or found.
     pub account: Account,
@@ -74,7 +74,7 @@ pub struct LoginResult {
 }
 
 /// Errors specific to the login flow.
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum LoginError {
     /// The provided private key is not valid (bad format, bad encoding, etc.).
     #[error("Invalid private key format: {0}")]
@@ -122,7 +122,7 @@ impl From<WhitenoiseError> for LoginError {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum AccountError {
     #[error("Failed to parse public key: {0}")]
     PublicKeyError(#[from] nostr_sdk::key::Error),
@@ -158,7 +158,7 @@ pub(crate) struct ExternalSignerRelaySetup {
     pub should_publish_key_package: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Account {
     pub id: Option<i64>,
     pub pubkey: PublicKey,
