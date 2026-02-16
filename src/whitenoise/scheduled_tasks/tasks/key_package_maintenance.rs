@@ -6,17 +6,11 @@ use nostr_sdk::{Event, Timestamp};
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::scheduled_tasks::Task;
 
 /// Maximum age for a key package before it should be rotated (30 days).
 const KEY_PACKAGE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
-/// Quiet period before cleaning up consumed key package local key material.
-/// After this many seconds with no new welcomes for an account, it's safe
-/// to delete local key material for consumed key packages.
-const CONSUMED_KP_QUIET_PERIOD_SECS: i64 = 30;
 
 /// Maximum number of accounts to process concurrently.
 const MAX_CONCURRENT_ACCOUNTS: usize = 5;
@@ -49,7 +43,7 @@ impl Task for KeyPackageMaintenance {
             return Ok(());
         }
 
-        let results: Vec<MaintenanceResult> = stream::iter(accounts.clone())
+        let results: Vec<MaintenanceResult> = stream::iter(accounts)
             .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
@@ -66,27 +60,6 @@ impl Task for KeyPackageMaintenance {
             summary.skipped,
             summary.errors
         );
-
-        // Phase 2: Clean up local key material for consumed key packages
-        let cleanup_results: Vec<(String, Result<usize, WhitenoiseError>)> = stream::iter(accounts)
-            .map(|account| async move {
-                let pubkey_hex = account.pubkey.to_hex();
-                let result = cleanup_consumed_key_packages(whitenoise, &account).await;
-                (pubkey_hex, result)
-            })
-            .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
-            .collect()
-            .await;
-
-        let total_cleaned = summarize_cleanup_results(cleanup_results);
-
-        if total_cleaned > 0 {
-            tracing::info!(
-                target: "whitenoise::scheduler::key_package_maintenance",
-                "Consumed key package cleanup: {} total cleaned",
-                total_cleaned
-            );
-        }
 
         Ok(())
     }
@@ -105,8 +78,8 @@ enum MaintenanceResult {
     Error(WhitenoiseError),
 }
 
-/// Summary counters from Phase 1 maintenance results.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// Summary counters from maintenance results.
+#[derive(Debug, PartialEq, Eq, Default)]
 struct MaintenanceSummary {
     checked: usize,
     published: usize,
@@ -115,7 +88,7 @@ struct MaintenanceSummary {
     errors: usize,
 }
 
-/// Tallies Phase 1 maintenance results into summary counters.
+/// Tallies maintenance results into summary counters.
 fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> MaintenanceSummary {
     let mut summary = MaintenanceSummary::default();
     for result in results {
@@ -143,34 +116,6 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
         }
     }
     summary
-}
-
-/// Tallies Phase 2 cleanup results, logging per-account outcomes.
-fn summarize_cleanup_results(results: Vec<(String, Result<usize, WhitenoiseError>)>) -> usize {
-    let mut total_cleaned = 0usize;
-    for (pubkey_hex, result) in results {
-        match result {
-            Ok(0) => {}
-            Ok(cleaned) => {
-                total_cleaned += cleaned;
-                tracing::info!(
-                    target: "whitenoise::scheduler::key_package_maintenance",
-                    "Cleaned up {} consumed key package(s) for account {}",
-                    cleaned,
-                    pubkey_hex
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::scheduler::key_package_maintenance",
-                    "Failed to clean up consumed key packages for account {}: {}",
-                    pubkey_hex,
-                    e
-                );
-            }
-        }
-    }
-    total_cleaned
 }
 
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
@@ -257,11 +202,12 @@ async fn rotate_expired_packages(
     );
 
     // Publish new key package first (so there's no gap)
-    if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
-        match e {
-            WhitenoiseError::AccountMissingKeyPackageRelays => return MaintenanceResult::Skipped,
-            _ => return MaintenanceResult::Error(e),
+    match whitenoise.publish_key_package_for_account(account).await {
+        Ok(()) => {}
+        Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {
+            return MaintenanceResult::Skipped;
         }
+        Err(e) => return MaintenanceResult::Error(e),
     }
 
     tracing::debug!(
@@ -288,68 +234,6 @@ async fn rotate_expired_packages(
             MaintenanceResult::Rotated { deleted: 0 }
         }
     }
-}
-
-/// Cleans up local MLS key material for consumed key packages after the quiet period.
-///
-/// Checks if the account has consumed key packages where the quiet period has elapsed
-/// (no new welcomes in the last 30 seconds), then deletes local key material using
-/// the hash_ref stored at publish time and marks the row as cleaned.
-async fn cleanup_consumed_key_packages(
-    whitenoise: &Whitenoise,
-    account: &Account,
-) -> Result<usize, WhitenoiseError> {
-    let eligible = PublishedKeyPackage::find_eligible_for_cleanup(
-        &account.pubkey,
-        CONSUMED_KP_QUIET_PERIOD_SECS,
-        &whitenoise.database,
-    )
-    .await?;
-
-    if eligible.is_empty() {
-        return Ok(0);
-    }
-
-    tracing::debug!(
-        target: "whitenoise::scheduler::key_package_maintenance",
-        "Found {} consumed key package(s) eligible for cleanup for account {}",
-        eligible.len(),
-        account.pubkey.to_hex()
-    );
-
-    let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
-    let mut cleaned = 0usize;
-
-    for consumed in &eligible {
-        match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
-            Ok(()) => {
-                if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
-                    consumed.id,
-                    &whitenoise.database,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Deleted key material but failed to mark record {}: {}",
-                        consumed.id,
-                        e
-                    );
-                }
-                cleaned += 1;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::scheduler::key_package_maintenance",
-                    "Failed to delete local key material for consumed key package {}: {}",
-                    consumed.id,
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(cleaned)
 }
 
 #[cfg(test)]
@@ -459,34 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn test_summarize_cleanup_results_empty() {
-        assert_eq!(summarize_cleanup_results(vec![]), 0);
-    }
-
-    #[test]
-    fn test_summarize_cleanup_results_mixed() {
-        let results = vec![
-            ("a".to_string(), Ok(0)),
-            ("b".to_string(), Ok(3)),
-            ("c".to_string(), Ok(2)),
-            ("d".to_string(), Err(WhitenoiseError::AccountNotFound)),
-        ];
-        assert_eq!(summarize_cleanup_results(results), 5);
-    }
-
-    #[test]
-    fn test_summarize_cleanup_results_all_errors() {
-        let results = vec![
-            ("a".to_string(), Err(WhitenoiseError::AccountNotFound)),
-            ("b".to_string(), Err(WhitenoiseError::AccountNotFound)),
-        ];
-        assert_eq!(summarize_cleanup_results(results), 0);
-    }
-
-    #[test]
     fn test_constants() {
         assert_eq!(KEY_PACKAGE_MAX_AGE, Duration::from_secs(30 * 24 * 60 * 60));
-        assert_eq!(CONSUMED_KP_QUIET_PERIOD_SECS, 30);
         assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
     }
 

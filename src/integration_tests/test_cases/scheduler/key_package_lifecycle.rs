@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::integration_tests::test_cases::shared::{CreateGroupTestCase, WaitForWelcomeTestCase};
-use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
+use crate::whitenoise::scheduled_tasks::{ConsumedKeyPackageCleanup, Task};
 
 /// Verifies the full key package lifecycle:
 /// 1. Publishing a KP tracks it in `published_key_packages`
@@ -131,8 +131,8 @@ impl TestCase for KeyPackageLifecycleTestCase {
             .backdate_consumed_at_for_testing(&member.pubkey, &kp_event_id, 60)
             .await?;
 
-        // Run the maintenance task
-        let task = KeyPackageMaintenance;
+        // Run the cleanup task
+        let task = ConsumedKeyPackageCleanup;
         task.execute(context.whitenoise).await?;
 
         // Verify key_material_deleted is now set

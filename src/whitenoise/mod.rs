@@ -423,6 +423,7 @@ impl Whitenoise {
         // Register and start scheduled background tasks
         let tasks: Vec<Arc<dyn scheduled_tasks::Task>> = vec![
             Arc::new(scheduled_tasks::KeyPackageMaintenance),
+            Arc::new(scheduled_tasks::ConsumedKeyPackageCleanup),
             Arc::new(scheduled_tasks::CachedGraphUserCleanup),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
