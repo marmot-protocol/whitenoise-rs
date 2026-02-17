@@ -705,17 +705,27 @@ impl Whitenoise {
         }
 
         // Publish all three relay list events.
-        self.publish_relay_list(&default_relays, RelayType::Nip65, &default_relays, &keys)
-            .await
-            .map_err(LoginError::from)?;
-        self.publish_relay_list(&default_relays, RelayType::Inbox, &default_relays, &keys)
-            .await
-            .map_err(LoginError::from)?;
+        self.publish_relay_list(
+            &default_relays,
+            RelayType::Nip65,
+            &default_relays,
+            keys.clone(),
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.publish_relay_list(
+            &default_relays,
+            RelayType::Inbox,
+            &default_relays,
+            keys.clone(),
+        )
+        .await
+        .map_err(LoginError::from)?;
         self.publish_relay_list(
             &default_relays,
             RelayType::KeyPackage,
             &default_relays,
-            &keys,
+            keys,
         )
         .await
         .map_err(LoginError::from)?;
