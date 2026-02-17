@@ -24,15 +24,17 @@ use crate::whitenoise::users::User;
 /// Get metadata for a pubkey using cache hierarchy.
 ///
 /// Strategy:
-/// 1. User table (if pubkey is a known user)
+/// 1. User table (if pubkey is a known user with populated metadata)
 /// 2. cached_graph_users table (if fresh)
 /// 3. Network fetch (result cached for future use)
 pub(super) async fn get_metadata_for_pubkey(
     whitenoise: &Whitenoise,
     pubkey: &PublicKey,
 ) -> Result<Option<Metadata>> {
-    // 1. Check User table
-    if let Ok(user) = User::find_by_pubkey(pubkey, &whitenoise.database).await {
+    // 1. Check User table (skip if metadata is empty — background sync may not have completed)
+    if let Ok(user) = User::find_by_pubkey(pubkey, &whitenoise.database).await
+        && user.metadata != Metadata::new()
+    {
         return Ok(Some(user.metadata));
     }
 
@@ -653,5 +655,52 @@ mod tests {
 
         // At minimum, cached entry should be present
         assert!(result.contains_key(&cached_pk));
+    }
+
+    /// When a User record exists with empty metadata but the CachedGraphUser
+    /// table has real metadata, get_metadata_for_pubkey should fall through
+    /// to the cache instead of returning the empty User metadata.
+    ///
+    /// This simulates the race condition where contact list sync creates a
+    /// User record with Metadata::new() (all None fields) before the
+    /// background metadata fetch completes.
+    #[tokio::test]
+    async fn get_metadata_falls_through_to_cache_when_user_has_empty_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        // Create a User record with empty metadata (simulates contact list sync)
+        let user = User {
+            id: None,
+            pubkey: keys.public_key(),
+            metadata: Metadata::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        // Add real metadata to the cache
+        let cached = CachedGraphUser::new(
+            keys.public_key(),
+            Metadata::new()
+                .name("Alice")
+                .display_name("Alice Wonderland"),
+            vec![],
+        );
+        cached.upsert(&whitenoise.database).await.unwrap();
+
+        // Should return the cached metadata, not the empty User metadata
+        let metadata = get_metadata_for_pubkey(&whitenoise, &keys.public_key())
+            .await
+            .unwrap();
+
+        assert!(metadata.is_some(), "Should return metadata");
+        let m = metadata.unwrap();
+
+        assert_eq!(
+            m.name,
+            Some("Alice".to_string()),
+            "Should return cached metadata, not empty User metadata"
+        );
     }
 }

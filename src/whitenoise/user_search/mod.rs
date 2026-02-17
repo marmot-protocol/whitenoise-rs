@@ -730,4 +730,59 @@ mod tests {
         // Target should appear at most once (deduplication)
         assert!(target_count <= 1);
     }
+
+    /// Search should find a followed user by name even when their User record
+    /// has empty metadata, as long as the cache has real metadata.
+    ///
+    /// This simulates the race condition where contact list sync creates a
+    /// User record with Metadata::new() before background metadata fetch
+    /// completes, but the CachedGraphUser table already has the real metadata.
+    #[tokio::test]
+    async fn search_finds_followed_user_when_user_record_has_empty_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let followed_keys = nostr_sdk::Keys::generate();
+
+        // Create a User record with empty metadata (simulates contact list sync
+        // before background metadata fetch completes)
+        let user = User {
+            id: None,
+            pubkey: followed_keys.public_key(),
+            metadata: Metadata::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        // Follow the user
+        whitenoise
+            .follow_user(&account, &followed_keys.public_key())
+            .await
+            .unwrap();
+
+        // Populate the cache with real metadata
+        let cached = CachedGraphUser::new(
+            followed_keys.public_key(),
+            Metadata::new().name("aleups").display_name("Aleups"),
+            vec![],
+        );
+        cached.upsert(&whitenoise.database).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Search by name at radius 1 (follows)
+        let updates = run_search(&whitenoise, "aleups", account.pubkey, 0, 1).await;
+
+        let found = updates
+            .iter()
+            .filter(|u| matches!(u.trigger, SearchUpdateTrigger::ResultsFound))
+            .flat_map(|u| &u.new_results)
+            .any(|r| r.pubkey == followed_keys.public_key());
+
+        assert!(
+            found,
+            "Should find followed user 'aleups' by name at radius 1"
+        );
+    }
 }
