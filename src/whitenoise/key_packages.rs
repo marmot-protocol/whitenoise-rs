@@ -638,8 +638,8 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        // Register external signer
-        whitenoise.register_external_signer(pubkey, keys.clone());
+        // Insert external signer directly (bypasses account validation)
+        whitenoise.insert_external_signer(pubkey, keys.clone());
 
         // Should get the registered external signer
         let result = whitenoise.get_signer_for_account(&account);
@@ -683,8 +683,8 @@ mod tests {
             .store_private_key(&local_keys)
             .expect("Should store keys");
 
-        // Register external signer for same pubkey
-        whitenoise.register_external_signer(pubkey, external_keys.clone());
+        // Insert external signer for same pubkey (bypasses account validation)
+        whitenoise.insert_external_signer(pubkey, external_keys.clone());
 
         let account = Account {
             id: Some(1),

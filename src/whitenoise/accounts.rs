@@ -479,7 +479,7 @@ impl Whitenoise {
 
         // Register the signer before activating the account so that subscription
         // setup can use it for NIP-42 AUTH on relays that require it.
-        self.register_external_signer(pubkey, signer.clone());
+        self.insert_external_signer(pubkey, signer.clone());
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
@@ -655,7 +655,7 @@ impl Whitenoise {
         // Register a mock signer so subscription setup can proceed.
         // In production, the real signer is registered before activation.
         let mock_keys = Keys::generate();
-        self.register_external_signer(pubkey, mock_keys);
+        self.insert_external_signer(pubkey, mock_keys);
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(

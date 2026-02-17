@@ -708,7 +708,31 @@ impl Whitenoise {
     /// This is used for accounts that use external signers like Amber (NIP-55).
     /// The signer will be used for operations that require signing or decryption,
     /// such as processing giftwrap events.
-    pub fn register_external_signer(&self, pubkey: PublicKey, signer: impl NostrSigner + 'static) {
+    ///
+    /// Returns an error if the account does not exist or is not an external
+    /// signer account.
+    pub async fn register_external_signer(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + 'static,
+    ) -> Result<()> {
+        let account = self.find_account_by_pubkey(&pubkey).await?;
+        if !account.uses_external_signer() {
+            return Err(WhitenoiseError::NotExternalSignerAccount);
+        }
+        self.insert_external_signer(pubkey, signer);
+        Ok(())
+    }
+
+    /// Inserts an external signer without validating the account type.
+    ///
+    /// This is for internal use where the caller has already verified that the
+    /// account uses an external signer (e.g., during login or test setup).
+    pub(crate) fn insert_external_signer(
+        &self,
+        pubkey: PublicKey,
+        signer: impl NostrSigner + 'static,
+    ) {
         tracing::info!(
             target: "whitenoise::external_signer",
             "Registering external signer for account: {}",
@@ -2175,8 +2199,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (signer, pubkey) = create_test_signer();
 
-            // Register signer
-            whitenoise.register_external_signer(pubkey, signer);
+            // Insert signer directly (bypasses account validation)
+            whitenoise.insert_external_signer(pubkey, signer);
 
             // Verify we can retrieve it
             let retrieved = whitenoise.get_external_signer(&pubkey);
@@ -2206,8 +2230,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let (signer, pubkey) = create_test_signer();
 
-            // Register and verify
-            whitenoise.register_external_signer(pubkey, signer);
+            // Insert and verify
+            whitenoise.insert_external_signer(pubkey, signer);
             assert!(whitenoise.get_external_signer(&pubkey).is_some());
 
             // Remove and verify
@@ -2224,11 +2248,11 @@ mod tests {
             let (signer1, pubkey1) = create_test_signer();
             let (signer2, pubkey2) = create_test_signer();
 
-            // Register first signer with pubkey1
-            whitenoise.register_external_signer(pubkey1, signer1);
+            // Insert first signer with pubkey1
+            whitenoise.insert_external_signer(pubkey1, signer1);
 
-            // Register second signer with same pubkey1 (should overwrite)
-            whitenoise.register_external_signer(pubkey1, signer2);
+            // Insert second signer with same pubkey1 (should overwrite)
+            whitenoise.insert_external_signer(pubkey1, signer2);
 
             // Verify second signer is active (has pubkey2's signing capability)
             let retrieved = whitenoise.get_external_signer(&pubkey1).unwrap();
@@ -2243,9 +2267,9 @@ mod tests {
             let (signer1, pubkey1) = create_test_signer();
             let (signer2, pubkey2) = create_test_signer();
 
-            // Register both signers with their respective pubkeys
-            whitenoise.register_external_signer(pubkey1, signer1);
-            whitenoise.register_external_signer(pubkey2, signer2);
+            // Insert both signers with their respective pubkeys
+            whitenoise.insert_external_signer(pubkey1, signer1);
+            whitenoise.insert_external_signer(pubkey2, signer2);
 
             // Verify both are retrievable
             let retrieved1 = whitenoise.get_external_signer(&pubkey1);
@@ -2265,9 +2289,9 @@ mod tests {
             let (signer1, pubkey1) = create_test_signer();
             let (signer2, pubkey2) = create_test_signer();
 
-            // Register both
-            whitenoise.register_external_signer(pubkey1, signer1);
-            whitenoise.register_external_signer(pubkey2, signer2);
+            // Insert both
+            whitenoise.insert_external_signer(pubkey1, signer1);
+            whitenoise.insert_external_signer(pubkey2, signer2);
 
             // Remove first signer
             whitenoise.remove_external_signer(&pubkey1);
@@ -2275,6 +2299,64 @@ mod tests {
             // Verify first is gone, second remains
             assert!(whitenoise.get_external_signer(&pubkey1).is_none());
             assert!(whitenoise.get_external_signer(&pubkey2).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_register_rejects_non_external_account() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // Create a local account (not external signer)
+            let account = whitenoise.create_identity().await.unwrap();
+            let (signer, _) = create_test_signer();
+
+            // Attempting to register an external signer for a local account should fail
+            let result = whitenoise
+                .register_external_signer(account.pubkey, signer)
+                .await;
+            assert!(
+                result.is_err(),
+                "Should reject registering external signer for a local account"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_rejects_unknown_pubkey() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (signer, pubkey) = create_test_signer();
+
+            // Attempting to register for a pubkey with no account should fail
+            let result = whitenoise.register_external_signer(pubkey, signer).await;
+            assert!(
+                result.is_err(),
+                "Should reject registering external signer for unknown pubkey"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_accepts_external_account() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // Create an external signer account
+            let keys = Keys::generate();
+            let pubkey = keys.public_key();
+            let account = whitenoise
+                .login_with_external_signer_for_test(pubkey)
+                .await
+                .unwrap();
+
+            let (signer, _) = create_test_signer();
+
+            // Registering for an external account should succeed
+            let result = whitenoise
+                .register_external_signer(account.pubkey, signer)
+                .await;
+            assert!(
+                result.is_ok(),
+                "Should accept registering external signer for an external account"
+            );
+
+            // Verify the signer was registered
+            assert!(whitenoise.get_external_signer(&account.pubkey).is_some());
         }
     }
 
