@@ -15,6 +15,7 @@ pub mod notification_streaming;
 pub mod scheduler;
 pub mod subscription_processing;
 pub mod user_discovery;
+pub mod user_search;
 
 pub use account_management::*;
 pub use advanced_messaging::*;
@@ -33,3 +34,4 @@ pub use notification_streaming::*;
 pub use scheduler::*;
 pub use subscription_processing::*;
 pub use user_discovery::*;
+pub use user_search::*;

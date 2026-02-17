@@ -15,3 +15,4 @@ pub mod scheduler;
 pub mod shared;
 pub mod subscription_processing;
 pub mod user_discovery;
+pub mod user_search;
