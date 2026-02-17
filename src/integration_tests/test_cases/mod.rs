@@ -6,6 +6,7 @@ pub mod chat_list_streaming;
 pub mod chat_media_upload;
 pub mod follow_management;
 pub mod group_membership;
+pub mod login_flow;
 pub mod message_streaming;
 pub mod metadata_management;
 pub mod notification_streaming;

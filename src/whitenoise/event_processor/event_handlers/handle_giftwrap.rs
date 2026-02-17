@@ -333,24 +333,39 @@ impl Whitenoise {
             return Ok(());
         };
 
-        if whitenoise
+        // Publish new key package first so the account is never left with zero
+        // key packages on relays. If this fails, the old one stays available.
+        whitenoise.publish_key_package_for_account(account).await?;
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "Published new key package"
+        );
+
+        // Now delete the used key package. Failure here is non-fatal — the
+        // scheduler will clean it up during routine maintenance.
+        match whitenoise
             .delete_key_package_for_account(account, &kp_event_id, false)
-            .await?
+            .await
         {
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Deleted used key package from relays"
-            );
-            whitenoise.publish_key_package_for_account(account).await?;
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Published new key package"
-            );
-        } else {
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Key package already deleted, skipping publish"
-            );
+            Ok(true) => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Deleted used key package from relays"
+                );
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Key package already deleted, skipping"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "Failed to delete used key package, scheduler will clean up: {}",
+                    e
+                );
+            }
         }
 
         Ok(())

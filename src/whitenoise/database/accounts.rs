@@ -506,7 +506,9 @@ impl Account {
 
 #[cfg(test)]
 mod tests {
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use nostr_sdk::Keys;
+
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_test_account};
 
     use super::*;
     use sqlx::sqlite::SqliteRow;
@@ -1808,5 +1810,53 @@ mod tests {
 
         // Verify account_type is still External after all operations
         assert_eq!(saved_account.account_type, AccountType::External);
+    }
+
+    #[tokio::test]
+    async fn test_delete_account_success() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let saved = account.save(&whitenoise.database).await.unwrap();
+
+        // Verify it exists.
+        assert!(
+            Account::find_by_pubkey(&saved.pubkey, &whitenoise.database)
+                .await
+                .is_ok()
+        );
+
+        // Delete it.
+        saved.delete(&whitenoise.database).await.unwrap();
+
+        // Verify it's gone.
+        assert!(
+            Account::find_by_pubkey(&saved.pubkey, &whitenoise.database)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_account_not_found() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an unsaved account (not in DB).
+        let keys = Keys::generate();
+        let account = Account {
+            id: None,
+            pubkey: keys.public_key(),
+            user_id: 999,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = account.delete(&whitenoise.database).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), WhitenoiseError::AccountNotFound),
+            "Deleting nonexistent account should return AccountNotFound"
+        );
     }
 }

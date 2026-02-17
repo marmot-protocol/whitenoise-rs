@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-step login API (`login_start`, `login_publish_default_relays`, `login_with_custom_relay`, `login_cancel`) that gracefully handles missing relay lists instead of crashing ([erskingardner])
+- `LoginError` enum, `LoginResult` struct, and `LoginStatus` enum for structured login error handling across the FFI boundary ([erskingardner])
+- Equivalent multi-step login API for external signer accounts ([erskingardner])
+- Integration test scenario (`login-flow`) covering happy path, no relays, publish defaults, custom relay, and cancel flows ([erskingardner])
+
+### Fixed
+
+- Login no longer crashes with "relay not found" when the user has no published relay lists ([erskingardner])
+
+### Added
+
 - Export `Language` enum from crate root for library consumers ([erskingardner])
 - Search for contacts by npub or hex pubkey ([erskingardner])
 - Copy npub button in settings page([josefinalliende])
@@ -21,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Better handling of long messages in chat ([josefinalliende])
+
+### Fixed
+
+- Fix key package publish reliability: detect failed relay publishes and retry with exponential backoff so accounts are never left with zero key packages ([mubarakcoded])
 
 ## [v0.1.0-alpha.3] - 2025-02-20
 
@@ -98,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [jgmontoya]: <https://github.com/jgmontoya> (nostr:npub1jgm0ntzjr03wuzj5788llhed7l6fst05um4ej2r86ueaa08etv6sgd669p)
 [a-mpch]: <https://github.com/a-mpch> (nostr:npub1mpchxagw3kaglylnyajzjmghdj63vly9q5eu7d62fl72f2gz8xfqk6nwkd)
 [F3r10]: <https://github.com/F3r10>
+[mubarakcoded]: <https://github.com/mubarakcoded> (nostr:npub1mlyye6fpsqnkuxwv3nzzf3cmrau8x6z3fhh095246me87ya0aprsun609q)
 
 
 

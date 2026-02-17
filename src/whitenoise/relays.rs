@@ -366,4 +366,93 @@ mod tests {
             assert!(set.contains(&RelayType::KeyPackage));
         }
     }
+
+    mod whitenoise_relay_tests {
+        use super::*;
+        use crate::whitenoise::test_utils::*;
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_empty() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            // Account with no relays should return an empty list.
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+            assert!(
+                statuses.is_empty(),
+                "Expected no relay statuses for a fresh account"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_with_relays() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            // Add some relays to the account's user.
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
+            let url2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
+            let relay1 = whitenoise.find_or_create_relay_by_url(&url1).await.unwrap();
+            let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
+            user.add_relays(&[relay1, relay2], RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+            assert_eq!(statuses.len(), 2);
+            // Relays aren't in the client pool, so they should show as Disconnected.
+            for (_url, status) in &statuses {
+                assert_eq!(
+                    *status,
+                    nostr_sdk::RelayStatus::Disconnected,
+                    "Non-pooled relays should appear as Disconnected"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_deduplicates() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            // Add the same relay URL to both NIP-65 and Inbox types.
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let url = RelayUrl::parse("wss://shared.relay.example.com").unwrap();
+            let relay = whitenoise.find_or_create_relay_by_url(&url).await.unwrap();
+            user.add_relays(
+                std::slice::from_ref(&relay),
+                RelayType::Nip65,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
+            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+            // Should be deduplicated to 1 entry.
+            assert_eq!(
+                statuses.len(),
+                1,
+                "Duplicate relay URLs should be deduplicated"
+            );
+        }
+    }
 }
