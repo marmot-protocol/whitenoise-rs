@@ -14,3 +14,4 @@ CREATE TABLE published_key_packages (
 
 CREATE INDEX idx_published_kp_account ON published_key_packages(account_pubkey);
 CREATE INDEX idx_published_kp_event_id ON published_key_packages(event_id);
+CREATE INDEX idx_published_kp_cleanup ON published_key_packages(account_pubkey, consumed_at, key_material_deleted);
