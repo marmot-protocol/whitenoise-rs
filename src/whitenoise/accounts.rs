@@ -556,7 +556,7 @@ impl Whitenoise {
 
         // Register the signer before activating the account so that subscription
         // setup can use it for NIP-42 AUTH on relays that require it.
-        self.insert_external_signer(pubkey, signer.clone());
+        self.insert_external_signer(pubkey, signer.clone()).await?;
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
@@ -914,7 +914,9 @@ impl Whitenoise {
             }
             None => {
                 // Stash the signer so continuation methods can use it.
-                self.register_external_signer(pubkey, signer);
+                self.insert_external_signer(pubkey, signer)
+                    .await
+                    .map_err(LoginError::from)?;
                 self.pending_logins.insert(pubkey);
                 tracing::info!(
                     target: "whitenoise::accounts",
@@ -1199,7 +1201,9 @@ impl Whitenoise {
         .await
         .map_err(LoginError::from)?;
 
-        self.register_external_signer(account.pubkey, signer.clone());
+        self.insert_external_signer(account.pubkey, signer.clone())
+            .await
+            .map_err(LoginError::from)?;
 
         self.publish_key_package_for_account_with_signer(account, signer)
             .await
@@ -1309,7 +1313,7 @@ impl Whitenoise {
     /// Validates that an external signer's pubkey matches the expected pubkey.
     ///
     /// This prevents publishing relay lists or key packages under a wrong identity.
-    async fn validate_signer_pubkey(
+    pub(crate) async fn validate_signer_pubkey(
         &self,
         expected_pubkey: &PublicKey,
         signer: &impl NostrSigner,
@@ -1389,18 +1393,16 @@ impl Whitenoise {
     /// Test-only: Sets up an external signer account without publishing.
     ///
     /// This is used by tests that only need to verify account creation/migration
-    /// logic without needing a real signer for publishing.
+    /// logic without needing a real signer for publishing. The provided keys are
+    /// used as the mock signer (their pubkey must match `keys.public_key()`).
     #[cfg(test)]
-    pub(crate) async fn login_with_external_signer_for_test(
-        &self,
-        pubkey: PublicKey,
-    ) -> Result<Account> {
+    pub(crate) async fn login_with_external_signer_for_test(&self, keys: Keys) -> Result<Account> {
+        let pubkey = keys.public_key();
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
 
-        // Register a mock signer so subscription setup can proceed.
+        // Register the keys as a signer so subscription setup can proceed.
         // In production, the real signer is registered before activation.
-        let mock_keys = Keys::generate();
-        self.insert_external_signer(pubkey, mock_keys);
+        self.insert_external_signer(pubkey, keys).await?;
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
@@ -1943,13 +1945,16 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn publish_relay_list(
+    async fn publish_relay_list<S>(
         &self,
         relays: &[Relay],
         relay_type: RelayType,
         target_relays: &[Relay],
-        signer: impl NostrSigner + 'static,
-    ) -> Result<()> {
+        signer: S,
+    ) -> Result<()>
+    where
+        S: NostrSigner + 'static,
+    {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.nostr
@@ -3245,7 +3250,7 @@ mod tests {
 
         // Login with external signer
         let _account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3290,15 +3295,14 @@ mod tests {
     async fn test_login_with_external_signer_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
-        // Login twice with same pubkey
+        // Login twice with same keys
         let account1 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
         let account2 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3322,7 +3326,7 @@ mod tests {
 
         // First login via test helper (sets up account in DB without needing relays)
         let first_account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3345,10 +3349,9 @@ mod tests {
     async fn test_external_account_helper_methods() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
         let account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3673,7 +3676,7 @@ mod tests {
 
         // Login with external signer (new account)
         let account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3709,11 +3712,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let keys = create_test_keys();
-        let pubkey = keys.public_key();
 
         // First login - creates new account
         let account1 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
         assert!(account1.id.is_some());
@@ -3723,7 +3725,7 @@ mod tests {
 
         // Second login - should return existing account
         let account2 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3749,7 +3751,7 @@ mod tests {
 
         // Now login with external signer - should migrate
         let migrated = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3793,7 +3795,7 @@ mod tests {
 
         // Login with external signer - should clean up stale key
         whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3956,11 +3958,10 @@ mod tests {
     async fn test_publish_relay_lists_with_signer_publishes_when_flags_true() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
         // Create an external account first - required for event tracking
         let _account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
