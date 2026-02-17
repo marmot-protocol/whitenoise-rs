@@ -510,8 +510,8 @@ mod tests {
         assert!(result.is_ok());
 
         // CRITICAL: AccountGroup must exist immediately after handle_giftwrap returns
-        // (not just after background task completes). This prevents race condition
-        // where Flutter polls groups() and triggers lazy migration before AccountGroup exists.
+        // (not just after background task completes). This prevents race conditions
+        // where Flutter polls groups() before the AccountGroup record exists.
         let mdk = whitenoise
             .create_mdk_for_account(member_account.pubkey)
             .unwrap();
