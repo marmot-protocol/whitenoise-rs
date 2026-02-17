@@ -72,6 +72,7 @@ macro_rules! scenario_registry {
 scenario_registry! {
     "account-management" => AccountManagementScenario,
     "app-settings" => AppSettingsScenario,
+    "drafts" => DraftsScenario,
     "metadata-management" => MetadataManagementScenario,
     "basic-messaging" => BasicMessagingScenario,
     "follow-management" => FollowManagementScenario,
@@ -198,6 +199,7 @@ mod tests {
         // Test all valid scenario names can be parsed
         assert!(parse_scenario_name("account-management").is_ok());
         assert!(parse_scenario_name("app-settings").is_ok());
+        assert!(parse_scenario_name("drafts").is_ok());
         assert!(parse_scenario_name("metadata-management").is_ok());
         assert!(parse_scenario_name("basic-messaging").is_ok());
         assert!(parse_scenario_name("follow-management").is_ok());
@@ -238,9 +240,10 @@ mod tests {
     fn test_get_all_scenario_names() {
         // Test that all scenario names are returned
         let names = get_all_scenario_names();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         assert!(names.contains(&"account-management"));
         assert!(names.contains(&"basic-messaging"));
+        assert!(names.contains(&"drafts"));
         assert!(names.contains(&"user-discovery"));
         assert!(names.contains(&"scheduler"));
         assert!(names.contains(&"message-streaming"));
