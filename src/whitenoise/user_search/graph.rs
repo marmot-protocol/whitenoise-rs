@@ -34,18 +34,23 @@ pub(super) async fn get_metadata_batch(
     pubkeys: &[PublicKey],
 ) -> HashMap<PublicKey, Metadata> {
     let mut results: HashMap<PublicKey, Metadata> = HashMap::new();
-    let mut remaining: Vec<PublicKey> = Vec::with_capacity(pubkeys.len());
 
-    // 1. Check User table (skip empty metadata — background sync may not have completed)
-    for pk in pubkeys {
-        if let Ok(user) = User::find_by_pubkey(pk, &whitenoise.database).await
-            && user.metadata != Metadata::new()
-        {
-            results.insert(*pk, user.metadata);
-        } else {
-            remaining.push(*pk);
+    // 1. Batch query User table (skip empty metadata — background sync may not have completed)
+    let users = User::find_by_pubkeys(pubkeys, &whitenoise.database)
+        .await
+        .unwrap_or_default();
+
+    for user in users {
+        if user.metadata != Metadata::new() {
+            results.insert(user.pubkey, user.metadata);
         }
     }
+
+    let mut remaining: Vec<PublicKey> = pubkeys
+        .iter()
+        .filter(|pk| !results.contains_key(pk))
+        .copied()
+        .collect();
 
     if remaining.is_empty() {
         return results;
@@ -442,6 +447,38 @@ mod tests {
             m.name,
             Some("Alice".to_string()),
             "Should return cached metadata, not empty User metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_metadata_batch_resolves_multiple_users_from_user_table() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys_a = Keys::generate();
+        let keys_b = Keys::generate();
+
+        for (keys, name) in [(&keys_a, "Alice"), (&keys_b, "Bob")] {
+            let user = User {
+                id: None,
+                pubkey: keys.public_key(),
+                metadata: Metadata::new().name(name),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            user.save(&whitenoise.database).await.unwrap();
+        }
+
+        let result =
+            get_metadata_batch(&whitenoise, &[keys_a.public_key(), keys_b.public_key()]).await;
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get(&keys_a.public_key()).unwrap().name,
+            Some("Alice".to_string())
+        );
+        assert_eq!(
+            result.get(&keys_b.public_key()).unwrap().name,
+            Some("Bob".to_string())
         );
     }
 
