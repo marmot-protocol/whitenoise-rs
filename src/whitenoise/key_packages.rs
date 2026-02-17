@@ -11,6 +11,11 @@ use crate::whitenoise::relays::Relay;
 /// Maximum number of relay publish attempts before giving up.
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
+/// Maximum number of fetch-delete rounds before giving up. This prevents
+/// infinite loops when relays keep returning the same key packages after
+/// deletion (e.g., because they don't support NIP-09 deletion).
+const MAX_DELETE_ROUNDS: u32 = 10;
+
 impl Whitenoise {
     /// Gets the appropriate signer for an account.
     ///
@@ -371,16 +376,9 @@ impl Whitenoise {
         account: &Account,
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
-        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
         let signer = self.get_signer_for_account(account)?;
-        self.delete_key_packages_for_account_internal(
-            account,
-            key_package_events,
-            delete_mls_stored_keys,
-            1,
-            signer,
-        )
-        .await
+        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
+            .await
     }
 
     /// Deletes all key package events from relays using an external signer.
@@ -404,15 +402,74 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + Clone + 'static,
     ) -> Result<usize> {
-        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
-        self.delete_key_packages_for_account_internal(
-            account,
-            key_package_events,
-            delete_mls_stored_keys,
-            1,
-            signer,
-        )
-        .await
+        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
+            .await
+    }
+
+    /// Loops fetch-delete rounds until no key packages remain on relays, up to
+    /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
+    /// only a subset of key packages per query, so a single fetch-delete pass
+    /// can leave packages behind.
+    async fn delete_all_key_packages_loop(
+        &self,
+        account: &Account,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<usize> {
+        let mut total_deleted = 0;
+
+        for round in 0..MAX_DELETE_ROUNDS {
+            let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
+
+            if key_package_events.is_empty() {
+                tracing::info!(
+                    target: "whitenoise::key_packages",
+                    "All key packages deleted for account {} \
+                     ({} total across {} round(s))",
+                    account.pubkey.to_hex(),
+                    total_deleted,
+                    round + 1,
+                );
+                return Ok(total_deleted);
+            }
+
+            tracing::debug!(
+                target: "whitenoise::key_packages",
+                "Round {}: found {} remaining key package(s) for account {}",
+                round + 1,
+                key_package_events.len(),
+                account.pubkey.to_hex(),
+            );
+
+            let batch_size = key_package_events.len();
+
+            let deleted = self
+                .delete_key_packages_for_account_internal(
+                    account,
+                    key_package_events,
+                    delete_mls_stored_keys,
+                    1,
+                    signer.clone(),
+                )
+                .await?;
+
+            total_deleted += deleted;
+
+            // If nothing was deleted this round, relays are not
+            // cooperating (e.g. they don't support NIP-09 deletion).
+            if deleted == 0 {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Round {} deleted 0 key packages despite {} found \
+                     — relays may not support deletion",
+                    round + 1,
+                    batch_size,
+                );
+                break;
+            }
+        }
+
+        Ok(total_deleted)
     }
 
     /// Deletes the specified key package events from relays for the given account.
@@ -981,10 +1038,39 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_max_delete_rounds_is_reasonable() {
+        // Safety cap must be high enough to handle pagination but low
+        // enough to prevent infinite loops with uncooperative relays.
+        assert_eq!(MAX_DELETE_ROUNDS, 10);
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_key_packages_without_signer_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Account without keys in secrets store — signer resolution fails
+        let account = create_local_account_struct();
+
+        let result = whitenoise
+            .delete_all_key_packages_for_account(&account, false)
+            .await;
+
+        assert!(result.is_err(), "Should fail when no signer is available");
+    }
+
     #[tokio::test]
     async fn test_delete_all_key_packages_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        // Create an account with keys stored but no key package relays.
+        // Keys are needed because the convergence loop resolves the signer
+        // before fetching key packages from relays.
+        let (account, keys) = create_test_account(&whitenoise).await;
+        whitenoise
+            .secrets_store
+            .store_private_key(&keys)
+            .expect("Should store keys");
 
         let result = whitenoise
             .delete_all_key_packages_for_account(&account, false)
@@ -1022,5 +1108,39 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_single_key_package_without_signer_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account without stored keys — signer resolution fails
+        let account = create_local_account_struct();
+        let event_id = EventId::all_zeros();
+
+        let result = whitenoise
+            .delete_key_package_for_account(&account, &event_id, false)
+            .await;
+        assert!(result.is_err(), "Should fail when no signer is available");
+    }
+
+    #[tokio::test]
+    async fn test_delete_single_key_package_with_signer_without_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Account exists but has no key package relays. The internal method
+        // streams events first (which returns empty without a real relay),
+        // so it returns Ok(false) — no event found, nothing to delete.
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let signer_keys = Keys::generate();
+        let event_id = EventId::all_zeros();
+
+        let result = whitenoise
+            .delete_key_package_for_account_with_signer(&account, &event_id, false, signer_keys)
+            .await;
+
+        // stream_events returns empty → Ok(false)
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 }
