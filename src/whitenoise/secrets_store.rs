@@ -245,6 +245,38 @@ mod tests {
     }
 
     #[test]
+    fn test_map_keyring_error_no_default_store() {
+        let err = map_keyring_error(KeyringError::NoDefaultStore);
+        assert!(
+            matches!(err, SecretsStoreError::KeyringNotInitialized(_)),
+            "Expected KeyringNotInitialized, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_map_keyring_error_no_storage_access() {
+        let inner = std::io::Error::other("permission denied");
+        let err = map_keyring_error(KeyringError::NoStorageAccess(Box::new(inner)));
+        assert!(
+            matches!(err, SecretsStoreError::KeyringUnavailable(_)),
+            "Expected KeyringUnavailable, got: {:?}",
+            err
+        );
+        assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn test_map_keyring_error_other() {
+        let err = map_keyring_error(KeyringError::NoEntry);
+        assert!(
+            matches!(err, SecretsStoreError::KeyringError(_)),
+            "Expected KeyringError, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
     fn test_overwrite_existing_key() {
         let secrets_store = create_test_secrets_store();
 

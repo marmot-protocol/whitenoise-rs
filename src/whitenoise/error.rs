@@ -4,7 +4,9 @@ use thiserror::Error;
 use crate::{
     nostr_manager::NostrManagerError,
     whitenoise::{
-        accounts::AccountError, database::DatabaseError, message_aggregator::ProcessingError,
+        accounts::{AccountError, LoginError},
+        database::DatabaseError,
+        message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
     },
 };
@@ -100,6 +102,9 @@ pub enum WhitenoiseError {
     #[error("Account error: {0}")]
     Account(#[from] AccountError),
 
+    #[error("Login error: {0}")]
+    Login(#[from] LoginError),
+
     #[error("SQLx error: {0}")]
     SqlxError(#[from] sqlx::Error),
 
@@ -142,6 +147,9 @@ pub enum WhitenoiseError {
     #[error("Failed to download from Blossom server: {0}")]
     BlossomDownload(String),
 
+    #[error("Key package publish failed: {0}")]
+    KeyPackagePublishFailed(String),
+
     #[error("Image decryption failed: {0}")]
     ImageDecryptionFailed(String),
 
@@ -170,6 +178,8 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    use crate::whitenoise::accounts::LoginError;
 
     #[test]
     fn io_errors_convert_into_filesystem_variant() {
@@ -305,6 +315,10 @@ mod tests {
             "Failed to download from Blossom server: timeout"
         );
         assert_eq!(
+            WhitenoiseError::KeyPackagePublishFailed("no relays accepted".to_string()).to_string(),
+            "Key package publish failed: no relays accepted"
+        );
+        assert_eq!(
             WhitenoiseError::ImageDecryptionFailed("bad key".to_string()).to_string(),
             "Image decryption failed: bad key"
         );
@@ -348,5 +362,37 @@ mod tests {
         // Debug impl should work without panicking
         let debug_str = format!("{:?}", err);
         assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn login_error_converts_to_whitenoise_error() {
+        let login_err = LoginError::InvalidKeyFormat("bad key".to_string());
+        let err: WhitenoiseError = login_err.into();
+        assert!(matches!(err, WhitenoiseError::Login(_)));
+        assert!(err.to_string().contains("bad key"));
+    }
+
+    #[test]
+    fn login_error_display_messages() {
+        assert_eq!(
+            LoginError::InvalidKeyFormat("not an nsec".to_string()).to_string(),
+            "Invalid private key format: not an nsec"
+        );
+        assert_eq!(
+            LoginError::NoRelayConnections.to_string(),
+            "Failed to connect to any relays"
+        );
+        assert_eq!(
+            LoginError::Timeout("relay fetch".to_string()).to_string(),
+            "Login operation timed out: relay fetch"
+        );
+        assert_eq!(
+            LoginError::NoLoginInProgress.to_string(),
+            "No login in progress for this account"
+        );
+        assert_eq!(
+            LoginError::Internal("something broke".to_string()).to_string(),
+            "Login error: something broke"
+        );
     }
 }

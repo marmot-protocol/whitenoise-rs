@@ -22,10 +22,11 @@ pub use whitenoise::{Whitenoise, WhitenoiseConfig};
 pub use whitenoise::error::WhitenoiseError;
 
 // Account and user management
-pub use whitenoise::accounts::{Account, AccountType};
+pub use whitenoise::accounts::{Account, AccountType, LoginError, LoginResult, LoginStatus};
 pub use whitenoise::users::{User, UserSyncMode};
 
 // Settings and configuration
+pub use whitenoise::account_settings::AccountSettings;
 pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
 
 // Groups and relays

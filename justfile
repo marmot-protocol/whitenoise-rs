@@ -214,16 +214,23 @@ test-nextest:
     cargo nextest run --all-features --all-targets
     cargo test --all-features --doc
 
-# Generate code coverage report
+# Filename regex for excluding test infrastructure from coverage metrics
+coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
+
+# Generate code coverage report (lcov format, matches CI flags)
 coverage:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --lcov --output-path lcov.info
+    cargo llvm-cov --workspace --all-targets \
+      --ignore-filename-regex '{{coverage_ignore}}' \
+      --lcov --output-path lcov.info
     @echo "Coverage report: lcov.info"
 
-# Generate HTML code coverage report
+# Generate HTML code coverage report (matches CI flags)
 coverage-html:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --html
+    cargo llvm-cov --workspace --all-targets \
+      --ignore-filename-regex '{{coverage_ignore}}' \
+      --html
     @echo "HTML report: target/llvm-cov/html/index.html"
 
 # Check minimum supported Rust version

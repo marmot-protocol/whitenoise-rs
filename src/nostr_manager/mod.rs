@@ -22,7 +22,7 @@ pub enum NostrManagerError {
     #[error("Whitenoise Instance Error: {0}")]
     WhitenoiseInstance(String),
     #[error("Client Error: {0}")]
-    Client(#[from] nostr_sdk::client::Error),
+    Client(nostr_sdk::client::Error),
     #[error("Database Error: {0}")]
     Database(#[from] DatabaseError),
     #[error("Signer Error: {0}")]
@@ -37,6 +37,8 @@ pub enum NostrManagerError {
     AccountError(String),
     #[error("Failed to connect to any relays")]
     NoRelayConnections,
+    #[error("Relay operation timed out")]
+    Timeout,
     #[error("Nostr Event error: {0}")]
     NostrEventBuilderError(#[from] nostr_sdk::event::builder::Error),
     #[error("Serialization error: {0}")]
@@ -47,6 +49,17 @@ pub enum NostrManagerError {
     FailedToTrackPublishedEvent(String),
     #[error("Invalid timestamp")]
     InvalidTimestamp,
+}
+
+impl From<nostr_sdk::client::Error> for NostrManagerError {
+    fn from(err: nostr_sdk::client::Error) -> Self {
+        match &err {
+            nostr_sdk::client::Error::Relay(nostr_sdk::pool::relay::Error::Timeout) => {
+                Self::Timeout
+            }
+            _ => Self::Client(err),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -622,5 +635,29 @@ mod subscription_monitoring_tests {
             );
         }
         // Success is also acceptable
+    }
+
+    #[test]
+    fn test_client_relay_timeout_maps_to_timeout_variant() {
+        let relay_timeout = nostr_sdk::client::Error::Relay(nostr_sdk::pool::relay::Error::Timeout);
+        let err = NostrManagerError::from(relay_timeout);
+        assert!(
+            matches!(err, NostrManagerError::Timeout),
+            "Expected Timeout variant, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_client_non_timeout_maps_to_client_variant() {
+        let signer_err = nostr_sdk::client::Error::Signer(nostr_sdk::signer::SignerError::backend(
+            std::io::Error::other("test error"),
+        ));
+        let err = NostrManagerError::from(signer_err);
+        assert!(
+            matches!(err, NostrManagerError::Client(_)),
+            "Expected Client variant, got: {:?}",
+            err
+        );
     }
 }

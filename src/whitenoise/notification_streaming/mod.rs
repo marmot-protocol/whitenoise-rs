@@ -12,6 +12,7 @@ use nostr_sdk::PublicKey;
 
 use crate::whitenoise::{
     Whitenoise,
+    account_settings::AccountSettings,
     accounts::Account,
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessage,
@@ -93,6 +94,85 @@ impl Whitenoise {
         };
 
         self.notification_stream_manager.emit(update);
+    }
+
+    /// Emits a new-message notification only if notifications are enabled for the account.
+    ///
+    /// Fail-open: if the settings lookup fails, defaults to enabled and logs a warning.
+    pub(crate) async fn emit_new_message_notification_if_enabled(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        message: &ChatMessage,
+        group_name: Option<String>,
+    ) {
+        if !self.are_notifications_enabled(account).await {
+            return;
+        }
+        self.emit_new_message_notification(account, group_id, message, group_name)
+            .await;
+    }
+
+    /// Emits a group-invite notification only if notifications are enabled for the account.
+    ///
+    /// Fail-open: if the settings lookup fails, defaults to enabled and logs a warning.
+    pub(crate) async fn emit_group_invite_notification_if_enabled(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        group_name: &str,
+        welcomer_pubkey: PublicKey,
+    ) {
+        if !self.are_notifications_enabled(account).await {
+            return;
+        }
+        self.emit_group_invite_notification(account, group_id, group_name, welcomer_pubkey)
+            .await;
+    }
+
+    /// Spawns a background task that emits a new-message notification if enabled.
+    ///
+    /// The caller is not blocked; settings are checked inside the spawned task.
+    pub(crate) fn spawn_new_message_notification_if_enabled(
+        account: &Account,
+        group_id: &GroupId,
+        message: &ChatMessage,
+        group_name: Option<String>,
+    ) {
+        let account = account.clone();
+        let group_id = group_id.clone();
+        let message = message.clone();
+        tokio::spawn(async move {
+            let whitenoise = match Self::get_instance() {
+                Ok(wn) => wn,
+                Err(e) => {
+                    tracing::error!(
+                        target: "whitenoise::notification_streaming",
+                        "Failed to get Whitenoise instance for notification: {}",
+                        e
+                    );
+                    return;
+                }
+            };
+            whitenoise
+                .emit_new_message_notification_if_enabled(&account, &group_id, &message, group_name)
+                .await;
+        });
+    }
+
+    /// Returns whether notifications are enabled for `account`. Fail-open on error.
+    async fn are_notifications_enabled(&self, account: &Account) -> bool {
+        AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "whitenoise::notification_streaming",
+                    "Failed to check notification settings for {}, defaulting to enabled: {}",
+                    account.pubkey.to_hex(),
+                    e
+                );
+                true
+            })
     }
 
     async fn build_notification_user(&self, pubkey: &PublicKey) -> NotificationUser {
@@ -311,5 +391,116 @@ mod tests {
 
         let external_pubkey = Keys::generate().public_key();
         assert!(!whitenoise.is_own_account(&external_pubkey).await);
+    }
+
+    #[tokio::test]
+    async fn test_emit_new_message_notification_if_enabled_emits_when_enabled() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let external_sender = Keys::generate().public_key();
+        let message = create_test_message(external_sender, "Hello enabled");
+        let group_id = GroupId::from_slice(&[10u8; 32]);
+
+        // Notifications enabled by default
+        whitenoise
+            .emit_new_message_notification_if_enabled(
+                &account,
+                &group_id,
+                &message,
+                Some("Enabled Group".to_string()),
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_ok(), "Should emit when notifications enabled");
+        let update = result.unwrap().unwrap();
+        assert_eq!(update.trigger, NotificationTrigger::NewMessage);
+        assert_eq!(update.content, "Hello enabled");
+    }
+
+    #[tokio::test]
+    async fn test_emit_new_message_notification_if_enabled_suppressed_when_disabled() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        // Disable notifications
+        AccountSettings::update_notifications_enabled(&account.pubkey, false, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let external_sender = Keys::generate().public_key();
+        let message = create_test_message(external_sender, "Should not arrive");
+        let group_id = GroupId::from_slice(&[11u8; 32]);
+
+        whitenoise
+            .emit_new_message_notification_if_enabled(&account, &group_id, &message, None)
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT emit when notifications disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_group_invite_notification_if_enabled_emits_when_enabled() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let welcomer = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[12u8; 32]);
+
+        whitenoise
+            .emit_group_invite_notification_if_enabled(
+                &account,
+                &group_id,
+                "Invite Group",
+                welcomer,
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "Should emit invite when notifications enabled"
+        );
+        let update = result.unwrap().unwrap();
+        assert_eq!(update.trigger, NotificationTrigger::GroupInvite);
+        assert_eq!(update.group_name, Some("Invite Group".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_emit_group_invite_notification_if_enabled_suppressed_when_disabled() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        // Disable notifications
+        AccountSettings::update_notifications_enabled(&account.pubkey, false, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let welcomer = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[13u8; 32]);
+
+        whitenoise
+            .emit_group_invite_notification_if_enabled(
+                &account,
+                &group_id,
+                "Should Not Arrive",
+                welcomer,
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT emit invite when notifications disabled"
+        );
     }
 }
