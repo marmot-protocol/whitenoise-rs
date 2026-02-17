@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LoginError` enum, `LoginResult` struct, and `LoginStatus` enum for structured login error handling across the FFI boundary ([erskingardner])
 - Equivalent multi-step login API for external signer accounts ([erskingardner])
 - Integration test scenario (`login-flow`) covering happy path, no relays, publish defaults, custom relay, and cancel flows ([erskingardner])
+- KeyPackage lifecycle management with delayed cleanup: track published key packages from creation through Welcome consumption, then automatically clean up local MLS key material via a dedicated `ConsumedKeyPackageCleanup` scheduled task after a 30s quiet period ([mubarakcoded])
 
 ### Fixed
 
