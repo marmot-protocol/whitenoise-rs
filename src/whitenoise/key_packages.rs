@@ -9,6 +9,14 @@ use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::Relay;
 
+/// Maximum number of relay publish attempts before giving up.
+const MAX_PUBLISH_ATTEMPTS: u32 = 3;
+
+/// Maximum number of fetch-delete rounds before giving up. This prevents
+/// infinite loops when relays keep returning the same key packages after
+/// deletion (e.g., because they don't support NIP-09 deletion).
+const MAX_DELETE_ROUNDS: u32 = 10;
+
 impl Whitenoise {
     /// Gets the appropriate signer for an account.
     ///
@@ -59,15 +67,69 @@ impl Whitenoise {
     }
 
     /// Publishes the MLS key package for the given account to its key package relays.
+    ///
+    /// Creates a single MLS key package, then retries relay publishing up to
+    /// 3 times with exponential backoff (2s, 4s) if publishing fails. The key
+    /// package is created only once to avoid orphaning unused key material in
+    /// local MLS storage.
     pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
         let relays = account.key_package_relays(self).await?;
 
         if relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
-        self.publish_key_package_to_relays(account, &relays).await?;
 
-        Ok(())
+        // Create the key package once — retries below only re-publish the same payload
+        let (encoded_key_package, tags, hash_ref) =
+            self.encoded_key_package(account, &relays).await?;
+        let relay_urls = Relay::urls(&relays);
+        let signer = self.get_signer_for_account(account)?;
+
+        let mut last_error = None;
+
+        for attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Retrying key package publish for account {} (attempt {}/{})",
+                    account.pubkey.to_hex(),
+                    attempt + 1,
+                    MAX_PUBLISH_ATTEMPTS,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .publish_key_package_to_relays(
+                    &encoded_key_package,
+                    &relay_urls,
+                    &tags,
+                    signer.clone(),
+                )
+                .await
+            {
+                Ok(event_id) => {
+                    self.track_published_key_package(account, &hash_ref, &event_id)
+                        .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Key package publish attempt {}/{} failed for account {}: {}",
+                        attempt + 1,
+                        MAX_PUBLISH_ATTEMPTS,
+                        account.pubkey.to_hex(),
+                        e,
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // `last_error` is always `Some` here because the loop runs at least once
+        Err(last_error.expect("loop ran at least once"))
     }
 
     /// Publishes the MLS key package using an external signer.
@@ -88,73 +150,90 @@ impl Whitenoise {
 
         let (encoded_key_package, tags, hash_ref) =
             self.encoded_key_package(account, &relays).await?;
-        let relays_urls = Relay::urls(&relays);
-
-        let result = self
-            .nostr
-            .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
+        let relay_urls = Relay::urls(&relays);
+        let event_id = self
+            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
             .await?;
-
-        // Track the published key package for lifecycle management
-        if !result.success.is_empty()
-            && let Err(e) = PublishedKeyPackage::create(
-                &account.pubkey,
-                &hash_ref,
-                &result.id().to_hex(),
-                &self.database,
-            )
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::publish_key_package_with_signer",
-                "Published key package but failed to track it: {}",
-                e
-            );
-        }
-
-        tracing::debug!(
-            target: "whitenoise::publish_key_package_with_signer",
-            "Published key package with external signer: {:?}",
-            result
-        );
-
+        self.track_published_key_package(account, &hash_ref, &event_id)
+            .await;
         Ok(())
     }
 
-    pub(crate) async fn publish_key_package_to_relays(
+    /// Creates a new MLS key package for the account and publishes it to the given relays.
+    ///
+    /// This is a convenience wrapper that calls [`Self::encoded_key_package`] followed by
+    /// [`Self::publish_key_package_to_relays`]. If you need retry semantics, prefer calling
+    /// those two methods separately so the key package is only created once.
+    pub(crate) async fn create_and_publish_key_package(
         &self,
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
         let (encoded_key_package, tags, hash_ref) =
             self.encoded_key_package(account, relays).await?;
-        let relays_urls = Relay::urls(relays);
+        let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
+        let event_id = self
+            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+            .await?;
+        self.track_published_key_package(account, &hash_ref, &event_id)
+            .await;
+        Ok(())
+    }
+
+    /// Publishes an already-encoded key package event to the given relays.
+    ///
+    /// Returns an error if no relay accepted the event. This method is
+    /// intentionally separated from key package creation so callers can retry
+    /// the relay publish without generating additional MLS key material.
+    async fn publish_key_package_to_relays(
+        &self,
+        encoded_key_package: &str,
+        relay_urls: &[RelayUrl],
+        tags: &[Tag],
+        signer: impl NostrSigner + 'static,
+    ) -> Result<EventId> {
         let result = self
             .nostr
-            .publish_key_package_with_signer(&encoded_key_package, &relays_urls, &tags, signer)
+            .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
             .await?;
 
-        // Track the published key package for lifecycle management
-        if !result.success.is_empty()
-            && let Err(e) = PublishedKeyPackage::create(
-                &account.pubkey,
-                &hash_ref,
-                &result.id().to_hex(),
-                &self.database,
-            )
-            .await
+        if result.success.is_empty() {
+            return Err(WhitenoiseError::KeyPackagePublishFailed(
+                "no relay accepted the key package event".to_string(),
+            ));
+        }
+
+        tracing::debug!(
+            target: "whitenoise::key_packages",
+            "Published key package to {} relay(s)",
+            result.success.len(),
+        );
+
+        Ok(*result.id())
+    }
+
+    /// Records a successfully published key package in the lifecycle tracking table.
+    async fn track_published_key_package(
+        &self,
+        account: &Account,
+        hash_ref: &[u8],
+        event_id: &EventId,
+    ) {
+        if let Err(e) = PublishedKeyPackage::create(
+            &account.pubkey,
+            hash_ref,
+            &event_id.to_hex(),
+            &self.database,
+        )
+        .await
         {
             tracing::warn!(
-                target: "whitenoise::publish_key_package_to_relays",
+                target: "whitenoise::key_packages",
                 "Published key package but failed to track it: {}",
                 e
             );
         }
-
-        tracing::debug!(target: "whitenoise::publish_key_package_to_relays", "Published key package to relays: {:?}", result);
-
-        Ok(())
     }
 
     /// Deletes the key package from the relays for the given account.
@@ -261,7 +340,7 @@ impl Whitenoise {
 
         let key_package_relays = account.key_package_relays(self).await?;
         if key_package_relays.is_empty() {
-            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+            return Ok(false);
         }
 
         let key_package_relays_urls = Relay::urls(&key_package_relays);
@@ -363,16 +442,9 @@ impl Whitenoise {
         account: &Account,
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
-        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
         let signer = self.get_signer_for_account(account)?;
-        self.delete_key_packages_for_account_internal(
-            account,
-            key_package_events,
-            delete_mls_stored_keys,
-            1,
-            signer,
-        )
-        .await
+        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
+            .await
     }
 
     /// Deletes all key package events from relays using an external signer.
@@ -396,15 +468,74 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + Clone + 'static,
     ) -> Result<usize> {
-        let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
-        self.delete_key_packages_for_account_internal(
-            account,
-            key_package_events,
-            delete_mls_stored_keys,
-            1,
-            signer,
-        )
-        .await
+        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
+            .await
+    }
+
+    /// Loops fetch-delete rounds until no key packages remain on relays, up to
+    /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
+    /// only a subset of key packages per query, so a single fetch-delete pass
+    /// can leave packages behind.
+    async fn delete_all_key_packages_loop(
+        &self,
+        account: &Account,
+        delete_mls_stored_keys: bool,
+        signer: impl NostrSigner + Clone + 'static,
+    ) -> Result<usize> {
+        let mut total_deleted = 0;
+
+        for round in 0..MAX_DELETE_ROUNDS {
+            let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
+
+            if key_package_events.is_empty() {
+                tracing::info!(
+                    target: "whitenoise::key_packages",
+                    "All key packages deleted for account {} \
+                     ({} total across {} round(s))",
+                    account.pubkey.to_hex(),
+                    total_deleted,
+                    round + 1,
+                );
+                return Ok(total_deleted);
+            }
+
+            tracing::debug!(
+                target: "whitenoise::key_packages",
+                "Round {}: found {} remaining key package(s) for account {}",
+                round + 1,
+                key_package_events.len(),
+                account.pubkey.to_hex(),
+            );
+
+            let batch_size = key_package_events.len();
+
+            let deleted = self
+                .delete_key_packages_for_account_internal(
+                    account,
+                    key_package_events,
+                    delete_mls_stored_keys,
+                    1,
+                    signer.clone(),
+                )
+                .await?;
+
+            total_deleted += deleted;
+
+            // If nothing was deleted this round, relays are not
+            // cooperating (e.g. they don't support NIP-09 deletion).
+            if deleted == 0 {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Round {} deleted 0 key packages despite {} found \
+                     — relays may not support deletion",
+                    round + 1,
+                    batch_size,
+                );
+                break;
+            }
+        }
+
+        Ok(total_deleted)
     }
 
     /// Deletes the specified key package events from relays for the given account.
@@ -685,11 +816,12 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use nostr_sdk::Keys;
+
     use super::*;
     use crate::whitenoise::accounts::AccountType;
     use crate::whitenoise::test_utils::*;
-    use chrono::Utc;
-    use nostr_sdk::Keys;
 
     fn create_local_account_struct() -> Account {
         Account {
@@ -713,6 +845,26 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// Creates a persisted account with a key package relay and stored keys.
+    async fn create_account_with_relay(whitenoise: &Whitenoise) -> Account {
+        let (account, keys) = create_test_account(whitenoise).await;
+        whitenoise
+            .secrets_store
+            .store_private_key(&keys)
+            .expect("Should store keys");
+        let user = account.user(&whitenoise.database).await.unwrap();
+        let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://unreachable.test.relay").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        user.add_relay(&relay, crate::RelayType::KeyPackage, &whitenoise.database)
+            .await
+            .unwrap();
+        account
     }
 
     #[tokio::test]
@@ -919,5 +1071,190 @@ mod tests {
                 other
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_with_signer_without_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Use create_test_account to get a persisted account (no key package relays)
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let signer_keys = Keys::generate();
+
+        let result = whitenoise
+            .publish_key_package_for_account_with_signer(&account, signer_keys)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WhitenoiseError::AccountMissingKeyPackageRelays => {}
+            other => panic!(
+                "Expected AccountMissingKeyPackageRelays error, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_key_package_publish_failed_error_variant() {
+        let err = WhitenoiseError::KeyPackagePublishFailed(
+            "no relay accepted the key package event".to_string(),
+        );
+        assert!(err.to_string().contains("no relay accepted"));
+        assert!(matches!(err, WhitenoiseError::KeyPackagePublishFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_for_account_retries_and_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = create_account_with_relay(&whitenoise).await;
+
+        // With no real relay connected, publish will fail after all retry attempts
+        let result = whitenoise.publish_key_package_for_account(&account).await;
+        assert!(result.is_err(), "Should fail when relay is unreachable");
+    }
+
+    #[tokio::test]
+    async fn test_create_and_publish_key_package_fails_with_unreachable_relay() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = create_account_with_relay(&whitenoise).await;
+
+        let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let result = whitenoise
+            .create_and_publish_key_package(&account, &relays)
+            .await;
+        assert!(result.is_err(), "Should fail when relay is unreachable");
+    }
+
+    #[tokio::test]
+    async fn test_publish_key_package_with_signer_fails_with_unreachable_relay() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = create_account_with_relay(&whitenoise).await;
+
+        let result = whitenoise
+            .publish_key_package_for_account_with_signer(&account, Keys::generate())
+            .await;
+        assert!(result.is_err(), "Should fail when relay is unreachable");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_key_packages_without_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        let result = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::AccountMissingKeyPackageRelays
+        ));
+    }
+
+    #[test]
+    fn test_max_delete_rounds_is_reasonable() {
+        // Safety cap must be high enough to handle pagination but low
+        // enough to prevent infinite loops with uncooperative relays.
+        assert_eq!(MAX_DELETE_ROUNDS, 10);
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_key_packages_without_signer_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Account without keys in secrets store — signer resolution fails
+        let account = create_local_account_struct();
+
+        let result = whitenoise
+            .delete_all_key_packages_for_account(&account, false)
+            .await;
+
+        assert!(result.is_err(), "Should fail when no signer is available");
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_key_packages_without_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create an account with keys stored but no key package relays.
+        // Keys are needed because the convergence loop resolves the signer
+        // before fetching key packages from relays.
+        let (account, keys) = create_test_account(&whitenoise).await;
+        whitenoise
+            .secrets_store
+            .store_private_key(&keys)
+            .expect("Should store keys");
+
+        let result = whitenoise
+            .delete_all_key_packages_for_account(&account, false)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::AccountMissingKeyPackageRelays
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_all_key_packages_with_signer_without_relays_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let signer_keys = Keys::generate();
+
+        let result = whitenoise
+            .delete_all_key_packages_for_account_with_signer(&account, false, signer_keys)
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::AccountMissingKeyPackageRelays
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_delete_key_packages_with_empty_events_returns_zero() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = create_account_with_relay(&whitenoise).await;
+
+        let result = whitenoise
+            .delete_key_packages_for_account(&account, vec![], false, 1)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_single_key_package_without_signer_fails() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Local account without stored keys — signer resolution fails
+        let account = create_local_account_struct();
+        let event_id = EventId::all_zeros();
+
+        let result = whitenoise
+            .delete_key_package_for_account(&account, &event_id, false)
+            .await;
+        assert!(result.is_err(), "Should fail when no signer is available");
+    }
+
+    #[tokio::test]
+    async fn test_delete_single_key_package_with_signer_without_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Account exists but has no key package relays. The internal method
+        // streams events first (which returns empty without a real relay),
+        // so it returns Ok(false) — no event found, nothing to delete.
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let signer_keys = Keys::generate();
+        let event_id = EventId::all_zeros();
+
+        let result = whitenoise
+            .delete_key_package_for_account_with_signer(&account, &event_id, false, signer_keys)
+            .await;
+
+        // stream_events returns empty → Ok(false)
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 }
