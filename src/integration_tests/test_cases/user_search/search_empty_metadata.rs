@@ -13,9 +13,9 @@ use super::helpers::collect_search_updates;
 /// empty metadata (as happens during contact list sync before the background
 /// metadata fetch completes).
 ///
-/// This exercises the fix in `get_metadata_for_pubkey`: when a User record
-/// exists with default (empty) metadata, the function falls through to the
-/// cache/network layers instead of returning empty metadata that can never match.
+/// This exercises the fix in metadata resolution: when a User record exists
+/// with default (empty) metadata, the search falls through to the cache/network
+/// layers instead of returning empty metadata that can never match.
 ///
 /// Sets up:
 /// - Target publishes metadata to relays
