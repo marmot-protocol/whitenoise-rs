@@ -1187,6 +1187,12 @@ impl Whitenoise {
     where
         S: NostrSigner + Clone + 'static,
     {
+        // Register the signer before activating the account so that subscription
+        // setup can use it for NIP-42 AUTH on relays that require it.
+        self.insert_external_signer(account.pubkey, signer.clone())
+            .await
+            .map_err(LoginError::from)?;
+
         let user = account
             .user(&self.database)
             .await
@@ -1200,10 +1206,6 @@ impl Whitenoise {
         )
         .await
         .map_err(LoginError::from)?;
-
-        self.insert_external_signer(account.pubkey, signer.clone())
-            .await
-            .map_err(LoginError::from)?;
 
         self.publish_key_package_for_account_with_signer(account, signer)
             .await
