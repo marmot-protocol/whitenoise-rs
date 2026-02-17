@@ -86,34 +86,6 @@ impl From<CachedGraphUserRow> for CachedGraphUser {
 }
 
 impl CachedGraphUser {
-    /// Find by pubkey, returns `None` if not found or stale (uses default 24h TTL).
-    pub(crate) async fn find_fresh(
-        pubkey: &PublicKey,
-        database: &Database,
-    ) -> Result<Option<Self>, WhitenoiseError> {
-        Self::find_fresh_with_ttl(pubkey, DEFAULT_CACHE_TTL_HOURS, database).await
-    }
-
-    /// Find by pubkey, returns `None` if not found or stale (custom TTL).
-    pub(crate) async fn find_fresh_with_ttl(
-        pubkey: &PublicKey,
-        max_age_hours: i64,
-        database: &Database,
-    ) -> Result<Option<Self>, WhitenoiseError> {
-        let cutoff = (Utc::now() - Duration::hours(max_age_hours)).timestamp_millis();
-
-        let row = sqlx::query_as::<_, CachedGraphUserRow>(
-            "SELECT * FROM cached_graph_users WHERE pubkey = ? AND updated_at > ?",
-        )
-        .bind(pubkey.to_hex())
-        .bind(cutoff)
-        .fetch_optional(&database.pool)
-        .await
-        .map_err(DatabaseError::Sqlx)?;
-
-        Ok(row.map(Self::from))
-    }
-
     /// Find multiple fresh cached users by pubkeys in a single query.
     ///
     /// Returns only entries that exist and are fresh (within default TTL).
@@ -225,65 +197,6 @@ mod tests {
     use nostr_sdk::Keys;
 
     #[tokio::test]
-    async fn find_fresh_returns_none_for_missing() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let unknown_pubkey = Keys::generate().public_key();
-
-        let result = CachedGraphUser::find_fresh(&unknown_pubkey, &whitenoise.database)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn find_fresh_returns_none_for_stale() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let keys = Keys::generate();
-
-        // Insert a stale entry directly
-        let old_time = (Utc::now() - Duration::hours(25)).timestamp_millis();
-        sqlx::query(
-            "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at)
-             VALUES (?, '{}', '[]', ?, ?)",
-        )
-        .bind(keys.public_key().to_hex())
-        .bind(old_time)
-        .bind(old_time)
-        .execute(&whitenoise.database.pool)
-        .await
-        .unwrap();
-
-        let result = CachedGraphUser::find_fresh(&keys.public_key(), &whitenoise.database)
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn find_fresh_returns_some_for_fresh() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let keys = Keys::generate();
-
-        let user = CachedGraphUser::new(
-            keys.public_key(),
-            Metadata::new().name("Fresh User"),
-            vec![],
-        );
-        user.upsert(&whitenoise.database).await.unwrap();
-
-        let result = CachedGraphUser::find_fresh(&keys.public_key(), &whitenoise.database)
-            .await
-            .unwrap();
-
-        assert!(result.is_some());
-        let found = result.unwrap();
-        assert_eq!(found.pubkey, keys.public_key());
-        assert_eq!(found.metadata.name, Some("Fresh User".to_string()));
-    }
-
-    #[tokio::test]
     async fn upsert_creates_new_entry() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
@@ -356,11 +269,14 @@ mod tests {
         .unwrap();
 
         // Verify it exists (use large TTL to find regardless of staleness)
-        let before =
-            CachedGraphUser::find_fresh_with_ttl(&keys.public_key(), 10000, &whitenoise.database)
-                .await
-                .unwrap();
-        assert!(before.is_some());
+        let before = CachedGraphUser::find_fresh_batch_with_ttl(
+            &[keys.public_key()],
+            10000,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.len(), 1);
 
         // Run cleanup
         let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database)
@@ -370,11 +286,14 @@ mod tests {
         assert_eq!(deleted, 1);
 
         // Verify it's gone
-        let after =
-            CachedGraphUser::find_fresh_with_ttl(&keys.public_key(), 10000, &whitenoise.database)
-                .await
-                .unwrap();
-        assert!(after.is_none());
+        let after = CachedGraphUser::find_fresh_batch_with_ttl(
+            &[keys.public_key()],
+            10000,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(after.is_empty());
     }
 
     #[tokio::test]
@@ -394,14 +313,14 @@ mod tests {
         assert_eq!(deleted, 0);
 
         // Verify it still exists
-        let after = CachedGraphUser::find_fresh(&keys.public_key(), &whitenoise.database)
+        let after = CachedGraphUser::find_fresh_batch(&[keys.public_key()], &whitenoise.database)
             .await
             .unwrap();
-        assert!(after.is_some());
+        assert_eq!(after.len(), 1);
     }
 
     #[tokio::test]
-    async fn custom_ttl_is_respected_in_find_fresh() {
+    async fn custom_ttl_is_respected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
 
@@ -419,18 +338,24 @@ mod tests {
         .unwrap();
 
         // With 1-hour TTL, should be stale
-        let result_1h =
-            CachedGraphUser::find_fresh_with_ttl(&keys.public_key(), 1, &whitenoise.database)
-                .await
-                .unwrap();
-        assert!(result_1h.is_none());
+        let result_1h = CachedGraphUser::find_fresh_batch_with_ttl(
+            &[keys.public_key()],
+            1,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(result_1h.is_empty());
 
         // With 3-hour TTL, should be fresh
-        let result_3h =
-            CachedGraphUser::find_fresh_with_ttl(&keys.public_key(), 3, &whitenoise.database)
-                .await
-                .unwrap();
-        assert!(result_3h.is_some());
+        let result_3h = CachedGraphUser::find_fresh_batch_with_ttl(
+            &[keys.public_key()],
+            3,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result_3h.len(), 1);
     }
 
     #[tokio::test]

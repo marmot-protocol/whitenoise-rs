@@ -243,31 +243,24 @@ async fn search_task(
                     return;
                 }
 
+                // Batch fetch metadata for all pubkeys in this batch
+                let metadata_map = graph::get_metadata_batch(whitenoise, batch).await;
+
                 let mut batch_results = Vec::new();
 
                 for pk in batch {
-                    // Fetch metadata with error handling
-                    let metadata = match graph::get_metadata_for_pubkey(whitenoise, pk).await {
-                        Ok(Some(m)) => m,
-                        Ok(None) => continue, // No metadata, skip
-                        Err(e) => {
-                            tracing::debug!(
-                                target: "whitenoise::user_search",
-                                "Failed to fetch metadata for {}: {}",
-                                pk.to_hex(),
-                                e
-                            );
-                            continue;
-                        }
+                    let metadata = match metadata_map.get(pk) {
+                        Some(m) => m,
+                        None => continue,
                     };
 
-                    let match_result = match_metadata(&metadata, &query);
+                    let match_result = match_metadata(metadata, &query);
                     if let (Some(quality), Some(best_field)) =
                         (match_result.quality, match_result.best_field)
                     {
                         batch_results.push(UserSearchResult {
                             pubkey: *pk,
-                            metadata,
+                            metadata: metadata.clone(),
                             radius,
                             match_quality: quality,
                             best_field,
