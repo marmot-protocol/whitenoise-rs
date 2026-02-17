@@ -1608,9 +1608,21 @@ impl Whitenoise {
                 .await?;
         }
         if key_package_event.is_none() {
-            self.publish_key_package_to_relays(account, key_package_relays)
-                .await?;
-            tracing::debug!(target: "whitenoise::accounts", "Published key package");
+            match self
+                .create_and_publish_key_package(account, key_package_relays)
+                .await
+            {
+                Ok(()) => {
+                    tracing::debug!(target: "whitenoise::accounts", "Published key package");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::accounts",
+                        "Initial key package publish failed, scheduler will retry: {}",
+                        e
+                    );
+                }
+            }
         }
         Ok(())
     }
