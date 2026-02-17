@@ -4,6 +4,7 @@ pub mod app_settings;
 pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod chat_media_upload;
+pub mod drafts;
 pub mod follow_management;
 pub mod group_membership;
 pub mod login_flow;
