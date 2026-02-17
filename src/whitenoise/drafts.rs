@@ -40,7 +40,7 @@ impl Whitenoise {
         reply_to_id: Option<&EventId>,
         media_attachments: &[MediaFile],
     ) -> Result<Draft, WhitenoiseError> {
-        Ok(Draft::save(
+        Draft::save(
             &account.pubkey,
             group_id,
             content,
@@ -48,7 +48,7 @@ impl Whitenoise {
             media_attachments,
             &self.database,
         )
-        .await?)
+        .await
     }
 
     /// Loads the draft for (account, group), if any.
@@ -57,7 +57,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<Draft>, WhitenoiseError> {
-        Ok(Draft::find(&account.pubkey, group_id, &self.database).await?)
+        Draft::find(&account.pubkey, group_id, &self.database).await
     }
 
     /// Deletes the draft for (account, group).
@@ -66,7 +66,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<(), WhitenoiseError> {
-        Ok(Draft::delete(&account.pubkey, group_id, &self.database).await?)
+        Draft::delete(&account.pubkey, group_id, &self.database).await
     }
 }
 

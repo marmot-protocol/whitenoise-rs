@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 
-use super::{Database, utils::parse_timestamp};
+use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::whitenoise::drafts::Draft;
+use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::media_files::MediaFile;
 
 /// Internal database row representation for the drafts table.
@@ -106,7 +107,7 @@ impl Draft {
         reply_to_id: Option<&EventId>,
         media_attachments: &[MediaFile],
         database: &Database,
-    ) -> Result<Self, sqlx::Error> {
+    ) -> Result<Self, WhitenoiseError> {
         let now = Utc::now().timestamp_millis();
 
         let media_json =
@@ -119,13 +120,13 @@ impl Draft {
             "INSERT INTO drafts
                  (account_pubkey, mls_group_id, content, reply_to_id,
                   media_attachments, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
-                 content = excluded.content,
-                 reply_to_id = excluded.reply_to_id,
-                 media_attachments = excluded.media_attachments,
-                 updated_at = excluded.updated_at
-             RETURNING *",
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
+                   content = excluded.content,
+                   reply_to_id = excluded.reply_to_id,
+                   media_attachments = excluded.media_attachments,
+                   updated_at = excluded.updated_at
+               RETURNING *",
         )
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
@@ -135,7 +136,8 @@ impl Draft {
         .bind(now)
         .bind(now)
         .fetch_one(&database.pool)
-        .await?;
+        .await
+        .map_err(DatabaseError::from)?;
 
         Ok(row.into())
     }
@@ -145,14 +147,15 @@ impl Draft {
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         database: &Database,
-    ) -> Result<Option<Self>, sqlx::Error> {
+    ) -> Result<Option<Self>, WhitenoiseError> {
         let row = sqlx::query_as::<_, DraftRow>(
             "SELECT * FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?",
         )
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
         .fetch_optional(&database.pool)
-        .await?;
+        .await
+        .map_err(DatabaseError::from)?;
 
         Ok(row.map(Into::into))
     }
@@ -162,12 +165,13 @@ impl Draft {
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         database: &Database,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), WhitenoiseError> {
         sqlx::query("DELETE FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?")
             .bind(account_pubkey.to_hex())
             .bind(mls_group_id.as_slice())
             .execute(&database.pool)
-            .await?;
+            .await
+            .map_err(DatabaseError::from)?;
 
         Ok(())
     }
