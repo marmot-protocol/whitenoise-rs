@@ -9,11 +9,21 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::stream::{self, StreamExt};
 use nostr_sdk::{Filter, Kind, Metadata, PublicKey};
 
 /// Maximum authors to include in a single relay filter query.
-/// Prevents overly large requests that may be rejected by relays.
-const MAX_AUTHORS_PER_FILTER: usize = 500;
+/// Most relays silently reject filters with more than ~40 authors.
+const MAX_AUTHORS_PER_FILTER: usize = 40;
+
+/// Maximum concurrent relay requests when fetching in chunks.
+/// Limits resource usage on mobile and avoids relay rate-limiting.
+const MAX_CONCURRENT_RELAY_REQUESTS: usize = 5;
+
+/// Timeout for relay requests during search graph traversal.
+/// Longer than the default 5s because search fetches large batches of authors
+/// that compete with background sync for relay connections.
+const SEARCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
@@ -56,21 +66,21 @@ pub(super) async fn get_metadata_batch(
         return results;
     }
 
-    // 2. Batch query cache
+    // 2. Batch query cache (skip empty metadata — same check as tier 1)
     if let Ok(cached_users) =
         CachedGraphUser::find_fresh_batch(&remaining, &whitenoise.database).await
     {
         for cached in &cached_users {
-            results.insert(cached.pubkey, cached.metadata.clone());
+            if cached.metadata != Metadata::new() {
+                results.insert(cached.pubkey, cached.metadata.clone());
+            }
         }
-        let cached_pks: HashSet<PublicKey> = cached_users.iter().map(|c| c.pubkey).collect();
-        remaining.retain(|pk| !cached_pks.contains(pk));
+        remaining.retain(|pk| !results.contains_key(pk));
     }
 
     if remaining.is_empty() {
         return results;
     }
-
     // 3. Batch network fetch for cache misses
     let fetched = fetch_and_cache_batch(whitenoise, &remaining).await;
     for cached in fetched {
@@ -157,7 +167,8 @@ fn parse_follows_from_event(event: &nostr_sdk::Event) -> Vec<PublicKey> {
 /// Batch fetch user data from network and persist to cache.
 ///
 /// Fetches metadata (kind 0) and contact lists (kind 3) for multiple users,
-/// chunking requests to respect relay limits. Results are cached for future use.
+/// chunking requests to respect relay limits. Chunks are fetched concurrently.
+/// Results are cached for future use by both metadata and follows lookups.
 async fn fetch_and_cache_batch(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -171,25 +182,35 @@ async fn fetch_and_cache_batch(
         return Vec::new();
     }
 
-    // Fetch events in chunks to avoid overly large filter queries
+    // Fetch events in chunks with bounded concurrency to avoid overly large
+    // filter queries while limiting relay load and mobile resource usage
+    let chunks: Vec<Vec<PublicKey>> = pubkeys
+        .chunks(MAX_AUTHORS_PER_FILTER)
+        .map(|c| c.to_vec())
+        .collect();
+
+    let chunk_results: Vec<_> = stream::iter(chunks.into_iter().map(|chunk| {
+        let relays = all_relays.clone();
+        async move {
+            let filter = Filter::new()
+                .authors(chunk)
+                .kinds([Kind::Metadata, Kind::ContactList]);
+            whitenoise
+                .nostr
+                .client
+                .fetch_events_from(relays, filter, SEARCH_FETCH_TIMEOUT)
+                .await
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_RELAY_REQUESTS)
+    .collect()
+    .await;
+
     let mut metadata_by_author: HashMap<PublicKey, Vec<_>> = HashMap::new();
     let mut contacts_by_author: HashMap<PublicKey, Vec<_>> = HashMap::new();
 
-    for chunk in pubkeys.chunks(MAX_AUTHORS_PER_FILTER) {
-        let filter = Filter::new()
-            .authors(chunk.to_vec())
-            .kinds([Kind::Metadata, Kind::ContactList]);
-
-        let events = match whitenoise
-            .nostr
-            .client
-            .fetch_events_from(
-                all_relays.clone(),
-                filter,
-                crate::nostr_manager::NostrManager::default_timeout(),
-            )
-            .await
-        {
+    for result in chunk_results {
+        let events = match result {
             Ok(events) => events,
             Err(e) => {
                 tracing::debug!(
@@ -220,22 +241,30 @@ async fn fetch_and_cache_batch(
         }
     }
 
-    // Build and cache results for each pubkey
+    // Build and cache results for each pubkey (only cache if we got useful data)
     let mut results = Vec::new();
     for pk in pubkeys {
         let metadata = metadata_by_author
             .get(pk)
             .and_then(|events| events.iter().max_by_key(|e| e.created_at))
-            .and_then(|e| serde_json::from_str::<Metadata>(&e.content).ok())
-            .unwrap_or_else(Metadata::new);
+            .and_then(|e| serde_json::from_str::<Metadata>(&e.content).ok());
 
         let follows = contacts_by_author
             .get(pk)
             .and_then(|events| events.iter().max_by_key(|e| e.created_at))
-            .map(parse_follows_from_event)
-            .unwrap_or_default();
+            .map(parse_follows_from_event);
 
-        let cached = CachedGraphUser::new(*pk, metadata, follows);
+        // Skip caching if we got nothing — avoids poisoning the cache with empty
+        // entries that block future lookups for 24 hours
+        if metadata.is_none() && follows.is_none() {
+            continue;
+        }
+
+        let cached = CachedGraphUser::new(
+            *pk,
+            metadata.unwrap_or_default(),
+            follows.unwrap_or_default(),
+        );
         match cached.upsert(&whitenoise.database).await {
             Ok(saved) => results.push(saved),
             Err(e) => {
@@ -480,6 +509,33 @@ mod tests {
             result.get(&keys_b.public_key()).unwrap().name,
             Some("Bob".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn get_metadata_batch_resolves_more_than_one_chunk_of_cached_entries() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create more entries than MAX_AUTHORS_PER_FILTER to exercise multi-chunk resolution
+        let count = 100;
+        let mut pubkeys = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let keys = Keys::generate();
+            let cached = CachedGraphUser::new(
+                keys.public_key(),
+                Metadata::new().name(format!("User{}", i)),
+                vec![],
+            );
+            cached.upsert(&whitenoise.database).await.unwrap();
+            pubkeys.push(keys.public_key());
+        }
+
+        let result = get_metadata_batch(&whitenoise, &pubkeys).await;
+
+        assert_eq!(result.len(), count);
+        for (i, pk) in pubkeys.iter().enumerate() {
+            assert_eq!(result.get(pk).unwrap().name, Some(format!("User{}", i)),);
+        }
     }
 
     #[tokio::test]

@@ -21,8 +21,9 @@ const MAX_PUBKEYS_PER_RADIUS: usize = 10_000;
 /// Timeout for fetching data at each radius level (seconds).
 const RADIUS_FETCH_TIMEOUT_SECS: u64 = 30;
 
-/// Batch size for processing pubkeys (affects cancellation responsiveness).
-const PUBKEY_BATCH_SIZE: usize = 250;
+/// Batch size for processing pubkeys. Aligned with MAX_AUTHORS_PER_FILTER
+/// so each batch produces exactly one relay request for cache misses.
+const PUBKEY_BATCH_SIZE: usize = 40;
 
 pub use matcher::{MatchQuality, MatchResult, MatchedField, match_metadata};
 pub(crate) use types::SEARCH_CHANNEL_BUFFER_SIZE;
@@ -229,12 +230,10 @@ async fn search_task(
 
         // Only search/emit results for requested radius range
         if in_requested_range {
-            // Process pubkeys in batches for cancellation responsiveness
             let pubkeys_vec: Vec<PublicKey> = layer_pubkeys.iter().copied().collect();
             let total_pubkeys_in_layer = pubkeys_vec.len();
 
             for batch in pubkeys_vec.chunks(PUBKEY_BATCH_SIZE) {
-                // Check for cancellation between batches
                 if tx.receiver_count() == 0 {
                     tracing::debug!(
                         target: "whitenoise::user_search",
@@ -243,7 +242,8 @@ async fn search_task(
                     return;
                 }
 
-                // Batch fetch metadata for all pubkeys in this batch
+                // Fetch metadata per batch so cache hits emit results immediately
+                // without waiting for slow network fetches of other batches
                 let metadata_map = graph::get_metadata_batch(whitenoise, batch).await;
 
                 let mut batch_results = Vec::new();
@@ -270,7 +270,6 @@ async fn search_task(
                 }
 
                 if !batch_results.is_empty() {
-                    // Sort using sort_key() method (follows ChatListItem pattern)
                     batch_results.sort_by_key(|r| r.sort_key());
                     total_results += batch_results.len();
 
@@ -281,7 +280,6 @@ async fn search_task(
                     });
                 }
 
-                // Yield for responsiveness
                 tokio::task::yield_now().await;
             }
 
