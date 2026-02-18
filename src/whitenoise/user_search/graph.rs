@@ -68,8 +68,7 @@ pub(super) async fn check_cache_metadata(
 ) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
     let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
 
-    if let Ok(cached_users) =
-        CachedGraphUser::find_fresh_batch(pubkeys, &whitenoise.database).await
+    if let Ok(cached_users) = CachedGraphUser::find_fresh_batch(pubkeys, &whitenoise.database).await
     {
         for cached in &cached_users {
             if let Some(ref m) = cached.metadata {
@@ -133,19 +132,13 @@ pub(super) async fn get_metadata_batch(
     results
 }
 
-/// Batch fetch follows for multiple pubkeys.
+/// Tiers 1+2: Batch check local accounts and cache for follows.
 ///
-/// Uses the same cache hierarchy as single fetch but optimized for batch operations:
-/// 1. Check local accounts
-/// 2. Batch query cached_graph_users table
-/// 3. Single network request for all cache misses
-///
-/// Returns a map of pubkey -> follows list. Pubkeys for which no data could be
-/// retrieved are omitted from the map.
-pub(super) async fn get_follows_batch(
+/// Returns (found follows map, remaining pubkeys needing network fetch).
+pub(super) async fn check_cached_follows_batch(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
-) -> HashMap<PublicKey, Vec<PublicKey>> {
+) -> (HashMap<PublicKey, Vec<PublicKey>>, Vec<PublicKey>) {
     let mut results: HashMap<PublicKey, Vec<PublicKey>> = HashMap::new();
     let mut remaining: HashSet<PublicKey> = pubkeys.iter().copied().collect();
 
@@ -160,7 +153,7 @@ pub(super) async fn get_follows_batch(
     }
 
     if remaining.is_empty() {
-        return results;
+        return (results, vec![]);
     }
 
     // 2. Batch query cache (skip entries where follows is None — not yet fetched)
@@ -176,19 +169,42 @@ pub(super) async fn get_follows_batch(
         }
     }
 
-    if remaining.is_empty() {
-        return results;
-    }
+    let remaining_vec: Vec<PublicKey> = remaining.into_iter().collect();
+    (results, remaining_vec)
+}
 
-    // 3. Batch network fetch for cache misses (follows only)
-    let needs_fetch: Vec<PublicKey> = remaining.into_iter().collect();
-    let fetched = fetch_and_cache_follows_batch(whitenoise, &needs_fetch).await;
+/// Tier 3: Fetch follows from network and cache them.
+///
+/// Returns a map of pubkey -> follows list. Pubkeys for which no data could be
+/// retrieved are omitted from the map.
+pub(super) async fn fetch_network_follows(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> HashMap<PublicKey, Vec<PublicKey>> {
+    let mut results = HashMap::new();
+    let fetched = fetch_and_cache_follows_batch(whitenoise, pubkeys).await;
     for cached in fetched {
         if let Some(follows) = cached.follows {
             results.insert(cached.pubkey, follows);
         }
     }
+    results
+}
 
+/// Batch fetch follows for multiple pubkeys (all tiers combined).
+///
+/// Convenience function used by tests; the pipeline uses individual tier functions.
+#[cfg(test)]
+pub(super) async fn get_follows_batch(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> HashMap<PublicKey, Vec<PublicKey>> {
+    let (mut results, remaining) = check_cached_follows_batch(whitenoise, pubkeys).await;
+    if remaining.is_empty() {
+        return results;
+    }
+
+    results.extend(fetch_network_follows(whitenoise, &remaining).await);
     results
 }
 
@@ -320,9 +336,7 @@ async fn fetch_and_cache_batch_inner(
                 CachedGraphUser::upsert_metadata_only(pk, &metadata, &whitenoise.database).await
             }
             FetchMode::FollowsOnly => {
-                let follows = latest
-                    .map(parse_follows_from_event)
-                    .unwrap_or_default();
+                let follows = latest.map(parse_follows_from_event).unwrap_or_default();
                 CachedGraphUser::upsert_follows_only(pk, &follows, &whitenoise.database).await
             }
         };

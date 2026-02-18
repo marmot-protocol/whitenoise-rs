@@ -205,14 +205,7 @@ async fn search_task(
             &query,
             &total_results,
         ),
-        tier2_cache_consumer(
-            whitenoise,
-            &tx,
-            rx_tier2,
-            tx_tier3,
-            &query,
-            &total_results,
-        ),
+        tier2_cache_consumer(whitenoise, &tx, rx_tier2, tx_tier3, &query, &total_results,),
         tier3_network_consumer(
             whitenoise,
             &tx,
@@ -224,10 +217,51 @@ async fn search_task(
     );
 }
 
+/// Apply the MAX_PUBKEYS_PER_RADIUS cap to a layer. Returns (capped layer, was_capped).
+fn apply_cap(layer: HashSet<PublicKey>) -> (HashSet<PublicKey>, bool) {
+    if layer.len() > MAX_PUBKEYS_PER_RADIUS {
+        let capped: HashSet<PublicKey> = layer.into_iter().take(MAX_PUBKEYS_PER_RADIUS).collect();
+        (capped, true)
+    } else {
+        (layer, false)
+    }
+}
+
+/// Push candidate batches to the channel, chunked by PUBKEY_BATCH_SIZE.
+async fn push_candidates(
+    tx: &mpsc::Sender<CandidateBatch>,
+    pubkeys: &HashSet<PublicKey>,
+    radius: u8,
+) -> std::result::Result<(), mpsc::error::SendError<CandidateBatch>> {
+    let pubkeys_vec: Vec<PublicKey> = pubkeys.iter().copied().collect();
+    for batch in pubkeys_vec.chunks(PUBKEY_BATCH_SIZE) {
+        tx.send(CandidateBatch {
+            radius,
+            kind: CandidateBatchKind::Candidates(batch.to_vec()),
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Push a RadiusComplete sentinel to the channel.
+async fn push_radius_complete(
+    tx: &mpsc::Sender<CandidateBatch>,
+    radius: u8,
+    total_pubkeys: usize,
+) -> std::result::Result<(), mpsc::error::SendError<CandidateBatch>> {
+    tx.send(CandidateBatch {
+        radius,
+        kind: CandidateBatchKind::RadiusComplete { total_pubkeys },
+    })
+    .await
+}
+
 /// Follows-producer: traverses the social graph and pushes candidate batches.
 ///
-/// For each radius, fetches follows to build the layer, then pushes batches
-/// of pubkeys to the candidate channel for metadata-matching.
+/// Uses two-phase follows fetching per radius:
+/// 1. Cached follows (instant) → push partial candidates immediately
+/// 2. Network follows (slow) → push additional candidates while consumers are busy
 async fn follows_producer_task(
     whitenoise: &Whitenoise,
     tx: broadcast::Sender<UserSearchUpdate>,
@@ -251,101 +285,143 @@ async fn follows_producer_task(
 
         let in_requested_range = radius >= radius_start;
 
-        // Build this radius layer
-        let layer_pubkeys: HashSet<PublicKey> = if radius == 0 {
-            HashSet::from([searcher_pubkey])
-        } else {
-            // Fetch follows with timeout (graph explosion mitigation)
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
-                build_layer_from_follows(whitenoise, &previous_layer_pubkeys, &seen_pubkeys),
-            )
-            .await
-            {
-                Ok(pubkeys) => pubkeys,
-                Err(_) => {
-                    // Timeout occurred - only notify for in-range radii
-                    if in_requested_range {
-                        let _ = tx.send(UserSearchUpdate {
-                            trigger: SearchUpdateTrigger::RadiusTimeout { radius },
-                            new_results: vec![],
-                            total_result_count: 0,
-                        });
-                    }
-                    // Continue with empty layer for this radius
-                    HashSet::new()
-                }
-            }
-        };
+        if radius == 0 {
+            let layer_pubkeys = HashSet::from([searcher_pubkey]);
+            seen_pubkeys.extend(layer_pubkeys.iter().copied());
 
-        // Apply cap after deduplication
-        let (layer_pubkeys, was_capped) = if layer_pubkeys.len() > MAX_PUBKEYS_PER_RADIUS {
-            let actual = layer_pubkeys.len();
-            let capped: HashSet<PublicKey> = layer_pubkeys
-                .into_iter()
-                .take(MAX_PUBKEYS_PER_RADIUS)
-                .collect();
             if in_requested_range {
                 let _ = tx.send(UserSearchUpdate {
-                    trigger: SearchUpdateTrigger::RadiusCapped {
-                        radius,
-                        cap: MAX_PUBKEYS_PER_RADIUS,
-                        actual,
-                    },
+                    trigger: SearchUpdateTrigger::RadiusStarted { radius },
                     new_results: vec![],
                     total_result_count: 0,
                 });
+
+                if push_candidates(&tx_candidates, &layer_pubkeys, radius)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                if push_radius_complete(&tx_candidates, radius, layer_pubkeys.len())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
             }
-            (capped, true)
-        } else {
-            (layer_pubkeys, false)
+
+            previous_layer_pubkeys = layer_pubkeys;
+            continue;
+        }
+
+        // Phase 1: Build partial layer from cached follows (instant)
+        let (partial_layer, need_fetch) = match tokio::time::timeout(
+            std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
+            build_cached_layer_from_follows(whitenoise, &previous_layer_pubkeys, &seen_pubkeys),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if in_requested_range {
+                    let _ = tx.send(UserSearchUpdate {
+                        trigger: SearchUpdateTrigger::RadiusTimeout { radius },
+                        new_results: vec![],
+                        total_result_count: 0,
+                    });
+                }
+                previous_layer_pubkeys = HashSet::new();
+                continue;
+            }
         };
 
-        // Add to seen set
-        seen_pubkeys.extend(layer_pubkeys.iter().copied());
+        // Apply cap to partial layer
+        let (partial_layer, partial_capped) = apply_cap(partial_layer);
 
-        // Only push candidates for requested radius range
+        seen_pubkeys.extend(partial_layer.iter().copied());
+
         if in_requested_range {
-            // Emit RadiusStarted
             let _ = tx.send(UserSearchUpdate {
                 trigger: SearchUpdateTrigger::RadiusStarted { radius },
                 new_results: vec![],
                 total_result_count: 0,
             });
 
-            let pubkeys_vec: Vec<PublicKey> = layer_pubkeys.iter().copied().collect();
-            let total_pubkeys_in_layer = pubkeys_vec.len();
-
-            // Push batches to candidate channel
-            for batch in pubkeys_vec.chunks(PUBKEY_BATCH_SIZE) {
-                if tx_candidates
-                    .send(CandidateBatch {
-                        radius,
-                        kind: CandidateBatchKind::Candidates(batch.to_vec()),
-                    })
-                    .await
-                    .is_err()
-                {
-                    // Consumer dropped — search cancelled
-                    return;
-                }
-            }
-
-            // Push end-of-radius sentinel
-            if tx_candidates
-                .send(CandidateBatch {
-                    radius,
-                    kind: CandidateBatchKind::RadiusComplete {
-                        total_pubkeys: total_pubkeys_in_layer,
-                    },
-                })
+            // Push partial layer candidates immediately — consumers start processing
+            if push_candidates(&tx_candidates, &partial_layer, radius)
                 .await
                 .is_err()
             {
                 return;
             }
+        }
+
+        // Phase 2: Fetch remaining follows from network (slow — consumers are busy)
+        let additional_layer =
+            if !need_fetch.is_empty() && partial_layer.len() < MAX_PUBKEYS_PER_RADIUS {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
+                    build_network_layer_from_follows(
+                        whitenoise,
+                        &need_fetch,
+                        &seen_pubkeys,
+                        &partial_layer,
+                    ),
+                )
+                .await
+                {
+                    Ok(additional) => {
+                        // Apply remaining cap budget
+                        let budget = MAX_PUBKEYS_PER_RADIUS - partial_layer.len();
+                        if additional.len() > budget {
+                            additional.into_iter().take(budget).collect()
+                        } else {
+                            additional
+                        }
+                    }
+                    Err(_) => {
+                        if in_requested_range {
+                            let _ = tx.send(UserSearchUpdate {
+                                trigger: SearchUpdateTrigger::RadiusTimeout { radius },
+                                new_results: vec![],
+                                total_result_count: 0,
+                            });
+                        }
+                        HashSet::new()
+                    }
+                }
+            } else {
+                HashSet::new()
+            };
+
+        seen_pubkeys.extend(additional_layer.iter().copied());
+
+        if in_requested_range {
+            // Push additional candidates from network follows
+            if !additional_layer.is_empty() {
+                if push_candidates(&tx_candidates, &additional_layer, radius)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            let total = partial_layer.len() + additional_layer.len();
+            let was_capped =
+                partial_capped || additional_layer.len() > 0 && total >= MAX_PUBKEYS_PER_RADIUS;
 
             if was_capped {
+                let _ = tx.send(UserSearchUpdate {
+                    trigger: SearchUpdateTrigger::RadiusCapped {
+                        radius,
+                        cap: MAX_PUBKEYS_PER_RADIUS,
+                        actual: total,
+                    },
+                    new_results: vec![],
+                    total_result_count: 0,
+                });
                 tracing::debug!(
                     target: "whitenoise::user_search",
                     "Radius {} was capped at {} pubkeys",
@@ -353,11 +429,21 @@ async fn follows_producer_task(
                     MAX_PUBKEYS_PER_RADIUS
                 );
             }
+
+            if push_radius_complete(&tx_candidates, radius, total)
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
 
-        previous_layer_pubkeys = layer_pubkeys;
+        // Combine both phases for next radius
+        let mut full_layer = partial_layer;
+        full_layer.extend(additional_layer);
+        previous_layer_pubkeys = full_layer;
     }
-    // tx_candidates is dropped here, signaling completion to consumer
+    // tx_candidates is dropped here, signaling completion to tier 1
 }
 
 /// Match metadata against query and emit results via broadcast.
@@ -378,9 +464,7 @@ fn match_and_emit(
         };
 
         let match_result = match_metadata(metadata, query);
-        if let (Some(quality), Some(best_field)) =
-            (match_result.quality, match_result.best_field)
-        {
+        if let (Some(quality), Some(best_field)) = (match_result.quality, match_result.best_field) {
             batch_results.push(UserSearchResult {
                 pubkey: *pk,
                 metadata: metadata.clone(),
@@ -479,8 +563,7 @@ async fn tier2_cache_consumer(
 
         match batch.kind {
             CandidateBatchKind::Candidates(pubkeys) => {
-                let (found, remaining) =
-                    graph::check_cache_metadata(whitenoise, &pubkeys).await;
+                let (found, remaining) = graph::check_cache_metadata(whitenoise, &pubkeys).await;
 
                 match_and_emit(tx, &found, &pubkeys, query, batch.radius, total_results);
 
@@ -563,34 +646,66 @@ async fn tier3_network_consumer(
     });
 }
 
-/// Build the set of pubkeys for the next radius layer by fetching follows.
-///
-/// Uses batch fetching to minimize network requests: all pubkeys from the
-/// previous layer are fetched in a single operation where possible.
-async fn build_layer_from_follows(
-    whitenoise: &Whitenoise,
-    previous_layer: &HashSet<PublicKey>,
+/// Collect unique follows not already seen into a layer set, respecting the cap.
+fn collect_layer_from_follows(
+    follows_map: &HashMap<PublicKey, Vec<PublicKey>>,
     seen: &HashSet<PublicKey>,
-) -> HashSet<PublicKey> {
-    let pubkeys: Vec<PublicKey> = previous_layer.iter().copied().collect();
-
-    // Batch fetch all follows at once
-    let follows_map = graph::get_follows_batch(whitenoise, &pubkeys).await;
-
-    // Collect unique follows not already seen
-    let mut layer = HashSet::new();
+    layer: &mut HashSet<PublicKey>,
+) {
     for follows in follows_map.values() {
         for follow in follows {
-            if !seen.contains(follow) {
+            if !seen.contains(follow) && !layer.contains(follow) {
                 layer.insert(*follow);
             }
             if layer.len() >= MAX_PUBKEYS_PER_RADIUS {
-                return layer;
+                return;
             }
         }
     }
+}
 
-    layer
+/// Phase 1: Build partial layer from cached follows (Account + CachedGraphUser).
+///
+/// Returns (partial layer, pubkeys needing network fetch for follows).
+async fn build_cached_layer_from_follows(
+    whitenoise: &Whitenoise,
+    previous_layer: &HashSet<PublicKey>,
+    seen: &HashSet<PublicKey>,
+) -> (HashSet<PublicKey>, Vec<PublicKey>) {
+    let pubkeys: Vec<PublicKey> = previous_layer.iter().copied().collect();
+
+    let (cached_follows, need_fetch) =
+        graph::check_cached_follows_batch(whitenoise, &pubkeys).await;
+
+    let mut layer = HashSet::new();
+    collect_layer_from_follows(&cached_follows, seen, &mut layer);
+
+    (layer, need_fetch)
+}
+
+/// Phase 2: Fetch remaining follows from network and extend the layer.
+///
+/// Returns the additional pubkeys discovered (not in partial_layer or seen).
+async fn build_network_layer_from_follows(
+    whitenoise: &Whitenoise,
+    need_fetch: &[PublicKey],
+    seen: &HashSet<PublicKey>,
+    partial_layer: &HashSet<PublicKey>,
+) -> HashSet<PublicKey> {
+    if need_fetch.is_empty() {
+        return HashSet::new();
+    }
+
+    let network_follows = graph::fetch_network_follows(whitenoise, need_fetch).await;
+
+    // Combine seen + partial_layer so we don't duplicate
+    let mut combined_seen = seen.clone();
+    combined_seen.extend(partial_layer.iter());
+
+    let mut additional = HashSet::new();
+    collect_layer_from_follows(&network_follows, &combined_seen, &mut additional);
+
+    additional
 }
 
 #[cfg(test)]
