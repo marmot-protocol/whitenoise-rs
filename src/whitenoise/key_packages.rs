@@ -788,13 +788,11 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
 
     use super::*;
     use crate::whitenoise::accounts::AccountType;
     use crate::whitenoise::test_utils::*;
-    use chrono::Utc;
-    use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
 
     fn create_local_account_struct() -> Account {
         Account {
