@@ -46,6 +46,52 @@ pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
 }
 
 impl Whitenoise {
+    /// Filters key package events to only include those that can be parsed by the local MDK.
+    ///
+    /// This serves as a proxy for "ownership" filtering: if a key package can be successfully
+    /// parsed by our MDK instance (which validates the encoding tag, ciphersuite, extensions,
+    /// and identity binding), it is compatible with this app. Packages from other Marmot apps
+    /// using different MDK versions or configurations will fail parsing and be excluded.
+    ///
+    /// Note: This does NOT verify that the private key material exists in local MLS storage,
+    /// so in a multi-device scenario using the same MDK version, packages from other devices
+    /// may still pass this filter. Full device-level ownership verification would require
+    /// checking the OpenMLS key package storage, which is not currently exposed by the MDK.
+    pub(crate) fn filter_locally_parseable_key_packages(
+        &self,
+        account: &Account,
+        packages: Vec<Event>,
+    ) -> Vec<Event> {
+        let mdk = match Account::create_mdk(account.pubkey, &self.config.data_dir) {
+            Ok(mdk) => mdk,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Failed to create MDK for account {}, cannot filter packages: {}",
+                    account.pubkey.to_hex(),
+                    e
+                );
+                return packages;
+            }
+        };
+
+        packages
+            .into_iter()
+            .filter(|event| match mdk.parse_key_package(event) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "whitenoise::key_packages",
+                        "Key package {} not parseable by local MDK (skipping): {}",
+                        event.id,
+                        e
+                    );
+                    false
+                }
+            })
+            .collect()
+    }
+
     /// Gets the appropriate signer for an account.
     ///
     /// For external accounts (Amber/NIP-55), returns the stored external signer.

@@ -47,7 +47,7 @@ impl Task for KeyPackageMaintenance {
         let mut checked = 0usize;
         let mut published = 0usize;
         let mut rotated_expired = 0usize;
-        let mut rotated_outdated = 0usize;
+        let mut deleted_outdated = 0usize;
         let mut skipped = 0usize;
         let mut errors = 0usize;
 
@@ -73,11 +73,11 @@ impl Task for KeyPackageMaintenance {
                         deleted
                     );
                 }
-                MaintenanceResult::RotatedOutdated { deleted } => {
-                    rotated_outdated += 1;
+                MaintenanceResult::DeletedOutdated { deleted } => {
+                    deleted_outdated += 1;
                     tracing::info!(
                         target: "whitenoise::scheduler::key_package_maintenance",
-                        "Rotated outdated key package (missing encoding tag), deleted {} old one(s)",
+                        "Deleted {} outdated key package(s) missing encoding tag",
                         deleted
                     );
                 }
@@ -97,11 +97,11 @@ impl Task for KeyPackageMaintenance {
 
         tracing::info!(
             target: "whitenoise::scheduler::key_package_maintenance",
-            "Key package maintenance completed: {} checked, {} published, {} rotated (expired), {} rotated (outdated), {} skipped, {} errors",
+            "Key package maintenance completed: {} checked, {} published, {} rotated (expired), {} deleted (outdated), {} skipped, {} errors",
             checked,
             published,
             rotated_expired,
-            rotated_outdated,
+            deleted_outdated,
             skipped,
             errors
         );
@@ -117,8 +117,8 @@ enum MaintenanceResult {
     Published,
     /// Rotated expired key packages (>30 days old)
     RotatedExpired { deleted: usize },
-    /// Rotated outdated key packages (missing encoding tag)
-    RotatedOutdated { deleted: usize },
+    /// Deleted outdated key packages (missing encoding tag) without republishing
+    DeletedOutdated { deleted: usize },
     /// Account has no key package relays configured
     Skipped,
     /// An error occurred
@@ -144,24 +144,48 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
         return publish_new_key_package(whitenoise, account).await;
     }
 
-    // Case 2: Check for outdated packages (missing encoding tag) - prioritize this check
-    // These need to be rotated immediately as they cause interop failures with newer MDK versions
+    // Case 2: Check for outdated packages (missing encoding tag)
+    // These are broken for newer MDK versions and should be cleaned up.
+    // We only delete outdated packages if there are also valid (non-outdated) packages
+    // remaining for this account, to avoid leaving the account with zero packages.
+    // We do NOT republish a new key package here -- ideally each device maintains a single
+    // key package that only gets rotated when used.
     let outdated_packages = find_outdated_packages(&packages);
 
     if !outdated_packages.is_empty() {
-        tracing::info!(
-            target: "whitenoise::scheduler::key_package_maintenance",
-            "Account {} has {} outdated key package(s) missing encoding tag, rotating",
-            account.pubkey.to_hex(),
-            outdated_packages.len()
-        );
-        return rotate_outdated_packages(whitenoise, account, outdated_packages).await;
+        let valid_package_count = packages.len() - outdated_packages.len();
+
+        if valid_package_count > 0 {
+            tracing::info!(
+                target: "whitenoise::scheduler::key_package_maintenance",
+                "Account {} has {} outdated key package(s) missing encoding tag and {} valid package(s), deleting outdated",
+                account.pubkey.to_hex(),
+                outdated_packages.len(),
+                valid_package_count
+            );
+            return delete_outdated_packages(whitenoise, account, outdated_packages).await;
+        } else {
+            // All packages are outdated -- publish a new valid one instead of deleting.
+            // The outdated packages will naturally age out and be caught by the expired
+            // package rotation (30 days), or will be cleaned up once a valid package exists.
+            tracing::info!(
+                target: "whitenoise::scheduler::key_package_maintenance",
+                "Account {} has {} outdated key package(s) but no valid packages, publishing new one",
+                account.pubkey.to_hex(),
+                outdated_packages.len()
+            );
+            return publish_new_key_package(whitenoise, account).await;
+        }
     }
 
     // Case 3: Check for expired packages (>30 days old)
+    // Only target expired packages that are parseable by our local MDK instance.
+    // This filters out packages published by other Marmot apps that we can't verify ownership of.
     let expired_packages = find_expired_packages(&packages);
+    let our_expired_packages =
+        whitenoise.filter_locally_parseable_key_packages(account, expired_packages);
 
-    if expired_packages.is_empty() {
+    if our_expired_packages.is_empty() {
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Account {} has {} fresh key package(s)",
@@ -171,8 +195,8 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
         return MaintenanceResult::Fresh;
     }
 
-    // Publish new key package first, then delete expired ones
-    rotate_expired_packages(whitenoise, account, expired_packages).await
+    // Delete expired packages, only publishing a replacement if the account would have none left
+    rotate_expired_packages(whitenoise, account, our_expired_packages, packages.len()).await
 }
 
 /// Returns key packages that are older than the maximum age threshold.
@@ -209,33 +233,44 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
     }
 }
 
-/// Publishes a new key package, then deletes expired ones.
+/// Deletes expired key packages, only publishing a replacement if needed.
+///
+/// If the account would be left with zero key packages after deletion, a new one is
+/// published first to avoid a gap. Otherwise, only the expired packages are deleted
+/// without republishing, since the account already has a valid package.
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
     account: &Account,
     expired_packages: Vec<Event>,
+    total_package_count: usize,
 ) -> MaintenanceResult {
+    let non_expired_count = total_package_count - expired_packages.len();
+
     tracing::info!(
         target: "whitenoise::scheduler::key_package_maintenance",
-        "Account {} has {} expired key package(s), rotating",
+        "Account {} has {} expired key package(s) and {} non-expired, cleaning up",
         account.pubkey.to_hex(),
-        expired_packages.len()
+        expired_packages.len(),
+        non_expired_count
     );
 
-    // Publish new key package first (so there's no gap)
-    if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
-        match e {
-            WhitenoiseError::AccountMissingKeyPackageRelays => return MaintenanceResult::Skipped,
-            _ => return MaintenanceResult::Error(e),
+    // Only publish a new key package if deleting the expired ones would leave zero packages
+    if non_expired_count == 0 {
+        if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
+            match e {
+                WhitenoiseError::AccountMissingKeyPackageRelays => {
+                    return MaintenanceResult::Skipped;
+                }
+                _ => return MaintenanceResult::Error(e),
+            }
         }
-    }
 
-    tracing::debug!(
-        target: "whitenoise::scheduler::key_package_maintenance",
-        "Published new key package for account {}, now deleting {} expired one(s)",
-        account.pubkey.to_hex(),
-        expired_packages.len()
-    );
+        tracing::debug!(
+            target: "whitenoise::scheduler::key_package_maintenance",
+            "Published new key package for account {} (all existing were expired)",
+            account.pubkey.to_hex(),
+        );
+    }
 
     // Delete expired key packages (don't delete MLS stored keys for now)
     match whitenoise
@@ -244,7 +279,6 @@ async fn rotate_expired_packages(
     {
         Ok(deleted) => MaintenanceResult::RotatedExpired { deleted },
         Err(e) => {
-            // Log but don't fail - we successfully published a new one
             tracing::warn!(
                 target: "whitenoise::scheduler::key_package_maintenance",
                 "Failed to delete expired key packages for account {}: {}",
@@ -256,45 +290,30 @@ async fn rotate_expired_packages(
     }
 }
 
-/// Publishes a new key package, then deletes outdated ones (missing encoding tag).
+/// Deletes outdated key packages (missing encoding tag) without publishing a replacement.
 ///
 /// Outdated key packages were published before the MIP-00/MIP-02 encoding tag requirement
-/// was enforced. They cause interop failures with newer MDK versions and must be replaced.
-async fn rotate_outdated_packages(
+/// was enforced. They cause interop failures with newer MDK versions. We only delete
+/// them (without republishing) because the account already has at least one valid key
+/// package. This avoids unnecessary key package churn.
+async fn delete_outdated_packages(
     whitenoise: &Whitenoise,
     account: &Account,
     outdated_packages: Vec<Event>,
 ) -> MaintenanceResult {
-    // Publish new key package first (so there's no gap)
-    if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
-        match e {
-            WhitenoiseError::AccountMissingKeyPackageRelays => return MaintenanceResult::Skipped,
-            _ => return MaintenanceResult::Error(e),
-        }
-    }
-
-    tracing::debug!(
-        target: "whitenoise::scheduler::key_package_maintenance",
-        "Published new key package for account {}, now deleting {} outdated one(s)",
-        account.pubkey.to_hex(),
-        outdated_packages.len()
-    );
-
-    // Delete outdated key packages (don't delete MLS stored keys - they may still be valid)
     match whitenoise
         .delete_key_packages_for_account(account, outdated_packages, false, 1)
         .await
     {
-        Ok(deleted) => MaintenanceResult::RotatedOutdated { deleted },
+        Ok(deleted) => MaintenanceResult::DeletedOutdated { deleted },
         Err(e) => {
-            // Log but don't fail - we successfully published a new one
             tracing::warn!(
                 target: "whitenoise::scheduler::key_package_maintenance",
                 "Failed to delete outdated key packages for account {}: {}",
                 account.pubkey.to_hex(),
                 e
             );
-            MaintenanceResult::RotatedOutdated { deleted: 0 }
+            MaintenanceResult::DeletedOutdated { deleted: 0 }
         }
     }
 }
@@ -534,7 +553,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_rotates_outdated_packages() {
+    async fn test_execute_deletes_outdated_packages_when_valid_exists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
+        // Create account (this publishes a valid key package automatically)
+        let account = whitenoise.create_identity().await.unwrap();
+        let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Also publish an outdated key package (missing encoding tag)
+        let outdated_event_id = publish_outdated_key_package(whitenoise, &account, &kp_relays)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify we have both packages
+        let before = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 2, "Should have two key packages");
+
+        let has_outdated = before.iter().any(|e| e.id == outdated_event_id);
+        assert!(has_outdated, "Should have the outdated package");
+
+        let valid_count = before.iter().filter(|e| has_encoding_tag(e)).count();
+        assert_eq!(valid_count, 1, "Should have one valid package");
+
+        // Run maintenance - should delete only the outdated package (no republish)
+        let task = KeyPackageMaintenance;
+        task.execute(whitenoise).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Verify only the outdated package was deleted
+        let after = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+
+        // Should still have the valid package
+        assert_eq!(after.len(), 1, "Should have exactly one key package");
+        assert!(
+            has_encoding_tag(&after[0]),
+            "Remaining package should have encoding tag"
+        );
+
+        // The outdated package should be gone
+        let outdated_still_exists = after.iter().any(|e| e.id == outdated_event_id);
+        assert!(
+            !outdated_still_exists,
+            "Outdated key package should have been deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_publishes_new_when_all_packages_outdated() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
@@ -549,56 +623,43 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Publish an outdated key package (missing encoding tag)
-        let outdated_event_id = publish_outdated_key_package(whitenoise, &account, &kp_relays)
+        // Publish only an outdated key package (missing encoding tag)
+        publish_outdated_key_package(whitenoise, &account, &kp_relays)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Verify we have the outdated package
+        // Verify we have only the outdated package
         let before = whitenoise
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "Should have exactly one key package");
-        assert_eq!(
-            before[0].id, outdated_event_id,
-            "Should be our outdated package"
-        );
         assert!(
             !has_encoding_tag(&before[0]),
-            "Outdated package should not have encoding tag"
+            "Package should be outdated (no encoding tag)"
         );
 
-        // Run maintenance - should rotate the outdated package
+        // Run maintenance - should publish a new valid package (not delete the outdated one)
         let task = KeyPackageMaintenance;
         task.execute(whitenoise).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Verify rotation occurred
+        // Verify a new valid package was published
         let after = whitenoise
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
 
-        // Should have at least one package (the new one)
+        // Should have at least the new valid package
+        let valid_packages: Vec<_> = after.iter().filter(|e| has_encoding_tag(e)).collect();
         assert!(
-            !after.is_empty(),
-            "Should have a key package after rotation"
+            !valid_packages.is_empty(),
+            "Should have a new valid key package"
         );
 
-        // The outdated package should be gone
-        let outdated_still_exists = after.iter().any(|e| e.id == outdated_event_id);
-        assert!(
-            !outdated_still_exists,
-            "Outdated key package should have been deleted"
-        );
-
-        // The new package should have the encoding tag
-        assert!(
-            has_encoding_tag(&after[0]),
-            "New key package should have encoding tag"
-        );
+        // The outdated package may still exist (we didn't delete it)
+        // It will age out via the expired package rotation
     }
 
     #[test]
