@@ -66,6 +66,12 @@ pub enum WhitenoiseError {
     #[error("Account not authorized")]
     AccountNotAuthorized,
 
+    #[error("Cannot export nsec for external signer account - private key is not stored locally")]
+    ExternalSignerCannotExportNsec,
+
+    #[error("Cannot register external signer for a non-external account")]
+    NotExternalSignerAccount,
+
     #[error("MDK error: {0}")]
     MdkCoreError(#[from] mdk_core::Error),
 

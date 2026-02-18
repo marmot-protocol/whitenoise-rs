@@ -52,8 +52,9 @@ impl NostrManager {
         Ok(())
     }
 
-    // Sets up subscriptions in batches for all users and their relays (without signer)
-    // Used for external signer accounts.
+    // Sets up subscriptions in batches for all users and their relays (without signer).
+    // Only used in tests; production code always uses the _with_signer variant.
+    #[cfg(test)]
     pub(crate) async fn setup_batched_relay_subscriptions(
         &self,
         users_with_relays: Vec<(PublicKey, Vec<RelayUrl>)>,
@@ -272,7 +273,8 @@ impl NostrManager {
     }
 
     /// Refresh subscriptions for a specific user across all their relays (without signer).
-    /// Used for external signer accounts.
+    /// Only used in tests; production code always uses the _with_signer variant.
+    #[cfg(test)]
     pub(crate) async fn refresh_user_global_subscriptions(
         &self,
         user_pubkey: PublicKey,
