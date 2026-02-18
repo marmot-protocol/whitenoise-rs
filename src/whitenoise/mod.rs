@@ -956,7 +956,18 @@ impl Whitenoise {
             return Ok(());
         };
 
-        let signer = self.get_signer_for_account(&signer_account)?;
+        let signer = match self.get_signer_for_account(&signer_account) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::users::refresh_global_subscription",
+                    "Failed to get signer for account {} (user {}), skipping global subscription refresh: {e}",
+                    signer_account.pubkey.to_hex(),
+                    user.pubkey.to_hex(),
+                );
+                return Ok(());
+            }
+        };
         self.nostr
             .refresh_user_global_subscriptions_with_signer(
                 user.pubkey,
