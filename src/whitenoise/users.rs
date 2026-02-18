@@ -19,6 +19,17 @@ use crate::{
 /// Set to 24 hours - metadata doesn't change frequently for most users
 const METADATA_TTL_HOURS: i64 = 24;
 
+/// Status of a user's key package on relays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPackageStatus {
+    /// User has a valid, compatible key package.
+    Valid(Box<Event>),
+    /// No key package event found on relays.
+    NotFound,
+    /// Key package found but is in an old/incompatible format.
+    Incompatible,
+}
+
 /// Specifies how user metadata and relay lists should be synchronized when finding or creating a user.
 ///
 /// This enum controls the synchronization behavior in `find_or_create_user_by_pubkey`, allowing
@@ -170,6 +181,15 @@ impl User {
             .fetch_user_key_package(self.pubkey, &key_package_relays_urls)
             .await?;
         Ok(key_package_event)
+    }
+
+    /// Checks the status of a user's key package on relays.
+    ///
+    /// Similar to [`key_package_event`](Self::key_package_event), but returns a
+    /// [`KeyPackageStatus`] that distinguishes between valid, missing, and incompatible.
+    pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
+        let event = self.key_package_event(whitenoise).await?;
+        Ok(classify_key_package(event))
     }
 
     pub async fn relays_by_type(
@@ -570,6 +590,32 @@ impl User {
         };
 
         Ok(should_update)
+    }
+}
+
+/// Checks whether a key package event has the required `["encoding", "base64"]` tag.
+///
+/// Per MIP-00/MIP-02, key package events must include an explicit encoding tag.
+/// Old key packages published before this requirement lack this tag and are
+/// incompatible with current clients.
+fn has_valid_encoding_tag(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        let s = tag.as_slice();
+        s.len() >= 2 && s[0] == "encoding" && s[1] == "base64"
+    })
+}
+
+/// Determines [`KeyPackageStatus`] from an optional key package event.
+fn classify_key_package(event: Option<Event>) -> KeyPackageStatus {
+    match event {
+        None => KeyPackageStatus::NotFound,
+        Some(event) => {
+            if has_valid_encoding_tag(&event) {
+                KeyPackageStatus::Valid(Box::new(event))
+            } else {
+                KeyPackageStatus::Incompatible
+            }
+        }
     }
 }
 
@@ -2469,6 +2515,102 @@ mod tests {
                 .await;
 
             assert!(result.is_ok());
+        }
+    }
+
+    mod has_valid_encoding_tag_tests {
+        use super::*;
+
+        async fn create_key_package_event_with_tags(tags: Vec<Tag>) -> Event {
+            let keys = Keys::generate();
+            let builder = EventBuilder::new(Kind::MlsKeyPackage, "test-content").tags(tags);
+            builder.sign(&keys).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_valid_encoding_tag() {
+            let event = create_key_package_event_with_tags(vec![Tag::custom(
+                TagKind::Custom("encoding".into()),
+                vec!["base64"],
+            )])
+            .await;
+            assert!(has_valid_encoding_tag(&event));
+        }
+
+        #[tokio::test]
+        async fn test_no_encoding_tag() {
+            let event = create_key_package_event_with_tags(vec![Tag::custom(
+                TagKind::Custom("mls_protocol_version".into()),
+                vec!["1.0"],
+            )])
+            .await;
+            assert!(!has_valid_encoding_tag(&event));
+        }
+
+        #[tokio::test]
+        async fn test_wrong_encoding_value() {
+            let event = create_key_package_event_with_tags(vec![Tag::custom(
+                TagKind::Custom("encoding".into()),
+                vec!["hex"],
+            )])
+            .await;
+            assert!(!has_valid_encoding_tag(&event));
+        }
+
+        #[tokio::test]
+        async fn test_encoding_tag_among_other_tags() {
+            let event = create_key_package_event_with_tags(vec![
+                Tag::custom(TagKind::Custom("mls_protocol_version".into()), vec!["1.0"]),
+                Tag::custom(TagKind::Custom("mls_ciphersuite".into()), vec!["0x0001"]),
+                Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
+                Tag::custom(
+                    TagKind::Custom("relays".into()),
+                    vec!["wss://relay.example.com"],
+                ),
+            ])
+            .await;
+            assert!(has_valid_encoding_tag(&event));
+        }
+
+        #[tokio::test]
+        async fn test_empty_tags() {
+            let event = create_key_package_event_with_tags(vec![]).await;
+            assert!(!has_valid_encoding_tag(&event));
+        }
+    }
+
+    mod classify_key_package_tests {
+        use super::*;
+
+        async fn create_event_with_tags(tags: Vec<Tag>) -> Event {
+            let keys = Keys::generate();
+            let builder = EventBuilder::new(Kind::MlsKeyPackage, "test-content").tags(tags);
+            builder.sign(&keys).await.unwrap()
+        }
+
+        #[test]
+        fn test_none_returns_not_found() {
+            assert_eq!(classify_key_package(None), KeyPackageStatus::NotFound);
+        }
+
+        #[tokio::test]
+        async fn test_valid_event_returns_valid() {
+            let event = create_event_with_tags(vec![Tag::custom(
+                TagKind::Custom("encoding".into()),
+                vec!["base64"],
+            )])
+            .await;
+            let result = classify_key_package(Some(event));
+            assert!(matches!(result, KeyPackageStatus::Valid(_)));
+        }
+
+        #[tokio::test]
+        async fn test_incompatible_event_returns_incompatible() {
+            let event = create_event_with_tags(vec![]).await;
+            assert_eq!(
+                classify_key_package(Some(event)),
+                KeyPackageStatus::Incompatible
+            );
         }
     }
 
