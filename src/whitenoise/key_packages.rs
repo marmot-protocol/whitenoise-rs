@@ -101,35 +101,6 @@ impl Whitenoise {
             .collect()
     }
 
-    /// Gets the appropriate signer for an account.
-    ///
-    /// For external accounts (Amber/NIP-55), returns the stored external signer.
-    /// For local accounts, returns the keys from the secrets store.
-    ///
-    /// Returns an error if no signer is available for the account.
-    fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
-        // First check for a registered external signer
-        if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
-            tracing::debug!(
-                target: "whitenoise::key_packages",
-                "Using external signer for account {}",
-                account.pubkey.to_hex()
-            );
-            return Ok(external_signer);
-        }
-
-        // Fall back to local keys from secrets store
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Using local keys for account {}",
-            account.pubkey.to_hex()
-        );
-        Ok(Arc::new(keys))
-    }
-
     /// Helper method to create and encode a key package for the given account.
     pub(crate) async fn encoded_key_package(
         &self,
