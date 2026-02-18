@@ -30,61 +30,75 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::users::User;
 
-/// Batch fetch metadata for multiple pubkeys.
+/// Tier 1: Batch check User table for metadata.
 ///
-/// Uses the same cache hierarchy as single fetch but optimized for batch operations:
-/// 1. Check User table (skip entries with empty metadata)
-/// 2. Batch query cached_graph_users table
-/// 3. Single batched network request for all cache misses
-///
-/// Returns a map of pubkey -> metadata. Pubkeys for which no metadata could be
-/// retrieved (or whose metadata is empty) are omitted from the map.
-pub(super) async fn get_metadata_batch(
+/// Returns (found metadata map, remaining pubkeys not found or with empty metadata).
+/// Pubkeys with empty metadata (background sync not yet completed) are included in remaining.
+pub(super) async fn check_user_table_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
-) -> HashMap<PublicKey, Metadata> {
-    let mut results: HashMap<PublicKey, Metadata> = HashMap::new();
+) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
+    let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
 
-    // 1. Batch query User table (skip empty metadata — background sync may not have completed)
     let users = User::find_by_pubkeys(pubkeys, &whitenoise.database)
         .await
         .unwrap_or_default();
 
     for user in users {
         if user.metadata != Metadata::new() {
-            results.insert(user.pubkey, user.metadata);
+            found.insert(user.pubkey, user.metadata);
         }
     }
 
-    let mut remaining: Vec<PublicKey> = pubkeys
+    let remaining = pubkeys
         .iter()
-        .filter(|pk| !results.contains_key(pk))
+        .filter(|pk| !found.contains_key(pk))
         .copied()
         .collect();
 
-    if remaining.is_empty() {
-        return results;
-    }
+    (found, remaining)
+}
 
-    // 2. Batch query cache (skip None and empty metadata)
+/// Tier 2: Batch check CachedGraphUser table for metadata.
+///
+/// Returns (found metadata map, remaining pubkeys not found or with None/empty metadata).
+pub(super) async fn check_cache_metadata(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
+    let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
+
     if let Ok(cached_users) =
-        CachedGraphUser::find_fresh_batch(&remaining, &whitenoise.database).await
+        CachedGraphUser::find_fresh_batch(pubkeys, &whitenoise.database).await
     {
         for cached in &cached_users {
             if let Some(ref m) = cached.metadata {
                 if *m != Metadata::new() {
-                    results.insert(cached.pubkey, m.clone());
+                    found.insert(cached.pubkey, m.clone());
                 }
             }
         }
-        remaining.retain(|pk| !results.contains_key(pk));
     }
 
-    if remaining.is_empty() {
-        return results;
-    }
-    // 3. Batch network fetch for cache misses (metadata only)
-    let fetched = fetch_and_cache_metadata_batch(whitenoise, &remaining).await;
+    let remaining = pubkeys
+        .iter()
+        .filter(|pk| !found.contains_key(pk))
+        .copied()
+        .collect();
+
+    (found, remaining)
+}
+
+/// Tier 3: Fetch metadata from network, cache it, return found metadata.
+///
+/// Uses partial upsert so existing follows data is preserved.
+/// Returns only pubkeys that had non-empty metadata.
+pub(super) async fn fetch_network_metadata(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> HashMap<PublicKey, Metadata> {
+    let fetched = fetch_and_cache_metadata_batch(whitenoise, pubkeys).await;
+    let mut results = HashMap::new();
     for cached in fetched {
         if let Some(ref m) = cached.metadata {
             if *m != Metadata::new() {
@@ -92,7 +106,30 @@ pub(super) async fn get_metadata_batch(
             }
         }
     }
+    results
+}
 
+/// Batch fetch metadata for multiple pubkeys (all 3 tiers combined).
+///
+/// Convenience function that runs all three tiers sequentially.
+/// Used by tests; the pipeline uses individual tier functions directly.
+#[cfg(test)]
+pub(super) async fn get_metadata_batch(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> HashMap<PublicKey, Metadata> {
+    let (mut results, remaining) = check_user_table_metadata(whitenoise, pubkeys).await;
+    if remaining.is_empty() {
+        return results;
+    }
+
+    let (cache_results, remaining) = check_cache_metadata(whitenoise, &remaining).await;
+    results.extend(cache_results);
+    if remaining.is_empty() {
+        return results;
+    }
+
+    results.extend(fetch_network_metadata(whitenoise, &remaining).await);
     results
 }
 

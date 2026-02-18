@@ -3,9 +3,10 @@
 //! This module provides streaming user search that traverses the social graph
 //! (web of trust) to find users matching a query, prioritized by social distance.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nostr_sdk::PublicKey;
+use nostr_sdk::{Metadata, PublicKey};
 use tokio::sync::{broadcast, mpsc};
 
 mod graph;
@@ -24,8 +25,12 @@ const RADIUS_FETCH_TIMEOUT_SECS: u64 = 30;
 /// Batch size for processing pubkeys.
 const PUBKEY_BATCH_SIZE: usize = 250;
 
-/// Capacity for the internal candidate channel between follows-producer and metadata-consumer.
+/// Capacity for the candidate channel between follows-producer and tier 1 consumer.
 const CANDIDATE_CHANNEL_CAPACITY: usize = 500;
+
+/// Capacity for inter-tier channels (tier1→tier2, tier2→tier3).
+/// Smaller than the producer channel since each tier resolves some pubkeys.
+const TIER_CHANNEL_CAPACITY: usize = 100;
 
 pub use matcher::{MatchQuality, MatchResult, MatchedField, match_metadata};
 pub(crate) use types::SEARCH_CHANNEL_BUFFER_SIZE;
@@ -155,12 +160,18 @@ enum CandidateBatchKind {
     RadiusComplete { total_pubkeys: usize },
 }
 
-/// Background search task that orchestrates a producer-consumer pipeline.
+/// Background search task that orchestrates a multi-tier pipeline.
 ///
-/// The follows-producer fetches contact lists and pushes candidate batches.
-/// The metadata-consumer fetches metadata, matches, and emits results.
-/// Connected by a bounded mpsc channel for backpressure.
-/// Both run concurrently in the same task via `tokio::join!`.
+/// ```text
+/// Producer → [candidates] → Tier1 (User table) → Tier2 (Cache) → Tier3 (Network)
+///                               ↓ emit              ↓ emit           ↓ emit
+///                           ResultsFound         ResultsFound     ResultsFound
+///                                                                 RadiusCompleted
+///                                                                 SearchCompleted
+/// ```
+///
+/// Each tier emits matches immediately and passes cache misses to the next tier.
+/// Cached results appear in the output stream without waiting for network fetches.
 async fn search_task(
     whitenoise: &Whitenoise,
     tx: broadcast::Sender<UserSearchUpdate>,
@@ -169,23 +180,47 @@ async fn search_task(
     radius_start: u8,
     radius_end: u8,
 ) {
+    let total_results = AtomicUsize::new(0);
+
     let (tx_candidates, rx_candidates) = mpsc::channel(CANDIDATE_CHANNEL_CAPACITY);
+    let (tx_tier2, rx_tier2) = mpsc::channel(TIER_CHANNEL_CAPACITY);
+    let (tx_tier3, rx_tier3) = mpsc::channel(TIER_CHANNEL_CAPACITY);
 
-    let producer_tx = tx.clone();
-
-    // Run producer and consumer concurrently.
-    // Producer drops tx_candidates when done, which closes the channel and
-    // lets the consumer finish. tokio::join! waits for both.
+    // Run producer + 3 tier consumers concurrently.
+    // Channel drops cascade: producer → tier1 → tier2 → tier3 → SearchCompleted.
     tokio::join!(
         follows_producer_task(
             whitenoise,
-            producer_tx,
+            tx.clone(),
             tx_candidates,
             searcher_pubkey,
             radius_start,
             radius_end,
         ),
-        metadata_consumer_task(whitenoise, tx, rx_candidates, &query, radius_end),
+        tier1_user_table_consumer(
+            whitenoise,
+            &tx,
+            rx_candidates,
+            tx_tier2,
+            &query,
+            &total_results,
+        ),
+        tier2_cache_consumer(
+            whitenoise,
+            &tx,
+            rx_tier2,
+            tx_tier3,
+            &query,
+            &total_results,
+        ),
+        tier3_network_consumer(
+            whitenoise,
+            &tx,
+            rx_tier3,
+            &query,
+            &total_results,
+            radius_end,
+        ),
     );
 }
 
@@ -325,63 +360,181 @@ async fn follows_producer_task(
     // tx_candidates is dropped here, signaling completion to consumer
 }
 
-/// Metadata-consumer: receives candidate batches, fetches metadata, matches, emits results.
-async fn metadata_consumer_task(
-    whitenoise: &Whitenoise,
-    tx: broadcast::Sender<UserSearchUpdate>,
-    mut rx_candidates: mpsc::Receiver<CandidateBatch>,
+/// Match metadata against query and emit results via broadcast.
+fn match_and_emit(
+    tx: &broadcast::Sender<UserSearchUpdate>,
+    metadata_map: &HashMap<PublicKey, Metadata>,
+    pubkeys: &[PublicKey],
     query: &str,
-    radius_end: u8,
+    radius: u8,
+    total_results: &AtomicUsize,
 ) {
-    let mut total_results: usize = 0;
+    let mut batch_results = Vec::new();
 
-    while let Some(batch) = rx_candidates.recv().await {
-        // Check if receivers still exist
+    for pk in pubkeys {
+        let metadata = match metadata_map.get(pk) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let match_result = match_metadata(metadata, query);
+        if let (Some(quality), Some(best_field)) =
+            (match_result.quality, match_result.best_field)
+        {
+            batch_results.push(UserSearchResult {
+                pubkey: *pk,
+                metadata: metadata.clone(),
+                radius,
+                match_quality: quality,
+                best_field,
+                matched_fields: match_result.matched_fields,
+            });
+        }
+    }
+
+    if !batch_results.is_empty() {
+        batch_results.sort_by_key(|r| r.sort_key());
+        let count = batch_results.len();
+        let total = total_results.fetch_add(count, Ordering::Relaxed) + count;
+
+        let _ = tx.send(UserSearchUpdate {
+            trigger: SearchUpdateTrigger::ResultsFound,
+            new_results: batch_results,
+            total_result_count: total,
+        });
+    }
+}
+
+/// Tier 1 consumer: checks User table for metadata.
+///
+/// Emits matches immediately, forwards cache misses + sentinels to tier 2.
+async fn tier1_user_table_consumer(
+    whitenoise: &Whitenoise,
+    tx: &broadcast::Sender<UserSearchUpdate>,
+    mut rx: mpsc::Receiver<CandidateBatch>,
+    tx_next: mpsc::Sender<CandidateBatch>,
+    query: &str,
+    total_results: &AtomicUsize,
+) {
+    while let Some(batch) = rx.recv().await {
         if tx.receiver_count() == 0 {
             tracing::debug!(
                 target: "whitenoise::user_search",
-                "Search cancelled - no receivers (consumer)"
+                "Search cancelled - no receivers (tier1)"
             );
             return;
         }
 
         match batch.kind {
             CandidateBatchKind::Candidates(pubkeys) => {
-                let metadata_map = graph::get_metadata_batch(whitenoise, &pubkeys).await;
+                let (found, remaining) =
+                    graph::check_user_table_metadata(whitenoise, &pubkeys).await;
 
-                let mut batch_results = Vec::new();
+                match_and_emit(tx, &found, &pubkeys, query, batch.radius, total_results);
 
-                for pk in &pubkeys {
-                    let metadata = match metadata_map.get(pk) {
-                        Some(m) => m,
-                        None => continue,
-                    };
-
-                    let match_result = match_metadata(metadata, query);
-                    if let (Some(quality), Some(best_field)) =
-                        (match_result.quality, match_result.best_field)
-                    {
-                        batch_results.push(UserSearchResult {
-                            pubkey: *pk,
-                            metadata: metadata.clone(),
+                // Forward cache misses to tier 2
+                if !remaining.is_empty() {
+                    if tx_next
+                        .send(CandidateBatch {
                             radius: batch.radius,
-                            match_quality: quality,
-                            best_field,
-                            matched_fields: match_result.matched_fields,
-                        });
+                            kind: CandidateBatchKind::Candidates(remaining),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
-
-                if !batch_results.is_empty() {
-                    batch_results.sort_by_key(|r| r.sort_key());
-                    total_results += batch_results.len();
-
-                    let _ = tx.send(UserSearchUpdate {
-                        trigger: SearchUpdateTrigger::ResultsFound,
-                        new_results: batch_results,
-                        total_result_count: total_results,
-                    });
+            }
+            CandidateBatchKind::RadiusComplete { .. } => {
+                // Forward sentinel to tier 2
+                if tx_next.send(batch).await.is_err() {
+                    return;
                 }
+            }
+        }
+    }
+    // tx_next dropped here → tier 2 channel closes
+}
+
+/// Tier 2 consumer: checks CachedGraphUser table for metadata.
+///
+/// Emits matches immediately, forwards cache misses + sentinels to tier 3.
+async fn tier2_cache_consumer(
+    whitenoise: &Whitenoise,
+    tx: &broadcast::Sender<UserSearchUpdate>,
+    mut rx: mpsc::Receiver<CandidateBatch>,
+    tx_next: mpsc::Sender<CandidateBatch>,
+    query: &str,
+    total_results: &AtomicUsize,
+) {
+    while let Some(batch) = rx.recv().await {
+        if tx.receiver_count() == 0 {
+            tracing::debug!(
+                target: "whitenoise::user_search",
+                "Search cancelled - no receivers (tier2)"
+            );
+            return;
+        }
+
+        match batch.kind {
+            CandidateBatchKind::Candidates(pubkeys) => {
+                let (found, remaining) =
+                    graph::check_cache_metadata(whitenoise, &pubkeys).await;
+
+                match_and_emit(tx, &found, &pubkeys, query, batch.radius, total_results);
+
+                // Forward cache misses to tier 3
+                if !remaining.is_empty() {
+                    if tx_next
+                        .send(CandidateBatch {
+                            radius: batch.radius,
+                            kind: CandidateBatchKind::Candidates(remaining),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            CandidateBatchKind::RadiusComplete { .. } => {
+                // Forward sentinel to tier 3
+                if tx_next.send(batch).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    // tx_next dropped here → tier 3 channel closes
+}
+
+/// Tier 3 consumer: fetches metadata from network relays.
+///
+/// This is the slowest tier — it makes network requests.
+/// Emits matches, RadiusCompleted (on sentinel), and SearchCompleted (on channel close).
+async fn tier3_network_consumer(
+    whitenoise: &Whitenoise,
+    tx: &broadcast::Sender<UserSearchUpdate>,
+    mut rx: mpsc::Receiver<CandidateBatch>,
+    query: &str,
+    total_results: &AtomicUsize,
+    radius_end: u8,
+) {
+    while let Some(batch) = rx.recv().await {
+        if tx.receiver_count() == 0 {
+            tracing::debug!(
+                target: "whitenoise::user_search",
+                "Search cancelled - no receivers (tier3)"
+            );
+            return;
+        }
+
+        match batch.kind {
+            CandidateBatchKind::Candidates(pubkeys) => {
+                let found = graph::fetch_network_metadata(whitenoise, &pubkeys).await;
+
+                match_and_emit(tx, &found, &pubkeys, query, batch.radius, total_results);
 
                 tokio::task::yield_now().await;
             }
@@ -392,20 +545,21 @@ async fn metadata_consumer_task(
                         total_pubkeys_searched: total_pubkeys,
                     },
                     new_results: vec![],
-                    total_result_count: total_results,
+                    total_result_count: total_results.load(Ordering::Relaxed),
                 });
             }
         }
     }
 
-    // Channel closed — producer is done. Emit SearchCompleted.
+    // Channel closed — all tiers done. Emit SearchCompleted.
+    let total = total_results.load(Ordering::Relaxed);
     let _ = tx.send(UserSearchUpdate {
         trigger: SearchUpdateTrigger::SearchCompleted {
             final_radius: radius_end,
-            total_results,
+            total_results: total,
         },
         new_results: vec![],
-        total_result_count: total_results,
+        total_result_count: total,
     });
 }
 
