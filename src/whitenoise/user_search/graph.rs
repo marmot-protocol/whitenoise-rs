@@ -66,13 +66,15 @@ pub(super) async fn get_metadata_batch(
         return results;
     }
 
-    // 2. Batch query cache (skip empty metadata — same check as tier 1)
+    // 2. Batch query cache (skip None and empty metadata)
     if let Ok(cached_users) =
         CachedGraphUser::find_fresh_batch(&remaining, &whitenoise.database).await
     {
         for cached in &cached_users {
-            if cached.metadata != Metadata::new() {
-                results.insert(cached.pubkey, cached.metadata.clone());
+            if let Some(ref m) = cached.metadata {
+                if *m != Metadata::new() {
+                    results.insert(cached.pubkey, m.clone());
+                }
             }
         }
         remaining.retain(|pk| !results.contains_key(pk));
@@ -81,11 +83,13 @@ pub(super) async fn get_metadata_batch(
     if remaining.is_empty() {
         return results;
     }
-    // 3. Batch network fetch for cache misses
-    let fetched = fetch_and_cache_batch(whitenoise, &remaining).await;
+    // 3. Batch network fetch for cache misses (metadata only)
+    let fetched = fetch_and_cache_metadata_batch(whitenoise, &remaining).await;
     for cached in fetched {
-        if cached.metadata != Metadata::new() {
-            results.insert(cached.pubkey, cached.metadata);
+        if let Some(ref m) = cached.metadata {
+            if *m != Metadata::new() {
+                results.insert(cached.pubkey, m.clone());
+            }
         }
     }
 
@@ -122,14 +126,16 @@ pub(super) async fn get_follows_batch(
         return results;
     }
 
-    // 2. Batch query cache
+    // 2. Batch query cache (skip entries where follows is None — not yet fetched)
     let remaining_vec: Vec<PublicKey> = remaining.iter().copied().collect();
     if let Ok(cached_users) =
         CachedGraphUser::find_fresh_batch(&remaining_vec, &whitenoise.database).await
     {
         for cached in cached_users {
-            results.insert(cached.pubkey, cached.follows);
-            remaining.remove(&cached.pubkey);
+            if let Some(follows) = cached.follows {
+                results.insert(cached.pubkey, follows);
+                remaining.remove(&cached.pubkey);
+            }
         }
     }
 
@@ -137,11 +143,13 @@ pub(super) async fn get_follows_batch(
         return results;
     }
 
-    // 3. Batch network fetch for cache misses
+    // 3. Batch network fetch for cache misses (follows only)
     let needs_fetch: Vec<PublicKey> = remaining.into_iter().collect();
-    let fetched = fetch_and_cache_batch(whitenoise, &needs_fetch).await;
+    let fetched = fetch_and_cache_follows_batch(whitenoise, &needs_fetch).await;
     for cached in fetched {
-        results.insert(cached.pubkey, cached.follows);
+        if let Some(follows) = cached.follows {
+            results.insert(cached.pubkey, follows);
+        }
     }
 
     results
@@ -164,14 +172,40 @@ fn parse_follows_from_event(event: &nostr_sdk::Event) -> Vec<PublicKey> {
         .collect()
 }
 
-/// Batch fetch user data from network and persist to cache.
+/// What kind of data to fetch from relays.
+enum FetchMode {
+    MetadataOnly,
+    FollowsOnly,
+}
+
+/// Batch fetch metadata from network and persist to cache (metadata only).
 ///
-/// Fetches metadata (kind 0) and contact lists (kind 3) for multiple users,
-/// chunking requests to respect relay limits. Chunks are fetched concurrently.
-/// Results are cached for future use by both metadata and follows lookups.
-async fn fetch_and_cache_batch(
+/// Uses partial upsert so existing follows data is preserved.
+pub(super) async fn fetch_and_cache_metadata_batch(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
+) -> Vec<CachedGraphUser> {
+    fetch_and_cache_batch_inner(whitenoise, pubkeys, FetchMode::MetadataOnly).await
+}
+
+/// Batch fetch follows from network and persist to cache (follows only).
+///
+/// Uses partial upsert so existing metadata is preserved.
+pub(super) async fn fetch_and_cache_follows_batch(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+) -> Vec<CachedGraphUser> {
+    fetch_and_cache_batch_inner(whitenoise, pubkeys, FetchMode::FollowsOnly).await
+}
+
+/// Inner implementation for split fetch-and-cache.
+///
+/// Fetches only the requested kind from relays, then uses partial upsert
+/// to avoid clobbering the other field in the cache.
+async fn fetch_and_cache_batch_inner(
+    whitenoise: &Whitenoise,
+    pubkeys: &[PublicKey],
+    mode: FetchMode,
 ) -> Vec<CachedGraphUser> {
     if pubkeys.is_empty() {
         return Vec::new();
@@ -181,6 +215,11 @@ async fn fetch_and_cache_batch(
     if all_relays.is_empty() {
         return Vec::new();
     }
+
+    let kind = match mode {
+        FetchMode::MetadataOnly => Kind::Metadata,
+        FetchMode::FollowsOnly => Kind::ContactList,
+    };
 
     // Fetch events in chunks with bounded concurrency to avoid overly large
     // filter queries while limiting relay load and mobile resource usage
@@ -192,9 +231,7 @@ async fn fetch_and_cache_batch(
     let chunk_results: Vec<_> = stream::iter(chunks.into_iter().map(|chunk| {
         let relays = all_relays.clone();
         async move {
-            let filter = Filter::new()
-                .authors(chunk)
-                .kinds([Kind::Metadata, Kind::ContactList]);
+            let filter = Filter::new().authors(chunk).kinds([kind]);
             whitenoise
                 .nostr
                 .client
@@ -206,8 +243,7 @@ async fn fetch_and_cache_batch(
     .collect()
     .await;
 
-    let mut metadata_by_author: HashMap<PublicKey, Vec<_>> = HashMap::new();
-    let mut contacts_by_author: HashMap<PublicKey, Vec<_>> = HashMap::new();
+    let mut events_by_author: HashMap<PublicKey, Vec<_>> = HashMap::new();
 
     for result in chunk_results {
         let events = match result {
@@ -223,49 +259,38 @@ async fn fetch_and_cache_batch(
         };
 
         for event in events.iter() {
-            match event.kind {
-                Kind::Metadata => {
-                    metadata_by_author
-                        .entry(event.pubkey)
-                        .or_default()
-                        .push(event.clone());
-                }
-                Kind::ContactList => {
-                    contacts_by_author
-                        .entry(event.pubkey)
-                        .or_default()
-                        .push(event.clone());
-                }
-                _ => {}
-            }
+            events_by_author
+                .entry(event.pubkey)
+                .or_default()
+                .push(event.clone());
         }
     }
 
-    // Build and cache results for each pubkey (only cache if we got useful data)
+    // Build and cache results using partial upserts.
+    // We cache "not found" as empty defaults (Metadata::new() / vec![]) so that
+    // subsequent searches get a cache hit instead of re-fetching from relays.
     let mut results = Vec::new();
     for pk in pubkeys {
-        let metadata = metadata_by_author
+        let latest = events_by_author
             .get(pk)
-            .and_then(|events| events.iter().max_by_key(|e| e.created_at))
-            .and_then(|e| serde_json::from_str::<Metadata>(&e.content).ok());
+            .and_then(|events| events.iter().max_by_key(|e| e.created_at));
 
-        let follows = contacts_by_author
-            .get(pk)
-            .and_then(|events| events.iter().max_by_key(|e| e.created_at))
-            .map(parse_follows_from_event);
+        let cache_result = match mode {
+            FetchMode::MetadataOnly => {
+                let metadata = latest
+                    .and_then(|e| serde_json::from_str::<Metadata>(&e.content).ok())
+                    .unwrap_or_default();
+                CachedGraphUser::upsert_metadata_only(pk, &metadata, &whitenoise.database).await
+            }
+            FetchMode::FollowsOnly => {
+                let follows = latest
+                    .map(parse_follows_from_event)
+                    .unwrap_or_default();
+                CachedGraphUser::upsert_follows_only(pk, &follows, &whitenoise.database).await
+            }
+        };
 
-        // Skip caching if we got nothing — avoids poisoning the cache with empty
-        // entries that block future lookups for 24 hours
-        if metadata.is_none() && follows.is_none() {
-            continue;
-        }
-
-        let cached = CachedGraphUser::new(
-            *pk,
-            metadata.unwrap_or_default(),
-            follows.unwrap_or_default(),
-        );
-        match cached.upsert(&whitenoise.database).await {
+        match cache_result {
             Ok(saved) => results.push(saved),
             Err(e) => {
                 tracing::debug!(
@@ -322,10 +347,18 @@ mod tests {
         let follow1 = Keys::generate().public_key();
         let follow2 = Keys::generate().public_key();
 
-        let cached1 = CachedGraphUser::new(keys1.public_key(), Metadata::new(), vec![follow1]);
+        let cached1 = CachedGraphUser::new(
+            keys1.public_key(),
+            Some(Metadata::new()),
+            Some(vec![follow1]),
+        );
         cached1.upsert(&whitenoise.database).await.unwrap();
 
-        let cached2 = CachedGraphUser::new(keys2.public_key(), Metadata::new(), vec![follow2]);
+        let cached2 = CachedGraphUser::new(
+            keys2.public_key(),
+            Some(Metadata::new()),
+            Some(vec![follow2]),
+        );
         cached2.upsert(&whitenoise.database).await.unwrap();
 
         let result =
@@ -351,7 +384,8 @@ mod tests {
         // Cached user
         let cached_pk = Keys::generate().public_key();
         let cached_follow = Keys::generate().public_key();
-        let cached = CachedGraphUser::new(cached_pk, Metadata::new(), vec![cached_follow]);
+        let cached =
+            CachedGraphUser::new(cached_pk, Some(Metadata::new()), Some(vec![cached_follow]));
         cached.upsert(&whitenoise.database).await.unwrap();
 
         let result = get_follows_batch(&whitenoise, &[account.pubkey, cached_pk]).await;
@@ -385,7 +419,7 @@ mod tests {
 
         // Pre-populate cache
         let cached_pk = Keys::generate().public_key();
-        let cached = CachedGraphUser::new(cached_pk, Metadata::new(), vec![]);
+        let cached = CachedGraphUser::new(cached_pk, Some(Metadata::new()), Some(vec![]));
         cached.upsert(&whitenoise.database).await.unwrap();
 
         let unknown_pk = Keys::generate().public_key();
@@ -435,8 +469,8 @@ mod tests {
         let keys = Keys::generate();
         let cached = CachedGraphUser::new(
             keys.public_key(),
-            Metadata::new().name("Bob").about("From cache"),
-            vec![],
+            Some(Metadata::new().name("Bob").about("From cache")),
+            Some(vec![]),
         );
         cached.upsert(&whitenoise.database).await.unwrap();
 
@@ -465,7 +499,11 @@ mod tests {
         user.save(&whitenoise.database).await.unwrap();
 
         // Cache has real metadata
-        let cached = CachedGraphUser::new(keys.public_key(), Metadata::new().name("Alice"), vec![]);
+        let cached = CachedGraphUser::new(
+            keys.public_key(),
+            Some(Metadata::new().name("Alice")),
+            Some(vec![]),
+        );
         cached.upsert(&whitenoise.database).await.unwrap();
 
         let result = get_metadata_batch(&whitenoise, &[keys.public_key()]).await;
@@ -523,8 +561,8 @@ mod tests {
             let keys = Keys::generate();
             let cached = CachedGraphUser::new(
                 keys.public_key(),
-                Metadata::new().name(format!("User{}", i)),
-                vec![],
+                Some(Metadata::new().name(format!("User{}", i))),
+                Some(vec![]),
             );
             cached.upsert(&whitenoise.database).await.unwrap();
             pubkeys.push(keys.public_key());
@@ -557,8 +595,8 @@ mod tests {
         let cached_keys = Keys::generate();
         let cached = CachedGraphUser::new(
             cached_keys.public_key(),
-            Metadata::new().name("FromCache"),
-            vec![],
+            Some(Metadata::new().name("FromCache")),
+            Some(vec![]),
         );
         cached.upsert(&whitenoise.database).await.unwrap();
 

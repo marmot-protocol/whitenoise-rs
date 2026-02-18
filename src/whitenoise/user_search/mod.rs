@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use nostr_sdk::PublicKey;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 mod graph;
 pub mod matcher;
@@ -21,9 +21,11 @@ const MAX_PUBKEYS_PER_RADIUS: usize = 10_000;
 /// Timeout for fetching data at each radius level (seconds).
 const RADIUS_FETCH_TIMEOUT_SECS: u64 = 30;
 
-/// Batch size for processing pubkeys. Aligned with MAX_AUTHORS_PER_FILTER
-/// so each batch produces exactly one relay request for cache misses.
-const PUBKEY_BATCH_SIZE: usize = 40;
+/// Batch size for processing pubkeys.
+const PUBKEY_BATCH_SIZE: usize = 250;
+
+/// Capacity for the internal candidate channel between follows-producer and metadata-consumer.
+const CANDIDATE_CHANNEL_CAPACITY: usize = 500;
 
 pub use matcher::{MatchQuality, MatchResult, MatchedField, match_metadata};
 pub(crate) use types::SEARCH_CHANNEL_BUFFER_SIZE;
@@ -140,7 +142,25 @@ impl Whitenoise {
     }
 }
 
-/// Background search task that performs BFS traversal of the social graph.
+/// A batch of candidate pubkeys sent from the follows-producer to the metadata-consumer.
+struct CandidateBatch {
+    radius: u8,
+    kind: CandidateBatchKind,
+}
+
+enum CandidateBatchKind {
+    /// A batch of pubkeys to fetch metadata for and match.
+    Candidates(Vec<PublicKey>),
+    /// Sentinel indicating a radius level is complete.
+    RadiusComplete { total_pubkeys: usize },
+}
+
+/// Background search task that orchestrates a producer-consumer pipeline.
+///
+/// The follows-producer fetches contact lists and pushes candidate batches.
+/// The metadata-consumer fetches metadata, matches, and emits results.
+/// Connected by a bounded mpsc channel for backpressure.
+/// Both run concurrently in the same task via `tokio::join!`.
 async fn search_task(
     whitenoise: &Whitenoise,
     tx: broadcast::Sender<UserSearchUpdate>,
@@ -149,8 +169,39 @@ async fn search_task(
     radius_start: u8,
     radius_end: u8,
 ) {
+    let (tx_candidates, rx_candidates) = mpsc::channel(CANDIDATE_CHANNEL_CAPACITY);
+
+    let producer_tx = tx.clone();
+
+    // Run producer and consumer concurrently.
+    // Producer drops tx_candidates when done, which closes the channel and
+    // lets the consumer finish. tokio::join! waits for both.
+    tokio::join!(
+        follows_producer_task(
+            whitenoise,
+            producer_tx,
+            tx_candidates,
+            searcher_pubkey,
+            radius_start,
+            radius_end,
+        ),
+        metadata_consumer_task(whitenoise, tx, rx_candidates, &query, radius_end),
+    );
+}
+
+/// Follows-producer: traverses the social graph and pushes candidate batches.
+///
+/// For each radius, fetches follows to build the layer, then pushes batches
+/// of pubkeys to the candidate channel for metadata-matching.
+async fn follows_producer_task(
+    whitenoise: &Whitenoise,
+    tx: broadcast::Sender<UserSearchUpdate>,
+    tx_candidates: mpsc::Sender<CandidateBatch>,
+    searcher_pubkey: PublicKey,
+    radius_start: u8,
+    radius_end: u8,
+) {
     let mut seen_pubkeys: HashSet<PublicKey> = HashSet::new();
-    let mut total_results: usize = 0;
     let mut previous_layer_pubkeys: HashSet<PublicKey> = HashSet::new();
 
     for radius in 0..=radius_end {
@@ -158,21 +209,12 @@ async fn search_task(
         if tx.receiver_count() == 0 {
             tracing::debug!(
                 target: "whitenoise::user_search",
-                "Search cancelled - no receivers"
+                "Search cancelled - no receivers (producer)"
             );
             return;
         }
 
         let in_requested_range = radius >= radius_start;
-
-        // Emit RadiusStarted before fetch so timeout/cap events come after
-        if in_requested_range {
-            let _ = tx.send(UserSearchUpdate {
-                trigger: SearchUpdateTrigger::RadiusStarted { radius },
-                new_results: vec![],
-                total_result_count: total_results,
-            });
-        }
 
         // Build this radius layer
         let layer_pubkeys: HashSet<PublicKey> = if radius == 0 {
@@ -192,7 +234,7 @@ async fn search_task(
                         let _ = tx.send(UserSearchUpdate {
                             trigger: SearchUpdateTrigger::RadiusTimeout { radius },
                             new_results: vec![],
-                            total_result_count: total_results,
+                            total_result_count: 0,
                         });
                     }
                     // Continue with empty layer for this radius
@@ -201,14 +243,13 @@ async fn search_task(
             }
         };
 
-        // Apply cap after deduplication (we already deduplicated in build_layer_from_follows)
+        // Apply cap after deduplication
         let (layer_pubkeys, was_capped) = if layer_pubkeys.len() > MAX_PUBKEYS_PER_RADIUS {
             let actual = layer_pubkeys.len();
             let capped: HashSet<PublicKey> = layer_pubkeys
                 .into_iter()
                 .take(MAX_PUBKEYS_PER_RADIUS)
                 .collect();
-            // Only notify for in-range radii
             if in_requested_range {
                 let _ = tx.send(UserSearchUpdate {
                     trigger: SearchUpdateTrigger::RadiusCapped {
@@ -217,7 +258,7 @@ async fn search_task(
                         actual,
                     },
                     new_results: vec![],
-                    total_result_count: total_results,
+                    total_result_count: 0,
                 });
             }
             (capped, true)
@@ -228,40 +269,102 @@ async fn search_task(
         // Add to seen set
         seen_pubkeys.extend(layer_pubkeys.iter().copied());
 
-        // Only search/emit results for requested radius range
+        // Only push candidates for requested radius range
         if in_requested_range {
+            // Emit RadiusStarted
+            let _ = tx.send(UserSearchUpdate {
+                trigger: SearchUpdateTrigger::RadiusStarted { radius },
+                new_results: vec![],
+                total_result_count: 0,
+            });
+
             let pubkeys_vec: Vec<PublicKey> = layer_pubkeys.iter().copied().collect();
             let total_pubkeys_in_layer = pubkeys_vec.len();
 
+            // Push batches to candidate channel
             for batch in pubkeys_vec.chunks(PUBKEY_BATCH_SIZE) {
-                if tx.receiver_count() == 0 {
-                    tracing::debug!(
-                        target: "whitenoise::user_search",
-                        "Search cancelled - no receivers (during batch processing)"
-                    );
+                if tx_candidates
+                    .send(CandidateBatch {
+                        radius,
+                        kind: CandidateBatchKind::Candidates(batch.to_vec()),
+                    })
+                    .await
+                    .is_err()
+                {
+                    // Consumer dropped — search cancelled
                     return;
                 }
+            }
 
-                // Fetch metadata per batch so cache hits emit results immediately
-                // without waiting for slow network fetches of other batches
-                let metadata_map = graph::get_metadata_batch(whitenoise, batch).await;
+            // Push end-of-radius sentinel
+            if tx_candidates
+                .send(CandidateBatch {
+                    radius,
+                    kind: CandidateBatchKind::RadiusComplete {
+                        total_pubkeys: total_pubkeys_in_layer,
+                    },
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if was_capped {
+                tracing::debug!(
+                    target: "whitenoise::user_search",
+                    "Radius {} was capped at {} pubkeys",
+                    radius,
+                    MAX_PUBKEYS_PER_RADIUS
+                );
+            }
+        }
+
+        previous_layer_pubkeys = layer_pubkeys;
+    }
+    // tx_candidates is dropped here, signaling completion to consumer
+}
+
+/// Metadata-consumer: receives candidate batches, fetches metadata, matches, emits results.
+async fn metadata_consumer_task(
+    whitenoise: &Whitenoise,
+    tx: broadcast::Sender<UserSearchUpdate>,
+    mut rx_candidates: mpsc::Receiver<CandidateBatch>,
+    query: &str,
+    radius_end: u8,
+) {
+    let mut total_results: usize = 0;
+
+    while let Some(batch) = rx_candidates.recv().await {
+        // Check if receivers still exist
+        if tx.receiver_count() == 0 {
+            tracing::debug!(
+                target: "whitenoise::user_search",
+                "Search cancelled - no receivers (consumer)"
+            );
+            return;
+        }
+
+        match batch.kind {
+            CandidateBatchKind::Candidates(pubkeys) => {
+                let metadata_map = graph::get_metadata_batch(whitenoise, &pubkeys).await;
 
                 let mut batch_results = Vec::new();
 
-                for pk in batch {
+                for pk in &pubkeys {
                     let metadata = match metadata_map.get(pk) {
                         Some(m) => m,
                         None => continue,
                     };
 
-                    let match_result = match_metadata(metadata, &query);
+                    let match_result = match_metadata(metadata, query);
                     if let (Some(quality), Some(best_field)) =
                         (match_result.quality, match_result.best_field)
                     {
                         batch_results.push(UserSearchResult {
                             pubkey: *pk,
                             metadata: metadata.clone(),
-                            radius,
+                            radius: batch.radius,
                             match_quality: quality,
                             best_field,
                             matched_fields: match_result.matched_fields,
@@ -282,31 +385,20 @@ async fn search_task(
 
                 tokio::task::yield_now().await;
             }
-
-            let _ = tx.send(UserSearchUpdate {
-                trigger: SearchUpdateTrigger::RadiusCompleted {
-                    radius,
-                    total_pubkeys_searched: total_pubkeys_in_layer,
-                },
-                new_results: vec![],
-                total_result_count: total_results,
-            });
-
-            // Log capping for debugging
-            if was_capped {
-                tracing::debug!(
-                    target: "whitenoise::user_search",
-                    "Radius {} was capped at {} pubkeys",
-                    radius,
-                    MAX_PUBKEYS_PER_RADIUS
-                );
+            CandidateBatchKind::RadiusComplete { total_pubkeys } => {
+                let _ = tx.send(UserSearchUpdate {
+                    trigger: SearchUpdateTrigger::RadiusCompleted {
+                        radius: batch.radius,
+                        total_pubkeys_searched: total_pubkeys,
+                    },
+                    new_results: vec![],
+                    total_result_count: total_results,
+                });
             }
         }
-
-        previous_layer_pubkeys = layer_pubkeys;
     }
 
-    // Search completed successfully
+    // Channel closed — producer is done. Emit SearchCompleted.
     let _ = tx.send(UserSearchUpdate {
         trigger: SearchUpdateTrigger::SearchCompleted {
             final_radius: radius_end,
@@ -678,15 +770,15 @@ mod tests {
 
         let cached1 = CachedGraphUser::new(
             user1.public_key(),
-            Metadata::new().name("User1"),
-            vec![target_keys.public_key()],
+            Some(Metadata::new().name("User1")),
+            Some(vec![target_keys.public_key()]),
         );
         cached1.upsert(&whitenoise.database).await.unwrap();
 
         let cached2 = CachedGraphUser::new(
             user2.public_key(),
-            Metadata::new().name("User2"),
-            vec![target_keys.public_key()],
+            Some(Metadata::new().name("User2")),
+            Some(vec![target_keys.public_key()]),
         );
         cached2.upsert(&whitenoise.database).await.unwrap();
 
@@ -703,8 +795,8 @@ mod tests {
         // Add target to cache
         let target_cached = CachedGraphUser::new(
             target_keys.public_key(),
-            Metadata::new().name("DedupeTarget"),
-            vec![],
+            Some(Metadata::new().name("DedupeTarget")),
+            Some(vec![]),
         );
         target_cached.upsert(&whitenoise.database).await.unwrap();
 
@@ -755,8 +847,8 @@ mod tests {
         // Populate the cache with real metadata
         let cached = CachedGraphUser::new(
             followed_keys.public_key(),
-            Metadata::new().name("aleups").display_name("Aleups"),
-            vec![],
+            Some(Metadata::new().name("aleups").display_name("Aleups")),
+            Some(vec![]),
         );
         cached.upsert(&whitenoise.database).await.unwrap();
 
