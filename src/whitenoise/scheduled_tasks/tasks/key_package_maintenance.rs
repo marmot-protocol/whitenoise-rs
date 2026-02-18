@@ -43,56 +43,22 @@ impl Task for KeyPackageMaintenance {
             return Ok(());
         }
 
-        let mut checked = 0usize;
-        let mut published = 0usize;
-        let mut rotated = 0usize;
-        let mut skipped = 0usize;
-        let mut errors = 0usize;
-
         let results: Vec<MaintenanceResult> = stream::iter(accounts)
             .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
             .await;
 
-        // Summarize results
-        for result in results {
-            checked += 1;
-            match result {
-                MaintenanceResult::Fresh => {}
-                MaintenanceResult::Published => {
-                    published += 1;
-                }
-                MaintenanceResult::Rotated { deleted } => {
-                    rotated += 1;
-                    tracing::debug!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Rotated key package, deleted {} old one(s)",
-                        deleted
-                    );
-                }
-                MaintenanceResult::Skipped => {
-                    skipped += 1;
-                }
-                MaintenanceResult::Error(e) => {
-                    errors += 1;
-                    tracing::warn!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Error during key package maintenance: {}",
-                        e
-                    );
-                }
-            }
-        }
+        let summary = summarize_maintenance_results(results);
 
         tracing::info!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Key package maintenance completed: {} checked, {} published, {} rotated, {} skipped, {} errors",
-            checked,
-            published,
-            rotated,
-            skipped,
-            errors
+            summary.checked,
+            summary.published,
+            summary.rotated,
+            summary.skipped,
+            summary.errors
         );
 
         Ok(())
@@ -110,6 +76,46 @@ enum MaintenanceResult {
     Skipped,
     /// An error occurred
     Error(WhitenoiseError),
+}
+
+/// Summary counters from maintenance results.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct MaintenanceSummary {
+    checked: usize,
+    published: usize,
+    rotated: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+/// Tallies maintenance results into summary counters.
+fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> MaintenanceSummary {
+    let mut summary = MaintenanceSummary::default();
+    for result in results {
+        summary.checked += 1;
+        match result {
+            MaintenanceResult::Fresh => {}
+            MaintenanceResult::Published => summary.published += 1,
+            MaintenanceResult::Rotated { deleted } => {
+                summary.rotated += 1;
+                tracing::debug!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Rotated key package, deleted {} old one(s)",
+                    deleted
+                );
+            }
+            MaintenanceResult::Skipped => summary.skipped += 1,
+            MaintenanceResult::Error(e) => {
+                summary.errors += 1;
+                tracing::warn!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Error during key package maintenance: {}",
+                    e
+                );
+            }
+        }
+    }
+    summary
 }
 
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
@@ -196,11 +202,12 @@ async fn rotate_expired_packages(
     );
 
     // Publish new key package first (so there's no gap)
-    if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
-        match e {
-            WhitenoiseError::AccountMissingKeyPackageRelays => return MaintenanceResult::Skipped,
-            _ => return MaintenanceResult::Error(e),
+    match whitenoise.publish_key_package_for_account(account).await {
+        Ok(()) => {}
+        Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {
+            return MaintenanceResult::Skipped;
         }
+        Err(e) => return MaintenanceResult::Error(e),
     }
 
     tracing::debug!(
@@ -296,6 +303,49 @@ mod tests {
     fn test_find_expired_packages_handles_empty_input() {
         let expired = find_expired_packages(&[]);
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_empty() {
+        let summary = summarize_maintenance_results(vec![]);
+        assert_eq!(summary, MaintenanceSummary::default());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_mixed() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Published,
+            MaintenanceResult::Rotated { deleted: 3 },
+            MaintenanceResult::Skipped,
+            MaintenanceResult::Error(WhitenoiseError::AccountNotFound),
+            MaintenanceResult::Fresh,
+        ];
+
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 6);
+        assert_eq!(summary.published, 1);
+        assert_eq!(summary.rotated, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_all_fresh() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+        ];
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 3);
+        assert_eq!(summary.published, 0);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(KEY_PACKAGE_MAX_AGE, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
     }
 
     // NOTE: Relay-dependent tests (publish when none exist, leave fresh
