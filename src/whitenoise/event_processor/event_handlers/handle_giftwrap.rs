@@ -238,12 +238,14 @@ impl Whitenoise {
             key_rotation_result,
             image_sync_result,
             welcomer_user_result,
+            self_update_result,
         ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, signer),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
+            Self::perform_self_update(whitenoise, account, group_id),
         );
 
         // Log any errors (operations are independent, so we log all failures)
@@ -298,6 +300,16 @@ impl Whitenoise {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
                 "Failed to ensure welcomer user exists: {}",
+                e
+            );
+        }
+
+        if let Err(e) = self_update_result {
+            tracing::error!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to perform post-welcome self-update for account {} in group {}: {}",
+                account.pubkey.to_hex(),
+                hex::encode(group_id.as_slice()),
                 e
             );
         }
@@ -443,6 +455,52 @@ impl Whitenoise {
         whitenoise
             .find_or_create_user_by_pubkey(&welcomer_pubkey, crate::UserSyncMode::Background)
             .await?;
+        Ok(())
+    }
+
+    /// Perform MLS self-update after joining a group (MIP-02 requirement).
+    ///
+    /// Rotates the member's leaf node key material so the group no longer
+    /// relies on the KeyPackage that was publicly available on relays.
+    /// This is a security-critical operation for forward secrecy.
+    ///
+    /// Per MIP-03, the evolution event is published to relays *before* merging
+    /// the pending commit locally. This ensures we only advance local state
+    /// after confirming the relay accepted the event. If publishing fails,
+    /// the pending commit is never merged and the group state remains unchanged.
+    async fn perform_self_update(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let relay_urls = {
+            let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+            Self::ensure_group_relays(&mdk, group_id)?
+        };
+
+        let evolution_event = {
+            let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+            let update_result = mdk.self_update(group_id)?;
+            update_result.evolution_event
+        };
+
+        // Publish first — only merge locally after relays accept the event
+        whitenoise
+            .nostr
+            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .await?;
+
+        // Relay accepted the event, now safe to advance local state
+        let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+        mdk.merge_pending_commit(group_id)?;
+
+        tracing::info!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            "Self-update completed for account {} in group {}",
+            account.pubkey.to_hex(),
+            hex::encode(group_id.as_slice())
+        );
+
         Ok(())
     }
 
@@ -738,5 +796,57 @@ mod tests {
             .filter(|ag| ag.mls_group_id == group_id)
             .collect();
         assert_eq!(matching.len(), 1, "Should have exactly one AccountGroup");
+    }
+
+    #[tokio::test]
+    async fn test_self_update_after_welcome_advances_epoch() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create creator and one member account
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        // Build and process a real MLS Welcome
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        // Get the group and record the epoch after welcome acceptance (before background tasks)
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(!groups.is_empty(), "Member should have at least one group");
+        let group = &groups[0];
+        let group_id = group.mls_group_id.clone();
+        let epoch_after_welcome = group.epoch;
+
+        // Run finalize_welcome_with_instance which includes perform_self_update
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &member_account,
+            &group_id,
+            &group.name,
+            None,
+            creator_account.pubkey,
+        )
+        .await;
+
+        // Re-read the group and verify epoch advanced
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let updated_group = mdk.get_group(&group_id).unwrap().expect("group must exist");
+        assert_eq!(
+            updated_group.epoch,
+            epoch_after_welcome + 1,
+            "Epoch should advance by 1 after self-update (was {}, now {})",
+            epoch_after_welcome,
+            updated_group.epoch
+        );
     }
 }

@@ -31,8 +31,17 @@ impl Scenario for BasicMessagingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Note: MLS membership is auto-finalized when welcome is received,
-        // so members can participate immediately without explicit accept
+        // Wait for the member to receive and process the welcome message
+        WaitForWelcomeTestCase::for_account("basic_msg_member", "basic_messaging_test_group")
+            .execute(&mut self.context)
+            .await?;
+
+        // Verify the member performed a post-welcome self-update (MIP-02).
+        // This confirms the member's leaf node key material was rotated,
+        // replacing the publicly-available KeyPackage keys with fresh material.
+        VerifySelfUpdateTestCase::for_account("basic_msg_member", "basic_messaging_test_group")
+            .execute(&mut self.context)
+            .await?;
 
         SendMessageTestCase::basic()
             .with_sender("basic_msg_creator")
