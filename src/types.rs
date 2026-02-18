@@ -865,4 +865,49 @@ mod tests {
         };
         assert!(!exhausted.should_retry());
     }
+
+    #[test]
+    fn test_retry_info_delay_ms_exponential_backoff() {
+        let info = RetryInfo::new();
+        // attempt 0 → 1000 * 2^0 = 1000
+        assert_eq!(info.delay_ms(), 1000);
+
+        let attempt_3 = RetryInfo {
+            attempt: 3,
+            max_attempts: 10,
+            base_delay_ms: 1000,
+        };
+        // attempt 3 → 1000 * 2^3 = 8000
+        assert_eq!(attempt_3.delay_ms(), 8000);
+    }
+
+    #[test]
+    fn test_retry_info_next_attempt() {
+        let info = RetryInfo::new();
+        let next = info.next_attempt().expect("should have next attempt");
+        assert_eq!(next.attempt, 1);
+        assert_eq!(next.max_attempts, 10);
+        assert_eq!(next.base_delay_ms, 1000);
+    }
+
+    #[test]
+    fn test_retry_info_next_attempt_exhausted() {
+        let exhausted = RetryInfo {
+            attempt: 10,
+            max_attempts: 10,
+            base_delay_ms: 1000,
+        };
+        assert!(exhausted.next_attempt().is_none());
+    }
+
+    #[test]
+    fn test_retry_info_next_attempt_chain() {
+        let mut info = RetryInfo::new();
+        for i in 1..=10 {
+            info = info.next_attempt().expect("should have next attempt");
+            assert_eq!(info.attempt, i);
+        }
+        // 11th attempt should return None
+        assert!(info.next_attempt().is_none());
+    }
 }

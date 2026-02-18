@@ -494,6 +494,71 @@ mod tests {
     }
 
     // NOTE: Other relay-dependent tests (publish when none exist, leave fresh
+    #[test]
+    fn test_task_properties() {
+        let task = KeyPackageMaintenance;
+
+        assert_eq!(task.name(), "key_package_maintenance");
+        assert_eq!(task.interval(), Duration::from_secs(60 * 10)); // 10 minutes
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_no_accounts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
+        let task = KeyPackageMaintenance;
+        let result = task.execute(whitenoise).await;
+
+        // Should succeed - just logs "No accounts found, skipping"
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_find_expired_packages_returns_old_packages() {
+        let keys = nostr_sdk::Keys::generate();
+
+        // Create an event with a timestamp 31 days in the past
+        let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        let old_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old")
+            .custom_created_at(old_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Create an event with a fresh timestamp
+        let fresh_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![old_event.clone(), fresh_event.clone()];
+        let expired = find_expired_packages(&packages);
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, old_event.id);
+    }
+
+    #[test]
+    fn test_find_expired_packages_returns_empty_when_all_fresh() {
+        let keys = nostr_sdk::Keys::generate();
+
+        let fresh1 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh1")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let fresh2 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh2")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let expired = find_expired_packages(&[fresh1, fresh2]);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn test_find_expired_packages_handles_empty_input() {
+        let expired = find_expired_packages(&[]);
+        assert!(expired.is_empty());
+    }
+
+    // NOTE: Relay-dependent tests (publish when none exist, leave fresh
     // packages alone, rotate expired packages) live in the integration test
     // suite at src/integration_tests/test_cases/scheduler/key_package_maintenance.rs
     // and are exercised via `just int-test scheduler`.
