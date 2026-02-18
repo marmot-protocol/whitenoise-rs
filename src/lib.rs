@@ -34,6 +34,9 @@ pub use whitenoise::accounts_groups::AccountGroup;
 pub use whitenoise::group_information::{GroupInformation, GroupType};
 pub use whitenoise::relays::{Relay, RelayType};
 
+// Drafts
+pub use whitenoise::drafts::Draft;
+
 // Media files
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 
