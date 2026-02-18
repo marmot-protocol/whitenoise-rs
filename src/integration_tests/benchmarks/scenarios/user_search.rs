@@ -7,7 +7,7 @@ use nostr_sdk::PublicKey;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkResult, BenchmarkScenario};
 use crate::integration_tests::core::ScenarioContext;
 use crate::whitenoise::user_search::UserSearchParams;
-use crate::{SearchUpdateTrigger, UserSearchResult, Whitenoise, WhitenoiseError};
+use crate::{SearchUpdateTrigger, Whitenoise, WhitenoiseError};
 
 /// Target npub for the benchmark searcher identity.
 /// This user's social graph is traversed during the benchmark.
@@ -25,12 +25,26 @@ const SEARCH_TARGETS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Timing data for a single search run.
+struct SearchTimings {
+    /// When the first ResultsFound event arrived (any result).
+    time_to_first_result: Option<Duration>,
+    /// When the expected target pubkey first appeared in results.
+    time_to_target: Option<Duration>,
+    /// Per-radius timing (RadiusStarted → RadiusCompleted).
+    radius_timings: Vec<(String, Duration)>,
+    /// Total time from search start to SearchCompleted.
+    time_to_complete: Duration,
+    /// Total results found.
+    total_results: usize,
+}
+
 pub struct UserSearchBenchmark;
 
 #[async_trait]
 impl BenchmarkScenario for UserSearchBenchmark {
     fn name(&self) -> &str {
-        "User Search - Cold Run"
+        "User Search - Time to Result"
     }
 
     fn config(&self) -> BenchmarkConfig {
@@ -42,7 +56,6 @@ impl BenchmarkScenario for UserSearchBenchmark {
     }
 
     async fn setup(&mut self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
-        // Create an identity to use as the searcher
         let account = context.whitenoise.create_identity().await?;
         context.add_account("searcher", account);
         Ok(())
@@ -52,7 +65,6 @@ impl BenchmarkScenario for UserSearchBenchmark {
         &self,
         _context: &mut ScenarioContext,
     ) -> Result<Duration, WhitenoiseError> {
-        // Not used — we override run_benchmark for custom orchestration
         unreachable!()
     }
 
@@ -79,74 +91,67 @@ impl BenchmarkScenario for UserSearchBenchmark {
                 WhitenoiseError::Other(anyhow::anyhow!("Failed to follow target: {}", e))
             })?;
 
-        tracing::info!("=== Benchmark: Layer Building ===");
-
-        // Measure radius 0-1 search (layer building + metadata resolution)
-        let (r1_timings, _) = run_search_and_collect(whitenoise, "", searcher_pubkey, 0, 1).await?;
-
-        for (label, duration) in &r1_timings {
-            tracing::info!("  {}: {:?}", label, duration);
-        }
-
-        // Measure radius 2 search (friends-of-friends)
-        let (r2_timings, _) = run_search_and_collect(whitenoise, "", searcher_pubkey, 0, 2).await?;
-
-        for (label, duration) in &r2_timings {
-            tracing::info!("  {}: {:?}", label, duration);
-        }
-
-        tracing::info!("=== Benchmark: Name Search ===");
-
-        let mut search_timings: Vec<Duration> = Vec::new();
+        let mut all_timings: Vec<Duration> = Vec::new();
 
         for &(query, expected_npub) in SEARCH_TARGETS {
             let expected_pk = PublicKey::parse(expected_npub).map_err(|e| {
                 WhitenoiseError::InvalidInput(format!("Invalid target npub: {}", e))
             })?;
 
-            let start = Instant::now();
-            let (timings, results) =
-                run_search_and_collect(whitenoise, query, searcher_pubkey, 0, 2).await?;
-            let total = start.elapsed();
+            // === Cold search (no cache) ===
+            tracing::info!("=== Cold search: '{}' ===", query);
+            let cold = run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk)
+                .await?;
 
-            let found = results.iter().any(|r| r.pubkey == expected_pk);
+            log_timings("Cold", query, &cold);
+            all_timings.push(cold.time_to_target.unwrap_or(cold.time_to_complete));
 
-            tracing::info!(
-                "  Search '{}': {:?} (found={}, results={})",
-                query,
-                total,
-                found,
-                results.len()
-            );
-            for (label, duration) in &timings {
-                tracing::info!("    {}: {:?}", label, duration);
-            }
+            // === Warm search (cache populated from cold run) ===
+            tracing::info!("=== Warm search: '{}' ===", query);
+            let warm = run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk)
+                .await?;
 
-            search_timings.push(total);
+            log_timings("Warm", query, &warm);
+            all_timings.push(warm.time_to_target.unwrap_or(warm.time_to_complete));
         }
 
-        // Use the total of all search timings as the benchmark duration
-        let total_duration: Duration = search_timings.iter().sum();
+        let total_duration: Duration = all_timings.iter().sum();
 
         Ok(BenchmarkResult::from_timings(
             self.name().to_string(),
             &self.config(),
-            search_timings,
+            all_timings,
             total_duration,
         ))
     }
 }
 
-/// Run a search and collect timing breakdowns from streaming updates.
-///
-/// Returns per-radius timing labels and all search results found.
-async fn run_search_and_collect(
+fn log_timings(phase: &str, query: &str, t: &SearchTimings) {
+    tracing::info!(
+        "  [{phase}] '{query}': target={}, first_result={}, complete={:?} ({} results)",
+        t.time_to_target
+            .map(|d| format!("{d:?}"))
+            .unwrap_or_else(|| "NOT FOUND".to_string()),
+        t.time_to_first_result
+            .map(|d| format!("{d:?}"))
+            .unwrap_or_else(|| "none".to_string()),
+        t.time_to_complete,
+        t.total_results,
+    );
+    for (label, duration) in &t.radius_timings {
+        tracing::info!("    {}: {:?}", label, duration);
+    }
+}
+
+/// Run a search, tracking when the target pubkey first appears in the result stream.
+async fn run_search_timed(
     whitenoise: &Whitenoise,
     query: &str,
     searcher_pubkey: PublicKey,
     radius_start: u8,
     radius_end: u8,
-) -> Result<(Vec<(String, Duration)>, Vec<UserSearchResult>), WhitenoiseError> {
+    target_pubkey: &PublicKey,
+) -> Result<SearchTimings, WhitenoiseError> {
     let sub = whitenoise
         .search_users(UserSearchParams {
             query: query.to_string(),
@@ -157,9 +162,11 @@ async fn run_search_and_collect(
         .await?;
 
     let mut rx = sub.updates;
-    let mut timings: Vec<(String, Duration)> = Vec::new();
-    let mut results = Vec::new();
+    let mut radius_timings: Vec<(String, Duration)> = Vec::new();
     let mut radius_starts: HashMap<u8, Instant> = HashMap::new();
+    let mut time_to_first_result: Option<Duration> = None;
+    let mut time_to_target: Option<Duration> = None;
+    let mut total_results: usize = 0;
     let overall_start = Instant::now();
 
     loop {
@@ -173,7 +180,7 @@ async fn run_search_and_collect(
                     total_pubkeys_searched,
                 } => {
                     if let Some(start) = radius_starts.get(radius) {
-                        timings.push((
+                        radius_timings.push((
                             format!("Radius {} ({} pubkeys)", radius, total_pubkeys_searched),
                             start.elapsed(),
                         ));
@@ -181,7 +188,8 @@ async fn run_search_and_collect(
                 }
                 SearchUpdateTrigger::RadiusTimeout { radius } => {
                     if let Some(start) = radius_starts.get(radius) {
-                        timings.push((format!("Radius {} (TIMEOUT)", radius), start.elapsed()));
+                        radius_timings
+                            .push((format!("Radius {} (TIMEOUT)", radius), start.elapsed()));
                     }
                 }
                 SearchUpdateTrigger::RadiusCapped {
@@ -197,7 +205,23 @@ async fn run_search_and_collect(
                     );
                 }
                 SearchUpdateTrigger::ResultsFound => {
-                    results.extend(update.new_results);
+                    let batch_size = update.new_results.len();
+                    total_results += batch_size;
+
+                    if time_to_first_result.is_none() && batch_size > 0 {
+                        time_to_first_result = Some(overall_start.elapsed());
+                    }
+
+                    if time_to_target.is_none() {
+                        if update.new_results.iter().any(|r| r.pubkey == *target_pubkey) {
+                            time_to_target = Some(overall_start.elapsed());
+                            tracing::info!(
+                                "    >> Target found at {:?} (after {} total results)",
+                                time_to_target.unwrap(),
+                                total_results
+                            );
+                        }
+                    }
                 }
                 SearchUpdateTrigger::SearchCompleted { .. } => break,
                 SearchUpdateTrigger::Error { message } => {
@@ -211,7 +235,11 @@ async fn run_search_and_collect(
         }
     }
 
-    timings.push(("Total".to_string(), overall_start.elapsed()));
-
-    Ok((timings, results))
+    Ok(SearchTimings {
+        time_to_first_result,
+        time_to_target,
+        radius_timings,
+        time_to_complete: overall_start.elapsed(),
+        total_results,
+    })
 }
