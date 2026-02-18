@@ -1,8 +1,9 @@
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::{RetryConfig, ScenarioContext, TestCase, retry_until};
-use async_trait::async_trait;
 
 /// Verifies that a member's MLS epoch has advanced after joining a group,
 /// confirming the post-welcome self-update (MIP-02) completed successfully.
@@ -33,7 +34,7 @@ impl VerifySelfUpdateTestCase {
     /// * `group_name` - Name of the group to check
     pub fn new(account_names: Vec<&str>, group_name: &str) -> Self {
         Self {
-            account_names: account_names.into_iter().map(String::from).collect(),
+            account_names: account_names.into_iter().map(str::to_string).collect(),
             group_name: group_name.to_string(),
             min_expected_epoch: 2,
         }
@@ -52,10 +53,12 @@ impl TestCase for VerifySelfUpdateTestCase {
         let group_id = group.mls_group_id.clone();
         let wn = context.whitenoise;
 
-        // The self-update runs as a background task after welcome processing.
-        // Use a longer retry window than default since it involves MDK operations
-        // and a relay round-trip for publishing the evolution event.
-        let config = RetryConfig::new(20, Duration::from_millis(250));
+        // The self-update runs as a deferred background task after welcome
+        // processing. It waits for in-flight messages at the current epoch to
+        // arrive before advancing the epoch, then performs MDK operations and
+        // a relay round-trip. Use a generous retry window to accommodate the
+        // intentional delay plus network/processing time.
+        let config = RetryConfig::new(40, Duration::from_millis(500));
 
         for account_name in &self.account_names {
             let account = context.get_account(account_name)?;

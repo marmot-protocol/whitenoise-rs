@@ -238,14 +238,12 @@ impl Whitenoise {
             key_rotation_result,
             image_sync_result,
             welcomer_user_result,
-            self_update_result,
         ) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::setup_group_subscriptions(whitenoise, account, signer),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
-            Self::perform_self_update(whitenoise, account, group_id),
         );
 
         // Log any errors (operations are independent, so we log all failures)
@@ -304,7 +302,21 @@ impl Whitenoise {
             );
         }
 
-        if let Err(e) = self_update_result {
+        // Perform self-update AFTER other tasks complete, especially after
+        // subscriptions are set up. The self-update advances the group epoch,
+        // so it must run after the member is fully subscribed and has had a
+        // chance to receive any messages sent at the current epoch. Running
+        // it concurrently would cause epoch mismatches: other members' messages
+        // sent at epoch N would be rejected because the local state already
+        // advanced to epoch N+1 via the self-update.
+        //
+        // We add a brief delay to allow in-flight messages at the current
+        // epoch to arrive via the newly-established subscriptions before we
+        // advance to the next epoch. Without this, messages that were sent
+        // by other members between group creation and the self-update would
+        // be rejected with "Wrong Epoch" errors.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
                 "Failed to perform post-welcome self-update for account {} in group {}: {}",
