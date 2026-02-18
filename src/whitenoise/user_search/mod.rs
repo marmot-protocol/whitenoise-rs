@@ -22,7 +22,7 @@ const MAX_PUBKEYS_PER_RADIUS: usize = 10_000;
 const RADIUS_FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Batch size for processing pubkeys (affects cancellation responsiveness).
-const PUBKEY_BATCH_SIZE: usize = 50;
+const PUBKEY_BATCH_SIZE: usize = 250;
 
 pub use matcher::{MatchQuality, MatchResult, MatchedField, match_metadata};
 pub(crate) use types::SEARCH_CHANNEL_BUFFER_SIZE;
