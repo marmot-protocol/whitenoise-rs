@@ -404,9 +404,7 @@ impl Account {
         whitenoise: &Whitenoise,
     ) -> Result<String> {
         let client = BlossomClient::new(server);
-        let keys = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&self.pubkey)?;
+        let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;
 
         let descriptor = client
@@ -414,7 +412,7 @@ impl Account {
                 data,
                 Some(image_type.mime_type().to_string()),
                 None,
-                Some(&keys),
+                Some(&signer),
             )
             .await
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
@@ -556,6 +554,10 @@ impl Whitenoise {
 
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
 
+        // Register the signer before activating the account so that subscription
+        // setup can use it for NIP-42 AUTH on relays that require it.
+        self.insert_external_signer(pubkey, signer.clone()).await?;
+
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
             &account,
@@ -566,7 +568,6 @@ impl Whitenoise {
         )
         .await?;
 
-        self.register_external_signer(pubkey, signer.clone());
         self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
             .await?;
 
@@ -704,17 +705,27 @@ impl Whitenoise {
         }
 
         // Publish all three relay list events.
-        self.publish_relay_list(&default_relays, RelayType::Nip65, &default_relays, &keys)
-            .await
-            .map_err(LoginError::from)?;
-        self.publish_relay_list(&default_relays, RelayType::Inbox, &default_relays, &keys)
-            .await
-            .map_err(LoginError::from)?;
+        self.publish_relay_list(
+            &default_relays,
+            RelayType::Nip65,
+            &default_relays,
+            keys.clone(),
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.publish_relay_list(
+            &default_relays,
+            RelayType::Inbox,
+            &default_relays,
+            keys.clone(),
+        )
+        .await
+        .map_err(LoginError::from)?;
         self.publish_relay_list(
             &default_relays,
             RelayType::KeyPackage,
             &default_relays,
-            &keys,
+            keys,
         )
         .await
         .map_err(LoginError::from)?;
@@ -903,7 +914,9 @@ impl Whitenoise {
             }
             None => {
                 // Stash the signer so continuation methods can use it.
-                self.register_external_signer(pubkey, signer);
+                self.insert_external_signer(pubkey, signer)
+                    .await
+                    .map_err(LoginError::from)?;
                 self.pending_logins.insert(pubkey);
                 tracing::info!(
                     target: "whitenoise::accounts",
@@ -1174,6 +1187,12 @@ impl Whitenoise {
     where
         S: NostrSigner + Clone + 'static,
     {
+        // Register the signer before activating the account so that subscription
+        // setup can use it for NIP-42 AUTH on relays that require it.
+        self.insert_external_signer(account.pubkey, signer.clone())
+            .await
+            .map_err(LoginError::from)?;
+
         let user = account
             .user(&self.database)
             .await
@@ -1187,8 +1206,6 @@ impl Whitenoise {
         )
         .await
         .map_err(LoginError::from)?;
-
-        self.register_external_signer(account.pubkey, signer.clone());
 
         self.publish_key_package_for_account_with_signer(account, signer)
             .await
@@ -1298,7 +1315,7 @@ impl Whitenoise {
     /// Validates that an external signer's pubkey matches the expected pubkey.
     ///
     /// This prevents publishing relay lists or key packages under a wrong identity.
-    async fn validate_signer_pubkey(
+    pub(crate) async fn validate_signer_pubkey(
         &self,
         expected_pubkey: &PublicKey,
         signer: &impl NostrSigner,
@@ -1378,13 +1395,16 @@ impl Whitenoise {
     /// Test-only: Sets up an external signer account without publishing.
     ///
     /// This is used by tests that only need to verify account creation/migration
-    /// logic without needing a real signer for publishing.
+    /// logic without needing a real signer for publishing. The provided keys are
+    /// used as the mock signer (their pubkey must match `keys.public_key()`).
     #[cfg(test)]
-    pub(crate) async fn login_with_external_signer_for_test(
-        &self,
-        pubkey: PublicKey,
-    ) -> Result<Account> {
+    pub(crate) async fn login_with_external_signer_for_test(&self, keys: Keys) -> Result<Account> {
+        let pubkey = keys.public_key();
         let (account, relay_setup) = self.setup_external_signer_account(pubkey).await?;
+
+        // Register the keys as a signer so subscription setup can proceed.
+        // In production, the real signer is registered before activation.
+        self.insert_external_signer(pubkey, keys).await?;
 
         let user = account.user(&self.database).await?;
         self.activate_account_without_publishing(
@@ -1686,9 +1706,7 @@ impl Whitenoise {
         account: &mut Account,
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
         let default_relays = self.load_default_relays().await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
 
         // NIP-65 must be fetched first because Inbox and KeyPackage use the
         // discovered NIP-65 relays as their query source.
@@ -1722,16 +1740,26 @@ impl Whitenoise {
         // Publish any relay lists that need publishing concurrently.
         let nip65_publish = async {
             if should_publish_nip65 {
-                self.publish_relay_list(&nip65_relays, RelayType::Nip65, &nip65_relays, &keys)
-                    .await
+                self.publish_relay_list(
+                    &nip65_relays,
+                    RelayType::Nip65,
+                    &nip65_relays,
+                    signer.clone(),
+                )
+                .await
             } else {
                 Ok(())
             }
         };
         let inbox_publish = async {
             if should_publish_inbox {
-                self.publish_relay_list(&inbox_relays, RelayType::Inbox, &nip65_relays, &keys)
-                    .await
+                self.publish_relay_list(
+                    &inbox_relays,
+                    RelayType::Inbox,
+                    &nip65_relays,
+                    signer.clone(),
+                )
+                .await
             } else {
                 Ok(())
             }
@@ -1742,7 +1770,7 @@ impl Whitenoise {
                     &key_package_relays,
                     RelayType::KeyPackage,
                     &nip65_relays,
-                    &keys,
+                    signer.clone(),
                 )
                 .await
             } else {
@@ -1919,22 +1947,20 @@ impl Whitenoise {
         Ok(())
     }
 
-    async fn publish_relay_list(
+    async fn publish_relay_list<S>(
         &self,
         relays: &[Relay],
         relay_type: RelayType,
         target_relays: &[Relay],
-        keys: &Keys,
-    ) -> Result<()> {
+        signer: S,
+    ) -> Result<()>
+    where
+        S: NostrSigner + 'static,
+    {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.nostr
-            .publish_relay_list_with_signer(
-                &relays_urls,
-                relay_type,
-                &target_relays_urls,
-                keys.clone(),
-            )
+            .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, signer)
             .await?;
         Ok(())
     }
@@ -1945,9 +1971,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
-        let signer = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let user = account.user(&self.database).await?;
         let relays = account.nip65_relays(self).await?;
 
@@ -1986,9 +2010,7 @@ impl Whitenoise {
         } else {
             account.relays(relay_type, self).await?
         };
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let target_relays = if relay_type == RelayType::Nip65 {
             relays.clone()
         } else {
@@ -2002,7 +2024,12 @@ impl Whitenoise {
             let target_relays_urls = Relay::urls(&target_relays);
 
             nostr
-                .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, keys)
+                .publish_relay_list_with_signer(
+                    &relays_urls,
+                    relay_type,
+                    &target_relays_urls,
+                    signer,
+                )
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts", "Successfully published relay list for account: {:?}", account_clone.pubkey);
@@ -2018,9 +2045,7 @@ impl Whitenoise {
         let account_clone = account.clone();
         let nostr = self.nostr.clone();
         let relays = account.nip65_relays(self).await?;
-        let keys = self
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&account.pubkey)?;
+        let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
 
@@ -2029,7 +2054,7 @@ impl Whitenoise {
 
             let relays_urls = Relay::urls(&relays);
             nostr
-                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, keys)
+                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts", "Successfully published follow list for account: {:?}", account_clone.pubkey);
@@ -2099,37 +2124,18 @@ impl Whitenoise {
             ),
         }
 
-        // For external signer accounts, we can't get keys from the secret store.
-        // Set up subscriptions without a signer - the signer is only needed for
-        // decryption which will be handled separately for external signers.
-        if account.uses_external_signer() {
-            self.nostr
-                .setup_account_subscriptions(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    since,
-                )
-                .await?;
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account.pubkey)?;
-
-            self.nostr
-                .setup_account_subscriptions_with_signer(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    since,
-                    keys,
-                )
-                .await?;
-        }
+        let signer = self.get_signer_for_account(account)?;
+        self.nostr
+            .setup_account_subscriptions_with_signer(
+                account.pubkey,
+                &user_relays,
+                &inbox_relays,
+                &group_relays_urls,
+                &nostr_group_ids,
+                since,
+                signer,
+            )
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -2161,35 +2167,18 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        // For external signer accounts, we can't get keys from the secret store.
-        if account.uses_external_signer() {
-            self.nostr
-                .update_account_subscriptions(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                )
-                .await
-                .map_err(WhitenoiseError::from)
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account.pubkey)?;
-
-            self.nostr
-                .update_account_subscriptions_with_signer(
-                    account.pubkey,
-                    &user_relays,
-                    &inbox_relays,
-                    &group_relays_urls,
-                    &nostr_group_ids,
-                    keys,
-                )
-                .await
-                .map_err(WhitenoiseError::from)
-        }
+        let signer = self.get_signer_for_account(account)?;
+        self.nostr
+            .update_account_subscriptions_with_signer(
+                account.pubkey,
+                &user_relays,
+                &inbox_relays,
+                &group_relays_urls,
+                &nostr_group_ids,
+                signer,
+            )
+            .await
+            .map_err(WhitenoiseError::from)
     }
 }
 
@@ -3263,7 +3252,7 @@ mod tests {
 
         // Login with external signer
         let _account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3308,15 +3297,14 @@ mod tests {
     async fn test_login_with_external_signer_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
-        // Login twice with same pubkey
+        // Login twice with same keys
         let account1 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
         let account2 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3340,7 +3328,7 @@ mod tests {
 
         // First login via test helper (sets up account in DB without needing relays)
         let first_account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3363,10 +3351,9 @@ mod tests {
     async fn test_external_account_helper_methods() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
         let account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3691,7 +3678,7 @@ mod tests {
 
         // Login with external signer (new account)
         let account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3727,11 +3714,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let keys = create_test_keys();
-        let pubkey = keys.public_key();
 
         // First login - creates new account
         let account1 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
         assert!(account1.id.is_some());
@@ -3741,7 +3727,7 @@ mod tests {
 
         // Second login - should return existing account
         let account2 = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3767,7 +3753,7 @@ mod tests {
 
         // Now login with external signer - should migrate
         let migrated = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3811,7 +3797,7 @@ mod tests {
 
         // Login with external signer - should clean up stale key
         whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
@@ -3974,11 +3960,10 @@ mod tests {
     async fn test_publish_relay_lists_with_signer_publishes_when_flags_true() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        let pubkey = keys.public_key();
 
         // Create an external account first - required for event tracking
         let _account = whitenoise
-            .login_with_external_signer_for_test(pubkey)
+            .login_with_external_signer_for_test(keys.clone())
             .await
             .unwrap();
 
