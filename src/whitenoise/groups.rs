@@ -335,25 +335,14 @@ impl Whitenoise {
             .filter(|group| !active_filter || group.state == group_types::GroupState::Active)
             .collect();
 
-        // Lazy migration: ensure AccountGroup records exist for all active groups.
-        for group in &groups {
-            if group.state == group_types::GroupState::Active {
-                self.ensure_account_group_exists(account, &group.mls_group_id)
-                    .await?;
-            }
-        }
-
         Ok(groups)
     }
 
     /// Returns only visible groups for the account (pending + accepted, excluding declined)
     ///
     /// This method filters out groups that the user has explicitly declined.
-    /// It first retrieves all active groups (which triggers lazy migration to ensure
-    /// AccountGroup records exist), then filters based on visibility status.
-    ///
-    /// Each returned `GroupWithMembership` pairs the MLS group with its `AccountGroup`
-    /// record, allowing callers to check confirmation status without additional queries.
+    /// It retrieves all active MLS groups and pairs them with their `AccountGroup`
+    /// records, allowing callers to check confirmation status without additional queries.
     ///
     /// # Arguments
     /// * `account` - The account to get visible groups for
@@ -362,7 +351,6 @@ impl Whitenoise {
     /// * `Ok(Vec<GroupWithMembership>)` - List of visible groups with their membership data
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
-        // Get all active MDK groups (triggers lazy migration)
         let all_active_groups = self.groups(account, true).await?;
 
         // Get visible AccountGroup records (pending + accepted)
@@ -404,43 +392,7 @@ impl Whitenoise {
             .map_err(WhitenoiseError::from)?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
-        // Lazy migration: ensure AccountGroup record exists for this group
-        if group.state == group_types::GroupState::Active {
-            self.ensure_account_group_exists(account, group_id).await?;
-        }
-
         Ok(group)
-    }
-
-    /// Ensures an AccountGroup record exists for the given account and group.
-    /// This handles lazy migration for existing users who had groups before
-    /// the accounts_groups table was added.
-    ///
-    /// If a new record is created for an existing active group, it's automatically
-    /// accepted since the user is already a member.
-    ///
-    /// Note: this does not populate `dm_peer_pubkey` for DM groups. The startup
-    /// backfill (`backfill_dm_peer_pubkeys`) handles that on next launch.
-    async fn ensure_account_group_exists(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let (ag, was_created) =
-            AccountGroup::get_or_create(self, &account.pubkey, group_id, None).await?;
-
-        // If this is a newly created record for an existing active group,
-        // auto-accept it since the user is already a member
-        if was_created {
-            ag.accept(self).await?;
-            tracing::debug!(
-                target: "whitenoise::groups",
-                "Lazy migration: created and accepted AccountGroup for existing group {}",
-                hex::encode(group_id.as_slice())
-            );
-        }
-
-        Ok(())
     }
 
     pub async fn group_members(

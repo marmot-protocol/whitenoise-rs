@@ -272,9 +272,9 @@ impl AccountGroup {
                last_read_message_id = excluded.last_read_message_id,
                pin_order = excluded.pin_order,
                -- Write-once: preserve existing dm_peer_pubkey if already set.
-               -- Many code paths construct AccountGroup without knowing the DM peer
-               -- (e.g. lazy migration), so we only fill this on first write and
-               -- never overwrite a correct value with NULL.
+               -- Many code paths construct AccountGroup without knowing the DM peer,
+               -- so we only fill this on first write and never overwrite a correct
+               -- value with NULL.
                dm_peer_pubkey = COALESCE(accounts_groups.dm_peer_pubkey, excluded.dm_peer_pubkey),
                updated_at = excluded.updated_at
              RETURNING *",
