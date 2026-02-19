@@ -1,6 +1,6 @@
 use crate::integration_tests::benchmarks::scenarios::{
     IdentityCreationBenchmark, LoginPerformanceBenchmark, MessageAggregationBenchmark,
-    MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
+    MessagingPerformanceBenchmark, UserDiscoveryBenchmark, UserSearchBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -62,6 +62,7 @@ benchmark_registry! {
     "message-aggregation" => MessageAggregationBenchmark::default(),
     "user-discovery-blocking" => UserDiscoveryBenchmark::with_blocking_mode(),
     "user-discovery-background" => UserDiscoveryBenchmark::with_background_mode(),
+    "user-search" => UserSearchBenchmark,
 }
 // ============================================================================
 
@@ -170,6 +171,7 @@ mod tests {
         assert!(parse_and_instantiate("message-aggregation").is_ok());
         assert!(parse_and_instantiate("user-discovery-blocking").is_ok());
         assert!(parse_and_instantiate("user-discovery-background").is_ok());
+        assert!(parse_and_instantiate("user-search").is_ok());
     }
 
     #[test]
@@ -180,6 +182,7 @@ mod tests {
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("Message-Aggregation").is_ok());
         assert!(parse_and_instantiate("USER-DISCOVERY-BLOCKING").is_ok());
+        assert!(parse_and_instantiate("USER-SEARCH").is_ok());
     }
 
     #[test]
@@ -198,7 +201,7 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 6);
+        assert_eq!(names.len(), 7);
         assert!(names.contains(&"identity-creation"));
         assert!(names.contains(&"login-performance"));
         assert!(names.contains(&"messaging-performance"));
