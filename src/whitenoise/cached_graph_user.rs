@@ -27,23 +27,34 @@ pub struct CachedGraphUser {
     pub id: Option<i64>,
     /// The user's Nostr public key.
     pub pubkey: PublicKey,
-    /// The user's profile metadata (name, display_name, about, etc.).
-    pub metadata: Metadata,
-    /// List of pubkeys this user follows.
-    pub follows: Vec<PublicKey>,
+    /// The user's profile metadata. `None` = not yet fetched, `Some(Metadata::new())` = fetched but empty.
+    pub metadata: Option<Metadata>,
+    /// List of pubkeys this user follows. `None` = not yet fetched, `Some(vec![])` = fetched but follows nobody.
+    pub follows: Option<Vec<PublicKey>>,
     /// When this cache entry was created.
     pub created_at: DateTime<Utc>,
-    /// When this cache entry was last updated.
+    /// When this cache entry was last updated (any field).
     pub updated_at: DateTime<Utc>,
+    /// When metadata was last fetched. `None` = metadata never written.
+    pub metadata_updated_at: Option<DateTime<Utc>>,
+    /// When follows were last fetched. `None` = follows never written.
+    pub follows_updated_at: Option<DateTime<Utc>>,
 }
 
 impl CachedGraphUser {
     /// Creates a new `CachedGraphUser` with the current timestamp.
-    pub fn new(pubkey: PublicKey, metadata: Metadata, follows: Vec<PublicKey>) -> Self {
+    #[cfg(test)]
+    pub fn new(
+        pubkey: PublicKey,
+        metadata: Option<Metadata>,
+        follows: Option<Vec<PublicKey>>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: None,
             pubkey,
+            metadata_updated_at: metadata.as_ref().map(|_| now),
+            follows_updated_at: follows.as_ref().map(|_| now),
             metadata,
             follows,
             created_at: now,
@@ -61,13 +72,15 @@ mod tests {
     fn new_creates_with_current_timestamp() {
         let keys = Keys::generate();
         let before = Utc::now();
-        let user = CachedGraphUser::new(keys.public_key(), Metadata::new(), vec![]);
+        let user = CachedGraphUser::new(keys.public_key(), Some(Metadata::new()), Some(vec![]));
         let after = Utc::now();
 
         assert!(user.created_at >= before);
         assert!(user.created_at <= after);
-        assert!(user.updated_at >= before);
-        assert!(user.updated_at <= after);
+        assert!(user.metadata_updated_at.unwrap() >= before);
+        assert!(user.metadata_updated_at.unwrap() <= after);
+        assert!(user.follows_updated_at.unwrap() >= before);
+        assert!(user.follows_updated_at.unwrap() <= after);
         assert!(user.id.is_none());
     }
 
@@ -82,21 +95,20 @@ mod tests {
             .display_name("Alice Wonderland")
             .about("Down the rabbit hole");
 
-        let user =
-            CachedGraphUser::new(keys.public_key(), metadata.clone(), vec![follow1, follow2]);
+        let user = CachedGraphUser::new(
+            keys.public_key(),
+            Some(metadata.clone()),
+            Some(vec![follow1, follow2]),
+        );
 
         assert_eq!(user.pubkey, keys.public_key());
-        assert_eq!(user.metadata.name, Some("Alice".to_string()));
-        assert_eq!(
-            user.metadata.display_name,
-            Some("Alice Wonderland".to_string())
-        );
-        assert_eq!(
-            user.metadata.about,
-            Some("Down the rabbit hole".to_string())
-        );
-        assert_eq!(user.follows.len(), 2);
-        assert!(user.follows.contains(&follow1));
-        assert!(user.follows.contains(&follow2));
+        let m = user.metadata.as_ref().unwrap();
+        assert_eq!(m.name, Some("Alice".to_string()));
+        assert_eq!(m.display_name, Some("Alice Wonderland".to_string()));
+        assert_eq!(m.about, Some("Down the rabbit hole".to_string()));
+        let follows = user.follows.as_ref().unwrap();
+        assert_eq!(follows.len(), 2);
+        assert!(follows.contains(&follow1));
+        assert!(follows.contains(&follow2));
     }
 }
