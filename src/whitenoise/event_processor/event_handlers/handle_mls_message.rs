@@ -120,11 +120,13 @@ impl Whitenoise {
                         )
                         .await?;
 
-                    if let Some(welcome_rumors) = &update_result.welcome_rumors {
+                    if let Some(welcome_rumors) = &update_result.welcome_rumors
+                        && !welcome_rumors.is_empty()
+                    {
                         tracing::warn!(
                             target: "whitenoise::event_handlers::handle_mls_message",
-                            "Auto-committed proposal produced {} welcome rumors \
-                             that were not delivered",
+                            "Auto-committed proposal produced {} welcome \
+                             rumors that were not delivered",
                             welcome_rumors.len()
                         );
                     }
