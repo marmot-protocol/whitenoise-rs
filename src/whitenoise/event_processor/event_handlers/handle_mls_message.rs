@@ -548,9 +548,10 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::whitenoise::{aggregated_message::AggregatedMessage, test_utils::*};
     use std::time::Duration;
+
+    use super::*;
+    use crate::whitenoise::{aggregated_message::AggregatedMessage, relays::Relay, test_utils::*};
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
     #[tokio::test]
@@ -1037,5 +1038,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.len(), 3, "Should fetch all cached messages");
+    }
+
+    /// Helper: create a group via MDK directly and have a member join via
+    /// welcome giftwrap, returning the group ID. This gives both the admin's
+    /// and member's MDK instances full MLS state for the group.
+    async fn setup_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        // Fetch the member's key package from relays
+        let relay_urls = Relay::urls(&admin_account.key_package_relays(whitenoise).await.unwrap());
+        let key_pkg_event = whitenoise
+            .nostr
+            .fetch_user_key_package(member_account.pubkey, &relay_urls)
+            .await
+            .unwrap()
+            .expect("member must have a published key package");
+
+        // Create group via MDK directly so we get the welcome rumor
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let create_result = admin_mdk
+            .create_group(
+                &admin_account.pubkey,
+                vec![key_pkg_event],
+                create_nostr_group_config_data(vec![admin_account.pubkey]),
+            )
+            .unwrap();
+
+        let group_id = create_result.group.mls_group_id.clone();
+        let welcome_rumor = create_result
+            .welcome_rumors
+            .first()
+            .expect("welcome rumor exists")
+            .clone();
+
+        // Build giftwrap so the member can process the welcome
+        let admin_signer = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
+            .unwrap();
+        let giftwrap =
+            EventBuilder::gift_wrap(&admin_signer, &member_account.pubkey, welcome_rumor, vec![])
+                .await
+                .unwrap();
+
+        // Member processes the welcome -- now their MDK has the group
+        whitenoise
+            .handle_giftwrap(member_account, giftwrap)
+            .await
+            .expect("member should process welcome successfully");
+
+        group_id
+    }
+
+    /// Test that auto-committed proposals (e.g., admin auto-commits a
+    /// member's self-removal) are published and merged successfully.
+    #[tokio::test]
+    async fn test_handle_mls_message_auto_committed_proposal() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Set up a group where both admin and member have full MLS state
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+
+        // Member creates a self-removal proposal (leave)
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let leave_result = member_mdk.leave_group(&group_id).unwrap();
+
+        // Admin processes the leave proposal -- should auto-commit because
+        // admin_account is the group admin
+        let result = whitenoise
+            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Admin should successfully auto-commit the leave proposal: {:?}",
+            result.err()
+        );
+
+        // Verify the admin's MLS state was updated (pending commit merged)
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let group = admin_mdk
+            .get_group(&group_id)
+            .expect("should be able to get group")
+            .expect("group should exist");
+
+        // After merging the commit that removed the member, the epoch
+        // should have advanced beyond 0 (the initial epoch)
+        assert!(
+            group.epoch > 0,
+            "Group epoch should have advanced after auto-committed removal"
+        );
+    }
+
+    /// Test that handle_mls_message returns Ok for non-auto-committed
+    /// proposal variants (PendingProposal, IgnoredProposal, etc.) without
+    /// publishing or crashing.
+    #[tokio::test]
+    async fn test_handle_mls_message_commit_after_auto_committed_proposal() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+
+        // Member leaves
+        let member_mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let leave_result = member_mdk.leave_group(&group_id).unwrap();
+
+        // Admin auto-commits the leave proposal
+        whitenoise
+            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .await
+            .expect("auto-commit should succeed");
+
+        // After auto-commit, admin should still be able to send messages
+        // to the group (verifies the MLS state is consistent)
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let mut inner = UnsignedEvent::new(
+            admin_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Message after member left".to_string(),
+        );
+        inner.ensure_id();
+
+        let message_event = admin_mdk.create_message(&group_id, inner);
+        assert!(
+            message_event.is_ok(),
+            "Admin should be able to create messages after auto-committed removal: {:?}",
+            message_event.err()
+        );
     }
 }
