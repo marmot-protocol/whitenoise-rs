@@ -16,7 +16,92 @@ const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 /// deletion (e.g., because they don't support NIP-09 deletion).
 const MAX_DELETE_ROUNDS: u32 = 10;
 
+/// Checks if a key package event has the required encoding tag.
+///
+/// Per MIP-00/MIP-02, key packages must have an explicit `["encoding", "base64"]` tag.
+/// Key packages without this tag are considered outdated and should be rotated.
+///
+/// # Arguments
+///
+/// * `event` - The key package event to check
+///
+/// # Returns
+///
+/// Returns `true` if the event has the required encoding tag, `false` otherwise.
+pub(crate) fn has_encoding_tag(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        tag.kind() == TagKind::Custom("encoding".into()) && tag.content() == Some("base64")
+    })
+}
+
+/// Returns key packages that are missing the required encoding tag.
+///
+/// These outdated packages were published before the MIP-00/MIP-02 encoding tag
+/// requirement was enforced. They should be deleted and replaced with new
+/// key packages that include the proper `["encoding", "base64"]` tag.
+///
+/// # Arguments
+///
+/// * `packages` - The key package events to check
+///
+/// # Returns
+///
+/// A vector of key package events that are missing the encoding tag.
+pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
+    packages
+        .iter()
+        .filter(|p| !has_encoding_tag(p))
+        .cloned()
+        .collect()
+}
+
 impl Whitenoise {
+    /// Filters key package events to only include those that can be parsed by the local MDK.
+    ///
+    /// This serves as a proxy for "ownership" filtering: if a key package can be successfully
+    /// parsed by our MDK instance (which validates the encoding tag, ciphersuite, extensions,
+    /// and identity binding), it is compatible with this app. Packages from other Marmot apps
+    /// using different MDK versions or configurations will fail parsing and be excluded.
+    ///
+    /// Note: This does NOT verify that the private key material exists in local MLS storage,
+    /// so in a multi-device scenario using the same MDK version, packages from other devices
+    /// may still pass this filter. Full device-level ownership verification would require
+    /// checking the OpenMLS key package storage, which is not currently exposed by the MDK.
+    pub(crate) fn filter_locally_parseable_key_packages(
+        &self,
+        account: &Account,
+        packages: Vec<Event>,
+    ) -> Vec<Event> {
+        let mdk = match self.create_mdk_for_account(account.pubkey) {
+            Ok(mdk) => mdk,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Failed to create MDK for account {}, skipping all packages: {}",
+                    account.pubkey.to_hex(),
+                    e
+                );
+                return Vec::new();
+            }
+        };
+
+        packages
+            .into_iter()
+            .filter(|event| match mdk.parse_key_package(event) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "whitenoise::key_packages",
+                        "Key package {} not parseable by local MDK (skipping): {}",
+                        event.id,
+                        e
+                    );
+                    false
+                }
+            })
+            .collect()
+    }
+
     /// Helper method to create and encode a key package for the given account.
     ///
     /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
@@ -787,7 +872,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use nostr_sdk::Keys;
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};
 
     use super::*;
     use crate::whitenoise::accounts::AccountType;
@@ -1047,6 +1132,144 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// Creates a mock key package event with the encoding tag
+    fn create_key_package_event_with_encoding_tag(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// Creates a mock key package event without the encoding tag (outdated)
+    fn create_key_package_event_without_encoding_tag(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_true_when_present() {
+        let keys = Keys::generate();
+        let event = create_key_package_event_with_encoding_tag(&keys);
+
+        assert!(
+            has_encoding_tag(&event),
+            "Should return true when encoding tag is present"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_false_when_missing() {
+        let keys = Keys::generate();
+        let event = create_key_package_event_without_encoding_tag(&keys);
+
+        assert!(
+            !has_encoding_tag(&event),
+            "Should return false when encoding tag is missing"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_returns_false_for_wrong_value() {
+        let keys = Keys::generate();
+        // Create event with encoding tag but wrong value
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["hex"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            !has_encoding_tag(&event),
+            "Should return false when encoding tag has wrong value"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_only_packages_without_tag() {
+        let keys = Keys::generate();
+        let with_tag = create_key_package_event_with_encoding_tag(&keys);
+        let without_tag = create_key_package_event_without_encoding_tag(&keys);
+
+        let packages = vec![with_tag.clone(), without_tag.clone()];
+        let outdated = find_outdated_packages(&packages);
+
+        assert_eq!(
+            outdated.len(),
+            1,
+            "Should find exactly one outdated package"
+        );
+        assert_eq!(
+            outdated[0].id, without_tag.id,
+            "Outdated package should be the one without encoding tag"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_empty_when_all_have_tag() {
+        let keys = Keys::generate();
+        let event1 = create_key_package_event_with_encoding_tag(&keys);
+        let event2 = create_key_package_event_with_encoding_tag(&keys);
+
+        let packages = vec![event1, event2];
+        let outdated = find_outdated_packages(&packages);
+
+        assert!(
+            outdated.is_empty(),
+            "Should return empty when all packages have encoding tag"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_returns_all_when_none_have_tag() {
+        let keys = Keys::generate();
+        let event1 = create_key_package_event_without_encoding_tag(&keys);
+        let event2 = create_key_package_event_without_encoding_tag(&keys);
+
+        let packages = vec![event1, event2];
+        let outdated = find_outdated_packages(&packages);
+
+        assert_eq!(
+            outdated.len(),
+            2,
+            "Should return all packages when none have encoding tag"
+        );
+    }
+
+    #[test]
+    fn test_find_outdated_packages_handles_empty_list() {
+        let packages: Vec<Event> = vec![];
+        let outdated = find_outdated_packages(&packages);
+
+        assert!(
+            outdated.is_empty(),
+            "Should return empty when given empty list"
+        );
+    }
+
+    #[test]
+    fn test_has_encoding_tag_with_multiple_tags() {
+        let keys = Keys::generate();
+        // Create event with multiple tags including encoding tag
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_protocol_version".into()),
+                ["1.0"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x0001"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(TagKind::Custom("client".into()), ["MDK/0.5.3"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            has_encoding_tag(&event),
+            "Should find encoding tag among multiple tags"
+        );
     }
 
     #[tokio::test]
