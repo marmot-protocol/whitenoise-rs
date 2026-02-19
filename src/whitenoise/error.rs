@@ -150,6 +150,9 @@ pub enum WhitenoiseError {
     #[error("Key package publish failed: {0}")]
     KeyPackagePublishFailed(String),
 
+    #[error("Event publish failed: no relay accepted the event")]
+    EventPublishNoRelayAccepted,
+
     #[error("Image decryption failed: {0}")]
     ImageDecryptionFailed(String),
 
