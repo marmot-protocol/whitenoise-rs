@@ -22,6 +22,7 @@ pub mod group_information;
 pub mod media_files;
 pub mod processed_events;
 pub mod published_events;
+pub mod published_key_packages;
 pub mod relays;
 pub mod user_relays;
 pub mod users;

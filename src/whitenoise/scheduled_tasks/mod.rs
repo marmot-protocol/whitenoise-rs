@@ -12,6 +12,7 @@ use crate::WhitenoiseError;
 mod tasks;
 
 pub(crate) use self::tasks::CachedGraphUserCleanup;
+pub(crate) use self::tasks::ConsumedKeyPackageCleanup;
 pub(crate) use self::tasks::KeyPackageMaintenance;
 
 /// Trait for implementing scheduled background tasks.

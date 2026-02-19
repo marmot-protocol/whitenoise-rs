@@ -10,6 +10,7 @@ use crate::whitenoise::{
     accounts::Account,
     accounts_groups::AccountGroup,
     chat_list_streaming::ChatListUpdateTrigger,
+    database::published_key_packages::PublishedKeyPackage,
     error::{Result, WhitenoiseError},
     group_information::{GroupInformation, GroupType},
     relays::Relay,
@@ -75,6 +76,52 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
+        // Extract key package event ID from the rumor tags early — needed for pre-check
+        let key_package_event_id: Option<EventId> = rumor
+            .tags
+            .iter()
+            .find(|tag| {
+                tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E))
+            })
+            .and_then(|tag| tag.content())
+            .and_then(|content| EventId::parse(content).ok());
+
+        // Pre-check: do we have this key package and is its key material still available?
+        // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
+        if let Some(ref kp_event_id) = key_package_event_id {
+            match PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &kp_event_id.to_hex(),
+                &self.database,
+            )
+            .await
+            {
+                Ok(Some(pkg)) if pkg.key_material_deleted => {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        "Key material already deleted for this key package, skipping Welcome"
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        "Unknown key package referenced in Welcome, skipping"
+                    );
+                    return Ok(());
+                }
+                Ok(Some(_)) => {} // Good — KP exists, key material available
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        "Failed to look up key package: {}, proceeding anyway",
+                        e
+                    );
+                    // Don't block on DB lookup failure — fall through to MLS
+                }
+            }
+        }
+
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         // Process the welcome to get group info (but don't accept yet)
@@ -117,16 +164,6 @@ impl Whitenoise {
         mdk.accept_welcome(&welcome)
             .map_err(WhitenoiseError::MdkCoreError)?;
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
-
-        // Extract key package event ID for rotation
-        let key_package_event_id: Option<EventId> = rumor
-            .tags
-            .iter()
-            .find(|tag| {
-                tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E))
-            })
-            .and_then(|tag| tag.content())
-            .and_then(|content| EventId::parse(content).ok());
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
@@ -317,7 +354,10 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Handle key package rotation after welcome
+    /// Handle key package rotation after welcome.
+    ///
+    /// Marks the consumed key package in the published_key_packages table,
+    /// then deletes it from relays and publishes a fresh replacement.
     async fn rotate_key_package(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -330,6 +370,22 @@ impl Whitenoise {
             );
             return Ok(());
         };
+
+        // Mark the key package as consumed so the maintenance task knows
+        // to clean up local key material after the quiet period.
+        if let Err(e) = PublishedKeyPackage::mark_consumed(
+            &account.pubkey,
+            &kp_event_id.to_hex(),
+            &whitenoise.database,
+        )
+        .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                "Failed to mark key package as consumed: {}",
+                e
+            );
+        }
 
         // Publish new key package first so the account is never left with zero
         // key packages on relays. If this fails, the old one stays available.

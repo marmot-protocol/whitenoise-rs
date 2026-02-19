@@ -44,68 +44,25 @@ impl Task for KeyPackageMaintenance {
             return Ok(());
         }
 
-        let mut checked = 0usize;
-        let mut published = 0usize;
-        let mut rotated_expired = 0usize;
-        let mut deleted_outdated = 0usize;
-        let mut skipped = 0usize;
-        let mut errors = 0usize;
-
         let results: Vec<MaintenanceResult> = stream::iter(accounts)
             .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
             .await;
 
-        // Summarize results
-        for result in results {
-            checked += 1;
-            match result {
-                MaintenanceResult::Fresh => {}
-                MaintenanceResult::Published => {
-                    published += 1;
-                }
-                MaintenanceResult::RotatedExpired { deleted } => {
-                    rotated_expired += 1;
-                    tracing::debug!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Rotated expired key package, deleted {} old one(s)",
-                        deleted
-                    );
-                }
-                MaintenanceResult::DeletedOutdated { deleted } => {
-                    deleted_outdated += 1;
-                    tracing::info!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Deleted {} outdated key package(s) missing encoding tag",
-                        deleted
-                    );
-                }
-                MaintenanceResult::Skipped => {
-                    skipped += 1;
-                }
-                MaintenanceResult::Error(e) => {
-                    errors += 1;
-                    tracing::warn!(
-                        target: "whitenoise::scheduler::key_package_maintenance",
-                        "Error during key package maintenance: {}",
-                        e
-                    );
-                }
-            }
-        }
+        let summary = summarize_maintenance_results(results);
 
         tracing::info!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Key package maintenance completed: {} checked, {} published, \
              {} rotated (expired), {} deleted (outdated), {} skipped, \
              {} errors",
-            checked,
-            published,
-            rotated_expired,
-            deleted_outdated,
-            skipped,
-            errors
+            summary.checked,
+            summary.published,
+            summary.rotated_expired,
+            summary.deleted_outdated,
+            summary.skipped,
+            summary.errors
         );
 
         Ok(())
@@ -125,6 +82,55 @@ enum MaintenanceResult {
     Skipped,
     /// An error occurred
     Error(WhitenoiseError),
+}
+
+/// Summary counters from maintenance results.
+#[derive(Debug, PartialEq, Eq, Default)]
+struct MaintenanceSummary {
+    checked: usize,
+    published: usize,
+    rotated_expired: usize,
+    deleted_outdated: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+/// Tallies maintenance results into summary counters.
+fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> MaintenanceSummary {
+    let mut summary = MaintenanceSummary::default();
+    for result in results {
+        summary.checked += 1;
+        match result {
+            MaintenanceResult::Fresh => {}
+            MaintenanceResult::Published => summary.published += 1,
+            MaintenanceResult::RotatedExpired { deleted } => {
+                summary.rotated_expired += 1;
+                tracing::debug!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Rotated expired key package, deleted {} old one(s)",
+                    deleted
+                );
+            }
+            MaintenanceResult::DeletedOutdated { deleted } => {
+                summary.deleted_outdated += 1;
+                tracing::info!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Deleted {} outdated key package(s) missing encoding tag",
+                    deleted
+                );
+            }
+            MaintenanceResult::Skipped => summary.skipped += 1,
+            MaintenanceResult::Error(e) => {
+                summary.errors += 1;
+                tracing::warn!(
+                    target: "whitenoise::scheduler::key_package_maintenance",
+                    "Error during key package maintenance: {}",
+                    e
+                );
+            }
+        }
+    }
+    summary
 }
 
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
@@ -351,7 +357,8 @@ mod tests {
         account: &crate::whitenoise::accounts::Account,
         relays: &[Relay],
     ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
-        let (encoded_key_package, tags) = whitenoise.encoded_key_package(account, relays).await?;
+        let (encoded_key_package, tags, _hash_ref) =
+            whitenoise.encoded_key_package(account, relays).await?;
 
         let nsec = whitenoise.export_account_nsec(account).await?;
         let secret_key =
@@ -556,6 +563,51 @@ mod tests {
     fn test_find_expired_packages_handles_empty_input() {
         let expired = find_expired_packages(&[]);
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_empty() {
+        let summary = summarize_maintenance_results(vec![]);
+        assert_eq!(summary, MaintenanceSummary::default());
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_mixed() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Published,
+            MaintenanceResult::RotatedExpired { deleted: 3 },
+            MaintenanceResult::DeletedOutdated { deleted: 2 },
+            MaintenanceResult::Skipped,
+            MaintenanceResult::Error(WhitenoiseError::AccountNotFound),
+            MaintenanceResult::Fresh,
+        ];
+
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 7);
+        assert_eq!(summary.published, 1);
+        assert_eq!(summary.rotated_expired, 1);
+        assert_eq!(summary.deleted_outdated, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
+    fn test_summarize_maintenance_results_all_fresh() {
+        let results = vec![
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+            MaintenanceResult::Fresh,
+        ];
+        let summary = summarize_maintenance_results(results);
+        assert_eq!(summary.checked, 3);
+        assert_eq!(summary.published, 0);
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(KEY_PACKAGE_MAX_AGE, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
     }
 
     // NOTE: Relay-dependent tests (publish when none exist, leave fresh

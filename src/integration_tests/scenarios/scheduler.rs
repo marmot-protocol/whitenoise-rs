@@ -1,13 +1,15 @@
+use async_trait::async_trait;
+
 use crate::integration_tests::{core::*, test_cases::scheduler::*};
 use crate::{Whitenoise, WhitenoiseError};
-use async_trait::async_trait;
 
 /// Integration test scenario for verifying the scheduler and its tasks.
 ///
 /// This scenario tests:
 /// 1. Scheduler is running after Whitenoise initialization
 /// 2. Key package maintenance task publishes key packages for accounts
-/// 3. Shutdown completes gracefully
+/// 3. Full key package lifecycle (publish → consume via Welcome → cleanup)
+/// 4. Shutdown completes gracefully
 pub struct SchedulerScenario {
     context: ScenarioContext,
 }
@@ -29,6 +31,11 @@ impl Scenario for SchedulerScenario {
     async fn run_scenario(&mut self) -> Result<(), WhitenoiseError> {
         // Test key package maintenance task
         KeyPackageMaintenanceTestCase::for_account("test_account")
+            .execute(&mut self.context)
+            .await?;
+
+        // Test full key package lifecycle (publish → consume → cleanup)
+        KeyPackageLifecycleTestCase::new("lifecycle_creator", "lifecycle_member")
             .execute(&mut self.context)
             .await?;
 
