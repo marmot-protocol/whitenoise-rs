@@ -1146,9 +1146,9 @@ mod tests {
         );
     }
 
-    /// Test that handle_mls_message returns Ok for non-auto-committed
-    /// proposal variants (PendingProposal, IgnoredProposal, etc.) without
-    /// publishing or crashing.
+    /// Verify MLS state consistency after an auto-committed removal:
+    /// the admin can still create messages in the group, confirming
+    /// that merge_pending_commit left the state valid.
     #[tokio::test]
     async fn test_handle_mls_message_commit_after_auto_committed_proposal() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
