@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::RelayType;
 use crate::nostr_manager::{NostrManager, NostrManagerError};
 use crate::types::ImageType;
+use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
@@ -1618,16 +1619,33 @@ impl Whitenoise {
         is_new_account: bool,
         key_package_relays: &[Relay],
     ) -> Result<()> {
-        let mut key_package_event = None;
+        let mut needs_publish = true;
+
         if !is_new_account {
             tracing::debug!(target: "whitenoise::accounts", "Found {} key package relays", key_package_relays.len());
             let relays_urls = Relay::urls(key_package_relays);
-            key_package_event = self
+
+            if let Some(event) = self
                 .nostr
                 .fetch_user_key_package(account.pubkey, &relays_urls)
-                .await?;
+                .await?
+            {
+                if self.is_own_key_package(&account.pubkey, &event.id).await {
+                    tracing::debug!(
+                        target: "whitenoise::accounts",
+                        "Found existing key package with live key material, skipping publish"
+                    );
+                    needs_publish = false;
+                } else {
+                    tracing::debug!(
+                        target: "whitenoise::accounts",
+                        "Key package on relay was not published by this client or key material is gone, publishing new one"
+                    );
+                }
+            }
         }
-        if key_package_event.is_none() {
+
+        if needs_publish {
             match self
                 .create_and_publish_key_package(account, key_package_relays)
                 .await
@@ -1644,7 +1662,28 @@ impl Whitenoise {
                 }
             }
         }
+
         Ok(())
+    }
+
+    /// Checks whether a key package event was published by this Whitenoise instance
+    /// and still has live local key material.
+    async fn is_own_key_package(&self, pubkey: &PublicKey, event_id: &EventId) -> bool {
+        match PublishedKeyPackage::find_by_event_id(pubkey, &event_id.to_hex(), &self.database)
+            .await
+        {
+            Ok(Some(pkg)) => !pkg.key_material_deleted,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    "Failed to look up published key package for event {}: {}",
+                    event_id,
+                    e
+                );
+                false
+            }
+        }
     }
 
     async fn load_default_relays(&self) -> Result<Vec<Relay>> {
@@ -4737,5 +4776,79 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(result.account.pubkey, pubkey);
         assert_eq!(result.account.account_type, AccountType::External);
+    }
+
+    #[tokio::test]
+    async fn test_is_own_key_package_returns_false_for_unknown_event() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        let event_id = EventId::all_zeros();
+        assert!(
+            !whitenoise
+                .is_own_key_package(&account.pubkey, &event_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_own_key_package_returns_true_for_tracked_kp() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        account.save(&whitenoise.database).await.unwrap();
+
+        // Use a valid 64-char hex string as event_id
+        let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let event_id = EventId::parse(event_hex).unwrap();
+        assert!(
+            whitenoise
+                .is_own_key_package(&account.pubkey, &event_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_own_key_package_returns_false_when_key_material_deleted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        account.save(&whitenoise.database).await.unwrap();
+
+        let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Mark key material as deleted
+        let pkg =
+            PublishedKeyPackage::find_by_event_id(&account.pubkey, event_hex, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let event_id = EventId::parse(event_hex).unwrap();
+        assert!(
+            !whitenoise
+                .is_own_key_package(&account.pubkey, &event_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_own_key_package_returns_false_on_db_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        // Close the pool to simulate a database error
+        whitenoise.database.pool.close().await;
+
+        let event_id = EventId::all_zeros();
+        assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
     }
 }
