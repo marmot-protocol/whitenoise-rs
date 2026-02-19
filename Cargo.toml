@@ -26,11 +26,11 @@ infer = "0.19"
 keyring-core = "0.7"
 lightning-invoice = "0.33.1"
 
-mdk-core = { version = "0.5.3", git = "https://github.com/marmot-protocol/mdk", rev = "9bffce8", features = [
+mdk-core = { version = "0.6.0", git = "https://github.com/marmot-protocol/mdk", rev = "749976c9876b320ca0144b4e1d13310038a8595b", features = [
     "mip04",
 ] }
-mdk-sqlite-storage = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "9bffce8" }
-mdk-storage-traits = { version = "0.5.1", git = "https://github.com/marmot-protocol/mdk", rev = "9bffce8" }
+mdk-sqlite-storage = { version = "0.6.0", git = "https://github.com/marmot-protocol/mdk", rev = "749976c9876b320ca0144b4e1d13310038a8595b" }
+mdk-storage-traits = { version = "0.6.0", git = "https://github.com/marmot-protocol/mdk", rev = "749976c9876b320ca0144b4e1d13310038a8595b" }
 
 nwc = "0.44"
 nostr-blossom = "0.44"
@@ -42,8 +42,8 @@ nostr-sdk = { version = "0.44", features = [
 ] }
 
 # LOCAL MDK FOR DEVELOPMENT
-# mdk-core = { version = "0.5.1", path="../mdk/crates/mdk-core" }
-# mdk-sqlite-storage = { version = "0.5.1", path="../mdk/crates/mdk-sqlite-storage" }
+# mdk-core = { version = "0.6.0", path="../mdk/crates/mdk-core" }
+# mdk-sqlite-storage = { version = "0.6.0", path="../mdk/crates/mdk-sqlite-storage" }
 
 # LOCAL RUST_NOSTR FOR DEVELOPMENT
 # nwc = { version = "0.43", path="../rust-nostr/crates/nwc" }
