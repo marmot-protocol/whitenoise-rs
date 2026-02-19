@@ -102,9 +102,61 @@ impl Whitenoise {
                     }
                 }
 
-                // Background sync for group images (existing pattern)
-                if let MessageProcessingResult::Commit { mls_group_id } = result {
-                    Whitenoise::background_sync_group_image_cache_if_needed(account, &mls_group_id);
+                // Handle auto-committed proposals (e.g., admin auto-commits a
+                // member's self-removal): publish the resulting commit event so
+                // other group members learn about the change, then merge the
+                // pending commit into our local MLS state.
+                if let MessageProcessingResult::Proposal(ref update_result) = result {
+                    let group_id = &update_result.mls_group_id;
+                    let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+
+                    mdk.merge_pending_commit(group_id)?;
+
+                    self.nostr
+                        .publish_event_to(
+                            update_result.evolution_event.clone(),
+                            &account.pubkey,
+                            &relay_urls,
+                        )
+                        .await?;
+
+                    if let Some(welcome_rumors) = &update_result.welcome_rumors {
+                        tracing::warn!(
+                            target: "whitenoise::event_handlers::handle_mls_message",
+                            "Auto-committed proposal produced {} welcome rumors \
+                             that were not delivered",
+                            welcome_rumors.len()
+                        );
+                    }
+
+                    tracing::info!(
+                        target: "whitenoise::event_handlers::handle_mls_message",
+                        "Published auto-committed proposal evolution event \
+                         for group {}",
+                        hex::encode(group_id.as_slice())
+                    );
+
+                    self.emit_chat_list_update(
+                        account,
+                        group_id,
+                        ChatListUpdateTrigger::NewLastMessage,
+                    )
+                    .await;
+                }
+
+                // Background sync for group images after commits or
+                // auto-committed proposals (group state may have changed).
+                match result {
+                    MessageProcessingResult::Commit { ref mls_group_id } => {
+                        Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+                    }
+                    MessageProcessingResult::Proposal(ref update_result) => {
+                        Self::background_sync_group_image_cache_if_needed(
+                            account,
+                            &update_result.mls_group_id,
+                        );
+                    }
+                    _ => {}
                 }
                 Ok(())
             }

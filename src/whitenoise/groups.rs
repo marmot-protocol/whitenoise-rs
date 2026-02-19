@@ -83,7 +83,7 @@ impl Whitenoise {
     /// # Returns
     /// * `Ok(Vec<nostr_sdk::RelayUrl>)` - Vector of relay URLs
     /// * `Err(WhitenoiseError::GroupMissingRelays)` - If no relays are configured
-    fn ensure_group_relays(
+    pub(crate) fn ensure_group_relays(
         mdk: &MDK<MdkSqliteStorage>,
         group_id: &GroupId,
     ) -> Result<Vec<nostr_sdk::RelayUrl>> {
