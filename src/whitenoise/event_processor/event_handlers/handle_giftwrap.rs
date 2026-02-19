@@ -476,10 +476,11 @@ impl Whitenoise {
     /// relies on the KeyPackage that was publicly available on relays.
     /// This is a security-critical operation for forward secrecy.
     ///
-    /// Per MIP-03, the evolution event is published to relays *before* merging
-    /// the pending commit locally. This ensures we only advance local state
-    /// after confirming the relay accepted the event. If publishing fails,
-    /// the pending commit is never merged and the group state remains unchanged.
+    /// Per MIP-03, the evolution event is published to relays (with retry)
+    /// *before* merging the pending commit locally. This ensures we only
+    /// advance local state after confirming the relay accepted the event.
+    /// If all publish attempts fail, the pending commit is never merged and
+    /// the group state remains unchanged.
     async fn perform_self_update(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -496,10 +497,9 @@ impl Whitenoise {
             update_result.evolution_event
         };
 
-        // Publish first — only merge locally after relays accept the event
+        // Publish first (with retry) — only merge locally after relays accept
         whitenoise
-            .nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+            .publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
         // Relay accepted the event, now safe to advance local state

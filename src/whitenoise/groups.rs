@@ -138,6 +138,61 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
+    /// Maximum number of retry attempts when publishing an event to relays.
+    const MAX_PUBLISH_ATTEMPTS: u32 = 3;
+
+    /// Publishes a pre-signed event to relays with retry and exponential backoff.
+    ///
+    /// Attempts to publish up to [`Self::MAX_PUBLISH_ATTEMPTS`] times with
+    /// exponential backoff (2 s, 4 s). The event is created once by the caller;
+    /// only the relay publish step is retried.
+    ///
+    /// This is the single entry-point for publishing MLS protocol events
+    /// (evolution commits, proposals, etc.) so that retry policy changes are
+    /// made in one place. When a durable publish queue is introduced later,
+    /// only this method needs to be replaced.
+    pub(crate) async fn publish_event_with_retry(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relay_urls: &[RelayUrl],
+    ) -> Result<()> {
+        let mut last_error = None;
+
+        for attempt in 0..Self::MAX_PUBLISH_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::warn!(
+                    target: "whitenoise::groups::publish_event_with_retry",
+                    "Retrying event publish (attempt {}/{}), backing off {delay:?}",
+                    attempt + 1,
+                    Self::MAX_PUBLISH_ATTEMPTS,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .nostr
+                .publish_event_to(event.clone(), account_pubkey, relay_urls)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::groups::publish_event_with_retry",
+                        "Event publish attempt {}/{} failed: {}",
+                        attempt + 1,
+                        Self::MAX_PUBLISH_ATTEMPTS,
+                        e,
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.expect("loop ran at least once").into())
+    }
+
     /// Creates a new MLS group with the specified members and settings
     ///
     /// # Arguments
@@ -426,9 +481,13 @@ impl Whitenoise {
     /// This method performs the complete workflow for adding members to a group:
     /// 1. Fetches key packages for all new members from their configured relays
     /// 2. Creates an MLS add members proposal and generates welcome messages
-    /// 3. Publishes the evolution event to the group's relays
-    /// 4. Merges the pending commit to finalize the member addition
+    /// 3. Publishes the evolution event to relays (with retry)
+    /// 4. Only after relay acceptance, merges the pending commit locally
     /// 5. Sends welcome messages to each new member via gift wrap
+    ///
+    /// Per MIP-03, the evolution event is published to relays *before* merging
+    /// the pending commit locally. This ensures we only advance local state
+    /// after confirming the relay accepted the event.
     ///
     /// # Arguments
     /// * `account` - The account performing the member addition (must be group admin)
@@ -478,9 +537,6 @@ impl Whitenoise {
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.add_members(group_id, &key_package_events)?;
-            // Merge the pending commit immediately after creating it
-            // This ensures our local state is correct before publishing
-            mdk.merge_pending_commit(group_id)?;
 
             (
                 relay_urls,
@@ -504,9 +560,17 @@ impl Whitenoise {
             )));
         }
 
-        self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+        // Per MIP-03, publish the evolution event to relays *before* merging
+        // the pending commit. This ensures local state only advances after
+        // confirming the relay accepted the event.
+        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        // Relay accepted the event — now safe to advance local MLS state
+        {
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
+            mdk.merge_pending_commit(group_id)?;
+        }
 
         // Evolution event published successfully
         // Fan out the welcome message to all members
@@ -562,8 +626,12 @@ impl Whitenoise {
     ///
     /// This method performs the complete workflow for removing members from a group:
     /// 1. Creates an MLS remove members proposal
-    /// 2. Merges the pending commit to finalize the member removal
-    /// 3. Publishes the evolution event to the group's relays
+    /// 2. Publishes the evolution event to relays (with retry)
+    /// 3. Only after relay acceptance, merges the pending commit locally
+    ///
+    /// Per MIP-03, the evolution event is published to relays *before* merging
+    /// the pending commit locally. This ensures we only advance local state
+    /// after confirming the relay accepted the event.
     ///
     /// # Arguments
     /// * `account` - The account performing the member removal (must be group admin)
@@ -580,20 +648,32 @@ impl Whitenoise {
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.remove_members(group_id, &members)?;
-            mdk.merge_pending_commit(group_id)?;
 
             (relay_urls, update_result.evolution_event)
         };
 
-        self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        // Relay accepted the event — now safe to advance local MLS state
+        {
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
+            mdk.merge_pending_commit(group_id)?;
+        }
+
         Ok(())
     }
 
     /// Updates group metadata and publishes the change to group relays.
     ///
-    /// This method updates the group data and publishes the change to group relays.
+    /// This method performs the complete workflow for updating group data:
+    /// 1. Creates an MLS group data update proposal
+    /// 2. Publishes the evolution event to relays (with retry)
+    /// 3. Only after relay acceptance, merges the pending commit locally
+    ///
+    /// Per MIP-03, the evolution event is published to relays *before* merging
+    /// the pending commit locally. This ensures we only advance local state
+    /// after confirming the relay accepted the event.
     ///
     /// # Arguments
     /// * `account` - The account performing the group data update (must be group admin)
@@ -610,22 +690,27 @@ impl Whitenoise {
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
             let update_result = mdk.update_group_data(group_id, group_data)?;
-            mdk.merge_pending_commit(group_id)?;
 
             (relay_urls, update_result.evolution_event)
         };
 
-        self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
+
+        // Relay accepted the event — now safe to advance local MLS state
+        {
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
+            mdk.merge_pending_commit(group_id)?;
+        }
+
         Ok(())
     }
 
     /// Initiates the process to leave a group by creating a self-removal proposal.
     ///
     /// This method creates a self-removal proposal using the nostr-mls library and publishes
-    /// it to the group relays. The proposal will need to be committed by a group admin before
-    /// the removal is finalized.
+    /// it to the group relays (with retry). The proposal will need to be committed by a group
+    /// admin before the removal is finalized.
     ///
     /// # Arguments
     /// * `account` - The account that wants to leave the group
@@ -642,8 +727,7 @@ impl Whitenoise {
         };
 
         // Publish the self-removal proposal to the group
-        self.nostr
-            .publish_event_to(evolution_event, &account.pubkey, &relay_urls)
+        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
         // TODO: Do any local updates to ensure that we're accurately reflecting that the account is trying to leave this group
