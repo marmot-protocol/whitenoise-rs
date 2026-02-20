@@ -5,8 +5,8 @@
 //!
 //! 1. User table (Account records with metadata)
 //! 2. CachedGraphUser table (recently fetched graph data)
-//! 3. Network fetch from default relays (single attempt, queue-based retries in consumer)
-//! 4. NIP-65 relay list discovery (single attempt, queue-based retries in consumer)
+//! 3. Network fetch from connected relays (single attempt, queue-based retries in consumer)
+//! 4. NIP-65 relay list discovery from connected relays (single attempt, queue-based retries in consumer)
 //! 5. Metadata fetch from user's preferred relays (single attempt, queue-based retries)
 
 use std::collections::{HashMap, HashSet};
@@ -33,9 +33,17 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::users::User;
 
-/// Collect all relay URLs the client is connected to.
+/// Collect relay URLs the client is currently connected to.
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
-    whitenoise.nostr.client.relays().await.into_keys().collect()
+    whitenoise
+        .nostr
+        .client
+        .relays()
+        .await
+        .into_iter()
+        .filter(|(_, relay)| relay.is_connected())
+        .map(|(url, _)| url)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -110,7 +118,7 @@ pub(super) async fn check_cache_metadata(
     (found, remaining)
 }
 
-/// Tier 3: Single-attempt metadata fetch from default relays.
+/// Tier 3: Single-attempt metadata fetch from connected relays.
 ///
 /// Caches found metadata via partial upsert (preserving follows).
 /// Does NOT cache empty defaults — remaining pubkeys flow to tier 4.
@@ -172,7 +180,7 @@ pub(super) async fn try_fetch_network_metadata(
     Ok((found, remaining))
 }
 
-/// Tier 4: Single-attempt NIP-65 relay list fetch from default relays.
+/// Tier 4: Single-attempt NIP-65 relay list fetch from connected relays.
 ///
 /// Returns `Ok(map)` where the map contains pubkey → write relay URLs.
 /// Pubkeys without relay list events are absent from the map.
