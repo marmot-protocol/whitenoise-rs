@@ -233,10 +233,11 @@ impl User {
         if stored_relays.is_empty() {
             tracing::debug!(
                 target: "whitenoise::users::get_query_relays",
-                "User {} has no stored NIP-65 relays, using default relays",
+                "User {} has no stored NIP-65 relays, using fallback relays",
                 self.pubkey,
             );
-            Ok(Relay::defaults())
+            let urls = whitenoise.fallback_relay_urls().await;
+            Ok(urls.into_iter().map(|url| Relay::new(&url)).collect())
         } else {
             Ok(stored_relays)
         }
@@ -1008,7 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_query_relays_with_no_stored_relays() {
+    async fn test_get_query_relays_with_no_stored_relays_includes_defaults() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let test_pubkey = nostr_sdk::Keys::generate().public_key();
         let user = User {
@@ -1020,8 +1021,45 @@ mod tests {
         };
         let saved_user = user.save(&whitenoise.database).await.unwrap();
         let query_relays = saved_user.get_query_relays(&whitenoise).await.unwrap();
+        let query_urls: std::collections::HashSet<RelayUrl> =
+            Relay::urls(&query_relays).into_iter().collect();
 
-        assert_eq!(Relay::urls(&query_relays), Relay::urls(&Relay::defaults()));
+        for url in Relay::urls(&Relay::defaults()) {
+            assert!(
+                query_urls.contains(&url),
+                "Fallback query relays should include default relay: {}",
+                url
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_query_relays_with_no_stored_relays_excludes_disconnected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let extra_url = RelayUrl::parse("wss://extra.relay.test").unwrap();
+        whitenoise
+            .nostr
+            .client
+            .add_relay(extra_url.clone())
+            .await
+            .unwrap();
+
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let saved_user = user.save(&whitenoise.database).await.unwrap();
+        let query_relays = saved_user.get_query_relays(&whitenoise).await.unwrap();
+        let query_urls: Vec<RelayUrl> = Relay::urls(&query_relays);
+
+        assert!(
+            !query_urls.contains(&extra_url),
+            "Fallback query relays should not include disconnected relay"
+        );
     }
 
     #[tokio::test]

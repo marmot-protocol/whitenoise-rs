@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -458,7 +458,7 @@ impl Whitenoise {
 
     async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
         let users_with_relays = User::all_users_with_relay_urls(whitenoise_ref).await?;
-        let default_relays: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+        let fallback_relays = whitenoise_ref.fallback_relay_urls().await;
 
         let accounts = Account::all(&whitenoise_ref.database).await?;
         if accounts.is_empty() {
@@ -502,7 +502,7 @@ impl Whitenoise {
             .nostr
             .setup_batched_relay_subscriptions_with_signer(
                 users_with_relays,
-                &default_relays,
+                &fallback_relays,
                 signer,
                 since,
             )
@@ -946,9 +946,24 @@ impl Whitenoise {
         media_files::MediaFiles::new(&self.storage, &self.database)
     }
 
+    /// Returns the union of default relays and currently connected relays.
+    ///
+    /// Used as the fallback relay set when a user has no stored NIP-65 relays.
+    /// Includes all relay types known to the client (NIP-65, inbox, group, etc.),
+    /// which broadens discovery coverage at negligible cost.
+    pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
+        let mut urls: HashSet<RelayUrl> = Relay::defaults().into_iter().map(|r| r.url).collect();
+        for (url, relay) in self.nostr.client.relays().await {
+            if relay.is_connected() {
+                urls.insert(url);
+            }
+        }
+        urls.into_iter().collect()
+    }
+
     pub(crate) async fn refresh_global_subscription_for_user(&self, user: &User) -> Result<()> {
         let users_with_relays = User::all_users_with_relay_urls(self).await?;
-        let default_relays: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+        let fallback_relays = self.fallback_relay_urls().await;
 
         let Some(signer_account) = Account::first(&self.database).await? else {
             tracing::info!(
@@ -974,7 +989,7 @@ impl Whitenoise {
             .refresh_user_global_subscriptions_with_signer(
                 user.pubkey,
                 users_with_relays,
-                &default_relays,
+                &fallback_relays,
                 signer,
             )
             .await?;
@@ -989,7 +1004,7 @@ impl Whitenoise {
     /// where new users may be spread across many different relay batches.
     pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
         let users_with_relays = User::all_users_with_relay_urls(self).await?;
-        let default_relays: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+        let fallback_relays = self.fallback_relay_urls().await;
 
         let Some(signer_account) = Account::first(&self.database).await? else {
             tracing::info!(
@@ -1001,7 +1016,7 @@ impl Whitenoise {
 
         if signer_account.uses_external_signer() {
             self.nostr
-                .refresh_all_global_subscriptions(users_with_relays, &default_relays)
+                .refresh_all_global_subscriptions(users_with_relays, &fallback_relays)
                 .await?;
         } else {
             let keys = self
@@ -1011,7 +1026,7 @@ impl Whitenoise {
             self.nostr
                 .refresh_all_global_subscriptions_with_signer(
                     users_with_relays,
-                    &default_relays,
+                    &fallback_relays,
                     keys,
                 )
                 .await?;
@@ -2452,6 +2467,57 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "refresh_all_global_subscriptions should succeed with no accounts"
+            );
+        }
+    }
+
+    mod fallback_relay_tests {
+        use super::*;
+        use std::collections::HashSet;
+
+        #[tokio::test]
+        async fn test_fallback_relay_urls_includes_defaults() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let fallback = whitenoise.fallback_relay_urls().await;
+            let default_urls: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+
+            for url in &default_urls {
+                assert!(
+                    fallback.contains(url),
+                    "Fallback should include default relay: {}",
+                    url
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_fallback_relay_urls_excludes_disconnected_relays() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let extra_url = RelayUrl::parse("wss://extra.relay.test").unwrap();
+            whitenoise
+                .nostr
+                .client
+                .add_relay(extra_url.clone())
+                .await
+                .unwrap();
+
+            let fallback = whitenoise.fallback_relay_urls().await;
+            assert!(
+                !fallback.contains(&extra_url),
+                "Fallback should not include disconnected relay"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_fallback_relay_urls_deduplicates() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let fallback = whitenoise.fallback_relay_urls().await;
+
+            let unique: HashSet<&RelayUrl> = fallback.iter().collect();
+            assert_eq!(
+                fallback.len(),
+                unique.len(),
+                "Fallback should not contain duplicates"
             );
         }
     }
