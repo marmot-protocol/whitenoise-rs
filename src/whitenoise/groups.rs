@@ -206,6 +206,41 @@ impl Whitenoise {
         Err(last_error.expect("loop ran at least once"))
     }
 
+    /// Publishes an evolution event and merges the pending commit on success.
+    ///
+    /// Per MIP-03 this is the canonical ordering for MLS state evolution:
+    /// 1. Caller creates the pending commit via an MDK operation
+    /// 2. This method publishes the evolution event (with retry)
+    /// 3. Only after at least one relay accepts, the pending commit is merged
+    ///
+    /// # Dangling pending commits on failure
+    ///
+    /// If all publish attempts fail, the pending commit created by the MDK
+    /// operation remains in the MLS group's internal state. MDK does not
+    /// currently expose `clear_pending_commit` (OpenMLS has it, but MDK
+    /// does not wrap it). This means subsequent MLS operations on the same
+    /// group may fail until the pending commit is resolved. Tracked
+    /// upstream — once MDK exposes a clear/abort API, the error path here
+    /// should call it.
+    // TODO(mdk): call mdk.clear_pending_commit(group_id) on failure once
+    // the MDK exposes it, so a failed publish doesn't block the group.
+    pub(crate) async fn publish_and_merge_commit(
+        &self,
+        evolution_event: Event,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+        relay_urls: &[RelayUrl],
+    ) -> Result<()> {
+        self.publish_event_with_retry(evolution_event, account_pubkey, relay_urls)
+            .await?;
+
+        // Relay accepted — now safe to advance local MLS state
+        let mdk = self.create_mdk_for_account(*account_pubkey)?;
+        mdk.merge_pending_commit(group_id)?;
+
+        Ok(())
+    }
+
     /// Creates a new MLS group with the specified members and settings
     ///
     /// # Arguments
@@ -573,19 +608,10 @@ impl Whitenoise {
             )));
         }
 
-        // Per MIP-03, publish the evolution event to relays *before* merging
-        // the pending commit. This ensures local state only advances after
-        // confirming the relay accepted the event.
-        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
+        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
             .await?;
 
-        // Relay accepted the event — now safe to advance local MLS state
-        {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            mdk.merge_pending_commit(group_id)?;
-        }
-
-        // Evolution event published successfully
+        // Evolution event published and commit merged successfully
         // Fan out the welcome message to all members
         for (welcome_rumor, user) in welcome_rumors.iter().zip(users) {
             // Get the public key of the member from the key package event
@@ -665,16 +691,8 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
-        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
-            .await?;
-
-        // Relay accepted the event — now safe to advance local MLS state
-        {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            mdk.merge_pending_commit(group_id)?;
-        }
-
-        Ok(())
+        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+            .await
     }
 
     /// Updates group metadata and publishes the change to group relays.
@@ -707,16 +725,8 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
-        self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
-            .await?;
-
-        // Relay accepted the event — now safe to advance local MLS state
-        {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            mdk.merge_pending_commit(group_id)?;
-        }
-
-        Ok(())
+        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+            .await
     }
 
     /// Initiates the process to leave a group by creating a self-removal proposal.
@@ -3067,20 +3077,54 @@ mod tests {
     }
 
     // ── Ordering tests: publish failure must not advance local state ─────
+    //
+    // These tests call the actual production methods (add_members_to_group,
+    // remove_members_from_group, update_group_data) against groups whose
+    // relays are configured to unreachable ports. This ensures the tests
+    // exercise the real publish-then-merge ordering and would catch
+    // regressions if someone reorders the code in the future.
 
-    /// Helper: creates a group with real Docker relays and returns the group
-    /// plus its creator account and new member accounts ready for mutation
-    /// tests.
-    async fn create_group_for_mutation_test(
+    /// Unreachable relay URLs used to force publish failures in ordering tests.
+    const UNREACHABLE_RELAYS: &[&str] = &["ws://localhost:1", "ws://localhost:2"];
+
+    /// Creates a group whose MLS-stored relays point to unreachable ports.
+    ///
+    /// The group is created with real Docker relays (so welcome fan-out
+    /// succeeds during `create_group`), then a successful `update_group_data`
+    /// swaps the relays to unreachable URLs. After this, any subsequent
+    /// call to `ensure_group_relays` returns the unreachable relays.
+    async fn create_group_with_unreachable_relays(
         whitenoise: &Whitenoise,
     ) -> (group_types::Group, Account, Vec<(Account, Keys)>) {
         let creator = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(whitenoise, 2).await;
         let member_pks = members.iter().map(|(a, _)| a.pubkey).collect::<Vec<_>>();
 
+        // Create with real relays so welcome messages succeed
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
             .create_group(&creator, member_pks, config, None)
+            .await
+            .unwrap();
+
+        // Now swap the group's relays to unreachable ports via update_group_data
+        let unreachable_urls: Vec<RelayUrl> = UNREACHABLE_RELAYS
+            .iter()
+            .map(|u| RelayUrl::parse(u).unwrap())
+            .collect();
+        let relay_swap = NostrGroupDataUpdate {
+            name: None,
+            description: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            image_upload_key: None,
+            admins: None,
+            relays: Some(unreachable_urls),
+            nostr_group_id: None,
+        };
+        whitenoise
+            .update_group_data(&creator, &group.mls_group_id, relay_swap)
             .await
             .unwrap();
 
@@ -3090,42 +3134,23 @@ mod tests {
     #[tokio::test]
     async fn test_add_members_no_merge_on_publish_failure() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (group, creator, _existing) = create_group_for_mutation_test(&whitenoise).await;
+        let (group, creator, _existing) = create_group_with_unreachable_relays(&whitenoise).await;
         let group_id = &group.mls_group_id;
 
         let members_before = whitenoise.group_members(&creator, group_id).await.unwrap();
 
-        // Prepare a new member whose key package we can fetch
+        // Prepare a new member with a key package on the real relay
         let new_members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let new_pk = new_members[0].0.pubkey;
 
-        // Manually perform the MDK add_members step (mimicking the production
-        // code path) but publish to an unreachable relay so the publish fails.
-        let kp_event = whitenoise
-            .nostr
-            .fetch_user_key_package(new_pk, &[RelayUrl::parse("ws://localhost:8080").unwrap()])
-            .await
-            .unwrap()
-            .expect("key package should exist");
-
-        let evolution_event = {
-            let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-            let result = mdk.add_members(group_id, &[kp_event]).unwrap();
-            result.evolution_event
-        };
-
-        // Publish to unreachable ports — should fail after retries
-        let unreachable = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
-        ];
-        let publish_result = whitenoise
-            .publish_event_with_retry(evolution_event, &creator.pubkey, &unreachable)
+        // Call the actual production method — it will fail at publish
+        // because the group's relays are now unreachable.
+        let result = whitenoise
+            .add_members_to_group(&creator, group_id, vec![new_pk])
             .await;
-        assert!(publish_result.is_err(), "Publish should fail");
+        assert!(result.is_err(), "Should fail when relays are unreachable");
 
-        // Crucially: we do NOT call merge_pending_commit because publish
-        // failed. Verify group membership is unchanged.
+        // Verify: group membership is unchanged (merge did not happen)
         let members_after = whitenoise.group_members(&creator, group_id).await.unwrap();
         assert_eq!(
             members_before.len(),
@@ -3142,28 +3167,18 @@ mod tests {
     #[tokio::test]
     async fn test_remove_members_no_merge_on_publish_failure() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (group, creator, existing) = create_group_for_mutation_test(&whitenoise).await;
+        let (group, creator, existing) = create_group_with_unreachable_relays(&whitenoise).await;
         let group_id = &group.mls_group_id;
         let member_to_remove = existing[0].0.pubkey;
 
         let members_before = whitenoise.group_members(&creator, group_id).await.unwrap();
         assert!(members_before.contains(&member_to_remove));
 
-        // Create the remove proposal but publish to unreachable ports
-        let evolution_event = {
-            let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-            let result = mdk.remove_members(group_id, &[member_to_remove]).unwrap();
-            result.evolution_event
-        };
-
-        let unreachable = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
-        ];
-        let publish_result = whitenoise
-            .publish_event_with_retry(evolution_event, &creator.pubkey, &unreachable)
+        // Call the actual production method — fails at publish
+        let result = whitenoise
+            .remove_members_from_group(&creator, group_id, vec![member_to_remove])
             .await;
-        assert!(publish_result.is_err(), "Publish should fail");
+        assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: member is still in the group (merge did not happen)
         let members_after = whitenoise.group_members(&creator, group_id).await.unwrap();
@@ -3181,12 +3196,12 @@ mod tests {
     #[tokio::test]
     async fn test_update_group_data_no_merge_on_publish_failure() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (group, creator, _existing) = create_group_for_mutation_test(&whitenoise).await;
+        let (group, creator, _existing) = create_group_with_unreachable_relays(&whitenoise).await;
         let group_id = &group.mls_group_id;
 
         let group_before = whitenoise.group(&creator, group_id).await.unwrap();
 
-        // Create a group data update but publish to unreachable ports
+        // Call the actual production method — fails at publish
         let new_data = NostrGroupDataUpdate {
             name: Some("Should Not Appear".to_string()),
             description: Some("This update should not be applied".to_string()),
@@ -3198,21 +3213,10 @@ mod tests {
             relays: None,
             nostr_group_id: None,
         };
-
-        let evolution_event = {
-            let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
-            let result = mdk.update_group_data(group_id, new_data).unwrap();
-            result.evolution_event
-        };
-
-        let unreachable = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
-        ];
-        let publish_result = whitenoise
-            .publish_event_with_retry(evolution_event, &creator.pubkey, &unreachable)
+        let result = whitenoise
+            .update_group_data(&creator, group_id, new_data)
             .await;
-        assert!(publish_result.is_err(), "Publish should fail");
+        assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: group data is unchanged (merge did not happen)
         let group_after = whitenoise.group(&creator, group_id).await.unwrap();
