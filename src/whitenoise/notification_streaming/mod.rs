@@ -14,6 +14,7 @@ use crate::whitenoise::{
     Whitenoise,
     account_settings::AccountSettings,
     accounts::Account,
+    accounts_groups::AccountGroup,
     group_information::{GroupInformation, GroupType},
     message_aggregator::ChatMessage,
     users::User,
@@ -22,7 +23,8 @@ use crate::whitenoise::{
 
 impl Whitenoise {
     /// Emit a notification for a new message.
-    /// Filters out messages from any of the user's own accounts.
+    /// Filters out messages from any of the user's own accounts and
+    /// suppresses notifications for groups the user has not yet accepted.
     pub(crate) async fn emit_new_message_notification(
         &self,
         account: &Account,
@@ -35,6 +37,15 @@ impl Whitenoise {
         }
 
         if self.is_own_account(&message.author).await {
+            return;
+        }
+
+        if !self.is_group_accepted(&account.pubkey, group_id).await {
+            tracing::debug!(
+                target: "whitenoise::notification_streaming",
+                "Suppressing NewMessage notification for unaccepted group {}",
+                hex::encode(group_id.as_slice())
+            );
             return;
         }
 
@@ -197,6 +208,26 @@ impl Whitenoise {
         }
     }
 
+    /// Returns whether the group has been accepted by the account.
+    /// Fail-closed: returns `false` on lookup error to avoid notifying for unknown groups.
+    async fn is_group_accepted(&self, account_pubkey: &PublicKey, group_id: &GroupId) -> bool {
+        match AccountGroup::find_by_account_and_group(account_pubkey, group_id, &self.database)
+            .await
+        {
+            Ok(Some(ag)) => ag.is_accepted(),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::notification_streaming",
+                    "Failed to check group acceptance for group {}, defaulting to suppressed: {}",
+                    hex::encode(group_id.as_slice()),
+                    e
+                );
+                false
+            }
+        }
+    }
+
     async fn is_own_account(&self, pubkey: &PublicKey) -> bool {
         Account::find_by_pubkey(pubkey, &self.database)
             .await
@@ -206,10 +237,13 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use nostr_sdk::{Keys, Tags, Timestamp};
+
     use super::*;
+    use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::message_aggregator::ReactionSummary;
     use crate::whitenoise::test_utils::*;
-    use nostr_sdk::{Keys, Tags, Timestamp};
 
     fn create_test_message(author: PublicKey, content: &str) -> ChatMessage {
         ChatMessage {
@@ -265,6 +299,10 @@ mod tests {
         let message = create_test_message(external_sender, "Hello from external");
 
         let group_id = GroupId::from_slice(&[2u8; 32]);
+
+        // Create an accepted AccountGroup so the notification is not suppressed
+        create_accepted_account_group(&whitenoise, &account.pubkey, &group_id).await;
+
         whitenoise
             .emit_new_message_notification(
                 &account,
@@ -403,6 +441,9 @@ mod tests {
         let message = create_test_message(external_sender, "Hello enabled");
         let group_id = GroupId::from_slice(&[10u8; 32]);
 
+        // Create an accepted AccountGroup so the notification is not suppressed
+        create_accepted_account_group(&whitenoise, &account.pubkey, &group_id).await;
+
         // Notifications enabled by default
         whitenoise
             .emit_new_message_notification_if_enabled(
@@ -434,6 +475,10 @@ mod tests {
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Should not arrive");
         let group_id = GroupId::from_slice(&[11u8; 32]);
+
+        // Create an accepted AccountGroup so we specifically test the
+        // notifications-disabled path, not the unaccepted-group path
+        create_accepted_account_group(&whitenoise, &account.pubkey, &group_id).await;
 
         whitenoise
             .emit_new_message_notification_if_enabled(&account, &group_id, &message, None)
@@ -501,6 +546,230 @@ mod tests {
         assert!(
             result.is_err(),
             "Should NOT emit invite when notifications disabled"
+        );
+    }
+
+    /// Creates an accepted AccountGroup for the given account and group.
+    async fn create_accepted_account_group(
+        whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+    ) {
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: *account_pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        ag.save(&whitenoise.database).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_emit_new_message_notification_suppressed_for_pending_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let external_sender = Keys::generate().public_key();
+        let message = create_test_message(external_sender, "Pending group msg");
+        let group_id = GroupId::from_slice(&[20u8; 32]);
+
+        // Create a pending AccountGroup (user_confirmation = None)
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        ag.save(&whitenoise.database).await.unwrap();
+
+        whitenoise
+            .emit_new_message_notification(
+                &account,
+                &group_id,
+                &message,
+                Some("Pending Group".to_string()),
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT receive notification for pending group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_new_message_notification_suppressed_for_declined_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let external_sender = Keys::generate().public_key();
+        let message = create_test_message(external_sender, "Declined group msg");
+        let group_id = GroupId::from_slice(&[21u8; 32]);
+
+        // Create a declined AccountGroup (user_confirmation = Some(false))
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(false),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        ag.save(&whitenoise.database).await.unwrap();
+
+        whitenoise
+            .emit_new_message_notification(
+                &account,
+                &group_id,
+                &message,
+                Some("Declined Group".to_string()),
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT receive notification for declined group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_emit_new_message_notification_suppressed_for_unknown_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let external_sender = Keys::generate().public_key();
+        let message = create_test_message(external_sender, "Unknown group msg");
+        let group_id = GroupId::from_slice(&[22u8; 32]);
+
+        // No AccountGroup record exists at all
+        whitenoise
+            .emit_new_message_notification(
+                &account,
+                &group_id,
+                &message,
+                Some("Unknown Group".to_string()),
+            )
+            .await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Should NOT receive notification when no AccountGroup exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_invite_notification_still_emits_for_pending_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mut rx = whitenoise.notification_stream_manager.subscribe();
+
+        let welcomer = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[23u8; 32]);
+
+        // Create a pending AccountGroup (user_confirmation = None)
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: Some(welcomer),
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        ag.save(&whitenoise.database).await.unwrap();
+
+        whitenoise
+            .emit_group_invite_notification(&account, &group_id, "Invite Group", welcomer)
+            .await;
+
+        // GroupInvite notifications should still emit for pending groups
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "GroupInvite notification should emit for pending groups"
+        );
+
+        let update = result.unwrap().unwrap();
+        assert_eq!(update.trigger, NotificationTrigger::GroupInvite);
+    }
+
+    #[tokio::test]
+    async fn test_is_group_accepted_returns_false_for_pending() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[24u8; 32]);
+
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: None,
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        ag.save(&whitenoise.database).await.unwrap();
+
+        assert!(
+            !whitenoise
+                .is_group_accepted(&account.pubkey, &group_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_group_accepted_returns_true_for_accepted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[25u8; 32]);
+
+        create_accepted_account_group(&whitenoise, &account.pubkey, &group_id).await;
+
+        assert!(
+            whitenoise
+                .is_group_accepted(&account.pubkey, &group_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_group_accepted_returns_false_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[26u8; 32]);
+
+        assert!(
+            !whitenoise
+                .is_group_accepted(&account.pubkey, &group_id)
+                .await
         );
     }
 }
