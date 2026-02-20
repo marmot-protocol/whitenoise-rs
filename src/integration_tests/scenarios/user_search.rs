@@ -48,6 +48,16 @@ impl Scenario for UserSearchScenario {
             .execute(&mut self.context)
             .await?;
 
+        // Use a fresh account with no follows for the fallback test
+        CreateAccountsTestCase::with_names(vec!["isolated"])
+            .execute(&mut self.context)
+            .await?;
+
+        tracing::info!("Testing: Fallback seed injection when social graph is empty");
+        SearchFallbackSeedTestCase::new("isolated")
+            .execute(&mut self.context)
+            .await?;
+
         Ok(())
     }
 }

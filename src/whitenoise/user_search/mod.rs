@@ -51,6 +51,13 @@ const CANDIDATE_CHANNEL_CAPACITY: usize = 500;
 /// Capacity for inter-tier channels.
 const TIER_CHANNEL_CAPACITY: usize = 500;
 
+/// Well-connected pubkey injected as a graph entrypoint when the searcher's
+/// social graph is exhausted (e.g., new account with no follows).
+///
+/// npub1zuuajd7u3sx8xu92yav9jwxpr839cs0kc3q6t56vd5u9q033xmhsk6c2uc
+const FALLBACK_SEED_PUBKEY: &str =
+    "1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef";
+
 pub use matcher::{MatchQuality, MatchResult, MatchedField, match_metadata};
 pub(crate) use types::SEARCH_CHANNEL_BUFFER_SIZE;
 pub use types::{
@@ -384,6 +391,7 @@ async fn follows_producer_task(
 ) {
     let mut seen_pubkeys: HashSet<PublicKey> = HashSet::new();
     let mut previous_layer_pubkeys: HashSet<PublicKey> = HashSet::new();
+    let mut fallback_used = false;
 
     for radius in 0..=radius_end {
         // Check if receivers still exist (implicit cancellation)
@@ -427,6 +435,27 @@ async fn follows_producer_task(
             continue;
         }
 
+        // When every user in the previous layer has an empty follows list,
+        // the graph can't expand further. Inject a well-connected seed pubkey
+        // so the search has an entrypoint into the broader network.
+        let fallback_seed = if previous_layer_pubkeys.is_empty() && !fallback_used {
+            match PublicKey::parse(FALLBACK_SEED_PUBKEY) {
+                Ok(seed) if !seen_pubkeys.contains(&seed) => {
+                    previous_layer_pubkeys.insert(seed);
+                    fallback_used = true;
+                    tracing::info!(
+                        target: "whitenoise::user_search",
+                        "Social graph exhausted at radius {} — injecting fallback seed",
+                        radius,
+                    );
+                    Some(seed)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Phase 1: Build partial layer from cached follows (instant)
         let (partial_layer, need_fetch) = match tokio::time::timeout(
             std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
@@ -449,7 +478,12 @@ async fn follows_producer_task(
         };
 
         // Apply cap to partial layer
-        let (partial_layer, partial_capped) = apply_cap(partial_layer);
+        let (mut partial_layer, partial_capped) = apply_cap(partial_layer);
+
+        // Include the seed itself so it's findable via metadata search
+        if let Some(seed) = fallback_seed {
+            partial_layer.insert(seed);
+        }
 
         seen_pubkeys.extend(partial_layer.iter().copied());
 
@@ -2640,6 +2674,112 @@ mod tests {
         assert!(
             found,
             "Should find followed user 'aleups' by name at radius 1"
+        );
+    }
+
+    /// When the searcher has no follows, the social graph is empty and can't
+    /// expand. The fallback seed should be injected so its follows become
+    /// searchable candidates.
+    #[tokio::test]
+    async fn search_injects_fallback_seed_when_graph_is_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        // Account has no follows — social graph is empty.
+
+        let seed_pk = PublicKey::parse(FALLBACK_SEED_PUBKEY).unwrap();
+
+        // Pre-populate the seed's follows in the cache
+        let discoverable_pk = random_pk();
+        let cached_seed = CachedGraphUser::new(
+            seed_pk,
+            Some(Metadata::new().name("SeedUser")),
+            Some(vec![discoverable_pk]),
+        );
+        cached_seed.upsert(&whitenoise.database).await.unwrap();
+
+        // Pre-populate the discoverable user's metadata
+        let cached_target = CachedGraphUser::new(
+            discoverable_pk,
+            Some(Metadata::new().name("FallbackTarget")),
+            Some(vec![]),
+        );
+        cached_target.upsert(&whitenoise.database).await.unwrap();
+
+        // Search at radius 0-2: radius 1 should be empty, triggering fallback
+        let updates = run_search(&whitenoise, "fallbacktarget", account.pubkey, 0, 2).await;
+
+        let found_target = updates
+            .iter()
+            .filter(|u| matches!(u.trigger, SearchUpdateTrigger::ResultsFound))
+            .flat_map(|u| &u.new_results)
+            .any(|r| r.pubkey == discoverable_pk);
+
+        assert!(
+            found_target,
+            "Should find the seed's follow via fallback injection"
+        );
+    }
+
+    /// The fallback seed itself should be searchable (findable by metadata).
+    #[tokio::test]
+    async fn search_fallback_seed_itself_is_findable() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let seed_pk = PublicKey::parse(FALLBACK_SEED_PUBKEY).unwrap();
+
+        let cached_seed = CachedGraphUser::new(
+            seed_pk,
+            Some(Metadata::new().name("SeedAccount")),
+            Some(vec![]),
+        );
+        cached_seed.upsert(&whitenoise.database).await.unwrap();
+
+        let updates = run_search(&whitenoise, "seedaccount", account.pubkey, 0, 2).await;
+
+        let found_seed = updates
+            .iter()
+            .filter(|u| matches!(u.trigger, SearchUpdateTrigger::ResultsFound))
+            .flat_map(|u| &u.new_results)
+            .any(|r| r.pubkey == seed_pk);
+
+        assert!(found_seed, "The fallback seed itself should be findable");
+    }
+
+    /// When the searcher has follows, the fallback seed should NOT be injected.
+    #[tokio::test]
+    async fn search_does_not_inject_fallback_when_graph_has_follows() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let seed_pk = PublicKey::parse(FALLBACK_SEED_PUBKEY).unwrap();
+
+        // Give the searcher a follow so the graph is not empty
+        let followed_pk = random_pk();
+        whitenoise
+            .follow_user(&account, &followed_pk)
+            .await
+            .unwrap();
+
+        // Pre-populate seed metadata
+        let cached_seed = CachedGraphUser::new(
+            seed_pk,
+            Some(Metadata::new().name("SeedAccount")),
+            Some(vec![]),
+        );
+        cached_seed.upsert(&whitenoise.database).await.unwrap();
+
+        let updates = run_search(&whitenoise, "seedaccount", account.pubkey, 0, 2).await;
+
+        let found_seed = updates
+            .iter()
+            .filter(|u| matches!(u.trigger, SearchUpdateTrigger::ResultsFound))
+            .flat_map(|u| &u.new_results)
+            .any(|r| r.pubkey == seed_pk);
+
+        assert!(
+            !found_seed,
+            "Fallback seed should NOT appear when graph is not empty"
         );
     }
 }
