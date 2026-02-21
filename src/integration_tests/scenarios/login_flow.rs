@@ -69,6 +69,12 @@ impl Scenario for LoginFlowScenario {
             .execute(&mut self.context)
             .await?;
 
+        // 7. Re-registering an external signer should recover subscriptions
+        // after startup-like signer/client state loss.
+        RegisterExternalSignerRecoversSubscriptionsTestCase
+            .execute(&mut self.context)
+            .await?;
+
         Ok(())
     }
 }
