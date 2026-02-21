@@ -48,6 +48,23 @@ impl Scenario for UserSearchScenario {
             .execute(&mut self.context)
             .await?;
 
+        // Create a second account to serve as a group member (not followed by searcher)
+        CreateAccountsTestCase::with_names(vec!["group_member"])
+            .execute(&mut self.context)
+            .await?;
+
+        // Create a group with searcher as creator and group_member as member
+        tracing::info!("Testing: Search finds group co-members at radius 1");
+        CreateGroupTestCase::basic()
+            .with_name("search_group")
+            .with_members("searcher", vec!["group_member"])
+            .execute(&mut self.context)
+            .await?;
+
+        SearchGroupMembersTestCase::new("searcher", "group_member")
+            .execute(&mut self.context)
+            .await?;
+
         // Use a fresh account with no follows for the fallback test
         CreateAccountsTestCase::with_names(vec!["isolated"])
             .execute(&mut self.context)

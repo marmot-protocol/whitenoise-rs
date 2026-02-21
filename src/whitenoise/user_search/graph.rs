@@ -13,6 +13,12 @@ use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::{Event, Filter, Kind, Metadata, PublicKey, RelayUrl, TagKind};
 
+use crate::whitenoise::Whitenoise;
+use crate::whitenoise::accounts::Account;
+use crate::whitenoise::accounts_groups::AccountGroup;
+use crate::whitenoise::cached_graph_user::CachedGraphUser;
+use crate::whitenoise::users::User;
+
 /// Maximum authors to include in a single relay filter query.
 /// Empirical testing shows major relays handle 500+ authors per filter,
 /// but we cap at 200 to match PUBKEY_BATCH_SIZE and avoid unnecessary splits.
@@ -28,10 +34,72 @@ const SEARCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// Metadata tiers use queue-based retries managed by their consumers.
 const NETWORK_FETCH_RETRIES: usize = 3;
 
-use crate::whitenoise::Whitenoise;
-use crate::whitenoise::accounts::Account;
-use crate::whitenoise::cached_graph_user::CachedGraphUser;
-use crate::whitenoise::users::User;
+/// Collect pubkeys of co-members from the searcher's accepted groups.
+///
+/// Iterates all accepted (not pending/declined) groups for the searcher's account,
+/// fetches each group's member list from the local MLS store, and returns a
+/// deduplicated set of member pubkeys (excluding the searcher).
+///
+/// This is purely local data (MLS/MDK) — no network fetch required.
+pub(super) async fn get_group_co_member_pubkeys(
+    whitenoise: &Whitenoise,
+    searcher_pubkey: &PublicKey,
+) -> HashSet<PublicKey> {
+    let account = match Account::find_by_pubkey(searcher_pubkey, &whitenoise.database).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!(
+                target: "whitenoise::user_search::graph",
+                "Could not find account for group co-member lookup: {}",
+                e
+            );
+            return HashSet::new();
+        }
+    };
+
+    let groups =
+        match AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.database).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::debug!(
+                    target: "whitenoise::user_search::graph",
+                    "Could not fetch account groups: {}",
+                    e
+                );
+                return HashSet::new();
+            }
+        };
+
+    let mut co_members = HashSet::new();
+
+    for ag in groups {
+        if !ag.is_accepted() {
+            continue;
+        }
+
+        match whitenoise.group_members(&account, &ag.mls_group_id).await {
+            Ok(members) => {
+                co_members.extend(members.into_iter().filter(|pk| pk != searcher_pubkey));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "whitenoise::user_search::graph",
+                    "Could not fetch members for group {:?}: {}",
+                    ag.mls_group_id,
+                    e
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        target: "whitenoise::user_search::graph",
+        "Found {} group co-members for searcher",
+        co_members.len()
+    );
+
+    co_members
+}
 
 /// Collect relay URLs the client is currently connected to.
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
@@ -1040,5 +1108,94 @@ mod tests {
 
         let follows = parse_follows_from_event(&event);
         assert!(follows.is_empty());
+    }
+
+    // --- get_group_co_member_pubkeys tests ---
+
+    #[tokio::test]
+    async fn group_co_members_returns_empty_for_unknown_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let unknown_pk = Keys::generate().public_key();
+
+        let result = get_group_co_member_pubkeys(&whitenoise, &unknown_pk).await;
+
+        assert!(
+            result.is_empty(),
+            "Should return empty set when account not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_co_members_returns_empty_when_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let result = get_group_co_member_pubkeys(&whitenoise, &account.pubkey).await;
+
+        assert!(
+            result.is_empty(),
+            "Should return empty set when account has no groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_co_members_skips_pending_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Insert a pending group (user_confirmation = None)
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[1, 2, 3]);
+        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = get_group_co_member_pubkeys(&whitenoise, &account.pubkey).await;
+
+        assert!(result.is_empty(), "Should skip pending (unaccepted) groups");
+    }
+
+    #[tokio::test]
+    async fn group_co_members_skips_declined_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Insert and decline a group
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[4, 5, 6]);
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+        ag.update_user_confirmation(false, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = get_group_co_member_pubkeys(&whitenoise, &account.pubkey).await;
+
+        assert!(result.is_empty(), "Should not include declined groups");
+    }
+
+    #[tokio::test]
+    async fn group_co_members_handles_mls_error_gracefully() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Insert and accept a group — group_members() will fail because
+        // mock whitenoise has no MLS infrastructure, exercising the error branch
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[7, 8, 9]);
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+        ag.update_user_confirmation(true, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = get_group_co_member_pubkeys(&whitenoise, &account.pubkey).await;
+
+        // Should return empty (not panic) when MLS call fails
+        assert!(
+            result.is_empty(),
+            "Should gracefully handle MLS errors and return empty set"
+        );
     }
 }
