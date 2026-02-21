@@ -21,7 +21,7 @@ use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::error::Result;
 
 /// Maximum pubkeys to process per radius level (prevents graph explosion from supernodes).
-const MAX_PUBKEYS_PER_RADIUS: usize = 10_000;
+const MAX_PUBKEYS_PER_RADIUS: usize = 25_000;
 
 /// Timeout for fetching data at each radius level (seconds).
 const RADIUS_FETCH_TIMEOUT_SECS: u64 = 300;
@@ -483,6 +483,20 @@ async fn follows_producer_task(
         // Include the seed itself so it's findable via metadata search
         if let Some(seed) = fallback_seed {
             partial_layer.insert(seed);
+        }
+
+        // Inject group co-members at radius 1 so users you share groups with
+        // are immediately discoverable without needing to be followed.
+        // Intentionally placed after apply_cap — group co-members are high-value
+        // local data and should not compete with follows for cap space.
+        if radius == 1 {
+            let group_members =
+                graph::get_group_co_member_pubkeys(whitenoise, &searcher_pubkey).await;
+            for pk in group_members {
+                if !seen_pubkeys.contains(&pk) {
+                    partial_layer.insert(pk);
+                }
+            }
         }
 
         seen_pubkeys.extend(partial_layer.iter().copied());
