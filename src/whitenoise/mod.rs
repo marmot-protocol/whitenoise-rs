@@ -753,6 +753,48 @@ impl Whitenoise {
             return Err(WhitenoiseError::NotExternalSignerAccount);
         }
         self.insert_external_signer(pubkey, signer).await?;
+
+        // On app restore, external accounts may exist before their signer is
+        // re-registered. Startup subscription setup can fail in that gap.
+        // Rebuild account subscriptions now that signing/decryption is available.
+        match (
+            account.nip65_relays(self).await,
+            account.inbox_relays(self).await,
+        ) {
+            (Ok(nip65_relays), Ok(inbox_relays)) => {
+                if let Err(e) = self
+                    .setup_subscriptions(&account, &nip65_relays, &inbox_relays)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::external_signer",
+                        "Failed to recover account subscriptions for {} after signer registration: {}",
+                        pubkey.to_hex(),
+                        e
+                    );
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(
+                    target: "whitenoise::external_signer",
+                    "Failed to load relay lists for {} during subscription recovery: {}",
+                    pubkey.to_hex(),
+                    e
+                );
+            }
+        }
+
+        // Best-effort global recovery for cases where global subscriptions were
+        // also skipped due to no available signer at startup.
+        if let Err(e) = self.ensure_global_subscriptions().await {
+            tracing::warn!(
+                target: "whitenoise::external_signer",
+                "Failed to recover global subscriptions after signer registration for {}: {}",
+                pubkey.to_hex(),
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -2452,6 +2494,83 @@ mod tests {
 
             // Verify the signer was registered
             assert!(whitenoise.get_external_signer(&pubkey).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_register_recovers_missing_account_subscriptions() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            // Create an external signer account with an initially operational subscription state.
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            // Simulate app startup gap: no signer registered yet + account subscriptions missing.
+            whitenoise.remove_external_signer(&account.pubkey);
+            whitenoise
+                .nostr
+                .unsubscribe_account_subscriptions(&account.pubkey)
+                .await
+                .unwrap();
+
+            let before = whitenoise
+                .is_account_subscriptions_operational(&account)
+                .await
+                .unwrap();
+            assert!(
+                !before,
+                "Account subscriptions should be non-operational before signer re-registration"
+            );
+
+            // Re-registering the signer should recover account subscriptions.
+            whitenoise
+                .register_external_signer(account.pubkey, keys)
+                .await
+                .unwrap();
+
+            let after = whitenoise
+                .is_account_subscriptions_operational(&account)
+                .await
+                .unwrap();
+            assert!(
+                after,
+                "register_external_signer should recover missing account subscriptions"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_external_signer_succeeds_when_relay_lookup_fails() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            // Corrupt account->user linkage so relay lookup fails during
+            // subscription recovery. Registration should still succeed.
+            sqlx::query("DELETE FROM users WHERE id = ?")
+                .bind(account.user_id)
+                .execute(&whitenoise.database.pool)
+                .await
+                .unwrap();
+
+            whitenoise.remove_external_signer(&account.pubkey);
+            let result = whitenoise
+                .register_external_signer(account.pubkey, keys)
+                .await;
+
+            assert!(
+                result.is_ok(),
+                "register_external_signer should remain successful even if recovery relay lookup fails"
+            );
+            assert!(
+                whitenoise.get_external_signer(&account.pubkey).is_some(),
+                "signer should still be registered when recovery fails"
+            );
         }
     }
 
