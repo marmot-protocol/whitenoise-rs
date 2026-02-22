@@ -2539,6 +2539,39 @@ mod tests {
                 "register_external_signer should recover missing account subscriptions"
             );
         }
+
+        #[tokio::test]
+        async fn test_register_external_signer_succeeds_when_relay_lookup_fails() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            // Corrupt account->user linkage so relay lookup fails during
+            // subscription recovery. Registration should still succeed.
+            sqlx::query("DELETE FROM users WHERE id = ?")
+                .bind(account.user_id)
+                .execute(&whitenoise.database.pool)
+                .await
+                .unwrap();
+
+            whitenoise.remove_external_signer(&account.pubkey);
+            let result = whitenoise
+                .register_external_signer(account.pubkey, keys)
+                .await;
+
+            assert!(
+                result.is_ok(),
+                "register_external_signer should remain successful even if recovery relay lookup fails"
+            );
+            assert!(
+                whitenoise.get_external_signer(&account.pubkey).is_some(),
+                "signer should still be registered when recovery fails"
+            );
+        }
     }
 
     mod subscription_tests {
