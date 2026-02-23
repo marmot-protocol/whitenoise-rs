@@ -5380,6 +5380,320 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // State machine tests: login_with_custom_relay full transitions
+    //
+    // Strategy: we inject partial relay lists into pending_logins so that
+    // when login_with_custom_relay calls try_discover_relay_lists against the
+    // local Docker relay (which has nothing for a fresh pubkey), the fresh
+    // discovery result is empty and the merge relies entirely on what was
+    // already in the stash.  This lets us test every branch of the function
+    // without needing a relay that actually serves specific event kinds.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_login_with_custom_relay_no_pending_returns_error() {
+        // Calling login_with_custom_relay without a prior login_start must fail.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        let err = whitenoise
+            .login_with_custom_relay(&pubkey, RelayUrl::parse("ws://localhost:8080").unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, LoginError::NoLoginInProgress),
+            "Must return NoLoginInProgress when no login is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_with_custom_relay_stays_incomplete_when_stash_still_missing_lists() {
+        // Stash starts with nip65 only.  The custom relay (local Docker, empty for
+        // this pubkey) finds nothing.  After merge the stash is still incomplete →
+        // must return NeedsRelayLists and keep the stash.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .await
+            .unwrap();
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay.clone()],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_with_custom_relay(&pubkey, RelayUrl::parse("ws://localhost:8080").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            LoginStatus::NeedsRelayLists,
+            "Still missing inbox+key_package → must stay NeedsRelayLists"
+        );
+        // Stash must still exist and retain the nip65 relay.
+        let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
+        assert_eq!(
+            stash.nip65.len(),
+            1,
+            "nip65 relay must be preserved in stash"
+        );
+        assert!(stash.inbox.is_empty());
+        assert!(stash.key_package.is_empty());
+        drop(stash);
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_login_with_custom_relay_completes_when_stash_becomes_full_via_merge() {
+        // This is the exact bug scenario: login_start found nip65, then
+        // login_with_custom_relay finds inbox+key_package.  After merge the stash
+        // is complete → must return Complete and clear the stash.
+        //
+        // We pre-load the stash with all three lists (simulating what would result
+        // after a merge where the custom relay provides inbox+key_package and the
+        // pre-existing stash had nip65).  The custom relay (local Docker, empty)
+        // contributes nothing new, but the stash is already complete, so
+        // is_now_complete is true and complete_login is called.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .await
+            .unwrap();
+        let inbox_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://inbox.example.com").unwrap())
+            .await
+            .unwrap();
+        let kp_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://kp.example.com").unwrap())
+            .await
+            .unwrap();
+
+        // Pre-load a complete stash with DB relay rows, simulating the
+        // accumulated result of login_start (nip65) + a prior custom-relay
+        // retry (inbox+kp) where both calls persisted their finds via
+        // try_discover_relay_lists.
+        setup_pending_login_with_db_relays(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay.clone()],
+                inbox: vec![inbox_relay.clone()],
+                key_package: vec![kp_relay.clone()],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_with_custom_relay(&pubkey, RelayUrl::parse("ws://localhost:8080").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            LoginStatus::Complete,
+            "Stash already complete → must complete login"
+        );
+        // Stash must be cleared — this is the key state-machine assertion.
+        assert!(
+            !whitenoise.pending_logins.contains_key(&pubkey),
+            "pending_logins must be cleared after Complete"
+        );
+        assert_eq!(result.account.pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_login_with_custom_relay_all_missing_stays_incomplete() {
+        // Stash starts empty (nothing found anywhere so far).  Custom relay
+        // (local Docker, empty) also finds nothing.  Must return NeedsRelayLists.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_with_custom_relay(&pubkey, RelayUrl::parse("ws://localhost:8080").unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::NeedsRelayLists);
+        assert!(
+            whitenoise.pending_logins.contains_key(&pubkey),
+            "Stash must persist when still incomplete"
+        );
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // State machine tests: login_external_signer_with_custom_relay full transitions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_login_ext_signer_with_custom_relay_no_pending_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        let err = whitenoise
+            .login_external_signer_with_custom_relay(
+                &pubkey,
+                RelayUrl::parse("ws://localhost:8080").unwrap(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, LoginError::NoLoginInProgress),
+            "Must return NoLoginInProgress when no login is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_ext_signer_with_custom_relay_stays_incomplete() {
+        // Same as the local-key variant: stash has nip65 only, custom relay finds
+        // nothing → NeedsRelayLists, stash preserved.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .await
+            .unwrap();
+        setup_partial_pending_login_external_signer(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_external_signer_with_custom_relay(
+                &pubkey,
+                RelayUrl::parse("ws://localhost:8080").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::NeedsRelayLists);
+        let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
+        assert_eq!(stash.nip65.len(), 1, "nip65 must be preserved");
+        assert!(stash.inbox.is_empty());
+        assert!(stash.key_package.is_empty());
+        drop(stash);
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_login_ext_signer_with_custom_relay_completes_when_stash_full() {
+        // Pre-loaded complete stash → must return Complete, clear stash.
+        // Use the local Docker relay URL for key_package so publish succeeds.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:7777").unwrap())
+            .await
+            .unwrap();
+        let inbox_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:7777").unwrap())
+            .await
+            .unwrap();
+        let kp_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:7777").unwrap())
+            .await
+            .unwrap();
+
+        setup_pending_login_external_signer_with_db_relays(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![inbox_relay],
+                key_package: vec![kp_relay],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_external_signer_with_custom_relay(
+                &pubkey,
+                RelayUrl::parse("ws://localhost:8080").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::Complete);
+        assert_eq!(result.account.account_type, AccountType::External);
+        assert!(
+            !whitenoise.pending_logins.contains_key(&pubkey),
+            "Stash must be cleared after Complete"
+        );
+        assert_eq!(result.account.pubkey, pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_login_ext_signer_with_custom_relay_all_missing_stays_incomplete() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        setup_partial_pending_login_external_signer(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_external_signer_with_custom_relay(
+                &pubkey,
+                RelayUrl::parse("ws://localhost:8080").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::NeedsRelayLists);
+        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    // -----------------------------------------------------------------------
     // login_publish_default_relays — selective publish tests
     // These tests inject partial DiscoveredRelayLists directly into
     // pending_logins and then drive login_publish_default_relays, verifying
@@ -5419,6 +5733,65 @@ mod tests {
             .insert_external_signer(pubkey, keys.clone())
             .await
             .unwrap();
+        whitenoise.pending_logins.insert(pubkey, discovered);
+    }
+
+    /// Helper: like `setup_partial_pending_login` but also writes the relay
+    /// associations from `discovered` to the DB, mirroring what
+    /// `try_discover_relay_lists` does.  Use this when the test will call a
+    /// function that relies on those rows already existing (e.g. a path that
+    /// calls `complete_login` without going through `login_publish_default_relays`).
+    async fn setup_pending_login_with_db_relays(
+        whitenoise: &Whitenoise,
+        keys: &Keys,
+        discovered: DiscoveredRelayLists,
+    ) {
+        whitenoise
+            .create_base_account_with_private_key(keys)
+            .await
+            .unwrap();
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+            .await
+            .unwrap();
+        let user = account.user(&whitenoise.database).await.unwrap();
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            let relays = discovered.relays(relay_type);
+            if !relays.is_empty() {
+                user.add_relays(relays, relay_type, &whitenoise.database)
+                    .await
+                    .unwrap();
+            }
+        }
+        whitenoise
+            .pending_logins
+            .insert(keys.public_key(), discovered);
+    }
+
+    /// Helper: like `setup_partial_pending_login_external_signer` but also
+    /// writes relay associations to the DB.
+    async fn setup_pending_login_external_signer_with_db_relays(
+        whitenoise: &Whitenoise,
+        keys: &Keys,
+        discovered: DiscoveredRelayLists,
+    ) {
+        let pubkey = keys.public_key();
+        let (account, _) = whitenoise
+            .setup_external_signer_account_without_relays(pubkey)
+            .await
+            .unwrap();
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+        let user = account.user(&whitenoise.database).await.unwrap();
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            let relays = discovered.relays(relay_type);
+            if !relays.is_empty() {
+                user.add_relays(relays, relay_type, &whitenoise.database)
+                    .await
+                    .unwrap();
+            }
+        }
         whitenoise.pending_logins.insert(pubkey, discovered);
     }
 
