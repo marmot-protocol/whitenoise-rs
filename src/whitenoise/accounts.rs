@@ -738,31 +738,39 @@ impl Whitenoise {
             discovered.nip65.clone()
         };
 
+        // For each relay type: persist the found relays to the DB (if any), and
+        // publish + assign defaults only for the ones that were missing.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let already_found = match relay_type {
-                RelayType::Nip65 => !discovered.nip65.is_empty(),
-                RelayType::Inbox => !discovered.inbox.is_empty(),
-                RelayType::KeyPackage => !discovered.key_package.is_empty(),
+            let found = match relay_type {
+                RelayType::Nip65 => &discovered.nip65,
+                RelayType::Inbox => &discovered.inbox,
+                RelayType::KeyPackage => &discovered.key_package,
             };
-            if already_found {
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    "Skipping publish for {:?} — already exists on network",
+            if found.is_empty() {
+                // Missing — assign defaults in the DB and publish to the network.
+                user.add_relays(&default_relays, relay_type, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+                self.publish_relay_list(
+                    &default_relays,
                     relay_type,
-                );
-                continue;
-            }
-            user.add_relays(&default_relays, relay_type, &self.database)
+                    &publish_to_relays,
+                    keys.clone(),
+                )
                 .await
                 .map_err(LoginError::from)?;
-            self.publish_relay_list(
-                &default_relays,
-                relay_type,
-                &publish_to_relays,
-                keys.clone(),
-            )
-            .await
-            .map_err(LoginError::from)?;
+            } else {
+                // Already found — persist the discovered relays so they are
+                // queryable via account.nip65_relays() etc. after login.
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Skipping publish for {:?} — already exists on network; persisting to DB",
+                    relay_type,
+                );
+                user.add_relays(found, relay_type, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+            }
         }
 
         tracing::debug!(
@@ -770,8 +778,7 @@ impl Whitenoise {
             "Missing relay lists published, activating account"
         );
 
-        // Build the final relay sets for activation: use discovered where found,
-        // fall back to defaults where we just published.
+        // Build the final relay sets for account activation.
         let nip65 = if discovered.nip65.is_empty() {
             &default_relays
         } else {
@@ -1044,32 +1051,39 @@ impl Whitenoise {
         };
         let default_urls = Relay::urls(&default_relays);
 
+        // For each relay type: persist found relays to the DB and publish defaults
+        // only for the ones that were missing.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let already_found = match relay_type {
-                RelayType::Nip65 => !discovered.nip65.is_empty(),
-                RelayType::Inbox => !discovered.inbox.is_empty(),
-                RelayType::KeyPackage => !discovered.key_package.is_empty(),
+            let found = match relay_type {
+                RelayType::Nip65 => &discovered.nip65,
+                RelayType::Inbox => &discovered.inbox,
+                RelayType::KeyPackage => &discovered.key_package,
             };
-            if already_found {
+            if found.is_empty() {
+                // Missing — assign defaults in the DB and publish via the signer.
+                user.add_relays(&default_relays, relay_type, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
+                self.nostr
+                    .publish_relay_list_with_signer(
+                        &default_urls,
+                        relay_type,
+                        &publish_to_urls,
+                        signer.clone(),
+                    )
+                    .await
+                    .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
+            } else {
+                // Already found — persist the discovered relays to the DB.
                 tracing::debug!(
                     target: "whitenoise::accounts",
-                    "Skipping publish for {:?} — already exists on network",
+                    "Skipping publish for {:?} — already exists on network; persisting to DB",
                     relay_type,
                 );
-                continue;
+                user.add_relays(found, relay_type, &self.database)
+                    .await
+                    .map_err(LoginError::from)?;
             }
-            user.add_relays(&default_relays, relay_type, &self.database)
-                .await
-                .map_err(LoginError::from)?;
-            self.nostr
-                .publish_relay_list_with_signer(
-                    &default_urls,
-                    relay_type,
-                    &publish_to_urls,
-                    signer.clone(),
-                )
-                .await
-                .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
         }
 
         // Build the final relay sets for activation.
@@ -4985,5 +4999,988 @@ mod tests {
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // DiscoveredRelayLists::is_complete tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a dummy Relay from a URL string without touching the DB.
+    fn dummy_relay(url: &str) -> Relay {
+        Relay {
+            id: Some(1),
+            url: RelayUrl::parse(url).unwrap(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_all_present() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![dummy_relay("wss://b.example.com")],
+            key_package: vec![dummy_relay("wss://c.example.com")],
+        };
+        assert!(
+            lists.is_complete(),
+            "All three lists present — should be complete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_all_empty() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        assert!(!lists.is_complete(), "All empty — should not be complete");
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_only_nip65() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        assert!(
+            !lists.is_complete(),
+            "Only nip65 present — must be incomplete (inbox and key_package missing)"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_only_inbox() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![dummy_relay("wss://b.example.com")],
+            key_package: vec![],
+        };
+        assert!(
+            !lists.is_complete(),
+            "Only inbox present — must be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_only_key_package() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![dummy_relay("wss://c.example.com")],
+        };
+        assert!(
+            !lists.is_complete(),
+            "Only key_package present — must be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_nip65_and_inbox_only() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![dummy_relay("wss://b.example.com")],
+            key_package: vec![],
+        };
+        assert!(
+            !lists.is_complete(),
+            "nip65 + inbox but no key_package — must be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_nip65_and_key_package_only() {
+        // This is the bug scenario: user has 10002 and 10051 but no 10050.
+        let lists = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![],
+            key_package: vec![dummy_relay("wss://c.example.com")],
+        };
+        assert!(
+            !lists.is_complete(),
+            "nip65 + key_package but no inbox — must be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_is_complete_inbox_and_key_package_only() {
+        let lists = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![dummy_relay("wss://b.example.com")],
+            key_package: vec![dummy_relay("wss://c.example.com")],
+        };
+        assert!(
+            !lists.is_complete(),
+            "inbox + key_package but no nip65 — must be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_discovered_relay_lists_multiple_relays_per_list() {
+        // Multiple entries per list should still count as complete.
+        let lists = DiscoveredRelayLists {
+            nip65: vec![
+                dummy_relay("wss://a1.example.com"),
+                dummy_relay("wss://a2.example.com"),
+            ],
+            inbox: vec![
+                dummy_relay("wss://b1.example.com"),
+                dummy_relay("wss://b2.example.com"),
+            ],
+            key_package: vec![dummy_relay("wss://c.example.com")],
+        };
+        assert!(
+            lists.is_complete(),
+            "Multiple relays per list — should be complete"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pending_logins stash tests (unit-level, no relay network required)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pending_logins_stash_is_incomplete_when_only_nip65_found() {
+        // Verify that a DiscoveredRelayLists with only nip65 populated (the bug
+        // scenario) reports is_complete() == false.  This is a pure unit test
+        // with no relay or DB involvement.
+        let pubkey = Keys::generate().public_key();
+        let partial = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![],
+            key_package: vec![],
+        };
+
+        // is_complete() must be false — the old code skipped this check.
+        assert!(!partial.is_complete(), "Partial stash must not be complete");
+        assert_eq!(
+            partial.nip65.len(),
+            1,
+            "nip65 list should contain the relay"
+        );
+        assert!(partial.inbox.is_empty(), "inbox list should be empty");
+        assert!(
+            partial.key_package.is_empty(),
+            "key_package list should be empty"
+        );
+
+        // Simulate what login_start does: insert into pending_logins map.
+        use dashmap::DashMap;
+        let pending: DashMap<nostr_sdk::PublicKey, DiscoveredRelayLists> = DashMap::new();
+        pending.insert(pubkey, partial);
+
+        let stashed = pending.get(&pubkey).unwrap();
+        assert!(
+            !stashed.is_complete(),
+            "Stashed partial must not be complete"
+        );
+        assert_eq!(stashed.nip65.len(), 1);
+        assert!(stashed.inbox.is_empty());
+        assert!(stashed.key_package.is_empty());
+    }
+
+    #[test]
+    fn test_pending_logins_stash_replaced_on_retry() {
+        // Verify that when login_with_custom_relay calls pending_logins.insert
+        // again for the same pubkey, the stash is replaced (not doubled) and
+        // remains incomplete when nothing was found.  Pure map mechanics test.
+        use dashmap::DashMap;
+        let pubkey = Keys::generate().public_key();
+        let pending: DashMap<nostr_sdk::PublicKey, DiscoveredRelayLists> = DashMap::new();
+
+        // Initial insert (nothing found).
+        pending.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        // A retry with a custom relay that also finds nothing replaces the entry.
+        pending.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        assert!(
+            pending.contains_key(&pubkey),
+            "Stash must persist after retry"
+        );
+        assert!(!pending.get(&pubkey).unwrap().is_complete());
+        assert_eq!(pending.len(), 1, "Only one entry per pubkey");
+
+        // A retry that finds nip65 updates the stash.
+        pending.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![dummy_relay("wss://found.example.com")],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+        let stash = pending.get(&pubkey).unwrap();
+        assert!(
+            !stash.is_complete(),
+            "Still incomplete — inbox and kp still missing"
+        );
+        assert_eq!(stash.nip65.len(), 1, "nip65 updated to found relay");
+    }
+
+    #[tokio::test]
+    async fn test_pending_logins_cleared_on_complete() {
+        // After login_publish_default_relays completes, the stash must be removed.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let complete = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(complete.status, LoginStatus::Complete);
+        assert!(
+            !whitenoise.pending_logins.contains_key(&pubkey),
+            "Stash must be removed after login_publish_default_relays"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // login_publish_default_relays — selective publish tests
+    // These tests inject partial DiscoveredRelayLists directly into
+    // pending_logins and then drive login_publish_default_relays, verifying
+    // that only the missing kinds end up with relay associations.
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a base account and insert a partial DiscoveredRelayLists
+    /// into pending_logins so we can test the step-2a path in isolation.
+    async fn setup_partial_pending_login(
+        whitenoise: &Whitenoise,
+        keys: &Keys,
+        discovered: DiscoveredRelayLists,
+    ) {
+        whitenoise
+            .create_base_account_with_private_key(keys)
+            .await
+            .unwrap();
+        whitenoise
+            .pending_logins
+            .insert(keys.public_key(), discovered);
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_all_missing_assigns_all_three() {
+        // When all three lists are absent, publish_default_relays must
+        // assign default relays to all three kinds.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        // All three relay types must have been assigned.
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            let relays = result
+                .account
+                .relays(relay_type, &whitenoise)
+                .await
+                .unwrap();
+            assert!(
+                !relays.is_empty(),
+                "{:?} relays must be assigned when all lists were missing",
+                relay_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_nip65_present_inbox_and_kp_missing() {
+        // The user from the bug report: has 10002 but missing 10050 and 10051.
+        // Only 10050 and 10051 should be published as defaults.
+        // 10002 relays should match what was pre-discovered, not defaults.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&nip65_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay.clone()],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        // NIP-65 relays must be the custom one, not defaults.
+        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(
+            stored_nip65.len(),
+            1,
+            "NIP-65 must keep the pre-discovered relay"
+        );
+        assert_eq!(
+            stored_nip65[0].url, nip65_url,
+            "NIP-65 must not be overwritten with defaults"
+        );
+
+        // Inbox and key_package must have been filled with defaults.
+        let inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert!(
+            !inbox.is_empty(),
+            "Inbox must get defaults when it was missing"
+        );
+
+        let kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert!(
+            !kp.is_empty(),
+            "KeyPackage must get defaults when it was missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_inbox_present_nip65_and_kp_missing() {
+        // User has 10050 but not 10002 or 10051.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
+        let inbox_relay = whitenoise
+            .find_or_create_relay_by_url(&inbox_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![inbox_relay],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        // Inbox must stay as the custom relay.
+        let stored_inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert_eq!(stored_inbox.len(), 1);
+        assert_eq!(
+            stored_inbox[0].url, inbox_url,
+            "Inbox must not be overwritten"
+        );
+
+        // NIP-65 and key_package must be filled with defaults.
+        let nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert!(!nip65.is_empty(), "NIP-65 must get defaults");
+
+        let kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert!(!kp.is_empty(), "KeyPackage must get defaults");
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_key_package_present_nip65_and_inbox_missing() {
+        // User has 10051 but not 10002 or 10050.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let kp_relay = whitenoise
+            .find_or_create_relay_by_url(&kp_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![kp_relay],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        let stored_kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(stored_kp.len(), 1);
+        assert_eq!(
+            stored_kp[0].url, kp_url,
+            "KeyPackage must not be overwritten"
+        );
+
+        let nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert!(!nip65.is_empty());
+
+        let inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert!(!inbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_nip65_and_inbox_present_kp_missing() {
+        // User has 10002 and 10050 but not 10051.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
+        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&nip65_url)
+            .await
+            .unwrap();
+        let inbox_relay = whitenoise
+            .find_or_create_relay_by_url(&inbox_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![inbox_relay],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(stored_nip65[0].url, nip65_url, "NIP-65 must be preserved");
+
+        let stored_inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert_eq!(stored_inbox[0].url, inbox_url, "Inbox must be preserved");
+
+        let kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert!(!kp.is_empty(), "KeyPackage must get defaults");
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_nip65_and_kp_present_inbox_missing() {
+        // User has 10002 and 10051 but not 10050.  This was the original bug scenario.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
+        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&nip65_url)
+            .await
+            .unwrap();
+        let kp_relay = whitenoise
+            .find_or_create_relay_by_url(&kp_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![],
+                key_package: vec![kp_relay],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(stored_nip65[0].url, nip65_url, "NIP-65 must be preserved");
+
+        let stored_kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(stored_kp[0].url, kp_url, "KeyPackage must be preserved");
+
+        let inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert!(!inbox.is_empty(), "Inbox must get defaults");
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_inbox_and_kp_present_nip65_missing() {
+        // User has 10050 and 10051 but not 10002.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
+        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let inbox_relay = whitenoise
+            .find_or_create_relay_by_url(&inbox_url)
+            .await
+            .unwrap();
+        let kp_relay = whitenoise
+            .find_or_create_relay_by_url(&kp_url)
+            .await
+            .unwrap();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![inbox_relay],
+                key_package: vec![kp_relay],
+            },
+        )
+        .await;
+
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        let nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert!(!nip65.is_empty(), "NIP-65 must get defaults");
+
+        let stored_inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert_eq!(stored_inbox[0].url, inbox_url, "Inbox must be preserved");
+
+        let stored_kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(stored_kp[0].url, kp_url, "KeyPackage must be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_removes_pending_entry() {
+        // After a successful call the pending_logins map must be empty for this pubkey.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        setup_partial_pending_login(
+            &whitenoise,
+            &keys,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        )
+        .await;
+
+        whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert!(
+            !whitenoise.pending_logins.contains_key(&pubkey),
+            "pending_logins must be cleared after successful publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_default_relays_without_pending_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        // No pending login — must fail.
+        let err = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoginError::NoLoginInProgress),
+            "Must return NoLoginInProgress when no stash exists"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // login_cancel edge cases
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_login_cancel_is_idempotent() {
+        // Calling login_cancel twice must not error on the second call.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        // First cancel: removes account and stash.
+        whitenoise.login_cancel(&pubkey).await.unwrap();
+        // Second cancel: no stash → should be a no-op, not an error.
+        whitenoise.login_cancel(&pubkey).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_login_cancel_with_partial_nip65_stash() {
+        // Cancel works even when the stash has a non-empty nip65 list.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://r.example.com").unwrap())
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        whitenoise.login_cancel(&pubkey).await.unwrap();
+        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(whitenoise.find_account_by_pubkey(&pubkey).await.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // External signer — selective publish tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_external_signer_publish_default_relays_all_missing() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Set up the external-signer account path (no relays pre-discovered).
+        let (account, _) = whitenoise
+            .setup_external_signer_account_without_relays(pubkey)
+            .await
+            .unwrap();
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        let result = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::Complete);
+        assert_eq!(result.account.account_type, AccountType::External);
+
+        for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
+            let relays = account.relays(relay_type, &whitenoise).await.unwrap();
+            assert!(
+                !relays.is_empty(),
+                "{:?} must be assigned when all lists were missing (external signer)",
+                relay_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_external_signer_publish_default_relays_preserves_found_nip65() {
+        // External signer path: user has 10002 but not 10050/10051.
+        // NIP-65 must be preserved; inbox and key_package get defaults.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_url = RelayUrl::parse("wss://custom-ext-nip65.example.com").unwrap();
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&nip65_url)
+            .await
+            .unwrap();
+
+        whitenoise
+            .setup_external_signer_account_without_relays(pubkey)
+            .await
+            .unwrap();
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![nip65_relay],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        let result = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(
+            stored_nip65[0].url, nip65_url,
+            "NIP-65 must not be overwritten"
+        );
+
+        let inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert!(!inbox.is_empty(), "Inbox must receive defaults");
+
+        let kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert!(!kp.is_empty(), "KeyPackage must receive defaults");
+    }
+
+    #[tokio::test]
+    async fn test_external_signer_publish_default_relays_without_pending_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+        let err = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoginError::NoLoginInProgress),
+            "Must return NoLoginInProgress when no stash exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_signer_publish_default_relays_removes_pending_entry() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        whitenoise
+            .setup_external_signer_account_without_relays(pubkey)
+            .await
+            .unwrap();
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+
+        assert!(
+            !whitenoise.pending_logins.contains_key(&pubkey),
+            "pending_logins must be cleared after external signer publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_signer_publish_default_relays_no_signer_registered() {
+        // Stash present but signer not registered → Internal error.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let pubkey = Keys::generate().public_key();
+
+        whitenoise.pending_logins.insert(
+            pubkey,
+            DiscoveredRelayLists {
+                nip65: vec![],
+                inbox: vec![],
+                key_package: vec![],
+            },
+        );
+
+        let err = whitenoise
+            .login_external_signer_publish_default_relays(&pubkey)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoginError::Internal(_)),
+            "Must error when signer is missing from the registry"
+        );
+
+        whitenoise.pending_logins.remove(&pubkey);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test — the original bug
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_regression_nip65_only_user_is_blocked_from_login() {
+        // This is the exact scenario that was broken:
+        // A user has published a 10002 relay list but has never published
+        // 10050 (InboxRelays) or 10051 (MlsKeyPackageRelays).
+        //
+        // The old code fell back to defaults silently and returned Complete.
+        // The new code must return NeedsRelayLists so the UI can prompt the user.
+        //
+        // We simulate this by pre-populating pending_logins with a partial
+        // DiscoveredRelayLists that only has nip65 populated, then verifying
+        // the stash is NOT complete.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let nip65_relay = whitenoise
+            .find_or_create_relay_by_url(&RelayUrl::parse("wss://relay.damus.io").unwrap())
+            .await
+            .unwrap();
+
+        // This is what try_discover_relay_lists now returns for the bug user.
+        let partial = DiscoveredRelayLists {
+            nip65: vec![nip65_relay],
+            inbox: vec![],       // 10050 absent
+            key_package: vec![], // 10051 absent
+        };
+
+        assert!(
+            !partial.is_complete(),
+            "A user with only 10002 must NOT pass is_complete() — this would have been the bug"
+        );
+
+        // Simulate what login_start does with this result: stash and return NeedsRelayLists.
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(pubkey, partial);
+
+        assert!(
+            whitenoise.pending_logins.contains_key(&pubkey),
+            "User with only 10002 must be held in pending state"
+        );
+
+        // Now drive publish_default_relays. It should fill only the missing ones.
+        let result = whitenoise
+            .login_publish_default_relays(&pubkey)
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::Complete);
+
+        // Inbox and key_package must now have defaults.
+        let inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        assert!(
+            !inbox.is_empty(),
+            "Inbox must be filled after publish_default_relays"
+        );
+        let kp = result
+            .account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        assert!(
+            !kp.is_empty(),
+            "KeyPackage must be filled after publish_default_relays"
+        );
     }
 }
