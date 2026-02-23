@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl, ToBech32};
 use tokio::sync::{
@@ -146,7 +146,9 @@ pub struct Whitenoise {
     background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
     /// Pubkeys with a login in progress (between login_start and
     /// login_publish_default_relays / login_with_custom_relay / login_cancel).
-    pending_logins: DashSet<PublicKey>,
+    /// The value holds whichever relay lists were already discovered on the
+    /// network so that step 2a can publish defaults only for the missing ones.
+    pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -365,7 +367,7 @@ impl Whitenoise {
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
-            pending_logins: DashSet::new(),
+            pending_logins: DashMap::new(),
         };
 
         // Create default relays in the database if they don't exist
@@ -1335,7 +1337,7 @@ pub mod test_utils {
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
-            pending_logins: DashSet::new(),
+            pending_logins: DashMap::new(),
         };
 
         (whitenoise, data_temp, logs_temp)
