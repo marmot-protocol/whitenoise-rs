@@ -64,14 +64,6 @@ pub enum SearchUpdateTrigger {
         total_pubkeys_searched: usize,
     },
 
-    /// Radius was capped due to too many pubkeys (graph explosion mitigation).
-    /// Search continues but some pubkeys at this radius were skipped.
-    RadiusCapped {
-        radius: u8,
-        cap: usize,
-        actual: usize,
-    },
-
     /// Radius fetch timed out (graph explosion mitigation).
     /// Search continues with partial data for this radius.
     RadiusTimeout { radius: u8 },
