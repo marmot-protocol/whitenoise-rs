@@ -22,6 +22,7 @@ clap = { version = "4.5.37", features = ["derive"] }
 dashmap = "6.1"
 hex = "0.4"
 image = "0.24"
+indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
 keyring-core = "0.7"
 lightning-invoice = "0.33.1"

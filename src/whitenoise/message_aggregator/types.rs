@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -80,7 +79,7 @@ pub struct ChatMessageSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ReactionSummary {
     /// Map of emoji to reaction details
-    pub by_emoji: HashMap<String, EmojiReaction>,
+    pub by_emoji: IndexMap<String, EmojiReaction>,
 
     /// List of all users who have reacted and with what
     pub user_reactions: Vec<UserReaction>,
@@ -230,7 +229,7 @@ mod tests {
                 reaction_id: EventId::all_zeros(),
             };
 
-            let mut by_emoji = HashMap::new();
+            let mut by_emoji = IndexMap::new();
             by_emoji.insert("👍".to_string(), emoji_reaction);
 
             let summary = ReactionSummary {
