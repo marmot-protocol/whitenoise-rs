@@ -5850,7 +5850,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -5910,7 +5910,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -5960,7 +5960,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -6013,7 +6013,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -6062,7 +6062,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -6111,7 +6111,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login(
+        setup_pending_login_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
@@ -6301,7 +6301,7 @@ mod tests {
             .await
             .unwrap();
 
-        setup_partial_pending_login_external_signer(
+        setup_pending_login_external_signer_with_db_relays(
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
