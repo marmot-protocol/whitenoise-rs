@@ -20,9 +20,6 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::error::Result;
 
-/// Maximum pubkeys to process per radius level (prevents graph explosion from supernodes).
-const MAX_PUBKEYS_PER_RADIUS: usize = 25_000;
-
 /// Timeout for fetching data at each radius level (seconds).
 const RADIUS_FETCH_TIMEOUT_SECS: u64 = 300;
 
@@ -106,7 +103,6 @@ impl Whitenoise {
     /// - `RadiusStarted` - Starting to search a new radius level
     /// - `ResultsFound` - Batch of results found (can be multiple per radius)
     /// - `RadiusCompleted` - Finished searching a radius level
-    /// - `RadiusCapped` - Radius was capped due to too many pubkeys
     /// - `RadiusTimeout` - Radius fetch timed out
     /// - `SearchCompleted` - Search finished (all radii searched)
     /// - `Error` - Error occurred (search continues with partial results)
@@ -331,16 +327,6 @@ async fn search_task(
     );
 }
 
-/// Apply the MAX_PUBKEYS_PER_RADIUS cap to a layer. Returns (capped layer, was_capped).
-fn apply_cap(layer: HashSet<PublicKey>) -> (HashSet<PublicKey>, bool) {
-    if layer.len() > MAX_PUBKEYS_PER_RADIUS {
-        let capped: HashSet<PublicKey> = layer.into_iter().take(MAX_PUBKEYS_PER_RADIUS).collect();
-        (capped, true)
-    } else {
-        (layer, false)
-    }
-}
-
 /// Push candidate batches to the channel, chunked by PUBKEY_BATCH_SIZE.
 async fn push_candidates(
     tx: &mpsc::Sender<CandidateBatch>,
@@ -477,8 +463,11 @@ async fn follows_producer_task(
             }
         };
 
-        // Apply cap to partial layer
-        let (mut partial_layer, partial_capped) = apply_cap(partial_layer);
+        if tx.receiver_count() == 0 {
+            return;
+        }
+
+        let mut partial_layer = partial_layer;
 
         // Include the seed itself so it's findable via metadata search
         if let Some(seed) = fallback_seed {
@@ -487,8 +476,6 @@ async fn follows_producer_task(
 
         // Inject group co-members at radius 1 so users you share groups with
         // are immediately discoverable without needing to be followed.
-        // Intentionally placed after apply_cap — group co-members are high-value
-        // local data and should not compete with follows for cap space.
         if radius == 1 {
             let group_members =
                 graph::get_group_co_member_pubkeys(whitenoise, &searcher_pubkey).await;
@@ -518,42 +505,37 @@ async fn follows_producer_task(
         }
 
         // Phase 2: Fetch remaining follows from network (slow — consumers are busy)
-        let additional_layer =
-            if !need_fetch.is_empty() && partial_layer.len() < MAX_PUBKEYS_PER_RADIUS {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
-                    build_network_layer_from_follows(
-                        whitenoise,
-                        &need_fetch,
-                        &seen_pubkeys,
-                        &partial_layer,
-                    ),
-                )
-                .await
-                {
-                    Ok(additional) => {
-                        // Apply remaining cap budget
-                        let budget = MAX_PUBKEYS_PER_RADIUS - partial_layer.len();
-                        if additional.len() > budget {
-                            additional.into_iter().take(budget).collect()
-                        } else {
-                            additional
-                        }
+        let additional_layer = if !need_fetch.is_empty() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(RADIUS_FETCH_TIMEOUT_SECS),
+                build_network_layer_from_follows(
+                    whitenoise,
+                    &need_fetch,
+                    &seen_pubkeys,
+                    &partial_layer,
+                ),
+            )
+            .await
+            {
+                Ok(additional) => additional,
+                Err(_) => {
+                    if in_requested_range {
+                        let _ = tx.send(UserSearchUpdate {
+                            trigger: SearchUpdateTrigger::RadiusTimeout { radius },
+                            new_results: vec![],
+                            total_result_count: 0,
+                        });
                     }
-                    Err(_) => {
-                        if in_requested_range {
-                            let _ = tx.send(UserSearchUpdate {
-                                trigger: SearchUpdateTrigger::RadiusTimeout { radius },
-                                new_results: vec![],
-                                total_result_count: 0,
-                            });
-                        }
-                        HashSet::new()
-                    }
+                    HashSet::new()
                 }
-            } else {
-                HashSet::new()
-            };
+            }
+        } else {
+            HashSet::new()
+        };
+
+        if tx.receiver_count() == 0 {
+            return;
+        }
 
         seen_pubkeys.extend(additional_layer.iter().copied());
 
@@ -568,26 +550,6 @@ async fn follows_producer_task(
             }
 
             let total = partial_layer.len() + additional_layer.len();
-            let was_capped =
-                partial_capped || (!additional_layer.is_empty() && total >= MAX_PUBKEYS_PER_RADIUS);
-
-            if was_capped {
-                let _ = tx.send(UserSearchUpdate {
-                    trigger: SearchUpdateTrigger::RadiusCapped {
-                        radius,
-                        cap: MAX_PUBKEYS_PER_RADIUS,
-                        actual: total,
-                    },
-                    new_results: vec![],
-                    total_result_count: 0,
-                });
-                tracing::debug!(
-                    target: "whitenoise::user_search",
-                    "Radius {} was capped at {} pubkeys",
-                    radius,
-                    MAX_PUBKEYS_PER_RADIUS
-                );
-            }
 
             if push_radius_complete(&tx_candidates, radius, total)
                 .await
@@ -871,6 +833,10 @@ async fn tier3_network_consumer(
                             // Drain all in-flight + pending before forwarding sentinel.
                             // Retried chunks are bounded by MAX_QUEUE_RETRIES so this terminates.
                             'drain: loop {
+                                if tx.receiver_count() == 0 {
+                                    while in_flight.next().await.is_some() {}
+                                    return;
+                                }
                                 while in_flight.len() < MAX_CONCURRENT_NETWORK_FETCHES {
                                     match pending.pop_front() {
                                         Some((chunk, r, att)) => {
@@ -1015,6 +981,10 @@ async fn tier4_relay_list_consumer(
                             CandidateBatchKind::RadiusComplete { total_pubkeys } => {
                                 // Drain all in-flight + pending before forwarding sentinel.
                                 'drain: loop {
+                                    if tx.receiver_count() == 0 {
+                                        while in_flight.next().await.is_some() {}
+                                        return;
+                                    }
                                     while in_flight.len() < MAX_CONCURRENT_RELAY_LIST_FETCHES {
                                         match pending.pop_front() {
                                             Some((chunk, r, att, failed)) => {
@@ -1250,6 +1220,10 @@ async fn tier5_user_relay_consumer(
                         UserRelayBatchKind::RadiusComplete { total_pubkeys } => {
                             // Drain all in-flight + pending before emitting sentinel.
                             'drain: loop {
+                                if tx.receiver_count() == 0 {
+                                    while in_flight.next().await.is_some() {}
+                                    return;
+                                }
                                 while in_flight.len() < MAX_CONCURRENT_USER_RELAY_FETCHES {
                                     match pending.pop_front() {
                                         Some((pk, relays, r, att)) => {
@@ -1457,7 +1431,7 @@ async fn fetch_user_relay_chunk(
     }
 }
 
-/// Collect unique follows not already seen into a layer set, respecting the cap.
+/// Collect unique follows not already seen into a layer set.
 fn collect_layer_from_follows(
     follows_map: &HashMap<PublicKey, Vec<PublicKey>>,
     seen: &HashSet<PublicKey>,
@@ -1465,11 +1439,8 @@ fn collect_layer_from_follows(
 ) {
     for follows in follows_map.values() {
         for follow in follows {
-            if !seen.contains(follow) && !layer.contains(follow) {
+            if !seen.contains(follow) {
                 layer.insert(*follow);
-            }
-            if layer.len() >= MAX_PUBKEYS_PER_RADIUS {
-                return;
             }
         }
     }
@@ -1898,43 +1869,6 @@ mod tests {
         assert!(target_count <= 1);
     }
 
-    // --- apply_cap tests ---
-
-    #[test]
-    fn apply_cap_returns_uncapped_when_under_limit() {
-        let mut set = HashSet::new();
-        for _ in 0..100 {
-            set.insert(random_pk());
-        }
-        let original_len = set.len();
-        let (result, was_capped) = apply_cap(set);
-        assert_eq!(result.len(), original_len);
-        assert!(!was_capped);
-    }
-
-    #[test]
-    fn apply_cap_caps_when_exceeding_limit() {
-        let mut set = HashSet::new();
-        for _ in 0..(MAX_PUBKEYS_PER_RADIUS + 500) {
-            set.insert(random_pk());
-        }
-        assert!(set.len() > MAX_PUBKEYS_PER_RADIUS);
-        let (result, was_capped) = apply_cap(set);
-        assert_eq!(result.len(), MAX_PUBKEYS_PER_RADIUS);
-        assert!(was_capped);
-    }
-
-    #[test]
-    fn apply_cap_exact_limit_is_not_capped() {
-        let mut set = HashSet::new();
-        while set.len() < MAX_PUBKEYS_PER_RADIUS {
-            set.insert(random_pk());
-        }
-        let (result, was_capped) = apply_cap(set);
-        assert_eq!(result.len(), MAX_PUBKEYS_PER_RADIUS);
-        assert!(!was_capped);
-    }
-
     // --- collect_layer_from_follows tests ---
 
     #[test]
@@ -1970,24 +1904,6 @@ mod tests {
         collect_layer_from_follows(&follows_map, &seen, &mut layer);
 
         assert!(layer.is_empty());
-    }
-
-    #[test]
-    fn collect_layer_from_follows_respects_cap() {
-        let pk = random_pk();
-        // Create more follows than the cap
-        let follows: Vec<PublicKey> = (0..MAX_PUBKEYS_PER_RADIUS + 100)
-            .map(|_| random_pk())
-            .collect();
-
-        let mut follows_map = HashMap::new();
-        follows_map.insert(pk, follows);
-
-        let seen = HashSet::new();
-        let mut layer = HashSet::new();
-        collect_layer_from_follows(&follows_map, &seen, &mut layer);
-
-        assert_eq!(layer.len(), MAX_PUBKEYS_PER_RADIUS);
     }
 
     // --- match_and_emit tests ---

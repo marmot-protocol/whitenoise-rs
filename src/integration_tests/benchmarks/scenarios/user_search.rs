@@ -192,18 +192,6 @@ async fn run_search_timed(
                             .push((format!("Radius {} (TIMEOUT)", radius), start.elapsed()));
                     }
                 }
-                SearchUpdateTrigger::RadiusCapped {
-                    radius,
-                    cap,
-                    actual,
-                } => {
-                    tracing::info!(
-                        "    Radius {} capped: {} -> {} pubkeys",
-                        radius,
-                        actual,
-                        cap
-                    );
-                }
                 SearchUpdateTrigger::ResultsFound => {
                     let batch_size = update.new_results.len();
                     total_results += batch_size;
