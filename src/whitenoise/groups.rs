@@ -213,17 +213,13 @@ impl Whitenoise {
     /// 2. This method publishes the evolution event (with retry)
     /// 3. Only after at least one relay accepts, the pending commit is merged
     ///
-    /// # Dangling pending commits on failure
+    /// # Publish failure and rollback
     ///
-    /// If all publish attempts fail, the pending commit created by the MDK
-    /// operation remains in the MLS group's internal state. MDK does not
-    /// currently expose `clear_pending_commit` (OpenMLS has it, but MDK
-    /// does not wrap it). This means subsequent MLS operations on the same
-    /// group may fail until the pending commit is resolved. Tracked
-    /// upstream — once MDK exposes a clear/abort API, the error path here
-    /// should call it.
-    // TODO(mdk): call mdk.clear_pending_commit(group_id) on failure once
-    // the MDK exposes it, so a failed publish doesn't block the group.
+    /// If all publish attempts fail, the pending commit is cleared via
+    /// `clear_pending_commit`, rolling back the MLS group to its pre-commit
+    /// state. This ensures a failed publish never leaves the group stuck with
+    /// a dangling pending commit that would block all subsequent operations.
+    /// The error from the publish attempt is returned to the caller.
     pub(crate) async fn publish_and_merge_commit(
         &self,
         evolution_event: Event,
@@ -231,11 +227,27 @@ impl Whitenoise {
         group_id: &GroupId,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
-        self.publish_event_with_retry(evolution_event, account_pubkey, relay_urls)
-            .await?;
+        let mdk = self.create_mdk_for_account(*account_pubkey)?;
+
+        if let Err(publish_err) = self
+            .publish_event_with_retry(evolution_event, account_pubkey, relay_urls)
+            .await
+        {
+            // Publish failed — roll back the pending commit so the group is
+            // not left in a blocked state. Log but do not propagate the
+            // clear error; the original publish error is what matters to the caller.
+            if let Err(clear_err) = mdk.clear_pending_commit(group_id) {
+                tracing::warn!(
+                    target: "whitenoise::groups::publish_and_merge_commit",
+                    "Failed to clear pending commit after publish failure for group {}: {}",
+                    hex::encode(group_id.as_slice()),
+                    clear_err,
+                );
+            }
+            return Err(publish_err);
+        }
 
         // Relay accepted — now safe to advance local MLS state
-        let mdk = self.create_mdk_for_account(*account_pubkey)?;
         mdk.merge_pending_commit(group_id)?;
 
         Ok(())
