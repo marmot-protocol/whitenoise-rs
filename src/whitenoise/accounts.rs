@@ -895,6 +895,30 @@ impl Whitenoise {
                 .get_mut(pubkey)
                 .ok_or(LoginError::NoLoginInProgress)?;
             stash.merge(discovered);
+            // The merged stash may now be complete (e.g. login_start found 10002
+            // and this relay provided 10050+10051). Clone what we need before
+            // dropping the lock so we can call the async complete_login.
+            let is_now_complete = stash.is_complete();
+            let merged_nip65 = stash.nip65.clone();
+            let merged_inbox = stash.inbox.clone();
+            let merged_key_package = stash.key_package.clone();
+            drop(stash);
+
+            if is_now_complete {
+                self.complete_login(&account, &merged_nip65, &merged_inbox, &merged_key_package)
+                    .await?;
+                self.pending_logins.remove(pubkey);
+                tracing::info!(
+                    target: "whitenoise::accounts",
+                    "Login complete for {} (lists accumulated across relays)",
+                    pubkey.to_hex()
+                );
+                return Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                });
+            }
+
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -1178,6 +1202,35 @@ impl Whitenoise {
                 .get_mut(pubkey)
                 .ok_or(LoginError::NoLoginInProgress)?;
             stash.merge(discovered);
+            // Clone what we need before dropping the lock so we can make async
+            // calls without holding the DashMap guard.
+            let is_now_complete = stash.is_complete();
+            let merged_nip65 = stash.nip65.clone();
+            let merged_inbox = stash.inbox.clone();
+            let merged_key_package = stash.key_package.clone();
+            drop(stash);
+
+            if is_now_complete {
+                self.complete_external_signer_login(
+                    &account,
+                    &merged_nip65,
+                    &merged_inbox,
+                    &merged_key_package,
+                    signer,
+                )
+                .await?;
+                self.pending_logins.remove(pubkey);
+                tracing::info!(
+                    target: "whitenoise::accounts",
+                    "Login complete for {} (lists accumulated across relays)",
+                    pubkey.to_hex()
+                );
+                return Ok(LoginResult {
+                    account,
+                    status: LoginStatus::Complete,
+                });
+            }
+
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -1189,12 +1242,6 @@ impl Whitenoise {
     // Shared helpers for multi-step login
     // -----------------------------------------------------------------------
 
-    /// Attempt to discover all three relay list types from the network.
-    ///
-    /// Fetches NIP-65 relays from `source_relays`, then uses the discovered
-    /// NIP-65 relays to fetch Inbox and KeyPackage lists. Saves all found
-    /// relays to the database.
-    ///
     /// Attempt to fetch all three relay lists from the network.
     ///
     /// Returns a [`DiscoveredRelayLists`] whose fields contain the relays found
@@ -5257,6 +5304,78 @@ mod tests {
         assert!(
             !whitenoise.pending_logins.contains_key(&pubkey),
             "Stash must be removed after login_publish_default_relays"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-relay accumulation: login_with_custom_relay completes via merge
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_then_is_complete_drives_login_completion_logic() {
+        // Unit test for the core invariant behind the merge-without-recheck fix:
+        // after merging a second discovery into a partial stash, is_complete()
+        // must return true so the caller knows to call complete_login.
+        //
+        // Scenario:
+        //   login_start  → found nip65 only           → stash incomplete
+        //   custom relay → found inbox + key_package  → stash now complete
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://nip65.example.com")],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        assert!(
+            !stash.is_complete(),
+            "Stash after login_start (nip65 only) must be incomplete"
+        );
+
+        // Simulate what try_discover_relay_lists returns for the custom relay.
+        let custom_relay_finds = DiscoveredRelayLists {
+            nip65: vec![], // custom relay has no 10002
+            inbox: vec![dummy_relay("wss://inbox.example.com")],
+            key_package: vec![dummy_relay("wss://kp.example.com")],
+        };
+        stash.merge(custom_relay_finds);
+
+        // The post-merge is_complete() check is what gates complete_login.
+        assert!(
+            stash.is_complete(),
+            "After merging inbox+key_package from custom relay the stash must be complete"
+        );
+        // The original nip65 must not have been overwritten.
+        assert_eq!(
+            stash.nip65[0].url,
+            RelayUrl::parse("wss://nip65.example.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_merge_cross_relay_accumulation_is_complete() {
+        // Pure unit test: confirms that a stash built across two retries
+        // reaches is_complete() after the second merge — the core invariant
+        // that the post-merge recheck relies on.
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://nip65.example.com")],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        assert!(!stash.is_complete(), "Incomplete before second relay");
+
+        stash.merge(DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://ignored.example.com")], // already set, ignored
+            inbox: vec![dummy_relay("wss://inbox.example.com")],
+            key_package: vec![dummy_relay("wss://kp.example.com")],
+        });
+
+        assert!(
+            stash.is_complete(),
+            "Complete after merging inbox+key_package from second relay"
+        );
+        // The original nip65 relay must be preserved.
+        assert_eq!(
+            stash.nip65[0].url,
+            RelayUrl::parse("wss://nip65.example.com").unwrap()
         );
     }
 
