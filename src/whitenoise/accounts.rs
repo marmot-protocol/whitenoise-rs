@@ -112,7 +112,7 @@ impl DiscoveredRelayLists {
     /// Each field is updated only when the current value is empty and the
     /// incoming value is non-empty, so previously discovered relays are never
     /// discarded.
-    pub fn merge(&mut self, other: DiscoveredRelayLists) {
+    pub fn merge(&mut self, other: Self) {
         if self.nip65.is_empty() && !other.nip65.is_empty() {
             self.nip65 = other.nip65;
         }
