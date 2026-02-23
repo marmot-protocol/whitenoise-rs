@@ -96,6 +96,33 @@ impl DiscoveredRelayLists {
     pub fn is_complete(&self) -> bool {
         !self.nip65.is_empty() && !self.inbox.is_empty() && !self.key_package.is_empty()
     }
+
+    /// Returns the relays for `relay_type` when non-empty, otherwise `fallback`.
+    pub fn relays_or<'a>(&'a self, relay_type: RelayType, fallback: &'a [Relay]) -> &'a [Relay] {
+        let found = match relay_type {
+            RelayType::Nip65 => &self.nip65,
+            RelayType::Inbox => &self.inbox,
+            RelayType::KeyPackage => &self.key_package,
+        };
+        if found.is_empty() { fallback } else { found }
+    }
+
+    /// Merge `other` into `self`, keeping any non-empty field from either side.
+    ///
+    /// Each field is updated only when the current value is empty and the
+    /// incoming value is non-empty, so previously discovered relays are never
+    /// discarded.
+    pub fn merge(&mut self, other: DiscoveredRelayLists) {
+        if self.nip65.is_empty() && !other.nip65.is_empty() {
+            self.nip65 = other.nip65;
+        }
+        if self.inbox.is_empty() && !other.inbox.is_empty() {
+            self.inbox = other.inbox;
+        }
+        if self.key_package.is_empty() && !other.key_package.is_empty() {
+            self.key_package = other.key_package;
+        }
+    }
 }
 
 /// Errors specific to the login flow.
@@ -730,22 +757,16 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
-        // For each missing list: assign defaults in the DB and publish to the network.
-        // Lists that were already found are left unchanged.
-        let publish_to_relays = if discovered.nip65.is_empty() {
-            default_relays.clone()
-        } else {
-            discovered.nip65.clone()
-        };
+        // publish_to_relays is the target for relay-list events: use the
+        // already-discovered NIP-65 relays when available, otherwise defaults.
+        let publish_to_relays = discovered
+            .relays_or(RelayType::Nip65, &default_relays)
+            .to_vec();
 
-        // For each relay type: persist the found relays to the DB (if any), and
-        // publish + assign defaults only for the ones that were missing.
+        // For each relay type: persist found relays to the DB and publish
+        // defaults only for the ones that were missing.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let found = match relay_type {
-                RelayType::Nip65 => &discovered.nip65,
-                RelayType::Inbox => &discovered.inbox,
-                RelayType::KeyPackage => &discovered.key_package,
-            };
+            let found = discovered.relays_or(relay_type, &[]);
             if found.is_empty() {
                 // Missing — assign defaults in the DB and publish to the network.
                 user.add_relays(&default_relays, relay_type, &self.database)
@@ -760,8 +781,8 @@ impl Whitenoise {
                 .await
                 .map_err(LoginError::from)?;
             } else {
-                // Already found — persist the discovered relays so they are
-                // queryable via account.nip65_relays() etc. after login.
+                // Already found — persist so it is queryable via
+                // account.nip65_relays() etc. after login.
                 tracing::debug!(
                     target: "whitenoise::accounts",
                     "Skipping publish for {:?} — already exists on network; persisting to DB",
@@ -778,25 +799,13 @@ impl Whitenoise {
             "Missing relay lists published, activating account"
         );
 
-        // Build the final relay sets for account activation.
-        let nip65 = if discovered.nip65.is_empty() {
-            &default_relays
-        } else {
-            &discovered.nip65
-        };
-        let inbox = if discovered.inbox.is_empty() {
-            &default_relays
-        } else {
-            &discovered.inbox
-        };
-        let key_package = if discovered.key_package.is_empty() {
-            &default_relays
-        } else {
-            &discovered.key_package
-        };
-
-        self.complete_login(&account, nip65, inbox, key_package)
-            .await?;
+        self.complete_login(
+            &account,
+            discovered.relays_or(RelayType::Nip65, &default_relays),
+            discovered.relays_or(RelayType::Inbox, &default_relays),
+            discovered.relays_or(RelayType::KeyPackage, &default_relays),
+        )
+        .await?;
 
         self.pending_logins.remove(pubkey);
         tracing::info!(
@@ -869,7 +878,8 @@ impl Whitenoise {
                 status: LoginStatus::Complete,
             })
         } else {
-            // Update the stashed partial results with whatever we found on this relay.
+            // Merge newly-found lists into the existing stash so that relays
+            // discovered during login_start are not discarded.
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Relay lists incomplete on {} for {} (nip65={}, inbox={}, key_package={})",
@@ -879,7 +889,11 @@ impl Whitenoise {
                 !discovered.inbox.is_empty(),
                 !discovered.key_package.is_empty(),
             );
-            self.pending_logins.insert(*pubkey, discovered);
+            let mut stash = self
+                .pending_logins
+                .get_mut(pubkey)
+                .expect("pending_logins entry must exist when login_with_custom_relay is called");
+            stash.merge(discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -1043,22 +1057,15 @@ impl Whitenoise {
             .map_err(LoginError::from)?;
 
         // Use discovered NIP-65 relays as the publish target when available,
-        // otherwise fall back to defaults (covers the case where 10002 was missing).
-        let publish_to_urls = if discovered.nip65.is_empty() {
-            Relay::urls(&default_relays)
-        } else {
-            Relay::urls(&discovered.nip65)
-        };
+        // publish_to_urls is the target for relay-list events: use discovered
+        // NIP-65 relays when available, otherwise defaults.
+        let publish_to_urls = Relay::urls(discovered.relays_or(RelayType::Nip65, &default_relays));
         let default_urls = Relay::urls(&default_relays);
 
-        // For each relay type: persist found relays to the DB and publish defaults
-        // only for the ones that were missing.
+        // For each relay type: persist found relays to the DB and publish
+        // defaults only for the ones that were missing.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let found = match relay_type {
-                RelayType::Nip65 => &discovered.nip65,
-                RelayType::Inbox => &discovered.inbox,
-                RelayType::KeyPackage => &discovered.key_package,
-            };
+            let found = discovered.relays_or(relay_type, &[]);
             if found.is_empty() {
                 // Missing — assign defaults in the DB and publish via the signer.
                 user.add_relays(&default_relays, relay_type, &self.database)
@@ -1074,7 +1081,7 @@ impl Whitenoise {
                     .await
                     .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
             } else {
-                // Already found — persist the discovered relays to the DB.
+                // Already found — persist so it is queryable after login.
                 tracing::debug!(
                     target: "whitenoise::accounts",
                     "Skipping publish for {:?} — already exists on network; persisting to DB",
@@ -1086,25 +1093,14 @@ impl Whitenoise {
             }
         }
 
-        // Build the final relay sets for activation.
-        let nip65 = if discovered.nip65.is_empty() {
-            &default_relays
-        } else {
-            &discovered.nip65
-        };
-        let inbox = if discovered.inbox.is_empty() {
-            &default_relays
-        } else {
-            &discovered.inbox
-        };
-        let key_package = if discovered.key_package.is_empty() {
-            &default_relays
-        } else {
-            &discovered.key_package
-        };
-
-        self.complete_external_signer_login(&account, nip65, inbox, key_package, signer)
-            .await?;
+        self.complete_external_signer_login(
+            &account,
+            discovered.relays_or(RelayType::Nip65, &default_relays),
+            discovered.relays_or(RelayType::Inbox, &default_relays),
+            discovered.relays_or(RelayType::KeyPackage, &default_relays),
+            signer,
+        )
+        .await?;
 
         self.pending_logins.remove(pubkey);
         tracing::info!(
@@ -1169,7 +1165,8 @@ impl Whitenoise {
                 status: LoginStatus::Complete,
             })
         } else {
-            // Update the stashed partial results with whatever we found on this relay.
+            // Merge newly-found lists into the existing stash so that relays
+            // discovered during login_external_signer_start are not discarded.
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Relay lists incomplete on {} for {} (nip65={}, inbox={}, key_package={})",
@@ -1179,7 +1176,11 @@ impl Whitenoise {
                 !discovered.inbox.is_empty(),
                 !discovered.key_package.is_empty(),
             );
-            self.pending_logins.insert(*pubkey, discovered);
+            let mut stash = self.pending_logins.get_mut(pubkey).expect(
+                "pending_logins entry must exist when login_external_signer_with_custom_relay \
+                     is called",
+            );
+            stash.merge(discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -1197,14 +1198,6 @@ impl Whitenoise {
     /// NIP-65 relays to fetch Inbox and KeyPackage lists. Saves all found
     /// relays to the database.
     ///
-    /// Returns `Ok(Some((nip65, inbox, key_package)))` when the NIP-65 list is
-    /// found. Inbox and KeyPackage fall back to defaults if not found
-    /// independently.
-    ///
-    /// Returns `Ok(None)` when the NIP-65 list is simply not published on the
-    /// queried relays.
-    ///
-    /// Returns `Err` for real failures (network errors, DB errors, etc.).
     /// Attempt to fetch all three relay lists from the network.
     ///
     /// Returns a [`DiscoveredRelayLists`] whose fields contain the relays found
@@ -2366,6 +2359,7 @@ mod tests {
     use crate::whitenoise::accounts::Account;
     use crate::whitenoise::test_utils::*;
     use chrono::{TimeDelta, Utc};
+    use dashmap::DashMap;
 
     #[tokio::test]
     #[ignore]
@@ -5167,8 +5161,7 @@ mod tests {
         );
 
         // Simulate what login_start does: insert into pending_logins map.
-        use dashmap::DashMap;
-        let pending: DashMap<nostr_sdk::PublicKey, DiscoveredRelayLists> = DashMap::new();
+        let pending: DashMap<PublicKey, DiscoveredRelayLists> = DashMap::new();
         pending.insert(pubkey, partial);
 
         let stashed = pending.get(&pubkey).unwrap();
@@ -5181,57 +5174,107 @@ mod tests {
         assert!(stashed.key_package.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // DiscoveredRelayLists::merge tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_pending_logins_stash_replaced_on_retry() {
-        // Verify that when login_with_custom_relay calls pending_logins.insert
-        // again for the same pubkey, the stash is replaced (not doubled) and
-        // remains incomplete when nothing was found.  Pure map mechanics test.
-        use dashmap::DashMap;
-        let pubkey = Keys::generate().public_key();
-        let pending: DashMap<nostr_sdk::PublicKey, DiscoveredRelayLists> = DashMap::new();
+    fn test_merge_fills_empty_fields_from_other() {
+        // When the existing stash has nothing, merge should adopt all non-empty
+        // fields from the incoming discovery.
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        let incoming = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://a.example.com")],
+            inbox: vec![dummy_relay("wss://b.example.com")],
+            key_package: vec![],
+        };
+        stash.merge(incoming);
+        assert_eq!(stash.nip65.len(), 1, "nip65 adopted from incoming");
+        assert_eq!(stash.inbox.len(), 1, "inbox adopted from incoming");
+        assert!(stash.key_package.is_empty(), "key_package stays empty");
+        assert!(!stash.is_complete());
+    }
 
-        // Initial insert (nothing found).
-        pending.insert(
-            pubkey,
-            DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
-            },
+    #[test]
+    fn test_merge_preserves_existing_non_empty_fields() {
+        // When the existing stash already has a value for a field, merge must
+        // NOT overwrite it even if the incoming also has a value.
+        let original_relay = dummy_relay("wss://original.example.com");
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![original_relay.clone()],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        let incoming = DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://new.example.com")], // must NOT overwrite
+            inbox: vec![dummy_relay("wss://inbox.example.com")],
+            key_package: vec![dummy_relay("wss://kp.example.com")],
+        };
+        stash.merge(incoming);
+        // nip65 should still be the original relay, not the incoming one.
+        assert_eq!(stash.nip65.len(), 1);
+        assert_eq!(
+            stash.nip65[0].url, original_relay.url,
+            "nip65 must not be overwritten by merge"
         );
+        assert_eq!(stash.inbox.len(), 1, "inbox adopted from incoming");
+        assert_eq!(
+            stash.key_package.len(),
+            1,
+            "key_package adopted from incoming"
+        );
+        assert!(stash.is_complete());
+    }
 
-        // A retry with a custom relay that also finds nothing replaces the entry.
-        pending.insert(
-            pubkey,
-            DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
-            },
-        );
+    #[test]
+    fn test_merge_both_empty_stays_empty() {
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![],
+        };
+        stash.merge(DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![],
+        });
+        assert!(!stash.is_complete());
+    }
 
-        assert!(
-            pending.contains_key(&pubkey),
-            "Stash must persist after retry"
-        );
-        assert!(!pending.get(&pubkey).unwrap().is_complete());
-        assert_eq!(pending.len(), 1, "Only one entry per pubkey");
+    #[test]
+    fn test_merge_sequential_retries_accumulate() {
+        // Simulate two login_with_custom_relay retries, each finding one new list.
+        // After both, the stash should be complete.
+        let mut stash = DiscoveredRelayLists {
+            nip65: vec![],
+            inbox: vec![],
+            key_package: vec![],
+        };
 
-        // A retry that finds nip65 updates the stash.
-        pending.insert(
-            pubkey,
-            DiscoveredRelayLists {
-                nip65: vec![dummy_relay("wss://found.example.com")],
-                inbox: vec![],
-                key_package: vec![],
-            },
+        // First retry finds nip65.
+        stash.merge(DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://nip65.example.com")],
+            inbox: vec![],
+            key_package: vec![],
+        });
+        assert!(!stash.is_complete(), "Still missing inbox and key_package");
+
+        // Second retry finds inbox and key_package.
+        stash.merge(DiscoveredRelayLists {
+            nip65: vec![dummy_relay("wss://other.example.com")], // ignored — nip65 already set
+            inbox: vec![dummy_relay("wss://inbox.example.com")],
+            key_package: vec![dummy_relay("wss://kp.example.com")],
+        });
+        assert!(stash.is_complete(), "All three found across two retries");
+        assert_eq!(
+            stash.nip65[0].url,
+            RelayUrl::parse("wss://nip65.example.com").unwrap(),
+            "First nip65 preserved — not overwritten"
         );
-        let stash = pending.get(&pubkey).unwrap();
-        assert!(
-            !stash.is_complete(),
-            "Still incomplete — inbox and kp still missing"
-        );
-        assert_eq!(stash.nip65.len(), 1, "nip65 updated to found relay");
     }
 
     #[tokio::test]
