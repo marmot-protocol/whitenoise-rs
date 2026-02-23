@@ -97,13 +97,18 @@ impl DiscoveredRelayLists {
         !self.nip65.is_empty() && !self.inbox.is_empty() && !self.key_package.is_empty()
     }
 
-    /// Returns the relays for `relay_type` when non-empty, otherwise `fallback`.
-    pub fn relays_or<'a>(&'a self, relay_type: RelayType, fallback: &'a [Relay]) -> &'a [Relay] {
-        let found = match relay_type {
+    /// Returns the relay slice for the given `relay_type`.
+    pub fn relays(&self, relay_type: RelayType) -> &[Relay] {
+        match relay_type {
             RelayType::Nip65 => &self.nip65,
             RelayType::Inbox => &self.inbox,
             RelayType::KeyPackage => &self.key_package,
-        };
+        }
+    }
+
+    /// Returns the relays for `relay_type` when non-empty, otherwise `fallback`.
+    pub fn relays_or<'a>(&'a self, relay_type: RelayType, fallback: &'a [Relay]) -> &'a [Relay] {
+        let found = self.relays(relay_type);
         if found.is_empty() { fallback } else { found }
     }
 
@@ -763,11 +768,11 @@ impl Whitenoise {
             .relays_or(RelayType::Nip65, &default_relays)
             .to_vec();
 
-        // For each relay type: persist found relays to the DB and publish
-        // defaults only for the ones that were missing.
+        // For each relay type: publish defaults only for the ones that were
+        // missing. Already-found lists were already persisted to the DB by
+        // try_discover_relay_lists in step 1, so no second write is needed.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let found = discovered.relays_or(relay_type, &[]);
-            if found.is_empty() {
+            if discovered.relays(relay_type).is_empty() {
                 // Missing — assign defaults in the DB and publish to the network.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
@@ -781,16 +786,11 @@ impl Whitenoise {
                 .await
                 .map_err(LoginError::from)?;
             } else {
-                // Already found — persist so it is queryable via
-                // account.nip65_relays() etc. after login.
                 tracing::debug!(
                     target: "whitenoise::accounts",
-                    "Skipping publish for {:?} — already exists on network; persisting to DB",
+                    "Skipping publish for {:?} — already exists on network",
                     relay_type,
                 );
-                user.add_relays(found, relay_type, &self.database)
-                    .await
-                    .map_err(LoginError::from)?;
             }
         }
 
@@ -822,11 +822,12 @@ impl Whitenoise {
     /// Step 2b: search a user-provided relay for existing relay lists.
     ///
     /// Called after [`Whitenoise::login_start`] returned [`LoginStatus::NeedsRelayLists`].
-    /// Connects to `relay_url`, fetches the NIP-65 list, and (if found) fetches
-    /// Inbox and KeyPackage lists from the discovered NIP-65 relays.
+    /// Connects to `relay_url` and attempts to fetch all three relay list kinds
+    /// (10002, 10050, 10051). Any newly-found lists are merged into the existing
+    /// pending-login stash so previously-discovered relays are preserved.
     ///
-    /// If relay lists are found the account is activated and
-    /// [`LoginStatus::Complete`] is returned. If nothing is found,
+    /// If the merged stash is now complete the account is activated and
+    /// [`LoginStatus::Complete`] is returned. Otherwise
     /// [`LoginStatus::NeedsRelayLists`] is returned so the caller can re-prompt.
     pub async fn login_with_custom_relay(
         &self,
@@ -892,7 +893,7 @@ impl Whitenoise {
             let mut stash = self
                 .pending_logins
                 .get_mut(pubkey)
-                .expect("pending_logins entry must exist when login_with_custom_relay is called");
+                .ok_or(LoginError::NoLoginInProgress)?;
             stash.merge(discovered);
             Ok(LoginResult {
                 account,
@@ -1062,11 +1063,11 @@ impl Whitenoise {
         let publish_to_urls = Relay::urls(discovered.relays_or(RelayType::Nip65, &default_relays));
         let default_urls = Relay::urls(&default_relays);
 
-        // For each relay type: persist found relays to the DB and publish
-        // defaults only for the ones that were missing.
+        // For each relay type: publish defaults only for the ones that were
+        // missing. Already-found lists were already persisted to the DB by
+        // try_discover_relay_lists in step 1, so no second write is needed.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let found = discovered.relays_or(relay_type, &[]);
-            if found.is_empty() {
+            if discovered.relays(relay_type).is_empty() {
                 // Missing — assign defaults in the DB and publish via the signer.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
@@ -1081,15 +1082,11 @@ impl Whitenoise {
                     .await
                     .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
             } else {
-                // Already found — persist so it is queryable after login.
                 tracing::debug!(
                     target: "whitenoise::accounts",
-                    "Skipping publish for {:?} — already exists on network; persisting to DB",
+                    "Skipping publish for {:?} — already exists on network",
                     relay_type,
                 );
-                user.add_relays(found, relay_type, &self.database)
-                    .await
-                    .map_err(LoginError::from)?;
             }
         }
 
@@ -1176,10 +1173,10 @@ impl Whitenoise {
                 !discovered.inbox.is_empty(),
                 !discovered.key_package.is_empty(),
             );
-            let mut stash = self.pending_logins.get_mut(pubkey).expect(
-                "pending_logins entry must exist when login_external_signer_with_custom_relay \
-                     is called",
-            );
+            let mut stash = self
+                .pending_logins
+                .get_mut(pubkey)
+                .ok_or(LoginError::NoLoginInProgress)?;
             stash.merge(discovered);
             Ok(LoginResult {
                 account,
@@ -2355,11 +2352,11 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeDelta, Utc};
+
     use super::*;
     use crate::whitenoise::accounts::Account;
     use crate::whitenoise::test_utils::*;
-    use chrono::{TimeDelta, Utc};
-    use dashmap::DashMap;
 
     #[tokio::test]
     #[ignore]
@@ -5132,49 +5129,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pending_logins stash tests (unit-level, no relay network required)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_pending_logins_stash_is_incomplete_when_only_nip65_found() {
-        // Verify that a DiscoveredRelayLists with only nip65 populated (the bug
-        // scenario) reports is_complete() == false.  This is a pure unit test
-        // with no relay or DB involvement.
-        let pubkey = Keys::generate().public_key();
-        let partial = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![],
-            key_package: vec![],
-        };
-
-        // is_complete() must be false — the old code skipped this check.
-        assert!(!partial.is_complete(), "Partial stash must not be complete");
-        assert_eq!(
-            partial.nip65.len(),
-            1,
-            "nip65 list should contain the relay"
-        );
-        assert!(partial.inbox.is_empty(), "inbox list should be empty");
-        assert!(
-            partial.key_package.is_empty(),
-            "key_package list should be empty"
-        );
-
-        // Simulate what login_start does: insert into pending_logins map.
-        let pending: DashMap<PublicKey, DiscoveredRelayLists> = DashMap::new();
-        pending.insert(pubkey, partial);
-
-        let stashed = pending.get(&pubkey).unwrap();
-        assert!(
-            !stashed.is_complete(),
-            "Stashed partial must not be complete"
-        );
-        assert_eq!(stashed.nip65.len(), 1);
-        assert!(stashed.inbox.is_empty());
-        assert!(stashed.key_package.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
     // DiscoveredRelayLists::merge tests
     // -----------------------------------------------------------------------
 
@@ -5313,7 +5267,7 @@ mod tests {
     // that only the missing kinds end up with relay associations.
     // -----------------------------------------------------------------------
 
-    /// Helper: create a base account and insert a partial DiscoveredRelayLists
+    /// Helper: create a local-key account and insert a partial DiscoveredRelayLists
     /// into pending_logins so we can test the step-2a path in isolation.
     async fn setup_partial_pending_login(
         whitenoise: &Whitenoise,
@@ -5327,6 +5281,26 @@ mod tests {
         whitenoise
             .pending_logins
             .insert(keys.public_key(), discovered);
+    }
+
+    /// Helper: create an external-signer account, register its signer, and
+    /// insert a partial DiscoveredRelayLists into pending_logins so we can
+    /// test the external-signer step-2a path in isolation.
+    async fn setup_partial_pending_login_external_signer(
+        whitenoise: &Whitenoise,
+        keys: &Keys,
+        discovered: DiscoveredRelayLists,
+    ) {
+        let pubkey = keys.public_key();
+        whitenoise
+            .setup_external_signer_account_without_relays(pubkey)
+            .await
+            .unwrap();
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+        whitenoise.pending_logins.insert(pubkey, discovered);
     }
 
     #[tokio::test]
@@ -5788,23 +5762,16 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        // Set up the external-signer account path (no relays pre-discovered).
-        let (account, _) = whitenoise
-            .setup_external_signer_account_without_relays(pubkey)
-            .await
-            .unwrap();
-        whitenoise
-            .insert_external_signer(pubkey, keys.clone())
-            .await
-            .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        setup_partial_pending_login_external_signer(
+            &whitenoise,
+            &keys,
             DiscoveredRelayLists {
                 nip65: vec![],
                 inbox: vec![],
                 key_package: vec![],
             },
-        );
+        )
+        .await;
 
         let result = whitenoise
             .login_external_signer_publish_default_relays(&pubkey)
@@ -5815,7 +5782,11 @@ mod tests {
         assert_eq!(result.account.account_type, AccountType::External);
 
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            let relays = account.relays(relay_type, &whitenoise).await.unwrap();
+            let relays = result
+                .account
+                .relays(relay_type, &whitenoise)
+                .await
+                .unwrap();
             assert!(
                 !relays.is_empty(),
                 "{:?} must be assigned when all lists were missing (external signer)",
@@ -5838,22 +5809,16 @@ mod tests {
             .await
             .unwrap();
 
-        whitenoise
-            .setup_external_signer_account_without_relays(pubkey)
-            .await
-            .unwrap();
-        whitenoise
-            .insert_external_signer(pubkey, keys.clone())
-            .await
-            .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        setup_partial_pending_login_external_signer(
+            &whitenoise,
+            &keys,
             DiscoveredRelayLists {
                 nip65: vec![nip65_relay],
                 inbox: vec![],
                 key_package: vec![],
             },
-        );
+        )
+        .await;
 
         let result = whitenoise
             .login_external_signer_publish_default_relays(&pubkey)
@@ -5899,22 +5864,16 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        whitenoise
-            .setup_external_signer_account_without_relays(pubkey)
-            .await
-            .unwrap();
-        whitenoise
-            .insert_external_signer(pubkey, keys.clone())
-            .await
-            .unwrap();
-        whitenoise.pending_logins.insert(
-            pubkey,
+        setup_partial_pending_login_external_signer(
+            &whitenoise,
+            &keys,
             DiscoveredRelayLists {
                 nip65: vec![],
                 inbox: vec![],
                 key_package: vec![],
             },
-        );
+        )
+        .await;
 
         whitenoise
             .login_external_signer_publish_default_relays(&pubkey)
