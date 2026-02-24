@@ -639,6 +639,10 @@ impl Whitenoise {
 
     // -----------------------------------------------------------------------
     // Multi-step login API
+    //
+    // Callers must not invoke step-2 methods concurrently for the same pubkey.
+    // The pending-login stash is not guarded beyond DashMap's per-key lock, so
+    // overlapping calls can race between the merge and complete_login phases.
     // -----------------------------------------------------------------------
 
     /// Step 1 of the multi-step login flow.
@@ -867,19 +871,10 @@ impl Whitenoise {
         //     that try_discover_relay_lists already wrote to the DB; and
         // (b) the is_complete check below correctly accounts for lists found
         //     across multiple relays (e.g. nip65 from login_start, inbox+kp here).
-        let mut stash = self
-            .pending_logins
-            .get_mut(pubkey)
-            .ok_or(LoginError::NoLoginInProgress)?;
-        stash.merge(discovered);
-        let is_complete = stash.is_complete();
-        let merged_nip65 = stash.nip65.clone();
-        let merged_inbox = stash.inbox.clone();
-        let merged_key_package = stash.key_package.clone();
-        drop(stash);
+        let merged = self.merge_into_stash(pubkey, discovered)?;
 
-        if is_complete {
-            self.complete_login(&account, &merged_nip65, &merged_inbox, &merged_key_package)
+        if merged.is_complete() {
+            self.complete_login(&account, &merged.nip65, &merged.inbox, &merged.key_package)
                 .await?;
             self.pending_logins.remove(pubkey);
             tracing::info!(
@@ -898,9 +893,9 @@ impl Whitenoise {
                 "Relay lists still incomplete after {} for {} (nip65={}, inbox={}, key_package={})",
                 relay_url,
                 pubkey.to_hex(),
-                !merged_nip65.is_empty(),
-                !merged_inbox.is_empty(),
-                !merged_key_package.is_empty(),
+                !merged.nip65.is_empty(),
+                !merged.inbox.is_empty(),
+                !merged.key_package.is_empty(),
             );
             Ok(LoginResult {
                 account,
@@ -1165,23 +1160,14 @@ impl Whitenoise {
         // Same upfront-merge pattern as login_with_custom_relay: update the
         // stash before attempting completion so a failed complete_external_signer_login
         // leaves the stash accurate for any subsequent retry.
-        let mut stash = self
-            .pending_logins
-            .get_mut(pubkey)
-            .ok_or(LoginError::NoLoginInProgress)?;
-        stash.merge(discovered);
-        let is_complete = stash.is_complete();
-        let merged_nip65 = stash.nip65.clone();
-        let merged_inbox = stash.inbox.clone();
-        let merged_key_package = stash.key_package.clone();
-        drop(stash);
+        let merged = self.merge_into_stash(pubkey, discovered)?;
 
-        if is_complete {
+        if merged.is_complete() {
             self.complete_external_signer_login(
                 &account,
-                &merged_nip65,
-                &merged_inbox,
-                &merged_key_package,
+                &merged.nip65,
+                &merged.inbox,
+                &merged.key_package,
                 signer,
             )
             .await?;
@@ -1202,9 +1188,9 @@ impl Whitenoise {
                 "Relay lists still incomplete after {} for {} (nip65={}, inbox={}, key_package={})",
                 relay_url,
                 pubkey.to_hex(),
-                !merged_nip65.is_empty(),
-                !merged_inbox.is_empty(),
-                !merged_key_package.is_empty(),
+                !merged.nip65.is_empty(),
+                !merged.inbox.is_empty(),
+                !merged.key_package.is_empty(),
             );
             Ok(LoginResult {
                 account,
@@ -1283,6 +1269,24 @@ impl Whitenoise {
             inbox: inbox_relays,
             key_package: key_package_relays,
         })
+    }
+
+    /// Merge newly-discovered relay lists into the pending-login stash and
+    /// return a snapshot.  The DashMap lock is released before returning so
+    /// the caller is free to do async work with the result.
+    fn merge_into_stash(
+        &self,
+        pubkey: &PublicKey,
+        discovered: DiscoveredRelayLists,
+    ) -> core::result::Result<DiscoveredRelayLists, LoginError> {
+        let mut stash = self
+            .pending_logins
+            .get_mut(pubkey)
+            .ok_or(LoginError::NoLoginInProgress)?;
+        stash.merge(discovered);
+        let snapshot = stash.clone();
+        drop(stash);
+        Ok(snapshot)
     }
 
     /// Activate a local-key account after relay lists have been resolved.
