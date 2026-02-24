@@ -4916,6 +4916,7 @@ dependencies = [
  "futures",
  "hex",
  "image 0.24.9",
+ "indexmap",
  "indicatif",
  "infer",
  "keyring-core",

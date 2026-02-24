@@ -3,12 +3,13 @@
 //! This module handles the processing of reaction messages (kind 7) and manages
 //! the aggregation of reactions on target messages.
 
-use nostr_sdk::prelude::*;
 use std::collections::HashMap;
+
+use mdk_core::prelude::message_types::Message;
+use nostr_sdk::prelude::*;
 
 use super::emoji_utils;
 use super::types::{AggregatorConfig, ChatMessage, EmojiReaction, ProcessingError, UserReaction};
-use mdk_core::prelude::message_types::Message;
 
 /// Process a reaction message and update the target message's reaction summary
 pub fn process_reaction(
@@ -104,7 +105,7 @@ pub(crate) fn remove_reaction_from_message(
             target_message
                 .reactions
                 .by_emoji
-                .remove(&removed_reaction.emoji);
+                .shift_remove(&removed_reaction.emoji);
         }
     }
 
@@ -158,11 +159,12 @@ pub(crate) fn add_reaction_to_message(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::whitenoise::message_aggregator::types::ReactionSummary;
     use mdk_core::prelude::GroupId;
     use mdk_core::prelude::message_types::{Message, MessageState};
     use nostr_sdk::UnsignedEvent;
+
+    use super::*;
+    use crate::whitenoise::message_aggregator::types::ReactionSummary;
 
     fn create_chat_message(id: &str) -> ChatMessage {
         let keys = Keys::generate();
