@@ -593,6 +593,27 @@ impl User {
             Ok(())
         }
     }
+
+    /// Remove all relay associations for this user across all relay types.
+    ///
+    /// Used by [`Whitenoise::login_cancel`] to clean up relay associations that
+    /// were written by [`try_discover_relay_lists`] before the user cancelled
+    /// the login flow.  Without this, `user_relays` rows for the partial
+    /// discovery would persist even after the account is deleted, causing stale
+    /// data if the same pubkey logs in again later.
+    pub(crate) async fn remove_all_relays(
+        &self,
+        database: &Database,
+    ) -> Result<(), WhitenoiseError> {
+        let user_id = self.id.ok_or(WhitenoiseError::UserNotPersisted)?;
+        sqlx::query("DELETE FROM user_relays WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)
+            .map_err(WhitenoiseError::Database)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
