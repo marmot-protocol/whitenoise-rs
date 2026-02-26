@@ -558,7 +558,7 @@ impl Whitenoise {
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
             let nip65_relays = account.nip65_relays(whitenoise_ref).await?;
-            let inbox_relays = account.inbox_relays(whitenoise_ref).await?;
+            let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
             // Setup subscriptions for this account
             match whitenoise_ref
                 .setup_subscriptions(&account, &nip65_relays, &inbox_relays)

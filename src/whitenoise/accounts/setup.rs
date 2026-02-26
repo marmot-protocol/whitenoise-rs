@@ -716,7 +716,7 @@ impl Whitenoise {
 
         let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
 
-        let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.inbox_relays(self).await?);
+        let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
 
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;

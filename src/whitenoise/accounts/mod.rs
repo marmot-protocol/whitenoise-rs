@@ -328,6 +328,28 @@ impl Account {
         Ok(relays)
     }
 
+    /// Returns inbox relays for this account, falling back to NIP-65 relays
+    /// when no inbox relay list (kind 10050) has been published.
+    ///
+    /// Accounts created before PR #515 may lack a kind 10050 event. Without
+    /// this fallback, giftwrap subscriptions would be set up with zero relays,
+    /// silently preventing the account from receiving DMs.
+    pub(crate) async fn effective_inbox_relays(
+        &self,
+        whitenoise: &Whitenoise,
+    ) -> Result<Vec<Relay>> {
+        let inbox = self.inbox_relays(whitenoise).await?;
+        if !inbox.is_empty() {
+            return Ok(inbox);
+        }
+        tracing::warn!(
+            target: "whitenoise::accounts",
+            "Account {} has no inbox relays, falling back to NIP-65 relays for giftwrap subscription",
+            self.pubkey.to_hex()
+        );
+        self.nip65_relays(whitenoise).await
+    }
+
     /// Helper method to retrieve the key package relays for this account.
     pub(crate) async fn key_package_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
         let user = self.user(&whitenoise.database).await?;
@@ -498,5 +520,73 @@ pub mod test_utils {
     pub fn create_mdk(pubkey: PublicKey) -> MDK<MdkSqliteStorage> {
         super::super::Whitenoise::initialize_mock_keyring_store();
         super::Account::create_mdk(pubkey, &data_dir(), "com.whitenoise.test").unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::whitenoise::relays::{Relay, RelayType};
+    use crate::whitenoise::test_utils::*;
+    use nostr_sdk::RelayUrl;
+
+    #[tokio::test]
+    async fn test_effective_inbox_relays_returns_inbox_when_present() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let user = account.user(&whitenoise.database).await.unwrap();
+
+        let inbox_url = RelayUrl::parse("wss://inbox.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
+
+        let inbox_relay = Relay::find_or_create_by_url(&inbox_url, &whitenoise.database)
+            .await
+            .unwrap();
+        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.database)
+            .await
+            .unwrap();
+
+        user.add_relay(&inbox_relay, RelayType::Inbox, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].url, inbox_url);
+    }
+
+    #[tokio::test]
+    async fn test_effective_inbox_relays_falls_back_to_nip65() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+        let user = account.user(&whitenoise.database).await.unwrap();
+
+        // Only add NIP-65 relays — no inbox relays
+        let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
+        let nip65_relay = Relay::find_or_create_by_url(&nip65_url, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].url, nip65_url);
+    }
+
+    #[tokio::test]
+    async fn test_effective_inbox_relays_returns_empty_when_no_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = create_test_account(&whitenoise).await;
+
+        // No relays at all
+        let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
+
+        assert!(result.is_empty());
     }
 }
