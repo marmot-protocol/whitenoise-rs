@@ -150,6 +150,12 @@ pub enum WhitenoiseError {
     #[error("Key package publish failed: {0}")]
     KeyPackagePublishFailed(String),
 
+    #[error("MLS message unprocessable: {0}")]
+    MlsMessageUnprocessable(String),
+
+    #[error("MLS message previously failed and cannot be reprocessed")]
+    MlsMessagePreviouslyFailed,
+
     #[error("Event publish failed: no relay accepted the event")]
     EventPublishNoRelayAccepted,
 
