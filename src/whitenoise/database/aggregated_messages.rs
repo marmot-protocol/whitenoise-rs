@@ -558,55 +558,52 @@ impl AggregatedMessage {
             .collect();
 
         let all_group_ids: Vec<Vec<u8>> = group_markers.iter().map(|(g, _)| g.to_vec()).collect();
-        let group_placeholders = "?,".repeat(all_group_ids.len());
-        let group_placeholders = group_placeholders.trim_end_matches(',');
+
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+            sqlx::QueryBuilder::new("WITH marker_input AS (");
 
         // Build UNION ALL for marker input, or an empty-result query if no markers
-        let marker_values = if groups_with_markers.is_empty() {
-            "SELECT NULL AS group_id, NULL AS marker_id WHERE 0".to_string()
+        if groups_with_markers.is_empty() {
+            qb.push("SELECT NULL AS group_id, NULL AS marker_id WHERE 0");
         } else {
-            groups_with_markers
-                .iter()
-                .map(|_| "SELECT ? AS group_id, ? AS marker_id")
-                .collect::<Vec<_>>()
-                .join(" UNION ALL ")
-        };
+            for (i, (group_id, marker_id)) in groups_with_markers.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" UNION ALL ");
+                }
+                qb.push("SELECT ");
+                qb.push_bind(group_id.as_slice());
+                qb.push(" AS group_id, ");
+                qb.push_bind(marker_id.to_hex());
+                qb.push(" AS marker_id");
+            }
+        }
 
-        let query = format!(
-            "WITH marker_input AS (
-                {marker_values}
-             ),
-             marker_timestamps AS (
-                 SELECT mi.group_id, am.created_at
-                 FROM marker_input mi
-                 JOIN aggregated_messages am
-                   ON am.mls_group_id = mi.group_id
-                  AND am.message_id = mi.marker_id
-             )
-             SELECT
-                 am.mls_group_id,
-                 COUNT(*) as count
-             FROM aggregated_messages am
-             LEFT JOIN marker_timestamps mt ON am.mls_group_id = mt.group_id
-             WHERE am.mls_group_id IN ({group_placeholders})
-               AND am.kind = 9
-               AND am.deletion_event_id IS NULL
-               AND am.created_at > COALESCE(mt.created_at, 0)
-             GROUP BY am.mls_group_id"
+        qb.push(
+            "), marker_timestamps AS ( \
+                 SELECT mi.group_id, am.created_at \
+                 FROM marker_input mi \
+                 JOIN aggregated_messages am \
+                   ON am.mls_group_id = mi.group_id \
+                  AND am.message_id = mi.marker_id \
+             ) \
+             SELECT am.mls_group_id, COUNT(*) as count \
+             FROM aggregated_messages am \
+             LEFT JOIN marker_timestamps mt ON am.mls_group_id = mt.group_id \
+             WHERE am.mls_group_id IN (",
         );
 
-        let mut query_builder = sqlx::query(&query);
-
-        for (group_id, marker_id) in &groups_with_markers {
-            query_builder = query_builder.bind(group_id.as_slice());
-            query_builder = query_builder.bind(marker_id.to_hex());
-        }
-
+        let mut sep = qb.separated(", ");
         for group_id in &all_group_ids {
-            query_builder = query_builder.bind(group_id);
+            sep.push_bind(group_id);
         }
+        sep.push_unseparated(
+            ") AND am.kind = 9 \
+             AND am.deletion_event_id IS NULL \
+             AND am.created_at > COALESCE(mt.created_at, 0) \
+             GROUP BY am.mls_group_id",
+        );
 
-        let rows = query_builder.fetch_all(&database.pool).await?;
+        let rows = qb.build().fetch_all(&database.pool).await?;
 
         // Parse results into HashMap
         let mut results: HashMap<GroupId, usize> = HashMap::new();
@@ -725,38 +722,31 @@ impl AggregatedMessage {
 
         let group_id_bytes: Vec<Vec<u8>> = group_ids.iter().map(|id| id.to_vec()).collect();
 
-        // Build dynamic query with correct number of placeholders
-        let placeholders = "?,".repeat(group_id_bytes.len());
-        let placeholders = placeholders.trim_end_matches(',');
-
         // Correlated subquery to get the last message per group
         // Uses id matching with ORDER BY LIMIT 1 for deterministic results on timestamp ties
-        let query = format!(
-            "SELECT message_id, mls_group_id, author, content, created_at,
-                    json_array_length(media_attachments) as media_count
-             FROM aggregated_messages am1
-             WHERE kind = 9
-               AND mls_group_id IN ({})
-               AND deletion_event_id IS NULL
-               AND id = (
-                   SELECT id
-                   FROM aggregated_messages am2
-                   WHERE am2.mls_group_id = am1.mls_group_id
-                     AND am2.kind = 9
-                     AND am2.deletion_event_id IS NULL
-                   ORDER BY created_at DESC, id DESC
-                   LIMIT 1
-               )",
-            placeholders
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT message_id, mls_group_id, author, content, created_at, \
+             json_array_length(media_attachments) as media_count \
+             FROM aggregated_messages am1 \
+             WHERE kind = 9 AND mls_group_id IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for id in &group_id_bytes {
+            sep.push_bind(id);
+        }
+        sep.push_unseparated(
+            ") AND deletion_event_id IS NULL \
+             AND id = ( \
+                 SELECT id FROM aggregated_messages am2 \
+                 WHERE am2.mls_group_id = am1.mls_group_id \
+                   AND am2.kind = 9 \
+                   AND am2.deletion_event_id IS NULL \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1 \
+             )",
         );
 
-        // Build and execute query with bindings
-        let mut query_builder = sqlx::query(&query);
-        for id_bytes in &group_id_bytes {
-            query_builder = query_builder.bind(id_bytes);
-        }
-
-        let rows = query_builder.fetch_all(&database.pool).await?;
+        let rows = qb.build().fetch_all(&database.pool).await?;
 
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
