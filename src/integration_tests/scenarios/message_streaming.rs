@@ -43,8 +43,17 @@ impl MessageStreamingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Note: MLS membership is auto-finalized when welcome is received,
-        // so members can participate immediately without explicit accept
+        // Wait for the member to receive and process the welcome before sending
+        // any messages. Without this, messages sent by stream_member before its
+        // join-time self-update completes would be at a different epoch than
+        // what stream_creator expects, causing decryption failures.
+        WaitForWelcomeTestCase::for_account("stream_member", Self::GROUP_NAME)
+            .execute(&mut self.context)
+            .await?;
+
+        VerifySelfUpdateTestCase::for_account("stream_member", Self::GROUP_NAME)
+            .execute(&mut self.context)
+            .await?;
 
         Ok(())
     }

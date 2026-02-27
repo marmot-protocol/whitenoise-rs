@@ -63,6 +63,15 @@ impl ChatListStreamingScenario {
             .execute(&mut self.context)
             .await?;
 
+        // Wait for the member's post-welcome self-update to complete before
+        // proceeding. The self-update runs as a background task that advances
+        // the group epoch; any messages sent while it is still running will be
+        // at a different epoch, which can interfere with later phases of this
+        // scenario that check the "last message" in the chat list.
+        VerifySelfUpdateTestCase::for_account("stream_member", Self::GROUP_NAME)
+            .execute(&mut self.context)
+            .await?;
+
         // Verify the NewGroup update was received
         new_group_verifier.execute(&mut self.context).await?;
 

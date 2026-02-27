@@ -209,6 +209,21 @@ impl Whitenoise {
     /// Core welcome finalization logic. Testable because it takes Whitenoise as a parameter.
     /// Handles DB writes, network calls, and other non-critical operations.
     /// All operations are idempotent and failures are logged but don't stop other operations.
+    ///
+    /// # Sequencing
+    ///
+    /// 1. **Subscription setup** — awaited first so the relay connection is live
+    ///    before we do anything else.
+    /// 2. **Catch-up fetch** — only if subscriptions succeeded.  Fetches recent
+    ///    group messages from relays and queues them through the event processor.
+    ///    This ensures messages sent between the Welcome being dispatched and our
+    ///    subscription becoming active are available before the self-update
+    ///    advances the epoch.
+    /// 3. **Independent ops** (group info, key rotation, image sync, welcomer
+    ///    user lookup) — run concurrently; failures are logged but do not block.
+    /// 4. **Self-update** — runs only if subscription setup succeeded.  If setup
+    ///    failed, the self-update is skipped and the reason is logged so the
+    ///    caller can diagnose the problem.
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -223,36 +238,58 @@ impl Whitenoise {
             Err(e) => {
                 tracing::error!(
                     target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to get signer for account {}: {}",
-                    account.pubkey.to_hex(),
-                    e
+                    account = %account.pubkey.to_hex(),
+                    error = %e,
+                    "Failed to get signer; aborting welcome finalization"
                 );
                 return;
             }
         };
 
-        // Run independent operations concurrently
-        let (
-            group_info_result,
-            subscription_result,
-            key_rotation_result,
-            image_sync_result,
-            welcomer_user_result,
-        ) = tokio::join!(
+        // --- Step 1: subscription setup (must happen before catch-up and self-update) ---
+        let subscription_ok = match Self::setup_group_subscriptions(whitenoise, account, signer)
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    "Group subscriptions established"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %e,
+                    reason = "subscription_setup_failed",
+                    "Subscription setup failed; skipping catch-up and self-update to avoid epoch mismatch"
+                );
+                false
+            }
+        };
+
+        // --- Step 2: bounded catch-up fetch (only when subscriptions are live) ---
+        if subscription_ok {
+            Self::catchup_group_messages(whitenoise, account, group_id).await;
+        }
+
+        // --- Step 3: independent operations (run concurrently regardless of subscription status) ---
+        let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::setup_group_subscriptions(whitenoise, account, signer),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
         );
 
-        // Log any errors (operations are independent, so we log all failures)
         if let Err(e) = group_info_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to create GroupInformation for group {}: {}",
-                hex::encode(group_id.as_slice()),
-                e
+                group = %hex::encode(group_id.as_slice()),
+                error = %e,
+                "Failed to create GroupInformation"
             );
         } else {
             whitenoise
@@ -268,70 +305,156 @@ impl Whitenoise {
                 .await;
         }
 
-        if let Err(e) = subscription_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to setup subscriptions for account {}: {}",
-                account.pubkey.to_hex(),
-                e
-            );
-        }
-
         if let Err(e) = key_rotation_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to rotate key package for account {}: {}",
-                account.pubkey.to_hex(),
-                e
+                account = %account.pubkey.to_hex(),
+                error = %e,
+                "Failed to rotate key package"
             );
         }
 
         if let Err(e) = image_sync_result {
             tracing::warn!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to sync group image cache: {}",
-                e
+                error = %e,
+                "Failed to sync group image cache"
             );
         }
 
         if let Err(e) = welcomer_user_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to ensure welcomer user exists: {}",
-                e
+                account = %account.pubkey.to_hex(),
+                error = %e,
+                "Failed to ensure welcomer user exists"
             );
         }
 
-        // Perform self-update AFTER other tasks complete, especially after
-        // subscriptions are set up. The self-update advances the group epoch,
-        // so it must run after the member is fully subscribed and has had a
-        // chance to receive any messages sent at the current epoch. Running
-        // it concurrently would cause epoch mismatches: other members' messages
-        // sent at epoch N would be rejected because the local state already
-        // advanced to epoch N+1 via the self-update.
+        // --- Step 4: self-update (only if subscriptions are live) ---
         //
-        // We add a brief delay to allow in-flight messages at the current
-        // epoch to arrive via the newly-established subscriptions before we
-        // advance to the next epoch. Without this, messages that were sent
-        // by other members between group creation and the self-update would
-        // be rejected with "Wrong Epoch" errors.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await {
+        // The self-update advances the group epoch.  It runs only when
+        // subscriptions are live (step 1 succeeded) AND after the catch-up
+        // step has queued in-flight messages and waited for the event processor
+        // to drain them (step 2).  This replaces the original unconditional
+        // 5 s sleep with a structured sequence that is both faster and more
+        // reliable.
+        if subscription_ok
+            && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
+        {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to perform post-welcome self-update for account {} in group {}: {}",
-                account.pubkey.to_hex(),
-                hex::encode(group_id.as_slice()),
-                e
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(group_id.as_slice()),
+                error = %e,
+                "Failed to perform post-welcome self-update"
             );
         }
 
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome::background",
-            "Completed post-welcome processing for account {} and group {}",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice())
+            account = %account.pubkey.to_hex(),
+            group = %hex::encode(group_id.as_slice()),
+            "Completed post-welcome processing"
         );
+    }
+
+    /// Fetch recent group messages from relays and queue them for processing,
+    /// then wait a bounded time for them to be handled before returning.
+    ///
+    /// The messages are queued through `event_sender` using the account's
+    /// `{hash}_mls_messages` subscription ID so that the existing event
+    /// processor pipeline handles them in the same way as live subscription
+    /// events (deduplication, retry, etc.).
+    ///
+    /// After queuing, a short sleep (`CATCHUP_DRAIN_WAIT`) gives the event
+    /// processor time to work through the queue before `perform_self_update`
+    /// advances the epoch.  This is intentionally brief — the subscription is
+    /// already live at this point, so any in-flight messages are either in the
+    /// channel or will arrive within normal relay latency.
+    ///
+    /// This is a **best-effort** operation: failures are logged but never
+    /// propagate to the caller.
+    async fn catchup_group_messages(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) {
+        // Derive the nostr_group_id (hex-encoded) and group relay URLs.
+        let (nostr_group_id, relay_urls) =
+            match Self::get_group_nostr_id_and_relays(whitenoise, account, group_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome::background",
+                        account = %account.pubkey.to_hex(),
+                        group = %hex::encode(group_id.as_slice()),
+                        error = %e,
+                        "Skipping catch-up: could not resolve group relay info"
+                    );
+                    return;
+                }
+            };
+
+        let events = whitenoise
+            .nostr
+            .fetch_group_messages_catchup(&nostr_group_id, &relay_urls)
+            .await;
+
+        let count = events.len();
+        tracing::debug!(
+            target: "whitenoise::event_processor::process_welcome::background",
+            account = %account.pubkey.to_hex(),
+            group = %hex::encode(group_id.as_slice()),
+            count,
+            "Catch-up: queuing fetched group messages for processing"
+        );
+
+        // Queue events through the standard pipeline so deduplication,
+        // retry logic, and MLS state management apply correctly.
+        let pubkey_hash = whitenoise.nostr.create_pubkey_hash(&account.pubkey);
+        let subscription_id = format!("{}_mls_messages", pubkey_hash);
+
+        for event in events {
+            use crate::types::ProcessableEvent;
+            if let Err(e) = whitenoise
+                .event_sender
+                .send(ProcessableEvent::new_nostr_event(
+                    event,
+                    Some(subscription_id.clone()),
+                ))
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    error = %e,
+                    "Catch-up: failed to queue event (channel closed?)"
+                );
+                break;
+            }
+        }
+
+        // Give the event processor time to drain the queued messages before
+        // the self-update advances the epoch.  This replaces the original
+        // unconditional 5 s sleep with a shorter, purposeful wait that only
+        // runs when subscriptions are live.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    /// Returns the Nostr group ID (hex) and relay URLs for a group.
+    fn get_group_nostr_id_and_relays(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<(String, Vec<RelayUrl>)> {
+        let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+        let group = mdk
+            .get_group(group_id)?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let nostr_group_id = hex::encode(group.nostr_group_id);
+        let relay_urls = mdk.get_relays(group_id)?;
+        Ok((nostr_group_id, relay_urls.into_iter().collect()))
     }
 
     /// Create GroupInformation for the welcome
