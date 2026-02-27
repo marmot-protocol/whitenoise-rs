@@ -22,6 +22,7 @@ pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod database;
+pub mod debug;
 pub mod drafts;
 pub mod error;
 mod event_processor;
