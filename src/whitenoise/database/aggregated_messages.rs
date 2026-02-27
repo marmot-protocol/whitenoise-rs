@@ -472,14 +472,16 @@ impl AggregatedMessage {
         Ok(())
     }
 
-    /// Update the delivery status of a cached message
+    /// Update the delivery status of a cached message.
+    ///
+    /// Returns an error if no matching message was found (0 rows affected).
     pub async fn update_delivery_status(
         message_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE aggregated_messages
              SET delivery_status = ?
              WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
@@ -489,6 +491,10 @@ impl AggregatedMessage {
         .bind(group_id.as_slice())
         .execute(&database.pool)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        }
 
         Ok(())
     }

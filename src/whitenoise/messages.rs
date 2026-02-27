@@ -48,6 +48,14 @@ impl Whitenoise {
             self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+
+        // Guard: fail immediately if no relays configured (before creating MLS message
+        // to avoid persisting a message in MDK storage that can never be delivered)
+        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
+        if group_relays.is_empty() {
+            return Err(WhitenoiseError::GroupMissingRelays);
+        }
+
         let message_event = mdk.create_message(group_id, inner_event)?;
         let mdk_message =
             mdk.get_message(group_id, &event_id)?
@@ -55,46 +63,42 @@ impl Whitenoise {
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
 
-        // Guard: fail immediately if no relays configured
-        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
-        if group_relays.is_empty() {
-            return Err(WhitenoiseError::GroupMissingRelays);
-        }
-
         let tokens = self.nostr.parse(&mdk_message.content);
 
-        // Build ChatMessage with Sending status for proactive caching
-        let chat_message = self
-            .message_aggregator
-            .process_single_message(
-                &mdk_message,
-                &self.nostr,
-                MediaFile::find_by_group(&self.database, group_id).await?,
-            )
-            .await
-            .map(|mut msg| {
-                msg.delivery_status = Some(DeliveryStatus::Sending);
-                msg
-            })
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
-            })?;
+        // Proactive caching + delivery tracking only for chat messages (kind 9).
+        // Reactions (kind 7) and deletions (kind 5) don't need delivery status UI.
+        if kind == 9 {
+            let chat_message = self
+                .message_aggregator
+                .process_single_message(
+                    &mdk_message,
+                    &self.nostr,
+                    MediaFile::find_by_group(&self.database, group_id).await?,
+                )
+                .await
+                .map(|mut msg| {
+                    msg.delivery_status = Some(DeliveryStatus::Sending);
+                    msg
+                })
+                .map_err(|e| {
+                    WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
+                })?;
 
-        // Proactively cache the message with Sending status
-        AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
-            .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
-            })?;
+            AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
+                })?;
 
-        // Emit NewMessage so the UI shows it immediately (optimistic)
-        self.message_stream_manager.emit(
-            group_id,
-            MessageUpdate {
-                trigger: UpdateTrigger::NewMessage,
-                message: chat_message,
-            },
-        );
+            // Emit NewMessage so the UI shows it immediately (optimistic)
+            self.message_stream_manager.emit(
+                group_id,
+                MessageUpdate {
+                    trigger: UpdateTrigger::NewMessage,
+                    message: chat_message,
+                },
+            );
+        }
 
         // Spawn background task: retry publish + emit delivery status update
         let nostr = self.nostr.clone();
@@ -103,19 +107,34 @@ impl Whitenoise {
         let event_id_str = event_id.to_string();
         let group_id_clone = group_id.clone();
         let account_pubkey = account.pubkey;
+        let is_chat_message = kind == 9;
 
         tokio::spawn(async move {
-            Self::publish_with_retries(
-                &nostr,
-                message_event,
-                &account_pubkey,
-                &group_relays,
-                &event_id_str,
-                &group_id_clone,
-                &database,
-                &stream_manager,
-            )
-            .await;
+            if is_chat_message {
+                Self::publish_with_retries(
+                    &nostr,
+                    message_event,
+                    &account_pubkey,
+                    &group_relays,
+                    &event_id_str,
+                    &group_id_clone,
+                    &database,
+                    &stream_manager,
+                )
+                .await;
+            } else {
+                // Reactions/deletions: best-effort publish, no delivery tracking
+                if let Err(e) = nostr
+                    .publish_event_to(message_event, &account_pubkey, &group_relays)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Failed to publish kind {} event: {e}",
+                        kind,
+                    );
+                }
+            }
         });
 
         Ok(MessageWithTokens::new(mdk_message, tokens))
@@ -261,7 +280,24 @@ impl Whitenoise {
         group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<()> {
+        // Guard: only retry messages that are in Failed state to prevent duplicate publishes
+        if let Ok(Some(cached)) =
+            AggregatedMessage::find_by_id(&event_id.to_string(), group_id, &self.database).await
+            && !matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_)))
+        {
+            return Err(WhitenoiseError::from(anyhow::anyhow!(
+                "Can only retry messages with Failed delivery status, got {:?}",
+                cached.delivery_status
+            )));
+        }
+
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+
+        // Guard: fail immediately if no relays configured (before re-creating MLS message)
+        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
+        if group_relays.is_empty() {
+            return Err(WhitenoiseError::GroupMissingRelays);
+        }
 
         // Retrieve the original message from MDK
         let mdk_message =
@@ -279,11 +315,6 @@ impl Whitenoise {
             &mdk_message.content,
         );
         let message_event = mdk.create_message(group_id, inner_event)?;
-
-        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
-        if group_relays.is_empty() {
-            return Err(WhitenoiseError::GroupMissingRelays);
-        }
 
         // Update status to Sending and emit MessageRetried (includes reposition)
         let sending_status = DeliveryStatus::Sending;
