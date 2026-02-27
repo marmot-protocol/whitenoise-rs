@@ -700,9 +700,13 @@ impl Whitenoise {
 
     /// Refresh account subscriptions.
     ///
-    /// This method updates subscriptions when account state changes (group membership, relay preferences).
-    /// Uses explicit cleanup to handle relay changes properly - NIP-01 auto-replacement only works
-    /// within the same relay, so changing relays would leave orphaned subscriptions without cleanup.
+    /// This method updates subscriptions when account state changes (group membership, relay
+    /// preferences). It re-issues subscriptions using NIP-01 stable IDs (atomic replacement) so
+    /// there is no unsubscribe/resubscribe gap during a normal refresh.
+    ///
+    /// The replay anchor is derived from the account's sync state via `since_timestamp`, ensuring
+    /// the relay delivers any events missed since the last successful sync rather than an
+    /// arbitrary wall-clock offset.
     ///
     /// # Arguments
     ///
@@ -721,6 +725,10 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
+        // Anchor replay from account sync state (10s buffer); falls back to None (no filter)
+        // when the account has never synced, so the relay sends everything it has.
+        let since = account.since_timestamp(10);
+
         let signer = self.get_signer_for_account(account)?;
         self.nostr
             .update_account_subscriptions_with_signer(
@@ -729,6 +737,7 @@ impl Whitenoise {
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,
+                since,
                 signer,
             )
             .await
