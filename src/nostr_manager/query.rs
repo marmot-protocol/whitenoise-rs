@@ -1,11 +1,34 @@
 //! This module contains functions for querying Nostr events from relays.
 
+use std::time::Duration;
+
 use nostr_sdk::prelude::*;
 
 use crate::{
     RelayType,
     nostr_manager::{NostrManager, Result, utils::is_event_timestamp_valid},
 };
+
+/// Maximum number of events to fetch in a single catch-up query.
+///
+/// Keeps the catch-up step bounded so it cannot stall the join flow
+/// by trying to replay an unbounded backlog.
+const CATCHUP_EVENT_LIMIT: usize = 200;
+
+/// How far back to look for group messages during join-time catch-up.
+///
+/// Covers the window between the Welcome being sent and our subscription
+/// becoming active, plus a safety margin for clock skew.
+const CATCHUP_LOOKBACK: Duration = Duration::from_secs(120);
+
+/// Maximum time to wait for the relay to respond during catch-up.
+///
+/// Keep this well below the default client timeout (5 s) so the catch-up
+/// step does not block the join-time flow for too long when the relay is
+/// slow or returns no results.  2 s is plenty for both local (sub-50 ms)
+/// and remote (sub-500 ms) relays while still leaving headroom before the
+/// WaitForWelcome test helper times out.
+const CATCHUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl NostrManager {
     pub(crate) async fn fetch_metadata_from(
@@ -56,6 +79,53 @@ impl NostrManager {
             .filter(is_event_timestamp_valid)
             .max_by_key(|e| (e.created_at, e.id));
         Ok(latest)
+    }
+
+    /// Fetch up to [`CATCHUP_EVENT_LIMIT`] MLS group messages for `nostr_group_id`
+    /// from `relays`, looking back at most [`CATCHUP_LOOKBACK`] seconds from now.
+    ///
+    /// This is a **bounded, one-shot** fetch used at join time so that messages
+    /// sent between the Welcome being dispatched and our subscription becoming
+    /// active are available for processing before the self-update advances the
+    /// epoch.  It is not a replacement for the ongoing subscription.
+    ///
+    /// # Returns
+    ///
+    /// The fetched events in no guaranteed order; the caller is responsible for
+    /// processing them.  Returns an empty `Vec` if the relay query fails so that
+    /// a transient failure never blocks the rest of the join flow.
+    pub(crate) async fn fetch_group_messages_catchup(
+        &self,
+        nostr_group_id: &str,
+        relays: &[RelayUrl],
+    ) -> Vec<Event> {
+        if relays.is_empty() || nostr_group_id.is_empty() {
+            return vec![];
+        }
+
+        let since = Timestamp::now() - CATCHUP_LOOKBACK;
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [nostr_group_id])
+            .since(since)
+            .limit(CATCHUP_EVENT_LIMIT);
+
+        match self
+            .client
+            .fetch_events_from(relays, filter, CATCHUP_TIMEOUT)
+            .await
+        {
+            Ok(events) => events.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::nostr_manager::fetch_group_messages_catchup",
+                    "Catch-up fetch failed for group {}: {}",
+                    nostr_group_id,
+                    e
+                );
+                vec![]
+            }
+        }
     }
 }
 
