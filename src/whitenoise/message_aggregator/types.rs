@@ -186,6 +186,52 @@ pub enum ProcessingError {
 mod tests {
     use super::*;
 
+    mod delivery_status_tests {
+        use super::*;
+
+        #[test]
+        fn test_serialization_roundtrip() {
+            let statuses = [
+                DeliveryStatus::Sending,
+                DeliveryStatus::Sent(3),
+                DeliveryStatus::Failed("No relay accepted".to_string()),
+            ];
+
+            for status in &statuses {
+                let json = serde_json::to_string(status).expect("serialize");
+                let deserialized: DeliveryStatus =
+                    serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(status, &deserialized);
+            }
+        }
+
+        #[test]
+        fn test_option_none_serialization() {
+            let status: Option<DeliveryStatus> = None;
+            let json = serde_json::to_string(&status).expect("serialize");
+            assert_eq!(json, "null");
+            let deserialized: Option<DeliveryStatus> =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(deserialized, None);
+        }
+
+        #[test]
+        fn test_option_some_serialization() {
+            let status = Some(DeliveryStatus::Sent(5));
+            let json = serde_json::to_string(&status).expect("serialize");
+            let deserialized: Option<DeliveryStatus> =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(deserialized, status);
+        }
+
+        #[test]
+        fn test_clone_and_eq() {
+            let status = DeliveryStatus::Failed("timeout".to_string());
+            let cloned = status.clone();
+            assert_eq!(status, cloned);
+        }
+    }
+
     mod aggregator_config_tests {
         use super::*;
 

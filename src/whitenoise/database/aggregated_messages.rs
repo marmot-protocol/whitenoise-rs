@@ -1672,6 +1672,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_delivery_status_and_find_by_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[200; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert a message with Sending status
+        let mut message = create_test_chat_message(200, author);
+        message.delivery_status = Some(DeliveryStatus::Sending);
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify initial Sending status via find_by_id
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Update to Sent(3)
+        AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Sent(3),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
+
+        // Update to Failed
+        AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Failed("timeout".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.delivery_status,
+            Some(DeliveryStatus::Failed("timeout".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_by_id_returns_none_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[201; 32]);
+
+        let found = AggregatedMessage::find_by_id("nonexistent", &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_insert_message_with_no_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[202; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let message = create_test_chat_message(202, author);
+        // delivery_status is None (incoming message)
+        assert!(message.delivery_status.is_none());
+
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_messages_by_group_preserves_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[203; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert incoming message (no delivery status)
+        let msg_incoming = create_test_chat_message(203, author);
+        AggregatedMessage::insert_message(&msg_incoming, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert outgoing message with Sent status
+        let mut msg_outgoing = create_test_chat_message(204, author);
+        msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
+        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
+        assert!(statuses.contains(&&None));
+        assert!(statuses.contains(&&Some(DeliveryStatus::Sent(2))));
+    }
+
+    #[tokio::test]
     async fn test_count_unread_for_groups_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 

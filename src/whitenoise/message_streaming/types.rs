@@ -83,6 +83,8 @@ mod tests {
             UpdateTrigger::ReactionAdded,
             UpdateTrigger::ReactionRemoved,
             UpdateTrigger::MessageDeleted,
+            UpdateTrigger::DeliveryStatusChanged,
+            UpdateTrigger::MessageRetried,
         ];
 
         for trigger in triggers {
