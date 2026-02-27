@@ -25,6 +25,14 @@ pub enum UpdateTrigger {
 
     /// The message itself was marked as deleted.
     MessageDeleted,
+
+    /// The delivery status of an outgoing message changed (e.g. Sending → Sent or Failed).
+    /// The message stays in its current position in the chat.
+    DeliveryStatusChanged,
+
+    /// A failed message was retried and needs both a status update and repositioning
+    /// to its new location in the chat history.
+    MessageRetried,
 }
 
 /// Represents a single update to be sent to subscribers.

@@ -9,7 +9,7 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ChatMessageSummary, ReactionSummary},
+    message_aggregator::{ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary},
     utils::timestamp_to_datetime,
 };
 
@@ -30,6 +30,7 @@ struct AggregatedMessageRow {
     pub content_tokens: Vec<SerializableToken>,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AggregatedMessageRow
@@ -123,6 +124,17 @@ where
             }
         })?;
 
+        // Deserialize optional delivery_status from JSON string
+        let delivery_status: Option<DeliveryStatus> = match row
+            .try_get::<Option<String>, _>("delivery_status")?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "delivery_status".to_string(),
+                source: Box::new(e),
+            })?,
+            None => None,
+        };
+
         Ok(Self {
             id,
             message_id,
@@ -137,6 +149,7 @@ where
             content_tokens,
             reactions,
             media_attachments,
+            delivery_status,
         })
     }
 }
@@ -309,8 +322,8 @@ impl AggregatedMessage {
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
-              reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)
+              reply_to_id, content_tokens, reactions, media_attachments, delivery_status)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
                tags = excluded.tags,
@@ -329,6 +342,13 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
+        .bind(
+            message
+                .delivery_status
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .execute(&database.pool)
         .await?;
 
@@ -444,6 +464,27 @@ impl AggregatedMessage {
              WHERE message_id = ? AND mls_group_id = ? AND kind IN (7, 9)",
         )
         .bind(deletion_event_id)
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update the delivery status of a cached message
+    pub async fn update_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE aggregated_messages
+             SET delivery_status = ?
+             WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
+        )
+        .bind(serde_json::to_string(status)?)
         .bind(message_id)
         .bind(group_id.as_slice())
         .execute(&database.pool)
@@ -814,6 +855,7 @@ impl AggregatedMessage {
             reactions: row.reactions,
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
+            delivery_status: row.delivery_status,
         })
     }
 
@@ -886,6 +928,7 @@ mod tests {
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
+            delivery_status: None,
         }
     }
 

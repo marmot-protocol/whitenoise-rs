@@ -42,7 +42,7 @@ pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 
 // Messaging
 pub use whitenoise::message_aggregator::{
-    ChatMessage, EmojiReaction, ReactionSummary, UserReaction,
+    ChatMessage, DeliveryStatus, EmojiReaction, ReactionSummary, UserReaction,
 };
 
 // Nostr integration

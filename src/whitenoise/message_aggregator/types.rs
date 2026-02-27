@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::media_files::MediaFile;
 
+/// Tracks the delivery state of an outgoing message.
+///
+/// Follows an optimistic UI pattern: the message appears instantly with `Sending`,
+/// then transitions to `Sent` or `Failed` after the background publish completes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DeliveryStatus {
+    /// Background publish in progress (message visible in chat immediately)
+    Sending,
+    /// Published successfully to N relays
+    Sent(usize),
+    /// All publish attempts exhausted — reason string for debugging (not shown to user)
+    Failed(String),
+}
+
 /// Represents an aggregated chat message ready for frontend display
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -45,6 +59,10 @@ pub struct ChatMessage {
 
     /// Media files attached to this message
     pub media_attachments: Vec<MediaFile>,
+
+    /// Delivery status for outgoing messages.
+    /// `None` for incoming messages, `Some(status)` for messages sent by the current user.
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 /// Lightweight message summary for previews (chat list).
