@@ -1800,6 +1800,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_delivery_status_returns_error_for_nonexistent_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[205; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        // Try to update delivery status for a message that doesn't exist
+        let result = AggregatedMessage::update_delivery_status(
+            &format!("{:0>64}", "ff"),
+            &group_id,
+            &DeliveryStatus::Sent(1),
+            &whitenoise.database,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent message"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
+            "Expected RowNotFound error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
     async fn test_count_unread_for_groups_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 

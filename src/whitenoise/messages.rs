@@ -1227,6 +1227,126 @@ mod tests {
         assert_eq!(messages[0].media_attachments.len(), 0);
     }
 
+    /// Test that sending a non-kind-9 message (e.g., reaction) skips proactive caching
+    /// and delivery tracking but still succeeds.
+    #[tokio::test]
+    async fn test_send_non_kind9_skips_delivery_tracking() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // First send a kind 9 message (needed as reaction target)
+        let chat_result = whitenoise
+            .send_message_to_group(&creator, &group.mls_group_id, "Hello".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        // Verify kind 9 was cached
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 1, "kind 9 message should be cached");
+
+        // Now send a kind 7 (reaction) — should succeed but NOT add to cache
+        let reaction_tags = Some(vec![
+            Tag::parse(vec!["e", &chat_result.message.id.to_hex()]).unwrap(),
+        ]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "+".to_string(),
+                7,
+                reaction_tags,
+            )
+            .await;
+        assert!(
+            reaction_result.is_ok(),
+            "Reaction send should succeed: {:?}",
+            reaction_result.err()
+        );
+
+        // Cache count should still be 1 (only the kind 9 message)
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(
+            cached_count, 1,
+            "kind 7 reaction should NOT be added to aggregated message cache"
+        );
+    }
+
+    /// Test that retry_message_publish rejects a message not in Failed state.
+    #[tokio::test]
+    async fn test_retry_rejects_non_failed_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message — it will be cached with Sending status
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry guard test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id;
+
+        // Verify status is Sending
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Attempt to retry — should be rejected because status is Sending, not Failed
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &event_id)
+            .await;
+        assert!(
+            retry_result.is_err(),
+            "Should reject retry for non-Failed status"
+        );
+
+        let err_msg = retry_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed delivery status"),
+            "Error should mention Failed status requirement, got: {}",
+            err_msg
+        );
+    }
+
     /// Test publish_with_retries exhausts all attempts and marks status as Failed
     /// when relays are unreachable.
     #[tokio::test]
