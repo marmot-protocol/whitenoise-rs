@@ -1,12 +1,18 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::{
+    nostr_manager::NostrManager,
     types::MessageWithTokens,
     whitenoise::{
         Whitenoise,
         accounts::Account,
         aggregated_message::AggregatedMessage,
+        database::Database,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
-        message_aggregator::ChatMessage,
+        message_aggregator::{ChatMessage, DeliveryStatus},
+        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
@@ -42,24 +48,342 @@ impl Whitenoise {
             self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+
+        // Guard: fail immediately if no relays configured (before creating MLS message
+        // to avoid persisting a message in MDK storage that can never be delivered)
+        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
+        if group_relays.is_empty() {
+            return Err(WhitenoiseError::GroupMissingRelays);
+        }
+
         let message_event = mdk.create_message(group_id, inner_event)?;
-        let message =
+        let mdk_message =
             mdk.get_message(group_id, &event_id)?
                 .ok_or(WhitenoiseError::MdkCoreError(
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
-        let group_relays = mdk.get_relays(group_id)?;
 
-        // Publish message in background without blocking
-        self.nostr.background_publish_event_to(
-            message_event,
-            account.pubkey,
-            group_relays.into_iter().collect::<Vec<_>>(),
+        let tokens = self.nostr.parse(&mdk_message.content);
+
+        // Proactive caching + delivery tracking only for chat messages (kind 9).
+        // Reactions (kind 7) and deletions (kind 5) don't need delivery status UI.
+        if kind == 9 {
+            let chat_message = self
+                .message_aggregator
+                .process_single_message(
+                    &mdk_message,
+                    &self.nostr,
+                    MediaFile::find_by_group(&self.database, group_id).await?,
+                )
+                .await
+                .map(|mut msg| {
+                    msg.delivery_status = Some(DeliveryStatus::Sending);
+                    msg
+                })
+                .map_err(|e| {
+                    WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
+                })?;
+
+            AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
+                })?;
+
+            // Emit NewMessage so the UI shows it immediately (optimistic)
+            self.message_stream_manager.emit(
+                group_id,
+                MessageUpdate {
+                    trigger: UpdateTrigger::NewMessage,
+                    message: chat_message,
+                },
+            );
+        }
+
+        // Spawn background task: retry publish + emit delivery status update
+        let nostr = self.nostr.clone();
+        let database = self.database.clone();
+        let stream_manager = self.message_stream_manager.clone();
+        let event_id_str = event_id.to_string();
+        let group_id_clone = group_id.clone();
+        let account_pubkey = account.pubkey;
+        let is_chat_message = kind == 9;
+
+        tokio::spawn(async move {
+            if is_chat_message {
+                Self::publish_with_retries(
+                    &nostr,
+                    message_event,
+                    &account_pubkey,
+                    &group_relays,
+                    &event_id_str,
+                    &group_id_clone,
+                    &database,
+                    &stream_manager,
+                )
+                .await;
+            } else {
+                // Reactions/deletions: best-effort publish, no delivery tracking
+                if let Err(e) = nostr
+                    .publish_event_to(message_event, &account_pubkey, &group_relays)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Failed to publish kind {} event: {e}",
+                        kind,
+                    );
+                }
+            }
+        });
+
+        Ok(MessageWithTokens::new(mdk_message, tokens))
+    }
+
+    /// Update delivery status in the DB cache and emit a stream update.
+    async fn update_and_emit_delivery_status(
+        event_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+        stream_manager: &MessageStreamManager,
+    ) {
+        if let Err(e) =
+            AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
+        {
+            tracing::warn!(
+                target: "whitenoise::messages::delivery",
+                "Failed to update delivery status in cache: {}",
+                e
+            );
+            return;
+        }
+
+        // Re-fetch the full message to emit with updated status
+        match AggregatedMessage::find_by_id(event_id, group_id, database).await {
+            Ok(Some(updated_msg)) => {
+                stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::DeliveryStatusChanged,
+                        message: updated_msg,
+                    },
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Message {} not found in cache after delivery status update",
+                    event_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Failed to fetch updated message for delivery status emission: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    /// Publish an event with exponential backoff retries.
+    ///
+    /// Attempts up to 3 publishes with delays of 2s and 4s between retries.
+    /// On success, updates the delivery status to `Sent(relay_count)`.
+    /// On failure (all retries exhausted), updates to `Failed(reason)`.
+    async fn publish_with_retries(
+        nostr: &NostrManager,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+        stream_manager: &Arc<MessageStreamManager>,
+    ) {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_error = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::debug!(
+                    target: "whitenoise::messages::delivery",
+                    "Retrying message publish \
+                     (attempt {}/{MAX_ATTEMPTS}), \
+                     backing off {delay:?}",
+                    attempt + 1,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match nostr
+                .publish_event_to(event.clone(), account_pubkey, relays)
+                .await
+            {
+                Ok(output) if !output.success.is_empty() => {
+                    let status = DeliveryStatus::Sent(output.success.len());
+                    Self::update_and_emit_delivery_status(
+                        event_id,
+                        group_id,
+                        &status,
+                        database,
+                        stream_manager,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS}: \
+                         no relay accepted (failed: {:?})",
+                        attempt + 1,
+                        output.failed.keys().collect::<Vec<_>>(),
+                    );
+                    last_error = Some("No relay accepted the message".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS} \
+                         failed: {e}",
+                        attempt + 1,
+                    );
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        // All retries exhausted — mark as failed
+        // Safety: last_error is always Some because the loop body always sets it
+        let reason = last_error.expect("loop always sets last_error");
+        let status = DeliveryStatus::Failed(reason);
+        Self::update_and_emit_delivery_status(
+            event_id,
+            group_id,
+            &status,
+            database,
+            stream_manager,
+        )
+        .await;
+    }
+
+    /// Retry publishing a failed message.
+    ///
+    /// Re-creates the MLS message event from the original message in the MDK store,
+    /// updates the delivery status to `Sending`, and spawns a new background publish task.
+    /// The retried message is repositioned to the current time in the chat history
+    /// via `UpdateTrigger::MessageRetried`.
+    pub async fn retry_message_publish(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        event_id: &EventId,
+    ) -> Result<()> {
+        // Guard: only retry messages that are in Failed state to prevent duplicate publishes
+        let event_id_str = event_id.to_string();
+        match AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database).await {
+            Ok(Some(cached))
+                if matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_))) =>
+            {
+                // Allow retry — message is in Failed state
+            }
+            Ok(Some(cached)) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Can only retry messages with Failed delivery status, got {:?}",
+                    cached.delivery_status
+                )));
+            }
+            Ok(None) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Cannot retry message {}: not found in cache for group",
+                    event_id_str
+                )));
+            }
+            Err(e) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Cannot retry message {}: failed to query cache: {}",
+                    event_id_str,
+                    e
+                )));
+            }
+        }
+
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+
+        // Guard: fail immediately if no relays configured (before re-creating MLS message)
+        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
+        if group_relays.is_empty() {
+            return Err(WhitenoiseError::GroupMissingRelays);
+        }
+
+        // Retrieve the original message from MDK
+        let mdk_message =
+            mdk.get_message(group_id, event_id)?
+                .ok_or(WhitenoiseError::MdkCoreError(
+                    mdk_core::error::Error::MessageNotFound,
+                ))?;
+
+        // Re-create the MLS message event for publishing
+        let inner_event = UnsignedEvent::new(
+            mdk_message.pubkey,
+            mdk_message.created_at,
+            mdk_message.kind,
+            mdk_message.tags.clone(),
+            &mdk_message.content,
         );
+        let message_event = mdk.create_message(group_id, inner_event)?;
 
-        let tokens = self.nostr.parse(&message.content);
+        // Update status to Sending and emit MessageRetried (includes reposition)
+        let sending_status = DeliveryStatus::Sending;
+        AggregatedMessage::update_delivery_status(
+            &event_id_str,
+            group_id,
+            &sending_status,
+            &self.database,
+        )
+        .await
+        .map_err(|e| {
+            WhitenoiseError::from(anyhow::anyhow!("Failed to update delivery status: {}", e))
+        })?;
 
-        Ok(MessageWithTokens::new(message, tokens))
+        // Emit MessageRetried so the UI repositions the message
+        if let Ok(Some(msg)) =
+            AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database).await
+        {
+            self.message_stream_manager.emit(
+                group_id,
+                MessageUpdate {
+                    trigger: UpdateTrigger::MessageRetried,
+                    message: msg,
+                },
+            );
+        }
+
+        // Spawn background publish with retry
+        let nostr = self.nostr.clone();
+        let database = self.database.clone();
+        let stream_manager = self.message_stream_manager.clone();
+        let group_id_clone = group_id.clone();
+        let account_pubkey = account.pubkey;
+
+        tokio::spawn(async move {
+            Self::publish_with_retries(
+                &nostr,
+                message_event,
+                &account_pubkey,
+                &group_relays,
+                &event_id_str,
+                &group_id_clone,
+                &database,
+                &stream_manager,
+            )
+            .await;
+        });
+
+        Ok(())
     }
 
     /// Fetches all messages for a specific group with parsed tokens.
@@ -338,7 +662,9 @@ mod tests {
 
         // Test 2: Message with custom tags (reply scenario)
         let reply_message = "This is a reply".to_string();
-        let tags = Some(vec![Tag::parse(vec!["e", "original_message_id"]).unwrap()]);
+        let tags = Some(vec![
+            Tag::parse(vec!["e", &format!("{:0>64}", "abc123")]).unwrap(),
+        ]);
         let result = whitenoise
             .send_message_to_group(
                 &creator_account,
@@ -568,7 +894,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Send a few messages
+        // Send a few messages — these are now proactively cached
         whitenoise
             .send_message_to_group(
                 &creator,
@@ -609,32 +935,24 @@ mod tests {
         // Verify we have 3 messages in MDK
         assert_eq!(mdk_messages.len(), 3);
 
-        // Cache should need sync since it's empty
-        let needs_sync = whitenoise
-            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
-            .await
-            .unwrap();
-        assert!(needs_sync, "Cache should need sync when empty");
-
-        // Verify cache is empty
+        // With proactive caching, cache already has kind 9 messages.
+        // But MDK also has kind 7/5 events (MLS protocol), so cache_needs_sync
+        // compares total event count (MDK) vs cache count.
+        // Cache only has kind 9 from proactive caching, sync fills in the rest.
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
                 .unwrap();
-        assert_eq!(cached_count, 0);
+        assert_eq!(
+            cached_count, 3,
+            "Proactive caching should have cached 3 kind-9 messages"
+        );
 
-        // Sync the cache
+        // Sync the cache (should be idempotent since messages already cached)
         whitenoise
             .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages.clone())
             .await
             .unwrap();
-
-        // Verify cache now has 3 messages
-        let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
-        assert_eq!(cached_count, 3);
 
         // Cache should not need sync anymore
         let needs_sync = whitenoise
@@ -672,7 +990,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Send 2 messages
+        // Send 2 messages — proactively cached
         whitenoise
             .send_message_to_group(&creator, &group.mls_group_id, "First".to_string(), 9, None)
             .await
@@ -683,7 +1001,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Sync the cache
+        // Verify 2 messages already in cache (proactive caching)
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 2);
+
+        // Sync the cache (should be idempotent for kind 9, may add other event types)
         let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
         whitenoise
@@ -691,37 +1016,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify 2 messages in cache
-        let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
-        assert_eq!(cached_count, 2);
-
-        // Send a 3rd message
+        // Send a 3rd message — also proactively cached
         whitenoise
             .send_message_to_group(&creator, &group.mls_group_id, "Third".to_string(), 9, None)
             .await
             .unwrap();
 
-        // Get updated messages from MDK
-        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
-        assert_eq!(mdk_messages.len(), 3);
-
-        // Cache should need sync now
-        let needs_sync = whitenoise
-            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
-            .await
-            .unwrap();
-        assert!(needs_sync, "Cache should need sync after new message");
-
-        // Incremental sync should only process the new message
-        whitenoise
-            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
-            .await
-            .unwrap();
-
-        // Verify 3 messages in cache now
+        // Verify 3 messages in cache
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
@@ -759,7 +1060,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Send messages
+        // Send messages — proactively cached
         for i in 1..=5 {
             whitenoise
                 .send_message_to_group(
@@ -773,17 +1074,17 @@ mod tests {
                 .unwrap();
         }
 
-        // Cache should be empty
+        // Cache already has 5 messages from proactive caching
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
                 .unwrap();
-        assert_eq!(cached_count, 0);
+        assert_eq!(cached_count, 5);
 
-        // Run startup sync
+        // Run startup sync — should be idempotent
         whitenoise.sync_message_cache_on_startup().await.unwrap();
 
-        // Cache should now have all 5 messages
+        // Cache should still have 5 messages
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
@@ -942,5 +1243,558 @@ mod tests {
 
         // Verify media attachments exists (even if empty)
         assert_eq!(messages[0].media_attachments.len(), 0);
+    }
+
+    /// Test that sending a non-kind-9 message (e.g., reaction) skips proactive caching
+    /// and delivery tracking but still succeeds.
+    #[tokio::test]
+    async fn test_send_non_kind9_skips_delivery_tracking() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // First send a kind 9 message (needed as reaction target)
+        let chat_result = whitenoise
+            .send_message_to_group(&creator, &group.mls_group_id, "Hello".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        // Verify kind 9 was cached
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 1, "kind 9 message should be cached");
+
+        // Now send a kind 7 (reaction) — should succeed but NOT add to cache
+        let reaction_tags = Some(vec![
+            Tag::parse(vec!["e", &chat_result.message.id.to_hex()]).unwrap(),
+        ]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "+".to_string(),
+                7,
+                reaction_tags,
+            )
+            .await;
+        assert!(
+            reaction_result.is_ok(),
+            "Reaction send should succeed: {:?}",
+            reaction_result.err()
+        );
+
+        // Cache count should still be 1 (only the kind 9 message)
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(
+            cached_count, 1,
+            "kind 7 reaction should NOT be added to aggregated message cache"
+        );
+    }
+
+    /// Test that retry_message_publish rejects a message not in Failed state.
+    #[tokio::test]
+    async fn test_retry_rejects_non_failed_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message — it will be cached with Sending status
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry guard test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id;
+
+        // Verify status is Sending
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Attempt to retry — should be rejected because status is Sending, not Failed
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &event_id)
+            .await;
+        assert!(
+            retry_result.is_err(),
+            "Should reject retry for non-Failed status"
+        );
+
+        let err_msg = retry_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Failed delivery status"),
+            "Error should mention Failed status requirement, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test that retry_message_publish rejects a message not found in cache.
+    #[tokio::test]
+    async fn test_retry_rejects_uncached_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Use a fabricated event ID that doesn't exist in the cache
+        let fake_event_id = EventId::all_zeros();
+
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &fake_event_id)
+            .await;
+        assert!(
+            retry_result.is_err(),
+            "Should reject retry for uncached message"
+        );
+
+        let err_msg = retry_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found in cache"),
+            "Error should mention message not found, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test the full retry happy path: Failed → Sending → publish.
+    /// Exercises the "allow" arm of the retry guard and the status update + emit path.
+    #[tokio::test]
+    async fn test_retry_happy_path_from_failed_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message (proactively cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry happy path".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id;
+
+        // Manually mark the message as Failed (simulating exhausted retries)
+        AggregatedMessage::update_delivery_status(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &DeliveryStatus::Failed("simulated failure".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Verify status is Failed
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            msg.delivery_status,
+            Some(DeliveryStatus::Failed(_))
+        ));
+
+        // Retry should succeed (passes the guard, updates to Sending, spawns publish)
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &event_id)
+            .await;
+        assert!(
+            retry_result.is_ok(),
+            "Retry from Failed should succeed: {:?}",
+            retry_result.err()
+        );
+
+        // Verify status transitioned to Sending (retry updates before spawning)
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            msg.delivery_status,
+            Some(DeliveryStatus::Sending),
+            "Status should be Sending after retry, got {:?}",
+            msg.delivery_status
+        );
+    }
+
+    /// Test publish_with_retries exhausts all attempts and marks status as Failed
+    /// when relays are unreachable.
+    #[tokio::test]
+    async fn test_publish_with_retries_marks_failed_on_exhaustion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send a message (proactively cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id.to_string();
+
+        // Verify initial status is Sending
+        let msg =
+            AggregatedMessage::find_by_id(&event_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Build a test event for publish_with_retries
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("test")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Call publish_with_retries directly with unreachable relays
+        let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
+
+        Whitenoise::publish_with_retries(
+            &whitenoise.nostr,
+            event,
+            &creator.pubkey,
+            &unreachable_relays,
+            &event_id,
+            &group.mls_group_id,
+            &whitenoise.database,
+            &whitenoise.message_stream_manager,
+        )
+        .await;
+
+        // Verify status transitioned to Failed
+        let msg =
+            AggregatedMessage::find_by_id(&event_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(msg.delivery_status, Some(DeliveryStatus::Failed(_))),
+            "Expected Failed status after exhausting retries, got {:?}",
+            msg.delivery_status
+        );
+    }
+
+    /// Test that cache_needs_sync returns false when there are no MDK messages.
+    #[tokio::test]
+    async fn test_cache_needs_sync_empty_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group_id = GroupId::from_slice(&[42u8; 32]);
+        let empty_messages: Vec<Message> = vec![];
+
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group_id, &empty_messages)
+            .await
+            .unwrap();
+        assert!(!needs_sync, "Empty MDK messages should not need sync");
+    }
+
+    /// Test that cache_needs_sync detects a count mismatch between MDK and cache.
+    #[tokio::test]
+    async fn test_cache_needs_sync_detects_mismatch() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=3 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Sync detect {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+
+        // Cache is in sync — should return false
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .await
+            .unwrap();
+        assert!(
+            !needs_sync,
+            "Cache should be in sync after proactive caching"
+        );
+
+        // Delete the cache to simulate stale state
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Now cache count (0) != MDK count (3) — should return true
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .await
+            .unwrap();
+        assert!(needs_sync, "Cache should need sync after deletion");
+    }
+
+    /// Test that sync_cache_for_group recovers a cleared cache.
+    ///
+    /// Exercises the full sync path: fetching cached IDs, filtering new events,
+    /// aggregating messages, and saving to the cache.
+    #[tokio::test]
+    async fn test_sync_cache_for_group_recovers_cleared_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=3 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Recover {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Get MDK messages before clearing cache
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        assert!(!mdk_messages.is_empty());
+
+        // Clear the cache entirely
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 0, "Cache should be empty after deletion");
+
+        // Sync should recover all messages from MDK
+        whitenoise
+            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .await
+            .unwrap();
+
+        // Verify messages were recovered
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 3, "All 3 messages should be recovered");
+
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=3 {
+            assert!(
+                contents
+                    .iter()
+                    .any(|c| c.contains(&format!("Recover {}", i))),
+                "Missing 'Recover {}' in recovered messages",
+                i
+            );
+        }
+    }
+
+    /// Test that sync_cache_for_group with empty input is a no-op.
+    #[tokio::test]
+    async fn test_sync_cache_for_group_empty_input() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+
+        let group_id = GroupId::from_slice(&[99u8; 32]);
+        let empty_messages: Vec<Message> = vec![];
+
+        // Should return Ok without touching the database
+        whitenoise
+            .sync_cache_for_group(&creator.pubkey, &group_id, empty_messages)
+            .await
+            .unwrap();
+
+        let cached_count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(cached_count, 0);
+    }
+
+    /// Test that sync_message_cache_on_startup recovers a stale cache.
+    ///
+    /// This exercises the full startup sync flow: iterating accounts, checking
+    /// each group for sync needs, and syncing when a mismatch is detected.
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_recovers_stale_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=4 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Startup recover {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Verify proactive cache has 4 messages
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 4);
+
+        // Clear the cache to simulate a stale/corrupt state
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 0, "Cache should be empty");
+
+        // Run startup sync — should detect mismatch and recover
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        // Verify all messages were recovered
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 4, "All 4 messages should be recovered");
+
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=4 {
+            assert!(
+                contents
+                    .iter()
+                    .any(|c| c.contains(&format!("Startup recover {}", i))),
+                "Missing 'Startup recover {}' in recovered messages",
+                i
+            );
+        }
     }
 }

@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::media_files::MediaFile;
 
+/// Tracks the delivery state of an outgoing message.
+///
+/// Follows an optimistic UI pattern: the message appears instantly with `Sending`,
+/// then transitions to `Sent` or `Failed` after the background publish completes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum DeliveryStatus {
+    /// Background publish in progress (message visible in chat immediately)
+    Sending,
+    /// Published successfully to N relays
+    Sent(usize),
+    /// All publish attempts exhausted — reason string for debugging (not shown to user)
+    Failed(String),
+}
+
 /// Represents an aggregated chat message ready for frontend display
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
@@ -45,6 +59,10 @@ pub struct ChatMessage {
 
     /// Media files attached to this message
     pub media_attachments: Vec<MediaFile>,
+
+    /// Delivery status for outgoing messages.
+    /// `None` for incoming messages, `Some(status)` for messages sent by the current user.
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 /// Lightweight message summary for previews (chat list).
@@ -167,6 +185,52 @@ pub enum ProcessingError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod delivery_status_tests {
+        use super::*;
+
+        #[test]
+        fn test_serialization_roundtrip() {
+            let statuses = [
+                DeliveryStatus::Sending,
+                DeliveryStatus::Sent(3),
+                DeliveryStatus::Failed("No relay accepted".to_string()),
+            ];
+
+            for status in &statuses {
+                let json = serde_json::to_string(status).expect("serialize");
+                let deserialized: DeliveryStatus =
+                    serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(status, &deserialized);
+            }
+        }
+
+        #[test]
+        fn test_option_none_serialization() {
+            let status: Option<DeliveryStatus> = None;
+            let json = serde_json::to_string(&status).expect("serialize");
+            assert_eq!(json, "null");
+            let deserialized: Option<DeliveryStatus> =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(deserialized, None);
+        }
+
+        #[test]
+        fn test_option_some_serialization() {
+            let status = Some(DeliveryStatus::Sent(5));
+            let json = serde_json::to_string(&status).expect("serialize");
+            let deserialized: Option<DeliveryStatus> =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(deserialized, status);
+        }
+
+        #[test]
+        fn test_clone_and_eq() {
+            let status = DeliveryStatus::Failed("timeout".to_string());
+            let cloned = status.clone();
+            assert_eq!(status, cloned);
+        }
+    }
 
     mod aggregator_config_tests {
         use super::*;

@@ -9,7 +9,7 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ChatMessageSummary, ReactionSummary},
+    message_aggregator::{ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary},
     utils::timestamp_to_datetime,
 };
 
@@ -30,6 +30,7 @@ struct AggregatedMessageRow {
     pub content_tokens: Vec<SerializableToken>,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AggregatedMessageRow
@@ -123,6 +124,17 @@ where
             }
         })?;
 
+        // Deserialize optional delivery_status from JSON string
+        let delivery_status: Option<DeliveryStatus> = match row
+            .try_get::<Option<String>, _>("delivery_status")?
+        {
+            Some(json) => serde_json::from_str(&json).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "delivery_status".to_string(),
+                source: Box::new(e),
+            })?,
+            None => None,
+        };
+
         Ok(Self {
             id,
             message_id,
@@ -137,6 +149,7 @@ where
             content_tokens,
             reactions,
             media_attachments,
+            delivery_status,
         })
     }
 }
@@ -309,8 +322,8 @@ impl AggregatedMessage {
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
-              reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)
+              reply_to_id, content_tokens, reactions, media_attachments, delivery_status)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
                tags = excluded.tags,
@@ -329,6 +342,13 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
+        .bind(
+            message
+                .delivery_status
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
         .execute(&database.pool)
         .await?;
 
@@ -448,6 +468,33 @@ impl AggregatedMessage {
         .bind(group_id.as_slice())
         .execute(&database.pool)
         .await?;
+
+        Ok(())
+    }
+
+    /// Update the delivery status of a cached message.
+    ///
+    /// Returns an error if no matching message was found (0 rows affected).
+    pub async fn update_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE aggregated_messages
+             SET delivery_status = ?
+             WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
+        )
+        .bind(serde_json::to_string(status)?)
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .execute(&database.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        }
 
         Ok(())
     }
@@ -814,6 +861,7 @@ impl AggregatedMessage {
             reactions: row.reactions,
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
+            delivery_status: row.delivery_status,
         })
     }
 
@@ -886,6 +934,7 @@ mod tests {
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
+            delivery_status: None,
         }
     }
 
@@ -1626,6 +1675,155 @@ mod tests {
         assert_eq!(result[&group_with_marker], 2); // Messages 3, 4 unread
         assert_eq!(result[&group_without_marker], 3); // All unread
         assert_eq!(result[&group_empty], 0);
+    }
+
+    #[tokio::test]
+    async fn test_update_delivery_status_and_find_by_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[200; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert a message with Sending status
+        let mut message = create_test_chat_message(200, author);
+        message.delivery_status = Some(DeliveryStatus::Sending);
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify initial Sending status via find_by_id
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Update to Sent(3)
+        AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Sent(3),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
+
+        // Update to Failed
+        AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Failed("timeout".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found.delivery_status,
+            Some(DeliveryStatus::Failed("timeout".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_by_id_returns_none_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[201; 32]);
+
+        let found = AggregatedMessage::find_by_id("nonexistent", &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_insert_message_with_no_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[202; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let message = create_test_chat_message(202, author);
+        // delivery_status is None (incoming message)
+        assert!(message.delivery_status.is_none());
+
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_messages_by_group_preserves_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[203; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert incoming message (no delivery status)
+        let msg_incoming = create_test_chat_message(203, author);
+        AggregatedMessage::insert_message(&msg_incoming, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert outgoing message with Sent status
+        let mut msg_outgoing = create_test_chat_message(204, author);
+        msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
+        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
+        assert!(statuses.contains(&&None));
+        assert!(statuses.contains(&&Some(DeliveryStatus::Sent(2))));
+    }
+
+    #[tokio::test]
+    async fn test_update_delivery_status_returns_error_for_nonexistent_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[205; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        // Try to update delivery status for a message that doesn't exist
+        let result = AggregatedMessage::update_delivery_status(
+            &format!("{:0>64}", "ff"),
+            &group_id,
+            &DeliveryStatus::Sent(1),
+            &whitenoise.database,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent message"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
+            "Expected RowNotFound error, got: {:?}",
+            err
+        );
     }
 
     #[tokio::test]

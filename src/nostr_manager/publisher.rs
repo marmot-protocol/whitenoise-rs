@@ -8,45 +8,6 @@ use crate::{
 };
 
 impl NostrManager {
-    /// Publishes an event to the specified relays in a background task.
-    ///
-    /// This is a fire-and-forget operation that spawns a background task to publish the event
-    /// without blocking the caller. Errors are logged but not returned. This is useful for
-    /// scenarios where you want to queue a publish operation but don't need to wait for completion.
-    ///
-    /// The method clones the necessary data to ensure `'static` lifetime for the spawned task.
-    /// The event is tracked in the database if published successfully to at least one relay.
-    pub(crate) fn background_publish_event_to(
-        &self,
-        event: Event,
-        account_pubkey: PublicKey,
-        relays: Vec<RelayUrl>,
-    ) {
-        let nostr = self.clone();
-
-        tokio::spawn(async move {
-            match nostr
-                .publish_event_to(event, &account_pubkey, &relays)
-                .await
-            {
-                Ok(output) => {
-                    tracing::debug!(
-                        target: "whitenoise::nostr_manager::background_publish_event_to",
-                        "Successfully published message to {} relay(s)",
-                        output.success.len()
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::nostr_manager::background_publish_event_to",
-                        "Failed to publish message in background task: {}",
-                        e
-                    );
-                }
-            }
-        });
-    }
-
     /// Constructs and publishes a Nostr gift wrap event using the provided signer.
     ///
     /// This method creates a gift-wrapped Nostr event and publishes it to specified relays.
@@ -786,73 +747,6 @@ mod publish_tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_background_publish_event_to_completes() {
-        use crate::whitenoise::event_tracker::NoEventTracker;
-
-        let (sender, _receiver) = mpsc::channel(100);
-        let event_tracker = Arc::new(NoEventTracker);
-        let nostr_manager =
-            NostrManager::new(sender, event_tracker, std::time::Duration::from_secs(10))
-                .await
-                .unwrap();
-
-        // Create a test account and keys
-        let keys = Keys::generate();
-
-        // Create a test event
-        let event_builder = EventBuilder::text_note("background test message");
-        let event = event_builder.sign_with_keys(&keys).unwrap();
-
-        // Use test relays
-        let test_relays = vec![
-            RelayUrl::parse("ws://localhost:8080").unwrap(),
-            RelayUrl::parse("ws://localhost:7777").unwrap(),
-        ];
-
-        // Call background publish (fire-and-forget)
-        nostr_manager.background_publish_event_to(event, keys.public_key(), test_relays);
-
-        // Give the background task time to complete
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // No assertions - just verify it doesn't panic or hang
-        // The background task logs success/failure internally
-    }
-
-    #[tokio::test]
-    async fn test_background_publish_event_to_with_unreachable_relays() {
-        use crate::whitenoise::event_tracker::NoEventTracker;
-
-        let (sender, _receiver) = mpsc::channel(100);
-        let event_tracker = Arc::new(NoEventTracker);
-        let nostr_manager =
-            NostrManager::new(sender, event_tracker, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
-
-        // Create a test account and keys
-        let keys = Keys::generate();
-
-        // Create a test event
-        let event_builder = EventBuilder::text_note("background test with unreachable relays");
-        let event = event_builder.sign_with_keys(&keys).unwrap();
-
-        // Use unreachable relays
-        let relays = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
-        ];
-
-        // Call background publish - should not panic even with unreachable relays
-        nostr_manager.background_publish_event_to(event, keys.public_key(), relays);
-
-        // Give the background task time to complete and log the error
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // No assertions - verify it handles errors gracefully without panicking
     }
 
     #[tokio::test]
