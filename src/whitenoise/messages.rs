@@ -257,7 +257,8 @@ impl Whitenoise {
         }
 
         // All retries exhausted — mark as failed
-        let reason = last_error.unwrap_or_else(|| "Unknown error".to_string());
+        // Safety: last_error is always Some because the loop body always sets it
+        let reason = last_error.expect("loop always sets last_error");
         let status = DeliveryStatus::Failed(reason);
         Self::update_and_emit_delivery_status(
             event_id,
@@ -282,14 +283,32 @@ impl Whitenoise {
         event_id: &EventId,
     ) -> Result<()> {
         // Guard: only retry messages that are in Failed state to prevent duplicate publishes
-        if let Ok(Some(cached)) =
-            AggregatedMessage::find_by_id(&event_id.to_string(), group_id, &self.database).await
-            && !matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_)))
-        {
-            return Err(WhitenoiseError::from(anyhow::anyhow!(
-                "Can only retry messages with Failed delivery status, got {:?}",
-                cached.delivery_status
-            )));
+        let event_id_str = event_id.to_string();
+        match AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database).await {
+            Ok(Some(cached))
+                if matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_))) =>
+            {
+                // Allow retry — message is in Failed state
+            }
+            Ok(Some(cached)) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Can only retry messages with Failed delivery status, got {:?}",
+                    cached.delivery_status
+                )));
+            }
+            Ok(None) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Cannot retry message {}: not found in cache for group",
+                    event_id_str
+                )));
+            }
+            Err(e) => {
+                return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    "Cannot retry message {}: failed to query cache: {}",
+                    event_id_str,
+                    e
+                )));
+            }
         }
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
@@ -320,7 +339,7 @@ impl Whitenoise {
         // Update status to Sending and emit MessageRetried (includes reposition)
         let sending_status = DeliveryStatus::Sending;
         AggregatedMessage::update_delivery_status(
-            &event_id.to_string(),
+            &event_id_str,
             group_id,
             &sending_status,
             &self.database,
@@ -332,7 +351,7 @@ impl Whitenoise {
 
         // Emit MessageRetried so the UI repositions the message
         if let Ok(Some(msg)) =
-            AggregatedMessage::find_by_id(&event_id.to_string(), group_id, &self.database).await
+            AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database).await
         {
             self.message_stream_manager.emit(
                 group_id,
@@ -347,7 +366,6 @@ impl Whitenoise {
         let nostr = self.nostr.clone();
         let database = self.database.clone();
         let stream_manager = self.message_stream_manager.clone();
-        let event_id_str = event_id.to_string();
         let group_id_clone = group_id.clone();
         let account_pubkey = account.pubkey;
 
@@ -1344,6 +1362,125 @@ mod tests {
             err_msg.contains("Failed delivery status"),
             "Error should mention Failed status requirement, got: {}",
             err_msg
+        );
+    }
+
+    /// Test that retry_message_publish rejects a message not found in cache.
+    #[tokio::test]
+    async fn test_retry_rejects_uncached_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Use a fabricated event ID that doesn't exist in the cache
+        let fake_event_id = EventId::all_zeros();
+
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &fake_event_id)
+            .await;
+        assert!(
+            retry_result.is_err(),
+            "Should reject retry for uncached message"
+        );
+
+        let err_msg = retry_result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not found in cache"),
+            "Error should mention message not found, got: {}",
+            err_msg
+        );
+    }
+
+    /// Test the full retry happy path: Failed → Sending → publish.
+    /// Exercises the "allow" arm of the retry guard and the status update + emit path.
+    #[tokio::test]
+    async fn test_retry_happy_path_from_failed_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message (proactively cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry happy path".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id;
+
+        // Manually mark the message as Failed (simulating exhausted retries)
+        AggregatedMessage::update_delivery_status(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &DeliveryStatus::Failed("simulated failure".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Verify status is Failed
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            msg.delivery_status,
+            Some(DeliveryStatus::Failed(_))
+        ));
+
+        // Retry should succeed (passes the guard, updates to Sending, spawns publish)
+        let retry_result = whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &event_id)
+            .await;
+        assert!(
+            retry_result.is_ok(),
+            "Retry from Failed should succeed: {:?}",
+            retry_result.err()
+        );
+
+        // Verify status transitioned to Sending (retry updates before spawning)
+        let msg = AggregatedMessage::find_by_id(
+            &event_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            msg.delivery_status,
+            Some(DeliveryStatus::Sending),
+            "Status should be Sending after retry, got {:?}",
+            msg.delivery_status
         );
     }
 
