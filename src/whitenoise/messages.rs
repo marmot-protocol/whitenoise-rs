@@ -1557,4 +1557,244 @@ mod tests {
             msg.delivery_status
         );
     }
+
+    /// Test that cache_needs_sync returns false when there are no MDK messages.
+    #[tokio::test]
+    async fn test_cache_needs_sync_empty_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let group_id = GroupId::from_slice(&[42u8; 32]);
+        let empty_messages: Vec<Message> = vec![];
+
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group_id, &empty_messages)
+            .await
+            .unwrap();
+        assert!(!needs_sync, "Empty MDK messages should not need sync");
+    }
+
+    /// Test that cache_needs_sync detects a count mismatch between MDK and cache.
+    #[tokio::test]
+    async fn test_cache_needs_sync_detects_mismatch() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=3 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Sync detect {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+
+        // Cache is in sync — should return false
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .await
+            .unwrap();
+        assert!(
+            !needs_sync,
+            "Cache should be in sync after proactive caching"
+        );
+
+        // Delete the cache to simulate stale state
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Now cache count (0) != MDK count (3) — should return true
+        let needs_sync = whitenoise
+            .cache_needs_sync(&group.mls_group_id, &mdk_messages)
+            .await
+            .unwrap();
+        assert!(needs_sync, "Cache should need sync after deletion");
+    }
+
+    /// Test that sync_cache_for_group recovers a cleared cache.
+    ///
+    /// Exercises the full sync path: fetching cached IDs, filtering new events,
+    /// aggregating messages, and saving to the cache.
+    #[tokio::test]
+    async fn test_sync_cache_for_group_recovers_cleared_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=3 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Recover {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Get MDK messages before clearing cache
+        let mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
+        let mdk_messages = mdk.get_messages(&group.mls_group_id, None).unwrap();
+        assert!(!mdk_messages.is_empty());
+
+        // Clear the cache entirely
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 0, "Cache should be empty after deletion");
+
+        // Sync should recover all messages from MDK
+        whitenoise
+            .sync_cache_for_group(&creator.pubkey, &group.mls_group_id, mdk_messages)
+            .await
+            .unwrap();
+
+        // Verify messages were recovered
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 3, "All 3 messages should be recovered");
+
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=3 {
+            assert!(
+                contents
+                    .iter()
+                    .any(|c| c.contains(&format!("Recover {}", i))),
+                "Missing 'Recover {}' in recovered messages",
+                i
+            );
+        }
+    }
+
+    /// Test that sync_cache_for_group with empty input is a no-op.
+    #[tokio::test]
+    async fn test_sync_cache_for_group_empty_input() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+
+        let group_id = GroupId::from_slice(&[99u8; 32]);
+        let empty_messages: Vec<Message> = vec![];
+
+        // Should return Ok without touching the database
+        whitenoise
+            .sync_cache_for_group(&creator.pubkey, &group_id, empty_messages)
+            .await
+            .unwrap();
+
+        let cached_count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(cached_count, 0);
+    }
+
+    /// Test that sync_message_cache_on_startup recovers a stale cache.
+    ///
+    /// This exercises the full startup sync flow: iterating accounts, checking
+    /// each group for sync needs, and syncing when a mismatch is detected.
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_recovers_stale_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send messages (proactively cached)
+        for i in 1..=4 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("Startup recover {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Verify proactive cache has 4 messages
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 4);
+
+        // Clear the cache to simulate a stale/corrupt state
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let cached_count =
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(cached_count, 0, "Cache should be empty");
+
+        // Run startup sync — should detect mismatch and recover
+        whitenoise.sync_message_cache_on_startup().await.unwrap();
+
+        // Verify all messages were recovered
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(messages.len(), 4, "All 4 messages should be recovered");
+
+        let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
+        for i in 1..=4 {
+            assert!(
+                contents
+                    .iter()
+                    .any(|c| c.contains(&format!("Startup recover {}", i))),
+                "Missing 'Startup recover {}' in recovered messages",
+                i
+            );
+        }
+    }
 }
