@@ -54,7 +54,7 @@ impl FromStr for AccountType {
 }
 
 /// The status of a login attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum LoginStatus {
     /// Login completed successfully. Account is fully activated with relay lists,
     /// subscriptions, and a published key package.
@@ -67,7 +67,7 @@ pub enum LoginStatus {
 }
 
 /// The result of a login attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LoginResult {
     /// The account that was created or found.
     pub account: Account,

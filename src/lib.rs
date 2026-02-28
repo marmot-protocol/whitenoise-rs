@@ -7,6 +7,9 @@ mod nostr_manager;
 mod types;
 pub mod whitenoise;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 // Integration tests module - included when integration-tests feature is enabled
 // This provides IDE support.
 #[cfg(feature = "integration-tests")]

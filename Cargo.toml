@@ -18,7 +18,7 @@ async-trait = "0.1.88"
 blurhash = "0.2.3"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4.40", features = ["serde"] }
-clap = { version = "4.5.37", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive"], optional = true }
 dashmap = "6.1"
 hex = "0.4"
 image = "0.25"
@@ -89,6 +89,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64ct = "=1.7.3"
 dotenvy = "0.15"
 tempfile = "3.19.1"
+dirs = { version = "6", optional = true }
 indicatif = { version = "0.18.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -111,10 +112,19 @@ mockito = "1.2"
 
 [features]
 default = []
-# Feature flag for integration tests - enables IDE support without including in production
-integration-tests = []
-# Feature flag for performance benchmarks - depends on integration-tests to reuse infrastructure
+cli = ["clap", "dirs"]
+integration-tests = ["clap"]
 benchmark-tests = ["integration-tests", "indicatif"]
+
+[[bin]]
+name = "wnd"
+path = "src/bin/wnd.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "wn"
+path = "src/bin/wn.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "integration_test"
