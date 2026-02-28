@@ -1,7 +1,10 @@
+use mdk_core::prelude::RatchetTreeInfo;
+use mdk_storage_traits::GroupId;
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
 use super::Whitenoise;
-use super::error::Result;
+use super::accounts::Account;
+use super::error::{Result, WhitenoiseError};
 
 impl Whitenoise {
     /// Executes an arbitrary SQL query and returns the raw results as a JSON string.
@@ -37,6 +40,30 @@ impl Whitenoise {
     ///
     /// For write statements (`INSERT`, `UPDATE`, `DELETE`) that return no rows,
     /// the result is an empty array `"[]"`.
+    /// Returns public information about the ratchet tree of an MLS group.
+    ///
+    /// Exposes the MLS ratchet tree structure for a given group. The returned
+    /// data contains only public information (encryption keys, signature keys,
+    /// tree structure) — no secrets.
+    ///
+    /// # Arguments
+    ///
+    /// * `account` - The account that is a member of the group
+    /// * `group_id` - The MLS group ID to inspect
+    ///
+    /// # Returns
+    ///
+    /// A [`RatchetTreeInfo`] containing the tree hash, serialized tree, and leaf nodes.
+    pub fn ratchet_tree_info(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<RatchetTreeInfo> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        mdk.get_ratchet_tree_info(group_id)
+            .map_err(WhitenoiseError::from)
+    }
+
     pub async fn debug_query(&self, sql: &str) -> Result<String> {
         tracing::warn!(
             target: "whitenoise::debug",
