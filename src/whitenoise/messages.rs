@@ -156,6 +156,7 @@ impl Whitenoise {
                 "Failed to update delivery status in cache: {}",
                 e
             );
+            return;
         }
 
         // Re-fetch the full message to emit with updated status
