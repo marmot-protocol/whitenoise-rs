@@ -151,24 +151,19 @@ impl GroupInformation {
 
         let id_bytes: Vec<Vec<u8>> = mls_group_ids.iter().map(|id| id.to_vec()).collect();
 
-        // Build dynamic query with correct number of placeholders
-        let placeholders = "?,".repeat(id_bytes.len());
-        let placeholders = placeholders.trim_end_matches(',');
-
-        let query = format!(
-            "SELECT id, mls_group_id, group_type, created_at, updated_at
-             FROM group_information
-             WHERE mls_group_id IN ({})",
-            placeholders
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT id, mls_group_id, group_type, created_at, updated_at FROM group_information WHERE mls_group_id IN (",
         );
-
-        // Build and execute query with bindings
-        let mut query_builder = sqlx::query_as::<_, GroupInformationRow>(&query);
-        for id_bytes in &id_bytes {
-            query_builder = query_builder.bind(id_bytes);
+        let mut sep = qb.separated(", ");
+        for id in &id_bytes {
+            sep.push_bind(id);
         }
+        sep.push_unseparated(")");
 
-        let rows = query_builder.fetch_all(&database.pool).await?;
+        let rows = qb
+            .build_query_as::<GroupInformationRow>()
+            .fetch_all(&database.pool)
+            .await?;
 
         rows.into_iter()
             .map(|row| row.into_group_information())

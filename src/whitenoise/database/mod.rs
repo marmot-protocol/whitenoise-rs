@@ -116,9 +116,11 @@ impl Database {
                         .execute(&mut *conn)
                         .await?;
                     // Set busy timeout for lock contention
-                    sqlx::query(&format!("PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}"))
-                        .execute(&mut *conn)
-                        .await?;
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}"
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
                     // Enable foreign keys and triggers
                     sqlx::query("PRAGMA foreign_keys = ON")
                         .execute(&mut *conn)
@@ -216,15 +218,19 @@ impl Database {
         // Delete all rows from each table (preserves schema)
         for (table_name,) in &tables {
             let delete_query = format!("DELETE FROM {}", table_name);
-            sqlx::query(&delete_query).execute(&mut *txn).await?;
+            sqlx::query(sqlx::AssertSqlSafe(delete_query))
+                .execute(&mut *txn)
+                .await?;
         }
 
         // Reset auto-increment counters for all tables
         for (table_name,) in &tables {
             // This resets the ROWID counter
-            let reset_query = format!("DELETE FROM sqlite_sequence WHERE name = '{}'", table_name);
             // Ignore errors - table might not have auto-increment
-            let _ = sqlx::query(&reset_query).execute(&mut *txn).await;
+            let _ = sqlx::query("DELETE FROM sqlite_sequence WHERE name = ?")
+                .bind(table_name)
+                .execute(&mut *txn)
+                .await;
         }
 
         // Re-enable foreign key constraints

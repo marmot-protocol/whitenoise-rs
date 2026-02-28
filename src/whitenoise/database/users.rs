@@ -215,24 +215,17 @@ impl User {
 
         let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_hex()).collect();
 
-        // Build dynamic query with correct number of placeholders
-        let placeholders = "?,".repeat(pubkey_hexes.len());
-        let placeholders = placeholders.trim_end_matches(',');
-
-        let query = format!(
-            "SELECT id, pubkey, metadata, created_at, updated_at
-             FROM users
-             WHERE pubkey IN ({})",
-            placeholders
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT id, pubkey, metadata, created_at, updated_at FROM users WHERE pubkey IN (",
         );
-
-        // Build and execute query with bindings
-        let mut query_builder = sqlx::query_as::<_, UserRow>(&query);
+        let mut sep = qb.separated(", ");
         for hex in &pubkey_hexes {
-            query_builder = query_builder.bind(hex);
+            sep.push_bind(hex);
         }
+        sep.push_unseparated(")");
 
-        let rows = query_builder
+        let rows = qb
+            .build_query_as::<UserRow>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
