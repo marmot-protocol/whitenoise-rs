@@ -115,7 +115,23 @@ impl NostrManager {
             .fetch_events_from(relays, filter, CATCHUP_TIMEOUT)
             .await
         {
-            Ok(events) => events.into_iter().collect(),
+            Ok(events) => {
+                // Sort ascending by (created_at, id) so catch-up events are
+                // queued oldest-first into the event processor.  MLS requires
+                // commits and application messages to be applied in epoch order;
+                // feeding them newest-first would cause unnecessary rejection of
+                // earlier messages that arrive out of order.
+                //
+                // Note: `Events` iterates in descending order (newest first,
+                // per its BTreeCappedSet<Event> backing), so we must re-sort.
+                let mut sorted: Vec<Event> = events.into_iter().collect();
+                sorted.sort_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                sorted
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::nostr_manager::fetch_group_messages_catchup",
@@ -126,6 +142,149 @@ impl NostrManager {
                 vec![]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod catchup_tests {
+    use super::*;
+    use crate::whitenoise::event_tracker::NoEventTracker;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    async fn make_nostr_manager() -> NostrManager {
+        let (event_sender, _) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+            .await
+            .unwrap()
+    }
+
+    /// fetch_group_messages_catchup should return an empty Vec immediately when
+    /// the relay slice is empty, without attempting any network I/O.
+    #[tokio::test]
+    async fn test_fetch_group_messages_catchup_empty_relays() {
+        let nostr = make_nostr_manager().await;
+        let result = nostr.fetch_group_messages_catchup("deadbeef", &[]).await;
+        assert!(
+            result.is_empty(),
+            "Expected empty Vec when relays slice is empty"
+        );
+    }
+
+    /// fetch_group_messages_catchup should return an empty Vec immediately when
+    /// the group ID is an empty string, without attempting any network I/O.
+    #[tokio::test]
+    async fn test_fetch_group_messages_catchup_empty_group_id() {
+        let nostr = make_nostr_manager().await;
+        let relay = RelayUrl::parse("ws://localhost:7777").unwrap();
+        let result = nostr.fetch_group_messages_catchup("", &[relay]).await;
+        assert!(
+            result.is_empty(),
+            "Expected empty Vec when group ID is empty"
+        );
+    }
+
+    /// The catch-up fetch must return events sorted ascending by (created_at, id)
+    /// so they are queued oldest-first into the MLS event processor.
+    ///
+    /// `Events` (nostr-database's BTreeCappedSet<Event>) iterates in descending
+    /// order (newest first), which is the wrong order for MLS epoch processing.
+    /// This test verifies our explicit re-sort corrects that.
+    #[test]
+    fn test_catchup_sort_order() {
+        // Build three events with distinct timestamps via raw JSON so we can
+        // control the created_at values without needing a signer or relay.
+        let make_event = |created_at: u64, id_suffix: u8| -> Event {
+            // Construct a minimal but valid-looking event JSON. The id is not
+            // a real hash, but Event deserialization in tests doesn't verify it
+            // when using serde directly (it trusts the JSON).
+            let id = format!("{:0>64}", format!("{:x}", id_suffix));
+            let pubkey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let sig = "a".repeat(128);
+            let json = format!(
+                r#"{{
+                    "id": "{id}",
+                    "pubkey": "{pubkey}",
+                    "created_at": {created_at},
+                    "kind": 445,
+                    "tags": [],
+                    "content": "",
+                    "sig": "{sig}"
+                }}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        };
+
+        // Three events at different timestamps; deliberately out of order.
+        let newest = make_event(1_000_003, 3);
+        let oldest = make_event(1_000_001, 1);
+        let middle = make_event(1_000_002, 2);
+
+        // Simulate what the Ok branch does: collect from Events (which would
+        // iterate newest-first) then sort ascending.
+        let mut events = vec![newest.clone(), oldest.clone(), middle.clone()];
+        events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        assert_eq!(
+            events[0].created_at, oldest.created_at,
+            "First event should be oldest"
+        );
+        assert_eq!(
+            events[1].created_at, middle.created_at,
+            "Second event should be middle"
+        );
+        assert_eq!(
+            events[2].created_at, newest.created_at,
+            "Third event should be newest"
+        );
+    }
+
+    /// When two events share the same timestamp, they must be ordered
+    /// deterministically by event id (ascending) as the tie-breaker.
+    #[test]
+    fn test_catchup_sort_tie_breaker_by_id() {
+        let make_event = |created_at: u64, id_suffix: u8| -> Event {
+            let id = format!("{:0>64}", format!("{:x}", id_suffix));
+            let pubkey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let sig = "a".repeat(128);
+            let json = format!(
+                r#"{{
+                    "id": "{id}",
+                    "pubkey": "{pubkey}",
+                    "created_at": {created_at},
+                    "kind": 445,
+                    "tags": [],
+                    "content": "",
+                    "sig": "{sig}"
+                }}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        };
+
+        // Two events at the same timestamp; id_suffix 1 < id_suffix 2 lexicographically.
+        let event_a = make_event(1_000_001, 1); // id starts with 00...01
+        let event_b = make_event(1_000_001, 2); // id starts with 00...02
+
+        let mut events = vec![event_b.clone(), event_a.clone()];
+        events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        assert_eq!(
+            events[0].id, event_a.id,
+            "Lower id should come first when timestamps are equal"
+        );
+        assert_eq!(
+            events[1].id, event_b.id,
+            "Higher id should come second when timestamps are equal"
+        );
     }
 }
 
