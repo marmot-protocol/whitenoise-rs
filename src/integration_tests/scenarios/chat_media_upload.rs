@@ -36,8 +36,17 @@ impl Scenario for ChatMediaUploadScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Note: MLS membership is auto-finalized when welcome is received,
-        // so members can participate immediately without explicit accept
+        // Wait for media_member's post-welcome self-update to complete before
+        // sending any messages.  The self-update advances the group epoch; any
+        // message sent before it completes is at epoch N while the group
+        // context moves to N+1, causing Wrong Epoch rejections on relay echo.
+        WaitForWelcomeTestCase::for_account("media_member", "media_upload_test_group")
+            .execute(&mut self.context)
+            .await?;
+
+        VerifySelfUpdateTestCase::for_account("media_member", "media_upload_test_group")
+            .execute(&mut self.context)
+            .await?;
 
         // Upload image with default options (includes blurhash generation)
         UploadChatImageTestCase::basic()
