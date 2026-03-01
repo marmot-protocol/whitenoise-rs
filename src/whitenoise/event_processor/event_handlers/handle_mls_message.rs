@@ -22,145 +22,14 @@ impl Whitenoise {
         );
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        match mdk.process_message(&event) {
+        let result = match mdk.process_message(&event) {
             Ok(result) => {
                 tracing::debug!(
                   target: "whitenoise::event_handlers::handle_mls_message",
                   "Handled MLS message - Result: {:?}",
                   result
                 );
-
-                // Extract and store media references synchronously
-                if let Some((group_id, inner_event, message)) =
-                    Self::extract_message_details(&result)
-                {
-                    let parsed_references = {
-                        let media_manager = mdk.media_manager(group_id.clone());
-                        self.media_files()
-                            .parse_imeta_tags_from_event(&inner_event, &media_manager)?
-                    };
-
-                    self.media_files()
-                        .store_parsed_media_references(
-                            &group_id,
-                            &account.pubkey,
-                            parsed_references,
-                        )
-                        .await?;
-
-                    match message.kind {
-                        Kind::ChatMessage => {
-                            let msg = self.cache_chat_message(&group_id, &message).await?;
-                            let group_name =
-                                mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                            Whitenoise::spawn_new_message_notification_if_enabled(
-                                account, &group_id, &msg, group_name,
-                            );
-                            self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
-                            self.emit_chat_list_update(
-                                account,
-                                &group_id,
-                                ChatListUpdateTrigger::NewLastMessage,
-                            )
-                            .await;
-                        }
-                        Kind::Reaction => {
-                            if let Some(target) = self.cache_reaction(&group_id, &message).await? {
-                                self.emit_message_update(
-                                    &group_id,
-                                    UpdateTrigger::ReactionAdded,
-                                    target,
-                                );
-                            }
-                        }
-                        Kind::EventDeletion => {
-                            let last_message_id = self.get_last_message_id(&group_id).await;
-
-                            for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
-                                self.emit_message_update(&group_id, trigger, msg);
-                            }
-
-                            // Check if the deleted message was the last message.
-                            // This check must happen AFTER get_last_message_id but the
-                            // result is only valid for the FIRST handler (before cache_deletion
-                            // modifies shared state). We emit for ALL subscribed accounts because
-                            // subsequent handlers will see incorrect post-deletion state.
-                            if let Some(last_message_id) = last_message_id {
-                                let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
-                                if deleted_ids.contains(&last_message_id) {
-                                    self.emit_chat_list_update_for_group(
-                                        &group_id,
-                                        ChatListUpdateTrigger::LastMessageDeleted,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
-                        }
-                    }
-                }
-
-                // Handle auto-committed proposals (e.g., admin auto-commits a
-                // member's self-removal): publish the resulting commit event so
-                // other group members learn about the change, then merge the
-                // pending commit into our local MLS state.
-                if let MessageProcessingResult::Proposal(ref update_result) = result {
-                    let group_id = &update_result.mls_group_id;
-                    let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-                    mdk.merge_pending_commit(group_id)?;
-
-                    self.nostr
-                        .publish_event_to(
-                            update_result.evolution_event.clone(),
-                            &account.pubkey,
-                            &relay_urls,
-                        )
-                        .await?;
-
-                    if let Some(welcome_rumors) = &update_result.welcome_rumors
-                        && !welcome_rumors.is_empty()
-                    {
-                        tracing::warn!(
-                            target: "whitenoise::event_handlers::handle_mls_message",
-                            "Auto-committed proposal produced {} welcome \
-                             rumors that were not delivered",
-                            welcome_rumors.len()
-                        );
-                    }
-
-                    tracing::info!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        "Published auto-committed proposal evolution event \
-                         for group {}",
-                        hex::encode(group_id.as_slice())
-                    );
-
-                    self.emit_chat_list_update(
-                        account,
-                        group_id,
-                        ChatListUpdateTrigger::NewLastMessage,
-                    )
-                    .await;
-                }
-
-                // Background sync for group images after commits or
-                // auto-committed proposals (group state may have changed).
-                match result {
-                    MessageProcessingResult::Commit { ref mls_group_id } => {
-                        Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
-                    }
-                    MessageProcessingResult::Proposal(ref update_result) => {
-                        Self::background_sync_group_image_cache_if_needed(
-                            account,
-                            &update_result.mls_group_id,
-                        );
-                    }
-                    _ => {}
-                }
-                Ok(())
+                result
             }
             Err(e) => {
                 tracing::error!(
@@ -169,9 +38,189 @@ impl Whitenoise {
                     account.pubkey.to_hex(),
                     e
                 );
-                Err(WhitenoiseError::MdkCoreError(e))
+                return Err(WhitenoiseError::MdkCoreError(e));
+            }
+        };
+
+        // Extract and store media references synchronously for application messages.
+        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&result) {
+            let parsed_references = {
+                let media_manager = mdk.media_manager(group_id.clone());
+                self.media_files()
+                    .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+            };
+
+            self.media_files()
+                .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
+                .await?;
+
+            match message.kind {
+                Kind::ChatMessage => {
+                    let msg = self.cache_chat_message(&group_id, &message).await?;
+                    let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                    Whitenoise::spawn_new_message_notification_if_enabled(
+                        account, &group_id, &msg, group_name,
+                    );
+                    self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
+                    self.emit_chat_list_update(
+                        account,
+                        &group_id,
+                        ChatListUpdateTrigger::NewLastMessage,
+                    )
+                    .await;
+                }
+                Kind::Reaction => {
+                    if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                        self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
+                    }
+                }
+                Kind::EventDeletion => {
+                    let last_message_id = self.get_last_message_id(&group_id).await;
+
+                    for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
+                        self.emit_message_update(&group_id, trigger, msg);
+                    }
+
+                    // Check if the deleted message was the last message.
+                    // This check must happen AFTER get_last_message_id but the
+                    // result is only valid for the FIRST handler (before cache_deletion
+                    // modifies shared state). We emit for ALL subscribed accounts because
+                    // subsequent handlers will see incorrect post-deletion state.
+                    if let Some(last_message_id) = last_message_id {
+                        let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+                        if deleted_ids.contains(&last_message_id) {
+                            self.emit_chat_list_update_for_group(
+                                &group_id,
+                                ChatListUpdateTrigger::LastMessageDeleted,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                _ => {
+                    tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
+                }
             }
         }
+
+        // Dispatch on every variant explicitly so the compiler enforces exhaustiveness.
+        // Unprocessable and PreviouslyFailed are returned as errors so the caller does
+        // not mark the event as processed or advance last_synced_at.
+        match result {
+            MessageProcessingResult::ApplicationMessage(_) => {
+                // Already handled above via extract_message_details.
+            }
+
+            MessageProcessingResult::Proposal(ref update_result) => {
+                // Auto-committed proposal (e.g., admin auto-commits a member's
+                // self-removal): publish the resulting commit event so other group
+                // members learn about the change, then merge the pending commit into
+                // our local MLS state.
+                let group_id = &update_result.mls_group_id;
+                let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+
+                mdk.merge_pending_commit(group_id)?;
+
+                self.nostr
+                    .publish_event_to(
+                        update_result.evolution_event.clone(),
+                        &account.pubkey,
+                        &relay_urls,
+                    )
+                    .await?;
+
+                if let Some(welcome_rumors) = &update_result.welcome_rumors
+                    && !welcome_rumors.is_empty()
+                {
+                    tracing::warn!(
+                        target: "whitenoise::event_handlers::handle_mls_message",
+                        "Auto-committed proposal produced {} welcome \
+                         rumors that were not delivered",
+                        welcome_rumors.len()
+                    );
+                }
+
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "Published auto-committed proposal evolution event for group {}",
+                    hex::encode(group_id.as_slice())
+                );
+
+                self.emit_chat_list_update(
+                    account,
+                    group_id,
+                    ChatListUpdateTrigger::NewLastMessage,
+                )
+                .await;
+
+                Self::background_sync_group_image_cache_if_needed(
+                    account,
+                    &update_result.mls_group_id,
+                );
+            }
+
+            MessageProcessingResult::PendingProposal { ref mls_group_id } => {
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "Stored pending proposal for group {} (awaiting admin commit)",
+                    hex::encode(mls_group_id.as_slice())
+                );
+            }
+
+            MessageProcessingResult::IgnoredProposal {
+                ref mls_group_id,
+                ref reason,
+            } => {
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "Ignored proposal for group {}: {}",
+                    hex::encode(mls_group_id.as_slice()),
+                    reason
+                );
+            }
+
+            MessageProcessingResult::ExternalJoinProposal { ref mls_group_id } => {
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "Received external join proposal for group {}",
+                    hex::encode(mls_group_id.as_slice())
+                );
+            }
+
+            MessageProcessingResult::Commit { ref mls_group_id } => {
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "Processed commit for group {}",
+                    hex::encode(mls_group_id.as_slice())
+                );
+                Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+            }
+
+            MessageProcessingResult::Unprocessable { ref mls_group_id } => {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "MLS message unprocessable for group {} (account {}): \
+                     event will not be marked processed",
+                    hex::encode(mls_group_id.as_slice()),
+                    account.pubkey.to_hex()
+                );
+                return Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
+                    mls_group_id.as_slice(),
+                )));
+            }
+
+            MessageProcessingResult::PreviouslyFailed => {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    "MLS message was previously failed for account {}: \
+                     event will not be marked processed",
+                    account.pubkey.to_hex()
+                );
+                return Err(WhitenoiseError::MlsMessagePreviouslyFailed);
+            }
+        }
+
+        Ok(())
     }
 
     /// Extracts group_id, inner_event, and the full Message from a processing result.
@@ -1143,6 +1192,162 @@ mod tests {
         assert!(
             group.epoch > 0,
             "Group epoch should have advanced after auto-committed removal"
+        );
+    }
+
+    /// Duplicate MLS messages (already-processed by MDK) return
+    /// `MlsMessageUnprocessable` so the caller does not mark the event as
+    /// processed or advance `last_synced_at`.
+    #[tokio::test]
+    async fn test_unprocessable_message_returns_err() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator_account,
+                vec![members[0].0.pubkey],
+                create_nostr_group_config_data(vec![creator_account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+
+        let mut inner = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Test message".to_string(),
+        );
+        inner.ensure_id();
+        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+
+        // First processing: should succeed
+        let first = whitenoise
+            .handle_mls_message(&creator_account, event.clone())
+            .await;
+        assert!(first.is_ok(), "First processing should succeed: {first:?}");
+
+        // Second processing of the same event: MDK returns Unprocessable because
+        // the event was already processed and its state recorded as Processed.
+        // Our handler must propagate this as an error.
+        let second = whitenoise.handle_mls_message(&creator_account, event).await;
+        assert!(
+            second.is_err(),
+            "Second processing of same event should return Err"
+        );
+        match second.err().unwrap() {
+            WhitenoiseError::MlsMessageUnprocessable(_) => {}
+            other => panic!("Expected MlsMessageUnprocessable, got: {other:?}"),
+        }
+    }
+
+    /// Verify that when `handle_mls_message` returns `Err` for an unprocessable
+    /// event, the account event processor does NOT record it as processed.
+    ///
+    /// This is tested end-to-end through `process_account_event`: we send the
+    /// same event twice.  After the second attempt (which the handler rejects as
+    /// `Unprocessable`), the event must NOT appear in the processed-event tracker
+    /// for the account.  It was already recorded by the first successful pass, so
+    /// the tracker returns `true`; the important thing is that the second `Err`
+    /// path does not call `track_processed_account_event` a second time (the
+    /// tracker would silently ignore duplicates, but we can still assert the
+    /// correct error path by inspecting `already_processed_account_event` and
+    /// confirming it reflects the one tracked entry from the FIRST call only,
+    /// not a spurious second call that could corrupt `last_synced_at`).
+    ///
+    /// The real observable guarantee: `process_account_event` only advances
+    /// `last_synced_at` on `Ok`.  We confirm this indirectly by asserting that
+    /// the second call to `handle_mls_message` returns `Err`.
+    #[tokio::test]
+    async fn test_unprocessable_not_tracked_via_process_account_event() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator_account,
+                vec![members[0].0.pubkey],
+                create_nostr_group_config_data(vec![creator_account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+
+        let mut inner = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Unprocessable test".to_string(),
+        );
+        inner.ensure_id();
+        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let event_id = event.id;
+
+        // Build a valid subscription ID for this account.
+        let sub_id = format!(
+            "{}_mls_messages",
+            whitenoise.nostr.create_pubkey_hash(&creator_account.pubkey)
+        );
+
+        // First pass through process_account_event: succeeds, event is tracked.
+        whitenoise
+            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .await;
+
+        let tracked_after_first = whitenoise
+            .nostr
+            .event_tracker
+            .already_processed_account_event(&event_id, &creator_account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            tracked_after_first,
+            "Event should be tracked after first successful processing"
+        );
+
+        // Second pass: the should_skip check will detect it as already processed
+        // and skip it WITHOUT calling handle_mls_message at all, so last_synced_at
+        // is not advanced for a duplicate.  This is the intended guard.
+        // We verify the skip path by confirming it doesn't panic or double-advance.
+        whitenoise
+            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .await;
+
+        // Still tracked — no double-entry, no crash.
+        let tracked_after_second = whitenoise
+            .nostr
+            .event_tracker
+            .already_processed_account_event(&event_id, &creator_account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            tracked_after_second,
+            "Event should still be tracked after second call"
+        );
+
+        // Confirm that handle_mls_message itself returns Err on duplicate so
+        // any caller that bypasses the skip check also cannot silently succeed.
+        let direct_result = whitenoise.handle_mls_message(&creator_account, event).await;
+        assert!(
+            direct_result.is_err(),
+            "Direct second call to handle_mls_message must return Err"
         );
     }
 

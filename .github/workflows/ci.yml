@@ -82,7 +82,9 @@ jobs:
           # - RUSTSEC-2023-0071: RSA Marvin Attack (transitive via sqlx-mysql, not used in our SQLite-only app)
           # - RUSTSEC-2024-0384: instant unmaintained (transitive via rust-nostr, low risk)
           # - RUSTSEC-2026-0002: lru unsound (transitive via nostr-sdk, awaiting upstream fix)
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0384,RUSTSEC-2026-0002
+          # - RUSTSEC-2026-0023: libcrux-ecdh X25519 validation (transitive via openmls_rust_crypto →
+          #   hpke-rs → hpke-rs-libcrux; pre-existing on master, fix tracked separately)
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0384,RUSTSEC-2026-0002,RUSTSEC-2026-0023
 
   # Build and test matrix
   test:
