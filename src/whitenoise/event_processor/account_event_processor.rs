@@ -407,7 +407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_extract_pubkey_no_underscore() {
+    async fn test_extract_pubkey_from_subscription_id_no_underscore() {
         let (whitenoise, _, _) = create_mock_whitenoise().await;
         let result = whitenoise
             .extract_pubkey_from_subscription_id("nounderscore")

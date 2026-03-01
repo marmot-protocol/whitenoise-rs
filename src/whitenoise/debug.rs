@@ -6,6 +6,12 @@ use super::Whitenoise;
 use super::accounts::Account;
 use super::error::{Result, WhitenoiseError};
 
+/// Maximum number of rows returned by [`Whitenoise::debug_query`].
+///
+/// Prevents unbounded memory allocation from queries that return large result
+/// sets. Results are silently truncated at this limit.
+const DEBUG_QUERY_ROW_LIMIT: usize = 1000;
+
 impl Whitenoise {
     /// Returns public information about the ratchet tree of an MLS group.
     ///
@@ -40,10 +46,11 @@ impl Whitenoise {
     ///
     /// # Column type mapping
     ///
-    /// SQLite values are mapped to JSON as follows:
-    /// - `INTEGER` → JSON number
+    /// SQLite values are mapped to JSON based on the runtime type reported by
+    /// sqlx's [`TypeInfo::name()`](sqlx::TypeInfo::name):
+    /// - `INTEGER`, `BOOLEAN`, `NUMERIC` → JSON number
     /// - `REAL` → JSON number
-    /// - `TEXT` → JSON string
+    /// - `TEXT`, `DATE`, `TIME`, `DATETIME` → JSON string
     /// - `BLOB` → JSON string (hex-encoded, prefixed with `"0x"`)
     /// - `NULL` → JSON null
     ///
@@ -71,13 +78,17 @@ impl Whitenoise {
             sql
         );
 
+        // SAFETY: `AssertSqlSafe` is required because `sql` is a dynamic string
+        // unknown at compile time. This is inherent to the purpose of a debug
+        // query tool — the caller is trusted (developer/admin tooling only).
         let rows = sqlx::query(AssertSqlSafe(sql))
             .fetch_all(&self.database.pool)
             .await?;
 
-        let mut result: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        let row_count = rows.len().min(DEBUG_QUERY_ROW_LIMIT);
+        let mut result: Vec<serde_json::Value> = Vec::with_capacity(row_count);
 
-        for row in &rows {
+        for row in rows.iter().take(DEBUG_QUERY_ROW_LIMIT) {
             let columns = row.columns();
             let mut map = serde_json::Map::with_capacity(columns.len());
 
@@ -97,13 +108,22 @@ impl Whitenoise {
 
 /// Converts a single SQLite column value to a [`serde_json::Value`].
 ///
-/// Inspects the raw SQLite type name reported by the value reference to decide
-/// the correct conversion. This avoids false positives from `try_get` coercing
-/// `NULL` into a default like `0`.
+/// Uses the runtime type reported by [`sqlx::TypeInfo::name()`] to select the
+/// correct conversion. SQLite has only five fundamental storage classes
+/// (NULL, INTEGER, REAL, TEXT, BLOB), plus a few extended names that sqlx maps
+/// from declared column types (BOOLEAN, DATE, TIME, DATETIME, NUMERIC).
+/// We match exhaustively on these known return values rather than guessing
+/// arbitrary SQL type names.
 fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, ordinal: usize) -> serde_json::Value {
-    let raw = row.try_get_raw(ordinal);
-    let Ok(value_ref) = raw else {
-        return serde_json::Value::Null;
+    let value_ref = match row.try_get_raw(ordinal) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::debug!(
+                target: "whitenoise::debug",
+                "Failed to get raw value at ordinal {ordinal}: {err}"
+            );
+            return serde_json::Value::Null;
+        }
     };
 
     if value_ref.is_null() {
@@ -111,22 +131,23 @@ fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, ordinal: usize) -> serde_
     }
 
     let type_info = value_ref.type_info();
-    let type_name = type_info.name();
 
-    match type_name {
-        "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "BOOLEAN" => {
+    // `TypeInfo::name()` returns one of: NULL, INTEGER, REAL, TEXT, BLOB,
+    // BOOLEAN, NUMERIC, DATE, TIME, DATETIME.
+    match type_info.name() {
+        "INTEGER" | "BOOLEAN" | "NUMERIC" => {
             if let Ok(v) = row.try_get::<i64, _>(ordinal) {
                 return serde_json::Value::Number(v.into());
             }
         }
-        "REAL" | "FLOAT" | "DOUBLE" => {
+        "REAL" => {
             if let Ok(v) = row.try_get::<f64, _>(ordinal)
                 && let Some(n) = serde_json::Number::from_f64(v)
             {
                 return serde_json::Value::Number(n);
             }
         }
-        "TEXT" | "VARCHAR" | "CLOB" => {
+        "TEXT" | "DATE" | "TIME" | "DATETIME" => {
             if let Ok(v) = row.try_get::<String, _>(ordinal) {
                 return serde_json::Value::String(v);
             }
@@ -141,29 +162,8 @@ fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, ordinal: usize) -> serde_
                 return serde_json::Value::String(hex);
             }
         }
-        "NULL" => return serde_json::Value::Null,
-        // Unknown type: try common conversions in order
-        _ => {
-            if let Ok(v) = row.try_get::<i64, _>(ordinal) {
-                return serde_json::Value::Number(v.into());
-            }
-            if let Ok(v) = row.try_get::<f64, _>(ordinal)
-                && let Some(n) = serde_json::Number::from_f64(v)
-            {
-                return serde_json::Value::Number(n);
-            }
-            if let Ok(v) = row.try_get::<String, _>(ordinal) {
-                return serde_json::Value::String(v);
-            }
-            if let Ok(v) = row.try_get::<Vec<u8>, _>(ordinal) {
-                let hex = v.iter().fold(String::from("0x"), |mut acc, byte| {
-                    use std::fmt::Write;
-                    let _ = write!(acc, "{byte:02x}");
-                    acc
-                });
-                return serde_json::Value::String(hex);
-            }
-        }
+        // NULL and any hypothetical future variants
+        _ => return serde_json::Value::Null,
     }
 
     serde_json::Value::Null
