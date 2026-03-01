@@ -135,7 +135,7 @@ impl NostrManager {
             }
             Err(e) => {
                 tracing::warn!(
-                    target: "whitenoise::nostr_manager::fetch_group_messages_catchup",
+                    target: "whitenoise::nostr_manager::query",
                     "Catch-up fetch failed for group {}: {}",
                     nostr_group_id,
                     e
