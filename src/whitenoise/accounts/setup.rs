@@ -702,15 +702,15 @@ impl Whitenoise {
     ///
     /// This method updates subscriptions when account state changes (group membership, relay
     /// preferences). It first unsubscribes all existing account subscriptions to clean up stale
-    /// relay state, then resubscribes with a replay anchor that looks back over two days.
+    /// relay state, then resubscribes with a replay anchor derived from the account's sync state.
     ///
-    /// The two-day lookback is required because nostr-sdk backdates gift-wrap events by up to
-    /// 48 hours, so a shorter replay window risks missing events that were published but carry
-    /// a created_at timestamp in the past.
+    /// Gift-wrap backdating (nostr-sdk timestamps gift-wraps up to 48 hours in the past) is
+    /// handled inside `setup_giftwrap_subscription` via `adjust_since_for_giftwrap`, which
+    /// subtracts an additional `GIFTWRAP_LOOKBACK_BUFFER` (7 days) from the `since` value.
+    /// No extra buffer is needed here for that purpose.
     ///
-    /// The replay anchor is derived from the account's sync state via `since_timestamp` with a
-    /// buffer of `172_810` seconds (2 days + 10 s). Falls back to `None` (no since filter) when
-    /// the account has never synced, so the relay sends everything it has.
+    /// The replay anchor falls back to `None` (no since filter) when the account has never
+    /// synced, so the relay sends everything it has.
     ///
     /// # Arguments
     ///
@@ -734,10 +734,9 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        // nostr-sdk backdates gift-wrap events by up to 48 hours, so look back 2 days + 10s
-        // to ensure we catch everything on the new subscriptions.
-        const TWO_DAYS_PLUS_BUFFER_SECS: u64 = 2 * 24 * 60 * 60 + 10;
-        let since = account.since_timestamp(TWO_DAYS_PLUS_BUFFER_SECS);
+        // 10s buffer to avoid missing events at the boundary of the last sync window.
+        // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
+        let since = account.since_timestamp(10);
 
         let signer = self.get_signer_for_account(account)?;
         self.nostr
