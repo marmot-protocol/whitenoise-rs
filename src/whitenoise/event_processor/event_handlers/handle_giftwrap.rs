@@ -1092,6 +1092,20 @@ mod tests {
         );
     }
 
+    /// `catchup_group_messages` must return early without panicking when the
+    /// group does not exist in MLS state.  This exercises the error branch in
+    /// `get_group_nostr_id_and_relays` (GroupNotFound → log + return).
+    #[tokio::test]
+    async fn test_catchup_group_messages_unknown_group_returns_early() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        // Use a group ID that was never created in MLS state.
+        let fake_group_id = mdk_core::GroupId::from_slice(&[55; 32]);
+
+        // Must complete without panic despite the group not existing.
+        Whitenoise::catchup_group_messages(&whitenoise, &account, &fake_group_id).await;
+    }
+
     /// `catchup_group_messages` must complete without panic when called with a
     /// real group.  No events are returned (no live relay) but the function
     /// must traverse the full path: resolve group info → fetch (empty) →
