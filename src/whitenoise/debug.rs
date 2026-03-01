@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use mdk_core::prelude::RatchetTreeInfo;
 use mdk_storage_traits::GroupId;
 use sqlx::{AssertSqlSafe, Column, Row, TypeInfo, ValueRef};
@@ -155,7 +157,6 @@ fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, ordinal: usize) -> serde_
         "BLOB" => {
             if let Ok(v) = row.try_get::<Vec<u8>, _>(ordinal) {
                 let hex = v.iter().fold(String::from("0x"), |mut acc, byte| {
-                    use std::fmt::Write;
                     let _ = write!(acc, "{byte:02x}");
                     acc
                 });
