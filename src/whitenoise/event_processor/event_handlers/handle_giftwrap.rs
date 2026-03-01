@@ -419,33 +419,22 @@ impl Whitenoise {
             use crate::types::ProcessableEvent;
             let processable =
                 ProcessableEvent::new_nostr_event(event, Some(subscription_id.clone()));
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                whitenoise.event_sender.send(processable),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    // Channel closed — receiver is gone; no point continuing.
+            match whitenoise.event_sender.try_send(processable) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Channel closed or full — we cannot safely skip MLS commits
+                    // (doing so leaves the member on a broken epoch), so stop here.
+                    // A full 500-slot channel during a ≤200-event catch-up indicates
+                    // the event processor is severely backed up; retrying later via
+                    // the live subscription is safer than dropping.
                     tracing::warn!(
                         target: "whitenoise::event_processor::process_welcome::background",
                         account = %account.pubkey.to_hex(),
                         subscription_id = %subscription_id,
                         error = %e,
-                        "Catch-up: event_sender closed, stopping queue"
+                        "Catch-up: could not queue event (channel full or closed), stopping"
                     );
                     break;
-                }
-                Err(_elapsed) => {
-                    // Channel full for >100 ms — drop this event and keep going
-                    // so the join flow is not blocked indefinitely.
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        account = %account.pubkey.to_hex(),
-                        subscription_id = %subscription_id,
-                        "Catch-up: event_sender full, dropping catch-up event"
-                    );
                 }
             }
         }
