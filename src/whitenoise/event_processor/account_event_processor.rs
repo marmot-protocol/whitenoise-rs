@@ -379,6 +379,9 @@ fn validate_giftwrap_target(account: &Account, event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use nostr_sdk::prelude::*;
+    use sha2::{Digest, Sha256};
+
     use crate::whitenoise::test_utils::*;
 
     #[tokio::test]
@@ -401,5 +404,60 @@ mod tests {
             .extract_pubkey_from_subscription_id(multi_underscore_id)
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_extract_pubkey_no_underscore() {
+        let (whitenoise, _, _) = create_mock_whitenoise().await;
+        let result = whitenoise
+            .extract_pubkey_from_subscription_id("nounderscore")
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_pubkey_from_subscription_id_matches_account() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        // Create an account via the high-level API
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // Build the expected subscription hash for this account
+        let mut hasher = Sha256::new();
+        hasher.update(whitenoise.nostr.session_salt());
+        hasher.update(account.pubkey.to_bytes());
+        let hash = hasher.finalize();
+        let pubkey_hash = format!("{:x}", hash)[..12].to_string();
+
+        let sub_id = format!("{}_user_events", pubkey_hash);
+        let result = whitenoise
+            .extract_pubkey_from_subscription_id(&sub_id)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), account.pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_route_account_event_unhandled_kind() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        // Use a kind that is not handled (e.g., TextNote)
+        let event = EventBuilder::text_note("hello world")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        let result = whitenoise
+            .route_account_event_for_processing(&event, &account)
+            .await;
+
+        // Unhandled events return Ok(())
+        assert!(result.is_ok());
     }
 }

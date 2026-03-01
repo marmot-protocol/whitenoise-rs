@@ -148,3 +148,87 @@ impl Whitenoise {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::prelude::*;
+
+    use crate::whitenoise::test_utils::*;
+
+    #[tokio::test]
+    async fn test_validate_batched_subscription_id_valid() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("global_users_abc123_0")
+                .is_ok()
+        );
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("global_users_deadbeef_42")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_batched_subscription_id_invalid_prefix() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("account_users_abc123_0")
+                .is_err()
+        );
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("abc123_0")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_batched_subscription_id_wrong_underscore_count() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        // Too few underscores
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("global_users")
+                .is_err()
+        );
+
+        // Too many underscores
+        assert!(
+            whitenoise
+                .validate_batched_subscription_id("global_users_abc_123_extra")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_global_event_unhandled_kind() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        let event = EventBuilder::text_note("test message")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        // Unhandled kinds should return Ok(())
+        let result = whitenoise.route_global_event_for_processing(&event).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_is_event_global() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        assert!(whitenoise.is_event_global("global_users_abc123_0"));
+        assert!(whitenoise.is_event_global("global_users_deadbeef_1"));
+        assert!(!whitenoise.is_event_global("account_users_abc123"));
+        assert!(!whitenoise.is_event_global("abc123_user_events"));
+        assert!(!whitenoise.is_event_global(""));
+    }
+}

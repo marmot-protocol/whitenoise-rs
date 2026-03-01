@@ -172,8 +172,15 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use crate::whitenoise::test_utils::*;
     use std::time::Duration;
+
+    use nostr_sdk::prelude::*;
+
+    use crate::nostr_manager::utils::is_event_timestamp_valid;
+    use crate::types::RetryInfo;
+    use crate::whitenoise::error::WhitenoiseError;
+    use crate::whitenoise::test_utils::*;
+
     #[tokio::test]
     async fn test_shutdown_event_processing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -199,15 +206,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_future_timestamp_rejection() {
-        use crate::nostr_manager::utils::is_event_timestamp_valid;
-        use nostr_sdk::prelude::*;
-        use std::time::Duration as StdDuration;
-
-        // Create test keys
         let keys = Keys::generate();
 
         // Create an event with a timestamp far in the future (exceeds MAX_FUTURE_SKEW of 1 hour)
-        let far_future = Timestamp::now() + StdDuration::from_secs(7200); // 2 hours in future
+        let far_future = Timestamp::now() + Duration::from_secs(7200); // 2 hours in future
         let event = EventBuilder::text_note("test message with future timestamp")
             .custom_created_at(far_future)
             .sign(&keys)
@@ -223,5 +225,78 @@ mod tests {
             .await
             .unwrap();
         assert!(is_event_timestamp_valid(&valid_event));
+    }
+
+    #[tokio::test]
+    async fn test_is_event_global() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        assert!(whitenoise.is_event_global("global_users_abc123_0"));
+        assert!(whitenoise.is_event_global("global_users_xyz_1"));
+        assert!(!whitenoise.is_event_global("account_abc123_events"));
+        assert!(!whitenoise.is_event_global("abc123"));
+        assert!(!whitenoise.is_event_global(""));
+    }
+
+    #[tokio::test]
+    async fn test_process_relay_message() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        // Should complete without error (just logs)
+        whitenoise
+            .process_relay_message(relay_url, "EOSE".to_string())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_schedule_retry_enqueues_event() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("retry me")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        let retry_info = RetryInfo::new(); // attempt=0, max=10
+        let error = WhitenoiseError::EventProcessor("test error".to_string());
+
+        // Should not panic; spawns a delayed re-queue task
+        whitenoise.schedule_retry(
+            event,
+            "global_users_abc123_0".to_string(),
+            retry_info,
+            error,
+        );
+
+        // Give the spawned task a moment (delay is 1s for attempt 0, so just verify no panic)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn test_schedule_retry_exhausted_does_nothing() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("no more retries")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        // Exhaust retry attempts
+        let retry_info = RetryInfo {
+            attempt: 10,
+            max_attempts: 10,
+            base_delay_ms: 1000,
+        };
+        let error = WhitenoiseError::EventProcessor("exhausted".to_string());
+
+        // Should not spawn any task since retries are exhausted
+        whitenoise.schedule_retry(
+            event,
+            "global_users_abc123_0".to_string(),
+            retry_info,
+            error,
+        );
     }
 }
