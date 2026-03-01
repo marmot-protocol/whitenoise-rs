@@ -213,17 +213,14 @@ impl Whitenoise {
     /// # Sequencing
     ///
     /// 1. **Subscription setup** — awaited first so the relay connection is live
-    ///    before we do anything else.
-    /// 2. **Catch-up fetch** — only if subscriptions succeeded.  Fetches recent
-    ///    group messages from relays and queues them through the event processor.
-    ///    This ensures messages sent between the Welcome being dispatched and our
-    ///    subscription becoming active are available before the self-update
-    ///    advances the epoch.
-    /// 3. **Independent ops** (group info, key rotation, image sync, welcomer
+    ///    before we do anything else.  Its result gates the self-update: we must
+    ///    not advance the epoch before our subscription is live.
+    /// 2. **Independent ops** (group info, key rotation, image sync, welcomer
     ///    user lookup) — run concurrently; failures are logged but do not block.
-    /// 4. **Self-update** — runs only if subscription setup succeeded.  If setup
+    /// 3. **Self-update** — runs only if subscription setup succeeded.  If setup
     ///    failed, the self-update is skipped and the reason is logged so the
-    ///    caller can diagnose the problem.
+    ///    caller can diagnose the problem.  Any missed self-update will be
+    ///    retried by the scheduled key-package maintenance task.
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -271,12 +268,7 @@ impl Whitenoise {
             }
         };
 
-        // --- Step 2: bounded catch-up fetch (only when subscriptions are live) ---
-        if subscription_ok {
-            Self::catchup_group_messages(whitenoise, account, group_id).await;
-        }
-
-        // --- Step 3: independent operations (run concurrently regardless of subscription status) ---
+        // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
         let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
@@ -331,14 +323,13 @@ impl Whitenoise {
             );
         }
 
-        // --- Step 4: self-update (only if subscriptions are live) ---
+        // --- Step 3: self-update (only if subscriptions are live) ---
         //
         // The self-update advances the group epoch.  It runs only when
-        // subscriptions are live (step 1 succeeded) AND after the catch-up
-        // step has queued in-flight messages and waited for the event processor
-        // to drain them (step 2).  This replaces the original unconditional
-        // 5 s sleep with a structured sequence that is both faster and more
-        // reliable.
+        // subscriptions are live (step 1 succeeded) so we don't advance
+        // the epoch before we can receive any resulting commits from peers.
+        // Any missed self-update will be retried by the scheduled
+        // key-package maintenance task.
         if subscription_ok
             && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
         {
@@ -359,109 +350,6 @@ impl Whitenoise {
         );
     }
 
-    /// Fetch recent group messages from relays and queue them for processing,
-    /// then wait a bounded time for them to be handled before returning.
-    ///
-    /// The messages are queued through `event_sender` using the account's
-    /// `{hash}_mls_messages` subscription ID so that the existing event
-    /// processor pipeline handles them in the same way as live subscription
-    /// events (deduplication, retry, etc.).
-    ///
-    /// After queuing, a short sleep (`CATCHUP_DRAIN_WAIT`) gives the event
-    /// processor time to work through the queue before `perform_self_update`
-    /// advances the epoch.  This is intentionally brief — the subscription is
-    /// already live at this point, so any in-flight messages are either in the
-    /// channel or will arrive within normal relay latency.
-    ///
-    /// This is a **best-effort** operation: failures are logged but never
-    /// propagate to the caller.
-    async fn catchup_group_messages(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        group_id: &GroupId,
-    ) {
-        // Derive the nostr_group_id (hex-encoded) and group relay URLs.
-        let (nostr_group_id, relay_urls) =
-            match Self::get_group_nostr_id_and_relays(whitenoise, account, group_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        account = %account.pubkey.to_hex(),
-                        group = %hex::encode(group_id.as_slice()),
-                        error = %e,
-                        "Skipping catch-up: could not resolve group relay info"
-                    );
-                    return;
-                }
-            };
-
-        let events = whitenoise
-            .nostr
-            .fetch_group_messages_catchup(&nostr_group_id, &relay_urls)
-            .await;
-
-        let count = events.len();
-        tracing::debug!(
-            target: "whitenoise::event_processor::process_welcome::background",
-            account = %account.pubkey.to_hex(),
-            group = %hex::encode(group_id.as_slice()),
-            count,
-            "Catch-up: queuing fetched group messages for processing"
-        );
-
-        // Queue events through the standard pipeline so deduplication,
-        // retry logic, and MLS state management apply correctly.
-        let pubkey_hash = whitenoise.nostr.create_pubkey_hash(&account.pubkey);
-        let subscription_id = format!("{}_mls_messages", pubkey_hash);
-
-        for event in events {
-            use crate::types::ProcessableEvent;
-            let processable =
-                ProcessableEvent::new_nostr_event(event, Some(subscription_id.clone()));
-            match whitenoise.event_sender.try_send(processable) {
-                Ok(()) => {}
-                Err(e) => {
-                    // Channel closed or full — we cannot safely skip MLS commits
-                    // (doing so leaves the member on a broken epoch), so stop here.
-                    // A full 500-slot channel during a ≤200-event catch-up indicates
-                    // the event processor is severely backed up; retrying later via
-                    // the live subscription is safer than dropping.
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome::background",
-                        account = %account.pubkey.to_hex(),
-                        subscription_id = %subscription_id,
-                        error = %e,
-                        "Catch-up: could not queue event (channel full or closed), stopping"
-                    );
-                    break;
-                }
-            }
-        }
-
-        // Give the event processor time to drain the queued messages before
-        // the self-update advances the epoch.  This replaces the original
-        // unconditional 5 s sleep with a shorter, purposeful wait that only
-        // runs when subscriptions are live.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    /// Returns the Nostr group ID (hex) and relay URLs for a group.
-    fn get_group_nostr_id_and_relays(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<(String, Vec<RelayUrl>)> {
-        let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
-        let group = mdk
-            .get_group(group_id)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-        let nostr_group_id = hex::encode(group.nostr_group_id);
-        let relay_urls = mdk.get_relays(group_id)?;
-        Ok((nostr_group_id, relay_urls.into_iter().collect()))
-    }
-
-    /// Create GroupInformation for the welcome
     async fn create_group_info(
         whitenoise: &Whitenoise,
         group_id: &GroupId,
@@ -1021,105 +909,5 @@ mod tests {
             .await
             .unwrap();
         assert!(ag.is_some(), "AccountGroup must survive an early return");
-    }
-
-    /// `get_group_nostr_id_and_relays` must return the hex-encoded Nostr group
-    /// ID and at least one relay URL when called with a real MLS group.
-    /// This covers the happy path of the helper (lines 451-457).
-    #[tokio::test]
-    async fn test_get_group_nostr_id_and_relays_with_real_group() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
-
-        // Create a real group so the MLS state exists
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
-        whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        assert!(!groups.is_empty(), "Creator should have one group");
-        let group_id = &groups[0].mls_group_id;
-
-        let result =
-            Whitenoise::get_group_nostr_id_and_relays(&whitenoise, &creator_account, group_id);
-
-        assert!(result.is_ok(), "Should resolve group relay info");
-        let (nostr_group_id, relay_urls) = result.unwrap();
-        assert_eq!(
-            nostr_group_id.len(),
-            64,
-            "Nostr group ID should be 32 bytes hex-encoded (64 chars)"
-        );
-        assert!(
-            !relay_urls.is_empty(),
-            "Group should have at least one relay"
-        );
-    }
-
-    /// `get_group_nostr_id_and_relays` must return an error when the group does
-    /// not exist in the MLS state — exercising the `GroupNotFound` error path.
-    #[tokio::test]
-    async fn test_get_group_nostr_id_and_relays_group_not_found() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let fake_group_id = mdk_core::GroupId::from_slice(&[77; 32]);
-
-        let result =
-            Whitenoise::get_group_nostr_id_and_relays(&whitenoise, &account, &fake_group_id);
-
-        assert!(
-            result.is_err(),
-            "Should return error for non-existent group"
-        );
-    }
-
-    /// `catchup_group_messages` must return early without panicking when the
-    /// group does not exist in MLS state.  This exercises the error branch in
-    /// `get_group_nostr_id_and_relays` (GroupNotFound → log + return).
-    #[tokio::test]
-    async fn test_catchup_group_messages_unknown_group_returns_early() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        // Use a group ID that was never created in MLS state.
-        let fake_group_id = mdk_core::GroupId::from_slice(&[55; 32]);
-
-        // Must complete without panic despite the group not existing.
-        Whitenoise::catchup_group_messages(&whitenoise, &account, &fake_group_id).await;
-    }
-
-    /// `catchup_group_messages` must complete without panic when called with a
-    /// real group.  No events are returned (no live relay) but the function
-    /// must traverse the full path: resolve group info → fetch (empty) →
-    /// skip queuing loop → drain sleep.  Covers lines 384-442.
-    #[tokio::test]
-    async fn test_catchup_group_messages_real_group_no_events() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let creator_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_pubkey = members[0].0.pubkey;
-
-        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
-        whitenoise
-            .create_group(&creator_account, vec![member_pubkey], config, None)
-            .await
-            .unwrap();
-
-        let mdk = whitenoise
-            .create_mdk_for_account(creator_account.pubkey)
-            .unwrap();
-        let groups = mdk.get_groups().unwrap();
-        let group_id = &groups[0].mls_group_id;
-
-        // Should complete without panic; relay returns no events in test env
-        Whitenoise::catchup_group_messages(&whitenoise, &creator_account, group_id).await;
     }
 }
