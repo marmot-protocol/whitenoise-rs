@@ -209,6 +209,18 @@ impl Whitenoise {
     /// Core welcome finalization logic. Testable because it takes Whitenoise as a parameter.
     /// Handles DB writes, network calls, and other non-critical operations.
     /// All operations are idempotent and failures are logged but don't stop other operations.
+    ///
+    /// # Sequencing
+    ///
+    /// 1. **Subscription setup** — awaited first so the relay connection is live
+    ///    before we do anything else.  Its result gates the self-update: we must
+    ///    not advance the epoch before our subscription is live.
+    /// 2. **Independent ops** (group info, key rotation, image sync, welcomer
+    ///    user lookup) — run concurrently; failures are logged but do not block.
+    /// 3. **Self-update** — runs only if subscription setup succeeded.  If setup
+    ///    failed, the self-update is skipped and the reason is logged so the
+    ///    caller can diagnose the problem.  Any missed self-update will be
+    ///    retried by the scheduled key-package maintenance task.
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -223,36 +235,53 @@ impl Whitenoise {
             Err(e) => {
                 tracing::error!(
                     target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to get signer for account {}: {}",
-                    account.pubkey.to_hex(),
-                    e
+                    account = %account.pubkey.to_hex(),
+                    error = %e,
+                    "Failed to get signer; aborting welcome finalization"
                 );
                 return;
             }
         };
 
-        // Run independent operations concurrently
-        let (
-            group_info_result,
-            subscription_result,
-            key_rotation_result,
-            image_sync_result,
-            welcomer_user_result,
-        ) = tokio::join!(
+        // --- Step 1: subscription setup (must happen before catch-up and self-update) ---
+        let subscription_ok = match Self::setup_group_subscriptions(whitenoise, account, signer)
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    "Group subscriptions established"
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %e,
+                    reason = "subscription_setup_failed",
+                    "Subscription setup failed; skipping catch-up and self-update to avoid epoch mismatch"
+                );
+                false
+            }
+        };
+
+        // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
+        let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::setup_group_subscriptions(whitenoise, account, signer),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
         );
 
-        // Log any errors (operations are independent, so we log all failures)
         if let Err(e) = group_info_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to create GroupInformation for group {}: {}",
-                hex::encode(group_id.as_slice()),
-                e
+                group = %hex::encode(group_id.as_slice()),
+                error = %e,
+                "Failed to create GroupInformation"
             );
         } else {
             whitenoise
@@ -268,73 +297,59 @@ impl Whitenoise {
                 .await;
         }
 
-        if let Err(e) = subscription_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to setup subscriptions for account {}: {}",
-                account.pubkey.to_hex(),
-                e
-            );
-        }
-
         if let Err(e) = key_rotation_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to rotate key package for account {}: {}",
-                account.pubkey.to_hex(),
-                e
+                account = %account.pubkey.to_hex(),
+                error = %e,
+                "Failed to rotate key package"
             );
         }
 
         if let Err(e) = image_sync_result {
             tracing::warn!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to sync group image cache: {}",
-                e
+                error = %e,
+                "Failed to sync group image cache"
             );
         }
 
         if let Err(e) = welcomer_user_result {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to ensure welcomer user exists: {}",
-                e
+                account = %account.pubkey.to_hex(),
+                error = %e,
+                "Failed to ensure welcomer user exists"
             );
         }
 
-        // Perform self-update AFTER other tasks complete, especially after
-        // subscriptions are set up. The self-update advances the group epoch,
-        // so it must run after the member is fully subscribed and has had a
-        // chance to receive any messages sent at the current epoch. Running
-        // it concurrently would cause epoch mismatches: other members' messages
-        // sent at epoch N would be rejected because the local state already
-        // advanced to epoch N+1 via the self-update.
+        // --- Step 3: self-update (only if subscriptions are live) ---
         //
-        // We add a brief delay to allow in-flight messages at the current
-        // epoch to arrive via the newly-established subscriptions before we
-        // advance to the next epoch. Without this, messages that were sent
-        // by other members between group creation and the self-update would
-        // be rejected with "Wrong Epoch" errors.
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await {
+        // The self-update advances the group epoch.  It runs only when
+        // subscriptions are live (step 1 succeeded) so we don't advance
+        // the epoch before we can receive any resulting commits from peers.
+        // Any missed self-update will be retried by the scheduled
+        // key-package maintenance task.
+        if subscription_ok
+            && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
+        {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to perform post-welcome self-update for account {} in group {}: {}",
-                account.pubkey.to_hex(),
-                hex::encode(group_id.as_slice()),
-                e
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(group_id.as_slice()),
+                error = %e,
+                "Failed to perform post-welcome self-update"
             );
         }
 
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome::background",
-            "Completed post-welcome processing for account {} and group {}",
-            account.pubkey.to_hex(),
-            hex::encode(group_id.as_slice())
+            account = %account.pubkey.to_hex(),
+            group = %hex::encode(group_id.as_slice()),
+            "Completed post-welcome processing"
         );
     }
 
-    /// Create GroupInformation for the welcome
     async fn create_group_info(
         whitenoise: &Whitenoise,
         group_id: &GroupId,
@@ -855,5 +870,44 @@ mod tests {
             epoch_after_welcome,
             updated_group.epoch
         );
+    }
+
+    /// When the account's signing key is not in the secrets store,
+    /// `finalize_welcome_with_instance` must return early without panicking.
+    /// This covers the signer-not-found early-return path (lines 238-245).
+    #[tokio::test]
+    async fn test_finalize_welcome_no_signer_returns_early() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[99; 32]);
+        let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
+
+        // Pre-create AccountGroup so the function has a record to work with
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id, None)
+            .await
+            .unwrap();
+
+        // Remove the private key so get_signer_for_account returns an error
+        whitenoise
+            .secrets_store
+            .remove_private_key_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        // Should complete without panic despite missing signer
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            "Test Group",
+            None,
+            welcomer_pubkey,
+        )
+        .await;
+
+        // AccountGroup must still exist (early return does not destroy it)
+        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+        assert!(ag.is_some(), "AccountGroup must survive an early return");
     }
 }
