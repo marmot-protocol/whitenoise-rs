@@ -701,12 +701,16 @@ impl Whitenoise {
     /// Refresh account subscriptions.
     ///
     /// This method updates subscriptions when account state changes (group membership, relay
-    /// preferences). It re-issues subscriptions using NIP-01 stable IDs (atomic replacement) so
-    /// there is no unsubscribe/resubscribe gap during a normal refresh.
+    /// preferences). It first unsubscribes all existing account subscriptions to clean up stale
+    /// relay state, then resubscribes with a replay anchor that looks back over two days.
     ///
-    /// The replay anchor is derived from the account's sync state via `since_timestamp`, ensuring
-    /// the relay delivers any events missed since the last successful sync rather than an
-    /// arbitrary wall-clock offset.
+    /// The two-day lookback is required because nostr-sdk backdates gift-wrap events by up to
+    /// 48 hours, so a shorter replay window risks missing events that were published but carry
+    /// a created_at timestamp in the past.
+    ///
+    /// The replay anchor is derived from the account's sync state via `since_timestamp` with a
+    /// buffer of `172_810` seconds (2 days + 10 s). Falls back to `None` (no since filter) when
+    /// the account has never synced, so the relay sends everything it has.
     ///
     /// # Arguments
     ///
@@ -718,6 +722,11 @@ impl Whitenoise {
             account.pubkey
         );
 
+        // Clean up existing subscriptions before resubscribing.
+        self.nostr
+            .unsubscribe_account_subscriptions(&account.pubkey)
+            .await?;
+
         let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
@@ -725,9 +734,10 @@ impl Whitenoise {
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
 
-        // Anchor replay from account sync state (10s buffer); falls back to None (no filter)
-        // when the account has never synced, so the relay sends everything it has.
-        let since = account.since_timestamp(10);
+        // nostr-sdk backdates gift-wrap events by up to 48 hours, so look back 2 days + 10s
+        // to ensure we catch everything on the new subscriptions.
+        const TWO_DAYS_PLUS_BUFFER_SECS: u64 = 2 * 24 * 60 * 60 + 10;
+        let since = account.since_timestamp(TWO_DAYS_PLUS_BUFFER_SECS);
 
         let signer = self.get_signer_for_account(account)?;
         self.nostr

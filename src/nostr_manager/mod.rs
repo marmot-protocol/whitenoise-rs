@@ -269,9 +269,9 @@ impl NostrManager {
     /// Updates account subscriptions by re-issuing them with the same stable subscription IDs.
     ///
     /// NIP-01 guarantees that a `REQ` with an existing subscription ID replaces the old subscription
-    /// atomically on each relay, so there is no dropped-event window during a normal refresh.
-    /// `unsubscribe_account_subscriptions` is intentionally NOT called here; it is reserved for
-    /// logout / account teardown paths where we truly want to cancel the subscriptions.
+    /// atomically on each relay. Callers that want to clean up stale relay state first (e.g.
+    /// `refresh_account_subscriptions`) should call `unsubscribe_account_subscriptions` before
+    /// invoking this method.
     ///
     /// The `since` parameter anchors the replay window.  Pass `account.since_timestamp(buffer)` from
     /// the caller so the anchor reflects the account's actual sync state rather than a hardcoded
@@ -288,7 +288,7 @@ impl NostrManager {
     ) -> Result<()> {
         tracing::debug!(
             target: "whitenoise::nostr_manager::update_account_subscriptions_with_signer",
-            "Updating account subscriptions (no unsubscribe, NIP-01 replacement)"
+            "Updating account subscriptions (NIP-01 replacement)"
         );
         self.with_signer(signer, || async {
             self.setup_account_subscriptions(
@@ -664,9 +664,10 @@ mod subscription_monitoring_tests {
         );
     }
 
-    /// update_account_subscriptions does NOT call unsubscribe first; the subscription count for
-    /// the account must remain zero (no subscriptions are established without real relays) rather
-    /// than error out from a phantom unsubscribe attempt.
+    /// update_account_subscriptions is a low-level primitive that does not call unsubscribe itself;
+    /// callers are responsible for cleanup before invoking it (e.g. refresh_account_subscriptions
+    /// calls unsubscribe_account_subscriptions first). Verify the function completes without
+    /// panicking even when no subscriptions exist before the call.
     #[tokio::test]
     async fn test_update_account_subscriptions_does_not_unsubscribe_first() {
         let (event_sender, _receiver) = mpsc::channel(100);
@@ -686,8 +687,8 @@ mod subscription_monitoring_tests {
             0
         );
 
-        // Call update with a concrete since anchor — it should not panic or attempt to
-        // send CLOSE frames for subscriptions that don't exist.
+        // Call update with a concrete since anchor — it should not panic even when
+        // there are no prior subscriptions to replace.
         let since = Some(Timestamp::now() - Duration::from_secs(30));
         let _ = nostr_manager
             .update_account_subscriptions(
