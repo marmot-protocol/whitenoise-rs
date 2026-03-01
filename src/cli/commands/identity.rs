@@ -7,8 +7,7 @@ use crate::cli::protocol::{Request, Response};
 
 pub async fn create_identity(socket: &Path, json: bool) -> anyhow::Result<()> {
     let resp = client::send(socket, &Request::CreateIdentity).await?;
-    output::print_response(&resp, json);
-    exit_code(&resp)
+    output::print_and_exit(&resp, json)
 }
 
 pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::Result<()> {
@@ -16,8 +15,7 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
     let resp = client::send(socket, &Request::LoginStart { nsec }).await?;
 
     if resp.error.is_some() {
-        output::print_response(&resp, json);
-        return exit_code(&resp);
+        return output::print_and_exit(&resp, json);
     }
 
     // Check if login needs relay resolution
@@ -105,7 +103,10 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
     } else {
         print_login_success(&relay_resp);
     }
-    exit_code(&relay_resp)
+    if relay_resp.error.is_some() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 pub async fn logout(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<()> {
@@ -116,8 +117,7 @@ pub async fn logout(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<(
         },
     )
     .await?;
-    output::print_response(&resp, json);
-    exit_code(&resp)
+    output::print_and_exit(&resp, json)
 }
 
 pub async fn whoami(socket: &Path, json: bool) -> anyhow::Result<()> {
@@ -137,7 +137,10 @@ pub async fn whoami(socket: &Path, json: bool) -> anyhow::Result<()> {
     } else {
         output::print_response(&resp, false);
     }
-    exit_code(&resp)
+    if resp.error.is_some() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<()> {
@@ -148,8 +151,7 @@ pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> anyhow::Res
         },
     )
     .await?;
-    output::print_response(&resp, json);
-    exit_code(&resp)
+    output::print_and_exit(&resp, json)
 }
 
 fn read_nsec() -> anyhow::Result<String> {
@@ -178,11 +180,4 @@ fn print_login_success(resp: &Response) {
     {
         println!("Logged in as {pubkey}");
     }
-}
-
-fn exit_code(resp: &Response) -> anyhow::Result<()> {
-    if resp.error.is_some() {
-        std::process::exit(1);
-    }
-    Ok(())
 }

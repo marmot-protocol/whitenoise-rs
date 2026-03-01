@@ -108,7 +108,7 @@ fn write_pid_file(path: &Path) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn set_socket_permissions(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -154,10 +154,10 @@ pub fn is_daemon_running(config: &Config) -> Option<u32> {
 pub fn stop_daemon(config: &Config) -> anyhow::Result<()> {
     match is_daemon_running(config) {
         Some(pid) => {
-            tracing::info!("sending SIGTERM to daemon (pid {pid})");
             if !send_sigterm(pid) {
                 anyhow::bail!("failed to send SIGTERM to pid {pid}");
             }
+            println!("daemon stopped (pid {pid})");
             Ok(())
         }
         None => {

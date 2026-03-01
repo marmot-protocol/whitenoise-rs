@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use whitenoise::cli::commands::{accounts::AccountsCmd, daemon::DaemonCmd, identity};
+use whitenoise::cli::commands::{
+    accounts::AccountsCmd, daemon::DaemonCmd, groups::GroupsCmd, identity, messages::MessagesCmd,
+};
 use whitenoise::cli::config::Config;
 
 #[derive(Parser, Debug)]
@@ -15,6 +17,10 @@ struct Args {
     /// Path to daemon socket (overrides default)
     #[clap(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
+
+    /// Account to use (npub or hex pubkey)
+    #[clap(long, global = true, value_name = "NPUB")]
+    account: Option<String>,
 
     #[clap(subcommand)]
     command: Cmd,
@@ -54,6 +60,14 @@ enum Cmd {
     /// Manage accounts
     #[clap(subcommand)]
     Accounts(AccountsCmd),
+
+    /// Manage groups
+    #[clap(subcommand)]
+    Groups(GroupsCmd),
+
+    /// Manage messages
+    #[clap(subcommand)]
+    Messages(MessagesCmd),
 }
 
 #[tokio::main]
@@ -70,5 +84,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Whoami => identity::whoami(&socket, args.json).await,
         Cmd::ExportNsec { pubkey } => identity::export_nsec(&socket, &pubkey, args.json).await,
         Cmd::Accounts(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Groups(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Messages(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
     }
 }

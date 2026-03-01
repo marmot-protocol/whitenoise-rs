@@ -22,9 +22,5 @@ impl AccountsCmd {
 
 async fn list(socket: &Path, json: bool) -> anyhow::Result<()> {
     let resp = client::send(socket, &Request::AllAccounts).await?;
-    output::print_response(&resp, json);
-    if resp.error.is_some() {
-        std::process::exit(1);
-    }
-    Ok(())
+    output::print_and_exit(&resp, json)
 }

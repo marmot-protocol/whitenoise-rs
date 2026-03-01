@@ -1,3 +1,4 @@
+pub mod account;
 pub mod client;
 pub mod commands;
 pub mod config;

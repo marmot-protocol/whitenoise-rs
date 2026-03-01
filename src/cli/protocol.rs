@@ -30,6 +30,37 @@ pub enum Request {
     AllAccounts,
     #[serde(rename = "export_nsec")]
     ExportNsec { pubkey: String },
+
+    // Groups
+    #[serde(rename = "visible_groups")]
+    VisibleGroups { account: String },
+    #[serde(rename = "create_group")]
+    CreateGroup {
+        account: String,
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        members: Vec<String>,
+    },
+    #[serde(rename = "add_members")]
+    AddMembers {
+        account: String,
+        group_id: String,
+        members: Vec<String>,
+    },
+    #[serde(rename = "get_group")]
+    GetGroup { account: String, group_id: String },
+
+    // Messages
+    #[serde(rename = "list_messages")]
+    ListMessages { account: String, group_id: String },
+    #[serde(rename = "send_message")]
+    SendMessage {
+        account: String,
+        group_id: String,
+        message: String,
+    },
 }
 
 /// A response from the daemon to the CLI client.
@@ -39,6 +70,8 @@ pub struct Response {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorPayload>,
+    /// Reserved for streaming responses (Phase 3). When true, signals no more
+    /// messages will follow for this subscription.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub stream_end: bool,
 }
@@ -146,6 +179,115 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::ExportNsec { pubkey } if pubkey == "npub1abc"));
+    }
+
+    #[test]
+    fn visible_groups_roundtrip() {
+        let req = Request::VisibleGroups {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::VisibleGroups { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn create_group_roundtrip() {
+        let req = Request::CreateGroup {
+            account: "npub1abc".into(),
+            name: "My Group".into(),
+            description: Some("A test group".into()),
+            members: vec!["npub1x".into(), "npub1y".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::CreateGroup { account, name, description, members }
+            if account == "npub1abc"
+                && name == "My Group"
+                && description.as_deref() == Some("A test group")
+                && members.len() == 2
+        ));
+    }
+
+    #[test]
+    fn create_group_minimal_roundtrip() {
+        // Only required fields — members defaults to empty, description to None
+        let wire = r#"{"method":"create_group","params":{"account":"npub1abc","name":"Chat"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::CreateGroup { account, name, description, members }
+            if account == "npub1abc"
+                && name == "Chat"
+                && description.is_none()
+                && members.is_empty()
+        ));
+    }
+
+    #[test]
+    fn add_members_roundtrip() {
+        let req = Request::AddMembers {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            members: vec!["npub1x".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::AddMembers { account, group_id, members }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && members.len() == 1
+        ));
+    }
+
+    #[test]
+    fn get_group_roundtrip() {
+        let req = Request::GetGroup {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GetGroup { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn list_messages_roundtrip() {
+        let req = Request::ListMessages {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ListMessages { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn send_message_roundtrip() {
+        let req = Request::SendMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            message: "Hello world".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SendMessage { account, group_id, message }
+            if account == "npub1abc" && group_id == "abcd1234" && message == "Hello world"
+        ));
     }
 
     #[test]
