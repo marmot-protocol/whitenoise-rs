@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.6.0"
-source = "git+https://github.com/marmot-protocol/mdk?rev=d7273e2#d7273e26615ca8d75670faf6f588345cce20829b"
+source = "git+https://github.com/marmot-protocol/mdk?rev=a295f21#a295f213063aeaa3a8286baf896804aebd5ccc74"
 dependencies = [
  "blurhash",
  "chacha20poly1305",
@@ -2467,7 +2467,7 @@ dependencies = [
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.6.0"
-source = "git+https://github.com/marmot-protocol/mdk?rev=d7273e2#d7273e26615ca8d75670faf6f588345cce20829b"
+source = "git+https://github.com/marmot-protocol/mdk?rev=a295f21#a295f213063aeaa3a8286baf896804aebd5ccc74"
 dependencies = [
  "getrandom 0.4.1",
  "hex",
@@ -2488,7 +2488,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.6.0"
-source = "git+https://github.com/marmot-protocol/mdk?rev=d7273e2#d7273e26615ca8d75670faf6f588345cce20829b"
+source = "git+https://github.com/marmot-protocol/mdk?rev=a295f21#a295f213063aeaa3a8286baf896804aebd5ccc74"
 dependencies = [
  "nostr",
  "openmls",
