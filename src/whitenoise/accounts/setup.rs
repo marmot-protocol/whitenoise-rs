@@ -700,9 +700,17 @@ impl Whitenoise {
 
     /// Refresh account subscriptions.
     ///
-    /// This method updates subscriptions when account state changes (group membership, relay preferences).
-    /// Uses explicit cleanup to handle relay changes properly - NIP-01 auto-replacement only works
-    /// within the same relay, so changing relays would leave orphaned subscriptions without cleanup.
+    /// This method updates subscriptions when account state changes (group membership, relay
+    /// preferences). It first unsubscribes all existing account subscriptions to clean up stale
+    /// relay state, then resubscribes with a replay anchor derived from the account's sync state.
+    ///
+    /// Gift-wrap backdating (nostr-sdk timestamps gift-wraps up to 48 hours in the past) is
+    /// handled inside `setup_giftwrap_subscription` via `adjust_since_for_giftwrap`, which
+    /// subtracts an additional `GIFTWRAP_LOOKBACK_BUFFER` (7 days) from the `since` value.
+    /// No extra buffer is needed here for that purpose.
+    ///
+    /// The replay anchor falls back to `None` (no since filter) when the account has never
+    /// synced, so the relay sends everything it has.
     ///
     /// # Arguments
     ///
@@ -714,12 +722,21 @@ impl Whitenoise {
             account.pubkey
         );
 
+        // Clean up existing subscriptions before resubscribing.
+        self.nostr
+            .unsubscribe_account_subscriptions(&account.pubkey)
+            .await?;
+
         let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
 
         let (group_relays_urls, nostr_group_ids) =
             self.extract_groups_relays_and_ids(account).await?;
+
+        // 10s buffer to avoid missing events at the boundary of the last sync window.
+        // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
+        let since = account.since_timestamp(10);
 
         let signer = self.get_signer_for_account(account)?;
         self.nostr
@@ -729,6 +746,7 @@ impl Whitenoise {
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,
+                since,
                 signer,
             )
             .await
