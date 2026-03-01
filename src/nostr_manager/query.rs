@@ -91,9 +91,10 @@ impl NostrManager {
     ///
     /// # Returns
     ///
-    /// The fetched events in no guaranteed order; the caller is responsible for
-    /// processing them.  Returns an empty `Vec` if the relay query fails so that
-    /// a transient failure never blocks the rest of the join flow.
+    /// The fetched events sorted in ascending order by `(created_at, id)` so
+    /// that the caller can feed them to the MLS event processor in epoch order
+    /// without additional sorting.  Returns an empty `Vec` if the relay query
+    /// fails so that a transient failure never blocks the rest of the join flow.
     pub(crate) async fn fetch_group_messages_catchup(
         &self,
         nostr_group_id: &str,

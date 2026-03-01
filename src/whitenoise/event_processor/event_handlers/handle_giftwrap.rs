@@ -417,21 +417,36 @@ impl Whitenoise {
 
         for event in events {
             use crate::types::ProcessableEvent;
-            if let Err(e) = whitenoise
-                .event_sender
-                .send(ProcessableEvent::new_nostr_event(
-                    event,
-                    Some(subscription_id.clone()),
-                ))
-                .await
+            let processable =
+                ProcessableEvent::new_nostr_event(event, Some(subscription_id.clone()));
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                whitenoise.event_sender.send(processable),
+            )
+            .await
             {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    account = %account.pubkey.to_hex(),
-                    error = %e,
-                    "Catch-up: failed to queue event (channel closed?)"
-                );
-                break;
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Channel closed — receiver is gone; no point continuing.
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome::background",
+                        account = %account.pubkey.to_hex(),
+                        subscription_id = %subscription_id,
+                        error = %e,
+                        "Catch-up: event_sender closed, stopping queue"
+                    );
+                    break;
+                }
+                Err(_elapsed) => {
+                    // Channel full for >100 ms — drop this event and keep going
+                    // so the join flow is not blocked indefinitely.
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome::background",
+                        account = %account.pubkey.to_hex(),
+                        subscription_id = %subscription_id,
+                        "Catch-up: event_sender full, dropping catch-up event"
+                    );
+                }
             }
         }
 
