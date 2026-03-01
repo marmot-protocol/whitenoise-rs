@@ -269,11 +269,14 @@ impl NostrManager {
     /// Updates account subscriptions by re-issuing them with the same stable subscription IDs.
     ///
     /// NIP-01 guarantees that a `REQ` with an existing subscription ID replaces the old subscription
-    /// atomically on each relay. Callers that want to clean up stale relay state first (e.g.
-    /// `refresh_account_subscriptions`) should call `unsubscribe_account_subscriptions` before
-    /// invoking this method.
+    /// atomically on each relay. This method does **not** unsubscribe first; it relies on the
+    /// NIP-01 replacement semantics to overwrite existing subscriptions on each relay.
     ///
-    /// The `since` parameter anchors the replay window.  Pass `account.since_timestamp(buffer)` from
+    /// Callers that need a clean relay state (e.g. `refresh_account_subscriptions`) must call
+    /// `unsubscribe_account_subscriptions` before invoking this method. Skipping that step leaves
+    /// stale subscriptions open on relays that are no longer in the updated relay set.
+    ///
+    /// The `since` parameter anchors the replay window. Pass `account.since_timestamp(buffer)` from
     /// the caller so the anchor reflects the account's actual sync state rather than a hardcoded
     /// wall-clock offset.
     pub(crate) async fn update_account_subscriptions_with_signer(
@@ -286,6 +289,18 @@ impl NostrManager {
         since: Option<Timestamp>,
         signer: impl NostrSigner + 'static,
     ) -> Result<()> {
+        let existing = self.count_subscriptions_for_account(&pubkey).await;
+        if existing > 0 {
+            tracing::warn!(
+                target: "whitenoise::nostr_manager::update_account_subscriptions_with_signer",
+                pubkey = %pubkey,
+                existing_subscription_count = existing,
+                "update_account_subscriptions_with_signer called with {} existing subscription(s) \
+                 for this account. Call unsubscribe_account_subscriptions first if a clean relay \
+                 state is required.",
+                existing
+            );
+        }
         tracing::debug!(
             target: "whitenoise::nostr_manager::update_account_subscriptions_with_signer",
             "Updating account subscriptions (NIP-01 replacement)"
