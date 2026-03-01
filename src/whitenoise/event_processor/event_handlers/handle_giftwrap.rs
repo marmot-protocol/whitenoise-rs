@@ -979,4 +979,129 @@ mod tests {
             updated_group.epoch
         );
     }
+
+    /// When the account's signing key is not in the secrets store,
+    /// `finalize_welcome_with_instance` must return early without panicking.
+    /// This covers the signer-not-found early-return path (lines 238-245).
+    #[tokio::test]
+    async fn test_finalize_welcome_no_signer_returns_early() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = mdk_core::GroupId::from_slice(&[99; 32]);
+        let welcomer_pubkey = whitenoise.create_identity().await.unwrap().pubkey;
+
+        // Pre-create AccountGroup so the function has a record to work with
+        AccountGroup::get_or_create(&whitenoise, &account.pubkey, &group_id, None)
+            .await
+            .unwrap();
+
+        // Remove the private key so get_signer_for_account returns an error
+        whitenoise
+            .secrets_store
+            .remove_private_key_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        // Should complete without panic despite missing signer
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &account,
+            &group_id,
+            "Test Group",
+            None,
+            welcomer_pubkey,
+        )
+        .await;
+
+        // AccountGroup must still exist (early return does not destroy it)
+        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap();
+        assert!(ag.is_some(), "AccountGroup must survive an early return");
+    }
+
+    /// `get_group_nostr_id_and_relays` must return the hex-encoded Nostr group
+    /// ID and at least one relay URL when called with a real MLS group.
+    /// This covers the happy path of the helper (lines 451-457).
+    #[tokio::test]
+    async fn test_get_group_nostr_id_and_relays_with_real_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        // Create a real group so the MLS state exists
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(!groups.is_empty(), "Creator should have one group");
+        let group_id = &groups[0].mls_group_id;
+
+        let result =
+            Whitenoise::get_group_nostr_id_and_relays(&whitenoise, &creator_account, group_id);
+
+        assert!(result.is_ok(), "Should resolve group relay info");
+        let (nostr_group_id, relay_urls) = result.unwrap();
+        assert_eq!(
+            nostr_group_id.len(),
+            64,
+            "Nostr group ID should be 32 bytes hex-encoded (64 chars)"
+        );
+        assert!(
+            !relay_urls.is_empty(),
+            "Group should have at least one relay"
+        );
+    }
+
+    /// `get_group_nostr_id_and_relays` must return an error when the group does
+    /// not exist in the MLS state — exercising the `GroupNotFound` error path.
+    #[tokio::test]
+    async fn test_get_group_nostr_id_and_relays_group_not_found() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let fake_group_id = mdk_core::GroupId::from_slice(&[77; 32]);
+
+        let result =
+            Whitenoise::get_group_nostr_id_and_relays(&whitenoise, &account, &fake_group_id);
+
+        assert!(
+            result.is_err(),
+            "Should return error for non-existent group"
+        );
+    }
+
+    /// `catchup_group_messages` must complete without panic when called with a
+    /// real group.  No events are returned (no live relay) but the function
+    /// must traverse the full path: resolve group info → fetch (empty) →
+    /// skip queuing loop → drain sleep.  Covers lines 384-442.
+    #[tokio::test]
+    async fn test_catchup_group_messages_real_group_no_events() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        let group_id = &groups[0].mls_group_id;
+
+        // Should complete without panic; relay returns no events in test env
+        Whitenoise::catchup_group_messages(&whitenoise, &creator_account, group_id).await;
+    }
 }
