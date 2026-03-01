@@ -104,6 +104,19 @@ impl Scenario for ChatListScenario {
         // ============================================================
         tracing::info!("Test 4: Verifying last message in chat list...");
 
+        // Wait for bob to complete the post-welcome self-update before alice
+        // sends.  Bob's self-update commits advance the group epoch; if alice
+        // sends at epoch N while bob's self-update is in flight, alice's
+        // message comes back from the relay at what is now epoch N+1 and is
+        // rejected as Wrong Epoch, so alice never sees her own last message.
+        WaitForWelcomeTestCase::for_account("chat_list_bob", "chat_list_group")
+            .execute(&mut self.context)
+            .await?;
+
+        VerifySelfUpdateTestCase::for_account("chat_list_bob", "chat_list_group")
+            .execute(&mut self.context)
+            .await?;
+
         SendMessageTestCase::basic()
             .with_sender("chat_list_alice")
             .with_group("chat_list_group")
