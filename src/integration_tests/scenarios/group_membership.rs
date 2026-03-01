@@ -47,6 +47,19 @@ impl Scenario for GroupMembershipScenario {
             test_group.mls_group_id.clone()
         };
 
+        // Wait for member1 to receive the welcome and complete the post-welcome
+        // self-update before the admin adds more members.  Each AddGroupMembers
+        // call creates a new MLS commit; if member1's background self-update
+        // fires while those commits are in flight it will attempt to advance
+        // an epoch that has already moved, causing a panic in MDK.
+        WaitForWelcomeTestCase::for_account("grp_mbr_member1", "group_membership_test_group")
+            .execute(&mut self.context)
+            .await?;
+
+        VerifySelfUpdateTestCase::for_account("grp_mbr_member1", "group_membership_test_group")
+            .execute(&mut self.context)
+            .await?;
+
         // Get account pubkeys before mutable operations
         let member2_pubkey = self.context.get_account("grp_mbr_member2")?.pubkey;
 

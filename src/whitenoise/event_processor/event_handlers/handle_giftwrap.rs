@@ -325,22 +325,11 @@ impl Whitenoise {
 
         // --- Step 3: self-update (only if subscriptions are live) ---
         //
-        // Brief pause before self-update: once the subscription is live, any
-        // commits that arrived while we were setting up (e.g. from other members
-        // who sent messages immediately after the invite) will be in flight
-        // through the event processor.  We wait a short time to give that
-        // pipeline a chance to apply them before we advance the epoch.
-        // Without this, self_update can panic if another member's commit has
-        // already advanced the group epoch past what we expect.
-        //
-        // This is intentionally a simple time-based wait rather than a
-        // deterministic drain — the window we're covering is the subscription
-        // setup latency, which is short.  Any missed self-update will be
-        // retried by the scheduled key-package maintenance task.
-        if subscription_ok {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-
+        // The self-update advances the group epoch.  It runs only when
+        // subscriptions are live (step 1 succeeded) so we don't advance
+        // the epoch before we can receive any resulting commits from peers.
+        // Any missed self-update will be retried by the scheduled
+        // key-package maintenance task.
         if subscription_ok
             && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
         {
