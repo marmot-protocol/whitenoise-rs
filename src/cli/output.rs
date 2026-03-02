@@ -42,7 +42,14 @@ const HEX_FIELDS: &[&str] = &["mls_group_id", "nostr_group_id"];
 const NO_NPUB_FIELDS: &[&str] = &["id", "reply_to", "message_id"];
 
 /// Fields hidden entirely in human-readable output (still present in --json).
-const HIDDEN_FIELDS: &[&str] = &["author", "created_at", "user_reactions", "reaction_id"];
+const HIDDEN_FIELDS: &[&str] = &[
+    "author",
+    "created_at",
+    "user_reactions",
+    "reaction_id",
+    "content_tokens",
+    "tags",
+];
 
 fn format_value(w: &mut impl Write, value: &serde_json::Value, indent: usize) -> io::Result<()> {
     let prefix = "  ".repeat(indent);
@@ -358,6 +365,18 @@ mod tests {
         let out = render(json!({"message_id": hex}));
         assert!(out.contains(hex), "message_id should stay as hex");
         assert!(!out.contains("npub1"), "message_id should not become npub");
+    }
+
+    #[test]
+    fn content_tokens_and_tags_hidden() {
+        let out = render(json!({
+            "content": "hello",
+            "content_tokens": [{"type": "text", "value": "hello"}],
+            "tags": [["e", "abc123"]]
+        }));
+        assert!(out.contains("content: hello"));
+        assert!(!out.contains("content_tokens"));
+        assert!(!out.contains("tags"));
     }
 
     #[test]

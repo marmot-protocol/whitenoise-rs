@@ -23,6 +23,12 @@ pub enum MessagesCmd {
         /// Message text
         message: String,
     },
+
+    /// Subscribe to live messages in a group
+    Subscribe {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
 }
 
 impl MessagesCmd {
@@ -36,6 +42,9 @@ impl MessagesCmd {
             MessagesCmd::List { group_id } => list(socket, json, account_flag, group_id).await,
             MessagesCmd::Send { group_id, message } => {
                 send(socket, json, account_flag, group_id, message).await
+            }
+            MessagesCmd::Subscribe { group_id } => {
+                subscribe(socket, json, account_flag, group_id).await
             }
         }
     }
@@ -57,6 +66,24 @@ async fn list(
     )
     .await?;
     output::print_and_exit(&resp, json)
+}
+
+async fn subscribe(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let req = Request::MessagesSubscribe {
+        account: pubkey,
+        group_id,
+    };
+    client::stream(socket, &req, |resp| {
+        output::print_response(resp, json);
+        true
+    })
+    .await
 }
 
 async fn send(

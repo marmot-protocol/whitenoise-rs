@@ -11,6 +11,9 @@ use crate::cli::protocol::Request;
 pub enum ChatsCmd {
     /// List all chats with last message preview
     List,
+
+    /// Subscribe to live chat list updates
+    Subscribe,
 }
 
 impl ChatsCmd {
@@ -22,6 +25,7 @@ impl ChatsCmd {
     ) -> anyhow::Result<()> {
         match self {
             ChatsCmd::List => list(socket, json, account_flag).await,
+            ChatsCmd::Subscribe => subscribe(socket, json, account_flag).await,
         }
     }
 }
@@ -30,4 +34,14 @@ async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::ChatsList { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
+}
+
+async fn subscribe(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let req = Request::ChatsSubscribe { account: pubkey };
+    client::stream(socket, &req, |resp| {
+        output::print_response(resp, json);
+        true
+    })
+    .await
 }

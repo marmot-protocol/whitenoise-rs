@@ -40,13 +40,7 @@ async fn show(socket: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 async fn theme(socket: &Path, json: bool, mode: &str) -> anyhow::Result<()> {
-    let resp = client::send(
-        socket,
-        &Request::SettingsTheme {
-            theme: mode.into(),
-        },
-    )
-    .await?;
+    let resp = client::send(socket, &Request::SettingsTheme { theme: mode.into() }).await?;
     output::print_and_exit(&resp, json)
 }
 

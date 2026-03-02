@@ -136,6 +136,22 @@ pub enum Request {
         group_id: String,
         message: String,
     },
+
+    // Streaming
+    #[serde(rename = "messages_subscribe")]
+    MessagesSubscribe { account: String, group_id: String },
+    #[serde(rename = "chats_subscribe")]
+    ChatsSubscribe { account: String },
+}
+
+impl Request {
+    /// Returns true if this request expects a streaming response (multiple lines).
+    pub fn is_streaming(&self) -> bool {
+        matches!(
+            self,
+            Request::MessagesSubscribe { .. } | Request::ChatsSubscribe { .. }
+        )
+    }
 }
 
 /// A response from the daemon to the CLI client.
@@ -671,6 +687,31 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::UsersShow { pubkey } if pubkey == "npub1abc"));
+    }
+
+    #[test]
+    fn chats_subscribe_roundtrip() {
+        let req = Request::ChatsSubscribe {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::ChatsSubscribe { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn messages_subscribe_roundtrip() {
+        let req = Request::MessagesSubscribe {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::MessagesSubscribe { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
     }
 
     /// Verify that JSON sent from the wire (e.g. via socat) deserializes correctly.

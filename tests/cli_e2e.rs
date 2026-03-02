@@ -158,11 +158,7 @@ fn group_id_hex(group_json: &serde_json::Value) -> String {
 /// Poll until `predicate` returns `true`, checking every second.
 ///
 /// Panics with `timeout_msg` if the deadline is exceeded.
-async fn poll_until(
-    timeout: Duration,
-    timeout_msg: &str,
-    mut predicate: impl FnMut() -> bool,
-) {
+async fn poll_until(timeout: Duration, timeout_msg: &str, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     loop {
         if predicate() {
@@ -193,10 +189,7 @@ async fn wait_for_message(socket: &PathBuf, pubkey: &str, group_id: &str, conten
     poll_until(Duration::from_secs(30), &msg, || {
         wn(socket, &["--account", pubkey, "messages", "list", group_id])
             .as_array()
-            .is_some_and(|m| {
-                m.iter()
-                    .any(|msg| msg["content"].as_str() == Some(content))
-            })
+            .is_some_and(|m| m.iter().any(|msg| msg["content"].as_str() == Some(content)))
     })
     .await;
 }
@@ -300,10 +293,7 @@ async fn follows_lifecycle() {
     assert_eq!(check["following"], true);
 
     // Bob appears in Alice's follows list
-    let follows = wn(
-        &alice.socket,
-        &["--account", &alice_pk, "follows", "list"],
-    );
+    let follows = wn(&alice.socket, &["--account", &alice_pk, "follows", "list"]);
     let pks: Vec<&str> = follows
         .as_array()
         .expect("follows list")
@@ -367,7 +357,10 @@ async fn group_metadata_and_membership() {
         &["--account", &alice_pk, "groups", "show", &gid],
     );
     assert!(detail.is_object(), "group detail should be a JSON object");
-    assert!(detail.get("mls_group_id").is_some(), "should contain mls_group_id");
+    assert!(
+        detail.get("mls_group_id").is_some(),
+        "should contain mls_group_id"
+    );
 
     // members includes both Alice and Bob
     let members = wn(

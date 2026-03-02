@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
 use nostr_sdk::{JsonUtil, PublicKey};
+use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
 use crate::whitenoise::accounts_groups::AccountGroup;
@@ -268,7 +269,228 @@ pub async fn dispatch(req: Request) -> Response {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
+
+        // Streaming commands should be routed through dispatch_streaming
+        Request::MessagesSubscribe { .. } | Request::ChatsSubscribe { .. } => {
+            Response::err("streaming commands must use dispatch_streaming")
+        }
     }
+}
+
+/// Write a single response line to the writer. Returns false if the client disconnected.
+async fn write_response(writer: &mut (impl AsyncWriteExt + Unpin), response: &Response) -> bool {
+    let mut buf = match serde_json::to_vec(response) {
+        Ok(buf) => buf,
+        Err(_) => return false,
+    };
+    buf.push(b'\n');
+    writer.write_all(&buf).await.is_ok()
+}
+
+/// Handle a streaming request by writing multiple response lines to the writer.
+///
+/// This function takes ownership of the writer and writes response lines until
+/// the stream ends or the client disconnects. The final line has `stream_end: true`.
+pub async fn dispatch_streaming(req: Request, mut writer: impl AsyncWriteExt + Unpin + Send) {
+    let wn = match Whitenoise::get_instance() {
+        Ok(wn) => wn,
+        Err(e) => {
+            let _ = write_response(
+                &mut writer,
+                &Response::err(format!("whitenoise not initialized: {e}")),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match req {
+        Request::MessagesSubscribe { account, group_id } => {
+            messages_subscribe(wn, &mut writer, &account, &group_id).await;
+        }
+        Request::ChatsSubscribe { account } => {
+            chats_subscribe(wn, &mut writer, &account).await;
+        }
+        _ => {
+            let _ = write_response(&mut writer, &Response::err("not a streaming command")).await;
+        }
+    }
+}
+
+async fn messages_subscribe(
+    wn: &Whitenoise,
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    account_str: &str,
+    group_id_hex: &str,
+) {
+    // Validate account and group_id
+    let _account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            return;
+        }
+    };
+    let group_id = match parse_group_id(group_id_hex) {
+        Ok(id) => id,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            return;
+        }
+    };
+
+    // Subscribe — gets initial snapshot + broadcast receiver
+    let subscription = match wn.subscribe_to_group_messages(&group_id).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            return;
+        }
+    };
+
+    // Resolve display names for initial messages
+    let mut display_names = resolve_chat_display_names(wn, &subscription.initial_messages).await;
+
+    // Send initial messages in chronological order (oldest first, newest last)
+    for msg in &subscription.initial_messages {
+        if let Some(formatted) = format_chat_message(msg, &display_names) {
+            let resp = Response::ok(serde_json::json!({
+                "trigger": "InitialMessage",
+                "message": formatted,
+            }));
+            if !write_response(writer, &resp).await {
+                return; // Client disconnected
+            }
+        }
+    }
+
+    // Stream live updates
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                // Resolve display name for new authors on the fly
+                if !display_names.contains_key(&update.message.author) {
+                    if let Some(name) = resolve_display_name(wn, &update.message.author).await {
+                        display_names.insert(update.message.author, name);
+                    }
+                }
+
+                if let Some(formatted) = format_chat_message(&update.message, &display_names) {
+                    let resp = Response::ok(serde_json::json!({
+                        "trigger": update.trigger,
+                        "message": formatted,
+                    }));
+                    if !write_response(writer, &resp).await {
+                        return; // Client disconnected
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("message stream lagged by {n} messages");
+            }
+        }
+    }
+
+    // Signal stream end
+    let end = Response {
+        result: None,
+        error: None,
+        stream_end: true,
+    };
+    let _ = write_response(writer, &end).await;
+}
+
+async fn chats_subscribe(
+    wn: &Whitenoise,
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    account_str: &str,
+) {
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            return;
+        }
+    };
+
+    let subscription = match wn.subscribe_to_chat_list(&account).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            return;
+        }
+    };
+
+    // Send initial items
+    for item in &subscription.initial_items {
+        let formatted = clean_chat_list_item(wn, item).await;
+        let resp = Response::ok(serde_json::json!({
+            "trigger": "InitialItem",
+            "item": formatted,
+        }));
+        if !write_response(writer, &resp).await {
+            return;
+        }
+    }
+
+    // Stream live updates
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let formatted = clean_chat_list_item(wn, &update.item).await;
+                let resp = Response::ok(serde_json::json!({
+                    "trigger": update.trigger,
+                    "item": formatted,
+                }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("chat list stream lagged by {n} updates");
+            }
+        }
+    }
+
+    let end = Response {
+        result: None,
+        error: None,
+        stream_end: true,
+    };
+    let _ = write_response(writer, &end).await;
+}
+
+/// Clean a ChatListItem for output: strip redundant mls_group_id from last_message,
+/// and resolve missing author_display_name.
+async fn clean_chat_list_item(
+    wn: &Whitenoise,
+    item: &crate::whitenoise::chat_list::ChatListItem,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(item).unwrap_or_default();
+    if let Some(last_msg) = value.get_mut("last_message") {
+        if let Some(obj) = last_msg.as_object_mut() {
+            obj.remove("mls_group_id");
+
+            // Resolve author_display_name if missing
+            if obj.get("author_display_name").is_none_or(|v| v.is_null()) {
+                if let Some(author_hex) = obj.get("author").and_then(|v| v.as_str()) {
+                    if let Ok(pk) = PublicKey::parse(author_hex) {
+                        if let Some(name) = resolve_display_name(wn, &pk).await {
+                            obj.insert(
+                                "author_display_name".to_string(),
+                                serde_json::Value::String(name),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    value
 }
 
 fn parse_pubkey(s: &str) -> Result<PublicKey, Response> {
@@ -624,26 +846,16 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
-    // Strip redundant mls_group_id from last_message (already on the outer item)
-    let mut value = serde_json::to_value(&items).map_err(|e| Response::err(e.to_string()))?;
-    if let Some(arr) = value.as_array_mut() {
-        for item in arr {
-            if let Some(last_msg) = item.get_mut("last_message") {
-                if let Some(obj) = last_msg.as_object_mut() {
-                    obj.remove("mls_group_id");
-                }
-            }
-        }
+    let mut clean = Vec::with_capacity(items.len());
+    for item in &items {
+        clean.push(clean_chat_list_item(wn, item).await);
     }
-
-    Ok(Response::ok(value))
+    Ok(to_response(&clean))
 }
 
 async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
     use crate::whitenoise::app_settings::ThemeMode;
-    let theme: ThemeMode = theme_str
-        .parse()
-        .map_err(|e: String| Response::err(e))?;
+    let theme: ThemeMode = theme_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_theme_mode(theme)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
@@ -652,9 +864,7 @@ async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Re
 
 async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
     use crate::whitenoise::app_settings::Language;
-    let language: Language = lang_str
-        .parse()
-        .map_err(|e: String| Response::err(e))?;
+    let language: Language = lang_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_language(language)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
@@ -691,22 +901,15 @@ async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
     Ok(to_response(&user))
 }
 
-async fn list_messages(
+/// Collect unique pubkeys from a slice of ChatMessages (authors + reaction users)
+/// and resolve their display names.
+async fn resolve_chat_display_names(
     wn: &Whitenoise,
-    account_str: &str,
-    group_id_hex: &str,
-) -> Result<Response, Response> {
-    let account = find_account(wn, account_str).await?;
-    let group_id = parse_group_id(group_id_hex)?;
-    let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
-        .await
-        .map_err(|e| Response::err(e.to_string()))?;
-
-    // Resolve display names for all referenced pubkeys (authors + reaction users)
+    messages: &[crate::whitenoise::message_aggregator::ChatMessage],
+) -> HashMap<PublicKey, String> {
     let unique_pubkeys: Vec<PublicKey> = {
         let mut seen = std::collections::HashSet::new();
-        for m in &messages {
+        for m in messages {
             seen.insert(m.author);
             for reaction in m.reactions.by_emoji.values() {
                 for pk in &reaction.users {
@@ -722,75 +925,98 @@ async fn list_messages(
             display_names.insert(*pk, name);
         }
     }
+    display_names
+}
 
-    // Build clean response, filtering deleted messages
-    let clean: Vec<serde_json::Value> = messages
-        .iter()
-        .filter(|m| !m.is_deleted)
-        .map(|m| {
-            let display_name = display_names
-                .get(&m.author)
-                .cloned()
-                .unwrap_or_else(|| m.author.to_string());
+/// Format a single ChatMessage into a JSON value with display names and local timestamps.
+/// Skipped if the message is deleted (returns None).
+fn format_chat_message(
+    m: &crate::whitenoise::message_aggregator::ChatMessage,
+    display_names: &HashMap<PublicKey, String>,
+) -> Option<serde_json::Value> {
+    if m.is_deleted {
+        return None;
+    }
 
-            let created_at_local =
-                chrono::DateTime::from_timestamp(m.created_at.as_secs() as i64, 0)
-                    .map(|dt| {
-                        dt.with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| m.created_at.to_string());
+    let display_name = display_names
+        .get(&m.author)
+        .cloned()
+        .unwrap_or_else(|| m.author.to_string());
 
-            let mut msg = serde_json::json!({
-                "id": m.id,
-                "author": m.author.to_hex(),
-                "display_name": display_name,
-                "content": m.content,
-                "created_at": m.created_at.as_secs(),
-                "created_at_local": created_at_local,
-                "kind": m.kind,
-                "reply_to": m.reply_to_id,
-                "is_reply": m.is_reply,
-                "media_attachments": m.media_attachments,
-            });
+    let created_at_local = chrono::DateTime::from_timestamp(m.created_at.as_secs() as i64, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| m.created_at.to_string());
 
-            // Only include reactions when non-empty
-            if !m.reactions.by_emoji.is_empty() || !m.reactions.user_reactions.is_empty() {
-                // Build by_emoji with display names instead of raw pubkeys
-                let by_emoji: serde_json::Map<String, serde_json::Value> = m
-                    .reactions
-                    .by_emoji
+    let mut msg = serde_json::json!({
+        "id": m.id,
+        "author": m.author.to_hex(),
+        "display_name": display_name,
+        "content": m.content,
+        "created_at": m.created_at.as_secs(),
+        "created_at_local": created_at_local,
+        "kind": m.kind,
+        "reply_to": m.reply_to_id,
+        "is_reply": m.is_reply,
+        "media_attachments": m.media_attachments,
+    });
+
+    // Only include reactions when non-empty
+    if !m.reactions.by_emoji.is_empty() || !m.reactions.user_reactions.is_empty() {
+        let by_emoji: serde_json::Map<String, serde_json::Value> = m
+            .reactions
+            .by_emoji
+            .iter()
+            .map(|(emoji, reaction)| {
+                let user_names: Vec<String> = reaction
+                    .users
                     .iter()
-                    .map(|(emoji, reaction)| {
-                        let user_names: Vec<String> = reaction
-                            .users
-                            .iter()
-                            .map(|pk| {
-                                display_names
-                                    .get(pk)
-                                    .cloned()
-                                    .unwrap_or_else(|| pk.to_hex())
-                            })
-                            .collect();
-                        (
-                            emoji.clone(),
-                            serde_json::json!({
-                                "emoji": reaction.emoji,
-                                "count": reaction.count,
-                                "users": user_names,
-                            }),
-                        )
+                    .map(|pk| {
+                        display_names
+                            .get(pk)
+                            .cloned()
+                            .unwrap_or_else(|| pk.to_hex())
                     })
                     .collect();
+                (
+                    emoji.clone(),
+                    serde_json::json!({
+                        "emoji": reaction.emoji,
+                        "count": reaction.count,
+                        "users": user_names,
+                    }),
+                )
+            })
+            .collect();
 
-                let mut reactions = serde_json::to_value(&m.reactions).unwrap_or_default();
-                reactions["by_emoji"] = serde_json::Value::Object(by_emoji);
-                msg["reactions"] = reactions;
-            }
+        let mut reactions = serde_json::to_value(&m.reactions).unwrap_or_default();
+        reactions["by_emoji"] = serde_json::Value::Object(by_emoji);
+        msg["reactions"] = reactions;
+    }
 
-            msg
-        })
+    Some(msg)
+}
+
+async fn list_messages(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let messages = wn
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let display_names = resolve_chat_display_names(wn, &messages).await;
+
+    let clean: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|m| format_chat_message(m, &display_names))
         .collect();
 
     Ok(to_response(&clean))

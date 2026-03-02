@@ -66,18 +66,35 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let response = match lines.next_line().await {
+    let req = match lines.next_line().await {
         Ok(Some(line)) => match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch::dispatch(req).await,
-            Err(e) => Response::err(format!("invalid request: {e}")),
+            Ok(req) => req,
+            Err(e) => {
+                let resp = Response::err(format!("invalid request: {e}"));
+                let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
+                buf.push(b'\n');
+                let _ = writer.write_all(&buf).await;
+                return;
+            }
         },
         Ok(None) => return, // Client disconnected without sending
-        Err(e) => Response::err(format!("read error: {e}")),
+        Err(e) => {
+            let resp = Response::err(format!("read error: {e}"));
+            let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
+            buf.push(b'\n');
+            let _ = writer.write_all(&buf).await;
+            return;
+        }
     };
 
-    let mut buf = serde_json::to_vec(&response).unwrap_or_default();
-    buf.push(b'\n');
-    let _ = writer.write_all(&buf).await;
+    if req.is_streaming() {
+        dispatch::dispatch_streaming(req, writer).await;
+    } else {
+        let response = dispatch::dispatch(req).await;
+        let mut buf = serde_json::to_vec(&response).unwrap_or_default();
+        buf.push(b'\n');
+        let _ = writer.write_all(&buf).await;
+    }
 }
 
 /// If a socket file exists but the process that created it is dead, remove it.

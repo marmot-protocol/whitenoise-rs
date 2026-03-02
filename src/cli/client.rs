@@ -33,6 +33,50 @@ pub async fn send(socket_path: &Path, request: &Request) -> anyhow::Result<Respo
     }
 }
 
+/// Send a streaming request and call the handler for each response line.
+///
+/// The handler receives each `Response` and returns `true` to continue or `false` to stop.
+/// The loop ends when the server sends `stream_end: true`, the handler returns `false`,
+/// or the connection closes.
+pub async fn stream(
+    socket_path: &Path,
+    request: &Request,
+    mut handler: impl FnMut(&Response) -> bool,
+) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::ConnectionRefused
+            || e.kind() == std::io::ErrorKind::NotFound
+        {
+            anyhow::anyhow!(
+                "daemon not running\n\n  Start it with: wn daemon start\n  Check status:  wn daemon status"
+            )
+        } else {
+            anyhow::anyhow!("failed to connect to daemon: {e}")
+        }
+    })?;
+
+    let (reader, mut writer) = stream.into_split();
+
+    let mut buf = serde_json::to_vec(request)?;
+    buf.push(b'\n');
+    writer.write_all(&buf).await?;
+    // Don't shutdown the writer — keep the connection open for streaming
+    drop(writer);
+
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let resp: Response = serde_json::from_str(&line)?;
+        if resp.stream_end {
+            break;
+        }
+        if !handler(&resp) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
