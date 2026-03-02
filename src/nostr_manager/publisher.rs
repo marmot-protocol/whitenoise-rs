@@ -1,10 +1,20 @@
 //! This module contains functions for publishing Nostr events and handling the publish tracking process.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 
 use crate::{
     RelayType,
     nostr_manager::{NostrManager, NostrManagerError, Result},
+    whitenoise::{
+        aggregated_message::AggregatedMessage,
+        database::Database,
+        message_aggregator::DeliveryStatus,
+        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
+    },
 };
 
 impl NostrManager {
@@ -188,6 +198,142 @@ impl NostrManager {
                 .map_err(|e| NostrManagerError::FailedToTrackPublishedEvent(e.to_string()))?;
         }
         Ok(result)
+    }
+
+    /// Publish an event with exponential backoff retries.
+    ///
+    /// Attempts up to 3 publishes with delays of 2s and 4s between retries.
+    /// On success, updates the delivery status to `Sent(relay_count)`.
+    /// On failure (all retries exhausted), updates to `Failed(reason)`.
+    pub(crate) async fn publish_with_retries(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+        stream_manager: &Arc<MessageStreamManager>,
+    ) {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_error = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::debug!(
+                    target: "whitenoise::messages::delivery",
+                    "Retrying message publish \
+                     (attempt {}/{MAX_ATTEMPTS}), \
+                     backing off {delay:?}",
+                    attempt + 1,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .publish_event_to(event.clone(), account_pubkey, relays)
+                .await
+            {
+                Ok(output) if !output.success.is_empty() => {
+                    let status = DeliveryStatus::Sent(output.success.len());
+                    Self::update_and_emit_delivery_status(
+                        event_id,
+                        group_id,
+                        &status,
+                        database,
+                        stream_manager,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS}: \
+                         no relay accepted (failed: {:?})",
+                        attempt + 1,
+                        output.failed.keys().collect::<Vec<_>>(),
+                    );
+                    last_error = Some("No relay accepted the message".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS} \
+                         failed: {e}",
+                        attempt + 1,
+                    );
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        // All retries exhausted — mark as failed
+        // Safety: last_error is always Some because the loop body always sets it
+        let reason = last_error.expect("loop always sets last_error");
+        let status = DeliveryStatus::Failed(reason);
+        Self::update_and_emit_delivery_status(
+            event_id,
+            group_id,
+            &status,
+            database,
+            stream_manager,
+        )
+        .await;
+    }
+
+    /// Update delivery status in the DB cache and emit a stream update.
+    ///
+    /// Note: There is a small race window between `update_delivery_status` and
+    /// `find_by_id` where a concurrent `retry_message_publish` could interleave.
+    /// In practice this is acceptable because (a) retries are user-initiated and
+    /// unlikely to overlap with in-flight status transitions, and (b) the worst
+    /// case is a briefly stale UI that self-corrects on the next status update.
+    async fn update_and_emit_delivery_status(
+        event_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+        stream_manager: &MessageStreamManager,
+    ) {
+        if let Err(e) =
+            AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
+        {
+            tracing::warn!(
+                target: "whitenoise::messages::delivery",
+                "Failed to update delivery status in cache: {}",
+                e
+            );
+            return;
+        }
+
+        // Re-fetch the full message to emit with updated status
+        match AggregatedMessage::find_by_id(event_id, group_id, database).await {
+            Ok(Some(updated_msg)) => {
+                stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::DeliveryStatusChanged,
+                        message: updated_msg,
+                    },
+                );
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Message {} not found in cache after delivery status update",
+                    event_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Failed to fetch updated message for delivery status emission: {}",
+                    e
+                );
+            }
+        }
     }
 
     /// Publishes a Nostr event builder using a temporary signer.

@@ -1,18 +1,13 @@
-use std::sync::Arc;
-use std::time::Duration;
-
 use crate::{
-    nostr_manager::NostrManager,
     types::MessageWithTokens,
     whitenoise::{
         Whitenoise,
         accounts::Account,
         aggregated_message::AggregatedMessage,
-        database::Database,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
         message_aggregator::{ChatMessage, DeliveryStatus},
-        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
+        message_streaming::{MessageUpdate, UpdateTrigger},
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
@@ -68,62 +63,36 @@ impl Whitenoise {
         // Proactive caching + delivery tracking only for chat messages (kind 9).
         // Reactions (kind 7) and deletions (kind 5) don't need delivery status UI.
         if kind == 9 {
-            let chat_message = self
-                .message_aggregator
-                .process_single_message(
-                    &mdk_message,
-                    &self.nostr,
-                    MediaFile::find_by_group(&self.database, group_id).await?,
-                )
-                .await
-                .map(|mut msg| {
-                    msg.delivery_status = Some(DeliveryStatus::Sending);
-                    msg
-                })
-                .map_err(|e| {
-                    WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
-                })?;
-
-            AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
-                .await
-                .map_err(|e| {
-                    WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
-                })?;
-
-            // Emit NewMessage so the UI shows it immediately (optimistic)
-            self.message_stream_manager.emit(
-                group_id,
-                MessageUpdate {
-                    trigger: UpdateTrigger::NewMessage,
-                    message: chat_message,
-                },
-            );
+            self.process_and_emit_outgoing_message(&mdk_message, group_id)
+                .await?;
         }
 
-        // Spawn background task: retry publish + emit delivery status update
+        // Spawn background publish task
         let nostr = self.nostr.clone();
-        let database = self.database.clone();
-        let stream_manager = self.message_stream_manager.clone();
         let event_id_str = event_id.to_string();
-        let group_id_clone = group_id.clone();
         let account_pubkey = account.pubkey;
-        let is_chat_message = kind == 9;
 
-        tokio::spawn(async move {
-            if is_chat_message {
-                Self::publish_with_retries(
-                    &nostr,
-                    message_event,
-                    &account_pubkey,
-                    &group_relays,
-                    &event_id_str,
-                    &group_id_clone,
-                    &database,
-                    &stream_manager,
-                )
-                .await;
-            } else {
-                // Reactions/deletions: best-effort publish, no delivery tracking
+        if kind == 9 {
+            let database = self.database.clone();
+            let stream_manager = self.message_stream_manager.clone();
+            let group_id_clone = group_id.clone();
+
+            tokio::spawn(async move {
+                nostr
+                    .publish_with_retries(
+                        message_event,
+                        &account_pubkey,
+                        &group_relays,
+                        &event_id_str,
+                        &group_id_clone,
+                        &database,
+                        &stream_manager,
+                    )
+                    .await;
+            });
+        } else {
+            // Reactions/deletions: best-effort publish, no delivery tracking
+            tokio::spawn(async move {
                 if let Err(e) = nostr
                     .publish_event_to(message_event, &account_pubkey, &group_relays)
                     .await
@@ -134,140 +103,54 @@ impl Whitenoise {
                         kind,
                     );
                 }
-            }
-        });
+            });
+        }
 
         Ok(MessageWithTokens::new(mdk_message, tokens))
     }
 
-    /// Update delivery status in the DB cache and emit a stream update.
-    async fn update_and_emit_delivery_status(
-        event_id: &str,
-        group_id: &GroupId,
-        status: &DeliveryStatus,
-        database: &Database,
-        stream_manager: &MessageStreamManager,
-    ) {
-        if let Err(e) =
-            AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
-        {
-            tracing::warn!(
-                target: "whitenoise::messages::delivery",
-                "Failed to update delivery status in cache: {}",
-                e
-            );
-            return;
-        }
-
-        // Re-fetch the full message to emit with updated status
-        match AggregatedMessage::find_by_id(event_id, group_id, database).await {
-            Ok(Some(updated_msg)) => {
-                stream_manager.emit(
-                    group_id,
-                    MessageUpdate {
-                        trigger: UpdateTrigger::DeliveryStatusChanged,
-                        message: updated_msg,
-                    },
-                );
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Message {} not found in cache after delivery status update",
-                    event_id
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Failed to fetch updated message for delivery status emission: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    /// Publish an event with exponential backoff retries.
+    /// Process an outgoing chat message for optimistic UI display.
     ///
-    /// Attempts up to 3 publishes with delays of 2s and 4s between retries.
-    /// On success, updates the delivery status to `Sent(relay_count)`.
-    /// On failure (all retries exhausted), updates to `Failed(reason)`.
-    async fn publish_with_retries(
-        nostr: &NostrManager,
-        event: Event,
-        account_pubkey: &PublicKey,
-        relays: &[RelayUrl],
-        event_id: &str,
+    /// Aggregates the raw MDK message into a `ChatMessage`, sets its delivery
+    /// status to `Sending`, persists it in the cache, and emits a `NewMessage`
+    /// update so the UI shows it immediately.
+    async fn process_and_emit_outgoing_message(
+        &self,
+        mdk_message: &Message,
         group_id: &GroupId,
-        database: &Database,
-        stream_manager: &Arc<MessageStreamManager>,
-    ) {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut last_error = None;
+    ) -> Result<()> {
+        let chat_message = self
+            .message_aggregator
+            .process_single_message(
+                mdk_message,
+                &self.nostr,
+                MediaFile::find_by_group(&self.database, group_id).await?,
+            )
+            .await
+            .map(|mut msg| {
+                msg.delivery_status = Some(DeliveryStatus::Sending);
+                msg
+            })
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
+            })?;
 
-        for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
-                let delay = Duration::from_secs(1 << attempt);
-                tracing::debug!(
-                    target: "whitenoise::messages::delivery",
-                    "Retrying message publish \
-                     (attempt {}/{MAX_ATTEMPTS}), \
-                     backing off {delay:?}",
-                    attempt + 1,
-                );
-                tokio::time::sleep(delay).await;
-            }
+        AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
+            })?;
 
-            match nostr
-                .publish_event_to(event.clone(), account_pubkey, relays)
-                .await
-            {
-                Ok(output) if !output.success.is_empty() => {
-                    let status = DeliveryStatus::Sent(output.success.len());
-                    Self::update_and_emit_delivery_status(
-                        event_id,
-                        group_id,
-                        &status,
-                        database,
-                        stream_manager,
-                    )
-                    .await;
-                    return;
-                }
-                Ok(output) => {
-                    tracing::warn!(
-                        target: "whitenoise::messages::delivery",
-                        "Publish attempt {}/{MAX_ATTEMPTS}: \
-                         no relay accepted (failed: {:?})",
-                        attempt + 1,
-                        output.failed.keys().collect::<Vec<_>>(),
-                    );
-                    last_error = Some("No relay accepted the message".to_string());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::messages::delivery",
-                        "Publish attempt {}/{MAX_ATTEMPTS} \
-                         failed: {e}",
-                        attempt + 1,
-                    );
-                    last_error = Some(e.to_string());
-                }
-            }
-        }
-
-        // All retries exhausted — mark as failed
-        // Safety: last_error is always Some because the loop body always sets it
-        let reason = last_error.expect("loop always sets last_error");
-        let status = DeliveryStatus::Failed(reason);
-        Self::update_and_emit_delivery_status(
-            event_id,
+        // Emit NewMessage so the UI shows it immediately (optimistic)
+        self.message_stream_manager.emit(
             group_id,
-            &status,
-            database,
-            stream_manager,
-        )
-        .await;
+            MessageUpdate {
+                trigger: UpdateTrigger::NewMessage,
+                message: chat_message,
+            },
+        );
+
+        Ok(())
     }
 
     /// Retry publishing a failed message.
@@ -370,17 +253,17 @@ impl Whitenoise {
         let account_pubkey = account.pubkey;
 
         tokio::spawn(async move {
-            Self::publish_with_retries(
-                &nostr,
-                message_event,
-                &account_pubkey,
-                &group_relays,
-                &event_id_str,
-                &group_id_clone,
-                &database,
-                &stream_manager,
-            )
-            .await;
+            nostr
+                .publish_with_retries(
+                    message_event,
+                    &account_pubkey,
+                    &group_relays,
+                    &event_id_str,
+                    &group_id_clone,
+                    &database,
+                    &stream_manager,
+                )
+                .await;
         });
 
         Ok(())
@@ -1533,17 +1416,18 @@ mod tests {
         // Call publish_with_retries directly with unreachable relays
         let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
 
-        Whitenoise::publish_with_retries(
-            &whitenoise.nostr,
-            event,
-            &creator.pubkey,
-            &unreachable_relays,
-            &event_id,
-            &group.mls_group_id,
-            &whitenoise.database,
-            &whitenoise.message_stream_manager,
-        )
-        .await;
+        whitenoise
+            .nostr
+            .publish_with_retries(
+                event,
+                &creator.pubkey,
+                &unreachable_relays,
+                &event_id,
+                &group.mls_group_id,
+                &whitenoise.database,
+                &whitenoise.message_stream_manager,
+            )
+            .await;
 
         // Verify status transitioned to Failed
         let msg =
