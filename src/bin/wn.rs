@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use whitenoise::cli::commands::{
-    accounts::AccountsCmd, daemon::DaemonCmd, groups::GroupsCmd, identity, messages::MessagesCmd,
+    accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, follows::FollowsCmd,
+    groups::GroupsCmd, identity, messages::MessagesCmd, profile::ProfileCmd, relays::RelaysCmd,
+    settings::SettingsCmd, users::UsersCmd,
 };
 use whitenoise::cli::config::Config;
 
@@ -61,6 +63,10 @@ enum Cmd {
     #[clap(subcommand)]
     Accounts(AccountsCmd),
 
+    /// List chats
+    #[clap(subcommand)]
+    Chats(ChatsCmd),
+
     /// Manage groups
     #[clap(subcommand)]
     Groups(GroupsCmd),
@@ -68,6 +74,26 @@ enum Cmd {
     /// Manage messages
     #[clap(subcommand)]
     Messages(MessagesCmd),
+
+    /// Manage follows
+    #[clap(subcommand)]
+    Follows(FollowsCmd),
+
+    /// Manage profile metadata
+    #[clap(subcommand)]
+    Profile(ProfileCmd),
+
+    /// Show relay statuses
+    #[clap(subcommand)]
+    Relays(RelaysCmd),
+
+    /// Manage app settings
+    #[clap(subcommand)]
+    Settings(SettingsCmd),
+
+    /// Look up users
+    #[clap(subcommand)]
+    Users(UsersCmd),
 }
 
 #[tokio::main]
@@ -84,7 +110,13 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Whoami => identity::whoami(&socket, args.json).await,
         Cmd::ExportNsec { pubkey } => identity::export_nsec(&socket, &pubkey, args.json).await,
         Cmd::Accounts(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Chats(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Groups(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Messages(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Follows(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Profile(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Relays(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Settings(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Users(cmd) => cmd.run(&socket, args.json).await,
     }
 }

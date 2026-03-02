@@ -52,6 +52,81 @@ pub enum Request {
     #[serde(rename = "get_group")]
     GetGroup { account: String, group_id: String },
 
+    #[serde(rename = "group_members")]
+    GroupMembers { account: String, group_id: String },
+    #[serde(rename = "group_admins")]
+    GroupAdmins { account: String, group_id: String },
+    #[serde(rename = "remove_members")]
+    RemoveMembers {
+        account: String,
+        group_id: String,
+        members: Vec<String>,
+    },
+    #[serde(rename = "leave_group")]
+    LeaveGroup { account: String, group_id: String },
+    #[serde(rename = "rename_group")]
+    RenameGroup {
+        account: String,
+        group_id: String,
+        name: String,
+    },
+    #[serde(rename = "group_invites")]
+    GroupInvites { account: String },
+    #[serde(rename = "accept_invite")]
+    AcceptInvite { account: String, group_id: String },
+    #[serde(rename = "decline_invite")]
+    DeclineInvite { account: String, group_id: String },
+
+    // Follows
+    #[serde(rename = "follows_list")]
+    FollowsList { account: String },
+    #[serde(rename = "follows_add")]
+    FollowsAdd { account: String, pubkey: String },
+    #[serde(rename = "follows_remove")]
+    FollowsRemove { account: String, pubkey: String },
+    #[serde(rename = "follows_check")]
+    FollowsCheck { account: String, pubkey: String },
+
+    // Profile
+    #[serde(rename = "profile_show")]
+    ProfileShow { account: String },
+    #[serde(rename = "profile_update")]
+    ProfileUpdate {
+        account: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        about: Option<String>,
+        #[serde(default)]
+        picture: Option<String>,
+        #[serde(default)]
+        nip05: Option<String>,
+        #[serde(default)]
+        lud16: Option<String>,
+    },
+
+    // Chat list
+    #[serde(rename = "chats_list")]
+    ChatsList { account: String },
+
+    // Settings
+    #[serde(rename = "settings_show")]
+    SettingsShow,
+    #[serde(rename = "settings_theme")]
+    SettingsTheme { theme: String },
+    #[serde(rename = "settings_language")]
+    SettingsLanguage { language: String },
+
+    // Users
+    #[serde(rename = "users_show")]
+    UsersShow { pubkey: String },
+
+    // Relays
+    #[serde(rename = "relays_list")]
+    RelaysList { account: String },
+
     // Messages
     #[serde(rename = "list_messages")]
     ListMessages { account: String, group_id: String },
@@ -291,6 +366,83 @@ mod tests {
     }
 
     #[test]
+    fn group_members_roundtrip() {
+        let req = Request::GroupMembers {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupMembers { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn group_admins_roundtrip() {
+        let req = Request::GroupAdmins {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupAdmins { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn remove_members_roundtrip() {
+        let req = Request::RemoveMembers {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            members: vec!["npub1x".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RemoveMembers { account, group_id, members }
+            if account == "npub1abc" && group_id == "abcd1234" && members.len() == 1
+        ));
+    }
+
+    #[test]
+    fn leave_group_roundtrip() {
+        let req = Request::LeaveGroup {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::LeaveGroup { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn rename_group_roundtrip() {
+        let req = Request::RenameGroup {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            name: "New Name".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RenameGroup { account, group_id, name }
+            if account == "npub1abc" && group_id == "abcd1234" && name == "New Name"
+        ));
+    }
+
+    #[test]
     fn unknown_method_is_deser_error() {
         let json = r#"{"method":"nonexistent"}"#;
         assert!(serde_json::from_str::<Request>(json).is_err());
@@ -314,6 +466,211 @@ mod tests {
         assert!(parsed.get("result").is_none());
         assert!(parsed.get("stream_end").is_none());
         assert_eq!(parsed["error"]["message"], "something went wrong");
+    }
+
+    #[test]
+    fn group_invites_roundtrip() {
+        let req = Request::GroupInvites {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::GroupInvites { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn accept_invite_roundtrip() {
+        let req = Request::AcceptInvite {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::AcceptInvite { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn decline_invite_roundtrip() {
+        let req = Request::DeclineInvite {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DeclineInvite { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn profile_show_roundtrip() {
+        let req = Request::ProfileShow {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::ProfileShow { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn profile_update_roundtrip() {
+        let req = Request::ProfileUpdate {
+            account: "npub1abc".into(),
+            name: Some("alice".into()),
+            display_name: Some("Alice".into()),
+            about: None,
+            picture: None,
+            nip05: Some("alice@example.com".into()),
+            lud16: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ProfileUpdate { account, name, display_name, nip05, about, .. }
+            if account == "npub1abc"
+                && name.as_deref() == Some("alice")
+                && display_name.as_deref() == Some("Alice")
+                && nip05.as_deref() == Some("alice@example.com")
+                && about.is_none()
+        ));
+    }
+
+    #[test]
+    fn profile_update_minimal_roundtrip() {
+        let wire = r#"{"method":"profile_update","params":{"account":"npub1abc","name":"bob"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ProfileUpdate { account, name, display_name, about, picture, nip05, lud16 }
+            if account == "npub1abc"
+                && name.as_deref() == Some("bob")
+                && display_name.is_none()
+                && about.is_none()
+                && picture.is_none()
+                && nip05.is_none()
+                && lud16.is_none()
+        ));
+    }
+
+    #[test]
+    fn follows_list_roundtrip() {
+        let req = Request::FollowsList {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::FollowsList { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn follows_add_roundtrip() {
+        let req = Request::FollowsAdd {
+            account: "npub1abc".into(),
+            pubkey: "npub1xyz".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::FollowsAdd { account, pubkey }
+            if account == "npub1abc" && pubkey == "npub1xyz"
+        ));
+    }
+
+    #[test]
+    fn follows_remove_roundtrip() {
+        let req = Request::FollowsRemove {
+            account: "npub1abc".into(),
+            pubkey: "npub1xyz".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::FollowsRemove { account, pubkey }
+            if account == "npub1abc" && pubkey == "npub1xyz"
+        ));
+    }
+
+    #[test]
+    fn follows_check_roundtrip() {
+        let req = Request::FollowsCheck {
+            account: "npub1abc".into(),
+            pubkey: "npub1xyz".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::FollowsCheck { account, pubkey }
+            if account == "npub1abc" && pubkey == "npub1xyz"
+        ));
+    }
+
+    #[test]
+    fn chats_list_roundtrip() {
+        let req = Request::ChatsList {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::ChatsList { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn settings_show_roundtrip() {
+        let req = Request::SettingsShow;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"method":"settings_show"}"#);
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::SettingsShow));
+    }
+
+    #[test]
+    fn settings_theme_roundtrip() {
+        let req = Request::SettingsTheme {
+            theme: "dark".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::SettingsTheme { theme } if theme == "dark"));
+    }
+
+    #[test]
+    fn settings_language_roundtrip() {
+        let req = Request::SettingsLanguage {
+            language: "en".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::SettingsLanguage { language } if language == "en"));
+    }
+
+    #[test]
+    fn relays_list_roundtrip() {
+        let req = Request::RelaysList {
+            account: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::RelaysList { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn users_show_roundtrip() {
+        let req = Request::UsersShow {
+            pubkey: "npub1abc".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::UsersShow { pubkey } if pubkey == "npub1abc"));
     }
 
     /// Verify that JSON sent from the wire (e.g. via socat) deserializes correctly.

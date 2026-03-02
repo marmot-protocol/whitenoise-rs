@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
-use nostr_sdk::PublicKey;
+use nostr_sdk::{JsonUtil, PublicKey};
 
 use crate::Whitenoise;
+use crate::whitenoise::accounts_groups::AccountGroup;
 
 use super::protocol::{Request, Response};
 
@@ -107,6 +108,151 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::GroupMembers { account, group_id } => {
+            match group_pubkey_list(wn, &account, &group_id, false).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::GroupAdmins { account, group_id } => {
+            match group_pubkey_list(wn, &account, &group_id, true).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::RemoveMembers {
+            account,
+            group_id,
+            members,
+        } => match remove_members(wn, &account, &group_id, members).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::LeaveGroup { account, group_id } => {
+            match leave_group(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::RenameGroup {
+            account,
+            group_id,
+            name,
+        } => match rename_group(wn, &account, &group_id, name).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::GroupInvites { account } => match group_invites(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::AcceptInvite { account, group_id } => {
+            match respond_to_invite(wn, &account, &group_id, true).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::DeclineInvite { account, group_id } => {
+            match respond_to_invite(wn, &account, &group_id, false).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::ProfileShow { account } => match profile_show(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::ProfileUpdate {
+            account,
+            name,
+            display_name,
+            about,
+            picture,
+            nip05,
+            lud16,
+        } => {
+            match profile_update(
+                wn,
+                &account,
+                name,
+                display_name,
+                about,
+                picture,
+                nip05,
+                lud16,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsList { account } => match follows_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::FollowsAdd { account, pubkey } => {
+            match follows_mutate(wn, &account, &pubkey, FollowAction::Add).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsRemove { account, pubkey } => {
+            match follows_mutate(wn, &account, &pubkey, FollowAction::Remove).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsCheck { account, pubkey } => {
+            match follows_check(wn, &account, &pubkey).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::ChatsList { account } => match chats_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::SettingsShow => match wn.app_settings().await {
+            Ok(settings) => to_response(&settings),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::SettingsTheme { theme } => match settings_theme(wn, &theme).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::SettingsLanguage { language } => match settings_language(wn, &language).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::RelaysList { account } => match relays_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UsersShow { pubkey } => match users_show(wn, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         Request::ListMessages { account, group_id } => {
             match list_messages(wn, &account, &group_id).await {
                 Ok(resp) => resp,
@@ -142,6 +288,40 @@ async fn find_account(
         .into_iter()
         .find(|a| a.pubkey == pk)
         .ok_or_else(|| Response::err(format!("account not found: {pubkey_str}")))
+}
+
+async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
+    // Try local User record first
+    if let Ok(mut user) = wn.find_user_by_pubkey(pubkey).await {
+        if user.metadata.display_name.is_none() && user.metadata.name.is_none() {
+            let _ = user.sync_metadata(wn).await;
+        }
+        let name = user
+            .metadata
+            .display_name
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .or(user.metadata.name.as_ref().filter(|s| !s.is_empty()))
+            .cloned();
+        if name.is_some() {
+            return name;
+        }
+    }
+
+    // User not in DB or sync returned empty — fetch metadata directly from relays
+    let relays = wn.fallback_relay_urls().await;
+    let event = wn
+        .nostr
+        .fetch_metadata_from(&relays, *pubkey)
+        .await
+        .ok()??;
+    let metadata = nostr_sdk::Metadata::from_json(&event.content).ok()?;
+    metadata
+        .display_name
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .or(metadata.name.as_ref().filter(|s| !s.is_empty()))
+        .cloned()
 }
 
 async fn create_group(
@@ -216,6 +396,301 @@ async fn get_group(
     Ok(to_response(&group))
 }
 
+async fn group_pubkey_list(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    admins_only: bool,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let pubkeys = if admins_only {
+        wn.group_admins(&account, &group_id).await
+    } else {
+        wn.group_members(&account, &group_id).await
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut members = Vec::with_capacity(pubkeys.len());
+    for pk in &pubkeys {
+        let display_name = resolve_display_name(wn, pk).await;
+        members.push(serde_json::json!({
+            "pubkey": pk.to_hex(),
+            "display_name": display_name,
+        }));
+    }
+    Ok(to_response(&members))
+}
+
+async fn remove_members(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    member_strs: Vec<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let members: Vec<PublicKey> = member_strs
+        .iter()
+        .map(|s| parse_pubkey(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    wn.remove_members_from_group(&account, &group_id, members)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn leave_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.leave_group(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn rename_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    name: String,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let update = mdk_core::prelude::NostrGroupDataUpdate::new().name(name);
+    wn.update_group_data(&account, &group_id, update)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let groups = wn
+        .visible_groups(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let pending: Vec<_> = groups.into_iter().filter(|g| g.is_pending()).collect();
+
+    Ok(to_response(&pending))
+}
+
+async fn respond_to_invite(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    accept: bool,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let ag = AccountGroup::get(wn, &account.pubkey, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .ok_or_else(|| Response::err("group not found for this account"))?;
+
+    if accept {
+        ag.accept(wn).await
+    } else {
+        ag.decline(wn).await
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let metadata = account
+        .metadata(wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(to_response(&metadata))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn profile_update(
+    wn: &Whitenoise,
+    account_str: &str,
+    name: Option<String>,
+    display_name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+
+    // Read-modify-write: start from current metadata, apply provided fields
+    let mut metadata = account
+        .metadata(wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    if let Some(v) = name {
+        metadata.name = Some(v);
+    }
+    if let Some(v) = display_name {
+        metadata.display_name = Some(v);
+    }
+    if let Some(v) = about {
+        metadata.about = Some(v);
+    }
+    if let Some(v) = picture {
+        metadata.picture = Some(
+            v.parse()
+                .map_err(|e| Response::err(format!("invalid picture URL: {e}")))?,
+        );
+    }
+    if let Some(v) = nip05 {
+        metadata.nip05 = Some(v);
+    }
+    if let Some(v) = lud16 {
+        metadata.lud16 = Some(v);
+    }
+
+    account
+        .update_metadata(&metadata, wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&metadata))
+}
+
+async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let users = wn
+        .follows(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut entries = Vec::with_capacity(users.len());
+    for user in &users {
+        let display_name = resolve_display_name(wn, &user.pubkey).await;
+        entries.push(serde_json::json!({
+            "pubkey": user.pubkey.to_hex(),
+            "display_name": display_name,
+        }));
+    }
+    Ok(to_response(&entries))
+}
+
+enum FollowAction {
+    Add,
+    Remove,
+}
+
+async fn follows_mutate(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+    action: FollowAction,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    match action {
+        FollowAction::Add => wn.follow_user(&account, &pubkey).await,
+        FollowAction::Remove => wn.unfollow_user(&account, &pubkey).await,
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn follows_check(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    let following = wn
+        .is_following_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!({ "following": following })))
+}
+
+async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let items = wn
+        .get_chat_list(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    // Strip redundant mls_group_id from last_message (already on the outer item)
+    let mut value = serde_json::to_value(&items).map_err(|e| Response::err(e.to_string()))?;
+    if let Some(arr) = value.as_array_mut() {
+        for item in arr {
+            if let Some(last_msg) = item.get_mut("last_message") {
+                if let Some(obj) = last_msg.as_object_mut() {
+                    obj.remove("mls_group_id");
+                }
+            }
+        }
+    }
+
+    Ok(Response::ok(value))
+}
+
+async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
+    use crate::whitenoise::app_settings::ThemeMode;
+    let theme: ThemeMode = theme_str
+        .parse()
+        .map_err(|e: String| Response::err(e))?;
+    wn.update_theme_mode(theme)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
+    use crate::whitenoise::app_settings::Language;
+    let language: Language = lang_str
+        .parse()
+        .map_err(|e: String| Response::err(e))?;
+    wn.update_language(language)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn relays_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let statuses = wn
+        .get_account_relay_statuses(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let relays: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|(url, status)| {
+            serde_json::json!({
+                "url": url.to_string(),
+                "status": format!("{status}"),
+            })
+        })
+        .collect();
+
+    Ok(to_response(&relays))
+}
+
+async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
+    use crate::whitenoise::users::UserSyncMode;
+    let pk = parse_pubkey(pubkey_str)?;
+    let user = wn
+        .find_or_create_user_by_pubkey(&pk, UserSyncMode::Blocking)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(to_response(&user))
+}
+
 async fn list_messages(
     wn: &Whitenoise,
     account_str: &str,
@@ -228,27 +703,23 @@ async fn list_messages(
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
-    // Resolve author display names
-    let unique_authors: Vec<PublicKey> = {
+    // Resolve display names for all referenced pubkeys (authors + reaction users)
+    let unique_pubkeys: Vec<PublicKey> = {
         let mut seen = std::collections::HashSet::new();
-        messages
-            .iter()
-            .filter(|m| seen.insert(m.author))
-            .map(|m| m.author)
-            .collect()
+        for m in &messages {
+            seen.insert(m.author);
+            for reaction in m.reactions.by_emoji.values() {
+                for pk in &reaction.users {
+                    seen.insert(*pk);
+                }
+            }
+        }
+        seen.into_iter().collect()
     };
     let mut display_names: HashMap<PublicKey, String> = HashMap::new();
-    for author in &unique_authors {
-        if let Ok(user) = wn.find_user_by_pubkey(author).await {
-            let name = user
-                .metadata
-                .display_name
-                .as_ref()
-                .filter(|s| !s.is_empty())
-                .or(user.metadata.name.as_ref().filter(|s| !s.is_empty()));
-            if let Some(name) = name {
-                display_names.insert(*author, name.clone());
-            }
+    for pk in &unique_pubkeys {
+        if let Some(name) = resolve_display_name(wn, pk).await {
+            display_names.insert(*pk, name);
         }
     }
 
@@ -286,7 +757,36 @@ async fn list_messages(
 
             // Only include reactions when non-empty
             if !m.reactions.by_emoji.is_empty() || !m.reactions.user_reactions.is_empty() {
-                msg["reactions"] = serde_json::to_value(&m.reactions).unwrap_or_default();
+                // Build by_emoji with display names instead of raw pubkeys
+                let by_emoji: serde_json::Map<String, serde_json::Value> = m
+                    .reactions
+                    .by_emoji
+                    .iter()
+                    .map(|(emoji, reaction)| {
+                        let user_names: Vec<String> = reaction
+                            .users
+                            .iter()
+                            .map(|pk| {
+                                display_names
+                                    .get(pk)
+                                    .cloned()
+                                    .unwrap_or_else(|| pk.to_hex())
+                            })
+                            .collect();
+                        (
+                            emoji.clone(),
+                            serde_json::json!({
+                                "emoji": reaction.emoji,
+                                "count": reaction.count,
+                                "users": user_names,
+                            }),
+                        )
+                    })
+                    .collect();
+
+                let mut reactions = serde_json::to_value(&m.reactions).unwrap_or_default();
+                reactions["by_emoji"] = serde_json::Value::Object(by_emoji);
+                msg["reactions"] = reactions;
             }
 
             msg

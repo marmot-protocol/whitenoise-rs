@@ -39,10 +39,10 @@ pub fn print_response(response: &Response, json: bool) {
 const HEX_FIELDS: &[&str] = &["mls_group_id", "nostr_group_id"];
 
 /// Field names whose hex values should NOT be converted to npub (they are event IDs, not pubkeys).
-const NO_NPUB_FIELDS: &[&str] = &["id", "reply_to"];
+const NO_NPUB_FIELDS: &[&str] = &["id", "reply_to", "message_id"];
 
 /// Fields hidden entirely in human-readable output (still present in --json).
-const HIDDEN_FIELDS: &[&str] = &["author", "created_at"];
+const HIDDEN_FIELDS: &[&str] = &["author", "created_at", "user_reactions", "reaction_id"];
 
 fn format_value(w: &mut impl Write, value: &serde_json::Value, indent: usize) -> io::Result<()> {
     let prefix = "  ".repeat(indent);
@@ -350,6 +350,14 @@ mod tests {
         let out = render(json!({"reply_to": hex}));
         assert!(out.contains(hex));
         assert!(!out.contains("npub1"));
+    }
+
+    #[test]
+    fn message_id_field_stays_hex_not_npub() {
+        let hex = "4dd7a05f5f668589d5d3025a30e3a2603f2d4fe7fb9d0e2b33914b765e9d6f69";
+        let out = render(json!({"message_id": hex}));
+        assert!(out.contains(hex), "message_id should stay as hex");
+        assert!(!out.contains("npub1"), "message_id should not become npub");
     }
 
     #[test]

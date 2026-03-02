@@ -41,6 +41,58 @@ pub enum GroupsCmd {
         #[clap(required = true, value_name = "MEMBER")]
         members: Vec<String>,
     },
+
+    /// Remove members from a group
+    RemoveMembers {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Member pubkeys (npub or hex) to remove
+        #[clap(required = true, value_name = "MEMBER")]
+        members: Vec<String>,
+    },
+
+    /// List group members
+    Members {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
+    /// List group admins
+    Admins {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
+    /// Leave a group
+    Leave {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
+    /// Rename a group
+    Rename {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// New group name
+        name: String,
+    },
+
+    /// List pending group invites
+    Invites,
+
+    /// Accept a group invite
+    Accept {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
+    /// Decline a group invite
+    Decline {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
 }
 
 impl GroupsCmd {
@@ -61,6 +113,18 @@ impl GroupsCmd {
             GroupsCmd::AddMembers { group_id, members } => {
                 add_members(socket, json, account_flag, group_id, members).await
             }
+            GroupsCmd::RemoveMembers { group_id, members } => {
+                remove_members(socket, json, account_flag, group_id, members).await
+            }
+            GroupsCmd::Members { group_id } => members(socket, json, account_flag, group_id).await,
+            GroupsCmd::Admins { group_id } => admins(socket, json, account_flag, group_id).await,
+            GroupsCmd::Leave { group_id } => leave(socket, json, account_flag, group_id).await,
+            GroupsCmd::Rename { group_id, name } => {
+                rename(socket, json, account_flag, group_id, name).await
+            }
+            GroupsCmd::Invites => invites(socket, json, account_flag).await,
+            GroupsCmd::Accept { group_id } => accept(socket, json, account_flag, group_id).await,
+            GroupsCmd::Decline { group_id } => decline(socket, json, account_flag, group_id).await,
         }
     }
 }
@@ -125,8 +189,144 @@ async fn add_members(
     output::print_and_exit(&resp, json)
 }
 
+async fn remove_members(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    members: Vec<String>,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::RemoveMembers {
+            account: pubkey,
+            group_id,
+            members,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn members(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GroupMembers {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn admins(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GroupAdmins {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn leave(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::LeaveGroup {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn rename(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    name: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::RenameGroup {
+            account: pubkey,
+            group_id,
+            name,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
 async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::VisibleGroups { account: pubkey }).await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn invites(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(socket, &Request::GroupInvites { account: pubkey }).await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn accept(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::AcceptInvite {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn decline(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::DeclineInvite {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
     output::print_and_exit(&resp, json)
 }
