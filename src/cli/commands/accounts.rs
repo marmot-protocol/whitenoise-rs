@@ -15,7 +15,7 @@ pub enum AccountsCmd {
 impl AccountsCmd {
     pub async fn run(self, socket: &Path, json: bool) -> anyhow::Result<()> {
         match self {
-            AccountsCmd::List => list(socket, json).await,
+            Self::List => list(socket, json).await,
         }
     }
 }

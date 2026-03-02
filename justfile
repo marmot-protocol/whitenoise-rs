@@ -235,7 +235,7 @@ coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_t
 # Generate code coverage report (lcov format, matches CI flags)
 coverage:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --all-targets \
+    cargo llvm-cov --workspace --all-targets --features cli \
       --ignore-filename-regex '{{coverage_ignore}}' \
       --lcov --output-path lcov.info
     @echo "Coverage report: lcov.info"
@@ -243,7 +243,7 @@ coverage:
 # Generate HTML code coverage report (matches CI flags)
 coverage-html:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --all-targets \
+    cargo llvm-cov --workspace --all-targets --features cli \
       --ignore-filename-regex '{{coverage_ignore}}' \
       --html
     @echo "HTML report: target/llvm-cov/html/index.html"

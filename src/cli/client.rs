@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -27,9 +28,11 @@ pub async fn send(socket_path: &Path, request: &Request) -> anyhow::Result<Respo
     writer.shutdown().await?;
 
     let mut lines = BufReader::new(reader).lines();
-    match lines.next_line().await? {
-        Some(line) => Ok(serde_json::from_str(&line)?),
-        None => anyhow::bail!("daemon closed connection without responding"),
+    match tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await {
+        Ok(Ok(Some(line))) => Ok(serde_json::from_str(&line)?),
+        Ok(Ok(None)) => anyhow::bail!("daemon closed connection without responding"),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => anyhow::bail!("daemon did not respond within 30s"),
     }
 }
 
@@ -146,5 +149,159 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("daemon not running"));
+    }
+
+    // --- send timeout ---
+
+    /// Server that accepts a connection but never responds.
+    async fn silent_server(socket_path: &Path) {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, _writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        // Read the request but never reply
+        let _request = lines.next_line().await.unwrap();
+        // Hold the connection open until the test completes
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+
+    #[tokio::test]
+    async fn send_times_out_when_daemon_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+
+        let socket_clone = socket.clone();
+        let _server = tokio::spawn(async move {
+            silent_server(&socket_clone).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Use a short timeout for the test by wrapping in our own timeout
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            send(&socket, &Request::Ping),
+        )
+        .await;
+
+        let err = result.expect("test timeout").unwrap_err();
+        assert!(err.to_string().contains("did not respond within 30s"));
+    }
+
+    // --- stream tests ---
+
+    /// Server that writes multiple response lines then a stream_end marker.
+    async fn streaming_server(socket_path: &Path, responses: Vec<Response>) {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let _request = lines.next_line().await.unwrap();
+
+        for resp in &responses {
+            let mut buf = serde_json::to_vec(resp).unwrap();
+            buf.push(b'\n');
+            writer.write_all(&buf).await.unwrap();
+        }
+
+        // Send stream_end
+        let end = Response {
+            result: None,
+            error: None,
+            stream_end: true,
+        };
+        let mut buf = serde_json::to_vec(&end).unwrap();
+        buf.push(b'\n');
+        writer.write_all(&buf).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_receives_multiple_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+
+        let responses = vec![
+            Response::ok(serde_json::json!(1)),
+            Response::ok(serde_json::json!(2)),
+            Response::ok(serde_json::json!(3)),
+        ];
+        let socket_clone = socket.clone();
+        let server = tokio::spawn(async move {
+            streaming_server(&socket_clone, responses).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut received = Vec::new();
+        stream(&socket, &Request::Ping, |resp| {
+            received.push(resp.result.clone());
+            true
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0], Some(serde_json::json!(1)));
+        assert_eq!(received[2], Some(serde_json::json!(3)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_handler_can_stop_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+
+        let responses = vec![
+            Response::ok(serde_json::json!("first")),
+            Response::ok(serde_json::json!("second")),
+            Response::ok(serde_json::json!("third")),
+        ];
+        let socket_clone = socket.clone();
+        let _server = tokio::spawn(async move {
+            streaming_server(&socket_clone, responses).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut count = 0;
+        stream(&socket, &Request::Ping, |_resp| {
+            count += 1;
+            count < 2 // stop after receiving 2
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn stream_handles_connection_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("test.sock");
+
+        // Server sends one response then closes (no stream_end)
+        let socket_clone = socket.clone();
+        let server = tokio::spawn(async move {
+            let listener = UnixListener::bind(&socket_clone).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let _request = lines.next_line().await.unwrap();
+
+            let resp = Response::ok(serde_json::json!("only-one"));
+            let mut buf = serde_json::to_vec(&resp).unwrap();
+            buf.push(b'\n');
+            writer.write_all(&buf).await.unwrap();
+            // Drop writer — connection closes
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut received = Vec::new();
+        stream(&socket, &Request::Ping, |resp| {
+            received.push(resp.result.clone());
+            true
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received.len(), 1);
+        server.await.unwrap();
     }
 }

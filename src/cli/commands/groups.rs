@@ -103,28 +103,28 @@ impl GroupsCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            GroupsCmd::List => list(socket, json, account_flag).await,
-            GroupsCmd::Create {
+            Self::List => list(socket, json, account_flag).await,
+            Self::Create {
                 name,
                 members,
                 description,
             } => create(socket, json, account_flag, name, members, description).await,
-            GroupsCmd::Show { group_id } => show(socket, json, account_flag, group_id).await,
-            GroupsCmd::AddMembers { group_id, members } => {
+            Self::Show { group_id } => show(socket, json, account_flag, group_id).await,
+            Self::AddMembers { group_id, members } => {
                 add_members(socket, json, account_flag, group_id, members).await
             }
-            GroupsCmd::RemoveMembers { group_id, members } => {
+            Self::RemoveMembers { group_id, members } => {
                 remove_members(socket, json, account_flag, group_id, members).await
             }
-            GroupsCmd::Members { group_id } => members(socket, json, account_flag, group_id).await,
-            GroupsCmd::Admins { group_id } => admins(socket, json, account_flag, group_id).await,
-            GroupsCmd::Leave { group_id } => leave(socket, json, account_flag, group_id).await,
-            GroupsCmd::Rename { group_id, name } => {
+            Self::Members { group_id } => members(socket, json, account_flag, group_id).await,
+            Self::Admins { group_id } => admins(socket, json, account_flag, group_id).await,
+            Self::Leave { group_id } => leave(socket, json, account_flag, group_id).await,
+            Self::Rename { group_id, name } => {
                 rename(socket, json, account_flag, group_id, name).await
             }
-            GroupsCmd::Invites => invites(socket, json, account_flag).await,
-            GroupsCmd::Accept { group_id } => accept(socket, json, account_flag, group_id).await,
-            GroupsCmd::Decline { group_id } => decline(socket, json, account_flag, group_id).await,
+            Self::Invites => invites(socket, json, account_flag).await,
+            Self::Accept { group_id } => accept(socket, json, account_flag, group_id).await,
+            Self::Decline { group_id } => decline(socket, json, account_flag, group_id).await,
         }
     }
 }

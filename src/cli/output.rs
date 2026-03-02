@@ -14,6 +14,15 @@ pub fn print_and_exit(response: &Response, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print a streaming response and return whether to continue the stream.
+///
+/// Returns `true` on success (keep reading), `false` on error (stop stream).
+/// Callers should exit non-zero when this returns `false`.
+pub fn print_stream_response(response: &Response, json: bool) -> bool {
+    print_response(response, json);
+    response.error.is_none()
+}
+
 /// Print a response to stdout, either as JSON or human-readable.
 pub fn print_response(response: &Response, json: bool) {
     if json {
@@ -51,7 +60,10 @@ const HIDDEN_FIELDS: &[&str] = &[
     "tags",
 ];
 
-fn format_value(w: &mut impl Write, value: &serde_json::Value, indent: usize) -> io::Result<()> {
+fn format_value<W>(w: &mut W, value: &serde_json::Value, indent: usize) -> io::Result<()>
+where
+    W: Write,
+{
     let prefix = "  ".repeat(indent);
     match value {
         serde_json::Value::Null => Ok(()),
@@ -70,11 +82,14 @@ fn format_value(w: &mut impl Write, value: &serde_json::Value, indent: usize) ->
     }
 }
 
-fn format_object(
-    w: &mut impl Write,
+fn format_object<W>(
+    w: &mut W,
     map: &serde_json::Map<String, serde_json::Value>,
     indent: usize,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    W: Write,
+{
     let prefix = "  ".repeat(indent);
     for (key, val) in map {
         // Skip fields hidden in human-readable output

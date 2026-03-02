@@ -18,9 +18,9 @@ pub enum DaemonCmd {
 impl DaemonCmd {
     pub async fn run(self, config: &Config) -> anyhow::Result<()> {
         match self {
-            DaemonCmd::Start => start(config).await,
-            DaemonCmd::Stop => server::stop_daemon(config),
-            DaemonCmd::Status => status(config),
+            Self::Start => start(config).await,
+            Self::Stop => server::stop_daemon(config),
+            Self::Status => status(config),
         }
     }
 }
@@ -58,7 +58,7 @@ fn which_wnd() -> anyhow::Result<std::path::PathBuf> {
     // Look next to the current executable first (cargo install puts both binaries together)
     if let Ok(current) = std::env::current_exe() {
         let sibling = current.parent().unwrap_or(current.as_ref()).join("wnd");
-        if sibling.exists() {
+        if sibling.is_file() {
             return Ok(sibling);
         }
     }
@@ -67,7 +67,7 @@ fn which_wnd() -> anyhow::Result<std::path::PathBuf> {
         .and_then(|paths| {
             std::env::split_paths(&paths).find_map(|dir| {
                 let candidate = dir.join("wnd");
-                candidate.exists().then_some(candidate)
+                candidate.is_file().then_some(candidate)
             })
         })
         .ok_or_else(|| anyhow::anyhow!("wnd not found. Ensure it's installed and on your PATH."))

@@ -39,10 +39,10 @@ impl FollowsCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            FollowsCmd::List => list(socket, json, account_flag).await,
-            FollowsCmd::Add { pubkey } => add(socket, json, account_flag, pubkey).await,
-            FollowsCmd::Remove { pubkey } => remove(socket, json, account_flag, pubkey).await,
-            FollowsCmd::Check { pubkey } => check(socket, json, account_flag, pubkey).await,
+            Self::List => list(socket, json, account_flag).await,
+            Self::Add { pubkey } => add(socket, json, account_flag, pubkey).await,
+            Self::Remove { pubkey } => remove(socket, json, account_flag, pubkey).await,
+            Self::Check { pubkey } => check(socket, json, account_flag, pubkey).await,
         }
     }
 }

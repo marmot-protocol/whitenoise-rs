@@ -122,6 +122,15 @@ pub enum Request {
     // Users
     #[serde(rename = "users_show")]
     UsersShow { pubkey: String },
+    #[serde(rename = "users_search")]
+    UsersSearch {
+        account: String,
+        query: String,
+        #[serde(default = "default_radius_start")]
+        radius_start: u8,
+        #[serde(default = "default_radius_end")]
+        radius_end: u8,
+    },
 
     // Relays
     #[serde(rename = "relays_list")]
@@ -146,14 +155,23 @@ pub enum Request {
     NotificationsSubscribe,
 }
 
+fn default_radius_start() -> u8 {
+    0
+}
+
+fn default_radius_end() -> u8 {
+    2
+}
+
 impl Request {
     /// Returns true if this request expects a streaming response (multiple lines).
     pub fn is_streaming(&self) -> bool {
         matches!(
             self,
-            Request::MessagesSubscribe { .. }
-                | Request::ChatsSubscribe { .. }
-                | Request::NotificationsSubscribe
+            Self::MessagesSubscribe { .. }
+                | Self::ChatsSubscribe { .. }
+                | Self::NotificationsSubscribe
+                | Self::UsersSearch { .. }
         )
     }
 }
@@ -691,6 +709,52 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::UsersShow { pubkey } if pubkey == "npub1abc"));
+    }
+
+    #[test]
+    fn users_search_roundtrip() {
+        let req = Request::UsersSearch {
+            account: "npub1abc".into(),
+            query: "alice".into(),
+            radius_start: 0,
+            radius_end: 3,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UsersSearch { account, query, radius_start, radius_end }
+            if account == "npub1abc"
+                && query == "alice"
+                && radius_start == 0
+                && radius_end == 3
+        ));
+    }
+
+    #[test]
+    fn users_search_minimal_roundtrip() {
+        // Only required fields — radius defaults to 0..2
+        let wire = r#"{"method":"users_search","params":{"account":"npub1abc","query":"bob"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UsersSearch { account, query, radius_start, radius_end }
+            if account == "npub1abc"
+                && query == "bob"
+                && radius_start == 0
+                && radius_end == 2
+        ));
+    }
+
+    #[test]
+    fn users_search_is_streaming() {
+        let req = Request::UsersSearch {
+            account: "npub1abc".into(),
+            query: "test".into(),
+            radius_start: 0,
+            radius_end: 2,
+        };
+        assert!(req.is_streaming());
     }
 
     #[test]

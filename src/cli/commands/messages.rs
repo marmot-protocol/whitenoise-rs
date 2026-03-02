@@ -39,13 +39,11 @@ impl MessagesCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            MessagesCmd::List { group_id } => list(socket, json, account_flag, group_id).await,
-            MessagesCmd::Send { group_id, message } => {
+            Self::List { group_id } => list(socket, json, account_flag, group_id).await,
+            Self::Send { group_id, message } => {
                 send(socket, json, account_flag, group_id, message).await
             }
-            MessagesCmd::Subscribe { group_id } => {
-                subscribe(socket, json, account_flag, group_id).await
-            }
+            Self::Subscribe { group_id } => subscribe(socket, json, account_flag, group_id).await,
         }
     }
 }
@@ -79,11 +77,19 @@ async fn subscribe(
         account: pubkey,
         group_id,
     };
+    let mut had_error = false;
     client::stream(socket, &req, |resp| {
-        output::print_response(resp, json);
-        true
+        let ok = output::print_stream_response(resp, json);
+        if !ok {
+            had_error = true;
+        }
+        ok
     })
-    .await
+    .await?;
+    if had_error {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn send(

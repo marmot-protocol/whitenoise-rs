@@ -27,9 +27,9 @@ pub enum SettingsCmd {
 impl SettingsCmd {
     pub async fn run(self, socket: &Path, json: bool) -> anyhow::Result<()> {
         match self {
-            SettingsCmd::Show => show(socket, json).await,
-            SettingsCmd::Theme { mode } => theme(socket, json, &mode).await,
-            SettingsCmd::Language { lang } => language(socket, json, &lang).await,
+            Self::Show => show(socket, json).await,
+            Self::Theme { mode } => theme(socket, json, &mode).await,
+            Self::Language { lang } => language(socket, json, &lang).await,
         }
     }
 }

@@ -21,7 +21,7 @@ impl RelaysCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            RelaysCmd::List => list(socket, json, account_flag).await,
+            Self::List => list(socket, json, account_flag).await,
         }
     }
 }

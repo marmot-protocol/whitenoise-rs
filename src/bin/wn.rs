@@ -10,7 +10,7 @@ use whitenoise::cli::commands::{
 use whitenoise::cli::config::Config;
 
 #[derive(Parser, Debug)]
-#[clap(name = "wn", about = "Whitenoise CLI")]
+#[clap(name = "wn", about = "Whitenoise CLI", version)]
 struct Args {
     /// Output as JSON
     #[clap(long, global = true)]
@@ -63,7 +63,7 @@ enum Cmd {
     #[clap(subcommand)]
     Accounts(AccountsCmd),
 
-    /// List chats
+    /// Manage chats
     #[clap(subcommand)]
     Chats(ChatsCmd),
 
@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Profile(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Relays(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Settings(cmd) => cmd.run(&socket, args.json).await,
-        Cmd::Users(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Users(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Notifications(cmd) => cmd.run(&socket, args.json).await,
     }
 }

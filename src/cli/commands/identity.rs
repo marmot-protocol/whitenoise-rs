@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use crate::cli::client;
@@ -100,6 +100,8 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
 
     if json {
         output::print_response(&relay_resp, true);
+    } else if relay_resp.error.is_some() {
+        output::print_response(&relay_resp, false);
     } else {
         print_login_success(&relay_resp);
     }
@@ -155,14 +157,17 @@ pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> anyhow::Res
 }
 
 fn read_nsec() -> anyhow::Result<String> {
-    use std::io::IsTerminal;
-
-    if io::stdin().is_terminal() {
+    let nsec = if io::stdin().is_terminal() {
         eprint!("Enter nsec: ");
         io::stderr().flush()?;
-    }
-    let mut nsec = String::new();
-    io::stdin().lock().read_line(&mut nsec)?;
+        let secret = rpassword::read_password()?;
+        eprintln!(); // newline after hidden input
+        secret
+    } else {
+        let mut buf = String::new();
+        io::stdin().lock().read_line(&mut buf)?;
+        buf
+    };
     let nsec = nsec.trim().to_string();
     if nsec.is_empty() {
         anyhow::bail!("no nsec provided");

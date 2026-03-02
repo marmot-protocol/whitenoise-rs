@@ -48,8 +48,8 @@ impl ProfileCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            ProfileCmd::Show => show(socket, json, account_flag).await,
-            ProfileCmd::Update {
+            Self::Show => show(socket, json, account_flag).await,
+            Self::Update {
                 name,
                 display_name,
                 about,

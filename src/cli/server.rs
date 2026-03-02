@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -66,8 +67,10 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let req = match lines.next_line().await {
-        Ok(Some(line)) => match serde_json::from_str::<Request>(&line) {
+    let read_result = tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await;
+
+    let req = match read_result {
+        Ok(Ok(Some(line))) => match serde_json::from_str::<Request>(&line) {
             Ok(req) => req,
             Err(e) => {
                 let resp = Response::err(format!("invalid request: {e}"));
@@ -77,12 +80,16 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
                 return;
             }
         },
-        Ok(None) => return, // Client disconnected without sending
-        Err(e) => {
+        Ok(Ok(None)) => return, // Client disconnected without sending
+        Ok(Err(e)) => {
             let resp = Response::err(format!("read error: {e}"));
             let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
             buf.push(b'\n');
             let _ = writer.write_all(&buf).await;
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("client request timed out");
             return;
         }
     };
@@ -168,14 +175,22 @@ pub fn is_daemon_running(config: &Config) -> Option<u32> {
 }
 
 /// Stop the daemon by sending SIGTERM to the PID in the pidfile.
+///
+/// Waits up to 5 seconds for the process to exit after sending the signal.
 pub fn stop_daemon(config: &Config) -> anyhow::Result<()> {
     match is_daemon_running(config) {
         Some(pid) => {
             if !send_sigterm(pid) {
                 anyhow::bail!("failed to send SIGTERM to pid {pid}");
             }
-            println!("daemon stopped (pid {pid})");
-            Ok(())
+            for _ in 0..100 {
+                if !is_process_alive(pid) {
+                    println!("daemon stopped (pid {pid})");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            anyhow::bail!("daemon (pid {pid}) did not exit within 5s after SIGTERM");
         }
         None => {
             anyhow::bail!("daemon not running");

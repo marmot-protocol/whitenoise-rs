@@ -6,6 +6,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
 use crate::whitenoise::accounts_groups::AccountGroup;
+use crate::whitenoise::app_settings::{Language, ThemeMode};
+use crate::whitenoise::users::UserSyncMode;
 
 use super::protocol::{Request, Response};
 
@@ -273,27 +275,50 @@ pub async fn dispatch(req: Request) -> Response {
         // Streaming commands should be routed through dispatch_streaming
         Request::MessagesSubscribe { .. }
         | Request::ChatsSubscribe { .. }
-        | Request::NotificationsSubscribe => {
+        | Request::NotificationsSubscribe
+        | Request::UsersSearch { .. } => {
             Response::err("streaming commands must use dispatch_streaming")
         }
     }
 }
 
 /// Write a single response line to the writer. Returns false if the client disconnected.
-async fn write_response(writer: &mut (impl AsyncWriteExt + Unpin), response: &Response) -> bool {
+async fn write_response<W>(writer: &mut W, response: &Response) -> bool
+where
+    W: AsyncWriteExt + Unpin,
+{
     let mut buf = match serde_json::to_vec(response) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::error!("failed to serialize response: {e}");
+            return false;
+        }
     };
     buf.push(b'\n');
     writer.write_all(&buf).await.is_ok()
+}
+
+/// Write the `stream_end: true` sentinel that signals the end of a streaming response.
+async fn write_stream_end<W>(writer: &mut W)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let end = Response {
+        result: None,
+        error: None,
+        stream_end: true,
+    };
+    let _ = write_response(writer, &end).await;
 }
 
 /// Handle a streaming request by writing multiple response lines to the writer.
 ///
 /// This function takes ownership of the writer and writes response lines until
 /// the stream ends or the client disconnects. The final line has `stream_end: true`.
-pub async fn dispatch_streaming(req: Request, mut writer: impl AsyncWriteExt + Unpin + Send) {
+pub async fn dispatch_streaming<W>(req: Request, mut writer: W)
+where
+    W: AsyncWriteExt + Unpin + Send,
+{
     let wn = match Whitenoise::get_instance() {
         Ok(wn) => wn,
         Err(e) => {
@@ -302,6 +327,7 @@ pub async fn dispatch_streaming(req: Request, mut writer: impl AsyncWriteExt + U
                 &Response::err(format!("whitenoise not initialized: {e}")),
             )
             .await;
+            write_stream_end(&mut writer).await;
             return;
         }
     };
@@ -316,23 +342,35 @@ pub async fn dispatch_streaming(req: Request, mut writer: impl AsyncWriteExt + U
         Request::NotificationsSubscribe => {
             notifications_subscribe(wn, &mut writer).await;
         }
+        Request::UsersSearch {
+            account,
+            query,
+            radius_start,
+            radius_end,
+        } => {
+            users_search(wn, &mut writer, &account, &query, radius_start, radius_end).await;
+        }
         _ => {
             let _ = write_response(&mut writer, &Response::err("not a streaming command")).await;
+            write_stream_end(&mut writer).await;
         }
     }
 }
 
-async fn messages_subscribe(
+async fn messages_subscribe<W>(
     wn: &Whitenoise,
-    writer: &mut (impl AsyncWriteExt + Unpin),
+    writer: &mut W,
     account_str: &str,
     group_id_hex: &str,
-) {
+) where
+    W: AsyncWriteExt + Unpin,
+{
     // Validate account and group_id
     let _account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
             let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
             return;
         }
     };
@@ -340,6 +378,7 @@ async fn messages_subscribe(
         Ok(id) => id,
         Err(resp) => {
             let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
             return;
         }
     };
@@ -349,6 +388,7 @@ async fn messages_subscribe(
         Ok(sub) => sub,
         Err(e) => {
             let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
             return;
         }
     };
@@ -399,24 +439,18 @@ async fn messages_subscribe(
         }
     }
 
-    // Signal stream end
-    let end = Response {
-        result: None,
-        error: None,
-        stream_end: true,
-    };
-    let _ = write_response(writer, &end).await;
+    write_stream_end(writer).await;
 }
 
-async fn chats_subscribe(
-    wn: &Whitenoise,
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    account_str: &str,
-) {
+async fn chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
+where
+    W: AsyncWriteExt + Unpin,
+{
     let account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
             let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
             return;
         }
     };
@@ -425,6 +459,7 @@ async fn chats_subscribe(
         Ok(sub) => sub,
         Err(e) => {
             let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
             return;
         }
     };
@@ -462,15 +497,13 @@ async fn chats_subscribe(
         }
     }
 
-    let end = Response {
-        result: None,
-        error: None,
-        stream_end: true,
-    };
-    let _ = write_response(writer, &end).await;
+    write_stream_end(writer).await;
 }
 
-async fn notifications_subscribe(wn: &Whitenoise, writer: &mut (impl AsyncWriteExt + Unpin)) {
+async fn notifications_subscribe<W>(wn: &Whitenoise, writer: &mut W)
+where
+    W: AsyncWriteExt + Unpin,
+{
     let subscription = wn.subscribe_to_notifications();
 
     let mut updates = subscription.updates;
@@ -498,12 +531,68 @@ async fn notifications_subscribe(wn: &Whitenoise, writer: &mut (impl AsyncWriteE
         }
     }
 
-    let end = Response {
-        result: None,
-        error: None,
-        stream_end: true,
+    write_stream_end(writer).await;
+}
+
+async fn users_search<W>(
+    wn: &Whitenoise,
+    writer: &mut W,
+    account_str: &str,
+    query: &str,
+    radius_start: u8,
+    radius_end: u8,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
     };
-    let _ = write_response(writer, &end).await;
+
+    let params = crate::whitenoise::user_search::UserSearchParams {
+        query: query.to_string(),
+        searcher_pubkey: account.pubkey,
+        radius_start,
+        radius_end,
+    };
+
+    let subscription = match wn.search_users(params).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = to_response(&update);
+                if !write_response(writer, &resp).await {
+                    return; // Client disconnected
+                }
+                // Stop after SearchCompleted
+                if matches!(
+                    update.trigger,
+                    crate::whitenoise::user_search::SearchUpdateTrigger::SearchCompleted { .. }
+                ) {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("user search stream lagged by {n} updates");
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
 }
 
 /// Clean a ChatListItem for output: strip redundant mls_group_id from last_message,
@@ -534,7 +623,7 @@ async fn clean_chat_list_item(
 }
 
 fn parse_pubkey(s: &str) -> Result<PublicKey, Response> {
-    PublicKey::parse(s).map_err(|e| Response::err(format!("invalid pubkey: {e}")))
+    PublicKey::parse(s).map_err(|e| Response::err(format!("invalid pubkey '{s}': {e}")))
 }
 
 async fn find_account(
@@ -894,7 +983,6 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
 }
 
 async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
-    use crate::whitenoise::app_settings::ThemeMode;
     let theme: ThemeMode = theme_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_theme_mode(theme)
         .await
@@ -903,7 +991,6 @@ async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Re
 }
 
 async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
-    use crate::whitenoise::app_settings::Language;
     let language: Language = lang_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_language(language)
         .await
@@ -932,7 +1019,6 @@ async fn relays_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Res
 }
 
 async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
-    use crate::whitenoise::users::UserSyncMode;
     let pk = parse_pubkey(pubkey_str)?;
     let user = wn
         .find_or_create_user_by_pubkey(&pk, UserSyncMode::Blocking)
@@ -1123,7 +1209,11 @@ async fn send_message(
 }
 
 fn parse_group_id(s: &str) -> Result<GroupId, Response> {
-    let bytes = hex::decode(s).map_err(|e| Response::err(format!("invalid group ID: {e}")))?;
+    let bytes =
+        hex::decode(s).map_err(|e| Response::err(format!("invalid group ID '{s}': {e}")))?;
+    if bytes.is_empty() {
+        return Err(Response::err("invalid group ID: empty"));
+    }
     Ok(GroupId::from_slice(&bytes))
 }
 
@@ -1131,5 +1221,75 @@ fn to_response<T: serde::Serialize>(value: &T) -> Response {
     match serde_json::to_value(value) {
         Ok(v) => Response::ok(v),
         Err(e) => Response::err(format!("serialization error: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::ToBech32;
+
+    use super::*;
+
+    // --- parse_pubkey ---
+
+    #[test]
+    fn parse_pubkey_valid_hex() {
+        let hex = "4dd7a05f5f668589d5d3025a30e3a2603f2d4fe7fb9d0e2b33914b765e9d6f69";
+        assert!(parse_pubkey(hex).is_ok());
+    }
+
+    #[test]
+    fn parse_pubkey_valid_npub() {
+        let hex = "4dd7a05f5f668589d5d3025a30e3a2603f2d4fe7fb9d0e2b33914b765e9d6f69";
+        let pk = PublicKey::from_hex(hex).unwrap();
+        let npub = pk.to_bech32().unwrap();
+        assert!(parse_pubkey(&npub).is_ok());
+    }
+
+    #[test]
+    fn parse_pubkey_invalid() {
+        let err = parse_pubkey("not-a-pubkey").unwrap_err();
+        assert!(err.error.unwrap().message.contains("not-a-pubkey"));
+    }
+
+    // --- parse_group_id ---
+
+    #[test]
+    fn parse_group_id_valid_hex() {
+        let gid = parse_group_id("abcd1234").unwrap();
+        assert_eq!(gid.as_slice(), &[0xab, 0xcd, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn parse_group_id_empty_string() {
+        let err = parse_group_id("").unwrap_err();
+        assert!(err.error.unwrap().message.contains("empty"));
+    }
+
+    #[test]
+    fn parse_group_id_invalid_hex() {
+        let err = parse_group_id("zzzz").unwrap_err();
+        assert!(err.error.unwrap().message.contains("invalid group ID"));
+    }
+
+    #[test]
+    fn parse_group_id_odd_length() {
+        let err = parse_group_id("abc").unwrap_err();
+        assert!(err.error.is_some());
+    }
+
+    // --- to_response ---
+
+    #[test]
+    fn to_response_serializable_value() {
+        let resp = to_response(&serde_json::json!({"key": "value"}));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn to_response_string() {
+        let resp = to_response(&"hello");
+        assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
     }
 }

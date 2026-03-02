@@ -90,6 +90,7 @@ base64ct = "=1.7.3"
 dotenvy = "0.15"
 tempfile = "3.19.1"
 dirs = { version = "6", optional = true }
+rpassword = { version = "7", optional = true }
 indicatif = { version = "0.18.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -112,7 +113,7 @@ mockito = "1.2"
 
 [features]
 default = []
-cli = ["clap", "dirs"]
+cli = ["clap", "dirs", "rpassword"]
 integration-tests = ["clap"]
 benchmark-tests = ["integration-tests", "indicatif"]
 
