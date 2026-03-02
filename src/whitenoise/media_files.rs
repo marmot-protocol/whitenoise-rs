@@ -581,4 +581,52 @@ mod tests {
                 .contains("Invalid Blossom URL")
         );
     }
+
+    #[test]
+    fn test_extract_hash_from_blossom_url_with_extension() {
+        // Hash with .png extension should be stripped
+        let hash_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let url = format!("https://blossom.example.com/{}.png", hash_hex);
+        let result = extract_hash_from_blossom_url(&url).unwrap();
+        assert_eq!(hex::encode(result), hash_hex);
+    }
+
+    #[test]
+    fn test_extract_hash_from_blossom_url_dot_only_extension() {
+        // URL ending in just a dot after the hash -> hash_hex becomes empty before the dot
+        let url = "https://blossom.example.com/.";
+        let result = extract_hash_from_blossom_url(url);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("contains no hash"));
+    }
+
+    #[test]
+    fn test_extract_blurhash_from_tag_with_blurhash() {
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                "url https://blossom.example.com/abc123",
+                "blurhash LEHV6nWB2yk8pyoJadR*.7kCMdnj",
+            ],
+        );
+        let result = MediaFiles::extract_blurhash_from_tag(&tag);
+        assert_eq!(result, Some("LEHV6nWB2yk8pyoJadR*.7kCMdnj".to_string()));
+    }
+
+    #[test]
+    fn test_extract_blurhash_from_tag_without_blurhash() {
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            ["url https://blossom.example.com/abc123", "m image/jpeg"],
+        );
+        let result = MediaFiles::extract_blurhash_from_tag(&tag);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_blurhash_from_tag_empty_tag() {
+        let tag = Tag::custom(TagKind::Custom("imeta".into()), Vec::<String>::new());
+        let result = MediaFiles::extract_blurhash_from_tag(&tag);
+        assert!(result.is_none());
+    }
 }

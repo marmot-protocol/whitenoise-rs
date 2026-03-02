@@ -22,6 +22,7 @@ pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod database;
+pub mod debug;
 pub mod drafts;
 pub mod error;
 mod event_processor;
@@ -558,7 +559,7 @@ impl Whitenoise {
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
             let nip65_relays = account.nip65_relays(whitenoise_ref).await?;
-            let inbox_relays = account.inbox_relays(whitenoise_ref).await?;
+            let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
             // Setup subscriptions for this account
             match whitenoise_ref
                 .setup_subscriptions(&account, &nip65_relays, &inbox_relays)

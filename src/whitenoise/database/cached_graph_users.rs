@@ -177,21 +177,20 @@ impl CachedGraphUser {
         let cutoff = (Utc::now() - Duration::hours(max_age_hours)).timestamp_millis();
         let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_hex()).collect();
 
-        let placeholders = "?,".repeat(pubkey_hexes.len());
-        let placeholders = placeholders.trim_end_matches(',');
-
-        let query = format!(
-            "SELECT * FROM cached_graph_users WHERE pubkey IN ({}) AND {} > ?",
-            placeholders, timestamp_column
-        );
-
-        let mut query_builder = sqlx::query_as::<_, CachedGraphUserRow>(&query);
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+            sqlx::QueryBuilder::new("SELECT * FROM cached_graph_users WHERE pubkey IN (");
+        let mut sep = qb.separated(", ");
         for hex in &pubkey_hexes {
-            query_builder = query_builder.bind(hex);
+            sep.push_bind(hex);
         }
-        query_builder = query_builder.bind(cutoff);
+        sep.push_unseparated(") AND ");
+        // timestamp_column is a trusted internal identifier, not user input
+        qb.push(timestamp_column);
+        qb.push(" > ");
+        qb.push_bind(cutoff);
 
-        let rows = query_builder
+        let rows = qb
+            .build_query_as::<CachedGraphUserRow>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;

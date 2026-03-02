@@ -266,12 +266,19 @@ impl NostrManager {
         .await
     }
 
-    /// Updates account subscriptions by clearing from all relays first, then setting up new ones.
+    /// Updates account subscriptions by re-issuing them with the same stable subscription IDs.
     ///
-    /// This is necessary when relay sets change, as NIP-01 automatic replacement only works
-    /// within the same relay. Without explicit cleanup, old relays would keep orphaned subscriptions.
+    /// NIP-01 guarantees that a `REQ` with an existing subscription ID replaces the old subscription
+    /// atomically on each relay. This method does **not** unsubscribe first; it relies on the
+    /// NIP-01 replacement semantics to overwrite existing subscriptions on each relay.
     ///
-    /// Uses a time buffer to prevent missing events during the update window.
+    /// Callers that need a clean relay state (e.g. `refresh_account_subscriptions`) must call
+    /// `unsubscribe_account_subscriptions` before invoking this method. Skipping that step leaves
+    /// stale subscriptions open on relays that are no longer in the updated relay set.
+    ///
+    /// The `since` parameter anchors the replay window. Pass `account.since_timestamp(buffer)` from
+    /// the caller so the anchor reflects the account's actual sync state rather than a hardcoded
+    /// wall-clock offset.
     pub(crate) async fn update_account_subscriptions_with_signer(
         &self,
         pubkey: PublicKey,
@@ -279,14 +286,25 @@ impl NostrManager {
         inbox_relays: &[RelayUrl],
         group_relays: &[RelayUrl],
         nostr_group_ids: &[String],
+        since: Option<Timestamp>,
         signer: impl NostrSigner + 'static,
     ) -> Result<()> {
+        let existing = self.count_subscriptions_for_account(&pubkey).await;
+        if existing > 0 {
+            tracing::warn!(
+                target: "whitenoise::nostr_manager::update_account_subscriptions_with_signer",
+                pubkey = %pubkey,
+                existing_subscription_count = existing,
+                "update_account_subscriptions_with_signer called with {} existing subscription(s) \
+                 for this account. Call unsubscribe_account_subscriptions first if a clean relay \
+                 state is required.",
+                existing
+            );
+        }
         tracing::debug!(
             target: "whitenoise::nostr_manager::update_account_subscriptions_with_signer",
-            "Updating account subscriptions with cleanup for relay changes"
+            "Updating account subscriptions (NIP-01 replacement)"
         );
-        let buffer_time = Timestamp::now() - Duration::from_secs(10);
-        self.unsubscribe_account_subscriptions(&pubkey).await?;
         self.with_signer(signer, || async {
             self.setup_account_subscriptions(
                 pubkey,
@@ -294,7 +312,7 @@ impl NostrManager {
                 inbox_relays,
                 group_relays,
                 nostr_group_ids,
-                Some(buffer_time),
+                since,
             )
             .await
         })
@@ -311,20 +329,19 @@ impl NostrManager {
         inbox_relays: &[RelayUrl],
         group_relays: &[RelayUrl],
         nostr_group_ids: &[String],
+        since: Option<Timestamp>,
     ) -> Result<()> {
         tracing::debug!(
             target: "whitenoise::nostr_manager::update_account_subscriptions",
-            "Updating account subscriptions (no signer) with cleanup for relay changes"
+            "Updating account subscriptions (no signer, NIP-01 replacement)"
         );
-        let buffer_time = Timestamp::now() - Duration::from_secs(10);
-        self.unsubscribe_account_subscriptions(&pubkey).await?;
         self.setup_account_subscriptions(
             pubkey,
             user_relays,
             inbox_relays,
             group_relays,
             nostr_group_ids,
-            Some(buffer_time),
+            since,
         )
         .await
     }
@@ -618,6 +635,7 @@ mod subscription_monitoring_tests {
                 &empty_relays,
                 &empty_relays,
                 &empty_group_ids,
+                None,
             )
             .await;
 
@@ -658,6 +676,114 @@ mod subscription_monitoring_tests {
             matches!(err, NostrManagerError::Client(_)),
             "Expected Client variant, got: {:?}",
             err
+        );
+    }
+
+    /// update_account_subscriptions is a low-level primitive that does not call unsubscribe itself;
+    /// callers are responsible for cleanup before invoking it (e.g. refresh_account_subscriptions
+    /// calls unsubscribe_account_subscriptions first). Verify the function completes without
+    /// panicking even when no subscriptions exist before the call.
+    #[tokio::test]
+    async fn test_update_account_subscriptions_does_not_unsubscribe_first() {
+        let (event_sender, _receiver) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let empty_relays: Vec<RelayUrl> = vec![];
+        let empty_group_ids: Vec<String> = vec![];
+
+        // No subscriptions exist before the call.
+        assert_eq!(
+            nostr_manager.count_subscriptions_for_account(&pubkey).await,
+            0
+        );
+
+        // Call update with a concrete since anchor — it should not panic even when
+        // there are no prior subscriptions to replace.
+        let since = Some(Timestamp::now() - Duration::from_secs(30));
+        let _ = nostr_manager
+            .update_account_subscriptions(
+                pubkey,
+                &empty_relays,
+                &empty_relays,
+                &empty_relays,
+                &empty_group_ids,
+                since,
+            )
+            .await;
+
+        // Still zero after the call (no relay connections to subscribe to).
+        assert_eq!(
+            nostr_manager.count_subscriptions_for_account(&pubkey).await,
+            0
+        );
+    }
+
+    /// update_account_subscriptions forwards the caller-supplied `since` value unchanged.
+    /// Verify with two calls: one with a past anchor (should be forwarded) and one with
+    /// None (no since filter).  We can only observe the behaviour indirectly through the
+    /// absence of errors and the subscription count remaining zero without real relays.
+    #[tokio::test]
+    async fn test_update_account_subscriptions_replay_anchor_forwarded() {
+        let (event_sender, _receiver) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let pubkey = Keys::generate().public_key();
+        let empty_relays: Vec<RelayUrl> = vec![];
+        let empty_group_ids: Vec<String> = vec![];
+
+        // Call 1: anchor at a specific past timestamp (simulates account.since_timestamp(10)).
+        let anchor = Timestamp::now() - Duration::from_secs(120);
+        let r1 = nostr_manager
+            .update_account_subscriptions(
+                pubkey,
+                &empty_relays,
+                &empty_relays,
+                &empty_relays,
+                &empty_group_ids,
+                Some(anchor),
+            )
+            .await;
+        // No relays → no subscriptions, but should not panic or produce an unexpected error.
+        if let Err(ref e) = r1 {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("relay") || msg.contains("Relay") || msg.contains("connection"),
+                "Unexpected error kind: {msg}"
+            );
+        }
+
+        // Call 2: no anchor (unsynced account).
+        let r2 = nostr_manager
+            .update_account_subscriptions(
+                pubkey,
+                &empty_relays,
+                &empty_relays,
+                &empty_relays,
+                &empty_group_ids,
+                None,
+            )
+            .await;
+        if let Err(ref e) = r2 {
+            let msg = format!("{e:?}");
+            assert!(
+                msg.contains("relay") || msg.contains("Relay") || msg.contains("connection"),
+                "Unexpected error kind: {msg}"
+            );
+        }
+
+        // Subscription count must stay zero in both cases (no relay connections).
+        assert_eq!(
+            nostr_manager.count_subscriptions_for_account(&pubkey).await,
+            0
         );
     }
 }

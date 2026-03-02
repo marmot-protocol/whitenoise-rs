@@ -2872,7 +2872,8 @@ mod tests {
 
         // Create a valid 100x100 JPEG image using the image crate
         // (must be large enough for blurhash generation)
-        let img = ::image::RgbaImage::from_pixel(100, 100, ::image::Rgba([255u8, 0, 0, 255]));
+        // JPEG does not support an alpha channel, so use RgbImage (Rgb8) rather than RgbaImage.
+        let img = ::image::RgbImage::from_pixel(100, 100, ::image::Rgb([255u8, 0, 0]));
         let temp_file = NamedTempFile::new().unwrap();
         img.save_with_format(temp_file.path(), ::image::ImageFormat::Jpeg)
             .unwrap();
