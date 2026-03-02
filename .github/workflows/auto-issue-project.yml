@@ -5,7 +5,7 @@ on:
 
 jobs:
   add-to-project:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - name: Add issue to project
         uses: actions/add-to-project@v0.5.0
