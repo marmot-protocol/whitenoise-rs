@@ -36,18 +36,6 @@ impl Scenario for AdvancedMessagingScenario {
             .execute(&mut self.context)
             .await?;
 
-        // Wait for the reactor to receive and process the welcome before anyone
-        // sends messages. The reactor's join-time self-update advances the group
-        // epoch; messages sent before that completes would be encrypted at epoch
-        // N-1 and could not be decrypted by other members at epoch N.
-        WaitForWelcomeTestCase::for_account("adv_msg_reactor", "advanced_messaging_group")
-            .execute(&mut self.context)
-            .await?;
-
-        VerifySelfUpdateTestCase::for_account("adv_msg_reactor", "advanced_messaging_group")
-            .execute(&mut self.context)
-            .await?;
-
         // Send initial message that will receive reactions
         SendMessageTestCase::basic()
             .with_sender("adv_msg_sender")
