@@ -271,7 +271,9 @@ pub async fn dispatch(req: Request) -> Response {
         },
 
         // Streaming commands should be routed through dispatch_streaming
-        Request::MessagesSubscribe { .. } | Request::ChatsSubscribe { .. } => {
+        Request::MessagesSubscribe { .. }
+        | Request::ChatsSubscribe { .. }
+        | Request::NotificationsSubscribe => {
             Response::err("streaming commands must use dispatch_streaming")
         }
     }
@@ -310,6 +312,9 @@ pub async fn dispatch_streaming(req: Request, mut writer: impl AsyncWriteExt + U
         }
         Request::ChatsSubscribe { account } => {
             chats_subscribe(wn, &mut writer, &account).await;
+        }
+        Request::NotificationsSubscribe => {
+            notifications_subscribe(wn, &mut writer).await;
         }
         _ => {
             let _ = write_response(&mut writer, &Response::err("not a streaming command")).await;
@@ -370,10 +375,11 @@ async fn messages_subscribe(
         match updates.recv().await {
             Ok(update) => {
                 // Resolve display name for new authors on the fly
-                if !display_names.contains_key(&update.message.author) {
-                    if let Some(name) = resolve_display_name(wn, &update.message.author).await {
-                        display_names.insert(update.message.author, name);
-                    }
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    display_names.entry(update.message.author)
+                    && let Some(name) = resolve_display_name(wn, &update.message.author).await
+                {
+                    e.insert(name);
                 }
 
                 if let Some(formatted) = format_chat_message(&update.message, &display_names) {
@@ -464,6 +470,42 @@ async fn chats_subscribe(
     let _ = write_response(writer, &end).await;
 }
 
+async fn notifications_subscribe(wn: &Whitenoise, writer: &mut (impl AsyncWriteExt + Unpin)) {
+    let subscription = wn.subscribe_to_notifications();
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = Response::ok(serde_json::json!({
+                    "trigger": update.trigger,
+                    "mls_group_id": update.mls_group_id,
+                    "group_name": update.group_name,
+                    "is_dm": update.is_dm,
+                    "receiver": update.receiver,
+                    "sender": update.sender,
+                    "content": update.content,
+                    "timestamp": update.timestamp,
+                }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("notification stream lagged by {n} updates");
+            }
+        }
+    }
+
+    let end = Response {
+        result: None,
+        error: None,
+        stream_end: true,
+    };
+    let _ = write_response(writer, &end).await;
+}
+
 /// Clean a ChatListItem for output: strip redundant mls_group_id from last_message,
 /// and resolve missing author_display_name.
 async fn clean_chat_list_item(
@@ -471,23 +513,21 @@ async fn clean_chat_list_item(
     item: &crate::whitenoise::chat_list::ChatListItem,
 ) -> serde_json::Value {
     let mut value = serde_json::to_value(item).unwrap_or_default();
-    if let Some(last_msg) = value.get_mut("last_message") {
-        if let Some(obj) = last_msg.as_object_mut() {
-            obj.remove("mls_group_id");
+    if let Some(last_msg) = value.get_mut("last_message")
+        && let Some(obj) = last_msg.as_object_mut()
+    {
+        obj.remove("mls_group_id");
 
-            // Resolve author_display_name if missing
-            if obj.get("author_display_name").is_none_or(|v| v.is_null()) {
-                if let Some(author_hex) = obj.get("author").and_then(|v| v.as_str()) {
-                    if let Ok(pk) = PublicKey::parse(author_hex) {
-                        if let Some(name) = resolve_display_name(wn, &pk).await {
-                            obj.insert(
-                                "author_display_name".to_string(),
-                                serde_json::Value::String(name),
-                            );
-                        }
-                    }
-                }
-            }
+        // Resolve author_display_name if missing
+        if obj.get("author_display_name").is_none_or(|v| v.is_null())
+            && let Some(author_hex) = obj.get("author").and_then(|v| v.as_str())
+            && let Ok(pk) = PublicKey::parse(author_hex)
+            && let Some(name) = resolve_display_name(wn, &pk).await
+        {
+            obj.insert(
+                "author_display_name".to_string(),
+                serde_json::Value::String(name),
+            );
         }
     }
     value

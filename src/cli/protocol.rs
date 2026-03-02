@@ -142,6 +142,8 @@ pub enum Request {
     MessagesSubscribe { account: String, group_id: String },
     #[serde(rename = "chats_subscribe")]
     ChatsSubscribe { account: String },
+    #[serde(rename = "notifications_subscribe")]
+    NotificationsSubscribe,
 }
 
 impl Request {
@@ -149,7 +151,9 @@ impl Request {
     pub fn is_streaming(&self) -> bool {
         matches!(
             self,
-            Request::MessagesSubscribe { .. } | Request::ChatsSubscribe { .. }
+            Request::MessagesSubscribe { .. }
+                | Request::ChatsSubscribe { .. }
+                | Request::NotificationsSubscribe
         )
     }
 }
@@ -712,6 +716,15 @@ mod tests {
             Request::MessagesSubscribe { account, group_id }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
+    }
+
+    #[test]
+    fn notifications_subscribe_roundtrip() {
+        let req = Request::NotificationsSubscribe;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"method":"notifications_subscribe"}"#);
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::NotificationsSubscribe));
     }
 
     /// Verify that JSON sent from the wire (e.g. via socat) deserializes correctly.

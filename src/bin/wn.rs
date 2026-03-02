@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 
 use whitenoise::cli::commands::{
     accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, follows::FollowsCmd,
-    groups::GroupsCmd, identity, messages::MessagesCmd, profile::ProfileCmd, relays::RelaysCmd,
-    settings::SettingsCmd, users::UsersCmd,
+    groups::GroupsCmd, identity, messages::MessagesCmd, notifications::NotificationsCmd,
+    profile::ProfileCmd, relays::RelaysCmd, settings::SettingsCmd, users::UsersCmd,
 };
 use whitenoise::cli::config::Config;
 
@@ -94,6 +94,10 @@ enum Cmd {
     /// Look up users
     #[clap(subcommand)]
     Users(UsersCmd),
+
+    /// Subscribe to notifications
+    #[clap(subcommand)]
+    Notifications(NotificationsCmd),
 }
 
 #[tokio::main]
@@ -118,5 +122,6 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Relays(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Settings(cmd) => cmd.run(&socket, args.json).await,
         Cmd::Users(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Notifications(cmd) => cmd.run(&socket, args.json).await,
     }
 }
