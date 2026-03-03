@@ -213,6 +213,7 @@ impl User {
                     self.pubkey,
                     e
                 );
+                return Ok(false);
             }
         }
 
@@ -233,6 +234,7 @@ impl User {
                         self.pubkey,
                         e
                     );
+                    return Ok(false);
                 }
             }
         }
