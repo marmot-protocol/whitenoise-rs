@@ -124,16 +124,21 @@ where
             }
         })?;
 
-        // Deserialize optional delivery_status from JSON string
-        let delivery_status: Option<DeliveryStatus> = match row
-            .try_get::<Option<String>, _>("delivery_status")?
-        {
-            Some(json) => serde_json::from_str(&json).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "delivery_status".to_string(),
-                source: Box::new(e),
-            })?,
-            None => None,
-        };
+        // Deserialize optional delivery_status from JSON string.
+        // Uses lenient ColumnNotFound handling because delivery_status lives in a
+        // separate table and is only present when the query includes a LEFT JOIN alias.
+        let delivery_status: Option<DeliveryStatus> =
+            match row.try_get::<Option<String>, _>("delivery_status") {
+                Ok(Some(json)) => {
+                    serde_json::from_str(&json).map_err(|e| sqlx::Error::ColumnDecode {
+                        index: "delivery_status".to_string(),
+                        source: Box::new(e),
+                    })?
+                }
+                Ok(None) => None,
+                Err(sqlx::Error::ColumnNotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
 
         Ok(Self {
             id,
@@ -206,10 +211,13 @@ impl AggregatedMessage {
         database: &Database,
     ) -> Result<Vec<ChatMessage>> {
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT * FROM aggregated_messages
-             WHERE kind = 9 AND mls_group_id = ?
-               AND (delivery_status IS NULL OR delivery_status != '\"Retried\"')
-             ORDER BY created_at",
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9 AND am.mls_group_id = ?
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             ORDER BY am.created_at",
         )
         .bind(group_id.as_slice())
         .fetch_all(&database.pool)
@@ -320,11 +328,13 @@ impl AggregatedMessage {
             }
         })?;
 
+        let mut tx = database.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
-              reply_to_id, content_tokens, reactions, media_attachments, delivery_status)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
+              reply_to_id, content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
                tags = excluded.tags,
@@ -343,15 +353,23 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
-        .bind(
-            message
-                .delivery_status
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
-        )
-        .execute(&database.pool)
+        .execute(&mut *tx)
         .await?;
+
+        if let Some(status) = &message.delivery_status {
+            sqlx::query(
+                "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+            )
+            .bind(&message.id)
+            .bind(group_id.as_slice())
+            .bind(serde_json::to_string(status)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -475,8 +493,8 @@ impl AggregatedMessage {
 
     /// Update the delivery status of a cached message and return the full updated message.
     ///
-    /// Uses `RETURNING` to atomically update and fetch the row, avoiding a race window
-    /// between separate UPDATE + SELECT queries.
+    /// Upserts into the separate `message_delivery_status` table, then fetches the
+    /// full message via LEFT JOIN. Runs in a transaction for atomicity.
     ///
     /// Returns an error if no matching message was found.
     pub async fn update_delivery_status(
@@ -485,17 +503,41 @@ impl AggregatedMessage {
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<ChatMessage> {
-        let row: Option<AggregatedMessageRow> = sqlx::query_as(
-            "UPDATE aggregated_messages
-             SET delivery_status = ?
-             WHERE message_id = ? AND mls_group_id = ? AND kind = 9
-             RETURNING *",
+        let mut tx = database.pool.begin().await?;
+
+        // Upsert delivery status (FK constraint ensures the message exists)
+        sqlx::query(
+            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+             VALUES (?, ?, ?)
+             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
         )
-        .bind(serde_json::to_string(status)?)
         .bind(message_id)
         .bind(group_id.as_slice())
-        .fetch_optional(&database.pool)
+        .bind(serde_json::to_string(status)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            // FK violation means the message doesn't exist
+            sqlx::Error::Database(ref db_err) if db_err.code().as_deref() == Some("787") => {
+                DatabaseError::Sqlx(sqlx::Error::RowNotFound)
+            }
+            _ => DatabaseError::Sqlx(e),
+        })?;
+
+        // Fetch the full message with updated status
+        let row: Option<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.message_id = ? AND am.mls_group_id = ? AND am.kind = 9",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_optional(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         match row {
             Some(r) => Self::row_to_chat_message(r),
@@ -519,8 +561,11 @@ impl AggregatedMessage {
         database: &Database,
     ) -> Result<Option<ChatMessage>> {
         let row: Option<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT * FROM aggregated_messages
-             WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.message_id = ? AND am.mls_group_id = ? AND am.kind = 9",
         )
         .bind(message_id)
         .bind(group_id.as_slice())
