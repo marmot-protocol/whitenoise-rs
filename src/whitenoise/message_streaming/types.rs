@@ -12,7 +12,7 @@ use crate::whitenoise::message_aggregator::ChatMessage;
 ///
 /// The accompanying `message` field in [`MessageUpdate`] always contains
 /// the complete, up-to-date state of the affected message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UpdateTrigger {
     /// A new message was added to the group.
     NewMessage,
@@ -29,10 +29,6 @@ pub enum UpdateTrigger {
     /// The delivery status of an outgoing message changed (e.g. Sending → Sent or Failed).
     /// The message stays in its current position in the chat.
     DeliveryStatusChanged,
-
-    /// A failed message was retried and needs both a status update and repositioning
-    /// to its new location in the chat history.
-    MessageRetried,
 }
 
 /// Represents a single update to be sent to subscribers.
@@ -69,7 +65,7 @@ mod tests {
     #[test]
     fn update_trigger_derives_clone_and_eq() {
         let trigger = UpdateTrigger::NewMessage;
-        let cloned = trigger.clone();
+        let cloned = trigger;
         assert_eq!(trigger, cloned);
 
         let trigger2 = UpdateTrigger::ReactionAdded;
@@ -84,7 +80,6 @@ mod tests {
             UpdateTrigger::ReactionRemoved,
             UpdateTrigger::MessageDeleted,
             UpdateTrigger::DeliveryStatusChanged,
-            UpdateTrigger::MessageRetried,
         ];
 
         for trigger in triggers {

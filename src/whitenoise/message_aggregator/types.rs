@@ -11,7 +11,7 @@ use crate::whitenoise::media_files::MediaFile;
 ///
 /// Follows an optimistic UI pattern: the message appears instantly with `Sending`,
 /// then transitions to `Sent` or `Failed` after the background publish completes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeliveryStatus {
     /// Background publish in progress (message visible in chat immediately)
     Sending,
@@ -19,6 +19,10 @@ pub enum DeliveryStatus {
     Sent(usize),
     /// All publish attempts exhausted — reason string for debugging (not shown to user)
     Failed(String),
+    /// The user retried this message — a new message was created with the same content.
+    /// Messages in this state are excluded from UI snapshots so they don't resurface
+    /// after app restart.
+    Retried,
 }
 
 /// Represents an aggregated chat message ready for frontend display
@@ -195,6 +199,7 @@ mod tests {
                 DeliveryStatus::Sending,
                 DeliveryStatus::Sent(3),
                 DeliveryStatus::Failed("No relay accepted".to_string()),
+                DeliveryStatus::Retried,
             ];
 
             for status in &statuses {

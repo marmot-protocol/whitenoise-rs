@@ -285,11 +285,9 @@ impl NostrManager {
 
     /// Update delivery status in the DB cache and emit a stream update.
     ///
-    /// Note: There is a small race window between `update_delivery_status` and
-    /// `find_by_id` where a concurrent `retry_message_publish` could interleave.
-    /// In practice this is acceptable because (a) retries are user-initiated and
-    /// unlikely to overlap with in-flight status transitions, and (b) the worst
-    /// case is a briefly stale UI that self-corrects on the next status update.
+    /// Uses `update_delivery_status` with `RETURNING` to atomically update and
+    /// fetch the row in a single query, eliminating the race window between
+    /// separate UPDATE + SELECT operations.
     async fn update_and_emit_delivery_status(
         event_id: &str,
         group_id: &GroupId,
@@ -297,20 +295,9 @@ impl NostrManager {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
-        if let Err(e) =
-            AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
+        match AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
         {
-            tracing::warn!(
-                target: "whitenoise::messages::delivery",
-                "Failed to update delivery status in cache: {}",
-                e
-            );
-            return;
-        }
-
-        // Re-fetch the full message to emit with updated status
-        match AggregatedMessage::find_by_id(event_id, group_id, database).await {
-            Ok(Some(updated_msg)) => {
+            Ok(updated_msg) => {
                 stream_manager.emit(
                     group_id,
                     MessageUpdate {
@@ -319,17 +306,11 @@ impl NostrManager {
                     },
                 );
             }
-            Ok(None) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Message {} not found in cache after delivery status update",
-                    event_id
-                );
-            }
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::messages::delivery",
-                    "Failed to fetch updated message for delivery status emission: {}",
+                    "Failed to update delivery status for message {}: {}",
+                    event_id,
                     e
                 );
             }

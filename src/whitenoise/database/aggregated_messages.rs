@@ -208,6 +208,7 @@ impl AggregatedMessage {
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT * FROM aggregated_messages
              WHERE kind = 9 AND mls_group_id = ?
+               AND (delivery_status IS NULL OR delivery_status != '\"Retried\"')
              ORDER BY created_at",
         )
         .bind(group_id.as_slice())
@@ -472,31 +473,34 @@ impl AggregatedMessage {
         Ok(())
     }
 
-    /// Update the delivery status of a cached message.
+    /// Update the delivery status of a cached message and return the full updated message.
     ///
-    /// Returns an error if no matching message was found (0 rows affected).
+    /// Uses `RETURNING` to atomically update and fetch the row, avoiding a race window
+    /// between separate UPDATE + SELECT queries.
+    ///
+    /// Returns an error if no matching message was found.
     pub async fn update_delivery_status(
         message_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
         database: &Database,
-    ) -> Result<()> {
-        let result = sqlx::query(
+    ) -> Result<ChatMessage> {
+        let row: Option<AggregatedMessageRow> = sqlx::query_as(
             "UPDATE aggregated_messages
              SET delivery_status = ?
-             WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
+             WHERE message_id = ? AND mls_group_id = ? AND kind = 9
+             RETURNING *",
         )
         .bind(serde_json::to_string(status)?)
         .bind(message_id)
         .bind(group_id.as_slice())
-        .execute(&database.pool)
+        .fetch_optional(&database.pool)
         .await?;
 
-        if result.rows_affected() == 0 {
-            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        match row {
+            Some(r) => Self::row_to_chat_message(r),
+            None => Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
         }
-
-        Ok(())
     }
 
     /// Delete ALL cached events for a group
@@ -891,10 +895,11 @@ impl AggregatedMessage {
 
 #[cfg(test)]
 mod tests {
+    use nostr_sdk::Keys;
+
     use super::*;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
-    use nostr_sdk::Keys;
 
     async fn setup_group(group_id: &GroupId, database: &Database) {
         // Create group_information record (required for foreign key constraint)
@@ -1689,8 +1694,8 @@ mod tests {
             .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
 
-        // Update to Sent(3)
-        AggregatedMessage::update_delivery_status(
+        // Update to Sent(3) — returned message should have the updated status
+        let updated = AggregatedMessage::update_delivery_status(
             &message.id,
             &group_id,
             &DeliveryStatus::Sent(3),
@@ -1698,7 +1703,9 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(updated.delivery_status, Some(DeliveryStatus::Sent(3)));
 
+        // Verify via find_by_id as well
         let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
             .await
             .unwrap()
@@ -1706,7 +1713,7 @@ mod tests {
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Update to Failed
-        AggregatedMessage::update_delivery_status(
+        let updated = AggregatedMessage::update_delivery_status(
             &message.id,
             &group_id,
             &DeliveryStatus::Failed("timeout".to_string()),
@@ -1714,13 +1721,8 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            found.delivery_status,
+            updated.delivery_status,
             Some(DeliveryStatus::Failed("timeout".to_string()))
         );
     }
@@ -1814,6 +1816,46 @@ mod tests {
             "Expected RowNotFound error, got: {:?}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_messages_by_group_excludes_retried() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[206; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert a normal message
+        let msg_normal = create_test_chat_message(206, author);
+        AggregatedMessage::insert_message(&msg_normal, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert a message with Retried status (simulating a retried failed message)
+        let mut msg_retried = create_test_chat_message(207, author);
+        msg_retried.delivery_status = Some(DeliveryStatus::Retried);
+        AggregatedMessage::insert_message(&msg_retried, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert a message with Failed status (should still be visible)
+        let mut msg_failed = create_test_chat_message(208, author);
+        msg_failed.delivery_status = Some(DeliveryStatus::Failed("error".to_string()));
+        AggregatedMessage::insert_message(&msg_failed, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Only normal and failed messages should appear, not retried
+        assert_eq!(messages.len(), 2);
+        let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&msg_normal.id.as_str()));
+        assert!(ids.contains(&msg_failed.id.as_str()));
+        assert!(!ids.contains(&msg_retried.id.as_str()));
     }
 
     #[tokio::test]
