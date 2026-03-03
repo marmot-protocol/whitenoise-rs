@@ -95,7 +95,7 @@ impl TestCase for VerifyStreamUpdateTestCase {
             .as_ref()
             .and_then(|key| context.get_message_id(key).ok().cloned());
 
-        let expected_trigger = self.expected_trigger.clone();
+        let expected_trigger = self.expected_trigger;
 
         // Wait for the expected update with timeout, skipping stale events that don't match
         // This handles race conditions where previous test updates arrive late
