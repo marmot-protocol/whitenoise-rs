@@ -74,6 +74,54 @@ pub struct NostrManager {
 
 pub type Result<T> = std::result::Result<T, NostrManagerError>;
 
+struct SignerScopeGuard {
+    client: Client,
+    lock_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl SignerScopeGuard {
+    async fn new(
+        client: Client,
+        signer_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+        signer: impl NostrSigner + 'static,
+    ) -> Self {
+        let lock_guard = signer_lock.lock_owned().await;
+        client.set_signer(signer).await;
+
+        Self {
+            client,
+            lock_guard: Some(lock_guard),
+        }
+    }
+
+    async fn cleanup(mut self) {
+        self.client.unset_signer().await;
+        self.lock_guard.take();
+    }
+}
+
+impl Drop for SignerScopeGuard {
+    fn drop(&mut self) {
+        let Some(lock_guard) = self.lock_guard.take() else {
+            return;
+        };
+
+        let client = self.client.clone();
+        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                target: "whitenoise::nostr_manager::with_signer",
+                "Cannot spawn signer cleanup task because no Tokio runtime is active"
+            );
+            return;
+        };
+
+        runtime_handle.spawn(async move {
+            client.unset_signer().await;
+            drop(lock_guard);
+        });
+    }
+}
+
 impl NostrManager {
     /// Default timeout for client requests
     pub(crate) fn default_timeout() -> Duration {
@@ -202,16 +250,16 @@ impl NostrManager {
     /// Reusable helper to execute operations with a temporary signer.
     ///
     /// This helper ensures that the signer is always unset after the operation completes,
-    /// even if the operation returns early or encounters an error.
+    /// including when the operation future is cancelled.
     async fn with_signer<F, Fut, T>(&self, signer: impl NostrSigner + 'static, f: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
-        let _guard = self.signer_lock.lock().await;
-        self.client.set_signer(signer).await;
+        let signer_guard =
+            SignerScopeGuard::new(self.client.clone(), self.signer_lock.clone(), signer).await;
         let result = f().await;
-        self.client.unset_signer().await;
+        signer_guard.cleanup().await;
         result
     }
 
@@ -548,6 +596,7 @@ mod subscription_monitoring_tests {
     use crate::whitenoise::event_tracker::NoEventTracker;
     use std::sync::Arc;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
     #[tokio::test]
     async fn test_count_subscriptions_for_account_empty() {
@@ -785,5 +834,45 @@ mod subscription_monitoring_tests {
             nostr_manager.count_subscriptions_for_account(&pubkey).await,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_with_signer_unsets_signer_on_cancellation() {
+        let (event_sender, _receiver) = mpsc::channel(100);
+        let event_tracker = Arc::new(NoEventTracker);
+        let nostr_manager =
+            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
+                .await
+                .unwrap();
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let signer = Keys::generate();
+
+        let manager = nostr_manager.clone();
+        let handle = tokio::spawn(async move {
+            manager
+                .with_signer(signer, || async move {
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+                .await
+        });
+
+        started_rx.await.unwrap();
+        assert!(nostr_manager.client.has_signer().await);
+
+        handle.abort();
+        let join_error = handle.await.unwrap_err();
+        assert!(join_error.is_cancelled());
+
+        for _ in 0..50 {
+            if !nostr_manager.client.has_signer().await {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!nostr_manager.client.has_signer().await);
     }
 }
