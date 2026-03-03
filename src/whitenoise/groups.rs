@@ -12,6 +12,7 @@ use crate::{
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
+        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
         relays::Relay,
         users::User,
     },
@@ -81,6 +82,7 @@ impl Whitenoise {
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
         let signer = self.get_signer_for_account(creator_account)?;
+        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut members = Vec::new();
@@ -134,6 +136,23 @@ impl Whitenoise {
             let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
+
+            if event.pubkey != *pk {
+                return Err(WhitenoiseError::InvalidInput(format!(
+                    "Fetched key package event {} signed by {} instead of expected {}",
+                    event.id, event.pubkey, pk
+                )));
+            }
+
+            validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(
+                |e| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "Incompatible key package event {} for member {}: {}",
+                        event.id, pk, e
+                    ))
+                },
+            )?;
+
             key_package_events.push(event);
             members.push(user);
         }
@@ -143,7 +162,6 @@ impl Whitenoise {
         let group_relays = config.relays.clone();
         let group_name = config.name.clone();
 
-        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
         let create_group_result =
             mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
 
@@ -374,6 +392,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let mut key_package_events: Vec<Event> = Vec::new();
         let signer = self.get_signer_for_account(account)?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
 
         // Fetch key packages for all members
@@ -401,22 +420,33 @@ impl Whitenoise {
             let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
+
+            if event.pubkey != *pk {
+                return Err(WhitenoiseError::InvalidInput(format!(
+                    "Fetched key package event {} signed by {} instead of expected {}",
+                    event.id, event.pubkey, pk
+                )));
+            }
+
+            validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(
+                |e| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "Incompatible key package event {} for member {}: {}",
+                        event.id, pk, e
+                    ))
+                },
+            )?;
+
             key_package_events.push(event);
             users.push(user);
         }
 
-        let (relay_urls, evolution_event, welcome_rumors) = {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
-            let update_result = mdk.add_members(group_id, &key_package_events)?;
+        let update_result = mdk.add_members(group_id, &key_package_events)?;
 
-            (
-                relay_urls,
-                update_result.evolution_event,
-                update_result.welcome_rumors,
-            )
-        };
+        let evolution_event = update_result.evolution_event;
+        let welcome_rumors = update_result.welcome_rumors;
 
         let welcome_rumors = match welcome_rumors {
             None => {
