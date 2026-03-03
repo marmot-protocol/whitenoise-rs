@@ -67,6 +67,7 @@ impl NostrManager {
     {
         let timestamp_valid_events: Vec<Event> = events
             .into_iter()
+            .filter(|event| event.kind == expected_kind)
             .filter(is_event_timestamp_valid)
             .collect();
 
@@ -123,8 +124,9 @@ impl NostrManager {
 
 #[cfg(test)]
 mod contact_list_logic_tests {
-    use super::*;
     use std::{collections::HashMap, time::Duration};
+
+    use super::*;
 
     // Test data for problematic contact list
     fn get_test_contact_list_event() -> Event {
