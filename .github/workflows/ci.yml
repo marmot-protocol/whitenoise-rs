@@ -163,6 +163,14 @@ jobs:
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
+          echo "Checking relay logs for startup issues:"
+          echo "=== nostr-rs-relay logs ==="
+          docker compose logs nostr-rs-relay
+          echo "=== strfry-nostr-relay logs ==="
+          docker compose logs strfry-nostr-relay
+          echo "Testing basic HTTP connectivity first:"
+          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
+          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
           echo "Testing WebSocket connectivity:"
           ./scripts/wait_for_relays.sh
 
@@ -213,6 +221,14 @@ jobs:
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
+          echo "Checking relay logs for startup issues:"
+          echo "=== nostr-rs-relay logs ==="
+          docker compose logs nostr-rs-relay
+          echo "=== strfry-nostr-relay logs ==="
+          docker compose logs strfry-nostr-relay
+          echo "Testing basic HTTP connectivity first:"
+          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
+          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
           echo "Testing WebSocket connectivity:"
           ./scripts/wait_for_relays.sh
 
