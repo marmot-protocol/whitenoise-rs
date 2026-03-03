@@ -155,7 +155,7 @@ impl User {
                         new_timestamp.timestamp_millis(),
                         stored_timestamp.timestamp_millis()
                     );
-                    return Err(e);
+                    return Ok(false);
                 }
                 None => {
                     tracing::debug!(
