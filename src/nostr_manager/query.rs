@@ -98,11 +98,14 @@ impl NostrManager {
     }
 
     fn is_relay_event_semantically_valid(event: &Event) -> bool {
-        event
+        let relay_tags: Vec<&Tag> = event
             .tags
             .iter()
             .filter(|tag| Self::is_relay_list_tag_for_event_kind(tag, event.kind))
-            .all(|tag| {
+            .collect();
+
+        !relay_tags.is_empty()
+            && relay_tags.iter().all(|tag| {
                 tag.content()
                     .and_then(|content| RelayUrl::parse(content).ok())
                     .is_some()
@@ -706,6 +709,29 @@ mod contact_list_logic_tests {
         assert!(
             !NostrManager::is_key_package_event_semantically_valid(&empty_content),
             "Key package with empty content should fail semantic checks"
+        );
+    }
+
+    #[test]
+    fn test_relay_event_semantic_validation_requires_at_least_one_relay_tag() {
+        let keys = Keys::generate();
+
+        let no_relay_tags_event = EventBuilder::new(Kind::RelayList, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let valid_relay_event = EventBuilder::new(Kind::RelayList, "")
+            .tags(vec![Tag::reference("wss://relay.example.com")])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            !NostrManager::is_relay_event_semantically_valid(&no_relay_tags_event),
+            "Relay event without relay tags should fail semantic checks"
+        );
+        assert!(
+            NostrManager::is_relay_event_semantically_valid(&valid_relay_event),
+            "Relay event with valid relay tags should pass semantic checks"
         );
     }
 }
