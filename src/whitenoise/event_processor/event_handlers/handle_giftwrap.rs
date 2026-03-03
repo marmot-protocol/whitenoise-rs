@@ -76,49 +76,67 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
-        // Extract key package event ID from the rumor tags early — needed for pre-check
-        let key_package_event_id: Option<EventId> = rumor
+        // Extract key package event ID from the rumor tags early — required for pre-check
+        // and key package lifecycle finalization.
+        let key_package_event_id = match rumor
             .tags
             .iter()
             .find(|tag| {
                 tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E))
             })
             .and_then(|tag| tag.content())
-            .and_then(|content| EventId::parse(content).ok());
-
-        // Pre-check: do we have this key package and is its key material still available?
-        // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
-        if let Some(ref kp_event_id) = key_package_event_id {
-            match PublishedKeyPackage::find_by_event_id(
-                &account.pubkey,
-                &kp_event_id.to_hex(),
-                &self.database,
-            )
-            .await
-            {
-                Ok(Some(pkg)) if pkg.key_material_deleted => {
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome",
-                        "Key material already deleted for this key package, skipping Welcome"
-                    );
-                    return Ok(());
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        target: "whitenoise::event_processor::process_welcome",
-                        "Unknown key package referenced in Welcome, skipping"
-                    );
-                    return Ok(());
-                }
-                Ok(Some(_)) => {} // Good — KP exists, key material available
+        {
+            Some(content) => match EventId::parse(content) {
+                Ok(event_id) => event_id,
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::event_processor::process_welcome",
-                        "Failed to look up key package: {}, proceeding anyway",
-                        e
+                        error = %e,
+                        "Malformed key package event id in Welcome e-tag, skipping"
                     );
-                    // Don't block on DB lookup failure — fall through to MLS
+                    return Ok(());
                 }
+            },
+            None => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome",
+                    "Missing key package event id in Welcome e-tag, skipping"
+                );
+                return Ok(());
+            }
+        };
+
+        // Pre-check: do we have this key package and is its key material still available?
+        // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
+        match PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &key_package_event_id.to_hex(),
+            &self.database,
+        )
+        .await
+        {
+            Ok(Some(pkg)) if pkg.key_material_deleted => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome",
+                    "Key material already deleted for this key package, skipping Welcome"
+                );
+                return Ok(());
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome",
+                    "Unknown key package referenced in Welcome, skipping"
+                );
+                return Ok(());
+            }
+            Ok(Some(_)) => {} // Good — KP exists, key material available
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome",
+                    "Failed to look up key package: {}, proceeding anyway",
+                    e
+                );
+                // Don't block on DB lookup failure — fall through to MLS
             }
         }
 
@@ -184,7 +202,7 @@ impl Whitenoise {
         account: Account,
         group_id: GroupId,
         group_name: String,
-        key_package_event_id: Option<EventId>,
+        key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
         let Ok(whitenoise) = Whitenoise::get_instance() else {
@@ -226,7 +244,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
         group_name: &str,
-        key_package_event_id: Option<EventId>,
+        key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
         // Get signer early - needed for subscriptions
@@ -400,21 +418,13 @@ impl Whitenoise {
     async fn rotate_key_package(
         whitenoise: &Whitenoise,
         account: &Account,
-        key_package_event_id: Option<EventId>,
+        key_package_event_id: EventId,
     ) -> Result<()> {
-        let Some(kp_event_id) = key_package_event_id else {
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "No key package event id found in welcome event"
-            );
-            return Ok(());
-        };
-
         // Mark the key package as consumed so the maintenance task knows
         // to clean up local key material after the quiet period.
         if let Err(e) = PublishedKeyPackage::mark_consumed(
             &account.pubkey,
-            &kp_event_id.to_hex(),
+            &key_package_event_id.to_hex(),
             &whitenoise.database,
         )
         .await
@@ -437,7 +447,7 @@ impl Whitenoise {
         // Now delete the used key package. Failure here is non-fatal — the
         // scheduler will clean it up during routine maintenance.
         match whitenoise
-            .delete_key_package_for_account(account, &kp_event_id, false)
+            .delete_key_package_for_account(account, &key_package_event_id, false)
             .await
         {
             Ok(true) => {
@@ -556,11 +566,11 @@ mod tests {
     use crate::whitenoise::test_utils::*;
 
     // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
-    async fn build_welcome_giftwrap(
+    async fn build_welcome_rumor(
         whitenoise: &Whitenoise,
         creator_account: &Account,
         member_pubkey: PublicKey,
-    ) -> Event {
+    ) -> UnsignedEvent {
         // Fetch a real key package event for the member from relays
         let relays_urls = Relay::urls(
             &creator_account
@@ -587,11 +597,20 @@ mod tests {
             )
             .unwrap();
 
-        let welcome_rumor = create_group_result
+        create_group_result
             .welcome_rumors
             .first()
             .expect("welcome rumor exists")
-            .clone();
+            .clone()
+    }
+
+    // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
+    async fn build_welcome_giftwrap(
+        whitenoise: &Whitenoise,
+        creator_account: &Account,
+        member_pubkey: PublicKey,
+    ) -> Event {
+        let welcome_rumor = build_welcome_rumor(whitenoise, creator_account, member_pubkey).await;
 
         // Use the creator's real keys as signer to build the giftwrap
         let creator_signer = whitenoise
@@ -602,6 +621,107 @@ mod tests {
         EventBuilder::gift_wrap(&creator_signer, &member_pubkey, welcome_rumor, vec![])
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_missing_e_tag_skipped() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let mut welcome_rumor =
+            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+        let mut tags_without_e = Tags::new();
+        for tag in welcome_rumor.tags.iter() {
+            if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
+                tags_without_e.push(tag.clone());
+            }
+        }
+        welcome_rumor.tags = tags_without_e;
+        welcome_rumor.ensure_id();
+
+        let creator_signer = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&creator_account.pubkey)
+            .unwrap();
+        let giftwrap_event = EventBuilder::gift_wrap(
+            &creator_signer,
+            &member_account.pubkey,
+            welcome_rumor,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Missing e-tag Welcome should be skipped safely"
+        );
+
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(
+            groups.is_empty(),
+            "Member should not accept Welcome without required e-tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_malformed_e_tag_skipped() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let mut welcome_rumor =
+            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+        let mut malformed_tags = Tags::new();
+        for tag in welcome_rumor.tags.iter() {
+            if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
+                malformed_tags.push(tag.clone());
+            }
+        }
+        malformed_tags.push(Tag::parse(vec!["e", "not-an-event-id"]).unwrap());
+        welcome_rumor.tags = malformed_tags;
+        welcome_rumor.ensure_id();
+
+        let creator_signer = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&creator_account.pubkey)
+            .unwrap();
+        let giftwrap_event = EventBuilder::gift_wrap(
+            &creator_signer,
+            &member_account.pubkey,
+            welcome_rumor,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Malformed e-tag Welcome should be skipped safely"
+        );
+
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(
+            groups.is_empty(),
+            "Member should not accept Welcome with malformed e-tag"
+        );
     }
 
     #[tokio::test]
@@ -759,7 +879,7 @@ mod tests {
             &account,
             &group_id,
             group_name,
-            None,
+            EventId::all_zeros(),
             welcomer_pubkey,
         )
         .await;
@@ -794,7 +914,7 @@ mod tests {
             &account,
             &group_id,
             group_name,
-            None,
+            EventId::all_zeros(),
             welcomer_pubkey,
         )
         .await;
@@ -804,7 +924,7 @@ mod tests {
             &account,
             &group_id,
             group_name,
-            None,
+            EventId::all_zeros(),
             welcomer_pubkey,
         )
         .await;
@@ -853,7 +973,7 @@ mod tests {
             &member_account,
             &group_id,
             &group.name,
-            None,
+            EventId::all_zeros(),
             creator_account.pubkey,
         )
         .await;
@@ -899,7 +1019,7 @@ mod tests {
             &account,
             &group_id,
             "Test Group",
-            None,
+            EventId::all_zeros(),
             welcomer_pubkey,
         )
         .await;
