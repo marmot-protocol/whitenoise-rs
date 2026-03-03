@@ -80,11 +80,14 @@ struct SignerScopeGuard {
 }
 
 impl SignerScopeGuard {
-    async fn new(
+    async fn new<S>(
         client: Client,
         signer_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-        signer: impl NostrSigner + 'static,
-    ) -> Self {
+        signer: S,
+    ) -> Self
+    where
+        S: NostrSigner + 'static,
+    {
         let lock_guard = signer_lock.lock_owned().await;
         client.set_signer(signer).await;
 
@@ -107,11 +110,14 @@ impl Drop for SignerScopeGuard {
         };
 
         let client = self.client.clone();
-        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+        let runtime_handle = tokio::runtime::Handle::try_current();
+        let Ok(runtime_handle) = runtime_handle else {
             tracing::warn!(
                 target: "whitenoise::nostr_manager::with_signer",
                 "Cannot spawn signer cleanup task because no Tokio runtime is active"
             );
+            futures::executor::block_on(client.unset_signer());
+            drop(lock_guard);
             return;
         };
 
@@ -866,13 +872,16 @@ mod subscription_monitoring_tests {
         let join_error = handle.await.unwrap_err();
         assert!(join_error.is_cancelled());
 
-        for _ in 0..50 {
-            if !nostr_manager.client.has_signer().await {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
+            loop {
+                if !nostr_manager.client.has_signer().await {
+                    return;
+                }
 
-        assert!(!nostr_manager.client.has_signer().await);
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("signer should be unset after cancellation within timeout");
     }
 }
