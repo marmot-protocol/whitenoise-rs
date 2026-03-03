@@ -90,7 +90,7 @@ impl NostrManager {
         event_tracker: std::sync::Arc<dyn EventTracker>,
         timeout: Duration,
     ) -> Result<Self> {
-        let opts = ClientOptions::default();
+        let opts = ClientOptions::default().verify_subscriptions(true);
 
         let client = { Client::builder().opts(opts).build() };
 

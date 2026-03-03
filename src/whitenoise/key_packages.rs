@@ -55,6 +55,34 @@ pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
         .collect()
 }
 
+/// Filters relay responses to key package events that match the expected kind and author.
+///
+/// Returns `(valid_events, dropped_wrong_kind, dropped_wrong_author)`.
+pub(crate) fn filter_key_package_events_for_account(
+    account_pubkey: PublicKey,
+    events: Vec<Event>,
+) -> (Vec<Event>, usize, usize) {
+    let mut valid_events = Vec::new();
+    let mut dropped_wrong_kind = 0;
+    let mut dropped_wrong_author = 0;
+
+    for event in events {
+        if event.kind != Kind::MlsKeyPackage {
+            dropped_wrong_kind += 1;
+            continue;
+        }
+
+        if event.pubkey != account_pubkey {
+            dropped_wrong_author += 1;
+            continue;
+        }
+
+        valid_events.push(event);
+    }
+
+    (valid_events, dropped_wrong_kind, dropped_wrong_author)
+}
+
 impl Whitenoise {
     /// Filters key package events to only include those that can be parsed by the local MDK.
     ///
@@ -454,9 +482,25 @@ impl Whitenoise {
             key_package_events.push(event);
         }
 
+        let (key_package_events, dropped_wrong_kind, dropped_wrong_author) =
+            filter_key_package_events_for_account(account.pubkey, key_package_events);
+
+        let total_dropped = dropped_wrong_kind + dropped_wrong_author;
+        if total_dropped > 0 {
+            tracing::warn!(
+                target: "whitenoise::key_packages",
+                "Dropped {} off-filter event(s) while fetching key packages for account {} \
+                 (wrong kind: {}, wrong author: {})",
+                total_dropped,
+                account.pubkey.to_hex(),
+                dropped_wrong_kind,
+                dropped_wrong_author,
+            );
+        }
+
         tracing::debug!(
-            target: "whitenoise::fetch_all_key_packages_for_account",
-            "Found {} key package events for account {}",
+            target: "whitenoise::key_packages",
+            "Found {} valid key package event(s) for account {}",
             key_package_events.len(),
             account.pubkey.to_hex()
         );
@@ -1149,6 +1193,13 @@ mod tests {
             .unwrap()
     }
 
+    /// Creates a non-key-package event for filtering tests
+    fn create_non_key_package_event(keys: &Keys) -> Event {
+        EventBuilder::new(Kind::TextNote, "test_content")
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
     #[test]
     fn test_has_encoding_tag_returns_true_when_present() {
         let keys = Keys::generate();
@@ -1245,6 +1296,85 @@ mod tests {
         assert!(
             outdated.is_empty(),
             "Should return empty when given empty list"
+        );
+    }
+
+    #[test]
+    fn test_filter_key_package_events_for_account_drops_off_filter_events() {
+        let account_keys = Keys::generate();
+        let other_keys = Keys::generate();
+
+        let valid_with_encoding = create_key_package_event_with_encoding_tag(&account_keys);
+        let valid_without_encoding = create_key_package_event_without_encoding_tag(&account_keys);
+        let wrong_kind = create_non_key_package_event(&account_keys);
+        let wrong_author = create_key_package_event_with_encoding_tag(&other_keys);
+
+        let (filtered, dropped_wrong_kind, dropped_wrong_author) =
+            filter_key_package_events_for_account(
+                account_keys.public_key(),
+                vec![
+                    valid_with_encoding.clone(),
+                    valid_without_encoding.clone(),
+                    wrong_kind,
+                    wrong_author,
+                ],
+            );
+
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Should keep only key package events from the requested author"
+        );
+        assert!(
+            filtered.iter().any(|e| e.id == valid_with_encoding.id),
+            "Should keep matching key package with encoding tag"
+        );
+        assert!(
+            filtered.iter().any(|e| e.id == valid_without_encoding.id),
+            "Should keep matching key package without encoding tag"
+        );
+        assert_eq!(
+            dropped_wrong_kind, 1,
+            "Should count one dropped event with wrong kind"
+        );
+        assert_eq!(
+            dropped_wrong_author, 1,
+            "Should count one dropped event with wrong author"
+        );
+    }
+
+    #[test]
+    fn test_filter_key_package_events_for_account_keeps_all_matching_events() {
+        let account_keys = Keys::generate();
+        let event1 = create_key_package_event_with_encoding_tag(&account_keys);
+        let event2 = create_key_package_event_without_encoding_tag(&account_keys);
+
+        let (filtered, dropped_wrong_kind, dropped_wrong_author) =
+            filter_key_package_events_for_account(
+                account_keys.public_key(),
+                vec![event1.clone(), event2.clone()],
+            );
+
+        assert_eq!(
+            filtered.len(),
+            2,
+            "Should keep all matching key package events"
+        );
+        assert_eq!(
+            dropped_wrong_kind, 0,
+            "Should not drop events for wrong kind when all are key packages"
+        );
+        assert_eq!(
+            dropped_wrong_author, 0,
+            "Should not drop events for wrong author when all authors match"
+        );
+        assert!(
+            filtered.iter().any(|e| e.id == event1.id),
+            "Should retain first matching key package"
+        );
+        assert!(
+            filtered.iter().any(|e| e.id == event2.id),
+            "Should retain second matching key package"
         );
     }
 
