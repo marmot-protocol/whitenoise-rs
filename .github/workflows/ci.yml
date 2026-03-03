@@ -154,11 +154,35 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Running Nostr health checks..."
+          sleep 5
+          echo "Checking if services are running:"
+          docker compose ps
+          echo "Checking relay logs for startup issues:"
+          echo "=== nostr-rs-relay logs ==="
+          docker compose logs nostr-rs-relay
+          echo "=== strfry-nostr-relay logs ==="
+          docker compose logs strfry-nostr-relay
+          echo "Testing basic HTTP connectivity first:"
+          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
+          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
+          echo "Testing WebSocket connectivity:"
+          ./scripts/wait_for_relays.sh
+
       - name: Unit and integration tests (non-Docker)
         run: cargo nextest run --all-features --all-targets
 
       - name: Doc tests
         run: cargo test --workspace --doc
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
 
   # Coverage lane isolated from normal tests to avoid duplicate instrumentation work
   coverage:
@@ -188,6 +212,26 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Running Nostr health checks..."
+          sleep 5
+          echo "Checking if services are running:"
+          docker compose ps
+          echo "Checking relay logs for startup issues:"
+          echo "=== nostr-rs-relay logs ==="
+          docker compose logs nostr-rs-relay
+          echo "=== strfry-nostr-relay logs ==="
+          docker compose logs strfry-nostr-relay
+          echo "Testing basic HTTP connectivity first:"
+          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
+          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
+          echo "Testing WebSocket connectivity:"
+          ./scripts/wait_for_relays.sh
+
       - name: Test with Coverage
         run: |
           # Exclude test infrastructure, integration tests, and benchmarks from coverage.
@@ -215,6 +259,10 @@ jobs:
           cat coverage/summary.txt
         env:
           RUST_LOG: error
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
 
       - name: Extract coverage percentage
         id: coverage
