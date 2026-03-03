@@ -6,14 +6,53 @@ on:
   pull_request:
     branches: ["master"]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect Changed Paths
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      ci: ${{ steps.filter.outputs.ci }}
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'rustfmt.toml'
+              - 'justfile'
+              - 'db_migrations/**'
+              - 'scripts/**'
+            ci:
+              - '.github/workflows/**'
+            deps:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+
   # Quick checks that fail fast
   fmt:
     name: Format Check
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +68,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +88,8 @@ jobs:
 
   docs:
     name: Documentation
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +110,8 @@ jobs:
   # Security audit
   audit:
     name: Security Audit
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.deps == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       checks: write
@@ -86,23 +131,44 @@ jobs:
           #   hpke-rs → hpke-rs-libcrux; pre-existing on master, fix tracked separately)
           ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0384,RUSTSEC-2026-0002,RUSTSEC-2026-0023
 
-  # Build and test matrix
-  test:
-    name: Test (${{ matrix.os }})
+  # Fast Linux test lane for PR feedback
+  test-linux:
+    name: Tests (Linux)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Unit and integration tests (non-Docker)
+        run: cargo nextest run --all-features --all-targets
+
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  # Coverage lane isolated from normal tests to avoid duplicate instrumentation work
+  coverage:
+    name: Coverage (Linux)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
-      pull-requests: write # Required for PR coverage comments
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: blacksmith-4vcpu-ubuntu-2404
-            run-integration: true
-          - os: macos-latest
-            run-integration: false
-          - os: macos-14
-            run-integration: false
-    runs-on: ${{ matrix.os }}
+      pull-requests: write
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
 
@@ -114,46 +180,15 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.os }}
+          key: coverage-linux
 
-      - name: Install cargo-llvm-cov (Linux)
-        if: runner.os == 'Linux'
+      - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Start Docker Compose services (Linux)
-        if: runner.os == 'Linux'
-        run: docker compose up -d
-
-      - name: Wait for services to be ready (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          echo "Running Nostr health checks..."
-          sleep 5
-          echo "Checking if services are running:"
-          docker compose ps
-          echo "Checking relay logs for startup issues:"
-          echo "=== nostr-rs-relay logs ==="
-          docker compose logs nostr-rs-relay
-          echo "=== strfry-nostr-relay logs ==="
-          docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
-
-      - name: Check
-        run: cargo check --all-targets --all-features
-
-      - name: Build
-        run: cargo build --all-targets --all-features
-
-      - name: Test with Coverage (Linux only - requires Docker)
-        if: runner.os == 'Linux'
+      - name: Test with Coverage
         run: |
           # Exclude test infrastructure, integration tests, and benchmarks from coverage.
           # These inflate the line count without measuring library code quality.
@@ -182,7 +217,6 @@ jobs:
           RUST_LOG: error
 
       - name: Extract coverage percentage
-        if: matrix.run-integration
         id: coverage
         run: |
           chmod +x scripts/extract-coverage.sh
@@ -191,7 +225,7 @@ jobs:
           echo "Current coverage: $COVERAGE%"
 
       - name: Get master branch coverage (for PRs)
-        if: matrix.run-integration && github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request'
         id: master_coverage
         run: |
           echo "🔍 Searching for baseline from master branch..."
@@ -236,7 +270,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
 
       - name: Compare coverage
-        if: matrix.run-integration && github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
+        if: github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
         run: |
           CURRENT=${{ steps.coverage.outputs.percentage }}
           BASELINE=${{ steps.master_coverage.outputs.baseline }}
@@ -258,7 +292,7 @@ jobs:
           fi
 
       - name: Comment PR with coverage
-        if: always() && matrix.run-integration && github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
+        if: always() && github.event_name == 'pull_request' && steps.master_coverage.outputs.baseline != '0'
         uses: actions/github-script@v7
         with:
           script: |
@@ -336,24 +370,15 @@ jobs:
               });
             }
 
-      - name: Integration Test
-        if: matrix.run-integration
-        run: |
-          mkdir -p ./dev/data/integration_test/
-          RUST_LOG=warn,sqlx=info,refinery_core=error,keyring=info,nostr_relay_pool=error,mdk_sqlite_storage=error,tungstenite=error,integration_test=debug \
-          cargo run --bin integration_test --features integration-tests -- \
-          --data-dir ./dev/data/integration_test/ --logs-dir ./dev/data/integration_test/
-          rm -rf ./dev/data/integration_test/
-
       - name: Save coverage baseline (master only)
-        if: matrix.run-integration && github.ref == 'refs/heads/master' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
         run: |
           mkdir -p coverage-baseline
           echo "${{ steps.coverage.outputs.percentage }}" > coverage-baseline/coverage-baseline.txt
           echo "Saved baseline: ${{ steps.coverage.outputs.percentage }}%"
 
       - name: Upload coverage baseline (master only)
-        if: matrix.run-integration && github.ref == 'refs/heads/master' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-baseline
@@ -361,7 +386,6 @@ jobs:
           retention-days: 90
 
       - name: Upload HTML coverage report
-        if: matrix.run-integration
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report-html
@@ -369,7 +393,6 @@ jobs:
           retention-days: 90
 
       - name: Upload lcov coverage report
-        if: matrix.run-integration
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report-lcov
@@ -377,20 +400,115 @@ jobs:
           retention-days: 90
 
       - name: Upload coverage summary
-        if: matrix.run-integration
         uses: actions/upload-artifact@v4
         with:
           name: coverage-summary
           path: coverage/summary.txt
           retention-days: 90
 
-      - name: Stop Docker Compose services (Linux)
-        if: always() && runner.os == 'Linux'
+  # Integration tests are isolated (Docker startup is expensive)
+  integration:
+    name: Integration (Linux + Docker)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integration-linux
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Running Nostr health checks..."
+          sleep 5
+          echo "Checking if services are running:"
+          docker compose ps
+          echo "Checking relay logs for startup issues:"
+          echo "=== nostr-rs-relay logs ==="
+          docker compose logs nostr-rs-relay
+          echo "=== strfry-nostr-relay logs ==="
+          docker compose logs strfry-nostr-relay
+          echo "Testing basic HTTP connectivity first:"
+          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
+          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
+          echo "Testing WebSocket connectivity:"
+          ./scripts/wait_for_relays.sh
+
+      - name: Integration Test
+        run: |
+          mkdir -p ./dev/data/integration_test/
+          RUST_LOG=warn,sqlx=info,refinery_core=error,keyring=info,nostr_relay_pool=error,mdk_sqlite_storage=error,tungstenite=error,integration_test=debug \
+          cargo run --bin integration_test --features integration-tests -- \
+          --data-dir ./dev/data/integration_test/ --logs-dir ./dev/data/integration_test/
+          rm -rf ./dev/data/integration_test/
+
+      - name: Stop Docker Compose services
+        if: always()
         run: docker compose down -v
+
+  # macOS compile smoke test for PR compatibility
+  macos-smoke:
+    name: macOS Smoke (latest)
+    needs: changes
+    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-latest
+
+      - name: Check
+        run: cargo check --all-targets --all-features
+
+  # Extra macOS compatibility lane only on master pushes
+  macos-compat:
+    name: macOS Compatibility (14)
+    needs: changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-14
+
+      - name: Check
+        run: cargo check --all-targets --all-features
 
   # Test against nightly (informational only)
   nightly:
     name: Nightly Check
+    needs: changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     continue-on-error: true
     steps:
