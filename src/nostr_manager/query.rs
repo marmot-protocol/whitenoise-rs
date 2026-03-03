@@ -19,7 +19,7 @@ impl NostrManager {
             .client
             .fetch_events_from(nip65_relay_urls, filter, self.timeout)
             .await?;
-        Self::latest_from_events_with_validation(events, "metadata", |event| {
+        Self::latest_from_events_with_validation(events, Kind::Metadata, |event| {
             Self::is_metadata_event_semantically_valid(event)
         })
     }
@@ -35,7 +35,7 @@ impl NostrManager {
             .client
             .fetch_events_from(nip65_relay_urls, filter, self.timeout)
             .await?;
-        Self::latest_from_events_with_validation(events, "relay list", |event| {
+        Self::latest_from_events_with_validation(events, relay_type.into(), |event| {
             Self::is_relay_event_semantically_valid(event)
         })
     }
@@ -52,14 +52,14 @@ impl NostrManager {
             .client
             .fetch_events_from(relays, filter, self.timeout)
             .await?;
-        Self::latest_from_events_with_validation(events, "key package", |event| {
+        Self::latest_from_events_with_validation(events, Kind::MlsKeyPackage, |event| {
             Self::is_key_package_event_semantically_valid(event)
         })
     }
 
     fn latest_from_events_with_validation<F>(
         events: Events,
-        event_type: &str,
+        expected_kind: Kind,
         is_semantically_valid: F,
     ) -> Result<Option<Event>>
     where
@@ -84,19 +84,22 @@ impl NostrManager {
         if latest_semantically_valid.is_none() && latest_timestamp_valid.is_some() {
             tracing::warn!(
                 target: "whitenoise::nostr_manager::query",
-                "No semantically valid {} events found after timestamp checks; \
+                "No semantically valid kind {} events found after timestamp checks; \
                  falling back to latest timestamp-valid event",
-                event_type
+                expected_kind
             );
         }
 
         Ok(latest_semantically_valid.or(latest_timestamp_valid))
     }
 
+    /// Returns true when metadata content is valid JSON according to NIP-01 metadata format.
     fn is_metadata_event_semantically_valid(event: &Event) -> bool {
         Metadata::from_json(&event.content).is_ok()
     }
 
+    /// Returns true when the event has at least one relay tag for its kind with a parseable
+    /// relay URL.
     fn is_relay_event_semantically_valid(event: &Event) -> bool {
         let relay_tags: Vec<&Tag> = event
             .tags
@@ -104,14 +107,15 @@ impl NostrManager {
             .filter(|tag| Self::is_relay_list_tag_for_event_kind(tag, event.kind))
             .collect();
 
-        !relay_tags.is_empty()
-            && relay_tags.iter().all(|tag| {
-                tag.content()
-                    .and_then(|content| RelayUrl::parse(content).ok())
-                    .is_some()
-            })
+        relay_tags.iter().any(|tag| {
+            tag.content()
+                .and_then(|content| RelayUrl::parse(content).ok())
+                .is_some()
+        })
     }
 
+    /// Returns true when the key package includes the expected encoding tag and non-empty
+    /// encoded key package content.
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
         has_encoding_tag(event) && !event.content.trim().is_empty()
     }
@@ -668,11 +672,12 @@ mod contact_list_logic_tests {
 
         let events: Events = vec![valid_old.clone(), invalid_new].into_iter().collect();
 
-        let selected = NostrManager::latest_from_events_with_validation(events, "metadata", |e| {
-            NostrManager::is_metadata_event_semantically_valid(e)
-        })
-        .unwrap()
-        .unwrap();
+        let selected =
+            NostrManager::latest_from_events_with_validation(events, Kind::Metadata, |e| {
+                NostrManager::is_metadata_event_semantically_valid(e)
+            })
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             selected.id, valid_old.id,
@@ -732,6 +737,24 @@ mod contact_list_logic_tests {
         assert!(
             NostrManager::is_relay_event_semantically_valid(&valid_relay_event),
             "Relay event with valid relay tags should pass semantic checks"
+        );
+    }
+
+    #[test]
+    fn test_relay_event_semantic_validation_allows_mixed_relay_tag_quality() {
+        let keys = Keys::generate();
+
+        let mixed_relay_event = EventBuilder::new(Kind::RelayList, "")
+            .tags(vec![
+                Tag::reference("wss://relay.example.com"),
+                Tag::reference("not-a-relay-url"),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            NostrManager::is_relay_event_semantically_valid(&mixed_relay_event),
+            "Relay event should be valid when at least one relay tag is parseable"
         );
     }
 }
