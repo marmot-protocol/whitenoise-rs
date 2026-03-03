@@ -155,7 +155,7 @@ impl User {
                         new_timestamp.timestamp_millis(),
                         stored_timestamp.timestamp_millis()
                     );
-                    return Ok(false);
+                    return Err(e);
                 }
                 None => {
                     tracing::debug!(
@@ -213,7 +213,7 @@ impl User {
                     self.pubkey,
                     e
                 );
-                return Ok(false);
+                return Err(e);
             }
         }
 
@@ -234,7 +234,7 @@ impl User {
                         self.pubkey,
                         e
                     );
-                    return Ok(false);
+                    return Err(e);
                 }
             }
         }
