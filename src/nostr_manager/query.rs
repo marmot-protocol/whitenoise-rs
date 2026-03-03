@@ -124,7 +124,7 @@ impl NostrManager {
 #[cfg(test)]
 mod contact_list_logic_tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     // Test data for problematic contact list
     fn get_test_contact_list_event() -> Event {
@@ -686,6 +686,66 @@ mod contact_list_logic_tests {
     }
 
     #[test]
+    fn test_latest_from_events_with_validation_falls_back_when_no_semantic_match() {
+        let keys = Keys::generate();
+
+        let invalid_old = EventBuilder::new(Kind::Metadata, "not-json-old")
+            .custom_created_at(Timestamp::from(100))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_new = EventBuilder::new(Kind::Metadata, "not-json-new")
+            .custom_created_at(Timestamp::from(200))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let events: Events = vec![invalid_old, invalid_new.clone()].into_iter().collect();
+
+        let selected = NostrManager::latest_from_events_with_validation(
+            events,
+            Kind::Metadata,
+            NostrManager::is_metadata_event_semantically_valid,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            selected.id, invalid_new.id,
+            "Should fall back to latest timestamp-valid event when none are semantically valid"
+        );
+    }
+
+    #[test]
+    fn test_latest_from_events_with_validation_ignores_future_timestamp_events() {
+        let keys = Keys::generate();
+
+        let valid_future = EventBuilder::new(Kind::Metadata, "{\"name\":\"future\"}")
+            .custom_created_at(Timestamp::now() + Duration::from_secs(60 * 60 + 1))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_now = EventBuilder::new(Kind::Metadata, "not-json-now")
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let events: Events = vec![valid_future, invalid_now.clone()]
+            .into_iter()
+            .collect();
+
+        let selected = NostrManager::latest_from_events_with_validation(
+            events,
+            Kind::Metadata,
+            NostrManager::is_metadata_event_semantically_valid,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            selected.id, invalid_now.id,
+            "Should ignore semantically valid events with out-of-range future timestamps"
+        );
+    }
+
+    #[test]
     fn test_key_package_semantic_validation_requires_encoding_and_content() {
         let keys = Keys::generate();
 
@@ -755,6 +815,24 @@ mod contact_list_logic_tests {
         assert!(
             NostrManager::is_relay_event_semantically_valid(&mixed_relay_event),
             "Relay event should be valid when at least one relay tag is parseable"
+        );
+    }
+
+    #[test]
+    fn test_relay_event_semantic_validation_rejects_all_invalid_relay_tags() {
+        let keys = Keys::generate();
+
+        let invalid_relay_event = EventBuilder::new(Kind::RelayList, "")
+            .tags(vec![
+                Tag::reference("not-a-relay-url"),
+                Tag::reference("also-invalid"),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(
+            !NostrManager::is_relay_event_semantically_valid(&invalid_relay_event),
+            "Relay event should fail when no relay tags are parseable"
         );
     }
 }
