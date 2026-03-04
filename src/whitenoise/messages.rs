@@ -2331,4 +2331,122 @@ mod tests {
             "Error should mention unsupported kind, got: {err_msg}"
         );
     }
+
+    /// Test cascade_delivery_failure for kind 7 when parent message is not cached.
+    /// Should handle gracefully (warn + return) without panic.
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_parent_not_found() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[200; 32]);
+        let author = Keys::generate().public_key();
+        let stream_manager = MessageStreamManager::new();
+
+        // Point reaction at a target that doesn't exist in cache
+        let nonexistent_target = format!("{:0>64x}", 0xdeadbeefu64);
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &nonexistent_target]).unwrap()]);
+
+        // Should return cleanly without panic — parent not found is handled
+        Whitenoise::cascade_delivery_failure(
+            7,
+            "some_reaction_id",
+            &tags,
+            &author,
+            "+",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+    }
+
+    /// Test cascade_delivery_failure for kind 7 with no e-tag at all.
+    /// Should handle the extract_reaction_target_id error gracefully.
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_missing_etag() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[201; 32]);
+        let author = Keys::generate().public_key();
+        let stream_manager = MessageStreamManager::new();
+
+        // Empty tags — no e-tag to extract
+        Whitenoise::cascade_delivery_failure(
+            7,
+            "some_reaction_id",
+            &Tags::new(),
+            &author,
+            "+",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+    }
+
+    /// Test that deleting the last message in a group exercises the
+    /// find_last_by_group_ids path in cache_and_apply_outgoing_deletion.
+    #[tokio::test]
+    async fn test_send_deletion_of_last_message_exercises_last_check() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send two messages so we can delete the last one
+        whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "First message".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let second = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Second (last) message".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let last_id = second.message.id.to_hex();
+
+        // Delete the last message — exercises find_last_by_group_ids + LastMessageDeleted path
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &last_id]).unwrap()]);
+        let del_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                String::new(),
+                5,
+                deletion_tags,
+            )
+            .await;
+        assert!(del_result.is_ok(), "Deletion should succeed");
+
+        // The second message should be marked deleted
+        let msg =
+            AggregatedMessage::find_by_id(&last_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(msg.is_deleted, "Last message should be marked deleted");
+    }
 }
