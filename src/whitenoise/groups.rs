@@ -67,6 +67,24 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
+    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
+        if event.pubkey != *pk {
+            return Err(WhitenoiseError::InvalidInput(format!(
+                "Fetched key package event {} signed by {} instead of expected {}",
+                event.id, event.pubkey, pk
+            )));
+        }
+
+        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
+            WhitenoiseError::InvalidInput(format!(
+                "Incompatible key package event {} for member {}: {}",
+                event.id, pk, e
+            ))
+        })?;
+
+        Ok(())
+    }
+
     /// Creates a new MLS group with the specified members and settings
     ///
     /// # Arguments
@@ -82,7 +100,6 @@ impl Whitenoise {
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
         let signer = self.get_signer_for_account(creator_account)?;
-        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut members = Vec::new();
@@ -137,27 +154,15 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            if event.pubkey != *pk {
-                return Err(WhitenoiseError::InvalidInput(format!(
-                    "Fetched key package event {} signed by {} instead of expected {}",
-                    event.id, event.pubkey, pk
-                )));
-            }
-
-            validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(
-                |e| {
-                    WhitenoiseError::InvalidInput(format!(
-                        "Incompatible key package event {} for member {}: {}",
-                        event.id, pk, e
-                    ))
-                },
-            )?;
+            Self::validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             members.push(user);
         }
 
         tracing::debug!("Succefully fetched the key packages of members");
+
+        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
 
         let group_relays = config.relays.clone();
         let group_name = config.name.clone();
@@ -421,21 +426,7 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            if event.pubkey != *pk {
-                return Err(WhitenoiseError::InvalidInput(format!(
-                    "Fetched key package event {} signed by {} instead of expected {}",
-                    event.id, event.pubkey, pk
-                )));
-            }
-
-            validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(
-                |e| {
-                    WhitenoiseError::InvalidInput(format!(
-                        "Incompatible key package event {} for member {}: {}",
-                        event.id, pk, e
-                    ))
-                },
-            )?;
+            Self::validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             users.push(user);

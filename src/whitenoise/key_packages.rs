@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use base64ct::{Base64, Encoding};
 use nostr_sdk::prelude::*;
 
 use crate::whitenoise::Whitenoise;
@@ -61,6 +62,9 @@ pub(crate) fn validate_marmot_key_package_tags(
         return Err("missing required encoding tag ['encoding','base64']".to_string());
     }
 
+    Base64::decode_vec(&event.content)
+        .map_err(|e| format!("invalid base64 key package content: {}", e))?;
+
     let expected_ciphersuite = expected_ciphersuite.to_ascii_lowercase();
     let advertised_ciphersuites = normalized_tag_values(event, TagKind::MlsCiphersuite);
     if !advertised_ciphersuites.contains(&expected_ciphersuite) {
@@ -94,15 +98,10 @@ fn normalized_tag_values(event: &Event, tag_kind: TagKind<'_>) -> Vec<String> {
         .tags
         .iter()
         .filter(|tag| tag.kind() == tag_kind)
-        .flat_map(|tag| {
-            tag.as_slice().iter().skip(1).flat_map(|value| {
-                value
-                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                    .filter(|part| !part.is_empty())
-                    .map(|part| part.to_ascii_lowercase())
-                    .collect::<Vec<_>>()
-            })
-        })
+        .flat_map(|tag| tag.as_slice().iter().skip(1))
+        .flat_map(|value| value.split(|c: char| c == ',' || c.is_ascii_whitespace()))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_ascii_lowercase())
         .collect()
 }
 
@@ -1270,7 +1269,7 @@ mod tests {
         ciphersuite: &str,
         extensions: &[&str],
     ) -> Event {
-        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
                 [ciphersuite],
@@ -1374,6 +1373,81 @@ mod tests {
                 .unwrap_err()
                 .contains("missing required mls_extensions"),
             "Expected missing extension error message"
+        );
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_tags_rejects_invalid_base64_content() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "not-base64$$$")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(result.is_err(), "Expected invalid base64 content to fail");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("invalid base64 key package content"),
+            "Expected base64 decode error message"
+        );
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_tags_rejects_wrong_kind() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(result.is_err(), "Expected wrong kind to fail");
+        assert!(
+            result.unwrap_err().contains("expected kind"),
+            "Expected wrong kind error message"
+        );
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_tags_rejects_missing_encoding_tag() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(result.is_err(), "Expected missing encoding tag to fail");
+        assert!(
+            result
+                .unwrap_err()
+                .contains("missing required encoding tag ['encoding','base64']"),
+            "Expected missing encoding tag error message"
         );
     }
 
