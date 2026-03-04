@@ -2011,4 +2011,243 @@ mod tests {
 
         assert_eq!(result[&group_id], 2); // msg1 and msg3, excluding deleted msg2
     }
+
+    #[tokio::test]
+    async fn test_insert_delivery_status_and_has_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[180; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg = create_test_chat_message(180, author);
+        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Before inserting, has_delivery_status should return false
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(!has, "No delivery status should exist yet");
+
+        // Insert delivery status
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sending,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Now has_delivery_status should return true
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(has, "Delivery status should exist after insert");
+
+        // Verify it shows up in find_by_id
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
+    }
+
+    #[tokio::test]
+    async fn test_insert_delivery_status_upsert() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[181; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg = create_test_chat_message(181, author);
+        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert Sending
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sending,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Upsert to Sent — ON CONFLICT should update
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sent(2),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(2)));
+    }
+
+    #[tokio::test]
+    async fn test_unmark_deleted_reverses_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[182; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(182, author);
+        let msg2 = create_test_chat_message(183, author);
+        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let del_id = format!("{:0>64x}", 0xde1182u64);
+
+        // Mark both as deleted by the same deletion event
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Both should have is_deleted=true
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            messages.iter().all(|m| m.is_deleted),
+            "All messages should be marked as deleted"
+        );
+
+        // Unmark — both should revert to not deleted
+        AggregatedMessage::unmark_deleted(&del_id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2, "Both messages should still be present");
+        assert!(
+            messages.iter().all(|m| !m.is_deleted),
+            "All messages should be un-deleted after unmark"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmark_deleted_only_affects_matching_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[184; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(184, author);
+        let msg2 = create_test_chat_message(185, author);
+        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let del_a = format!("{:0>64x}", 0xde1au64);
+        let del_b = format!("{:0>64x}", 0xde1bu64);
+
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Unmark only del_a — msg1 should revert to not-deleted, msg2 stays deleted
+        AggregatedMessage::unmark_deleted(&del_a, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let not_deleted: Vec<_> = messages.iter().filter(|m| !m.is_deleted).collect();
+        assert_eq!(not_deleted.len(), 1, "Only msg1 should be un-deleted");
+        assert_eq!(not_deleted[0].id, msg1.id);
+    }
+
+    #[tokio::test]
+    async fn test_find_orphaned_reactions_excludes_deleted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[186; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        // Use valid hex IDs (find_orphaned_reactions parses message_id as EventId)
+        let parent_id = format!("{:0>64x}", 0xba186u64);
+        let reaction_id = format!("{:0>64x}", 0xea186u64);
+
+        // Insert a reaction targeting the parent, using direct SQL since
+        // insert_reaction needs a Message struct from MDK
+        let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
+        let empty_tokens = serde_json::to_string(&Vec::<String>::new()).unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media = serde_json::to_string(&Vec::<String>::new()).unwrap();
+
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 7, '+', ?, ?, ?, ?)",
+        )
+        .bind(&reaction_id)
+        .bind(group_id.as_slice())
+        .bind(author.to_hex())
+        .bind(1000i64)
+        .bind(&tags_json)
+        .bind(&empty_tokens)
+        .bind(&empty_reactions)
+        .bind(&empty_media)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        // The reaction should appear as orphaned
+        let orphans =
+            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(orphans.len(), 1, "Non-deleted reaction should be found");
+
+        // Now mark the reaction as deleted
+        let del_id = format!("{:0>64x}", 0xde1186u64);
+        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Deleted reaction should NOT appear as orphaned
+        let orphans =
+            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(orphans.len(), 0, "Deleted reaction should be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_has_delivery_status_returns_false_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[188; 32]);
+
+        let has =
+            AggregatedMessage::has_delivery_status("nonexistent", &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(!has);
+    }
 }

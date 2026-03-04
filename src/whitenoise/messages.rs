@@ -2028,4 +2028,307 @@ mod tests {
             );
         }
     }
+
+    /// Test sending a kind 5 (deletion) tracks delivery and applies to target message.
+    #[tokio::test]
+    async fn test_send_deletion_tracks_delivery_and_marks_target() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let admin_pubkeys = vec![creator.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a kind 9 message to delete later
+        let chat_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Delete me".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let target_id = chat_result.message.id.to_hex();
+
+        // Send a kind 5 (deletion) targeting the message
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let del_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                String::new(),
+                5,
+                deletion_tags,
+            )
+            .await;
+        assert!(
+            del_result.is_ok(),
+            "Deletion send should succeed: {:?}",
+            del_result.err()
+        );
+
+        // find_by_id should return the message but with is_deleted=true
+        let target =
+            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(target.is_deleted, "Message should be marked as deleted");
+
+        // Also verify via find_messages_by_group — message should have is_deleted flag
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
+        assert!(
+            target_msg.is_deleted,
+            "Message should be marked as deleted in find_messages_by_group"
+        );
+
+        // The deletion event (kind 5) should have delivery status
+        let del_event_id = del_result.unwrap().message.id.to_string();
+        let has_status = AggregatedMessage::has_delivery_status(
+            &del_event_id,
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(has_status, "Deletion event should have delivery status");
+    }
+
+    /// Test cascade_delivery_failure for kind 7 (reaction) removes reaction from parent.
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_removes_from_parent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a kind 9 message as reaction target
+        let chat_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "React to me".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a kind 7 (reaction)
+        let target_id = chat_result.message.id.to_hex();
+        let reaction_tags = Some(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "+".to_string(),
+                7,
+                reaction_tags,
+            )
+            .await
+            .unwrap();
+
+        // Verify reaction was applied to parent
+        let parent =
+            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            !parent.reactions.by_emoji.is_empty(),
+            "Parent should have reaction applied"
+        );
+
+        // Now simulate cascade failure for the reaction
+        let reaction_event_id = reaction_result.message.id.to_string();
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        Whitenoise::cascade_delivery_failure(
+            7,
+            &reaction_event_id,
+            &tags,
+            &creator.pubkey,
+            "+",
+            &group.mls_group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Parent should no longer have the reaction
+        let parent =
+            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            parent.reactions.by_emoji.is_empty(),
+            "Reaction should be removed after cascade failure"
+        );
+    }
+
+    /// Test cascade_delivery_failure for kind 5 (deletion) unmarks targets.
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_unmarks_targets() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a kind 9 message to delete
+        let chat_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Delete and cascade".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let target_id = chat_result.message.id.to_hex();
+
+        // Send a kind 5 deletion
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let del_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                String::new(),
+                5,
+                deletion_tags,
+            )
+            .await
+            .unwrap();
+
+        // Verify message is marked as deleted
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
+        assert!(target_msg.is_deleted, "Message should be marked as deleted");
+
+        // Cascade the deletion failure — reverses the optimistic deletion
+        let del_event_id = del_result.message.id.to_string();
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        Whitenoise::cascade_delivery_failure(
+            5,
+            &del_event_id,
+            &tags,
+            &creator.pubkey,
+            "",
+            &group.mls_group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Message should no longer be deleted after cascade
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
+        assert!(
+            !target_msg.is_deleted,
+            "Message should be un-deleted after deletion cascade failure"
+        );
+    }
+
+    /// Test cascade_delivery_failure is a no-op for kind 9.
+    #[tokio::test]
+    async fn test_cascade_kind9_is_noop() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[199; 32]);
+        let author = Keys::generate().public_key();
+        let stream_manager = MessageStreamManager::new();
+
+        // Should not panic or error — just a no-op
+        Whitenoise::cascade_delivery_failure(
+            9,
+            "some_event_id",
+            &Tags::from_list(vec![]),
+            &author,
+            "",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+    }
+
+    /// Test that sending an unsupported event kind returns an error.
+    #[tokio::test]
+    async fn test_send_unsupported_kind_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Kind 10 should be rejected
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "unsupported".to_string(),
+                10,
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "Kind 10 should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Unsupported"),
+            "Error should mention unsupported kind, got: {err_msg}"
+        );
+    }
 }
