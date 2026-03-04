@@ -1,11 +1,11 @@
 mod helpers;
-pub mod seeds;
 pub mod search_direct_follows;
 pub mod search_empty_metadata;
 pub mod search_fallback_seed;
 pub mod search_follows_of_follows;
 pub mod search_group_members;
 pub mod search_incremental_radius;
+pub mod seeds;
 
 pub use search_direct_follows::*;
 pub use search_empty_metadata::*;
