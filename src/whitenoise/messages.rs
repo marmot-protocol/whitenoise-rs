@@ -4,6 +4,7 @@ use crate::{
         Whitenoise,
         accounts::Account,
         aggregated_message::AggregatedMessage,
+        chat_list_streaming::ChatListUpdateTrigger,
         database::Database,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
@@ -189,8 +190,10 @@ impl Whitenoise {
                 WhitenoiseError::from(anyhow::anyhow!("Failed to cache reaction: {}", e))
             })?;
 
-        // Track delivery status for the reaction event
-        AggregatedMessage::update_delivery_status(
+        // Track delivery status for the reaction event (direct insert, not full
+        // update_delivery_status which opens a transaction that can contend with
+        // background publish_with_retries)
+        AggregatedMessage::insert_delivery_status(
             &mdk_message.id.to_string(),
             group_id,
             &DeliveryStatus::Sending,
@@ -260,8 +263,10 @@ impl Whitenoise {
                 WhitenoiseError::from(anyhow::anyhow!("Failed to cache deletion: {}", e))
             })?;
 
-        // Track delivery status for the deletion event
-        AggregatedMessage::update_delivery_status(
+        // Track delivery status for the deletion event (direct insert, not full
+        // update_delivery_status which opens a transaction that can contend with
+        // background publish_with_retries)
+        AggregatedMessage::insert_delivery_status(
             &mdk_message.id.to_string(),
             group_id,
             &DeliveryStatus::Sending,
@@ -275,19 +280,69 @@ impl Whitenoise {
             ))
         })?;
 
-        // Apply deletion to all target messages
+        // Capture the last message ID *before* applying deletions so we can
+        // detect if the deletion removed it and emit a chat-list update.
+        let last_message_id = AggregatedMessage::find_last_by_group_ids(
+            std::slice::from_ref(group_id),
+            &self.database,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|s| s.message_id.to_hex());
+
+        // Apply deletion to all targets (reactions and/or messages)
+        let deletion_event_id_str = mdk_message.id.to_string();
         let target_ids = Self::extract_deletion_target_ids(&mdk_message.tags);
-        for target_id in target_ids {
+        for target_id in &target_ids {
+            // Check if target is a reaction — must remove from parent's reaction summary
+            if let Some(reaction) =
+                AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.database).await?
+            {
+                // Remove reaction from parent message's summary
+                if let Ok(parent_id) = Self::extract_reaction_target_id(&reaction.tags)
+                    && let Some(mut parent) =
+                        AggregatedMessage::find_by_id(&parent_id, group_id, &self.database).await?
+                    && reaction_handler::remove_reaction_from_message(&mut parent, &reaction.author)
+                {
+                    AggregatedMessage::update_reactions(
+                        &parent_id,
+                        group_id,
+                        &parent.reactions,
+                        &self.database,
+                    )
+                    .await?;
+
+                    self.message_stream_manager.emit(
+                        group_id,
+                        MessageUpdate {
+                            trigger: UpdateTrigger::ReactionRemoved,
+                            message: parent,
+                        },
+                    );
+                }
+
+                AggregatedMessage::mark_deleted(
+                    target_id,
+                    group_id,
+                    &deletion_event_id_str,
+                    &self.database,
+                )
+                .await?;
+                continue;
+            }
+
+            // Target is a message — mark as deleted
             AggregatedMessage::mark_deleted(
-                &target_id,
+                target_id,
                 group_id,
-                &mdk_message.id.to_string(),
+                &deletion_event_id_str,
                 &self.database,
             )
             .await?;
 
             if let Some(mut msg) =
-                AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
+                AggregatedMessage::find_by_id(target_id, group_id, &self.database).await?
             {
                 msg.is_deleted = true;
                 self.message_stream_manager.emit(
@@ -298,6 +353,18 @@ impl Whitenoise {
                     },
                 );
             }
+        }
+
+        // If the deleted target was the last message in the group, emit a
+        // chat-list update so the UI shows the new last message.
+        if let Some(last_id) = last_message_id
+            && target_ids.contains(&last_id)
+        {
+            self.emit_chat_list_update_for_group(
+                group_id,
+                ChatListUpdateTrigger::LastMessageDeleted,
+            )
+            .await;
         }
 
         Ok(())
@@ -1398,6 +1465,10 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(cached_count, 1, "kind 9 message should be cached");
+
+        // Let the background publish_with_retries from the kind 9 message settle
+        // to avoid SQLite write contention with the reaction's delivery status update.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Send a kind 7 (reaction) — should be cached with delivery tracking
         let reaction_tags = Some(vec![

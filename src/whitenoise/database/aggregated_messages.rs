@@ -574,6 +574,31 @@ impl AggregatedMessage {
         }
     }
 
+    /// Insert an initial delivery status row for an outgoing event.
+    ///
+    /// Uses a single INSERT (no transaction) to avoid write contention with
+    /// `publish_with_retries` which may be running concurrently for other events.
+    /// Only suitable when the parent `aggregated_messages` row was just inserted.
+    pub async fn insert_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+             VALUES (?, ?, ?)
+             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .bind(serde_json::to_string(status)?)
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Check whether an event has a delivery status row (i.e. was sent by us).
     pub async fn has_delivery_status(
         message_id: &str,
@@ -798,6 +823,7 @@ impl AggregatedMessage {
             "SELECT am.* FROM aggregated_messages am
              WHERE am.kind = 7
                AND am.mls_group_id = ?
+               AND am.deletion_event_id IS NULL
                AND EXISTS (
                  SELECT 1 FROM json_each(am.tags) AS tag
                  WHERE json_extract(tag.value, '$[0]') = 'e'
