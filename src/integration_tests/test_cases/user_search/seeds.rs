@@ -11,9 +11,9 @@ use crate::WhitenoiseError;
 ///
 /// To refresh, run from the repo root:
 /// ```sh
-/// nak req -k 0 -a 1739d937...3136ef wss://relay.damus.io | head -1 > src/.../seeds/jeff_metadata.json
-/// nak req -k 3 -a 1739d937...3136ef wss://relay.damus.io | head -1 > src/.../seeds/jeff_contacts.json
-/// nak req -k 0 -a b7ed68b0...d32fc  wss://relay.damus.io | head -1 > src/.../seeds/max_metadata.json
+/// nak req -k 0 -a 1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef wss://relay.damus.io | head -1 > src/integration_tests/test_cases/user_search/seeds/jeff_metadata.json
+/// nak req -k 3 -a 1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef wss://relay.damus.io | head -1 > src/integration_tests/test_cases/user_search/seeds/jeff_contacts.json
+/// nak req -k 0 -a b7ed68b062de6b4a12e51fd5285c1e1e0ed0e5128cda93ab11b4150b55ed32fc wss://relay.damus.io | head -1 > src/integration_tests/test_cases/user_search/seeds/max_metadata.json
 /// ```
 const JEFF_METADATA: &str = include_str!("seeds/jeff_metadata.json");
 const JEFF_CONTACTS: &str = include_str!("seeds/jeff_contacts.json");
