@@ -1,12 +1,12 @@
 use async_trait::async_trait;
-use nostr_sdk::{PublicKey, RelayStatus};
+use nostr_sdk::PublicKey;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
-use crate::whitenoise::relays::RelayType;
 use crate::whitenoise::user_search::{SearchUpdateTrigger, UserSearchParams};
 
 use super::helpers::{collect_search_updates, wait_for_result};
+use super::seeds;
 
 /// Jeff's pubkey (the fallback seed).
 const JEFF_PUBKEY: &str = "1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef";
@@ -18,8 +18,8 @@ const MAX_PUBKEY: &str = "b7ed68b062de6b4a12e51fd5285c1e1e0ed0e5128cda93ab11b415
 ///
 /// When the social graph is empty, the search injects a well-connected seed
 /// pubkey (Jeff) as an entrypoint. The pipeline fetches Jeff's metadata and
-/// contact list from the network, then expands into his follows. This test
-/// verifies:
+/// contact list from the local relays (pre-seeded with real events), then
+/// expands into his follows. This test verifies:
 ///
 /// 1. Searching "Jeff" finds the seed itself (it's pushed as a candidate)
 /// 2. Searching "Max" finds one of Jeff's follows (graph expansion works)
@@ -40,48 +40,14 @@ impl TestCase for SearchFallbackSeedTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;
-        // Account has no follows — social graph is empty.
 
         let jeff_pk = PublicKey::parse(JEFF_PUBKEY).expect("valid Jeff pubkey");
         let max_pk = PublicKey::parse(MAX_PUBKEY).expect("valid Max pubkey");
 
-        // Add public relays so the pipeline can reach Jeff's and Max's data.
-        // In debug mode the default relays are local-only.
-        let public_relay_urls = [
-            "wss://relay.damus.io",
-            "wss://relay.primal.net",
-            "wss://nos.lol",
-        ];
-        for url in &public_relay_urls {
-            let relay_url = nostr_sdk::RelayUrl::parse(url).expect("valid relay URL");
-            let relay = context
-                .whitenoise
-                .find_or_create_relay_by_url(&relay_url)
-                .await?;
-            account
-                .add_relay(&relay, RelayType::Nip65, context.whitenoise)
-                .await?;
-        }
-        tracing::info!("Connected to public relays for fallback seed test");
-
-        let relay_statuses = context
-            .whitenoise
-            .get_account_relay_statuses(account)
-            .await?;
-        let connected_relays = relay_statuses
-            .iter()
-            .filter(|(_, status)| {
-                matches!(status, RelayStatus::Connected | RelayStatus::Connecting)
-            })
-            .count();
-
-        if connected_relays == 0 {
-            tracing::warn!(
-                "Skipping fallback seed assertions: no public relays are connected ({:?})",
-                relay_statuses
-            );
-            return Ok(());
-        }
+        // Seed Jeff's metadata, contact list, and Max's metadata to local relays
+        // so the pipeline can resolve them without hitting the public network.
+        seeds::publish_fallback_seed_events(&context.dev_relays).await?;
+        tracing::info!("Seeded fallback events to local relays");
 
         // --- Search 1: "Jeff" should find the fallback seed itself ---
 
@@ -108,13 +74,11 @@ impl TestCase for SearchFallbackSeedTestCase {
             .flat_map(|u| &u.new_results)
             .any(|r| r.pubkey == jeff_pk);
 
-        if found_jeff {
-            tracing::info!("✓ Found Jeff (fallback seed) via empty-graph injection");
-        } else {
-            tracing::warn!(
-                "Did not find Jeff by metadata query; continuing with graph expansion check"
-            );
-        }
+        assert!(
+            found_jeff,
+            "Searching 'Jeff' should find the fallback seed itself"
+        );
+        tracing::info!("✓ Found Jeff (fallback seed) via empty-graph injection");
 
         // --- Search 2: "Max" should find Jeff's follow via graph expansion ---
 
@@ -128,9 +92,6 @@ impl TestCase for SearchFallbackSeedTestCase {
             })
             .await?;
 
-        // Don't wait for SearchCompleted — Jeff follows hundreds of accounts and
-        // draining all batches through tiers 3-5 takes 30-40s. Instead, return as
-        // soon as Max appears in a ResultsFound event.
         let updates_max = wait_for_result(sub_max.updates, &max_pk).await;
 
         let found_max = updates_max
