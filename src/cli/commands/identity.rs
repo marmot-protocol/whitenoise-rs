@@ -44,49 +44,8 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
         .ok_or_else(|| anyhow::anyhow!("unexpected login response: missing pubkey"))?
         .to_string();
 
-    let relay_resp = if let Some(url) = relay {
-        client::send(
-            socket,
-            &Request::LoginWithCustomRelay {
-                pubkey: pubkey.clone(),
-                relay_url: url,
-            },
-        )
-        .await?
-    } else {
-        eprintln!("Relay lists not found on the network.");
-        eprint!("Use default relays? [Y/n] ");
-        io::stderr().flush()?;
-
-        let mut answer = String::new();
-        io::stdin().lock().read_line(&mut answer)?;
-        let answer = answer.trim();
-
-        if answer.is_empty()
-            || answer.eq_ignore_ascii_case("y")
-            || answer.eq_ignore_ascii_case("yes")
-        {
-            client::send(
-                socket,
-                &Request::LoginPublishDefaultRelays {
-                    pubkey: pubkey.clone(),
-                },
-            )
-            .await?
-        } else {
-            eprint!("Relay URL: ");
-            io::stderr().flush()?;
-
-            let mut url = String::new();
-            io::stdin().lock().read_line(&mut url)?;
-            let url = url.trim().to_string();
-
-            if url.is_empty() {
-                // User bailed — cancel the pending login
-                let _ = client::send(socket, &Request::LoginCancel { pubkey }).await;
-                anyhow::bail!("login cancelled");
-            }
-
+    let relay_resp = match relay {
+        Some(url) => {
             client::send(
                 socket,
                 &Request::LoginWithCustomRelay {
@@ -95,6 +54,50 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
                 },
             )
             .await?
+        }
+        None => {
+            eprintln!("Relay lists not found on the network.");
+            eprint!("Use default relays? [Y/n] ");
+            io::stderr().flush()?;
+
+            let mut answer = String::new();
+            io::stdin().lock().read_line(&mut answer)?;
+            let answer = answer.trim();
+
+            if answer.is_empty()
+                || answer.eq_ignore_ascii_case("y")
+                || answer.eq_ignore_ascii_case("yes")
+            {
+                client::send(
+                    socket,
+                    &Request::LoginPublishDefaultRelays {
+                        pubkey: pubkey.clone(),
+                    },
+                )
+                .await?
+            } else {
+                eprint!("Relay URL: ");
+                io::stderr().flush()?;
+
+                let mut url = String::new();
+                io::stdin().lock().read_line(&mut url)?;
+                let url = url.trim().to_string();
+
+                if url.is_empty() {
+                    // User bailed — cancel the pending login
+                    let _ = client::send(socket, &Request::LoginCancel { pubkey }).await;
+                    anyhow::bail!("login cancelled");
+                }
+
+                client::send(
+                    socket,
+                    &Request::LoginWithCustomRelay {
+                        pubkey: pubkey.clone(),
+                        relay_url: url,
+                    },
+                )
+                .await?
+            }
         }
     };
 

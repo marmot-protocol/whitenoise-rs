@@ -123,7 +123,7 @@ impl WhitenoiseConfig {
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
     database: Arc<Database>,
-    pub(crate) nostr: NostrManager,
+    nostr: NostrManager,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,

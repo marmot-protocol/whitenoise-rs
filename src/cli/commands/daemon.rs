@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use anyhow::Context;
 use clap::Subcommand;
 
 use crate::cli::config::Config;
@@ -26,18 +27,18 @@ impl DaemonCmd {
 }
 
 async fn start(config: &Config) -> anyhow::Result<()> {
-    // When invoked via `wn daemon start`, spawn `wnd` as a child process.
-    // When invoked directly as `wnd`, this path isn't used — wnd.rs calls
-    // server::run() directly.
+    // When invoked via `wn daemon start`, spawn `wnd` as a detached child
+    // and return immediately. When invoked directly as `wnd`, this path
+    // isn't used — wnd.rs calls server::run() directly.
     let wnd = which_wnd()?;
     let mut cmd = Command::new(wnd);
     cmd.arg("--data-dir").arg(&config.data_dir);
     cmd.arg("--logs-dir").arg(&config.logs_dir);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
 
-    let status = cmd.status()?;
-    if !status.success() {
-        anyhow::bail!("wnd exited with {status}");
-    }
+    cmd.spawn().context("failed to start daemon")?;
+    println!("daemon started");
     Ok(())
 }
 

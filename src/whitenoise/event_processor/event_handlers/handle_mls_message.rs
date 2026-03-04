@@ -280,7 +280,7 @@ impl Whitenoise {
     ///
     /// Processes the message through the aggregator, inserts into database,
     /// and applies any orphaned reactions/deletions that arrived before this message.
-    pub(crate) async fn cache_chat_message(
+    async fn cache_chat_message(
         &self,
         group_id: &GroupId,
         message: &Message,

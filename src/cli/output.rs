@@ -174,11 +174,10 @@ fn maybe_npub(s: &str) -> Cow<'_, str> {
 /// - Plain array: `[100, 88, ...]`
 /// - MLS wrapper: `{"value": {"vec": [92, 112, ...]}}`
 fn try_as_hex(value: &serde_json::Value) -> Option<String> {
-    let arr = if let Some(arr) = value.as_array() {
-        arr
-    } else {
+    let arr = match value.as_array() {
+        Some(arr) => arr,
         // MLS GroupId wrapper: {"value": {"vec": [...]}}
-        value.get("value")?.get("vec")?.as_array()?
+        None => value.get("value")?.get("vec")?.as_array()?,
     };
 
     let bytes: Option<Vec<u8>> = arr

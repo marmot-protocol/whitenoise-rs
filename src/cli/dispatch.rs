@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
-use nostr_sdk::{JsonUtil, PublicKey};
+use nostr_sdk::PublicKey;
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
@@ -642,36 +642,15 @@ async fn find_account(
 }
 
 async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
-    // Try local User record first
-    if let Ok(mut user) = wn.find_user_by_pubkey(pubkey).await {
-        if user.metadata.display_name.is_none() && user.metadata.name.is_none() {
-            let _ = user.sync_metadata(wn).await;
-        }
-        let name = user
-            .metadata
-            .display_name
-            .as_ref()
-            .filter(|s| !s.is_empty())
-            .or(user.metadata.name.as_ref().filter(|s| !s.is_empty()))
-            .cloned();
-        if name.is_some() {
-            return name;
-        }
-    }
-
-    // User not in DB or sync returned empty — fetch metadata directly from relays
-    let relays = wn.fallback_relay_urls().await;
-    let event = wn
-        .nostr
-        .fetch_metadata_from(&relays, *pubkey)
+    let user = wn
+        .find_or_create_user_by_pubkey(pubkey, UserSyncMode::Blocking)
         .await
-        .ok()??;
-    let metadata = nostr_sdk::Metadata::from_json(&event.content).ok()?;
-    metadata
+        .ok()?;
+    user.metadata
         .display_name
         .as_ref()
         .filter(|s| !s.is_empty())
-        .or(metadata.name.as_ref().filter(|s| !s.is_empty()))
+        .or(user.metadata.name.as_ref().filter(|s| !s.is_empty()))
         .cloned()
 }
 
@@ -1157,55 +1136,12 @@ async fn send_message(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    // Replicate send_message_to_group steps inline so we can publish
-    // synchronously and report relay results back to the CLI user.
-    let (inner_event, event_id) = wn
-        .create_unsigned_nostr_event(&account.pubkey, &message, 9, None)
-        .map_err(|e| Response::err(format!("create event: {e}")))?;
-
-    let mdk = wn
-        .create_mdk_for_account(account.pubkey)
-        .map_err(|e| Response::err(format!("create mdk: {e}")))?;
-
-    let message_event = mdk
-        .create_message(&group_id, inner_event)
-        .map_err(|e| Response::err(format!("create MLS message: {e}")))?;
-
-    let stored_message = mdk
-        .get_message(&group_id, &event_id)
-        .map_err(|e| Response::err(format!("get message: {e}")))?
-        .ok_or_else(|| Response::err("message not found after creation"))?;
-
-    let group_relays: Vec<nostr_sdk::RelayUrl> = mdk
-        .get_relays(&group_id)
-        .map_err(|e| Response::err(format!("get relays: {e}")))?
-        .into_iter()
-        .collect();
-
-    if group_relays.is_empty() {
-        return Err(Response::err("no relays configured for this group"));
-    }
-
-    // Publish synchronously so the CLI gets actual relay feedback
-    let publish_result = wn
-        .nostr
-        .publish_event_to(message_event, &account.pubkey, &group_relays)
+    let result = wn
+        .send_message_to_group(&account, &group_id, message, 9, None)
         .await
-        .map_err(|e| Response::err(format!("publish failed: {e}")))?;
+        .map_err(|e| Response::err(e.to_string()))?;
 
-    // Cache the message locally. The sender's own nostr-sdk client
-    // deduplicates events it already published, so the subscription
-    // will never deliver our own event back to us.
-    wn.cache_chat_message(&group_id, &stored_message)
-        .await
-        .map_err(|e| Response::err(format!("cache message: {e}")))?;
-
-    Ok(Response::ok(serde_json::json!({
-        "id": stored_message.id,
-        "content": stored_message.content,
-        "relays_success": publish_result.success.len(),
-        "relays_failed": publish_result.failed.len(),
-    })))
+    Ok(to_response(&result))
 }
 
 fn parse_group_id(s: &str) -> Result<GroupId, Response> {
