@@ -259,6 +259,7 @@ mod tests {
             reactions: ReactionSummary::default(),
             kind: 9, // MLS message kind
             media_attachments: vec![],
+            delivery_status: None,
         }
     }
 

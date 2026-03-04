@@ -1,52 +1,23 @@
 //! This module contains functions for publishing Nostr events and handling the publish tracking process.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 
 use crate::{
     RelayType,
     nostr_manager::{NostrManager, NostrManagerError, Result},
+    whitenoise::{
+        aggregated_message::AggregatedMessage,
+        database::Database,
+        message_aggregator::DeliveryStatus,
+        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
+    },
 };
 
 impl NostrManager {
-    /// Publishes an event to the specified relays in a background task.
-    ///
-    /// This is a fire-and-forget operation that spawns a background task to publish the event
-    /// without blocking the caller. Errors are logged but not returned. This is useful for
-    /// scenarios where you want to queue a publish operation but don't need to wait for completion.
-    ///
-    /// The method clones the necessary data to ensure `'static` lifetime for the spawned task.
-    /// The event is tracked in the database if published successfully to at least one relay.
-    pub(crate) fn background_publish_event_to(
-        &self,
-        event: Event,
-        account_pubkey: PublicKey,
-        relays: Vec<RelayUrl>,
-    ) {
-        let nostr = self.clone();
-
-        tokio::spawn(async move {
-            match nostr
-                .publish_event_to(event, &account_pubkey, &relays)
-                .await
-            {
-                Ok(output) => {
-                    tracing::debug!(
-                        target: "whitenoise::nostr_manager::background_publish_event_to",
-                        "Successfully published message to {} relay(s)",
-                        output.success.len()
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::nostr_manager::background_publish_event_to",
-                        "Failed to publish message in background task: {}",
-                        e
-                    );
-                }
-            }
-        });
-    }
-
     /// Constructs and publishes a Nostr gift wrap event using the provided signer.
     ///
     /// This method creates a gift-wrapped Nostr event and publishes it to specified relays.
@@ -227,6 +198,124 @@ impl NostrManager {
                 .map_err(|e| NostrManagerError::FailedToTrackPublishedEvent(e.to_string()))?;
         }
         Ok(result)
+    }
+
+    /// Publish an event with exponential backoff retries.
+    ///
+    /// Attempts up to 3 publishes with delays of 2s and 4s between retries.
+    /// On success, updates the delivery status to `Sent(relay_count)` and returns `true`.
+    /// On failure (all retries exhausted), updates to `Failed(reason)` and returns `false`.
+    pub(crate) async fn publish_with_retries(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+        stream_manager: &Arc<MessageStreamManager>,
+    ) -> bool {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut last_error = None;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                let delay = Duration::from_secs(1 << attempt);
+                tracing::debug!(
+                    target: "whitenoise::messages::delivery",
+                    "Retrying message publish \
+                     (attempt {}/{MAX_ATTEMPTS}), \
+                     backing off {delay:?}",
+                    attempt + 1,
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .publish_event_to(event.clone(), account_pubkey, relays)
+                .await
+            {
+                Ok(output) if !output.success.is_empty() => {
+                    let status = DeliveryStatus::Sent(output.success.len());
+                    Self::update_and_emit_delivery_status(
+                        event_id,
+                        group_id,
+                        &status,
+                        database,
+                        stream_manager,
+                    )
+                    .await;
+                    return true;
+                }
+                Ok(output) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS}: \
+                         no relay accepted (failed: {:?})",
+                        attempt + 1,
+                        output.failed.keys().collect::<Vec<_>>(),
+                    );
+                    last_error = Some("No relay accepted the message".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Publish attempt {}/{MAX_ATTEMPTS} \
+                         failed: {e}",
+                        attempt + 1,
+                    );
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        // All retries exhausted — mark as failed
+        // Safety: last_error is always Some because the loop body always sets it
+        let reason = last_error.expect("loop always sets last_error");
+        let status = DeliveryStatus::Failed(reason);
+        Self::update_and_emit_delivery_status(
+            event_id,
+            group_id,
+            &status,
+            database,
+            stream_manager,
+        )
+        .await;
+        false
+    }
+
+    /// Update delivery status in the DB cache and emit a stream update.
+    ///
+    /// Uses `update_delivery_status` with `RETURNING` to atomically update and
+    /// fetch the row in a single query, eliminating the race window between
+    /// separate UPDATE + SELECT operations.
+    async fn update_and_emit_delivery_status(
+        event_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+        stream_manager: &MessageStreamManager,
+    ) {
+        match AggregatedMessage::update_delivery_status(event_id, group_id, status, database).await
+        {
+            Ok(updated_msg) => {
+                stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::DeliveryStatusChanged,
+                        message: updated_msg,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Failed to update delivery status for message {}: {}",
+                    event_id,
+                    e
+                );
+            }
+        }
     }
 
     /// Publishes a Nostr event builder using a temporary signer.
@@ -786,73 +875,6 @@ mod publish_tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_background_publish_event_to_completes() {
-        use crate::whitenoise::event_tracker::NoEventTracker;
-
-        let (sender, _receiver) = mpsc::channel(100);
-        let event_tracker = Arc::new(NoEventTracker);
-        let nostr_manager =
-            NostrManager::new(sender, event_tracker, std::time::Duration::from_secs(10))
-                .await
-                .unwrap();
-
-        // Create a test account and keys
-        let keys = Keys::generate();
-
-        // Create a test event
-        let event_builder = EventBuilder::text_note("background test message");
-        let event = event_builder.sign_with_keys(&keys).unwrap();
-
-        // Use test relays
-        let test_relays = vec![
-            RelayUrl::parse("ws://localhost:8080").unwrap(),
-            RelayUrl::parse("ws://localhost:7777").unwrap(),
-        ];
-
-        // Call background publish (fire-and-forget)
-        nostr_manager.background_publish_event_to(event, keys.public_key(), test_relays);
-
-        // Give the background task time to complete
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // No assertions - just verify it doesn't panic or hang
-        // The background task logs success/failure internally
-    }
-
-    #[tokio::test]
-    async fn test_background_publish_event_to_with_unreachable_relays() {
-        use crate::whitenoise::event_tracker::NoEventTracker;
-
-        let (sender, _receiver) = mpsc::channel(100);
-        let event_tracker = Arc::new(NoEventTracker);
-        let nostr_manager =
-            NostrManager::new(sender, event_tracker, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
-
-        // Create a test account and keys
-        let keys = Keys::generate();
-
-        // Create a test event
-        let event_builder = EventBuilder::text_note("background test with unreachable relays");
-        let event = event_builder.sign_with_keys(&keys).unwrap();
-
-        // Use unreachable relays
-        let relays = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
-        ];
-
-        // Call background publish - should not panic even with unreachable relays
-        nostr_manager.background_publish_event_to(event, keys.public_key(), relays);
-
-        // Give the background task time to complete and log the error
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // No assertions - verify it handles errors gracefully without panicking
     }
 
     #[tokio::test]

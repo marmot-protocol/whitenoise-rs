@@ -157,6 +157,7 @@ pub(crate) async fn process_regular_message(
         reactions: Default::default(),
         kind: u16::from(message.kind),
         media_attachments,
+        delivery_status: None,
     })
 }
 
@@ -461,6 +462,7 @@ mod tests {
                 reactions: Default::default(),
                 kind: 9,
                 media_attachments: vec![],
+                delivery_status: None,
             },
         );
 

@@ -299,13 +299,29 @@ impl Whitenoise {
 
     /// Cache a reaction and return the updated target message for emission.
     ///
-    /// Returns `Ok(None)` if the target message isn't cached yet (orphaned reaction).
+    /// Returns `Ok(None)` if the target message isn't cached yet (orphaned reaction),
+    /// or if the reaction was already processed as an outgoing event (echo from relay).
     /// Propagates real errors (malformed tags, invalid emoji, DB failures).
     async fn cache_reaction(
         &self,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
+        // If this reaction already has a delivery status, it was sent by us and already
+        // applied to the parent — skip re-applying to avoid unnecessary DB writes and
+        // duplicate UI emissions.
+        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
+            .await?
+        {
+            tracing::debug!(
+                target: "whitenoise::cache",
+                "Skipping echo of outgoing reaction {} in group {}",
+                message.id,
+                hex::encode(group_id.as_slice())
+            );
+            return Ok(None);
+        }
+
         AggregatedMessage::insert_reaction(message, group_id, &self.database).await?;
 
         let result = self.apply_reaction_to_target(message, group_id).await?;
@@ -378,6 +394,21 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
+        // If this deletion already has a delivery status, it was sent by us and already
+        // applied to targets — skip re-applying to avoid unnecessary DB writes and
+        // duplicate UI emissions.
+        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
+            .await?
+        {
+            tracing::debug!(
+                target: "whitenoise::cache",
+                "Skipping echo of outgoing deletion {} in group {}",
+                message.id,
+                hex::encode(group_id.as_slice())
+            );
+            return Ok(Vec::new());
+        }
+
         AggregatedMessage::insert_deletion(message, group_id, &self.database).await?;
 
         let updates = self.apply_deletions_to_targets(message, group_id).await?;
@@ -502,14 +533,14 @@ impl Whitenoise {
         }
     }
 
-    fn extract_reaction_target_id(tags: &Tags) -> Result<String> {
+    pub(crate) fn extract_reaction_target_id(tags: &Tags) -> Result<String> {
         tags.iter()
             .find(|tag| tag.kind() == nostr_sdk::TagKind::e())
             .and_then(|tag| tag.content().map(|s| s.to_string()))
             .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Reaction missing e-tag")))
     }
 
-    fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {
+    pub(crate) fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {
         tags.iter()
             .filter(|tag| tag.kind() == nostr_sdk::TagKind::e())
             .filter_map(|tag| tag.content().map(|s| s.to_string()))
