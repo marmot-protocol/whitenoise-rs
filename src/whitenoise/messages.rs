@@ -4,10 +4,11 @@ use crate::{
         Whitenoise,
         accounts::Account,
         aggregated_message::AggregatedMessage,
+        database::Database,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
-        message_aggregator::{ChatMessage, DeliveryStatus},
-        message_streaming::{MessageUpdate, UpdateTrigger},
+        message_aggregator::{ChatMessage, DeliveryStatus, emoji_utils, reaction_handler},
+        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
@@ -60,51 +61,69 @@ impl Whitenoise {
 
         let tokens = self.nostr.parse(&mdk_message.content);
 
-        // Proactive caching + delivery tracking only for chat messages (kind 9).
-        // Reactions (kind 7) and deletions (kind 5) don't need delivery status UI.
-        if kind == 9 {
-            self.process_and_emit_outgoing_message(&mdk_message, group_id)
-                .await?;
+        // Proactive caching + delivery tracking for all outgoing event kinds.
+        // Kind 9 (chat): full message processing + NewMessage emission
+        // Kind 7/5 (reaction/deletion): insert event + apply aggregated effect on parent
+        match kind {
+            9 => {
+                self.process_and_emit_outgoing_message(&mdk_message, group_id)
+                    .await?;
+            }
+            7 => {
+                self.cache_and_apply_outgoing_reaction(&mdk_message, group_id)
+                    .await?;
+            }
+            5 => {
+                self.cache_and_apply_outgoing_deletion(&mdk_message, group_id)
+                    .await?;
+            }
+            other => {
+                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    "Unsupported outgoing event kind: {other}"
+                )));
+            }
         }
 
-        // Spawn background publish task
+        // Spawn background publish task with retries + delivery tracking for all kinds.
+        // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
         let nostr = self.nostr.clone();
         let event_id_str = event_id.to_string();
         let account_pubkey = account.pubkey;
+        let database = self.database.clone();
+        let stream_manager = self.message_stream_manager.clone();
+        let group_id_clone = group_id.clone();
+        let tags_clone = mdk_message.tags.clone();
+        let message_author = mdk_message.pubkey;
+        let reaction_content = mdk_message.content.clone();
 
-        if kind == 9 {
-            let database = self.database.clone();
-            let stream_manager = self.message_stream_manager.clone();
-            let group_id_clone = group_id.clone();
+        tokio::spawn(async move {
+            let success = nostr
+                .publish_with_retries(
+                    message_event,
+                    &account_pubkey,
+                    &group_relays,
+                    &event_id_str,
+                    &group_id_clone,
+                    &database,
+                    &stream_manager,
+                )
+                .await;
 
-            tokio::spawn(async move {
-                nostr
-                    .publish_with_retries(
-                        message_event,
-                        &account_pubkey,
-                        &group_relays,
-                        &event_id_str,
-                        &group_id_clone,
-                        &database,
-                        &stream_manager,
-                    )
-                    .await;
-            });
-        } else {
-            // Reactions/deletions: best-effort publish, no delivery tracking
-            tokio::spawn(async move {
-                if let Err(e) = nostr
-                    .publish_event_to(message_event, &account_pubkey, &group_relays)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::messages::delivery",
-                        "Failed to publish kind {} event: {e}",
-                        kind,
-                    );
-                }
-            });
-        }
+            // On failure, reverse optimistic aggregated effects for reactions/deletions
+            if !success {
+                Whitenoise::cascade_delivery_failure(
+                    kind,
+                    &event_id_str,
+                    &tags_clone,
+                    &message_author,
+                    &reaction_content,
+                    &group_id_clone,
+                    &database,
+                    &stream_manager,
+                )
+                .await;
+            }
+        });
 
         Ok(MessageWithTokens::new(mdk_message, tokens))
     }
@@ -153,6 +172,249 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Cache an outgoing reaction (kind 7) and optimistically apply it to the parent.
+    ///
+    /// Inserts the reaction event into `aggregated_messages`, sets delivery status
+    /// to `Sending`, applies the reaction to the target kind-9 message, and emits
+    /// a `ReactionAdded` update so the UI reflects the change immediately.
+    async fn cache_and_apply_outgoing_reaction(
+        &self,
+        mdk_message: &Message,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        // Insert the reaction event row
+        AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to cache reaction: {}", e))
+            })?;
+
+        // Track delivery status for the reaction event
+        AggregatedMessage::update_delivery_status(
+            &mdk_message.id.to_string(),
+            group_id,
+            &DeliveryStatus::Sending,
+            &self.database,
+        )
+        .await
+        .map_err(|e| {
+            WhitenoiseError::from(anyhow::anyhow!(
+                "Failed to set reaction delivery status: {}",
+                e,
+            ))
+        })?;
+
+        // Apply reaction to the target kind-9 message (if e-tag is present and target cached)
+        if let Ok(target_id) = Self::extract_reaction_target_id(&mdk_message.tags)
+            && let Some(mut target) =
+                AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
+        {
+            let emoji = emoji_utils::validate_and_normalize_reaction(
+                &mdk_message.content,
+                self.message_aggregator.config().normalize_emoji,
+            )
+            .map_err(|e| WhitenoiseError::from(anyhow::anyhow!("Invalid reaction emoji: {}", e)))?;
+
+            reaction_handler::add_reaction_to_message(
+                &mut target,
+                &mdk_message.pubkey,
+                &emoji,
+                mdk_message.created_at,
+                mdk_message.id,
+            );
+
+            AggregatedMessage::update_reactions(
+                &target.id,
+                group_id,
+                &target.reactions,
+                &self.database,
+            )
+            .await?;
+
+            self.message_stream_manager.emit(
+                group_id,
+                MessageUpdate {
+                    trigger: UpdateTrigger::ReactionAdded,
+                    message: target,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Cache an outgoing deletion (kind 5) and optimistically apply it to the parent.
+    ///
+    /// Inserts the deletion event into `aggregated_messages`, sets delivery status
+    /// to `Sending`, marks the target message(s) as deleted, and emits appropriate
+    /// updates so the UI reflects the change immediately.
+    async fn cache_and_apply_outgoing_deletion(
+        &self,
+        mdk_message: &Message,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        // Insert the deletion event row
+        AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to cache deletion: {}", e))
+            })?;
+
+        // Track delivery status for the deletion event
+        AggregatedMessage::update_delivery_status(
+            &mdk_message.id.to_string(),
+            group_id,
+            &DeliveryStatus::Sending,
+            &self.database,
+        )
+        .await
+        .map_err(|e| {
+            WhitenoiseError::from(anyhow::anyhow!(
+                "Failed to set deletion delivery status: {}",
+                e,
+            ))
+        })?;
+
+        // Apply deletion to all target messages
+        let target_ids = Self::extract_deletion_target_ids(&mdk_message.tags);
+        for target_id in target_ids {
+            AggregatedMessage::mark_deleted(
+                &target_id,
+                group_id,
+                &mdk_message.id.to_string(),
+                &self.database,
+            )
+            .await?;
+
+            if let Some(mut msg) =
+                AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
+            {
+                msg.is_deleted = true;
+                self.message_stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::MessageDeleted,
+                        message: msg,
+                    },
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reverse optimistic aggregated effects when a reaction/deletion fails to publish.
+    ///
+    /// - **Kind 7 (reaction)**: Remove the reaction from the parent message's summary.
+    /// - **Kind 5 (deletion)**: Clear `deletion_event_id` on targets so they reappear.
+    /// - **Kind 9 / other**: No cascade needed — the message already shows Failed status.
+    async fn cascade_delivery_failure(
+        kind: u16,
+        event_id: &str,
+        tags: &Tags,
+        author: &PublicKey,
+        content: &str,
+        group_id: &GroupId,
+        database: &Database,
+        stream_manager: &MessageStreamManager,
+    ) {
+        match kind {
+            7 => {
+                // Reaction failed: remove from parent message's reaction summary
+                let target_id = match Self::extract_reaction_target_id(tags) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Failed to extract reaction target for cascade: {e}",
+                        );
+                        return;
+                    }
+                };
+
+                let Some(mut parent) =
+                    (match AggregatedMessage::find_by_id(&target_id, group_id, database).await {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "whitenoise::messages::delivery",
+                                "Failed to find parent message for reaction cascade: {e}",
+                            );
+                            return;
+                        }
+                    })
+                else {
+                    return;
+                };
+
+                if reaction_handler::remove_reaction_from_message(&mut parent, author) {
+                    if let Err(e) = AggregatedMessage::update_reactions(
+                        &target_id,
+                        group_id,
+                        &parent.reactions,
+                        database,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Failed to update reactions after cascade: {e}",
+                        );
+                        return;
+                    }
+
+                    stream_manager.emit(
+                        group_id,
+                        MessageUpdate {
+                            trigger: UpdateTrigger::ReactionRemoved,
+                            message: parent,
+                        },
+                    );
+                }
+
+                tracing::info!(
+                    target: "whitenoise::messages::delivery",
+                    "Cascaded reaction failure: removed reaction '{content}' \
+                     from message {target_id}",
+                );
+            }
+            5 => {
+                // Deletion failed: unmark targets so they reappear
+                if let Err(e) =
+                    AggregatedMessage::unmark_deleted(event_id, group_id, database).await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::messages::delivery",
+                        "Failed to unmark deleted messages after cascade: {e}",
+                    );
+                    return;
+                }
+
+                // Re-emit affected target messages so the UI reflects them as not deleted
+                let target_ids = Self::extract_deletion_target_ids(tags);
+                for target_id in target_ids {
+                    if let Ok(Some(msg)) =
+                        AggregatedMessage::find_by_id(&target_id, group_id, database).await
+                    {
+                        stream_manager.emit(
+                            group_id,
+                            MessageUpdate {
+                                trigger: UpdateTrigger::DeliveryStatusChanged,
+                                message: msg,
+                            },
+                        );
+                    }
+                }
+
+                tracing::info!(
+                    target: "whitenoise::messages::delivery",
+                    "Cascaded deletion failure: unmarked targets of deletion {event_id}",
+                );
+            }
+            _ => {} // Kind 9 and others: no cascade needed
+        }
+    }
+
     /// Retry publishing a failed message.
     ///
     /// Creates a brand new message with the same content, tags, and kind as the
@@ -198,17 +460,9 @@ impl Whitenoise {
                 }
             };
 
-        // Build tags from original, adding a nonce to guarantee a unique event ID
-        // (without a nonce, retries within the same second produce identical IDs
-        // because Nostr event IDs are deterministic over pubkey+timestamp+kind+tags+content)
-        let mut tags = original.tags.to_vec();
-        tags.push(Tag::custom(
-            TagKind::custom("nonce"),
-            [event_id_str.clone()],
-        ));
-
         // Create the new message FIRST — if this fails, the original stays visible as Failed
-        // rather than being hidden with no replacement
+        // rather than being hidden with no replacement.
+        let tags = original.tags.to_vec();
         self.send_message_to_group(
             account,
             group_id,
@@ -622,8 +876,8 @@ mod tests {
             long_content.len()
         );
 
-        // Test different event kinds
-        for kind in [7, 9, 10] {
+        // Test supported event kinds (7=reaction needs an e-tag, so skip here; 5=deletion is fine)
+        for kind in [5, 9] {
             let result = whitenoise
                 .send_message_to_group(
                     &creator_account,
@@ -635,6 +889,21 @@ mod tests {
                 .await;
             assert!(result.is_ok(), "Message with kind {} should succeed", kind);
         }
+
+        // Unsupported kind should fail
+        let result = whitenoise
+            .send_message_to_group(
+                &creator_account,
+                &group.mls_group_id,
+                "Kind 10".to_string(),
+                10,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "Unsupported event kind 10 should return an error"
+        );
     }
 
     /// Test helper method: create_unsigned_nostr_event
@@ -1102,7 +1371,7 @@ mod tests {
     /// Test that sending a non-kind-9 message (e.g., reaction) skips proactive caching
     /// and delivery tracking but still succeeds.
     #[tokio::test]
-    async fn test_send_non_kind9_skips_delivery_tracking() {
+    async fn test_send_reaction_tracks_delivery_and_applies_to_parent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
@@ -1130,7 +1399,7 @@ mod tests {
                 .unwrap();
         assert_eq!(cached_count, 1, "kind 9 message should be cached");
 
-        // Now send a kind 7 (reaction) — should succeed but NOT add to cache
+        // Send a kind 7 (reaction) — should be cached with delivery tracking
         let reaction_tags = Some(vec![
             Tag::parse(vec!["e", &chat_result.message.id.to_hex()]).unwrap(),
         ]);
@@ -1149,14 +1418,28 @@ mod tests {
             reaction_result.err()
         );
 
-        // Cache count should still be 1 (only the kind 9 message)
+        // Cache count should be 2 (kind 9 + kind 7)
         let cached_count =
             AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
                 .unwrap();
         assert_eq!(
-            cached_count, 1,
-            "kind 7 reaction should NOT be added to aggregated message cache"
+            cached_count, 2,
+            "kind 7 reaction should be cached alongside kind 9 message"
+        );
+
+        // The reaction should have been applied to the parent message
+        let parent = AggregatedMessage::find_by_id(
+            &chat_result.message.id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !parent.reactions.by_emoji.is_empty(),
+            "Parent message should have the reaction applied"
         );
     }
 
@@ -1286,7 +1569,13 @@ mod tests {
 
         let original_event_id = result.message.id;
 
-        // Manually mark the message as Failed (simulating exhausted retries)
+        // Sleep 1s so the Nostr timestamp (1-second granularity) differs,
+        // producing a distinct inner event ID for the retry.
+        // Also lets background publish_with_retries finish before we override the status.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Manually mark the message as Failed (simulating exhausted retries).
+        // Done after the sleep so background publish_with_retries doesn't overwrite it.
         AggregatedMessage::update_delivery_status(
             &original_event_id.to_string(),
             &group.mls_group_id,

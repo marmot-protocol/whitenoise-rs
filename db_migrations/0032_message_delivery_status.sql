@@ -10,3 +10,7 @@ CREATE TABLE message_delivery_status (
         REFERENCES aggregated_messages(message_id, mls_group_id)
         ON DELETE CASCADE
 );
+
+-- Queries frequently filter by (mls_group_id, status), e.g. excluding Retried messages.
+CREATE INDEX idx_mds_group_status
+    ON message_delivery_status (mls_group_id, status);

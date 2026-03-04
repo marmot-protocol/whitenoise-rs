@@ -491,6 +491,28 @@ impl AggregatedMessage {
         Ok(())
     }
 
+    /// Reverse a deletion by clearing `deletion_event_id` for targets of a specific deletion.
+    ///
+    /// Used to cascade delivery failure: if a kind-5 deletion fails to publish,
+    /// we undo its effect on the target messages.
+    pub async fn unmark_deleted(
+        deletion_event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE aggregated_messages
+             SET deletion_event_id = NULL
+             WHERE deletion_event_id = ? AND mls_group_id = ?",
+        )
+        .bind(deletion_event_id)
+        .bind(group_id.as_slice())
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Update the delivery status of a cached message and return the full updated message.
     ///
     /// Upserts into the separate `message_delivery_status` table, then fetches the
@@ -505,7 +527,21 @@ impl AggregatedMessage {
     ) -> Result<ChatMessage> {
         let mut tx = database.pool.begin().await?;
 
-        // Upsert delivery status (FK constraint ensures the message exists)
+        // Verify the parent message exists before upserting delivery status
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM aggregated_messages
+             WHERE message_id = ? AND mls_group_id = ?)",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !exists {
+            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        }
+
+        // Upsert delivery status
         sqlx::query(
             "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
              VALUES (?, ?, ?)
@@ -515,14 +551,7 @@ impl AggregatedMessage {
         .bind(group_id.as_slice())
         .bind(serde_json::to_string(status)?)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| match e {
-            // FK violation means the message doesn't exist
-            sqlx::Error::Database(ref db_err) if db_err.code().as_deref() == Some("787") => {
-                DatabaseError::Sqlx(sqlx::Error::RowNotFound)
-            }
-            _ => DatabaseError::Sqlx(e),
-        })?;
+        .await?;
 
         // Fetch the full message with updated status
         let row: Option<AggregatedMessageRow> = sqlx::query_as(
@@ -530,7 +559,7 @@ impl AggregatedMessage {
              FROM aggregated_messages am
              LEFT JOIN message_delivery_status mds
                ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
-             WHERE am.message_id = ? AND am.mls_group_id = ? AND am.kind = 9",
+             WHERE am.message_id = ? AND am.mls_group_id = ?",
         )
         .bind(message_id)
         .bind(group_id.as_slice())
@@ -543,6 +572,24 @@ impl AggregatedMessage {
             Some(r) => Self::row_to_chat_message(r),
             None => Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
         }
+    }
+
+    /// Check whether an event has a delivery status row (i.e. was sent by us).
+    pub async fn has_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM message_delivery_status
+             WHERE message_id = ? AND mls_group_id = ?)",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(exists)
     }
 
     /// Delete ALL cached events for a group

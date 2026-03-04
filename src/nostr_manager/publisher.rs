@@ -203,8 +203,8 @@ impl NostrManager {
     /// Publish an event with exponential backoff retries.
     ///
     /// Attempts up to 3 publishes with delays of 2s and 4s between retries.
-    /// On success, updates the delivery status to `Sent(relay_count)`.
-    /// On failure (all retries exhausted), updates to `Failed(reason)`.
+    /// On success, updates the delivery status to `Sent(relay_count)` and returns `true`.
+    /// On failure (all retries exhausted), updates to `Failed(reason)` and returns `false`.
     pub(crate) async fn publish_with_retries(
         &self,
         event: Event,
@@ -214,7 +214,7 @@ impl NostrManager {
         group_id: &GroupId,
         database: &Database,
         stream_manager: &Arc<MessageStreamManager>,
-    ) {
+    ) -> bool {
         const MAX_ATTEMPTS: u32 = 3;
         let mut last_error = None;
 
@@ -245,7 +245,7 @@ impl NostrManager {
                         stream_manager,
                     )
                     .await;
-                    return;
+                    return true;
                 }
                 Ok(output) => {
                     tracing::warn!(
@@ -281,6 +281,7 @@ impl NostrManager {
             stream_manager,
         )
         .await;
+        false
     }
 
     /// Update delivery status in the DB cache and emit a stream update.
