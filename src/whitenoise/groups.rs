@@ -349,6 +349,19 @@ impl Whitenoise {
             .collect::<Vec<PublicKey>>())
     }
 
+    async fn ensure_account_is_group_admin(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let admins = self.group_admins(account, group_id).await?;
+        if !admins.contains(&account.pubkey) {
+            return Err(WhitenoiseError::AccountNotAuthorized);
+        }
+
+        Ok(())
+    }
+
     /// Adds new members to an existing MLS group
     ///
     /// This method performs the complete workflow for adding members to a group:
@@ -372,6 +385,9 @@ impl Whitenoise {
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
+        self.ensure_account_is_group_admin(account, group_id)
+            .await?;
+
         let mut key_package_events: Vec<Event> = Vec::new();
         let signer = self.get_signer_for_account(account)?;
         let mut users = Vec::new();
@@ -507,6 +523,9 @@ impl Whitenoise {
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
+        self.ensure_account_is_group_admin(account, group_id)
+            .await?;
+
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -541,6 +560,9 @@ impl Whitenoise {
         group_id: &GroupId,
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
+        self.ensure_account_is_group_admin(account, group_id)
+            .await?;
+
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
@@ -1053,6 +1075,100 @@ mod tests {
         assert_eq!(
             updated_group.image_key,
             new_group_data.image_key.unwrap().map(Secret::new)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_only_group_functions_reject_non_admin_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let new_admin_pubkey = members[0].0.pubkey;
+        let other_member_pubkey = members[1].0.pubkey;
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .create_group(
+                &creator_account,
+                vec![new_admin_pubkey, other_member_pubkey],
+                config,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let transfer_admin_rights_update = NostrGroupDataUpdate {
+            name: None,
+            description: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            image_upload_key: None,
+            admins: Some(vec![new_admin_pubkey]),
+            relays: None,
+            nostr_group_id: None,
+        };
+        whitenoise
+            .update_group_data(
+                &creator_account,
+                &group.mls_group_id,
+                transfer_admin_rights_update,
+            )
+            .await
+            .unwrap();
+
+        let new_account = whitenoise.create_identity().await.unwrap();
+        let add_members_result = whitenoise
+            .add_members_to_group(
+                &creator_account,
+                &group.mls_group_id,
+                vec![new_account.pubkey],
+            )
+            .await;
+        assert!(
+            matches!(
+                add_members_result,
+                Err(WhitenoiseError::AccountNotAuthorized)
+            ),
+            "Expected AccountNotAuthorized for add_members_to_group, got: {:?}",
+            add_members_result
+        );
+
+        let remove_members_result = whitenoise
+            .remove_members_from_group(
+                &creator_account,
+                &group.mls_group_id,
+                vec![other_member_pubkey],
+            )
+            .await;
+        assert!(
+            matches!(
+                remove_members_result,
+                Err(WhitenoiseError::AccountNotAuthorized)
+            ),
+            "Expected AccountNotAuthorized for remove_members_from_group, got: {:?}",
+            remove_members_result
+        );
+
+        let update = NostrGroupDataUpdate {
+            name: Some("Updated Name".to_string()),
+            description: None,
+            image_hash: None,
+            image_key: None,
+            image_nonce: None,
+            image_upload_key: None,
+            admins: None,
+            relays: None,
+            nostr_group_id: None,
+        };
+        let update_result = whitenoise
+            .update_group_data(&creator_account, &group.mls_group_id, update)
+            .await;
+        assert!(
+            matches!(update_result, Err(WhitenoiseError::AccountNotAuthorized)),
+            "Expected AccountNotAuthorized for update_group_data, got: {:?}",
+            update_result
         );
     }
 
