@@ -147,6 +147,20 @@ pub enum Request {
         group_id: String,
         message: String,
     },
+    #[serde(rename = "react_to_message")]
+    ReactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+        #[serde(default = "default_reaction_emoji")]
+        emoji: String,
+    },
+    #[serde(rename = "unreact_to_message")]
+    UnreactToMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+    },
 
     // Streaming
     #[serde(rename = "messages_subscribe")]
@@ -163,6 +177,10 @@ fn default_radius_start() -> u8 {
 
 fn default_radius_end() -> u8 {
     2
+}
+
+fn default_reaction_emoji() -> String {
+    "+".to_string()
 }
 
 /// Manual `Debug` impl to prevent accidental nsec exposure in logs.
@@ -794,6 +812,58 @@ mod tests {
             parsed,
             Request::MessagesSubscribe { account, group_id }
             if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn react_to_message_roundtrip() {
+        let req = Request::ReactToMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            message_id: "eventid123".into(),
+            emoji: "👍".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ReactToMessage { account, group_id, message_id, emoji }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message_id == "eventid123"
+                && emoji == "👍"
+        ));
+    }
+
+    #[test]
+    fn react_to_message_default_emoji_roundtrip() {
+        let wire = r#"{"method":"react_to_message","params":{"account":"npub1abc","group_id":"abcd1234","message_id":"eventid123"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ReactToMessage { account, group_id, message_id, emoji }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message_id == "eventid123"
+                && emoji == "+"
+        ));
+    }
+
+    #[test]
+    fn unreact_to_message_roundtrip() {
+        let req = Request::UnreactToMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            message_id: "eventid123".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UnreactToMessage { account, group_id, message_id }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message_id == "eventid123"
         ));
     }
 
