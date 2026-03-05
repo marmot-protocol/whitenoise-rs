@@ -487,10 +487,8 @@ impl Whitenoise {
     /// Creates a brand new message with the same content, tags, and kind as the
     /// original failed message but with a new event ID and `Timestamp::now()`.
     /// The original message is marked as `Retried` so it's excluded from future
-    /// UI snapshots. The new message follows the normal `NewMessage` flow.
-    ///
-    /// Flutter removes the failed message from the UI immediately on retry tap,
-    /// so no server-side emit is needed for that.
+    /// UI snapshots, and a `DeliveryStatusChanged` update is emitted on the
+    /// message stream. The new message follows the normal `NewMessage` flow.
     pub async fn retry_message_publish(
         &self,
         account: &Account,
@@ -542,7 +540,7 @@ impl Whitenoise {
         // Mark the original message as Retried so it's excluded from future snapshots.
         // This is best-effort: if it fails, the user sees a duplicate (original Failed +
         // new Sending) which is harmless and self-corrects on next app restart.
-        if let Err(e) = AggregatedMessage::update_delivery_status(
+        match AggregatedMessage::update_delivery_status(
             &event_id_str,
             group_id,
             &DeliveryStatus::Retried,
@@ -550,11 +548,22 @@ impl Whitenoise {
         )
         .await
         {
-            tracing::warn!(
-                target: "whitenoise::messages::delivery",
-                "Failed to mark original message {} as Retried: {e}",
-                event_id_str,
-            );
+            Ok(updated_msg) => {
+                self.message_stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::DeliveryStatusChanged,
+                        message: updated_msg,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Failed to mark original message {} as Retried: {e}",
+                    event_id_str,
+                );
+            }
         }
 
         Ok(())
@@ -1714,6 +1723,96 @@ mod tests {
         );
     }
 
+    /// Test that retry_message_publish emits DeliveryStatusChanged(Retried) on the
+    /// message stream for the original message, and NewMessage(Sending) for the new one.
+    #[tokio::test]
+    async fn test_retry_emits_retried_and_new_message_to_stream() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message (proactively cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Retry stream test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let original_event_id = result.message.id;
+
+        // Wait for background publish to settle, then force status to Failed
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        AggregatedMessage::update_delivery_status(
+            &original_event_id.to_string(),
+            &group.mls_group_id,
+            &DeliveryStatus::Failed("simulated failure".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Subscribe to the stream AFTER setup so we only see retry-related updates
+        let mut receiver = whitenoise
+            .message_stream_manager
+            .subscribe(&group.mls_group_id);
+
+        // Retry — should emit NewMessage for the new message + DeliveryStatusChanged(Retried)
+        // for the original
+        whitenoise
+            .retry_message_publish(&creator, &group.mls_group_id, &original_event_id)
+            .await
+            .unwrap();
+
+        // Collect the two updates (order: NewMessage for the retry, then Retried for original)
+        let mut got_new_message = false;
+        let mut got_retried = false;
+
+        for _ in 0..2 {
+            let update = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("Timed out waiting for stream update")
+                .expect("Stream closed unexpectedly");
+
+            match update.trigger {
+                UpdateTrigger::NewMessage => {
+                    assert_eq!(
+                        update.message.delivery_status,
+                        Some(DeliveryStatus::Sending),
+                    );
+                    assert_eq!(update.message.content, "Retry stream test");
+                    assert_ne!(update.message.id, original_event_id.to_string());
+                    got_new_message = true;
+                }
+                UpdateTrigger::DeliveryStatusChanged => {
+                    assert_eq!(
+                        update.message.delivery_status,
+                        Some(DeliveryStatus::Retried),
+                    );
+                    assert_eq!(update.message.id, original_event_id.to_string());
+                    got_retried = true;
+                }
+                other => panic!("Unexpected trigger: {:?}", other),
+            }
+        }
+
+        assert!(got_new_message, "Expected NewMessage for the retry message");
+        assert!(got_retried, "Expected DeliveryStatusChanged(Retried) for original");
+    }
+
     /// Test publish_with_retries exhausts all attempts and marks status as Failed
     /// when relays are unreachable.
     #[tokio::test]
@@ -2380,6 +2479,162 @@ mod tests {
             &stream_manager,
         )
         .await;
+    }
+
+    /// Test that delivery status changes emit DeliveryStatusChanged on the message stream.
+    ///
+    /// Subscribes to the stream BEFORE sending, then asserts:
+    /// 1. NewMessage arrives with delivery_status = Sending (optimistic insert)
+    /// 2. DeliveryStatusChanged arrives with delivery_status = Failed (after retries exhaust)
+    #[tokio::test]
+    async fn test_delivery_status_change_emits_to_stream() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Subscribe to the group's message stream BEFORE sending
+        let mut receiver = whitenoise
+            .message_stream_manager
+            .subscribe(&group.mls_group_id);
+
+        // Send a message (proactively cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Stream emission test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id.to_string();
+
+        // 1) First stream update: NewMessage with Sending
+        let update = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("Timed out waiting for NewMessage update")
+            .expect("Stream closed unexpectedly");
+
+        assert_eq!(update.trigger, UpdateTrigger::NewMessage);
+        assert_eq!(update.message.delivery_status, Some(DeliveryStatus::Sending));
+        assert_eq!(update.message.id, event_id);
+
+        // Trigger a status transition by calling publish_with_retries with unreachable relays
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
+
+        whitenoise
+            .nostr
+            .publish_with_retries(
+                event,
+                &creator.pubkey,
+                &unreachable_relays,
+                &event_id,
+                &group.mls_group_id,
+                &whitenoise.database,
+                &whitenoise.message_stream_manager,
+            )
+            .await;
+
+        // 2) Second stream update: DeliveryStatusChanged with Failed
+        let update = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("Timed out waiting for DeliveryStatusChanged update")
+            .expect("Stream closed unexpectedly");
+
+        assert_eq!(update.trigger, UpdateTrigger::DeliveryStatusChanged);
+        assert!(
+            matches!(update.message.delivery_status, Some(DeliveryStatus::Failed(_))),
+            "Expected Failed status in stream update, got {:?}",
+            update.message.delivery_status
+        );
+        assert_eq!(update.message.id, event_id);
+    }
+
+    /// Test that a Sending -> Sent transition emits DeliveryStatusChanged on the stream.
+    ///
+    /// Exercises the same update_delivery_status + emit path used by
+    /// `NostrManager::update_and_emit_delivery_status` (which is private), proving
+    /// that Sent status changes propagate to stream subscribers.
+    #[tokio::test]
+    async fn test_delivery_status_sent_emits_to_stream() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send a message (cached with Sending status)
+        let result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "Sent emission test".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event_id = result.message.id.to_string();
+
+        // Subscribe after send so we skip the NewMessage update
+        let mut receiver = whitenoise
+            .message_stream_manager
+            .subscribe(&group.mls_group_id);
+
+        // Simulate the Sending -> Sent transition (same as update_and_emit_delivery_status)
+        let updated_msg = AggregatedMessage::update_delivery_status(
+            &event_id,
+            &group.mls_group_id,
+            &DeliveryStatus::Sent(2),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        whitenoise.message_stream_manager.emit(
+            &group.mls_group_id,
+            MessageUpdate {
+                trigger: UpdateTrigger::DeliveryStatusChanged,
+                message: updated_msg,
+            },
+        );
+
+        let update = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("Timed out waiting for DeliveryStatusChanged(Sent) update")
+            .expect("Stream closed unexpectedly");
+
+        assert_eq!(update.trigger, UpdateTrigger::DeliveryStatusChanged);
+        assert_eq!(
+            update.message.delivery_status,
+            Some(DeliveryStatus::Sent(2)),
+        );
+        assert_eq!(update.message.id, event_id);
     }
 
     /// Test that deleting the last message in a group exercises the
