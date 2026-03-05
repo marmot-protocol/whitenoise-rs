@@ -818,10 +818,10 @@ mod tests {
     #[test]
     fn react_to_message_roundtrip() {
         let req = Request::ReactToMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            message_id: "eventid123".into(),
-            emoji: "👍".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            message_id: "eventid123".to_string(),
+            emoji: "👍".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -852,9 +852,9 @@ mod tests {
     #[test]
     fn unreact_to_message_roundtrip() {
         let req = Request::UnreactToMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            message_id: "eventid123".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            message_id: "eventid123".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
