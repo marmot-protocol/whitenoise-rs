@@ -1,10 +1,12 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// A request from the CLI client to the daemon.
 ///
 /// Each variant maps to one daemon method. The JSON wire format uses
 /// `{"method": "variant_name", "params": {...}}` via serde's tagged enum.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
     // Daemon management
@@ -161,6 +163,19 @@ fn default_radius_start() -> u8 {
 
 fn default_radius_end() -> u8 {
     2
+}
+
+/// Manual `Debug` impl to prevent accidental nsec exposure in logs.
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoginStart { .. } => f
+                .debug_struct("LoginStart")
+                .field("nsec", &"[REDACTED]")
+                .finish(),
+            other => write!(f, "{}", serde_json::to_string(other).unwrap_or_default()),
+        }
+    }
 }
 
 impl Request {

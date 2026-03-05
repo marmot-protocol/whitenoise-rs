@@ -435,6 +435,11 @@ async fn messages_subscribe<W>(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("message stream lagged by {n} messages");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} messages dropped")),
+                )
+                .await;
             }
         }
     }
@@ -493,6 +498,11 @@ where
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("chat list stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} updates dropped")),
+                )
+                .await;
             }
         }
     }
@@ -527,6 +537,11 @@ where
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!("notification stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} notifications dropped")),
+                )
+                .await;
             }
         }
     }
