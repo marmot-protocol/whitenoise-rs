@@ -17,7 +17,9 @@ impl Whitenoise {
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
         tracing::debug!(
           target: "whitenoise::event_handlers::handle_mls_message",
-          "Handling MLS message for account: {}",
+          "Handling MLS message {} (kind {}) for account: {}",
+          event.id.to_hex(),
+          event.kind.as_u16(),
           account.pubkey.to_hex()
         );
 
@@ -26,8 +28,18 @@ impl Whitenoise {
             Ok(result) => {
                 tracing::debug!(
                   target: "whitenoise::event_handlers::handle_mls_message",
-                  "Handled MLS message - Result: {:?}",
-                  result
+                  "MLS message {} processed - Result variant: {}",
+                  event.id.to_hex(),
+                  match &result {
+                      mdk_core::prelude::MessageProcessingResult::ApplicationMessage(_) => "ApplicationMessage",
+                      mdk_core::prelude::MessageProcessingResult::Commit { .. } => "Commit",
+                      mdk_core::prelude::MessageProcessingResult::Proposal(_) => "Proposal",
+                      mdk_core::prelude::MessageProcessingResult::PendingProposal { .. } => "PendingProposal",
+                      mdk_core::prelude::MessageProcessingResult::IgnoredProposal { .. } => "IgnoredProposal",
+                      mdk_core::prelude::MessageProcessingResult::ExternalJoinProposal { .. } => "ExternalJoinProposal",
+                      mdk_core::prelude::MessageProcessingResult::Unprocessable { .. } => "Unprocessable",
+                      mdk_core::prelude::MessageProcessingResult::PreviouslyFailed => "PreviouslyFailed",
+                  }
                 );
                 result
             }

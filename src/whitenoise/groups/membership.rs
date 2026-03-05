@@ -7,7 +7,7 @@ use crate::whitenoise::accounts_groups::AccountGroup;
 /// This struct combines an MLS group with its `AccountGroup` record (the join table
 /// between accounts and groups). The `AccountGroup` tracks account-specific state
 /// such as user confirmation status (pending, accepted, or declined).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GroupWithMembership {
     /// The MLS group data from MDK
     pub group: group_types::Group,

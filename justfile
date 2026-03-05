@@ -10,6 +10,21 @@ default:
 clear-dev-data:
     rm -rf ./dev/data/*
 
+# Run CLI end-to-end tests (requires local relays via docker compose)
+# Usage:
+#   just e2e-test                             # Run all E2E tests
+#   just e2e-test account_profile_and_export  # Run specific test
+e2e-test test="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{test}}" ]; then
+        echo "Running all CLI E2E tests..."
+        cargo test --features cli,integration-tests --test cli_e2e
+    else
+        echo "Running CLI E2E test: {{test}}"
+        cargo test --features cli,integration-tests --test cli_e2e "{{test}}"
+    fi
+
 # Run integration_test binary using the local relays and data dirs
 # Usage:
 #   just int-test                      # Run all integration tests
@@ -220,7 +235,7 @@ coverage_ignore := '(integration_tests/|bin/integration_test\.rs|bin/benchmark_t
 # Generate code coverage report (lcov format, matches CI flags)
 coverage:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --all-targets \
+    cargo llvm-cov --workspace --all-targets --features cli \
       --ignore-filename-regex '{{coverage_ignore}}' \
       --lcov --output-path lcov.info
     @echo "Coverage report: lcov.info"
@@ -228,7 +243,7 @@ coverage:
 # Generate HTML code coverage report (matches CI flags)
 coverage-html:
     cargo llvm-cov clean --workspace
-    cargo llvm-cov --workspace --all-targets \
+    cargo llvm-cov --workspace --all-targets --features cli \
       --ignore-filename-regex '{{coverage_ignore}}' \
       --html
     @echo "HTML report: target/llvm-cov/html/index.html"

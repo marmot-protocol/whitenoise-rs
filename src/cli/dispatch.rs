@@ -1,0 +1,1246 @@
+use std::collections::HashMap;
+
+use mdk_core::prelude::{GroupId, NostrGroupConfigData};
+use nostr_sdk::PublicKey;
+use tokio::io::AsyncWriteExt;
+
+use crate::Whitenoise;
+use crate::whitenoise::accounts_groups::AccountGroup;
+use crate::whitenoise::app_settings::{Language, ThemeMode};
+use crate::whitenoise::users::UserSyncMode;
+
+use super::protocol::{Request, Response};
+
+/// Route a request to the appropriate `Whitenoise` method and produce a response.
+pub async fn dispatch(req: Request) -> Response {
+    let wn = match Whitenoise::get_instance() {
+        Ok(wn) => wn,
+        Err(e) => return Response::err(format!("whitenoise not initialized: {e}")),
+    };
+
+    match req {
+        Request::Ping => Response::ok(serde_json::json!("pong")),
+
+        Request::CreateIdentity => match wn.create_identity().await {
+            Ok(account) => to_response(&account),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::LoginStart { nsec } => match wn.login_start(nsec).await {
+            Ok(result) => to_response(&result),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::LoginPublishDefaultRelays { pubkey } => match parse_pubkey(&pubkey) {
+            Ok(pk) => match wn.login_publish_default_relays(&pk).await {
+                Ok(result) => to_response(&result),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::LoginWithCustomRelay { pubkey, relay_url } => match parse_pubkey(&pubkey) {
+            Ok(pk) => match relay_url.parse::<nostr_sdk::RelayUrl>() {
+                Ok(url) => match wn.login_with_custom_relay(&pk, url).await {
+                    Ok(result) => to_response(&result),
+                    Err(e) => Response::err(e.to_string()),
+                },
+                Err(e) => Response::err(format!("invalid relay URL: {e}")),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::LoginCancel { pubkey } => match parse_pubkey(&pubkey) {
+            Ok(pk) => match wn.login_cancel(&pk).await {
+                Ok(()) => Response::ok(serde_json::json!(null)),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::Logout { pubkey } => match parse_pubkey(&pubkey) {
+            Ok(pk) => match wn.logout(&pk).await {
+                Ok(()) => Response::ok(serde_json::json!(null)),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::AllAccounts => match wn.all_accounts().await {
+            Ok(accounts) => to_response(&accounts),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::ExportNsec { pubkey } => match find_account(wn, &pubkey).await {
+            Ok(account) => match wn.export_account_nsec(&account).await {
+                Ok(nsec) => to_response(&nsec),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::VisibleGroups { account } => match find_account(wn, &account).await {
+            Ok(acct) => match wn.visible_groups(&acct).await {
+                Ok(groups) => to_response(&groups),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(resp) => resp,
+        },
+
+        Request::CreateGroup {
+            account,
+            name,
+            description,
+            members,
+        } => match create_group(wn, &account, name, description, members).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::AddMembers {
+            account,
+            group_id,
+            members,
+        } => match add_members(wn, &account, &group_id, members).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::GetGroup { account, group_id } => match get_group(wn, &account, &group_id).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::GroupMembers { account, group_id } => {
+            match group_pubkey_list(wn, &account, &group_id, false).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::GroupAdmins { account, group_id } => {
+            match group_pubkey_list(wn, &account, &group_id, true).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::RemoveMembers {
+            account,
+            group_id,
+            members,
+        } => match remove_members(wn, &account, &group_id, members).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::LeaveGroup { account, group_id } => {
+            match leave_group(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::RenameGroup {
+            account,
+            group_id,
+            name,
+        } => match rename_group(wn, &account, &group_id, name).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::GroupInvites { account } => match group_invites(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::AcceptInvite { account, group_id } => {
+            match respond_to_invite(wn, &account, &group_id, true).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::DeclineInvite { account, group_id } => {
+            match respond_to_invite(wn, &account, &group_id, false).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::ProfileShow { account } => match profile_show(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::ProfileUpdate {
+            account,
+            name,
+            display_name,
+            about,
+            picture,
+            nip05,
+            lud16,
+        } => {
+            match profile_update(
+                wn,
+                &account,
+                name,
+                display_name,
+                about,
+                picture,
+                nip05,
+                lud16,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsList { account } => match follows_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::FollowsAdd { account, pubkey } => {
+            match follows_mutate(wn, &account, &pubkey, FollowAction::Add).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsRemove { account, pubkey } => {
+            match follows_mutate(wn, &account, &pubkey, FollowAction::Remove).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::FollowsCheck { account, pubkey } => {
+            match follows_check(wn, &account, &pubkey).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::ChatsList { account } => match chats_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::SettingsShow => match wn.app_settings().await {
+            Ok(settings) => to_response(&settings),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::SettingsTheme { theme } => match settings_theme(wn, &theme).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::SettingsLanguage { language } => match settings_language(wn, &language).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::RelaysList { account } => match relays_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UsersShow { pubkey } => match users_show(wn, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::ListMessages { account, group_id } => {
+            match list_messages(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::SendMessage {
+            account,
+            group_id,
+            message,
+        } => match send_message(wn, &account, &group_id, message).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        // Streaming commands should be routed through dispatch_streaming
+        Request::MessagesSubscribe { .. }
+        | Request::ChatsSubscribe { .. }
+        | Request::NotificationsSubscribe
+        | Request::UsersSearch { .. } => {
+            Response::err("streaming commands must use dispatch_streaming")
+        }
+    }
+}
+
+/// Write a single response line to the writer. Returns false if the client disconnected.
+async fn write_response<W>(writer: &mut W, response: &Response) -> bool
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf = match serde_json::to_vec(response) {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::error!("failed to serialize response: {e}");
+            return false;
+        }
+    };
+    buf.push(b'\n');
+    writer.write_all(&buf).await.is_ok()
+}
+
+/// Write the `stream_end: true` sentinel that signals the end of a streaming response.
+async fn write_stream_end<W>(writer: &mut W)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let end = Response {
+        result: None,
+        error: None,
+        stream_end: true,
+    };
+    let _ = write_response(writer, &end).await;
+}
+
+/// Handle a streaming request by writing multiple response lines to the writer.
+///
+/// This function takes ownership of the writer and writes response lines until
+/// the stream ends or the client disconnects. The final line has `stream_end: true`.
+pub async fn dispatch_streaming<W>(req: Request, mut writer: W)
+where
+    W: AsyncWriteExt + Unpin + Send,
+{
+    let wn = match Whitenoise::get_instance() {
+        Ok(wn) => wn,
+        Err(e) => {
+            let _ = write_response(
+                &mut writer,
+                &Response::err(format!("whitenoise not initialized: {e}")),
+            )
+            .await;
+            write_stream_end(&mut writer).await;
+            return;
+        }
+    };
+
+    match req {
+        Request::MessagesSubscribe { account, group_id } => {
+            messages_subscribe(wn, &mut writer, &account, &group_id).await;
+        }
+        Request::ChatsSubscribe { account } => {
+            chats_subscribe(wn, &mut writer, &account).await;
+        }
+        Request::NotificationsSubscribe => {
+            notifications_subscribe(wn, &mut writer).await;
+        }
+        Request::UsersSearch {
+            account,
+            query,
+            radius_start,
+            radius_end,
+        } => {
+            users_search(wn, &mut writer, &account, &query, radius_start, radius_end).await;
+        }
+        _ => {
+            let _ = write_response(&mut writer, &Response::err("not a streaming command")).await;
+            write_stream_end(&mut writer).await;
+        }
+    }
+}
+
+async fn messages_subscribe<W>(
+    wn: &Whitenoise,
+    writer: &mut W,
+    account_str: &str,
+    group_id_hex: &str,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    // Validate account and group_id
+    let _account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+    let group_id = match parse_group_id(group_id_hex) {
+        Ok(id) => id,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    // Subscribe — gets initial snapshot + broadcast receiver
+    let subscription = match wn.subscribe_to_group_messages(&group_id).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    // Resolve display names for initial messages
+    let mut display_names = resolve_chat_display_names(wn, &subscription.initial_messages).await;
+
+    // Send initial messages in chronological order (oldest first, newest last)
+    for msg in &subscription.initial_messages {
+        if let Some(formatted) = format_chat_message(msg, &display_names) {
+            let resp = Response::ok(serde_json::json!({
+                "trigger": "InitialMessage",
+                "message": formatted,
+            }));
+            if !write_response(writer, &resp).await {
+                return; // Client disconnected
+            }
+        }
+    }
+
+    // Stream live updates
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                // Resolve display name for new authors on the fly
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    display_names.entry(update.message.author)
+                    && let Some(name) = resolve_display_name(wn, &update.message.author).await
+                {
+                    e.insert(name);
+                }
+
+                if let Some(formatted) = format_chat_message(&update.message, &display_names) {
+                    let resp = Response::ok(serde_json::json!({
+                        "trigger": update.trigger,
+                        "message": formatted,
+                    }));
+                    if !write_response(writer, &resp).await {
+                        return; // Client disconnected
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("message stream lagged by {n} messages");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} messages dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+async fn chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let subscription = match wn.subscribe_to_chat_list(&account).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    // Send initial items
+    for item in &subscription.initial_items {
+        let formatted = clean_chat_list_item(wn, item).await;
+        let resp = Response::ok(serde_json::json!({
+            "trigger": "InitialItem",
+            "item": formatted,
+        }));
+        if !write_response(writer, &resp).await {
+            return;
+        }
+    }
+
+    // Stream live updates
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let formatted = clean_chat_list_item(wn, &update.item).await;
+                let resp = Response::ok(serde_json::json!({
+                    "trigger": update.trigger,
+                    "item": formatted,
+                }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("chat list stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} updates dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+async fn notifications_subscribe<W>(wn: &Whitenoise, writer: &mut W)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let subscription = wn.subscribe_to_notifications();
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = Response::ok(serde_json::json!({
+                    "trigger": update.trigger,
+                    "mls_group_id": update.mls_group_id,
+                    "group_name": update.group_name,
+                    "is_dm": update.is_dm,
+                    "receiver": update.receiver,
+                    "sender": update.sender,
+                    "content": update.content,
+                    "timestamp": update.timestamp,
+                }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("notification stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} notifications dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+async fn users_search<W>(
+    wn: &Whitenoise,
+    writer: &mut W,
+    account_str: &str,
+    query: &str,
+    radius_start: u8,
+    radius_end: u8,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let params = crate::whitenoise::user_search::UserSearchParams {
+        query: query.to_string(),
+        searcher_pubkey: account.pubkey,
+        radius_start,
+        radius_end,
+    };
+
+    let subscription = match wn.search_users(params).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let resp = to_response(&update);
+                if !write_response(writer, &resp).await {
+                    return; // Client disconnected
+                }
+                // Stop after SearchCompleted
+                if matches!(
+                    update.trigger,
+                    crate::whitenoise::user_search::SearchUpdateTrigger::SearchCompleted { .. }
+                ) {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("user search stream lagged by {n} updates");
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
+}
+
+/// Clean a ChatListItem for output: strip redundant mls_group_id from last_message,
+/// and resolve missing author_display_name.
+async fn clean_chat_list_item(
+    wn: &Whitenoise,
+    item: &crate::whitenoise::chat_list::ChatListItem,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(item).unwrap_or_default();
+    if let Some(last_msg) = value.get_mut("last_message")
+        && let Some(obj) = last_msg.as_object_mut()
+    {
+        obj.remove("mls_group_id");
+
+        // Resolve author_display_name if missing
+        if obj.get("author_display_name").is_none_or(|v| v.is_null())
+            && let Some(author_hex) = obj.get("author").and_then(|v| v.as_str())
+            && let Ok(pk) = PublicKey::parse(author_hex)
+            && let Some(name) = resolve_display_name(wn, &pk).await
+        {
+            obj.insert(
+                "author_display_name".to_string(),
+                serde_json::Value::String(name),
+            );
+        }
+    }
+    value
+}
+
+fn parse_pubkey(s: &str) -> Result<PublicKey, Response> {
+    PublicKey::parse(s).map_err(|e| Response::err(format!("invalid pubkey '{s}': {e}")))
+}
+
+async fn find_account(
+    wn: &Whitenoise,
+    pubkey_str: &str,
+) -> Result<crate::whitenoise::accounts::Account, Response> {
+    let pk = parse_pubkey(pubkey_str)?;
+    let accounts = wn
+        .all_accounts()
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    accounts
+        .into_iter()
+        .find(|a| a.pubkey == pk)
+        .ok_or_else(|| Response::err(format!("account not found: {pubkey_str}")))
+}
+
+async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
+    let user = wn
+        .find_or_create_user_by_pubkey(pubkey, UserSyncMode::Blocking)
+        .await
+        .ok()?;
+    user.metadata
+        .display_name
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .or(user.metadata.name.as_ref().filter(|s| !s.is_empty()))
+        .cloned()
+}
+
+async fn create_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    name: String,
+    description: Option<String>,
+    member_strs: Vec<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+
+    let member_pubkeys: Vec<PublicKey> = member_strs
+        .iter()
+        .map(|s| parse_pubkey(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let relays = account
+        .inbox_relays(wn)
+        .await
+        .map_err(|e| Response::err(format!("failed to get relays: {e}")))?;
+    let relay_urls = relays.into_iter().map(|r| r.url).collect();
+
+    let config = NostrGroupConfigData::new(
+        name,
+        description.unwrap_or_default(),
+        None, // image_hash
+        None, // image_key
+        None, // image_nonce
+        relay_urls,
+        vec![account.pubkey], // admins — creator only
+    );
+
+    let group = wn
+        .create_group(&account, member_pubkeys, config, None)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&group))
+}
+
+async fn add_members(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    member_strs: Vec<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let members: Vec<PublicKey> = member_strs
+        .iter()
+        .map(|s| parse_pubkey(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    wn.add_members_to_group(&account, &group_id, members)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn get_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let group = wn
+        .group(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(to_response(&group))
+}
+
+async fn group_pubkey_list(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    admins_only: bool,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let pubkeys = if admins_only {
+        wn.group_admins(&account, &group_id).await
+    } else {
+        wn.group_members(&account, &group_id).await
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut members = Vec::with_capacity(pubkeys.len());
+    for pk in &pubkeys {
+        let display_name = resolve_display_name(wn, pk).await;
+        members.push(serde_json::json!({
+            "pubkey": pk.to_hex(),
+            "display_name": display_name,
+        }));
+    }
+    Ok(to_response(&members))
+}
+
+async fn remove_members(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    member_strs: Vec<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let members: Vec<PublicKey> = member_strs
+        .iter()
+        .map(|s| parse_pubkey(s))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    wn.remove_members_from_group(&account, &group_id, members)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn leave_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.leave_group(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn rename_group(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    name: String,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let update = mdk_core::prelude::NostrGroupDataUpdate::new().name(name);
+    wn.update_group_data(&account, &group_id, update)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let groups = wn
+        .visible_groups(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let pending: Vec<_> = groups.into_iter().filter(|g| g.is_pending()).collect();
+
+    Ok(to_response(&pending))
+}
+
+async fn respond_to_invite(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    accept: bool,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let ag = AccountGroup::get(wn, &account.pubkey, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .ok_or_else(|| Response::err("group not found for this account"))?;
+
+    if accept {
+        ag.accept(wn).await
+    } else {
+        ag.decline(wn).await
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let metadata = account
+        .metadata(wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(to_response(&metadata))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn profile_update(
+    wn: &Whitenoise,
+    account_str: &str,
+    name: Option<String>,
+    display_name: Option<String>,
+    about: Option<String>,
+    picture: Option<String>,
+    nip05: Option<String>,
+    lud16: Option<String>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+
+    // Read-modify-write: start from current metadata, apply provided fields
+    let mut metadata = account
+        .metadata(wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    if let Some(v) = name {
+        metadata.name = Some(v);
+    }
+    if let Some(v) = display_name {
+        metadata.display_name = Some(v);
+    }
+    if let Some(v) = about {
+        metadata.about = Some(v);
+    }
+    if let Some(v) = picture {
+        metadata.picture = Some(
+            v.parse()
+                .map_err(|e| Response::err(format!("invalid picture URL: {e}")))?,
+        );
+    }
+    if let Some(v) = nip05 {
+        metadata.nip05 = Some(v);
+    }
+    if let Some(v) = lud16 {
+        metadata.lud16 = Some(v);
+    }
+
+    account
+        .update_metadata(&metadata, wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&metadata))
+}
+
+async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let users = wn
+        .follows(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut entries = Vec::with_capacity(users.len());
+    for user in &users {
+        let display_name = resolve_display_name(wn, &user.pubkey).await;
+        entries.push(serde_json::json!({
+            "pubkey": user.pubkey.to_hex(),
+            "display_name": display_name,
+        }));
+    }
+    Ok(to_response(&entries))
+}
+
+enum FollowAction {
+    Add,
+    Remove,
+}
+
+async fn follows_mutate(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+    action: FollowAction,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    match action {
+        FollowAction::Add => wn.follow_user(&account, &pubkey).await,
+        FollowAction::Remove => wn.unfollow_user(&account, &pubkey).await,
+    }
+    .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn follows_check(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    let following = wn
+        .is_following_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!({ "following": following })))
+}
+
+async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let items = wn
+        .get_chat_list(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut clean = Vec::with_capacity(items.len());
+    for item in &items {
+        clean.push(clean_chat_list_item(wn, item).await);
+    }
+    Ok(to_response(&clean))
+}
+
+async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
+    let theme: ThemeMode = theme_str.parse().map_err(|e: String| Response::err(e))?;
+    wn.update_theme_mode(theme)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
+    let language: Language = lang_str.parse().map_err(|e: String| Response::err(e))?;
+    wn.update_language(language)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn relays_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let statuses = wn
+        .get_account_relay_statuses(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let relays: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|(url, status)| {
+            serde_json::json!({
+                "url": url.to_string(),
+                "status": format!("{status}"),
+            })
+        })
+        .collect();
+
+    Ok(to_response(&relays))
+}
+
+async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
+    let pk = parse_pubkey(pubkey_str)?;
+    let user = wn
+        .find_or_create_user_by_pubkey(&pk, UserSyncMode::Blocking)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(to_response(&user))
+}
+
+/// Collect unique pubkeys from a slice of ChatMessages (authors + reaction users)
+/// and resolve their display names.
+async fn resolve_chat_display_names(
+    wn: &Whitenoise,
+    messages: &[crate::whitenoise::message_aggregator::ChatMessage],
+) -> HashMap<PublicKey, String> {
+    let unique_pubkeys: Vec<PublicKey> = {
+        let mut seen = std::collections::HashSet::new();
+        for m in messages {
+            seen.insert(m.author);
+            for reaction in m.reactions.by_emoji.values() {
+                for pk in &reaction.users {
+                    seen.insert(*pk);
+                }
+            }
+        }
+        seen.into_iter().collect()
+    };
+    let mut display_names: HashMap<PublicKey, String> = HashMap::new();
+    for pk in &unique_pubkeys {
+        if let Some(name) = resolve_display_name(wn, pk).await {
+            display_names.insert(*pk, name);
+        }
+    }
+    display_names
+}
+
+/// Format a single ChatMessage into a JSON value with display names and local timestamps.
+/// Skipped if the message is deleted (returns None).
+fn format_chat_message(
+    m: &crate::whitenoise::message_aggregator::ChatMessage,
+    display_names: &HashMap<PublicKey, String>,
+) -> Option<serde_json::Value> {
+    if m.is_deleted {
+        return None;
+    }
+
+    let display_name = display_names
+        .get(&m.author)
+        .cloned()
+        .unwrap_or_else(|| m.author.to_string());
+
+    let created_at_local = chrono::DateTime::from_timestamp(m.created_at.as_secs() as i64, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| m.created_at.to_string());
+
+    let mut msg = serde_json::json!({
+        "id": m.id,
+        "author": m.author.to_hex(),
+        "display_name": display_name,
+        "content": m.content,
+        "created_at": m.created_at.as_secs(),
+        "created_at_local": created_at_local,
+        "kind": m.kind,
+        "reply_to": m.reply_to_id,
+        "is_reply": m.is_reply,
+        "media_attachments": m.media_attachments,
+    });
+
+    // Only include reactions when non-empty
+    if !m.reactions.by_emoji.is_empty() || !m.reactions.user_reactions.is_empty() {
+        let by_emoji: serde_json::Map<String, serde_json::Value> = m
+            .reactions
+            .by_emoji
+            .iter()
+            .map(|(emoji, reaction)| {
+                let user_names: Vec<String> = reaction
+                    .users
+                    .iter()
+                    .map(|pk| {
+                        display_names
+                            .get(pk)
+                            .cloned()
+                            .unwrap_or_else(|| pk.to_hex())
+                    })
+                    .collect();
+                (
+                    emoji.clone(),
+                    serde_json::json!({
+                        "emoji": reaction.emoji,
+                        "count": reaction.count,
+                        "users": user_names,
+                    }),
+                )
+            })
+            .collect();
+
+        let mut reactions = serde_json::to_value(&m.reactions).unwrap_or_default();
+        reactions["by_emoji"] = serde_json::Value::Object(by_emoji);
+        msg["reactions"] = reactions;
+    }
+
+    Some(msg)
+}
+
+async fn list_messages(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let messages = wn
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let display_names = resolve_chat_display_names(wn, &messages).await;
+
+    let clean: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|m| format_chat_message(m, &display_names))
+        .collect();
+
+    Ok(to_response(&clean))
+}
+
+async fn send_message(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    message: String,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let result = wn
+        .send_message_to_group(&account, &group_id, message, 9, None)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&result))
+}
+
+fn parse_group_id(s: &str) -> Result<GroupId, Response> {
+    let bytes =
+        hex::decode(s).map_err(|e| Response::err(format!("invalid group ID '{s}': {e}")))?;
+    if bytes.is_empty() {
+        return Err(Response::err("invalid group ID: empty"));
+    }
+    Ok(GroupId::from_slice(&bytes))
+}
+
+fn to_response<T: serde::Serialize>(value: &T) -> Response {
+    match serde_json::to_value(value) {
+        Ok(v) => Response::ok(v),
+        Err(e) => Response::err(format!("serialization error: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::ToBech32;
+
+    use super::*;
+
+    // --- parse_pubkey ---
+
+    #[test]
+    fn parse_pubkey_valid_hex() {
+        let hex = "4dd7a05f5f668589d5d3025a30e3a2603f2d4fe7fb9d0e2b33914b765e9d6f69";
+        assert!(parse_pubkey(hex).is_ok());
+    }
+
+    #[test]
+    fn parse_pubkey_valid_npub() {
+        let hex = "4dd7a05f5f668589d5d3025a30e3a2603f2d4fe7fb9d0e2b33914b765e9d6f69";
+        let pk = PublicKey::from_hex(hex).unwrap();
+        let npub = pk.to_bech32().unwrap();
+        assert!(parse_pubkey(&npub).is_ok());
+    }
+
+    #[test]
+    fn parse_pubkey_invalid() {
+        let err = parse_pubkey("not-a-pubkey").unwrap_err();
+        assert!(err.error.unwrap().message.contains("not-a-pubkey"));
+    }
+
+    // --- parse_group_id ---
+
+    #[test]
+    fn parse_group_id_valid_hex() {
+        let gid = parse_group_id("abcd1234").unwrap();
+        assert_eq!(gid.as_slice(), &[0xab, 0xcd, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn parse_group_id_empty_string() {
+        let err = parse_group_id("").unwrap_err();
+        assert!(err.error.unwrap().message.contains("empty"));
+    }
+
+    #[test]
+    fn parse_group_id_invalid_hex() {
+        let err = parse_group_id("zzzz").unwrap_err();
+        assert!(err.error.unwrap().message.contains("invalid group ID"));
+    }
+
+    #[test]
+    fn parse_group_id_odd_length() {
+        let err = parse_group_id("abc").unwrap_err();
+        assert!(err.error.is_some());
+    }
+
+    // --- to_response ---
+
+    #[test]
+    fn to_response_serializable_value() {
+        let resp = to_response(&serde_json::json!({"key": "value"}));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn to_response_string() {
+        let resp = to_response(&"hello");
+        assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
+    }
+}
