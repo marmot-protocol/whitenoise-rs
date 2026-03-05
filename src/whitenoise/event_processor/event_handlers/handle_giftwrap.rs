@@ -262,7 +262,7 @@ impl Whitenoise {
         };
 
         // --- Step 1: subscription setup (must happen before catch-up and self-update) ---
-        let subscription_ok = match Self::setup_group_subscriptions(whitenoise, account, signer)
+        let _subscription_ok = match Self::setup_group_subscriptions(whitenoise, account, signer)
             .await
         {
             Ok(()) => {
@@ -348,17 +348,18 @@ impl Whitenoise {
         // the epoch before we can receive any resulting commits from peers.
         // Any missed self-update will be retried by the scheduled
         // key-package maintenance task.
-        if subscription_ok
-            && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
-        {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                account = %account.pubkey.to_hex(),
-                group = %hex::encode(group_id.as_slice()),
-                error = %e,
-                "Failed to perform post-welcome self-update"
-            );
-        }
+        // Temporarily disabled for now: skip post-welcome self-update.
+        // if subscription_ok
+        //     && let Err(e) = Self::perform_self_update(whitenoise, account, group_id).await
+        // {
+        //     tracing::error!(
+        //         target: "whitenoise::event_processor::process_welcome::background",
+        //         account = %account.pubkey.to_hex(),
+        //         group = %hex::encode(group_id.as_slice()),
+        //         error = %e,
+        //         "Failed to perform post-welcome self-update"
+        //     );
+        // }
 
         tracing::debug!(
             target: "whitenoise::event_processor::process_welcome::background",
@@ -506,6 +507,7 @@ impl Whitenoise {
     /// advance local state after confirming the relay accepted the event.
     /// If all publish attempts fail, the pending commit is never merged and
     /// the group state remains unchanged.
+    #[allow(dead_code)]
     async fn perform_self_update(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -941,7 +943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_self_update_after_welcome_advances_epoch() {
+    async fn test_self_update_after_welcome_disabled_does_not_advance_epoch() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Create creator and one member account
@@ -978,17 +980,15 @@ mod tests {
         )
         .await;
 
-        // Re-read the group and verify epoch advanced
+        // Re-read the group and verify epoch does not advance while self-update is disabled
         let mdk = whitenoise
             .create_mdk_for_account(member_account.pubkey)
             .unwrap();
         let updated_group = mdk.get_group(&group_id).unwrap().expect("group must exist");
         assert_eq!(
-            updated_group.epoch,
-            epoch_after_welcome + 1,
-            "Epoch should advance by 1 after self-update (was {}, now {})",
-            epoch_after_welcome,
-            updated_group.epoch
+            updated_group.epoch, epoch_after_welcome,
+            "Epoch should remain unchanged while self-update is disabled (was {}, now {})",
+            epoch_after_welcome, updated_group.epoch
         );
     }
 
