@@ -146,6 +146,20 @@ pub enum Request {
         account: String,
         group_id: String,
         message: String,
+        #[serde(default)]
+        reply_to: Option<String>,
+    },
+    #[serde(rename = "delete_message")]
+    DeleteMessage {
+        account: String,
+        group_id: String,
+        message_id: String,
+    },
+    #[serde(rename = "retry_message")]
+    RetryMessage {
+        account: String,
+        group_id: String,
+        event_id: String,
     },
     #[serde(rename = "react_to_message")]
     ReactToMessage {
@@ -426,13 +440,14 @@ mod tests {
             account: "npub1abc".into(),
             group_id: "abcd1234".into(),
             message: "Hello world".into(),
+            reply_to: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::SendMessage { account, group_id, message }
-            if account == "npub1abc" && group_id == "abcd1234" && message == "Hello world"
+            Request::SendMessage { account, group_id, message, reply_to }
+            if account == "npub1abc" && group_id == "abcd1234" && message == "Hello world" && reply_to.is_none()
         ));
     }
 
@@ -864,6 +879,76 @@ mod tests {
             if account == "npub1abc"
                 && group_id == "abcd1234"
                 && message_id == "eventid123"
+        ));
+    }
+
+    #[test]
+    fn delete_message_roundtrip() {
+        let req = Request::DeleteMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            message_id: "eventid123".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DeleteMessage { account, group_id, message_id }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message_id == "eventid123"
+        ));
+    }
+
+    #[test]
+    fn retry_message_roundtrip() {
+        let req = Request::RetryMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            event_id: "eventid123".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RetryMessage { account, group_id, event_id }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && event_id == "eventid123"
+        ));
+    }
+
+    #[test]
+    fn send_message_with_reply_to_roundtrip() {
+        let req = Request::SendMessage {
+            account: "npub1abc".into(),
+            group_id: "abcd1234".into(),
+            message: "Hello".into(),
+            reply_to: Some("eventid456".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SendMessage { account, group_id, message, reply_to }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message == "Hello"
+                && reply_to.as_deref() == Some("eventid456")
+        ));
+    }
+
+    #[test]
+    fn send_message_without_reply_to_roundtrip() {
+        let wire = r#"{"method":"send_message","params":{"account":"npub1abc","group_id":"abcd1234","message":"Hi"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SendMessage { account, group_id, message, reply_to }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && message == "Hi"
+                && reply_to.is_none()
         ));
     }
 

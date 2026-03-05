@@ -22,6 +22,28 @@ pub enum MessagesCmd {
 
         /// Message text
         message: String,
+
+        /// Reply to a specific message (event ID)
+        #[arg(long)]
+        reply_to: Option<String>,
+    },
+
+    /// Delete a message
+    Delete {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Message event ID to delete
+        message_id: String,
+    },
+
+    /// Retry sending a failed message
+    Retry {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Event ID of the failed message
+        event_id: String,
     },
 
     /// Subscribe to live messages in a group
@@ -62,9 +84,11 @@ impl MessagesCmd {
     ) -> anyhow::Result<()> {
         match self {
             Self::List { group_id } => list(socket, json, account_flag, group_id).await,
-            Self::Send { group_id, message } => {
-                send(socket, json, account_flag, group_id, message).await
-            }
+            Self::Send {
+                group_id,
+                message,
+                reply_to,
+            } => send(socket, json, account_flag, group_id, message, reply_to).await,
             Self::Subscribe { group_id } => subscribe(socket, json, account_flag, group_id).await,
             Self::React {
                 group_id,
@@ -75,6 +99,13 @@ impl MessagesCmd {
                 group_id,
                 message_id,
             } => unreact(socket, json, account_flag, group_id, message_id).await,
+            Self::Delete {
+                group_id,
+                message_id,
+            } => delete(socket, json, account_flag, group_id, message_id).await,
+            Self::Retry { group_id, event_id } => {
+                retry(socket, json, account_flag, group_id, event_id).await
+            }
         }
     }
 }
@@ -129,6 +160,7 @@ async fn send(
     account_flag: Option<&str>,
     group_id: String,
     message: String,
+    reply_to: Option<String>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
@@ -137,6 +169,47 @@ async fn send(
             account: pubkey,
             group_id,
             message,
+            reply_to,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn delete(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    message_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::DeleteMessage {
+            account: pubkey,
+            group_id,
+            message_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn retry(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    event_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::RetryMessage {
+            account: pubkey,
+            group_id,
+            event_id,
         },
     )
     .await?;

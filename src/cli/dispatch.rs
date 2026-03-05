@@ -267,7 +267,26 @@ pub async fn dispatch(req: Request) -> Response {
             account,
             group_id,
             message,
-        } => match send_message(wn, &account, &group_id, message).await {
+            reply_to,
+        } => match send_message(wn, &account, &group_id, message, reply_to).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::DeleteMessage {
+            account,
+            group_id,
+            message_id,
+        } => match delete_message(wn, &account, &group_id, &message_id).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::RetryMessage {
+            account,
+            group_id,
+            event_id,
+        } => match retry_message(wn, &account, &group_id, &event_id).await {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1166,16 +1185,64 @@ async fn send_message(
     account_str: &str,
     group_id_hex: &str,
     message: String,
+    reply_to: Option<String>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
+    let tags = match reply_to {
+        Some(ref id) => {
+            let tag = nostr_sdk::Tag::parse(["e", id])
+                .map_err(|e| Response::err(format!("invalid reply-to message ID: {e}")))?;
+            Some(vec![tag])
+        }
+        None => None,
+    };
+
     let result = wn
-        .send_message_to_group(&account, &group_id, message, 9, None)
+        .send_message_to_group(&account, &group_id, message, 9, tags)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(to_response(&result))
+}
+
+async fn delete_message(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    message_id: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let tag = nostr_sdk::Tag::parse(["e", message_id])
+        .map_err(|e| Response::err(format!("invalid message ID: {e}")))?;
+
+    let result = wn
+        .send_message_to_group(&account, &group_id, String::new(), 5, Some(vec![tag]))
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&result))
+}
+
+async fn retry_message(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    event_id_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let event_id = nostr_sdk::EventId::from_hex(event_id_str)
+        .map_err(|e| Response::err(format!("invalid event ID '{event_id_str}': {e}")))?;
+
+    wn.retry_message_publish(&account, &group_id, &event_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
 }
 
 async fn react_to_message(
@@ -1208,6 +1275,11 @@ async fn unreact_to_message(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
+    // Normalize to canonical lowercase hex for comparison against ChatMessage.id
+    let canonical_id = nostr_sdk::EventId::from_hex(message_id)
+        .map_err(|e| Response::err(format!("invalid message ID '{message_id}': {e}")))?
+        .to_hex();
+
     // Find the user's reaction event ID on this message
     let messages = wn
         .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
@@ -1216,7 +1288,7 @@ async fn unreact_to_message(
 
     let target_msg = messages
         .iter()
-        .find(|m| m.id == message_id)
+        .find(|m| m.id == canonical_id)
         .ok_or_else(|| Response::err(format!("message not found: {message_id}")))?;
 
     let user_reaction = target_msg
