@@ -1,6 +1,6 @@
 [package]
 name = "whitenoise"
-version = "0.2.0"
+version = "0.2.1"
 description = "A secure messenger built on MLS and Nostr"
 authors = ["White Noise Authors"]
 edition = "2024"

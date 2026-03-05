@@ -37,7 +37,10 @@ impl Scenario for BasicMessagingScenario {
             .await?;
 
         // Post-welcome self-update is temporarily disabled in production flow,
-        // so skip epoch advancement verification until self-update is re-enabled.
+        // so keep this check commented out until self-update is re-enabled.
+        // VerifySelfUpdateTestCase::for_account("basic_msg_member", "basic_messaging_test_group")
+        //     .execute(&mut self.context)
+        //     .await?;
 
         SendMessageTestCase::basic()
             .with_sender("basic_msg_creator")
