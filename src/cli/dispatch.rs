@@ -310,6 +310,29 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::UploadMedia {
+            account,
+            group_id,
+            file_path,
+        } => match upload_media(wn, &account, &group_id, &file_path).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::DownloadMedia {
+            account,
+            group_id,
+            file_hash,
+        } => match download_media(wn, &account, &group_id, &file_hash).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::ListMedia { group_id } => match list_media(wn, &group_id).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         // Streaming commands should be routed through dispatch_streaming
         Request::MessagesSubscribe { .. }
         | Request::ChatsSubscribe { .. }
@@ -1308,6 +1331,58 @@ async fn unreact_to_message(
         .map_err(|e| Response::err(e.to_string()))?;
 
     Ok(to_response(&result))
+}
+
+async fn upload_media(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    file_path: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let media_file = wn
+        .upload_chat_media(&account, &group_id, file_path, None, None)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&media_file))
+}
+
+async fn download_media(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    file_hash_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let hash_bytes: [u8; 32] = hex::decode(file_hash_hex)
+        .map_err(|e| Response::err(format!("invalid file hash: {e}")))?
+        .try_into()
+        .map_err(|v: Vec<u8>| {
+            Response::err(format!("file hash must be 32 bytes (got {})", v.len()))
+        })?;
+
+    let media_file = wn
+        .download_chat_media(&account, &group_id, &hash_bytes)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&media_file))
+}
+
+async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let files = wn
+        .get_media_files_for_group(&group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&files))
 }
 
 fn parse_group_id(s: &str) -> Result<GroupId, Response> {

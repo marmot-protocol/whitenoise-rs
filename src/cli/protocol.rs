@@ -176,6 +176,22 @@ pub enum Request {
         message_id: String,
     },
 
+    // Media
+    #[serde(rename = "upload_media")]
+    UploadMedia {
+        account: String,
+        group_id: String,
+        file_path: String,
+    },
+    #[serde(rename = "download_media")]
+    DownloadMedia {
+        account: String,
+        group_id: String,
+        file_hash: String,
+    },
+    #[serde(rename = "list_media")]
+    ListMedia { group_id: String },
+
     // Streaming
     #[serde(rename = "messages_subscribe")]
     MessagesSubscribe { account: String, group_id: String },
@@ -290,7 +306,7 @@ mod tests {
     #[test]
     fn login_start_roundtrip() {
         let req = Request::LoginStart {
-            nsec: "nsec1abc".into(),
+            nsec: "nsec1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -300,8 +316,8 @@ mod tests {
     #[test]
     fn login_with_custom_relay_roundtrip() {
         let req = Request::LoginWithCustomRelay {
-            pubkey: "npub1xyz".into(),
-            relay_url: "wss://relay.example.com".into(),
+            pubkey: "npub1xyz".to_string(),
+            relay_url: "wss://relay.example.com".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -324,7 +340,7 @@ mod tests {
     #[test]
     fn logout_roundtrip() {
         let req = Request::Logout {
-            pubkey: "npub1abc".into(),
+            pubkey: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -334,7 +350,7 @@ mod tests {
     #[test]
     fn export_nsec_roundtrip() {
         let req = Request::ExportNsec {
-            pubkey: "npub1abc".into(),
+            pubkey: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -344,7 +360,7 @@ mod tests {
     #[test]
     fn visible_groups_roundtrip() {
         let req = Request::VisibleGroups {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -354,10 +370,10 @@ mod tests {
     #[test]
     fn create_group_roundtrip() {
         let req = Request::CreateGroup {
-            account: "npub1abc".into(),
-            name: "My Group".into(),
-            description: Some("A test group".into()),
-            members: vec!["npub1x".into(), "npub1y".into()],
+            account: "npub1abc".to_string(),
+            name: "My Group".to_string(),
+            description: Some("A test group".to_string()),
+            members: vec!["npub1x".to_string(), "npub1y".to_string()],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -389,9 +405,9 @@ mod tests {
     #[test]
     fn add_members_roundtrip() {
         let req = Request::AddMembers {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            members: vec!["npub1x".into()],
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            members: vec!["npub1x".to_string()],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -407,8 +423,8 @@ mod tests {
     #[test]
     fn get_group_roundtrip() {
         let req = Request::GetGroup {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -422,8 +438,8 @@ mod tests {
     #[test]
     fn list_messages_roundtrip() {
         let req = Request::ListMessages {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -437,9 +453,9 @@ mod tests {
     #[test]
     fn send_message_roundtrip() {
         let req = Request::SendMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            message: "Hello world".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            message: "Hello world".to_string(),
             reply_to: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -454,8 +470,8 @@ mod tests {
     #[test]
     fn group_members_roundtrip() {
         let req = Request::GroupMembers {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -469,8 +485,8 @@ mod tests {
     #[test]
     fn group_admins_roundtrip() {
         let req = Request::GroupAdmins {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -484,9 +500,9 @@ mod tests {
     #[test]
     fn remove_members_roundtrip() {
         let req = Request::RemoveMembers {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            members: vec!["npub1x".into()],
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            members: vec!["npub1x".to_string()],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -500,8 +516,8 @@ mod tests {
     #[test]
     fn leave_group_roundtrip() {
         let req = Request::LeaveGroup {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -515,9 +531,9 @@ mod tests {
     #[test]
     fn rename_group_roundtrip() {
         let req = Request::RenameGroup {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            name: "New Name".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            name: "New Name".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -557,7 +573,7 @@ mod tests {
     #[test]
     fn group_invites_roundtrip() {
         let req = Request::GroupInvites {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -567,8 +583,8 @@ mod tests {
     #[test]
     fn accept_invite_roundtrip() {
         let req = Request::AcceptInvite {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -582,8 +598,8 @@ mod tests {
     #[test]
     fn decline_invite_roundtrip() {
         let req = Request::DeclineInvite {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -597,7 +613,7 @@ mod tests {
     #[test]
     fn profile_show_roundtrip() {
         let req = Request::ProfileShow {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -607,12 +623,12 @@ mod tests {
     #[test]
     fn profile_update_roundtrip() {
         let req = Request::ProfileUpdate {
-            account: "npub1abc".into(),
-            name: Some("alice".into()),
-            display_name: Some("Alice".into()),
+            account: "npub1abc".to_string(),
+            name: Some("alice".to_string()),
+            display_name: Some("Alice".to_string()),
             about: None,
             picture: None,
-            nip05: Some("alice@example.com".into()),
+            nip05: Some("alice@example.com".to_string()),
             lud16: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -648,7 +664,7 @@ mod tests {
     #[test]
     fn follows_list_roundtrip() {
         let req = Request::FollowsList {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -658,8 +674,8 @@ mod tests {
     #[test]
     fn follows_add_roundtrip() {
         let req = Request::FollowsAdd {
-            account: "npub1abc".into(),
-            pubkey: "npub1xyz".into(),
+            account: "npub1abc".to_string(),
+            pubkey: "npub1xyz".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -673,8 +689,8 @@ mod tests {
     #[test]
     fn follows_remove_roundtrip() {
         let req = Request::FollowsRemove {
-            account: "npub1abc".into(),
-            pubkey: "npub1xyz".into(),
+            account: "npub1abc".to_string(),
+            pubkey: "npub1xyz".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -688,8 +704,8 @@ mod tests {
     #[test]
     fn follows_check_roundtrip() {
         let req = Request::FollowsCheck {
-            account: "npub1abc".into(),
-            pubkey: "npub1xyz".into(),
+            account: "npub1abc".to_string(),
+            pubkey: "npub1xyz".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -703,7 +719,7 @@ mod tests {
     #[test]
     fn chats_list_roundtrip() {
         let req = Request::ChatsList {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -722,7 +738,7 @@ mod tests {
     #[test]
     fn settings_theme_roundtrip() {
         let req = Request::SettingsTheme {
-            theme: "dark".into(),
+            theme: "dark".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -732,7 +748,7 @@ mod tests {
     #[test]
     fn settings_language_roundtrip() {
         let req = Request::SettingsLanguage {
-            language: "en".into(),
+            language: "en".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -742,7 +758,7 @@ mod tests {
     #[test]
     fn relays_list_roundtrip() {
         let req = Request::RelaysList {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -752,7 +768,7 @@ mod tests {
     #[test]
     fn users_show_roundtrip() {
         let req = Request::UsersShow {
-            pubkey: "npub1abc".into(),
+            pubkey: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -762,8 +778,8 @@ mod tests {
     #[test]
     fn users_search_roundtrip() {
         let req = Request::UsersSearch {
-            account: "npub1abc".into(),
-            query: "alice".into(),
+            account: "npub1abc".to_string(),
+            query: "alice".to_string(),
             radius_start: 0,
             radius_end: 3,
         };
@@ -797,8 +813,8 @@ mod tests {
     #[test]
     fn users_search_is_streaming() {
         let req = Request::UsersSearch {
-            account: "npub1abc".into(),
-            query: "test".into(),
+            account: "npub1abc".to_string(),
+            query: "test".to_string(),
             radius_start: 0,
             radius_end: 2,
         };
@@ -808,7 +824,7 @@ mod tests {
     #[test]
     fn chats_subscribe_roundtrip() {
         let req = Request::ChatsSubscribe {
-            account: "npub1abc".into(),
+            account: "npub1abc".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -818,8 +834,8 @@ mod tests {
     #[test]
     fn messages_subscribe_roundtrip() {
         let req = Request::MessagesSubscribe {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -885,9 +901,9 @@ mod tests {
     #[test]
     fn delete_message_roundtrip() {
         let req = Request::DeleteMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            message_id: "eventid123".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            message_id: "eventid123".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -903,9 +919,9 @@ mod tests {
     #[test]
     fn retry_message_roundtrip() {
         let req = Request::RetryMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            event_id: "eventid123".into(),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            event_id: "eventid123".to_string(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -921,10 +937,10 @@ mod tests {
     #[test]
     fn send_message_with_reply_to_roundtrip() {
         let req = Request::SendMessage {
-            account: "npub1abc".into(),
-            group_id: "abcd1234".into(),
-            message: "Hello".into(),
-            reply_to: Some("eventid456".into()),
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            message: "Hello".to_string(),
+            reply_to: Some("eventid456".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
@@ -949,6 +965,56 @@ mod tests {
                 && group_id == "abcd1234"
                 && message == "Hi"
                 && reply_to.is_none()
+        ));
+    }
+
+    #[test]
+    fn upload_media_roundtrip() {
+        let req = Request::UploadMedia {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            file_path: "/tmp/image.png".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UploadMedia { account, group_id, file_path }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && file_path == "/tmp/image.png"
+        ));
+    }
+
+    #[test]
+    fn download_media_roundtrip() {
+        let req = Request::DownloadMedia {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            file_hash: "abcdef1234567890".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DownloadMedia { account, group_id, file_hash }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && file_hash == "abcdef1234567890"
+        ));
+    }
+
+    #[test]
+    fn list_media_roundtrip() {
+        let req = Request::ListMedia {
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ListMedia { group_id }
+            if group_id == "abcd1234"
         ));
     }
 
