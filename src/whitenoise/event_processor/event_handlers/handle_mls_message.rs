@@ -287,10 +287,20 @@ impl Whitenoise {
     ) -> Result<ChatMessage> {
         let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
 
-        let chat_message = self
+        let mut chat_message = self
             .message_aggregator
             .process_single_message(message, &self.nostr, media_files)
             .await?;
+
+        // Preserve existing delivery status for relay echoes of locally-sent messages.
+        // This keeps stream payloads aligned with the latest DB state instead of
+        // regressing to `None` on reprocessing.
+        if let Some(existing_message) =
+            AggregatedMessage::find_by_id(&chat_message.id, group_id, &self.database).await?
+            && existing_message.delivery_status.is_some()
+        {
+            chat_message.delivery_status = existing_message.delivery_status;
+        }
 
         AggregatedMessage::insert_message(&chat_message, group_id, &self.database).await?;
 
@@ -645,7 +655,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::whitenoise::{aggregated_message::AggregatedMessage, relays::Relay, test_utils::*};
+    use crate::whitenoise::{
+        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus, relays::Relay,
+        test_utils::*,
+    };
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
     #[tokio::test]
@@ -747,6 +760,80 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(cached_msg.is_deleted, "Message should be marked as deleted");
+    }
+
+    #[tokio::test]
+    async fn test_cache_chat_message_preserves_existing_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator_account,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator_account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(creator_account.pubkey)
+            .unwrap();
+
+        let mut inner = UnsignedEvent::new(
+            creator_account.pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "Echo status preservation".to_string(),
+        );
+        inner.ensure_id();
+        let message_id = inner.id.unwrap();
+        mdk.create_message(&group.mls_group_id, inner).unwrap();
+
+        let message = mdk
+            .get_message(&group.mls_group_id, &message_id)
+            .unwrap()
+            .expect("message should exist in mdk");
+
+        // Initial cache pass creates the row without delivery status.
+        let first = whitenoise
+            .cache_chat_message(&group.mls_group_id, &message)
+            .await
+            .unwrap();
+        assert_eq!(first.delivery_status, None);
+
+        // Simulate background publish completion updating delivery status.
+        AggregatedMessage::update_delivery_status(
+            &message_id.to_string(),
+            &group.mls_group_id,
+            &DeliveryStatus::Sent(1),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Relay echo reprocess should preserve the existing status.
+        let second = whitenoise
+            .cache_chat_message(&group.mls_group_id, &message)
+            .await
+            .unwrap();
+        assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
+
+        let persisted = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted.delivery_status, Some(DeliveryStatus::Sent(1)));
     }
 
     /// Test error handling for invalid MLS messages
