@@ -489,8 +489,8 @@ impl Whitenoise {
     /// The original message is marked as `Retried` so it's excluded from future
     /// UI snapshots. The new message follows the normal `NewMessage` flow.
     ///
-    /// Flutter removes the failed message from the UI immediately on retry tap,
-    /// so no server-side emit is needed for that.
+    /// Also emits `DeliveryStatusChanged` for the original message when it moves
+    /// to `Retried`, so subscribers can update immediately without a reload.
     pub async fn retry_message_publish(
         &self,
         account: &Account,
@@ -542,7 +542,7 @@ impl Whitenoise {
         // Mark the original message as Retried so it's excluded from future snapshots.
         // This is best-effort: if it fails, the user sees a duplicate (original Failed +
         // new Sending) which is harmless and self-corrects on next app restart.
-        if let Err(e) = AggregatedMessage::update_delivery_status(
+        match AggregatedMessage::update_delivery_status(
             &event_id_str,
             group_id,
             &DeliveryStatus::Retried,
@@ -550,11 +550,22 @@ impl Whitenoise {
         )
         .await
         {
-            tracing::warn!(
-                target: "whitenoise::messages::delivery",
-                "Failed to mark original message {} as Retried: {e}",
-                event_id_str,
-            );
+            Ok(updated_original) => {
+                self.message_stream_manager.emit(
+                    group_id,
+                    MessageUpdate {
+                        trigger: UpdateTrigger::DeliveryStatusChanged,
+                        message: updated_original,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::messages::delivery",
+                    "Failed to mark original message {} as Retried: {e}",
+                    event_id_str,
+                );
+            }
         }
 
         Ok(())
@@ -1670,6 +1681,13 @@ mod tests {
             Some(DeliveryStatus::Failed(_))
         ));
 
+        // Subscribe before retry so we can verify live delivery status transition.
+        let mut updates = whitenoise
+            .subscribe_to_group_messages(&group.mls_group_id)
+            .await
+            .unwrap()
+            .updates;
+
         // Retry should succeed — creates a new message, marks original as Retried
         let retry_result = whitenoise
             .retry_message_publish(&creator, &group.mls_group_id, &original_event_id)
@@ -1712,6 +1730,24 @@ mod tests {
             Some(DeliveryStatus::Sending),
             "New message should have Sending status"
         );
+
+        let retried_update = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = updates.recv().await.expect("stream should remain open");
+                if update.trigger == UpdateTrigger::DeliveryStatusChanged
+                    && update.message.id == original_event_id.to_string()
+                {
+                    return update;
+                }
+            }
+        })
+        .await
+        .expect("Should receive DeliveryStatusChanged for original retried message");
+
+        assert!(matches!(
+            retried_update.message.delivery_status,
+            Some(DeliveryStatus::Retried)
+        ));
     }
 
     /// Test publish_with_retries exhausts all attempts and marks status as Failed
