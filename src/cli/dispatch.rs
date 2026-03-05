@@ -272,6 +272,25 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::ReactToMessage {
+            account,
+            group_id,
+            message_id,
+            emoji,
+        } => match react_to_message(wn, &account, &group_id, &message_id, emoji).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UnreactToMessage {
+            account,
+            group_id,
+            message_id,
+        } => match unreact_to_message(wn, &account, &group_id, &message_id).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         // Streaming commands should be routed through dispatch_streaming
         Request::MessagesSubscribe { .. }
         | Request::ChatsSubscribe { .. }
@@ -1153,6 +1172,66 @@ async fn send_message(
 
     let result = wn
         .send_message_to_group(&account, &group_id, message, 9, None)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&result))
+}
+
+async fn react_to_message(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    message_id: &str,
+    emoji: String,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    let tag = nostr_sdk::Tag::parse(["e", message_id])
+        .map_err(|e| Response::err(format!("invalid message ID: {e}")))?;
+
+    let result = wn
+        .send_message_to_group(&account, &group_id, emoji, 7, Some(vec![tag]))
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&result))
+}
+
+async fn unreact_to_message(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    message_id: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+
+    // Find the user's reaction event ID on this message
+    let messages = wn
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let target_msg = messages
+        .iter()
+        .find(|m| m.id == message_id)
+        .ok_or_else(|| Response::err(format!("message not found: {message_id}")))?;
+
+    let user_reaction = target_msg
+        .reactions
+        .user_reactions
+        .iter()
+        .find(|r| r.user == account.pubkey)
+        .ok_or_else(|| Response::err("no reaction to remove"))?;
+
+    // Send a kind 5 deletion event targeting the reaction event
+    let tag = nostr_sdk::Tag::parse(["e", &user_reaction.reaction_id.to_hex()])
+        .map_err(|e| Response::err(format!("invalid reaction event ID: {e}")))?;
+
+    let result = wn
+        .send_message_to_group(&account, &group_id, String::new(), 5, Some(vec![tag]))
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

@@ -29,6 +29,28 @@ pub enum MessagesCmd {
         /// MLS group ID (hex)
         group_id: String,
     },
+
+    /// React to a message
+    React {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Message event ID to react to
+        message_id: String,
+
+        /// Emoji reaction (defaults to "+")
+        #[arg(default_value = "+")]
+        emoji: String,
+    },
+
+    /// Remove your reaction from a message
+    Unreact {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Message event ID to unreact from
+        message_id: String,
+    },
 }
 
 impl MessagesCmd {
@@ -44,6 +66,15 @@ impl MessagesCmd {
                 send(socket, json, account_flag, group_id, message).await
             }
             Self::Subscribe { group_id } => subscribe(socket, json, account_flag, group_id).await,
+            Self::React {
+                group_id,
+                message_id,
+                emoji,
+            } => react(socket, json, account_flag, group_id, message_id, emoji).await,
+            Self::Unreact {
+                group_id,
+                message_id,
+            } => unreact(socket, json, account_flag, group_id, message_id).await,
         }
     }
 }
@@ -106,6 +137,48 @@ async fn send(
             account: pubkey,
             group_id,
             message,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn react(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    message_id: String,
+    emoji: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::ReactToMessage {
+            account: pubkey,
+            group_id,
+            message_id,
+            emoji,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn unreact(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    message_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::UnreactToMessage {
+            account: pubkey,
+            group_id,
+            message_id,
         },
     )
     .await?;
