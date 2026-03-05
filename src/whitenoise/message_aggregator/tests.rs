@@ -229,6 +229,7 @@ mod integration_tests {
             reactions: ReactionSummary::default(),
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],
+            delivery_status: None,
         };
 
         // Test serialization
@@ -258,6 +259,7 @@ mod integration_tests {
             reactions: ReactionSummary::default(),
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],
+            delivery_status: None,
         };
 
         let message2 = message1.clone();

@@ -3,6 +3,7 @@ use crate::integration_tests::core::*;
 use async_trait::async_trait;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
+use std::time::Duration;
 
 pub struct RemoveGroupMembersTestCase {
     admin_account_name: String,
@@ -84,7 +85,9 @@ impl TestCase for RemoveGroupMembersTestCase {
         // Wait for MLS processing and event propagation
         let expected_count = initial_members.len() - self.member_pubkeys_to_remove.len();
 
-        let updated_members = retry_default(
+        let updated_members = retry(
+            30,
+            Duration::from_millis(200),
             || async {
                 let members = context
                     .whitenoise

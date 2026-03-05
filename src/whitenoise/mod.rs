@@ -127,7 +127,7 @@ pub struct Whitenoise {
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
-    message_stream_manager: message_streaming::MessageStreamManager,
+    message_stream_manager: Arc<message_streaming::MessageStreamManager>,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
@@ -358,7 +358,7 @@ impl Whitenoise {
             secrets_store,
             storage,
             message_aggregator,
-            message_stream_manager: message_streaming::MessageStreamManager::default(),
+            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             notification_stream_manager: notification_streaming::NotificationStreamManager::default(),
             event_sender,
@@ -1327,7 +1327,7 @@ pub mod test_utils {
             secrets_store,
             storage,
             message_aggregator,
-            message_stream_manager: message_streaming::MessageStreamManager::default(),
+            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             notification_stream_manager: notification_streaming::NotificationStreamManager::default(
             ),
@@ -1778,6 +1778,7 @@ mod tests {
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
+                delivery_status: None,
             };
             let msg2 = message_aggregator::ChatMessage {
                 id: format!("{:0>64x}", 2),
@@ -1792,6 +1793,7 @@ mod tests {
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
+                delivery_status: None,
             };
 
             aggregated_message::AggregatedMessage::insert_message(
@@ -1852,6 +1854,7 @@ mod tests {
                 reactions: message_aggregator::ReactionSummary::default(),
                 kind: 9,
                 media_attachments: vec![],
+                delivery_status: None,
             };
 
             // Emit an update (will be caught by subscriber during drain phase)
@@ -2259,6 +2262,7 @@ mod tests {
                     reactions: message_aggregator::ReactionSummary::default(),
                     kind: 9,
                     media_attachments: vec![],
+                    delivery_status: None,
                 };
                 aggregated_message::AggregatedMessage::insert_message(
                     &msg,

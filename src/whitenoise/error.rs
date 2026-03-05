@@ -138,6 +138,27 @@ pub enum WhitenoiseError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("Invalid event kind: expected {expected}, got {got}")]
+    InvalidEventKind { expected: String, got: String },
+
+    #[error("Missing required encoding tag ['encoding','base64']")]
+    MissingEncodingTag,
+
+    #[error("Invalid base64 key package content: {0}")]
+    InvalidBase64(#[from] base64ct::Error),
+
+    #[error(
+        "Incompatible mls_ciphersuite: expected {expected}, advertised [{}]",
+        advertised.join(", ")
+    )]
+    IncompatibleMlsCiphersuite {
+        expected: String,
+        advertised: Vec<String>,
+    },
+
+    #[error("Missing required mls_extensions [{}]", missing.join(", "))]
+    MissingMlsExtensions { missing: Vec<String> },
+
     #[error("Invalid timestamp")]
     InvalidTimestamp,
 

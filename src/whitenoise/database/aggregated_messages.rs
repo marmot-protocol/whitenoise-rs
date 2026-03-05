@@ -9,7 +9,7 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ChatMessageSummary, ReactionSummary},
+    message_aggregator::{ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary},
     utils::timestamp_to_datetime,
 };
 
@@ -30,6 +30,7 @@ struct AggregatedMessageRow {
     pub content_tokens: Vec<SerializableToken>,
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
+    pub delivery_status: Option<DeliveryStatus>,
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AggregatedMessageRow
@@ -123,6 +124,22 @@ where
             }
         })?;
 
+        // Deserialize optional delivery_status from JSON string.
+        // Uses lenient ColumnNotFound handling because delivery_status lives in a
+        // separate table and is only present when the query includes a LEFT JOIN alias.
+        let delivery_status: Option<DeliveryStatus> =
+            match row.try_get::<Option<String>, _>("delivery_status") {
+                Ok(Some(json)) => {
+                    serde_json::from_str(&json).map_err(|e| sqlx::Error::ColumnDecode {
+                        index: "delivery_status".to_string(),
+                        source: Box::new(e),
+                    })?
+                }
+                Ok(None) => None,
+                Err(sqlx::Error::ColumnNotFound(_)) => None,
+                Err(e) => return Err(e),
+            };
+
         Ok(Self {
             id,
             message_id,
@@ -137,6 +154,7 @@ where
             content_tokens,
             reactions,
             media_attachments,
+            delivery_status,
         })
     }
 }
@@ -193,9 +211,13 @@ impl AggregatedMessage {
         database: &Database,
     ) -> Result<Vec<ChatMessage>> {
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT * FROM aggregated_messages
-             WHERE kind = 9 AND mls_group_id = ?
-             ORDER BY created_at",
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9 AND am.mls_group_id = ?
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             ORDER BY am.created_at",
         )
         .bind(group_id.as_slice())
         .fetch_all(&database.pool)
@@ -306,6 +328,8 @@ impl AggregatedMessage {
             }
         })?;
 
+        let mut tx = database.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, tags,
@@ -329,8 +353,23 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
-        .execute(&database.pool)
+        .execute(&mut *tx)
         .await?;
+
+        if let Some(status) = &message.delivery_status {
+            sqlx::query(
+                "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+            )
+            .bind(&message.id)
+            .bind(group_id.as_slice())
+            .bind(serde_json::to_string(status)?)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -452,6 +491,132 @@ impl AggregatedMessage {
         Ok(())
     }
 
+    /// Reverse a deletion by clearing `deletion_event_id` for targets of a specific deletion.
+    ///
+    /// Used to cascade delivery failure: if a kind-5 deletion fails to publish,
+    /// we undo its effect on the target messages.
+    pub async fn unmark_deleted(
+        deletion_event_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE aggregated_messages
+             SET deletion_event_id = NULL
+             WHERE deletion_event_id = ? AND mls_group_id = ?",
+        )
+        .bind(deletion_event_id)
+        .bind(group_id.as_slice())
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update the delivery status of a cached message and return the full updated message.
+    ///
+    /// Upserts into the separate `message_delivery_status` table, then fetches the
+    /// full message via LEFT JOIN. Runs in a transaction for atomicity.
+    ///
+    /// Returns an error if no matching message was found.
+    pub async fn update_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<ChatMessage> {
+        let mut tx = database.pool.begin().await?;
+
+        // Verify the parent message exists before upserting delivery status
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM aggregated_messages
+             WHERE message_id = ? AND mls_group_id = ?)",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if !exists {
+            return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+        }
+
+        // Upsert delivery status
+        sqlx::query(
+            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+             VALUES (?, ?, ?)
+             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .bind(serde_json::to_string(status)?)
+        .execute(&mut *tx)
+        .await?;
+
+        // Fetch the full message with updated status
+        let row: Option<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.message_id = ? AND am.mls_group_id = ?",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        match row {
+            Some(r) => Self::row_to_chat_message(r),
+            None => Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
+        }
+    }
+
+    /// Insert an initial delivery status row for an outgoing event.
+    ///
+    /// Uses a single INSERT (no transaction) to avoid write contention with
+    /// `publish_with_retries` which may be running concurrently for other events.
+    /// Only suitable when the parent `aggregated_messages` row was just inserted.
+    pub async fn insert_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
+             VALUES (?, ?, ?)
+             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .bind(serde_json::to_string(status)?)
+        .execute(&database.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Check whether an event has a delivery status row (i.e. was sent by us).
+    pub async fn has_delivery_status(
+        message_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM message_delivery_status
+             WHERE message_id = ? AND mls_group_id = ?)",
+        )
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(exists)
+    }
+
     /// Delete ALL cached events for a group
     pub async fn delete_by_group(group_id: &GroupId, database: &Database) -> Result<()> {
         sqlx::query("DELETE FROM aggregated_messages WHERE mls_group_id = ?")
@@ -468,8 +633,11 @@ impl AggregatedMessage {
         database: &Database,
     ) -> Result<Option<ChatMessage>> {
         let row: Option<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT * FROM aggregated_messages
-             WHERE message_id = ? AND mls_group_id = ? AND kind = 9",
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.message_id = ? AND am.mls_group_id = ? AND am.kind = 9",
         )
         .bind(message_id)
         .bind(group_id.as_slice())
@@ -655,6 +823,7 @@ impl AggregatedMessage {
             "SELECT am.* FROM aggregated_messages am
              WHERE am.kind = 7
                AND am.mls_group_id = ?
+               AND am.deletion_event_id IS NULL
                AND EXISTS (
                  SELECT 1 FROM json_each(am.tags) AS tag
                  WHERE json_extract(tag.value, '$[0]') = 'e'
@@ -804,6 +973,7 @@ impl AggregatedMessage {
             reactions: row.reactions,
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
+            delivery_status: row.delivery_status,
         })
     }
 
@@ -843,10 +1013,11 @@ impl AggregatedMessage {
 
 #[cfg(test)]
 mod tests {
+    use nostr_sdk::Keys;
+
     use super::*;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
-    use nostr_sdk::Keys;
 
     async fn setup_group(group_id: &GroupId, database: &Database) {
         // Create group_information record (required for foreign key constraint)
@@ -876,6 +1047,7 @@ mod tests {
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
+            delivery_status: None,
         }
     }
 
@@ -1619,6 +1791,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_delivery_status_and_find_by_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[200; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert a message with Sending status
+        let mut message = create_test_chat_message(200, author);
+        message.delivery_status = Some(DeliveryStatus::Sending);
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify initial Sending status via find_by_id
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
+
+        // Update to Sent(3) — returned message should have the updated status
+        let updated = AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Sent(3),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.delivery_status, Some(DeliveryStatus::Sent(3)));
+
+        // Verify via find_by_id as well
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
+
+        // Update to Failed
+        let updated = AggregatedMessage::update_delivery_status(
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Failed("timeout".to_string()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated.delivery_status,
+            Some(DeliveryStatus::Failed("timeout".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_by_id_returns_none_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[201; 32]);
+
+        let found = AggregatedMessage::find_by_id("nonexistent", &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_insert_message_with_no_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[202; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let message = create_test_chat_message(202, author);
+        // delivery_status is None (incoming message)
+        assert!(message.delivery_status.is_none());
+
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, None);
+    }
+
+    #[tokio::test]
+    async fn test_find_messages_by_group_preserves_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[203; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert incoming message (no delivery status)
+        let msg_incoming = create_test_chat_message(203, author);
+        AggregatedMessage::insert_message(&msg_incoming, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert outgoing message with Sent status
+        let mut msg_outgoing = create_test_chat_message(204, author);
+        msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
+        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
+        assert!(statuses.contains(&&None));
+        assert!(statuses.contains(&&Some(DeliveryStatus::Sent(2))));
+    }
+
+    #[tokio::test]
+    async fn test_update_delivery_status_returns_error_for_nonexistent_message() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[205; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        // Try to update delivery status for a message that doesn't exist
+        let result = AggregatedMessage::update_delivery_status(
+            &format!("{:0>64}", "ff"),
+            &group_id,
+            &DeliveryStatus::Sent(1),
+            &whitenoise.database,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Should return error for nonexistent message"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::Sqlx(sqlx::Error::RowNotFound)),
+            "Expected RowNotFound error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_messages_by_group_excludes_retried() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[206; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Insert a normal message
+        let msg_normal = create_test_chat_message(206, author);
+        AggregatedMessage::insert_message(&msg_normal, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert a message with Retried status (simulating a retried failed message)
+        let mut msg_retried = create_test_chat_message(207, author);
+        msg_retried.delivery_status = Some(DeliveryStatus::Retried);
+        AggregatedMessage::insert_message(&msg_retried, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert a message with Failed status (should still be visible)
+        let mut msg_failed = create_test_chat_message(208, author);
+        msg_failed.delivery_status = Some(DeliveryStatus::Failed("error".to_string()));
+        AggregatedMessage::insert_message(&msg_failed, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Only normal and failed messages should appear, not retried
+        assert_eq!(messages.len(), 2);
+        let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&msg_normal.id.as_str()));
+        assert!(ids.contains(&msg_failed.id.as_str()));
+        assert!(!ids.contains(&msg_retried.id.as_str()));
+    }
+
+    #[tokio::test]
     async fn test_count_unread_for_groups_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
@@ -1652,5 +2010,244 @@ mod tests {
             .unwrap();
 
         assert_eq!(result[&group_id], 2); // msg1 and msg3, excluding deleted msg2
+    }
+
+    #[tokio::test]
+    async fn test_insert_delivery_status_and_has_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[180; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg = create_test_chat_message(180, author);
+        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Before inserting, has_delivery_status should return false
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(!has, "No delivery status should exist yet");
+
+        // Insert delivery status
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sending,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Now has_delivery_status should return true
+        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(has, "Delivery status should exist after insert");
+
+        // Verify it shows up in find_by_id
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
+    }
+
+    #[tokio::test]
+    async fn test_insert_delivery_status_upsert() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[181; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg = create_test_chat_message(181, author);
+        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert Sending
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sending,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Upsert to Sent — ON CONFLICT should update
+        AggregatedMessage::insert_delivery_status(
+            &msg.id,
+            &group_id,
+            &DeliveryStatus::Sent(2),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(2)));
+    }
+
+    #[tokio::test]
+    async fn test_unmark_deleted_reverses_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[182; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(182, author);
+        let msg2 = create_test_chat_message(183, author);
+        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let del_id = format!("{:0>64x}", 0xde1182u64);
+
+        // Mark both as deleted by the same deletion event
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Both should have is_deleted=true
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            messages.iter().all(|m| m.is_deleted),
+            "All messages should be marked as deleted"
+        );
+
+        // Unmark — both should revert to not deleted
+        AggregatedMessage::unmark_deleted(&del_id, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2, "Both messages should still be present");
+        assert!(
+            messages.iter().all(|m| !m.is_deleted),
+            "All messages should be un-deleted after unmark"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmark_deleted_only_affects_matching_deletion() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[184; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let msg1 = create_test_chat_message(184, author);
+        let msg2 = create_test_chat_message(185, author);
+        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let del_a = format!("{:0>64x}", 0xde1au64);
+        let del_b = format!("{:0>64x}", 0xde1bu64);
+
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &whitenoise.database)
+            .await
+            .unwrap();
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Unmark only del_a — msg1 should revert to not-deleted, msg2 stays deleted
+        AggregatedMessage::unmark_deleted(&del_a, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        let not_deleted: Vec<_> = messages.iter().filter(|m| !m.is_deleted).collect();
+        assert_eq!(not_deleted.len(), 1, "Only msg1 should be un-deleted");
+        assert_eq!(not_deleted[0].id, msg1.id);
+    }
+
+    #[tokio::test]
+    async fn test_find_orphaned_reactions_excludes_deleted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[186; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        // Use valid hex IDs (find_orphaned_reactions parses message_id as EventId)
+        let parent_id = format!("{:0>64x}", 0xba186u64);
+        let reaction_id = format!("{:0>64x}", 0xea186u64);
+
+        // Insert a reaction targeting the parent, using direct SQL since
+        // insert_reaction needs a Message struct from MDK
+        let tags_json = serde_json::to_string(&vec![vec!["e", &parent_id]]).unwrap();
+        let empty_tokens = serde_json::to_string(&Vec::<String>::new()).unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media = serde_json::to_string(&Vec::<String>::new()).unwrap();
+
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 7, '+', ?, ?, ?, ?)",
+        )
+        .bind(&reaction_id)
+        .bind(group_id.as_slice())
+        .bind(author.to_hex())
+        .bind(1000i64)
+        .bind(&tags_json)
+        .bind(&empty_tokens)
+        .bind(&empty_reactions)
+        .bind(&empty_media)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        // The reaction should appear as orphaned
+        let orphans =
+            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(orphans.len(), 1, "Non-deleted reaction should be found");
+
+        // Now mark the reaction as deleted
+        let del_id = format!("{:0>64x}", 0xde1186u64);
+        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Deleted reaction should NOT appear as orphaned
+        let orphans =
+            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(orphans.len(), 0, "Deleted reaction should be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_has_delivery_status_returns_false_for_nonexistent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[188; 32]);
+
+        let has =
+            AggregatedMessage::has_delivery_status("nonexistent", &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(!has);
     }
 }

@@ -81,6 +81,7 @@ mod tests {
             reactions: ReactionSummary::default(),
             kind: 9,
             media_attachments: vec![],
+            delivery_status: None,
         }
     }
 
