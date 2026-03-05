@@ -812,6 +812,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
+
+        let persisted = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted.delivery_status, Some(DeliveryStatus::Sent(1)));
     }
 
     /// Test error handling for invalid MLS messages
