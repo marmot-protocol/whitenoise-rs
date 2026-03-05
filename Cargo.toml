@@ -1,6 +1,6 @@
 [package]
 name = "whitenoise"
-version = "0.1.0"
+version = "0.2.0"
 description = "A secure messenger built on MLS and Nostr"
 authors = ["White Noise Authors"]
 edition = "2024"
@@ -27,11 +27,11 @@ infer = "0.19"
 keyring-core = "0.7"
 lightning-invoice = "0.33.1"
 
-mdk-core = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "491e24923cafd07c37d4cb3ea99aa0788ffbe1f3", features = [
+mdk-core = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "7341dd5c9f52bff133ad7f16e127f8163e9b0ffa", features = [
     "mip04",
 ] }
-mdk-sqlite-storage = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "491e24923cafd07c37d4cb3ea99aa0788ffbe1f3" }
-mdk-storage-traits = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "491e24923cafd07c37d4cb3ea99aa0788ffbe1f3" }
+mdk-sqlite-storage = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "7341dd5c9f52bff133ad7f16e127f8163e9b0ffa" }
+mdk-storage-traits = { version = "0.7.0", git = "https://github.com/marmot-protocol/mdk", rev = "7341dd5c9f52bff133ad7f16e127f8163e9b0ffa" }
 
 nwc = "0.44"
 nostr-blossom = "0.44"
