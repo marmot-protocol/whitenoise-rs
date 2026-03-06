@@ -446,13 +446,14 @@ impl Whitenoise {
                 .await;
 
                 match result {
-                    Ok(_) => {
+                    Ok(true) => {
                         tracing::info!(
                             target: "whitenoise::messages::delivery",
                             "Cascaded reaction failure: removed reaction \
                              '{content}' from message {target_id}",
                         );
                     }
+                    Ok(false) => {}
                     Err(e) => {
                         tracing::error!(
                             target: "whitenoise::messages::delivery",
