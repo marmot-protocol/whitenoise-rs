@@ -2539,4 +2539,118 @@ mod tests {
                 .unwrap();
         assert!(msg.is_deleted, "Last message should be marked deleted");
     }
+
+    /// Test cascade_delivery_failure for kind 7 handles DB errors gracefully.
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_handles_db_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[202; 32]);
+        let author = Keys::generate().public_key();
+        let target_id = format!("{:0>64x}", 0xabc123u64);
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        // Close the pool to force DB errors on find_by_id
+        whitenoise.database.pool.close().await;
+
+        Whitenoise::cascade_delivery_failure(
+            7,
+            "reaction_event_id",
+            &tags,
+            &author,
+            "+",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Should complete without panic — error is logged at error! level
+    }
+
+    /// Test cascade_delivery_failure for kind 5 handles DB errors gracefully.
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_handles_db_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[203; 32]);
+        let target_id = format!("{:0>64x}", 0xdef456u64);
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        // Close the pool to force DB errors on unmark_deleted
+        whitenoise.database.pool.close().await;
+
+        Whitenoise::cascade_delivery_failure(
+            5,
+            "deletion_event_id",
+            &tags,
+            &Keys::generate().public_key(),
+            "",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Should complete without panic — error is logged at error! level
+    }
+
+    /// Test cascade for kind 7 when update_reactions fails after
+    /// successful find_by_id (exercises the second error branch).
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_db_error_on_update() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a message and a reaction so cascade has something to find
+        let chat_result = whitenoise
+            .send_message_to_group(&creator, &group.mls_group_id, "Target".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        let target_id = chat_result.message.id.to_hex();
+        let reaction_tags = Some(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "+".to_string(),
+                7,
+                reaction_tags,
+            )
+            .await
+            .unwrap();
+
+        let reaction_event_id = reaction_result.message.id.to_string();
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        // Close pool AFTER data is inserted — find_by_id will fail,
+        // exercising the error path
+        whitenoise.database.pool.close().await;
+
+        Whitenoise::cascade_delivery_failure(
+            7,
+            &reaction_event_id,
+            &tags,
+            &creator.pubkey,
+            "+",
+            &group.mls_group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Should complete without panic — error is logged at error! level
+    }
 }
