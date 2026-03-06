@@ -53,6 +53,21 @@ pub enum DatabaseError {
     Serialization(#[from] serde_json::Error),
 }
 
+impl DatabaseError {
+    /// Returns `true` for transient SQLite lock errors
+    /// (SQLITE_BUSY = "5", SQLITE_LOCKED = "6").
+    pub fn is_sqlite_lock_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlx(sqlx::Error::Database(db_err))
+                if db_err
+                    .code()
+                    .map(|c| c == "5" || c == "6")
+                    .unwrap_or(false)
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Database {
     pub pool: SqlitePool,
@@ -186,11 +201,7 @@ impl Database {
             match self.delete_all_data_inner().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    // Check if this is a database lock error
-                    let is_lock_error = matches!(&e, DatabaseError::Sqlx(sqlx::Error::Database(db_err))
-                        if db_err.code().map(|c| c == "5" || c == "6").unwrap_or(false));
-
-                    if is_lock_error && attempt < max_retries {
+                    if e.is_sqlite_lock_error() && attempt < max_retries {
                         tracing::warn!(
                             "Database locked during cleanup (attempt {}/{}), retrying...",
                             attempt,
@@ -574,5 +585,83 @@ mod tests {
 
         assert_eq!(result1.0, 1);
         assert_eq!(result2.0, 2);
+    }
+
+    /// Minimal mock implementing `sqlx::error::DatabaseError` for testing
+    /// `is_sqlite_lock_error()` with specific error codes.
+    #[derive(Debug)]
+    struct MockDbError {
+        code: Option<String>,
+    }
+
+    impl std::fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mock db error")
+        }
+    }
+
+    impl std::error::Error for MockDbError {}
+
+    impl sqlx::error::DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            "mock db error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.as_deref().map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn make_lock_error(code: &str) -> DatabaseError {
+        DatabaseError::Sqlx(sqlx::Error::Database(Box::new(MockDbError {
+            code: Some(code.to_string()),
+        })))
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_busy() {
+        let err = make_lock_error("5");
+        assert!(err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_locked() {
+        let err = make_lock_error("6");
+        assert!(err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_row_not_found() {
+        let err = DatabaseError::Sqlx(sqlx::Error::RowNotFound);
+        assert!(!err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_other_db_code() {
+        let err = make_lock_error("19");
+        assert!(!err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_serialization() {
+        let json_err = serde_json::from_str::<String>("invalid").unwrap_err();
+        let err = DatabaseError::Serialization(json_err);
+        assert!(!err.is_sqlite_lock_error());
     }
 }

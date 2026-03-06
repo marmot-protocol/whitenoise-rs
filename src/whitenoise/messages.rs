@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{
     perf_instrument, perf_span,
     types::MessageWithTokens,
@@ -401,6 +403,8 @@ impl Whitenoise {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
+        const MAX_CASCADE_RETRIES: u32 = 3;
+
         match kind {
             7 => {
                 // Reaction failed: remove from parent message's reaction summary
@@ -415,23 +419,32 @@ impl Whitenoise {
                     }
                 };
 
-                let Some(mut parent) =
-                    (match AggregatedMessage::find_by_id(&target_id, group_id, database).await {
-                        Ok(msg) => msg,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "whitenoise::messages::delivery",
-                                "Failed to find parent message for reaction cascade: {e}",
-                            );
-                            return;
-                        }
-                    })
-                else {
-                    return;
-                };
+                let mut last_error = None;
 
-                if reaction_handler::remove_reaction_from_message(&mut parent, author) {
-                    if let Err(e) = AggregatedMessage::update_reactions(
+                for attempt in 1..=MAX_CASCADE_RETRIES {
+                    let parent = match AggregatedMessage::find_by_id(&target_id, group_id, database)
+                        .await
+                    {
+                        Ok(Some(p)) => p,
+                        Ok(None) => break,
+                        Err(e) => {
+                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
+                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
+                                    .await;
+                                last_error = Some(e);
+                                continue;
+                            }
+                            last_error = Some(e);
+                            break;
+                        }
+                    };
+
+                    let mut parent = parent;
+                    if !reaction_handler::remove_reaction_from_message(&mut parent, author) {
+                        break;
+                    }
+
+                    match AggregatedMessage::update_reactions(
                         &target_id,
                         group_id,
                         &parent.reactions,
@@ -439,41 +452,81 @@ impl Whitenoise {
                     )
                     .await
                     {
-                        tracing::warn!(
-                            target: "whitenoise::messages::delivery",
-                            "Failed to update reactions after cascade: {e}",
-                        );
-                        return;
+                        Ok(()) => {
+                            stream_manager.emit(
+                                group_id,
+                                MessageUpdate {
+                                    trigger: UpdateTrigger::ReactionRemoved,
+                                    message: parent,
+                                },
+                            );
+                            last_error = None;
+                            break;
+                        }
+                        Err(e) => {
+                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
+                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
+                                    .await;
+                                last_error = Some(e);
+                                continue;
+                            }
+                            last_error = Some(e);
+                            break;
+                        }
                     }
-
-                    stream_manager.emit(
-                        group_id,
-                        MessageUpdate {
-                            trigger: UpdateTrigger::ReactionRemoved,
-                            message: parent,
-                        },
-                    );
                 }
 
-                tracing::info!(
-                    target: "whitenoise::messages::delivery",
-                    "Cascaded reaction failure: removed reaction '{content}' \
-                     from message {target_id}",
-                );
+                match last_error {
+                    None => {
+                        tracing::info!(
+                            target: "whitenoise::messages::delivery",
+                            "Cascaded reaction failure: removed reaction \
+                             '{content}' from message {target_id}",
+                        );
+                    }
+                    Some(e) => {
+                        tracing::error!(
+                            target: "whitenoise::messages::delivery",
+                            "Failed to cascade reaction failure after \
+                             retries: {e}",
+                        );
+                    }
+                }
             }
             5 => {
                 // Deletion failed: unmark targets so they reappear
-                if let Err(e) =
-                    AggregatedMessage::unmark_deleted(event_id, group_id, database).await
-                {
-                    tracing::warn!(
+                let mut unmark_error = None;
+
+                for attempt in 1..=MAX_CASCADE_RETRIES {
+                    match AggregatedMessage::unmark_deleted(event_id, group_id, database).await {
+                        Ok(()) => {
+                            unmark_error = None;
+                            break;
+                        }
+                        Err(e) => {
+                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
+                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
+                                    .await;
+                                unmark_error = Some(e);
+                                continue;
+                            }
+                            unmark_error = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(e) = unmark_error {
+                    tracing::error!(
                         target: "whitenoise::messages::delivery",
-                        "Failed to unmark deleted messages after cascade: {e}",
+                        "Failed to cascade deletion failure after \
+                         retries: {e}",
                     );
                     return;
                 }
 
-                // Re-emit affected target messages so the UI reflects them as not deleted
+                // Re-emit affected target messages so the UI reflects
+                // them as not deleted
                 let target_ids = Self::extract_deletion_target_ids(tags);
                 for target_id in target_ids {
                     if let Ok(Some(msg)) =
@@ -491,7 +544,8 @@ impl Whitenoise {
 
                 tracing::info!(
                     target: "whitenoise::messages::delivery",
-                    "Cascaded deletion failure: unmarked targets of deletion {event_id}",
+                    "Cascaded deletion failure: unmarked targets \
+                     of deletion {event_id}",
                 );
             }
             _ => {} // Kind 9 and others: no cascade needed
