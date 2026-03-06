@@ -144,6 +144,15 @@ pub enum WhitenoiseError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error(
+        "Incompatible key package(s) while {context}: {} member(s) failed validation",
+        failures.len()
+    )]
+    KeyPackageIncompatibility {
+        context: &'static str,
+        failures: Vec<(PublicKey, WhitenoiseError)>,
+    },
+
     #[error("Invalid event kind: expected {expected}, got {got}")]
     InvalidEventKind { expected: String, got: String },
 

@@ -202,3 +202,26 @@ macro_rules! perf_span {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_trace_id_increments() {
+        let a = next_trace_id();
+        let b = next_trace_id();
+        assert!(b > a);
+    }
+
+    #[tokio::test]
+    async fn with_trace_id_sets_current_trace_id_for_task() {
+        assert_eq!(current_trace_id(), 0);
+        let tid = 42_u64;
+        with_trace_id(tid, async {
+            assert_eq!(current_trace_id(), tid);
+        })
+        .await;
+        assert_eq!(current_trace_id(), 0);
+    }
+}
