@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Relay control plane with health monitoring scaffold ([erskingardner])
 - Relay observability persistence for connection metrics and failure tracking ([erskingardner])
 
+### Fixed
+
+- Pre-validate fetched Marmot key package signer and tag compatibility before group creation and member adds, returning aggregated incompatibility details instead of failing mid-operation ([sergey3bv])
+
 ## [v0.2.1] - 2026-03-05
 
 ### Added
@@ -213,7 +217,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [F3r10]: <https://github.com/F3r10>
 [mubarakcoded]: <https://github.com/mubarakcoded> (nostr:npub1mlyye6fpsqnkuxwv3nzzf3cmrau8x6z3fhh095246me87ya0aprsun609q)
 [johnathanCorgan]: <https://github.com/jcorgan>
-
+[sergey3bv]: <https://github.com/sergey3bv> (nostr:npub1e7prxjp36rmw82gks6jc0tzva5d6fctsjhwff2qkjfqh2n9anjysgl8g2h)
 
 
 <!-- Tags -->

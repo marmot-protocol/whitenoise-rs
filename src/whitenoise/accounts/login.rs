@@ -328,15 +328,11 @@ impl Whitenoise {
                     )
                     .await
                 {
-                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
-                        return Err(LoginError::from(error));
-                    }
-
                     tracing::warn!(
                         target: "whitenoise::accounts",
                         pubkey = %pubkey,
                         ?relay_type,
-                        "Failed to publish default relay list to preserved NIP-65 relays; continuing login with local relay state: {error}"
+                        "Failed to publish default relay list; continuing login with local relay state: {error}"
                     );
                 }
             } else {
@@ -650,15 +646,11 @@ impl Whitenoise {
                     )
                     .await
                 {
-                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
-                        return Err(LoginError::from(WhitenoiseError::from(error)));
-                    }
-
                     tracing::warn!(
                         target: "whitenoise::accounts",
                         pubkey = %pubkey,
                         ?relay_type,
-                        "Failed to publish default relay list via external signer to preserved NIP-65 relays; continuing login with local relay state: {error}"
+                        "Failed to publish default relay list via external signer; continuing login with local relay state: {error}"
                     );
                 }
             } else {
