@@ -176,37 +176,7 @@ impl Database {
     /// 2. Schema is preserved even if interrupted
     /// 3. No risk of migration failures leaving database in broken state
     pub async fn delete_all_data(&self) -> Result<(), DatabaseError> {
-        // Retry logic for database locking issues
-        let max_retries = 3;
-        let mut last_error = None;
-
-        for attempt in 1..=max_retries {
-            match self.delete_all_data_inner().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    if e.is_sqlite_lock_error() && attempt < max_retries {
-                        tracing::warn!(
-                            "Database locked during cleanup (attempt {}/{}), retrying...",
-                            attempt,
-                            max_retries
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            100 * attempt as u64,
-                        ))
-                        .await;
-                        last_error = Some(e);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            DatabaseError::Sqlx(sqlx::Error::Protocol(
-                "Unexpected retry failure".to_string(),
-            ))
-        }))
+        retry_on_lock(|| self.delete_all_data_inner()).await
     }
 
     /// Inner implementation of delete_all_data
@@ -255,6 +225,44 @@ impl Database {
 
         Ok(())
     }
+}
+
+/// Retry an async database operation on transient SQLite lock errors.
+///
+/// Uses linear backoff (100ms × attempt) for up to 3 attempts.
+/// Returns on first success or first non-lock error.
+pub async fn retry_on_lock<F, Fut, T>(mut op: F) -> std::result::Result<T, DatabaseError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
+{
+    const MAX_RETRIES: u32 = 3;
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if e.is_sqlite_lock_error() && attempt < MAX_RETRIES {
+                    tracing::warn!(
+                        target: "whitenoise::database",
+                        "SQLite lock on attempt {attempt}/{MAX_RETRIES}, \
+                         retrying...",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+                    last_error = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        DatabaseError::Sqlx(sqlx::Error::Protocol(
+            "Unexpected retry failure".to_string(),
+        ))
+    }))
 }
 
 #[cfg(test)]
@@ -660,5 +668,70 @@ mod tests {
     #[test]
     fn test_is_sqlite_lock_error_false_for_non_numeric_code() {
         assert!(!make_lock_error("abc").is_sqlite_lock_error());
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_succeeds_first_try() {
+        let result = retry_on_lock(|| async { Ok::<_, DatabaseError>(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_succeeds_after_transient_lock() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                let attempt = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(make_lock_error("5"))
+                } else {
+                    Ok(99)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_exhausts_on_persistent_lock() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(make_lock_error("5"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_sqlite_lock_error());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_no_retry_on_non_lock_error() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(DatabaseError::Sqlx(sqlx::Error::RowNotFound))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
