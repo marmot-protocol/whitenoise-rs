@@ -2664,6 +2664,61 @@ mod tests {
         assert!(msg.is_deleted, "Last message should be marked deleted");
     }
 
+    /// Test cascade_delivery_failure for kind 7 handles DB errors gracefully.
+    #[tokio::test]
+    async fn test_cascade_reaction_failure_handles_db_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[202; 32]);
+        let author = Keys::generate().public_key();
+        let target_id = format!("{:0>64x}", 0xabc123u64);
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        // Close the pool to force DB errors on find_by_id
+        whitenoise.database.pool.close().await;
+
+        Whitenoise::cascade_delivery_failure(
+            7,
+            "reaction_event_id",
+            &tags,
+            &author,
+            "+",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Should complete without panic — error is logged at error! level
+    }
+
+    /// Test cascade_delivery_failure for kind 5 handles DB errors gracefully.
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_handles_db_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[203; 32]);
+        let target_id = format!("{:0>64x}", 0xdef456u64);
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        // Close the pool to force DB errors on unmark_deleted
+        whitenoise.database.pool.close().await;
+
+        Whitenoise::cascade_delivery_failure(
+            5,
+            "deletion_event_id",
+            &tags,
+            &Keys::generate().public_key(),
+            "",
+            &group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Should complete without panic — error is logged at error! level
+    }
+
     /// fetch_message_by_id returns Some with the correct message when the message exists.
     #[tokio::test]
     async fn test_fetch_message_by_id_returns_message_when_it_exists() {
