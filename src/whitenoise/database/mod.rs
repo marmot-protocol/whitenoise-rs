@@ -54,17 +54,19 @@ pub enum DatabaseError {
 }
 
 impl DatabaseError {
-    /// Returns `true` for transient SQLite lock errors
-    /// (SQLITE_BUSY = "5", SQLITE_LOCKED = "6").
+    /// Returns `true` for transient SQLite lock errors.
+    ///
+    /// Handles both primary codes (5 = SQLITE_BUSY, 6 = SQLITE_LOCKED) and
+    /// extended codes (e.g. 517 = SQLITE_BUSY_SNAPSHOT) by masking with 0xFF
+    /// to extract the primary result code.
     pub fn is_sqlite_lock_error(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlx(sqlx::Error::Database(db_err))
-                if db_err
-                    .code()
-                    .map(|c| c == "5" || c == "6")
-                    .unwrap_or(false)
-        )
+        let Self::Sqlx(sqlx::Error::Database(db_err)) = self else {
+            return false;
+        };
+        db_err
+            .code()
+            .and_then(|c| c.parse::<u32>().ok())
+            .is_some_and(|code| matches!(code & 0xFF, 5 | 6))
     }
 }
 
@@ -636,14 +638,24 @@ mod tests {
 
     #[test]
     fn test_is_sqlite_lock_error_true_for_busy() {
-        let err = make_lock_error("5");
-        assert!(err.is_sqlite_lock_error());
+        assert!(make_lock_error("5").is_sqlite_lock_error());
     }
 
     #[test]
     fn test_is_sqlite_lock_error_true_for_locked() {
-        let err = make_lock_error("6");
-        assert!(err.is_sqlite_lock_error());
+        assert!(make_lock_error("6").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_extended_busy() {
+        // 517 = SQLITE_BUSY_SNAPSHOT (517 & 0xFF == 5)
+        assert!(make_lock_error("517").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_extended_locked() {
+        // 262 = SQLITE_LOCKED_SHAREDCACHE (262 & 0xFF == 6)
+        assert!(make_lock_error("262").is_sqlite_lock_error());
     }
 
     #[test]
@@ -654,8 +666,7 @@ mod tests {
 
     #[test]
     fn test_is_sqlite_lock_error_false_for_other_db_code() {
-        let err = make_lock_error("19");
-        assert!(!err.is_sqlite_lock_error());
+        assert!(!make_lock_error("19").is_sqlite_lock_error());
     }
 
     #[test]
@@ -663,5 +674,10 @@ mod tests {
         let json_err = serde_json::from_str::<String>("invalid").unwrap_err();
         let err = DatabaseError::Serialization(json_err);
         assert!(!err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_non_numeric_code() {
+        assert!(!make_lock_error("abc").is_sqlite_lock_error());
     }
 }
