@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use crate::{
     perf_instrument, perf_span,
     types::MessageWithTokens,
@@ -8,7 +6,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::Database,
+        database::{Database, retry_on_lock},
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
         message_aggregator::{
@@ -403,8 +401,6 @@ impl Whitenoise {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
-        const MAX_CASCADE_RETRIES: u32 = 3;
-
         match kind {
             7 => {
                 // Reaction failed: remove from parent message's reaction summary
@@ -419,72 +415,45 @@ impl Whitenoise {
                     }
                 };
 
-                let mut last_error = None;
-
-                for attempt in 1..=MAX_CASCADE_RETRIES {
-                    let parent = match AggregatedMessage::find_by_id(&target_id, group_id, database)
-                        .await
-                    {
-                        Ok(Some(p)) => p,
-                        Ok(None) => break,
-                        Err(e) => {
-                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
-                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
-                                    .await;
-                                last_error = Some(e);
-                                continue;
-                            }
-                            last_error = Some(e);
-                            break;
-                        }
+                let result = retry_on_lock(|| async {
+                    let Some(mut parent) =
+                        AggregatedMessage::find_by_id(&target_id, group_id, database).await?
+                    else {
+                        return Ok(false);
                     };
 
-                    let mut parent = parent;
                     if !reaction_handler::remove_reaction_from_message(&mut parent, author) {
-                        break;
+                        return Ok(false);
                     }
 
-                    match AggregatedMessage::update_reactions(
+                    AggregatedMessage::update_reactions(
                         &target_id,
                         group_id,
                         &parent.reactions,
                         database,
                     )
-                    .await
-                    {
-                        Ok(()) => {
-                            stream_manager.emit(
-                                group_id,
-                                MessageUpdate {
-                                    trigger: UpdateTrigger::ReactionRemoved,
-                                    message: parent,
-                                },
-                            );
-                            last_error = None;
-                            break;
-                        }
-                        Err(e) => {
-                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
-                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
-                                    .await;
-                                last_error = Some(e);
-                                continue;
-                            }
-                            last_error = Some(e);
-                            break;
-                        }
-                    }
-                }
+                    .await?;
 
-                match last_error {
-                    None => {
+                    stream_manager.emit(
+                        group_id,
+                        MessageUpdate {
+                            trigger: UpdateTrigger::ReactionRemoved,
+                            message: parent,
+                        },
+                    );
+                    Ok(true)
+                })
+                .await;
+
+                match result {
+                    Ok(_) => {
                         tracing::info!(
                             target: "whitenoise::messages::delivery",
                             "Cascaded reaction failure: removed reaction \
                              '{content}' from message {target_id}",
                         );
                     }
-                    Some(e) => {
+                    Err(e) => {
                         tracing::error!(
                             target: "whitenoise::messages::delivery",
                             "Failed to cascade reaction failure after \
@@ -495,28 +464,12 @@ impl Whitenoise {
             }
             5 => {
                 // Deletion failed: unmark targets so they reappear
-                let mut unmark_error = None;
+                let result = retry_on_lock(|| async {
+                    AggregatedMessage::unmark_deleted(event_id, group_id, database).await
+                })
+                .await;
 
-                for attempt in 1..=MAX_CASCADE_RETRIES {
-                    match AggregatedMessage::unmark_deleted(event_id, group_id, database).await {
-                        Ok(()) => {
-                            unmark_error = None;
-                            break;
-                        }
-                        Err(e) => {
-                            if e.is_sqlite_lock_error() && attempt < MAX_CASCADE_RETRIES {
-                                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt)))
-                                    .await;
-                                unmark_error = Some(e);
-                                continue;
-                            }
-                            unmark_error = Some(e);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(e) = unmark_error {
+                if let Err(e) = result {
                     tracing::error!(
                         target: "whitenoise::messages::delivery",
                         "Failed to cascade deletion failure after \
