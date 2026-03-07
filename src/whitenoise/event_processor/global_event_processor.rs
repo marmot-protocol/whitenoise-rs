@@ -15,6 +15,9 @@ impl Whitenoise {
         source: EventSource,
         retry_info: RetryInfo,
     ) {
+        // Relay-plane events already carry typed source context. The
+        // `global_users_*` prefix check only exists for the legacy shared-client
+        // compatibility path.
         if let EventSource::LegacySubscriptionId(Some(subscription_id)) = &source
             && self
                 .validate_batched_subscription_id(subscription_id)

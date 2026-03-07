@@ -573,11 +573,10 @@ impl Whitenoise {
     async fn setup_accounts_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
-            let nip65_relays = account.nip65_relays(whitenoise_ref).await?;
             let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
             // Setup subscriptions for this account
             match whitenoise_ref
-                .setup_subscriptions(&account, &nip65_relays, &inbox_relays)
+                .setup_subscriptions(&account, &inbox_relays)
                 .await
             {
                 Ok(()) => {
@@ -776,14 +775,11 @@ impl Whitenoise {
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
         match (
-            account.nip65_relays(self).await,
             account.inbox_relays(self).await,
+            account.nip65_relays(self).await,
         ) {
-            (Ok(nip65_relays), Ok(inbox_relays)) => {
-                if let Err(e) = self
-                    .setup_subscriptions(&account, &nip65_relays, &inbox_relays)
-                    .await
-                {
+            (Ok(inbox_relays), Ok(_nip65_relays)) => {
+                if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
                         target: "whitenoise::external_signer",
                         "Failed to recover account subscriptions for {} after signer registration: {}",
@@ -1015,8 +1011,7 @@ impl Whitenoise {
         self.relay_control.discovery().relays().to_vec()
     }
 
-    pub(crate) async fn refresh_global_subscription_for_user(&self, user: &User) -> Result<()> {
-        let _ = user;
+    pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
         self.sync_discovery_subscriptions().await?;
         Ok(())
     }
@@ -1123,8 +1118,8 @@ impl Whitenoise {
 
     /// Checks if account subscriptions are operational
     ///
-    /// Returns true if at least one relay is connected or connecting AND
-    /// expected subscriptions exist (minimum: follow_list and giftwrap).
+    /// Returns true if the account inbox plane exists and at least one of its
+    /// relays is connected or connecting.
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
         Ok(self
             .relay_control

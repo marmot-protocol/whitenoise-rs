@@ -53,7 +53,7 @@ impl Whitenoise {
         );
         self.nostr.ensure_relays_connected(&relay_urls).await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays connected");
-        if let Err(e) = self.refresh_global_subscription_for_user(user).await {
+        if let Err(e) = self.refresh_global_subscription_for_user().await {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 "Failed to refresh global subscription for new user {}: {}",
@@ -62,8 +62,7 @@ impl Whitenoise {
             );
         }
         tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed for account user");
-        self.setup_subscriptions(account, nip65_relays, inbox_relays)
-            .await?;
+        self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
         self.setup_key_package(account, is_new_account, key_package_relays)
             .await?;
@@ -94,7 +93,7 @@ impl Whitenoise {
         self.nostr.ensure_relays_connected(&relay_urls).await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays connected");
 
-        if let Err(e) = self.refresh_global_subscription_for_user(user).await {
+        if let Err(e) = self.refresh_global_subscription_for_user().await {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 "Failed to refresh global subscription for new user {}: {}",
@@ -104,8 +103,7 @@ impl Whitenoise {
         }
         tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed");
 
-        self.setup_subscriptions(account, nip65_relays, inbox_relays)
-            .await?;
+        self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
 
         // Note: We skip key package setup for external signer accounts.
@@ -641,7 +639,6 @@ impl Whitenoise {
     pub(crate) async fn setup_subscriptions(
         &self,
         account: &Account,
-        nip65_relays: &[Relay],
         inbox_relays: &[Relay],
     ) -> Result<()> {
         tracing::debug!(
@@ -649,8 +646,6 @@ impl Whitenoise {
             "Setting up subscriptions for account: {:?}",
             account
         );
-
-        let user_relays: Vec<RelayUrl> = Relay::urls(nip65_relays);
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(inbox_relays);
 
@@ -682,7 +677,6 @@ impl Whitenoise {
         self.relay_control
             .activate_account_subscriptions(
                 account.pubkey,
-                &user_relays,
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,
@@ -727,8 +721,6 @@ impl Whitenoise {
             .deactivate_account_subscriptions(&account.pubkey)
             .await;
 
-        let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
-
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
 
         let (group_relays_urls, nostr_group_ids) =
@@ -742,7 +734,6 @@ impl Whitenoise {
         self.relay_control
             .activate_account_subscriptions(
                 account.pubkey,
-                &user_relays,
                 &inbox_relays,
                 &group_relays_urls,
                 &nostr_group_ids,

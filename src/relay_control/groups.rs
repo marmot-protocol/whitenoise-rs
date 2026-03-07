@@ -2,11 +2,10 @@ use std::collections::HashMap;
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use super::{
-    RelayPlane, SubscriptionStream,
+    RelayPlane, SubscriptionStream, hash_pubkey_for_subscription_id,
     sessions::{
         RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     },
@@ -121,10 +120,7 @@ impl GroupPlane {
     }
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.session_salt);
-        hasher.update(pubkey.to_bytes());
-        format!("{:x}", hasher.finalize())[..12].to_string()
+        hash_pubkey_for_subscription_id(&self.session_salt, pubkey)
     }
 }
 

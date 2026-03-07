@@ -102,6 +102,9 @@ impl DiscoveryPlane {
     ) -> Result<()> {
         self.start().await?;
 
+        // Discovery sync is a full replace. We intentionally tear down and
+        // rebuild the watched-set subscriptions so callers do not need to
+        // reason about incremental relay or batch mutations.
         let stale_subscription_ids = {
             let mut state = self.state.write().await;
             let stale_subscription_ids = state
@@ -174,6 +177,9 @@ impl DiscoveryPlane {
                     &self.config.relays,
                     subscription_id.clone(),
                     filter,
+                    // Discovery follow lists are account-scoped: they run on the
+                    // discovery plane, but still route through account event
+                    // processing and therefore must carry the owning account pubkey.
                     SubscriptionStream::DiscoveryFollowLists,
                     Some(account_pubkey),
                 )
@@ -191,6 +197,12 @@ impl DiscoveryPlane {
     pub(crate) async fn has_subscriptions(&self) -> bool {
         let state = self.state.read().await;
         !state.public_subscription_ids.is_empty() || !state.follow_list_subscription_ids.is_empty()
+    }
+
+    pub(crate) async fn has_connected_relay(&self) -> bool {
+        self.session
+            .has_any_relay_connected(&self.config.relays)
+            .await
     }
 }
 

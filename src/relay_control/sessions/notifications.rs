@@ -38,6 +38,9 @@ pub(crate) enum RelayNotification {
 
 impl RelayNotification {
     pub(crate) fn from_message(relay_url: RelayUrl, message: RelayMessage<'static>) -> Self {
+        // This normalization is telemetry-oriented. For message types such as
+        // `OK` and `EOSE` we intentionally collapse structured payloads into a
+        // coarse notification shape instead of preserving every field.
         match message {
             RelayMessage::Event {
                 subscription_id,

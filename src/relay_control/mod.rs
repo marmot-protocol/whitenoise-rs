@@ -9,6 +9,7 @@ use core::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 
 use nostr_sdk::{PublicKey, RelayUrl};
+use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, mpsc::Sender};
 
 pub(crate) mod account_inbox;
@@ -112,7 +113,6 @@ impl RelayControlPlane {
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
-        user_relays: &[RelayUrl],
         inbox_relays: &[RelayUrl],
         group_relays: &[RelayUrl],
         group_ids: &[String],
@@ -128,7 +128,6 @@ impl RelayControlPlane {
             self.event_sender.clone(),
             self.session_salt,
         );
-        let _ = user_relays;
         plane.activate(inbox_relays, since, signer).await?;
         self.account_inbox_planes
             .write()
@@ -151,14 +150,21 @@ impl RelayControlPlane {
     }
 
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
-        self.account_inbox_planes
+        let plane = self
+            .account_inbox_planes
             .read()
             .await
-            .contains_key(account_pubkey)
+            .get(account_pubkey)
+            .cloned();
+
+        match plane {
+            Some(plane) => plane.has_connected_relay().await,
+            None => false,
+        }
     }
 
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {
-        self.discovery.has_subscriptions().await
+        self.discovery.has_subscriptions().await && self.discovery.has_connected_relay().await
     }
 
     /// Discovery-plane configuration, including the configured relay set.
@@ -225,6 +231,16 @@ impl SubscriptionStream {
             Self::AccountInboxGiftwraps => "account_inbox_giftwraps",
         }
     }
+}
+
+pub(crate) fn hash_pubkey_for_subscription_id(
+    session_salt: &[u8; 16],
+    pubkey: &PublicKey,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_salt);
+    hasher.update(pubkey.to_bytes());
+    format!("{:x}", hasher.finalize())[..12].to_string()
 }
 
 /// Local subscription-routing metadata for an opaque relay-facing subscription.

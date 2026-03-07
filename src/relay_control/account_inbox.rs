@@ -1,11 +1,8 @@
-use std::collections::HashSet;
-
 use nostr_sdk::prelude::*;
 use nostr_sdk::{PublicKey, RelayUrl};
-use sha2::{Digest, Sha256};
 
 use super::{
-    RelayPlane,
+    RelayPlane, hash_pubkey_for_subscription_id,
     sessions::{
         RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     },
@@ -48,7 +45,7 @@ impl AccountInboxPlaneConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AccountInboxPlane {
     session: RelaySession,
     config: AccountInboxPlaneConfig,
@@ -76,30 +73,26 @@ impl AccountInboxPlane {
     ) -> Result<()> {
         self.session.set_signer(signer).await;
 
-        let all_relays: Vec<RelayUrl> = inbox_relays
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        self.session.ensure_relays_connected(&all_relays).await?;
+        self.session.ensure_relays_connected(inbox_relays).await?;
         self.subscribe_giftwrap(inbox_relays, since).await?;
 
         Ok(())
     }
 
     pub(crate) async fn deactivate(&self) {
-        let pubkey_hash = self.pubkey_hash();
         self.session
             .unsubscribe(&SubscriptionId::new(format!(
-                "{pubkey_hash}_user_follow_list"
+                "{}_giftwrap",
+                self.pubkey_hash()
             )))
             .await;
-        self.session
-            .unsubscribe(&SubscriptionId::new(format!("{pubkey_hash}_giftwrap")))
-            .await;
         self.session.unset_signer().await;
+    }
+
+    pub(crate) async fn has_connected_relay(&self) -> bool {
+        self.session
+            .has_any_relay_connected(&self.config.inbox_relays)
+            .await
     }
 
     async fn subscribe_giftwrap(
@@ -127,10 +120,7 @@ impl AccountInboxPlane {
     }
 
     fn pubkey_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.session_salt);
-        hasher.update(self.config.account_pubkey.to_bytes());
-        format!("{:x}", hasher.finalize())[..12].to_string()
+        hash_pubkey_for_subscription_id(&self.session_salt, &self.config.account_pubkey)
     }
 }
 

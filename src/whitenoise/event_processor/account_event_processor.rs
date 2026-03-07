@@ -1,8 +1,8 @@
 use nostr_sdk::prelude::*;
-use sha2::{Digest, Sha256};
 
 use crate::{
     nostr_manager::utils::cap_timestamp_to_now,
+    relay_control::hash_pubkey_for_subscription_id,
     types::{EventSource, RetryInfo},
     whitenoise::{
         Whitenoise,
@@ -210,11 +210,8 @@ impl Whitenoise {
         // Get all accounts and find the one whose hash matches
         let accounts = Account::all(&self.database).await?;
         for account in accounts.iter() {
-            let mut hasher = Sha256::new();
-            hasher.update(self.nostr.session_salt());
-            hasher.update(account.pubkey.to_bytes());
-            let hash = hasher.finalize();
-            let pubkey_hash = format!("{:x}", hash)[..12].to_string();
+            let pubkey_hash =
+                hash_pubkey_for_subscription_id(self.nostr.session_salt(), &account.pubkey);
             if pubkey_hash == hash_str {
                 return Ok(account.pubkey);
             }

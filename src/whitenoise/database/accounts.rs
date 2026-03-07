@@ -132,6 +132,8 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    ///
+    /// Test-only: production code resolves accounts explicitly by pubkey.
     #[cfg(test)]
     pub(crate) async fn first(database: &Database) -> Result<Option<Account>, WhitenoiseError> {
         let row_opt = sqlx::query_as::<_, AccountRow>(

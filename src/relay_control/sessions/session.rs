@@ -87,6 +87,19 @@ impl RelaySession {
         self.client.unset_signer().await;
     }
 
+    pub(crate) async fn has_any_relay_connected(&self, relay_urls: &[RelayUrl]) -> bool {
+        for relay_url in relay_urls {
+            if let Ok(relay) = self.client.relay(relay_url).await {
+                match relay.status() {
+                    RelayStatus::Connected | RelayStatus::Connecting => return true,
+                    _ => {}
+                }
+            }
+        }
+
+        false
+    }
+
     pub(crate) async fn ensure_relays_connected(&self, relay_urls: &[RelayUrl]) -> Result<()> {
         if relay_urls.is_empty() {
             return Ok(());
@@ -112,6 +125,9 @@ impl RelaySession {
         }
 
         self.client.connect().await;
+        self.client
+            .wait_for_connection(self.config.connect_timeout)
+            .await;
 
         Ok(())
     }
