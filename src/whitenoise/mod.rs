@@ -49,6 +49,7 @@ use mdk_sqlite_storage::MdkSqliteStorage;
 
 use crate::init_tracing;
 use crate::nostr_manager::NostrManager;
+use crate::relay_control::RelayControlPlane;
 
 use crate::types::ProcessableEvent;
 
@@ -123,6 +124,8 @@ impl WhitenoiseConfig {
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
     database: Arc<Database>,
+    #[allow(dead_code)]
+    relay_control: RelayControlPlane,
     nostr: NostrManager,
     secrets_store: SecretsStore,
     storage: storage::Storage,
@@ -159,6 +162,7 @@ impl std::fmt::Debug for Whitenoise {
         f.debug_struct("Whitenoise")
             .field("config", &self.config)
             .field("database", &"<REDACTED>")
+            .field("relay_control", &"<REDACTED>")
             .field("nostr", &"<REDACTED>")
             .field("secrets_store", &"<REDACTED>")
             .field("storage", &"<REDACTED>")
@@ -350,9 +354,11 @@ impl Whitenoise {
         } else {
             message_aggregator::MessageAggregator::new()
         };
+        let relay_control = RelayControlPlane::new(database.clone());
 
         let whitenoise = Self {
             config,
+            relay_control,
             database,
             nostr,
             secrets_store,
@@ -1319,9 +1325,11 @@ pub mod test_utils {
 
         // Create message aggregator for testing
         let message_aggregator = message_aggregator::MessageAggregator::new();
+        let relay_control = RelayControlPlane::new(database.clone());
 
         let whitenoise = Whitenoise {
             config,
+            relay_control,
             database,
             nostr,
             secrets_store,

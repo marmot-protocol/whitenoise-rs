@@ -4,6 +4,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::EnvFilter, fmt::Layer, prelude::*, registry::Registry};
 
 mod nostr_manager;
+pub(crate) mod relay_control;
 mod types;
 pub mod whitenoise;
 
