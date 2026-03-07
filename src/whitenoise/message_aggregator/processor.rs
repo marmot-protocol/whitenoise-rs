@@ -128,18 +128,25 @@ pub(crate) async fn process_regular_message(
     parser: &dyn Parser,
     media_files_map: &HashMap<String, MediaFile>,
 ) -> Result<ChatMessage, ProcessingError> {
-    // Parse content tokens
-    let content_tokens = match parser.parse(&message.content) {
+    // Check if this is a reply (NIP-C7 q-tag, or legacy e-tag)
+    let reply_to_id = extract_reply_info(&message.tags);
+    let is_reply = reply_to_id.is_some();
+
+    // NIP-C7: strip the leading nostr:nevent1... reference from reply content,
+    // then parse tokens from the final content so they always stay aligned.
+    let content = if is_reply {
+        strip_reply_event_reference(&message.content)
+    } else {
+        message.content.clone()
+    };
+
+    let content_tokens = match parser.parse(&content) {
         Ok(tokens) => tokens,
         Err(e) => {
             tracing::warn!("Failed to parse message content: {}", e);
-            Vec::new() // Use empty tokens if parsing fails
+            Vec::new()
         }
     };
-
-    // Check if this is a reply (has e-tag)
-    let reply_to_id = extract_reply_info(&message.tags);
-    let is_reply = reply_to_id.is_some();
 
     // Extract media attachments
     let media_attachments = extract_media_attachments(&message.tags, media_files_map);
@@ -147,7 +154,7 @@ pub(crate) async fn process_regular_message(
     Ok(ChatMessage {
         id: message.id.to_string(),
         author: message.pubkey,
-        content: message.content.clone(),
+        content,
         created_at: message.created_at,
         tags: message.tags.clone(),
         is_reply,
@@ -161,19 +168,26 @@ pub(crate) async fn process_regular_message(
     })
 }
 
-/// Extract reply information from message tags
+/// Extract reply information from message tags.
+///
+/// NIP-C7: `q` tags take precedence (new reply format).
+/// Falls back to `e` tags for backward compatibility with pre-NIP-C7 messages.
 fn extract_reply_info(tags: &Tags) -> Option<String> {
-    // Look for e-tags indicating this is a reply
+    // NIP-C7: check q-tags first
+    for tag in tags.iter() {
+        if tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q))
+            && let Some(event_id) = tag.content()
+        {
+            return Some(event_id.to_string());
+        }
+    }
+
+    // Fallback: e-tags (use last one per NIP-10 convention)
     let e_tags: Vec<_> = tags
         .iter()
         .filter(|tag| tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)))
         .collect();
 
-    if e_tags.is_empty() {
-        return None;
-    }
-
-    // Use the last e-tag as per Nostr convention (NIP-10)
     if let Some(last_e_tag) = e_tags.last()
         && let Some(event_id) = last_e_tag.content()
     {
@@ -181,6 +195,39 @@ fn extract_reply_info(tags: &Tags) -> Option<String> {
     }
 
     None
+}
+
+/// Strip the first `nostr:nevent1...` reference from reply content.
+///
+/// Per NIP-C7, reply content includes a `nostr:nevent1...` URI citing the replied-to event.
+/// The NIP does not require this reference to appear at the start of the content, so we scan
+/// for the first occurrence and remove it. Any surrounding whitespace (newlines/spaces) that
+/// was used to separate the reference from the rest of the message is also trimmed.
+///
+/// This is a protocol-level citation that should not be shown to the user — the UI renders
+/// the replied-to message inline above the reply body.
+fn strip_reply_event_reference(content: &str) -> String {
+    // Find the start of the first nostr:nevent1 token
+    let Some(start) = content.find("nostr:nevent1") else {
+        return content.to_string();
+    };
+
+    // Find the end of the token: whitespace or end of string terminates the URI
+    let end = content[start..]
+        .find(|c: char| c.is_ascii_whitespace())
+        .map(|rel| start + rel)
+        .unwrap_or(content.len());
+
+    // Build the stripped string: content before the token + content after the token
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start();
+
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before}\n{after}"),
+    }
 }
 
 /// Try to process deletion message (kind 5)
@@ -274,26 +321,47 @@ mod tests {
     // Test the pure logic functions that don't require complex Message structs
 
     #[test]
-    fn test_extract_reply_info() {
-        // Test with e-tag
+    fn test_extract_reply_info_e_tag() {
         let mut tags = Tags::new();
         tags.push(Tag::parse(vec!["e", "original_message_id"]).unwrap());
 
         let reply_to_id = extract_reply_info(&tags);
         assert_eq!(reply_to_id, Some("original_message_id".to_string()));
+    }
 
-        // Test with no e-tags
-        let empty_tags = Tags::new();
-        let reply_to_id = extract_reply_info(&empty_tags);
+    #[test]
+    fn test_extract_reply_info_empty_tags() {
+        let reply_to_id = extract_reply_info(&Tags::new());
         assert!(reply_to_id.is_none());
+    }
 
-        // Test with multiple e-tags (should use last one per NIP-10)
-        let mut multi_tags = Tags::new();
-        multi_tags.push(Tag::parse(vec!["e", "first_id"]).unwrap());
-        multi_tags.push(Tag::parse(vec!["e", "second_id", "relay", "mention"]).unwrap());
+    #[test]
+    fn test_extract_reply_info_multiple_e_tags_uses_last() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["e", "first_id"]).unwrap());
+        tags.push(Tag::parse(vec!["e", "second_id", "relay", "mention"]).unwrap());
 
-        let reply_to_id = extract_reply_info(&multi_tags);
+        let reply_to_id = extract_reply_info(&tags);
         assert_eq!(reply_to_id, Some("second_id".to_string()));
+    }
+
+    #[test]
+    fn test_extract_reply_info_q_tag() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["q", "quoted_event_id", "", "author_pubkey"]).unwrap());
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert_eq!(reply_to_id, Some("quoted_event_id".to_string()));
+    }
+
+    #[test]
+    fn test_extract_reply_info_q_tag_takes_precedence_over_e_tag() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["e", "e_tag_event_id"]).unwrap());
+        tags.push(Tag::parse(vec!["q", "q_tag_event_id", "", "author_pubkey"]).unwrap());
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert_eq!(reply_to_id, Some("q_tag_event_id".to_string()));
     }
 
     #[test]
@@ -347,17 +415,68 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_reply_info_edge_cases() {
-        // Test with malformed e-tag (no content)
+    fn test_extract_reply_info_malformed_e_tag() {
         let mut malformed_tags = Tags::new();
-        // This will create a tag with just "e" but no content
         if let Ok(tag) = Tag::parse(vec!["e"]) {
             malformed_tags.push(tag);
         }
 
         let reply_to_id = extract_reply_info(&malformed_tags);
-        // Should handle gracefully - return None for malformed tags
         assert!(reply_to_id.is_none());
+    }
+
+    #[test]
+    fn test_extract_reply_info_malformed_q_tag() {
+        let mut tags = Tags::new();
+        if let Ok(tag) = Tag::parse(vec!["q"]) {
+            tags.push(tag);
+        }
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert!(reply_to_id.is_none());
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_at_start() {
+        let stripped = strip_reply_event_reference("nostr:nevent1abc123\nHello world");
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_no_nevent() {
+        let stripped = strip_reply_event_reference("Just a normal message");
+        assert_eq!(stripped, "Just a normal message");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_only() {
+        let stripped = strip_reply_event_reference("nostr:nevent1abc123");
+        assert_eq!(stripped, "");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_in_middle() {
+        let stripped = strip_reply_event_reference("Hello nostr:nevent1abc123 world");
+        assert_eq!(stripped, "Hello\nworld");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_at_end() {
+        let stripped = strip_reply_event_reference("Hello world\nnostr:nevent1abc123");
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_only_first_nevent_removed() {
+        let stripped =
+            strip_reply_event_reference("nostr:nevent1first\nSome text nostr:nevent1second");
+        assert_eq!(stripped, "Some text nostr:nevent1second");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_preserves_note_uri() {
+        let stripped = strip_reply_event_reference("nostr:note1abc123\nHello");
+        assert_eq!(stripped, "nostr:note1abc123\nHello");
     }
 
     #[test]
