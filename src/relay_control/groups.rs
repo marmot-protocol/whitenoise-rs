@@ -191,7 +191,10 @@ impl GroupPlane {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use futures::future::join_all;
     use tokio::sync::mpsc;
 
     #[test]
@@ -212,5 +215,38 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         assert_eq!(plane.pubkey_hash(&pubkey), plane.pubkey_hash(&pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_update_same_account_keeps_single_state() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = Arc::new(GroupPlane::new(sender, [42; 16]));
+        let pubkey = Keys::generate().public_key();
+
+        // Use the empty-state path so the test stays unit-scoped and does not
+        // depend on live relays. The concurrency invariant we care about is
+        // that same-account updates serialize cleanly and leave one stable
+        // account entry behind rather than racing unsubscribe/resubscribe.
+        let update_tasks = (0..10)
+            .map(|_| {
+                let plane = plane.clone();
+                tokio::spawn(async move { plane.update_account(pubkey, &[], &[], None).await })
+            })
+            .collect::<Vec<_>>();
+
+        let results = join_all(update_tasks).await;
+        for result in results {
+            result.unwrap().unwrap();
+        }
+
+        assert!(plane.has_account(&pubkey).await);
+        assert!(plane.has_active_subscription(&pubkey).await);
+
+        let accounts = plane.accounts.read().await;
+        assert_eq!(accounts.len(), 1);
+
+        let account_state = accounts.get(&pubkey).unwrap();
+        assert!(account_state.relays.is_empty());
+        assert!(account_state.group_ids.is_empty());
     }
 }
