@@ -3,11 +3,11 @@ use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::{
     Database, DatabaseError,
-    relay_observability::{
-        parse_failure_category, parse_optional_public_key, parse_relay_plane, parse_relay_url,
+    utils::{
+        normalize_relay_url, parse_failure_category, parse_optional_public_key,
+        parse_optional_timestamp, parse_relay_plane, parse_relay_url, parse_timestamp,
         serialize_optional_public_key,
     },
-    utils::{normalize_relay_url, parse_optional_timestamp, parse_timestamp},
 };
 use crate::relay_control::{
     RelayPlane,
