@@ -9,7 +9,10 @@ use super::{
         RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     },
 };
-use crate::{nostr_manager::Result, types::ProcessableEvent};
+use crate::{
+    nostr_manager::Result,
+    types::{DiscoveryPlaneStateSnapshot, ProcessableEvent},
+};
 
 const MAX_USERS_PER_PUBLIC_DISCOVERY_SUBSCRIPTION: usize = 500;
 
@@ -70,6 +73,10 @@ pub(crate) struct DiscoveryPlane {
 struct DiscoveryPlaneState {
     public_subscription_ids: Vec<SubscriptionId>,
     follow_list_subscription_ids: Vec<SubscriptionId>,
+    watched_user_count: usize,
+    follow_list_account_count: usize,
+    public_since: Option<Timestamp>,
+    last_sync_at: Option<Timestamp>,
 }
 
 impl DiscoveryPlane {
@@ -114,6 +121,10 @@ impl DiscoveryPlane {
                     .collect::<Vec<_>>();
                 state.public_subscription_ids.clear();
                 state.follow_list_subscription_ids.clear();
+                state.watched_user_count = 0;
+                state.follow_list_account_count = 0;
+                state.public_since = public_since;
+                state.last_sync_at = Some(Timestamp::now());
                 stale
             };
             for id in stale {
@@ -184,6 +195,8 @@ impl DiscoveryPlane {
             }
         }
 
+        let follow_list_account_count = deduped_follow_list_accounts.len();
+
         for (index, (account_pubkey, since)) in deduped_follow_list_accounts.into_iter().enumerate()
         {
             let mut filter = Filter::new().kind(Kind::ContactList).author(account_pubkey);
@@ -222,6 +235,10 @@ impl DiscoveryPlane {
             let old_public = std::mem::replace(&mut state.public_subscription_ids, new_public_ids);
             let old_follow =
                 std::mem::replace(&mut state.follow_list_subscription_ids, new_follow_ids);
+            state.watched_user_count = watched_users.len();
+            state.follow_list_account_count = follow_list_account_count;
+            state.public_since = public_since;
+            state.last_sync_at = Some(Timestamp::now());
             old_public
                 .into_iter()
                 .chain(old_follow.into_iter())
@@ -249,6 +266,32 @@ impl DiscoveryPlane {
         self.session
             .has_any_relay_connected(&self.config.relays)
             .await
+    }
+
+    pub(crate) async fn snapshot(&self) -> DiscoveryPlaneStateSnapshot {
+        let state = self.state.read().await;
+
+        let mut public_subscription_ids = state
+            .public_subscription_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        public_subscription_ids.sort_unstable();
+
+        let mut follow_list_subscription_ids = state
+            .follow_list_subscription_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        follow_list_subscription_ids.sort_unstable();
+
+        DiscoveryPlaneStateSnapshot {
+            watched_user_count: state.watched_user_count,
+            follow_list_subscription_count: state.follow_list_account_count,
+            public_subscription_ids,
+            follow_list_subscription_ids,
+            session: self.session.snapshot(&self.config.relays).await,
+        }
     }
 }
 

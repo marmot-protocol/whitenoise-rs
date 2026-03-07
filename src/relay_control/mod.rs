@@ -21,7 +21,10 @@ pub(crate) mod router;
 pub(crate) mod sessions;
 
 use crate::whitenoise::database::{Database, DatabaseError};
-use crate::{nostr_manager::Result as NostrResult, types::ProcessableEvent};
+use crate::{
+    nostr_manager::Result as NostrResult,
+    types::{AccountInboxPlanesStateSnapshot, ProcessableEvent, RelayControlStateSnapshot},
+};
 
 /// Top-level relay-control owner hosted by `Whitenoise`.
 ///
@@ -194,6 +197,35 @@ impl RelayControlPlane {
     /// Discovery-plane configuration, including the configured relay set.
     pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlane {
         &self.discovery
+    }
+
+    pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
+        let discovery = self.discovery.snapshot().await;
+
+        let inbox_planes = self
+            .account_inbox_planes
+            .read()
+            .await
+            .iter()
+            .map(|(pubkey, plane)| (*pubkey, plane.clone()))
+            .collect::<Vec<_>>();
+
+        let mut account_snapshots = Vec::with_capacity(inbox_planes.len());
+        for (_, plane) in inbox_planes {
+            account_snapshots.push(plane.snapshot().await);
+        }
+        account_snapshots
+            .sort_unstable_by(|left, right| left.account_pubkey.cmp(&right.account_pubkey));
+
+        RelayControlStateSnapshot {
+            generated_at: nostr_sdk::Timestamp::now().as_secs(),
+            discovery,
+            account_inbox: AccountInboxPlanesStateSnapshot {
+                active_account_count: account_snapshots.len(),
+                accounts: account_snapshots,
+            },
+            group: self.group_plane.snapshot().await,
+        }
     }
 
     #[cfg(feature = "integration-tests")]

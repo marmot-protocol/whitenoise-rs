@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use whitenoise::cli::commands::{
-    accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, follows::FollowsCmd,
-    groups::GroupsCmd, identity, messages::MessagesCmd, notifications::NotificationsCmd,
-    profile::ProfileCmd, relays::RelaysCmd, settings::SettingsCmd, users::UsersCmd,
+    accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, debug::DebugCmd,
+    follows::FollowsCmd, groups::GroupsCmd, identity, messages::MessagesCmd,
+    notifications::NotificationsCmd, profile::ProfileCmd, relays::RelaysCmd, settings::SettingsCmd,
+    users::UsersCmd,
 };
 use whitenoise::cli::config::Config;
 
@@ -33,6 +34,10 @@ enum Cmd {
     /// Manage the daemon
     #[clap(subcommand)]
     Daemon(DaemonCmd),
+
+    /// Development and troubleshooting commands
+    #[clap(subcommand)]
+    Debug(DebugCmd),
 
     /// Create a new identity
     CreateIdentity,
@@ -108,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Cmd::Daemon(cmd) => cmd.run(&config).await,
+        Cmd::Debug(cmd) => cmd.run(&socket, args.json).await,
         Cmd::CreateIdentity => identity::create_identity(&socket, args.json).await,
         Cmd::Login { relay } => identity::login(&socket, args.json, relay).await,
         Cmd::Logout { pubkey } => identity::logout(&socket, &pubkey, args.json).await,

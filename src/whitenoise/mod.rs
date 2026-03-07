@@ -52,7 +52,7 @@ use crate::nostr_manager::NostrManager;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::discovery::DiscoveryPlaneConfig;
 
-use crate::types::ProcessableEvent;
+use crate::types::{ProcessableEvent, RelayControlStateSnapshot};
 
 use accounts::*;
 use app_settings::*;
@@ -1145,6 +1145,11 @@ impl Whitenoise {
     /// AND at least one global subscription exists.
     pub async fn is_global_subscriptions_operational(&self) -> Result<bool> {
         Ok(self.relay_control.has_discovery_subscriptions().await)
+    }
+
+    /// Returns a live in-memory snapshot of relay-plane state for debugging.
+    pub async fn get_relay_control_state(&self) -> RelayControlStateSnapshot {
+        self.relay_control.snapshot().await
     }
 
     async fn sync_discovery_subscriptions(&self) -> Result<()> {

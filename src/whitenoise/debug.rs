@@ -106,6 +106,15 @@ impl Whitenoise {
         let json = serde_json::to_string(&result)?;
         Ok(json)
     }
+
+    /// Returns the current relay-control snapshot as pretty-printed JSON.
+    ///
+    /// This is a debug helper for inspecting live relay-plane state without
+    /// having to query internal structures manually.
+    pub async fn debug_relay_control_state(&self) -> Result<String> {
+        let snapshot = self.get_relay_control_state().await;
+        serde_json::to_string_pretty(&snapshot).map_err(WhitenoiseError::from)
+    }
 }
 
 /// Converts a single SQLite column value to a [`serde_json::Value`].
@@ -206,5 +215,17 @@ mod tests {
         let (wn, _data_dir, _logs_dir) = create_mock_whitenoise().await;
         let result = wn.debug_query("THIS IS NOT SQL").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn debug_relay_control_state_returns_json_object() {
+        let (wn, _data_dir, _logs_dir) = create_mock_whitenoise().await;
+        let json = wn.debug_relay_control_state().await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.is_object());
+        assert!(parsed.get("discovery").is_some());
+        assert!(parsed.get("account_inbox").is_some());
+        assert!(parsed.get("group").is_some());
     }
 }

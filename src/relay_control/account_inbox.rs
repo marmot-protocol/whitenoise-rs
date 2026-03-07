@@ -10,7 +10,7 @@ use super::{
 use crate::{
     nostr_manager::{Result, utils::adjust_since_for_giftwrap},
     relay_control::SubscriptionStream,
-    types::ProcessableEvent,
+    types::{AccountInboxPlaneStateSnapshot, ProcessableEvent},
 };
 
 /// Configuration for the per-account inbox plane.
@@ -121,6 +121,15 @@ impl AccountInboxPlane {
 
     fn pubkey_hash(&self) -> String {
         hash_pubkey_for_subscription_id(&self.session_salt, &self.config.account_pubkey)
+    }
+
+    pub(crate) async fn snapshot(&self) -> AccountInboxPlaneStateSnapshot {
+        AccountInboxPlaneStateSnapshot {
+            account_pubkey: self.config.account_pubkey.to_hex(),
+            subscription_id: format!("{}_giftwrap", self.pubkey_hash()),
+            relay_count: self.config.inbox_relays.len(),
+            session: self.session.snapshot(&self.config.inbox_relays).await,
+        }
     }
 }
 

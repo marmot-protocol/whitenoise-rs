@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,6 +18,7 @@ use crate::{
         router::RelayRouter,
     },
     types::ProcessableEvent,
+    types::{RelaySessionRelayStateSnapshot, RelaySessionStateSnapshot},
 };
 
 #[derive(Debug)]
@@ -358,6 +359,65 @@ impl RelaySession {
             self.unsubscribe(&subscription_id).await;
         }
         self.client.unsubscribe_all().await;
+    }
+
+    pub(crate) async fn snapshot(&self, known_relays: &[RelayUrl]) -> RelaySessionStateSnapshot {
+        let notification_handler_registered = self.notification_handler_registered();
+        let router_context_count = self.router.context_count().await;
+        let subscription_relays = self.state.subscription_relays.read().await.clone();
+
+        let mut registered_subscription_ids = subscription_relays
+            .keys()
+            .map(|subscription_id| subscription_id.to_string())
+            .collect::<Vec<_>>();
+        registered_subscription_ids.sort_unstable();
+
+        let mut all_relay_urls = BTreeSet::new();
+        for relay_url in known_relays {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+        for relay_url in subscription_relays.values().flatten() {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+
+        let client_relays = self.client.relays().await;
+        for relay_url in client_relays.keys() {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+
+        let mut relay_snapshots = Vec::with_capacity(all_relay_urls.len());
+        for relay_url in all_relay_urls {
+            let relay_url = RelayUrl::parse(&relay_url)
+                .unwrap_or_else(|error| panic!("invalid relay url in session snapshot: {error}"));
+
+            let mut relay_subscription_ids = subscription_relays
+                .iter()
+                .filter(|(_, relay_urls)| {
+                    relay_urls.iter().any(|candidate| candidate == &relay_url)
+                })
+                .map(|(subscription_id, _)| subscription_id.to_string())
+                .collect::<Vec<_>>();
+            relay_subscription_ids.sort_unstable();
+
+            let status = client_relays
+                .get(&relay_url)
+                .map(|relay| format!("{:?}", relay.status()))
+                .unwrap_or_else(|| "NotRegistered".to_string());
+
+            relay_snapshots.push(RelaySessionRelayStateSnapshot {
+                relay_url: relay_url.to_string(),
+                status,
+                subscription_ids: relay_subscription_ids,
+            });
+        }
+
+        RelaySessionStateSnapshot {
+            notification_handler_registered,
+            router_context_count,
+            registered_subscription_count: registered_subscription_ids.len(),
+            registered_subscription_ids,
+            relays: relay_snapshots,
+        }
     }
 
     /// Spawns the long-lived relay notification handler.

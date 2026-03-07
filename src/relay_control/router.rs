@@ -69,6 +69,10 @@ impl RelayRouter {
                 subscription_id.clone(),
             ))
     }
+
+    pub(crate) async fn context_count(&self) -> usize {
+        self.subscription_contexts.read().await.len()
+    }
 }
 
 #[cfg(test)]

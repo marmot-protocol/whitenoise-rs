@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
@@ -10,7 +10,10 @@ use super::{
         RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     },
 };
-use crate::{nostr_manager::Result, types::ProcessableEvent};
+use crate::{
+    nostr_manager::Result,
+    types::{GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ProcessableEvent},
+};
 
 /// Configuration for the long-lived group-message plane.
 #[allow(dead_code)]
@@ -171,6 +174,60 @@ impl GroupPlane {
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
         hash_pubkey_for_subscription_id(&self.session_salt, pubkey)
+    }
+
+    pub(crate) async fn snapshot(&self) -> GroupPlaneStateSnapshot {
+        let account_states = self
+            .accounts
+            .read()
+            .await
+            .iter()
+            .map(|(pubkey, state)| (*pubkey, state.clone()))
+            .collect::<Vec<_>>();
+
+        let mut distinct_group_relays = BTreeSet::new();
+        let mut groups = Vec::new();
+
+        for (pubkey, account_state) in &account_states {
+            for relay_url in &account_state.relays {
+                distinct_group_relays.insert(relay_url.to_string());
+            }
+
+            let relay_urls = account_state
+                .relays
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+
+            for group_id in &account_state.group_ids {
+                groups.push(GroupPlaneGroupStateSnapshot {
+                    account_pubkey: pubkey.to_hex(),
+                    group_id: group_id.clone(),
+                    subscription_id: format!("{}_mls_messages", self.pubkey_hash(pubkey)),
+                    relay_count: relay_urls.len(),
+                    relay_urls: relay_urls.clone(),
+                });
+            }
+        }
+
+        groups.sort_unstable_by(|left, right| {
+            left.account_pubkey
+                .cmp(&right.account_pubkey)
+                .then(left.group_id.cmp(&right.group_id))
+        });
+        let known_relays = distinct_group_relays
+            .into_iter()
+            .map(|relay_url| {
+                RelayUrl::parse(&relay_url)
+                    .unwrap_or_else(|error| panic!("invalid group relay in snapshot: {error}"))
+            })
+            .collect::<Vec<_>>();
+
+        GroupPlaneStateSnapshot {
+            group_count: groups.len(),
+            groups,
+            session: self.session.snapshot(&known_relays).await,
+        }
     }
 
     #[cfg(feature = "integration-tests")]

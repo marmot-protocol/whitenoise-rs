@@ -108,6 +108,81 @@ impl ProcessableEvent {
     }
 }
 
+/// Live in-memory snapshot of relay-plane state for debugging and health checks.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayControlStateSnapshot {
+    /// UNIX timestamp when the snapshot was assembled.
+    pub generated_at: u64,
+    /// Discovery-plane state and session details.
+    pub discovery: DiscoveryPlaneStateSnapshot,
+    /// Per-account inbox plane state.
+    pub account_inbox: AccountInboxPlanesStateSnapshot,
+    /// Shared group plane state.
+    pub group: GroupPlaneStateSnapshot,
+}
+
+/// Live snapshot of the discovery plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryPlaneStateSnapshot {
+    pub watched_user_count: usize,
+    pub follow_list_subscription_count: usize,
+    pub public_subscription_ids: Vec<String>,
+    pub follow_list_subscription_ids: Vec<String>,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of all account inbox planes.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountInboxPlanesStateSnapshot {
+    pub active_account_count: usize,
+    pub accounts: Vec<AccountInboxPlaneStateSnapshot>,
+}
+
+/// Live snapshot of a single account inbox plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountInboxPlaneStateSnapshot {
+    pub account_pubkey: String,
+    pub subscription_id: String,
+    pub relay_count: usize,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of the shared group plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupPlaneStateSnapshot {
+    pub group_count: usize,
+    pub groups: Vec<GroupPlaneGroupStateSnapshot>,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of one group entry inside the shared group plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupPlaneGroupStateSnapshot {
+    pub account_pubkey: String,
+    pub group_id: String,
+    pub subscription_id: String,
+    pub relay_count: usize,
+    pub relay_urls: Vec<String>,
+}
+
+/// Live snapshot of a relay session shared by one plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaySessionStateSnapshot {
+    pub notification_handler_registered: bool,
+    pub router_context_count: usize,
+    pub registered_subscription_count: usize,
+    pub registered_subscription_ids: Vec<String>,
+    pub relays: Vec<RelaySessionRelayStateSnapshot>,
+}
+
+/// Per-relay live state within a session.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaySessionRelayStateSnapshot {
+    pub relay_url: String,
+    pub status: String,
+    pub subscription_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageWithTokens {
     pub message: message_types::Message,
