@@ -1,39 +1,11 @@
 use chrono::{DateTime, Utc};
 use nostr_sdk::RelayUrl;
 
-use super::{Database, DatabaseError, utils::parse_timestamp};
+use super::{
+    Database, DatabaseError,
+    utils::{normalize_relay_url, parse_timestamp},
+};
 use crate::{WhitenoiseError, whitenoise::relays::Relay};
-
-/// Normalizes a RelayUrl to ensure consistent database storage.
-///
-/// This function removes ALL trailing slashes from URLs to ensure consistency.
-/// Since most WebSocket/relay implementations treat URLs with and without trailing
-/// slashes as equivalent, normalizing to no trailing slash provides the cleanest
-/// and most predictable behavior.
-///
-/// # Arguments
-/// * `url` - The RelayUrl to normalize
-///
-/// # Returns
-/// A normalized string representation of the URL
-///
-/// # Examples
-///
-/// All trailing slashes are removed:
-/// - `"wss://relay.com/"` becomes `"wss://relay.com"`
-/// - `"ws://localhost:8080/"` becomes `"ws://localhost:8080"`
-/// - `"wss://relay.com/nostr/"` becomes `"wss://relay.com/nostr"`
-/// - `"wss://relay.com/path/sub/"` becomes `"wss://relay.com/path/sub"`
-///
-/// No change needed:
-/// - `"wss://relay.com"` stays `"wss://relay.com"`
-/// - `"wss://relay.com/path"` stays `"wss://relay.com/path"`
-fn normalize_relay_url(url: &RelayUrl) -> String {
-    let url_str = url.to_string();
-
-    // Remove trailing slash if present
-    url_str.trim_end_matches('/').to_string()
-}
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub(crate) struct RelayRow {

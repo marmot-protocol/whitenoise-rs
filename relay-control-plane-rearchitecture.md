@@ -408,15 +408,16 @@ Success state:
 
 Objective:
 
-Introduce structured relay telemetry and persistence before changing relay
-ownership or retry behavior.
+Introduce structured relay telemetry types, classification, and persistence
+before changing relay ownership or retry behavior.
 
 In scope:
 
-- normalize relay notifications into structured internal telemetry
-- capture `NOTICE`, `CLOSED`, `AUTH`, connect, disconnect, publish, query, and
-  subscription outcomes
 - add DB tables and data-access code for `relay_status` and `relay_events`
+- define structured telemetry types that can represent `NOTICE`, `CLOSED`,
+  `AUTH`, connect, disconnect, publish, query, and subscription outcomes
+- add notification/error classification helpers for explicit failure
+  categories
 - include plane and account context in logs and persisted events
 - classify failures into explicit categories such as `transport`, `timeout`,
   `auth_required`, `auth_failed`, `relay_policy`, `invalid_filter`,
@@ -427,6 +428,7 @@ Out of scope:
 - no plane split yet
 - no retry-policy changes yet
 - no auth-policy changes yet
+- no instrumentation of the legacy shared `NostrManager` client
 - no new routing decisions based on stored status beyond lightweight read/write
   plumbing
 
@@ -434,8 +436,9 @@ Deliverables:
 
 - new SQL migration files for `relay_status` and `relay_events`
 - relay observability data-access layer under `src/whitenoise/database/`
-- structured telemetry types and notification normalization code
-- compatibility path from the current shared client into the new telemetry flow
+- structured telemetry types and notification/error classification code
+- observability APIs that later phases can call when new relay sessions are
+  introduced
 - unit tests for telemetry classification and persistence
 
 Validation steps:
@@ -445,18 +448,14 @@ Validation steps:
 2. Add tests for DB write and read behavior for `relay_status` and
    `relay_events`.
 3. Run `just precommit-quick`.
-4. Run Docker-backed smoke scenarios:
-   - `just docker-up`
-   - `just int-test basic-messaging`
-   - `just int-test user-discovery`
-   - `just docker-down`
 
 Success state:
 
-- active relay notifications produce structured telemetry with plane and
+- structured relay telemetry can be classified and persisted with plane and
   account context
 - relay status and recent events are persisted in the database
-- existing messaging and discovery flows still work with no routing change
+- existing messaging and discovery flows are unchanged because the legacy shared
+  client is not instrumented in this phase
 
 ### Phase 2: Extract `RelaySession`
 

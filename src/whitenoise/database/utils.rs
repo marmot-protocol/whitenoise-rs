@@ -1,4 +1,5 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
+use nostr_sdk::RelayUrl;
 use sqlx::Row;
 
 /// Parses a timestamp column with flexible type handling for SQLite type affinity.
@@ -49,6 +50,45 @@ where
         column_name,
         "Could not parse as INTEGER or DATETIME",
     ))
+}
+
+/// Parses an optional timestamp column with the same INTEGER/TEXT flexibility as
+/// [`parse_timestamp`].
+pub(crate) fn parse_optional_timestamp<'r, R>(
+    row: &'r R,
+    column_name: &'r str,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error>
+where
+    R: Row,
+    &'r str: sqlx::ColumnIndex<R>,
+    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+{
+    if let Ok(timestamp_ms) = row.try_get::<Option<i64>, _>(column_name) {
+        return timestamp_ms
+            .map(|value| {
+                DateTime::from_timestamp_millis(value).ok_or_else(|| {
+                    create_column_decode_error(column_name, "Invalid timestamp value")
+                })
+            })
+            .transpose();
+    }
+
+    if let Ok(datetime_str) = row.try_get::<Option<String>, _>(column_name) {
+        return datetime_str
+            .map(|value| parse_datetime_string(&value, column_name))
+            .transpose();
+    }
+
+    Err(create_column_decode_error(
+        column_name,
+        "Could not parse optional timestamp as INTEGER or DATETIME",
+    ))
+}
+
+/// Normalizes a RelayUrl to ensure consistent database storage.
+pub(crate) fn normalize_relay_url(url: &RelayUrl) -> String {
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 fn parse_datetime_string(

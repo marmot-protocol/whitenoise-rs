@@ -5,6 +5,7 @@
 //! later phases migrate individual relay workloads onto dedicated sessions.
 #![allow(clippy::large_enum_variant)]
 
+use core::str::FromStr;
 use std::sync::Arc;
 
 use nostr_sdk::{PublicKey, RelayUrl};
@@ -17,7 +18,7 @@ pub(crate) mod observability;
 pub(crate) mod router;
 pub(crate) mod sessions;
 
-use crate::whitenoise::database::Database;
+use crate::whitenoise::database::{Database, DatabaseError};
 
 /// Top-level relay-control owner hosted by `Whitenoise`.
 ///
@@ -63,6 +64,14 @@ impl RelayControlPlane {
         &self.observability
     }
 
+    /// Persist structured relay telemetry for later observability and retry work.
+    pub(crate) async fn record_relay_telemetry(
+        &self,
+        telemetry: &observability::RelayTelemetry,
+    ) -> Result<(), DatabaseError> {
+        self.observability.record(&self.database, telemetry).await
+    }
+
     /// Discovery-plane configuration, including the configured relay set.
     pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlaneConfig {
         &self.discovery
@@ -77,7 +86,6 @@ pub(crate) enum RelayPlane {
     Group,
     AccountInbox,
     Ephemeral,
-    Compatibility,
 }
 
 #[allow(dead_code)]
@@ -89,7 +97,20 @@ impl RelayPlane {
             Self::Group => "group",
             Self::AccountInbox => "account_inbox",
             Self::Ephemeral => "ephemeral",
-            Self::Compatibility => "compatibility",
+        }
+    }
+}
+
+impl FromStr for RelayPlane {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "discovery" => Ok(Self::Discovery),
+            "group" => Ok(Self::Group),
+            "account_inbox" => Ok(Self::AccountInbox),
+            "ephemeral" => Ok(Self::Ephemeral),
+            _ => Err(format!("invalid relay plane: {value}")),
         }
     }
 }
@@ -102,8 +123,6 @@ pub(crate) enum SubscriptionStream {
     DiscoveryRelayLists,
     GroupMessages,
     AccountInboxGiftwraps,
-    CompatibilityAccount,
-    CompatibilityGlobal,
 }
 
 #[allow(dead_code)]
@@ -115,8 +134,6 @@ impl SubscriptionStream {
             Self::DiscoveryRelayLists => "discovery_relay_lists",
             Self::GroupMessages => "group_messages",
             Self::AccountInboxGiftwraps => "account_inbox_giftwraps",
-            Self::CompatibilityAccount => "compatibility_account",
-            Self::CompatibilityGlobal => "compatibility_global",
         }
     }
 }
@@ -138,7 +155,13 @@ mod tests {
     #[test]
     fn test_relay_plane_as_str() {
         assert_eq!(RelayPlane::Discovery.as_str(), "discovery");
-        assert_eq!(RelayPlane::Compatibility.as_str(), "compatibility");
+        assert_eq!(RelayPlane::AccountInbox.as_str(), "account_inbox");
+    }
+
+    #[test]
+    fn test_relay_plane_from_str() {
+        assert_eq!("group".parse::<RelayPlane>().unwrap(), RelayPlane::Group);
+        assert!("not-a-plane".parse::<RelayPlane>().is_err());
     }
 
     #[test]

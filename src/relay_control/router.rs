@@ -84,10 +84,10 @@ mod tests {
         let subscription_id = SubscriptionId::new("opaque_sub");
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
         let context = SubscriptionContext {
-            plane: RelayPlane::Compatibility,
+            plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url.clone(),
-            stream: SubscriptionStream::CompatibilityGlobal,
+            stream: SubscriptionStream::DiscoveryMetadata,
         };
 
         router
@@ -113,16 +113,16 @@ mod tests {
         let relay_url_a = RelayUrl::parse("wss://relay-a.example.com").unwrap();
         let relay_url_b = RelayUrl::parse("wss://relay-b.example.com").unwrap();
         let context_a = SubscriptionContext {
-            plane: RelayPlane::Compatibility,
+            plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url_a.clone(),
-            stream: SubscriptionStream::CompatibilityGlobal,
+            stream: SubscriptionStream::DiscoveryRelayLists,
         };
         let context_b = SubscriptionContext {
-            plane: RelayPlane::Compatibility,
+            plane: RelayPlane::Group,
             account_pubkey: None,
             relay_url: relay_url_b.clone(),
-            stream: SubscriptionStream::CompatibilityAccount,
+            stream: SubscriptionStream::GroupMessages,
         };
 
         router
