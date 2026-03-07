@@ -175,10 +175,10 @@ pub(crate) async fn process_regular_message(
 fn extract_reply_info(tags: &Tags) -> Option<String> {
     // NIP-C7: check q-tags first
     for tag in tags.iter() {
-        if tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q)) {
-            if let Some(event_id) = tag.content() {
-                return Some(event_id.to_string());
-            }
+        if tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q))
+            && let Some(event_id) = tag.content()
+        {
+            return Some(event_id.to_string());
         }
     }
 
@@ -457,7 +457,10 @@ mod tests {
 
         let (stripped, filtered) = strip_reply_event_reference(content, tokens);
         assert_eq!(stripped, "Hello world");
-        assert_eq!(filtered, vec![SerializableToken::Text("Hello world".to_string())]);
+        assert_eq!(
+            filtered,
+            vec![SerializableToken::Text("Hello world".to_string())]
+        );
     }
 
     #[test]
@@ -473,9 +476,7 @@ mod tests {
     #[test]
     fn test_strip_reply_event_reference_nevent_only() {
         let content = "nostr:nevent1abc123";
-        let tokens = vec![
-            SerializableToken::Nostr("nostr:nevent1abc123".to_string()),
-        ];
+        let tokens = vec![SerializableToken::Nostr("nostr:nevent1abc123".to_string())];
 
         let (stripped, filtered) = strip_reply_event_reference(content, tokens);
         assert_eq!(stripped, "");
