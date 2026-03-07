@@ -18,6 +18,7 @@ use crate::nostr_manager::NostrManagerError;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
+use crate::whitenoise::secrets_store::SecretsStoreError;
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
@@ -174,7 +175,16 @@ impl From<WhitenoiseError> for LoginError {
             WhitenoiseError::NostrManager(NostrManagerError::Timeout) => {
                 Self::Timeout("relay operation timed out".to_string())
             }
-            WhitenoiseError::SecretsStore(ref e) => Self::KeyringUnavailable(e.to_string()),
+            WhitenoiseError::SecretsStore(ref e) => match e {
+                SecretsStoreError::KeyringError(_)
+                | SecretsStoreError::KeyringNotInitialized(_)
+                | SecretsStoreError::KeyringUnavailable(_) => {
+                    Self::KeyringUnavailable(e.to_string())
+                }
+                SecretsStoreError::KeyNotFound | SecretsStoreError::KeyError(_) => {
+                    Self::Internal(e.to_string())
+                }
+            },
             other => Self::Internal(other.to_string()),
         }
     }

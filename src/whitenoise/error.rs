@@ -450,4 +450,17 @@ mod tests {
             login_err
         );
     }
+
+    #[test]
+    fn secrets_store_key_not_found_converts_to_login_internal() {
+        use crate::whitenoise::secrets_store::SecretsStoreError;
+
+        let secrets_err = SecretsStoreError::KeyNotFound;
+        let wn_err = WhitenoiseError::SecretsStore(secrets_err);
+        let login_err: LoginError = wn_err.into();
+        assert!(
+            matches!(login_err, LoginError::Internal(_)),
+            "Expected Internal, got: {login_err:?}"
+        );
+    }
 }
