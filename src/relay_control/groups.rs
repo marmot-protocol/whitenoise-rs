@@ -94,8 +94,17 @@ impl GroupPlane {
             filter = filter.since(since);
         }
 
-        self.session.ensure_relays_connected(relays).await?;
-        self.session
+        // On any failure below, remove the accounts entry so that
+        // has_active_subscription() returns false and recovery is triggered.
+        // (The unsubscribe above already tore down the previous subscription,
+        // so leaving stale relay info in the map would make the health check
+        // falsely report healthy with no live subscription.)
+        if let Err(e) = self.session.ensure_relays_connected(relays).await {
+            self.accounts.write().await.remove(&pubkey);
+            return Err(e);
+        }
+        if let Err(e) = self
+            .session
             .subscribe_with_id_to(
                 relays,
                 subscription_id,
@@ -103,7 +112,11 @@ impl GroupPlane {
                 SubscriptionStream::GroupMessages,
                 Some(pubkey),
             )
-            .await?;
+            .await
+        {
+            self.accounts.write().await.remove(&pubkey);
+            return Err(e);
+        }
 
         self.accounts.write().await.insert(
             pubkey,

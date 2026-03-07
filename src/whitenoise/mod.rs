@@ -781,11 +781,10 @@ impl Whitenoise {
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
-        match (
-            account.inbox_relays(self).await,
-            account.nip65_relays(self).await,
-        ) {
-            (Ok(inbox_relays), Ok(_nip65_relays)) => {
+        // Only inbox_relays is needed by setup_subscriptions; do not gate
+        // recovery on the nip65 lookup which is not used here.
+        match account.inbox_relays(self).await {
+            Ok(inbox_relays) => {
                 if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
                         target: "whitenoise::external_signer",
@@ -795,10 +794,10 @@ impl Whitenoise {
                     );
                 }
             }
-            (Err(e), _) | (_, Err(e)) => {
+            Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::external_signer",
-                    "Failed to load relay lists for {} during subscription recovery: {}",
+                    "Failed to load inbox relay list for {} during subscription recovery: {}",
                     pubkey.to_hex(),
                     e
                 );
