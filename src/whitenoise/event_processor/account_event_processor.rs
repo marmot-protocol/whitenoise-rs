@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     nostr_manager::utils::cap_timestamp_to_now,
-    types::RetryInfo,
+    types::{EventSource, RetryInfo},
     whitenoise::{
         Whitenoise,
         accounts::Account,
@@ -15,19 +15,16 @@ impl Whitenoise {
     pub(super) async fn process_account_event(
         &self,
         event: Event,
-        subscription_id: String,
+        source: EventSource,
         retry_info: RetryInfo,
     ) {
         // Get the account from the subscription ID, skip if we can't find it
-        let account = match self
-            .account_from_subscription_id(subscription_id.clone())
-            .await
-        {
+        let account = match self.account_from_event_source(&source).await {
             Ok(account) => account,
             Err(e) => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::process_account_event",
-                    "Skipping event {}: Cannot find account for subscription ID: {}",
+                    "Skipping event {}: Cannot find account for event source: {}",
                     event.id.to_hex(),
                     e
                 );
@@ -181,7 +178,7 @@ impl Whitenoise {
             Err(e) => {
                 // Handle retry logic for actual processing errors
                 if retry_info.should_retry() {
-                    self.schedule_retry(event, subscription_id, retry_info, e);
+                    self.schedule_retry(event, source, retry_info, e);
                 } else {
                     tracing::error!(
                         target: "whitenoise::event_processor::process_account_event",
@@ -229,21 +226,33 @@ impl Whitenoise {
         )))
     }
 
-    async fn account_from_subscription_id(&self, subscription_id: String) -> Result<Account> {
-        let target_pubkey = self
-            .extract_pubkey_from_subscription_id(&subscription_id)
-            .await
-            .map_err(|_| {
-                WhitenoiseError::InvalidEvent(format!(
-                    "Cannot extract pubkey from subscription ID: {}",
-                    subscription_id
-                ))
-            })?;
+    async fn account_from_event_source(&self, source: &EventSource) -> Result<Account> {
+        let target_pubkey = match source {
+            EventSource::LegacySubscriptionId(Some(subscription_id)) => self
+                .extract_pubkey_from_subscription_id(subscription_id)
+                .await
+                .map_err(|_| {
+                    WhitenoiseError::InvalidEvent(format!(
+                        "Cannot extract pubkey from subscription ID: {}",
+                        subscription_id
+                    ))
+                })?,
+            EventSource::LegacySubscriptionId(None) => {
+                return Err(WhitenoiseError::InvalidEvent(
+                    "Cannot resolve account for missing legacy subscription ID".to_string(),
+                ));
+            }
+            EventSource::RelaySubscription(context) => {
+                context.account_pubkey.ok_or(WhitenoiseError::InvalidEvent(
+                    "Relay subscription context missing account pubkey".to_string(),
+                ))?
+            }
+        };
 
         tracing::debug!(
-        target: "whitenoise::event_processor::process_mls_message",
-        "Processing MLS message for account: {}",
-        target_pubkey.to_hex()
+            target: "whitenoise::event_processor::process_mls_message",
+            "Processing account-scoped event for account: {}",
+            target_pubkey.to_hex()
         );
 
         Account::find_by_pubkey(&target_pubkey, &self.database).await

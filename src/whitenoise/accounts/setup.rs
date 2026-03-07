@@ -679,8 +679,8 @@ impl Whitenoise {
         }
 
         let signer = self.get_signer_for_account(account)?;
-        self.nostr
-            .setup_account_subscriptions_with_signer(
+        self.relay_control
+            .activate_account_subscriptions(
                 account.pubkey,
                 &user_relays,
                 &inbox_relays,
@@ -723,9 +723,9 @@ impl Whitenoise {
         );
 
         // Clean up existing subscriptions before resubscribing.
-        self.nostr
-            .unsubscribe_account_subscriptions(&account.pubkey)
-            .await?;
+        self.relay_control
+            .deactivate_account_subscriptions(&account.pubkey)
+            .await;
 
         let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
 
@@ -739,8 +739,8 @@ impl Whitenoise {
         let since = account.since_timestamp(10);
 
         let signer = self.get_signer_for_account(account)?;
-        self.nostr
-            .update_account_subscriptions_with_signer(
+        self.relay_control
+            .activate_account_subscriptions(
                 account.pubkey,
                 &user_relays,
                 &inbox_relays,

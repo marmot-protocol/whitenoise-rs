@@ -1,7 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::{
-    types::RetryInfo,
+    types::{EventSource, RetryInfo},
     whitenoise::{
         Whitenoise,
         error::{Result, WhitenoiseError},
@@ -12,12 +12,13 @@ impl Whitenoise {
     pub(super) async fn process_global_event(
         &self,
         event: Event,
-        subscription_id: String,
+        source: EventSource,
         retry_info: RetryInfo,
     ) {
-        if self
-            .validate_batched_subscription_id(&subscription_id)
-            .is_err()
+        if let EventSource::LegacySubscriptionId(Some(subscription_id)) = &source
+            && self
+                .validate_batched_subscription_id(subscription_id)
+                .is_err()
         {
             tracing::error!(
                 target: "whitenoise::event_processor::process_global_event",
@@ -58,7 +59,7 @@ impl Whitenoise {
             Err(e) => {
                 // Handle retry logic for actual processing errors
                 if retry_info.should_retry() {
-                    self.schedule_retry(event, subscription_id, retry_info, e);
+                    self.schedule_retry(event, source, retry_info, e);
                 } else {
                     tracing::error!(
                         target: "whitenoise::event_processor::process_global_event",

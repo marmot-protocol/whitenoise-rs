@@ -87,7 +87,7 @@ mod tests {
             plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url.clone(),
-            stream: SubscriptionStream::DiscoveryMetadata,
+            stream: SubscriptionStream::DiscoveryUserData,
         };
 
         router
@@ -116,7 +116,7 @@ mod tests {
             plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url_a.clone(),
-            stream: SubscriptionStream::DiscoveryRelayLists,
+            stream: SubscriptionStream::DiscoveryUserData,
         };
         let context_b = SubscriptionContext {
             plane: RelayPlane::Group,

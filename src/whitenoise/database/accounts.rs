@@ -132,6 +132,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[cfg(test)]
     pub(crate) async fn first(database: &Database) -> Result<Option<Account>, WhitenoiseError> {
         let row_opt = sqlx::query_as::<_, AccountRow>(
             "SELECT * FROM accounts ORDER BY created_at ASC, id ASC LIMIT 1",

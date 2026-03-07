@@ -2,6 +2,8 @@ use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingResult};
 use nostr_sdk::prelude::*;
 
+#[cfg(test)]
+use crate::types::EventSource;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -1438,7 +1440,11 @@ mod tests {
 
         // First pass through process_account_event: succeeds, event is tracked.
         whitenoise
-            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .process_account_event(
+                event.clone(),
+                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
+                Default::default(),
+            )
             .await;
 
         let tracked_after_first = whitenoise
@@ -1457,7 +1463,11 @@ mod tests {
         // is not advanced for a duplicate.  This is the intended guard.
         // We verify the skip path by confirming it doesn't panic or double-advance.
         whitenoise
-            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .process_account_event(
+                event.clone(),
+                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
+                Default::default(),
+            )
             .await;
 
         // Still tracked — no double-entry, no crash.

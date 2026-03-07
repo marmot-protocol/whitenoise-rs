@@ -1,4 +1,7 @@
-use crate::{nostr_manager::parser::SerializableToken, whitenoise::error::WhitenoiseError};
+use crate::{
+    nostr_manager::parser::SerializableToken, relay_control::SubscriptionContext,
+    whitenoise::error::WhitenoiseError,
+};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Serialize;
@@ -51,12 +54,22 @@ impl Default for RetryInfo {
 }
 
 /// Events that can be processed by the Whitenoise event processing system
+#[derive(Debug, Clone)]
+pub enum EventSource {
+    /// Legacy compatibility path that still identifies streams by subscription ID.
+    LegacySubscriptionId(Option<String>),
+    /// Relay-plane path with typed local routing context.
+    RelaySubscription(SubscriptionContext),
+}
+
+/// Events that can be processed by the Whitenoise event processing system
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ProcessableEvent {
     /// A Nostr event with an optional subscription ID for account-aware processing
     NostrEvent {
         event: Event,
-        subscription_id: Option<String>,
+        source: EventSource,
         retry_info: RetryInfo,
     },
     /// A relay message for logging/monitoring purposes
@@ -64,11 +77,20 @@ pub enum ProcessableEvent {
 }
 
 impl ProcessableEvent {
-    /// Create a new NostrEvent with default retry settings
+    /// Create a new legacy NostrEvent with default retry settings.
     pub fn new_nostr_event(event: Event, subscription_id: Option<String>) -> Self {
         Self::NostrEvent {
             event,
-            subscription_id,
+            source: EventSource::LegacySubscriptionId(subscription_id),
+            retry_info: RetryInfo::new(),
+        }
+    }
+
+    /// Create a new relay-plane NostrEvent with default retry settings.
+    pub fn new_routed_nostr_event(event: Event, source: SubscriptionContext) -> Self {
+        Self::NostrEvent {
+            event,
+            source: EventSource::RelaySubscription(source),
             retry_info: RetryInfo::new(),
         }
     }
