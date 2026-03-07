@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::relay_control::RelayPlane;
 
 /// Session-level auth policy.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionAuthPolicy {
     #[default]
@@ -12,6 +13,7 @@ pub(crate) enum RelaySessionAuthPolicy {
 }
 
 /// Session-level reconnect policy.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionReconnectPolicy {
     Conservative,
@@ -21,6 +23,7 @@ pub(crate) enum RelaySessionReconnectPolicy {
 }
 
 /// Shared session configuration reused by all future relay planes.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelaySessionConfig {
     pub(crate) plane: RelayPlane,

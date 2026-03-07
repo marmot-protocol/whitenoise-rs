@@ -50,6 +50,7 @@ use mdk_sqlite_storage::MdkSqliteStorage;
 use crate::init_tracing;
 use crate::nostr_manager::NostrManager;
 use crate::relay_control::RelayControlPlane;
+use crate::relay_control::discovery::DiscoveryPlaneConfig;
 
 use crate::types::ProcessableEvent;
 
@@ -77,6 +78,9 @@ pub struct WhitenoiseConfig {
     /// Each application using this crate must provide a unique identifier
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
+
+    /// Configured discovery relays for the relay-control discovery plane.
+    pub discovery_relays: Vec<RelayUrl>,
 }
 
 impl WhitenoiseConfig {
@@ -94,6 +98,7 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
             keyring_service_id: keyring_service_id.to_string(),
+            discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
 
@@ -117,7 +122,13 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
             keyring_service_id: keyring_service_id.to_string(),
+            discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
+    }
+
+    pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
+        self.discovery_relays = discovery_relays;
+        self
     }
 }
 
@@ -157,6 +168,16 @@ pub struct Whitenoise {
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
 
+struct WhitenoiseComponents {
+    nostr: NostrManager,
+    secrets_store: SecretsStore,
+    storage: storage::Storage,
+    message_aggregator: message_aggregator::MessageAggregator,
+    event_sender: Sender<ProcessableEvent>,
+    shutdown_sender: Sender<()>,
+    scheduler_shutdown: watch::Sender<bool>,
+}
+
 impl std::fmt::Debug for Whitenoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Whitenoise")
@@ -180,6 +201,37 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    fn assemble(
+        config: WhitenoiseConfig,
+        database: Arc<Database>,
+        components: WhitenoiseComponents,
+    ) -> Self {
+        let relay_control =
+            RelayControlPlane::new(database.clone(), config.discovery_relays.clone());
+
+        Self {
+            config,
+            database,
+            relay_control,
+            nostr: components.nostr,
+            secrets_store: components.secrets_store,
+            storage: components.storage,
+            message_aggregator: components.message_aggregator,
+            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
+            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
+            notification_stream_manager: notification_streaming::NotificationStreamManager::default(
+            ),
+            event_sender: components.event_sender,
+            shutdown_sender: components.shutdown_sender,
+            contact_list_guards: DashMap::new(),
+            scheduler_shutdown: components.scheduler_shutdown,
+            scheduler_handles: Mutex::new(Vec::new()),
+            external_signers: DashMap::new(),
+            background_task_cancellation: DashMap::new(),
+            pending_logins: DashMap::new(),
+        }
+    }
+
     /// Initializes the keyring-core credential store.
     ///
     /// `mdk-sqlite-storage` and [`SecretsStore`] both use `keyring-core` to store
@@ -354,28 +406,19 @@ impl Whitenoise {
         } else {
             message_aggregator::MessageAggregator::new()
         };
-        let relay_control = RelayControlPlane::new(database.clone());
-
-        let whitenoise = Self {
+        let whitenoise = Self::assemble(
             config,
-            relay_control,
             database,
-            nostr,
-            secrets_store,
-            storage,
-            message_aggregator,
-            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
-            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
-            notification_stream_manager: notification_streaming::NotificationStreamManager::default(),
-            event_sender,
-            shutdown_sender,
-            contact_list_guards: DashMap::new(),
-            scheduler_shutdown,
-            scheduler_handles: Mutex::new(Vec::new()),
-            external_signers: DashMap::new(),
-            background_task_cancellation: DashMap::new(),
-            pending_logins: DashMap::new(),
-        };
+            WhitenoiseComponents {
+                nostr,
+                secrets_store,
+                storage,
+                message_aggregator,
+                event_sender,
+                shutdown_sender,
+                scheduler_shutdown,
+            },
+        );
 
         // Create default relays in the database if they don't exist
         // TODO: Make this batch fetch and insert all relays at once
@@ -1325,29 +1368,19 @@ pub mod test_utils {
 
         // Create message aggregator for testing
         let message_aggregator = message_aggregator::MessageAggregator::new();
-        let relay_control = RelayControlPlane::new(database.clone());
-
-        let whitenoise = Whitenoise {
+        let whitenoise = Whitenoise::assemble(
             config,
-            relay_control,
             database,
-            nostr,
-            secrets_store,
-            storage,
-            message_aggregator,
-            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
-            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
-            notification_stream_manager: notification_streaming::NotificationStreamManager::default(
-            ),
-            event_sender,
-            shutdown_sender,
-            contact_list_guards: DashMap::new(),
-            scheduler_shutdown,
-            scheduler_handles: Mutex::new(Vec::new()),
-            external_signers: DashMap::new(),
-            background_task_cancellation: DashMap::new(),
-            pending_logins: DashMap::new(),
-        };
+            WhitenoiseComponents {
+                nostr,
+                secrets_store,
+                storage,
+                message_aggregator,
+                event_sender,
+                shutdown_sender,
+                scheduler_shutdown,
+            },
+        );
 
         (whitenoise, data_temp, logs_temp)
     }
@@ -1527,6 +1560,10 @@ mod tests {
                 assert_eq!(config.logs_dir, logs_dir.join("release"));
             }
             assert_eq!(config.keyring_service_id, "com.test.app");
+            assert_eq!(
+                config.discovery_relays,
+                DiscoveryPlaneConfig::curated_default_relays()
+            );
         }
 
         #[test]
@@ -1541,12 +1578,14 @@ mod tests {
                 cloned_config.message_aggregator_config
             );
             assert_eq!(config.keyring_service_id, cloned_config.keyring_service_id);
+            assert_eq!(config.discovery_relays, cloned_config.discovery_relays);
 
             let debug_str = format!("{:?}", config);
             assert!(debug_str.contains("data_dir"));
             assert!(debug_str.contains("logs_dir"));
             assert!(debug_str.contains("message_aggregator_config"));
             assert!(debug_str.contains("keyring_service_id"));
+            assert!(debug_str.contains("discovery_relays"));
         }
 
         #[test]
@@ -1572,6 +1611,10 @@ mod tests {
             assert!(!aggregator_config.normalize_emoji);
             assert!(aggregator_config.enable_debug_logging);
             assert_eq!(config.keyring_service_id, "com.test.app");
+            assert_eq!(
+                config.discovery_relays,
+                DiscoveryPlaneConfig::curated_default_relays()
+            );
         }
 
         #[test]
@@ -1580,6 +1623,22 @@ mod tests {
             let logs_dir = std::path::Path::new("/test/logs");
             let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.myapp.custom");
             assert_eq!(config.keyring_service_id, "com.myapp.custom");
+        }
+
+        #[test]
+        fn test_whitenoise_config_with_discovery_relays() {
+            let custom_relays = vec![
+                RelayUrl::parse("ws://localhost:8080").unwrap(),
+                RelayUrl::parse("ws://localhost:7777").unwrap(),
+            ];
+            let config = WhitenoiseConfig::new(
+                std::path::Path::new("/test/data"),
+                std::path::Path::new("/test/logs"),
+                "com.test.app",
+            )
+            .with_discovery_relays(custom_relays.clone());
+
+            assert_eq!(config.discovery_relays, custom_relays);
         }
 
         #[tokio::test]

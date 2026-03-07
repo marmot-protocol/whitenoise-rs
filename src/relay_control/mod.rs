@@ -3,7 +3,6 @@
 //! Phase 0 intentionally introduces only the boundary and shared types. Runtime
 //! behavior continues to flow through the existing `NostrManager` paths until
 //! later phases migrate individual relay workloads onto dedicated sessions.
-#![allow(dead_code)]
 #![allow(clippy::large_enum_variant)]
 
 use std::sync::Arc;
@@ -26,18 +25,22 @@ use crate::whitenoise::database::Database;
 /// `relay-control-plane-rearchitecture.md`. In Phase 0 it only stores shared
 /// state and typed configuration; production code does not yet route relay
 /// work through it.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RelayControlPlane {
     database: Arc<Database>,
+    discovery: discovery::DiscoveryPlaneConfig,
     router: router::RelayRouter,
     observability: observability::RelayObservability,
 }
 
+#[allow(dead_code)]
 impl RelayControlPlane {
     /// Create the inactive Phase 0 control-plane host.
-    pub(crate) fn new(database: Arc<Database>) -> Self {
+    pub(crate) fn new(database: Arc<Database>, discovery_relays: Vec<RelayUrl>) -> Self {
         Self {
             database,
+            discovery: discovery::DiscoveryPlaneConfig::new(discovery_relays),
             router: router::RelayRouter::default(),
             observability: observability::RelayObservability::new(
                 observability::RelayObservabilityConfig::default(),
@@ -59,9 +62,15 @@ impl RelayControlPlane {
     pub(crate) fn observability(&self) -> &observability::RelayObservability {
         &self.observability
     }
+
+    /// Discovery-plane configuration, including the configured relay set.
+    pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlaneConfig {
+        &self.discovery
+    }
 }
 
 /// Logical relay workload partition.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayPlane {
     Discovery,
@@ -71,6 +80,7 @@ pub(crate) enum RelayPlane {
     Compatibility,
 }
 
+#[allow(dead_code)]
 impl RelayPlane {
     /// Stable identifier used for logs, persistence, and metrics labels.
     pub(crate) fn as_str(&self) -> &'static str {
@@ -85,6 +95,7 @@ impl RelayPlane {
 }
 
 /// Logical stream within a relay plane.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SubscriptionStream {
     DiscoveryMetadata,
@@ -95,6 +106,7 @@ pub(crate) enum SubscriptionStream {
     CompatibilityGlobal,
 }
 
+#[allow(dead_code)]
 impl SubscriptionStream {
     /// Stable identifier used only within White Noise.
     pub(crate) fn as_str(&self) -> &'static str {
@@ -110,6 +122,7 @@ impl SubscriptionStream {
 }
 
 /// Local subscription-routing metadata for an opaque relay-facing subscription.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SubscriptionContext {
     pub(crate) plane: RelayPlane,

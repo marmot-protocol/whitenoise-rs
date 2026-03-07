@@ -3,6 +3,7 @@ use nostr_sdk::{Event, RelayUrl, SubscriptionId};
 use crate::relay_control::observability::RelayFailureCategory;
 
 /// Normalized relay notification surface for future `RelaySession` wiring.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RelayNotification {
     Event {

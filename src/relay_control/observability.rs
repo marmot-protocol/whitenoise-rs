@@ -5,6 +5,7 @@ use nostr_sdk::{PublicKey, RelayUrl};
 use super::RelayPlane;
 
 /// High-level relay failure classification to be persisted in later phases.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayFailureCategory {
     Transport,
@@ -19,6 +20,7 @@ pub(crate) enum RelayFailureCategory {
 }
 
 /// Structured relay telemetry kind.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayTelemetryKind {
     Connected,
@@ -38,6 +40,7 @@ pub(crate) enum RelayTelemetryKind {
 }
 
 /// Normalized relay telemetry payload shape.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayTelemetryEvent {
     pub(crate) kind: RelayTelemetryKind,
@@ -50,6 +53,7 @@ pub(crate) struct RelayTelemetryEvent {
 }
 
 /// Static observability configuration owned by the control plane.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayObservabilityConfig {
     pub(crate) recent_event_limit: usize,
@@ -66,11 +70,13 @@ impl Default for RelayObservabilityConfig {
 }
 
 /// Relay-observability host for future persistence and aggregation logic.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayObservability {
     config: RelayObservabilityConfig,
 }
 
+#[allow(dead_code)]
 impl RelayObservability {
     pub(crate) fn new(config: RelayObservabilityConfig) -> Self {
         Self { config }

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use nostr_sdk::RelayUrl;
 
 use ::whitenoise::integration_tests::registry::ScenarioRegistry;
 use ::whitenoise::*;
@@ -34,7 +35,11 @@ async fn main() -> Result<(), WhitenoiseError> {
         &args.data_dir,
         &args.logs_dir,
         "com.whitenoise.integration-test",
-    );
+    )
+    .with_discovery_relays(vec![
+        RelayUrl::parse("ws://localhost:8080").unwrap(),
+        RelayUrl::parse("ws://localhost:7777").unwrap(),
+    ]);
     if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
         tracing::error!("Failed to initialize Whitenoise: {}", err);
         std::process::exit(1);

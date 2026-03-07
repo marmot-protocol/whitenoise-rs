@@ -3,6 +3,7 @@ use std::time::Duration;
 use super::sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy};
 
 /// Configuration for short-lived, targeted relay work.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EphemeralPlaneConfig {
     pub(crate) timeout: Duration,
