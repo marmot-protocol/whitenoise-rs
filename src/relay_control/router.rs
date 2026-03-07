@@ -69,6 +69,10 @@ impl RelayRouter {
                 subscription_id.clone(),
             ))
     }
+
+    pub(crate) async fn context_count(&self) -> usize {
+        self.subscription_contexts.read().await.len()
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +91,7 @@ mod tests {
             plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url.clone(),
-            stream: SubscriptionStream::DiscoveryMetadata,
+            stream: SubscriptionStream::DiscoveryUserData,
         };
 
         router
@@ -116,7 +120,7 @@ mod tests {
             plane: RelayPlane::Discovery,
             account_pubkey: None,
             relay_url: relay_url_a.clone(),
-            stream: SubscriptionStream::DiscoveryRelayLists,
+            stream: SubscriptionStream::DiscoveryUserData,
         };
         let context_b = SubscriptionContext {
             plane: RelayPlane::Group,

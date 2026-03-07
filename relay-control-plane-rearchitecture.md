@@ -923,3 +923,24 @@ Recommended path:
 
 This gives White Noise a new control plane without an all-at-once transport
 rewrite.
+
+## Revisit Before Completion
+
+### Group Subscription Privacy
+
+Current group-plane behavior batches all `nostr_group_id` values for one
+account into a single long-lived MLS subscription by placing every group ID
+into the same `h`-tag filter.
+
+That is operationally simple, but it has a privacy cost: a network observer who
+can see subscription filters can infer the full set of group IDs currently being
+tracked for that account.
+
+Before this project is considered complete, revisit whether we should keep this
+shape or move to a more privacy-preserving strategy, for example:
+
+- smaller group batches per account
+- one subscription per group
+- rotating or partitioned group filters
+- another approach that reduces group-set disclosure without making relay load
+  or recovery behavior unacceptable

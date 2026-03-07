@@ -353,7 +353,7 @@ impl Whitenoise {
                 );
             }
             // For new users, we need to add the user to the global subscriptions batches so we get updates on their events
-            if let Err(e) = self.refresh_global_subscription_for_user(&user_clone).await {
+            if let Err(e) = self.refresh_global_subscription_for_user().await {
                 tracing::warn!(
                     target: "whitenoise::users::sync_user_blocking",
                     "Failed to refresh global subscription for new user {}: {}",
@@ -437,10 +437,7 @@ impl Whitenoise {
                 tracing::warn!("Failed to fetch metadata for {}: {}", user_clone.pubkey, e);
             }
 
-            if let Err(e) = whitenoise
-                .refresh_global_subscription_for_user(&user_clone)
-                .await
-            {
+            if let Err(e) = whitenoise.refresh_global_subscription_for_user().await {
                 tracing::warn!(
                     target: "whitenoise::users::background_fetch_user_data",
                     "Failed to refresh global subscription for {}: {}",
@@ -620,7 +617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_query_relays_with_no_stored_relays_includes_defaults() {
+    async fn test_get_query_relays_with_no_stored_relays_uses_discovery_relays() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let test_pubkey = nostr_sdk::Keys::generate().public_key();
         let user = User {
@@ -635,10 +632,10 @@ mod tests {
         let query_urls: std::collections::HashSet<RelayUrl> =
             Relay::urls(&query_relays).into_iter().collect();
 
-        for url in Relay::urls(&Relay::defaults()) {
+        for url in &whitenoise.config.discovery_relays {
             assert!(
-                query_urls.contains(&url),
-                "Fallback query relays should include default relay: {}",
+                query_urls.contains(url),
+                "Fallback query relays should include discovery relay: {}",
                 url
             );
         }

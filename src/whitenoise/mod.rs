@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -52,7 +52,7 @@ use crate::nostr_manager::NostrManager;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::discovery::DiscoveryPlaneConfig;
 
-use crate::types::ProcessableEvent;
+use crate::types::{ProcessableEvent, RelayControlStateSnapshot};
 
 use accounts::*;
 use app_settings::*;
@@ -206,8 +206,12 @@ impl Whitenoise {
         database: Arc<Database>,
         components: WhitenoiseComponents,
     ) -> Self {
-        let relay_control =
-            RelayControlPlane::new(database.clone(), config.discovery_relays.clone());
+        let relay_control = RelayControlPlane::new(
+            database.clone(),
+            config.discovery_relays.clone(),
+            components.event_sender.clone(),
+            *components.nostr.session_salt(),
+        );
 
         Self {
             config,
@@ -444,6 +448,8 @@ impl Whitenoise {
                 client.connect().await;
             }
         });
+
+        whitenoise.relay_control.start_discovery_plane().await?;
         Ok(whitenoise)
         }).await;
 
@@ -509,56 +515,23 @@ impl Whitenoise {
     }
 
     async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
-        let users_with_relays = User::all_users_with_relay_urls(whitenoise_ref).await?;
-        let fallback_relays = whitenoise_ref.fallback_relay_urls().await;
-
         let accounts = Account::all(&whitenoise_ref.database).await?;
         if accounts.is_empty() {
             tracing::info!(
                 target: "whitenoise::setup_global_users_subscriptions",
-                "No accounts found, skipping global user subscriptions"
+                "No accounts found, clearing discovery subscriptions"
             );
+            // Explicitly sync with empty sets so any previously-active
+            // discovery subscriptions are torn down rather than left live.
+            whitenoise_ref
+                .relay_control
+                .sync_discovery_subscriptions(&[], &[], None)
+                .await
+                .map_err(WhitenoiseError::from)?;
             return Ok(());
         }
 
-        // Find the first account that has a usable signer. External-only
-        // accounts may not have a signer registered yet (e.g. before the
-        // Flutter side provides one), so we skip those gracefully.
-        let signer = accounts.iter().find_map(|account| {
-            match whitenoise_ref.get_signer_for_account(account) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    tracing::debug!(
-                        target: "whitenoise::setup_global_users_subscriptions",
-                        "Skipping account {} for global subscriptions: {}",
-                        account.pubkey.to_hex(),
-                        e,
-                    );
-                    None
-                }
-            }
-        });
-
-        let Some(signer) = signer else {
-            tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "No account has a usable signer, skipping global user subscriptions"
-            );
-            return Ok(());
-        };
-
-        // Compute shared since for global user subscriptions with 10s lookback buffer
-        let since = Self::compute_global_since_timestamp(whitenoise_ref).await?;
-
-        whitenoise_ref
-            .nostr
-            .setup_batched_relay_subscriptions_with_signer(
-                users_with_relays,
-                &fallback_relays,
-                signer,
-                since,
-            )
-            .await?;
+        whitenoise_ref.sync_discovery_subscriptions().await?;
         Ok(())
     }
 
@@ -607,11 +580,10 @@ impl Whitenoise {
     async fn setup_accounts_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
-            let nip65_relays = account.nip65_relays(whitenoise_ref).await?;
             let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
             // Setup subscriptions for this account
             match whitenoise_ref
-                .setup_subscriptions(&account, &nip65_relays, &inbox_relays)
+                .setup_subscriptions(&account, &inbox_relays)
                 .await
             {
                 Ok(()) => {
@@ -809,15 +781,11 @@ impl Whitenoise {
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
-        match (
-            account.nip65_relays(self).await,
-            account.inbox_relays(self).await,
-        ) {
-            (Ok(nip65_relays), Ok(inbox_relays)) => {
-                if let Err(e) = self
-                    .setup_subscriptions(&account, &nip65_relays, &inbox_relays)
-                    .await
-                {
+        // Only inbox_relays is needed by setup_subscriptions; do not gate
+        // recovery on the nip65 lookup which is not used here.
+        match account.inbox_relays(self).await {
+            Ok(inbox_relays) => {
+                if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
                         target: "whitenoise::external_signer",
                         "Failed to recover account subscriptions for {} after signer registration: {}",
@@ -826,10 +794,10 @@ impl Whitenoise {
                     );
                 }
             }
-            (Err(e), _) | (_, Err(e)) => {
+            Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::external_signer",
-                    "Failed to load relay lists for {} during subscription recovery: {}",
+                    "Failed to load inbox relay list for {} during subscription recovery: {}",
                     pubkey.to_hex(),
                     e
                 );
@@ -1043,88 +1011,31 @@ impl Whitenoise {
     /// Returns the union of default relays and currently connected relays.
     ///
     /// Used as the fallback relay set when a user has no stored NIP-65 relays.
-    /// Includes all relay types known to the client (NIP-65, inbox, group, etc.),
-    /// which broadens discovery coverage at negligible cost.
+    /// Discovery fallback is owned by the discovery plane rather than whatever
+    /// other relays happen to be connected for unrelated workloads.
     pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
-        let mut urls: HashSet<RelayUrl> = Relay::defaults().into_iter().map(|r| r.url).collect();
-        for (url, relay) in self.nostr.client.relays().await {
-            if relay.is_connected() {
-                urls.insert(url);
-            }
-        }
-        urls.into_iter().collect()
+        self.relay_control.discovery().relays().to_vec()
     }
 
-    pub(crate) async fn refresh_global_subscription_for_user(&self, user: &User) -> Result<()> {
-        let users_with_relays = User::all_users_with_relay_urls(self).await?;
-        let fallback_relays = self.fallback_relay_urls().await;
-
-        let Some(signer_account) = Account::first(&self.database).await? else {
-            tracing::info!(
-                target: "whitenoise::users::refresh_global_subscription",
-                "No signer account found, skipping global user subscriptions"
-            );
-            return Ok(());
-        };
-
-        let signer = match self.get_signer_for_account(&signer_account) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::users::refresh_global_subscription",
-                    "Failed to get signer for account {} (user {}), skipping global subscription refresh: {e}",
-                    signer_account.pubkey.to_hex(),
-                    user.pubkey.to_hex(),
-                );
-                return Ok(());
-            }
-        };
-        self.nostr
-            .refresh_user_global_subscriptions_with_signer(
-                user.pubkey,
-                users_with_relays,
-                &fallback_relays,
-                signer,
-            )
-            .await?;
+    /// Refreshes discovery subscriptions after a single user's relay metadata
+    /// changes (e.g. after processing a relay-list event for that user).
+    ///
+    /// **Note:** The current implementation performs a full replace of every
+    /// watched-user and follow-list batch, identical to
+    /// `refresh_all_global_subscriptions`. Per-user incremental patching is not
+    /// yet implemented. Callers should not rely on this being cheap for large
+    /// user sets — prefer batching multiple user updates and calling
+    /// `refresh_all_global_subscriptions` once instead.
+    pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
+        self.sync_discovery_subscriptions().await?;
         Ok(())
     }
 
-    /// Refreshes global subscriptions for ALL batches across ALL relays.
-    ///
-    /// Unlike `refresh_global_subscription_for_user` which only refreshes
-    /// batches containing a specific user, this refreshes every batch on every
-    /// relay. Use after bulk user discovery (e.g. contact list processing)
-    /// where new users may be spread across many different relay batches.
+    /// Refreshes discovery subscriptions for all watched users across all
+    /// relay batches. Use after bulk user discovery (e.g. contact-list
+    /// processing) where many users may have changed simultaneously.
     pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
-        let users_with_relays = User::all_users_with_relay_urls(self).await?;
-        let fallback_relays = self.fallback_relay_urls().await;
-
-        let Some(signer_account) = Account::first(&self.database).await? else {
-            tracing::info!(
-                target: "whitenoise::refresh_all_global_subscriptions",
-                "No signer account found, skipping global subscription refresh"
-            );
-            return Ok(());
-        };
-
-        if signer_account.uses_external_signer() {
-            self.nostr
-                .refresh_all_global_subscriptions(users_with_relays, &fallback_relays)
-                .await?;
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&signer_account.pubkey)?;
-
-            self.nostr
-                .refresh_all_global_subscriptions_with_signer(
-                    users_with_relays,
-                    &fallback_relays,
-                    keys,
-                )
-                .await?;
-        }
+        self.sync_discovery_subscriptions().await?;
         Ok(())
     }
 
@@ -1219,33 +1130,13 @@ impl Whitenoise {
 
     /// Checks if account subscriptions are operational
     ///
-    /// Returns true if at least one relay is connected or connecting AND
-    /// expected subscriptions exist (minimum: follow_list and giftwrap).
+    /// Returns true if the account inbox plane exists and at least one of its
+    /// relays is connected or connecting.
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
-        let sub_count = self
-            .nostr
-            .count_subscriptions_for_account(&account.pubkey)
-            .await;
-
-        if sub_count < 2 {
-            return Ok(false); // Early exit if subscriptions missing
-        }
-
-        let user_relays: Vec<RelayUrl> = Relay::urls(&account.nip65_relays(self).await?);
-        let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.inbox_relays(self).await?);
-
-        let (group_relays, _) = self.extract_groups_relays_and_ids(account).await?;
-
-        let all_relays: Vec<RelayUrl> = user_relays
-            .iter()
-            .chain(inbox_relays.iter())
-            .chain(group_relays.iter())
-            .cloned()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        Ok(self.nostr.has_any_relay_connected(&all_relays).await)
+        Ok(self
+            .relay_control
+            .has_account_subscriptions(&account.pubkey)
+            .await)
     }
 
     /// Checks if global subscriptions are operational without refreshing.
@@ -1253,14 +1144,31 @@ impl Whitenoise {
     /// Returns true if at least one relay (from the client pool) is connected or connecting
     /// AND at least one global subscription exists.
     pub async fn is_global_subscriptions_operational(&self) -> Result<bool> {
-        let all_relays: Vec<RelayUrl> = self.nostr.client.relays().await.into_keys().collect();
+        Ok(self.relay_control.has_discovery_subscriptions().await)
+    }
 
-        if !self.nostr.has_any_relay_connected(&all_relays).await {
-            return Ok(false);
-        }
+    /// Returns a live in-memory snapshot of relay-plane state for debugging.
+    pub async fn get_relay_control_state(&self) -> RelayControlStateSnapshot {
+        self.relay_control.snapshot().await
+    }
 
-        let global_count = self.nostr.count_global_subscriptions().await;
-        Ok(global_count > 0)
+    async fn sync_discovery_subscriptions(&self) -> Result<()> {
+        let watched_users = User::all_users_with_relay_urls(self)
+            .await?
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect::<Vec<_>>();
+        let follow_list_accounts = Account::all(&self.database)
+            .await?
+            .into_iter()
+            .map(|account| (account.pubkey, account.since_timestamp(10)))
+            .collect::<Vec<_>>();
+        let public_since = Self::compute_global_since_timestamp(self).await?;
+
+        self.relay_control
+            .sync_discovery_subscriptions(&watched_users, &follow_list_accounts, public_since)
+            .await
+            .map_err(WhitenoiseError::from)
     }
 
     #[cfg(feature = "integration-tests")]
@@ -1271,6 +1179,7 @@ impl Whitenoise {
 
     #[cfg(feature = "integration-tests")]
     pub async fn reset_nostr_client(&self) -> Result<()> {
+        self.relay_control.reset_for_tests().await?;
         self.nostr.client.reset().await;
         Ok(())
     }
@@ -1292,7 +1201,8 @@ pub mod test_utils {
             data_temp_dir.path(),
             logs_temp_dir.path(),
             "com.whitenoise.test",
-        );
+        )
+        .with_discovery_relays(Relay::urls(&Relay::defaults()));
         (config, data_temp_dir, logs_temp_dir)
     }
 
@@ -2061,10 +1971,9 @@ mod tests {
 
             // Test recovery - ensure_account_subscriptions should fix broken state
             whitenoise
-                .nostr
-                .unsubscribe_account_subscriptions(&account.pubkey)
-                .await
-                .unwrap();
+                .relay_control
+                .deactivate_account_subscriptions(&account.pubkey)
+                .await;
 
             let is_operational = whitenoise
                 .is_account_subscriptions_operational(&account)
@@ -2162,10 +2071,9 @@ mod tests {
 
             // Break account1's subscriptions
             whitenoise
-                .nostr
-                .unsubscribe_account_subscriptions(&account1.pubkey)
-                .await
-                .unwrap();
+                .relay_control
+                .deactivate_account_subscriptions(&account1.pubkey)
+                .await;
 
             // Verify account1 is not operational
             let account1_operational = whitenoise
@@ -2584,10 +2492,9 @@ mod tests {
             // Simulate app startup gap: no signer registered yet + account subscriptions missing.
             whitenoise.remove_external_signer(&account.pubkey);
             whitenoise
-                .nostr
-                .unsubscribe_account_subscriptions(&account.pubkey)
-                .await
-                .unwrap();
+                .relay_control
+                .deactivate_account_subscriptions(&account.pubkey)
+                .await;
 
             let before = whitenoise
                 .is_account_subscriptions_operational(&account)
@@ -2669,15 +2576,15 @@ mod tests {
         use std::collections::HashSet;
 
         #[tokio::test]
-        async fn test_fallback_relay_urls_includes_defaults() {
+        async fn test_fallback_relay_urls_uses_discovery_plane_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let fallback = whitenoise.fallback_relay_urls().await;
-            let default_urls: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
+            let discovery_urls = whitenoise.config.discovery_relays.clone();
 
-            for url in &default_urls {
+            for url in &discovery_urls {
                 assert!(
                     fallback.contains(url),
-                    "Fallback should include default relay: {}",
+                    "Fallback should include discovery relay: {}",
                     url
                 );
             }

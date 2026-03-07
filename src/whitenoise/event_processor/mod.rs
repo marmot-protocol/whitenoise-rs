@@ -3,7 +3,8 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::{
     nostr_manager::utils::is_event_timestamp_valid,
-    types::{ProcessableEvent, RetryInfo},
+    relay_control::SubscriptionStream,
+    types::{EventSource, ProcessableEvent, RetryInfo},
     whitenoise::{
         Whitenoise,
         error::{Result, WhitenoiseError},
@@ -57,7 +58,7 @@ impl Whitenoise {
 
                     // Process the event
                     match event {
-                        ProcessableEvent::NostrEvent { event, subscription_id, retry_info } => {
+                        ProcessableEvent::NostrEvent { event, source, retry_info } => {
                             // Validate timestamp before processing
                             if !is_event_timestamp_valid(&event) {
                                 tracing::debug!(
@@ -69,20 +70,40 @@ impl Whitenoise {
                                 continue;
                             }
 
-                            let sub_id = match &subscription_id {
-                                Some(s) => s.clone(),
-                                None => {
-                                    tracing::warn!(
-                                        target: "whitenoise::event_processor::process_events",
-                                        "Event received without subscription ID, skipping"
-                                    );
-                                    continue;
+                            match &source {
+                                EventSource::LegacySubscriptionId(subscription_id) => {
+                                    let Some(sub_id) = subscription_id.clone() else {
+                                        tracing::warn!(
+                                            target: "whitenoise::event_processor::process_events",
+                                            "Event received without subscription ID, skipping"
+                                        );
+                                        continue;
+                                    };
+
+                                    if whitenoise.is_event_global(&sub_id) {
+                                        whitenoise
+                                            .process_global_event(event, source, retry_info)
+                                            .await;
+                                    } else {
+                                        whitenoise
+                                            .process_account_event(event, source, retry_info)
+                                            .await;
+                                    }
                                 }
-                            };
-                            if whitenoise.is_event_global(&sub_id) {
-                                whitenoise.process_global_event(event, sub_id, retry_info).await;
-                            } else {
-                                whitenoise.process_account_event(event, sub_id, retry_info).await;
+                                EventSource::RelaySubscription(context) => match context.stream {
+                                    SubscriptionStream::DiscoveryUserData => {
+                                        whitenoise
+                                            .process_global_event(event, source, retry_info)
+                                            .await;
+                                    }
+                                    SubscriptionStream::DiscoveryFollowLists
+                                    | SubscriptionStream::GroupMessages
+                                    | SubscriptionStream::AccountInboxGiftwraps => {
+                                        whitenoise
+                                            .process_account_event(event, source, retry_info)
+                                            .await;
+                                    }
+                                },
                             }
                         }
                         ProcessableEvent::RelayMessage(relay_url, message) => {
@@ -134,7 +155,7 @@ impl Whitenoise {
     fn schedule_retry(
         &self,
         event: Event,
-        subscription_id: String,
+        source: EventSource,
         retry_info: RetryInfo,
         error: WhitenoiseError,
     ) {
@@ -151,7 +172,7 @@ impl Whitenoise {
 
             let retry_event = ProcessableEvent::NostrEvent {
                 event,
-                subscription_id: Some(subscription_id),
+                source,
                 retry_info: next_retry,
             };
             let sender = self.event_sender.clone();
@@ -177,7 +198,7 @@ mod tests {
     use nostr_sdk::prelude::*;
 
     use crate::nostr_manager::utils::is_event_timestamp_valid;
-    use crate::types::RetryInfo;
+    use crate::types::{EventSource, RetryInfo};
     use crate::whitenoise::error::WhitenoiseError;
     use crate::whitenoise::test_utils::*;
 
@@ -265,7 +286,7 @@ mod tests {
         // Should not panic; spawns a delayed re-queue task
         whitenoise.schedule_retry(
             event,
-            "global_users_abc123_0".to_string(),
+            EventSource::LegacySubscriptionId(Some("global_users_abc123_0".to_string())),
             retry_info,
             error,
         );
@@ -294,7 +315,7 @@ mod tests {
         // Should not spawn any task since retries are exhausted
         whitenoise.schedule_retry(
             event,
-            "global_users_abc123_0".to_string(),
+            EventSource::LegacySubscriptionId(Some("global_users_abc123_0".to_string())),
             retry_info,
             error,
         );

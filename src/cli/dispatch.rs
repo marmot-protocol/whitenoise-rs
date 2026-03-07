@@ -21,6 +21,13 @@ pub async fn dispatch(req: Request) -> Response {
     match req {
         Request::Ping => Response::ok(serde_json::json!("pong")),
 
+        Request::DebugRelayControlState => {
+            match serde_json::to_value(wn.get_relay_control_state().await) {
+                Ok(snapshot) => Response::ok(snapshot),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+
         Request::CreateIdentity => match wn.create_identity().await {
             Ok(account) => to_response(&account),
             Err(e) => Response::err(e.to_string()),

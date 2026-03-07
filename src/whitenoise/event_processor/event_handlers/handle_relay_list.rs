@@ -58,7 +58,7 @@ impl Whitenoise {
 
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
         // Refresh global subscriptions for this user (metadata, relay lists, key packages)
-        if let Err(e) = self.refresh_global_subscription_for_user(user).await {
+        if let Err(e) = self.refresh_global_subscription_for_user().await {
             tracing::warn!(
                 target: "whitenoise::handle_relay_list",
                 "Failed to refresh global subscriptions after relay list change for {}: {}",

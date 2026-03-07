@@ -1,4 +1,7 @@
-use crate::{nostr_manager::parser::SerializableToken, whitenoise::error::WhitenoiseError};
+use crate::{
+    nostr_manager::parser::SerializableToken, relay_control::SubscriptionContext,
+    whitenoise::error::WhitenoiseError,
+};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Serialize;
@@ -50,13 +53,35 @@ impl Default for RetryInfo {
     }
 }
 
+/// Identifies where a Nostr event came from in the processing pipeline.
+///
+/// This enum supports gradual migration from legacy subscription management to
+/// the relay-plane architecture. Events flow through one of two paths:
+///
+/// - **Legacy path**: Old `NostrManager` subscriptions identify streams by an
+///   opaque string subscription ID. The processor inspects the ID prefix to
+///   determine whether the event is global- or account-scoped.
+///
+/// - **Relay-plane path**: New relay-plane sessions attach a typed
+///   [`SubscriptionContext`] at event receipt time, so the processor never
+///   needs to parse subscription IDs.
+#[derive(Debug, Clone)]
+pub enum EventSource {
+    /// Legacy compatibility: the raw subscription ID from the old NostrManager.
+    /// `None` when the event arrived without a subscription ID.
+    LegacySubscriptionId(Option<String>),
+    /// Relay-plane path: fully typed routing context attached by the session.
+    RelaySubscription(SubscriptionContext),
+}
+
 /// Events that can be processed by the Whitenoise event processing system
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ProcessableEvent {
     /// A Nostr event with an optional subscription ID for account-aware processing
     NostrEvent {
         event: Event,
-        subscription_id: Option<String>,
+        source: EventSource,
         retry_info: RetryInfo,
     },
     /// A relay message for logging/monitoring purposes
@@ -64,14 +89,98 @@ pub enum ProcessableEvent {
 }
 
 impl ProcessableEvent {
-    /// Create a new NostrEvent with default retry settings
+    /// Create a new legacy NostrEvent with default retry settings.
     pub fn new_nostr_event(event: Event, subscription_id: Option<String>) -> Self {
         Self::NostrEvent {
             event,
-            subscription_id,
+            source: EventSource::LegacySubscriptionId(subscription_id),
             retry_info: RetryInfo::new(),
         }
     }
+
+    /// Create a new relay-plane NostrEvent with default retry settings.
+    pub fn new_routed_nostr_event(event: Event, source: SubscriptionContext) -> Self {
+        Self::NostrEvent {
+            event,
+            source: EventSource::RelaySubscription(source),
+            retry_info: RetryInfo::new(),
+        }
+    }
+}
+
+/// Live in-memory snapshot of relay-plane state for debugging and health checks.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayControlStateSnapshot {
+    /// UNIX timestamp when the snapshot was assembled.
+    pub generated_at: u64,
+    /// Discovery-plane state and session details.
+    pub discovery: DiscoveryPlaneStateSnapshot,
+    /// Per-account inbox plane state.
+    pub account_inbox: AccountInboxPlanesStateSnapshot,
+    /// Shared group plane state.
+    pub group: GroupPlaneStateSnapshot,
+}
+
+/// Live snapshot of the discovery plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryPlaneStateSnapshot {
+    pub watched_user_count: usize,
+    pub follow_list_subscription_count: usize,
+    pub public_subscription_ids: Vec<String>,
+    pub follow_list_subscription_ids: Vec<String>,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of all account inbox planes.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountInboxPlanesStateSnapshot {
+    pub active_account_count: usize,
+    pub accounts: Vec<AccountInboxPlaneStateSnapshot>,
+}
+
+/// Live snapshot of a single account inbox plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountInboxPlaneStateSnapshot {
+    pub account_pubkey: String,
+    pub subscription_id: String,
+    pub relay_count: usize,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of the shared group plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupPlaneStateSnapshot {
+    pub group_count: usize,
+    pub groups: Vec<GroupPlaneGroupStateSnapshot>,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of one group entry inside the shared group plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupPlaneGroupStateSnapshot {
+    pub account_pubkey: String,
+    pub group_id: String,
+    pub subscription_id: String,
+    pub relay_count: usize,
+    pub relay_urls: Vec<String>,
+}
+
+/// Live snapshot of a relay session shared by one plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaySessionStateSnapshot {
+    pub notification_handler_registered: bool,
+    pub router_context_count: usize,
+    pub registered_subscription_count: usize,
+    pub registered_subscription_ids: Vec<String>,
+    pub relays: Vec<RelaySessionRelayStateSnapshot>,
+}
+
+/// Per-relay live state within a session.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaySessionRelayStateSnapshot {
+    pub relay_url: String,
+    pub status: String,
+    pub subscription_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
