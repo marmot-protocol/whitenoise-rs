@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::reaction_handler;
 use super::types::{AggregatorConfig, ChatMessage, ProcessingError};
-use crate::nostr_manager::parser::Parser;
+use crate::nostr_manager::parser::{Parser, SerializableToken};
 use crate::whitenoise::media_files::MediaFile;
 use mdk_core::prelude::message_types::Message;
 
@@ -137,9 +137,16 @@ pub(crate) async fn process_regular_message(
         }
     };
 
-    // Check if this is a reply (has e-tag)
+    // Check if this is a reply (NIP-C7 q-tag, or legacy e-tag)
     let reply_to_id = extract_reply_info(&message.tags);
     let is_reply = reply_to_id.is_some();
+
+    // NIP-C7: strip the leading nostr:nevent1... reference from reply content
+    let (content, content_tokens) = if is_reply {
+        strip_reply_event_reference(&message.content, content_tokens)
+    } else {
+        (message.content.clone(), content_tokens)
+    };
 
     // Extract media attachments
     let media_attachments = extract_media_attachments(&message.tags, media_files_map);
@@ -147,7 +154,7 @@ pub(crate) async fn process_regular_message(
     Ok(ChatMessage {
         id: message.id.to_string(),
         author: message.pubkey,
-        content: message.content.clone(),
+        content,
         created_at: message.created_at,
         tags: message.tags.clone(),
         is_reply,
@@ -161,19 +168,26 @@ pub(crate) async fn process_regular_message(
     })
 }
 
-/// Extract reply information from message tags
+/// Extract reply information from message tags.
+///
+/// NIP-C7: `q` tags take precedence (new reply format).
+/// Falls back to `e` tags for backward compatibility with pre-NIP-C7 messages.
 fn extract_reply_info(tags: &Tags) -> Option<String> {
-    // Look for e-tags indicating this is a reply
+    // NIP-C7: check q-tags first
+    for tag in tags.iter() {
+        if tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::Q)) {
+            if let Some(event_id) = tag.content() {
+                return Some(event_id.to_string());
+            }
+        }
+    }
+
+    // Fallback: e-tags (use last one per NIP-10 convention)
     let e_tags: Vec<_> = tags
         .iter()
         .filter(|tag| tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)))
         .collect();
 
-    if e_tags.is_empty() {
-        return None;
-    }
-
-    // Use the last e-tag as per Nostr convention (NIP-10)
     if let Some(last_e_tag) = e_tags.last()
         && let Some(event_id) = last_e_tag.content()
     {
@@ -181,6 +195,49 @@ fn extract_reply_info(tags: &Tags) -> Option<String> {
     }
 
     None
+}
+
+/// Strip the leading `nostr:nevent1...\n` reference from reply content and tokens.
+///
+/// Per NIP-C7, reply content starts with a `nostr:nevent1...` URI followed by a newline.
+/// This is a protocol-level detail that should not be shown to the user.
+fn strip_reply_event_reference(
+    content: &str,
+    tokens: Vec<SerializableToken>,
+) -> (String, Vec<SerializableToken>) {
+    if !content.starts_with("nostr:nevent1") {
+        return (content.to_string(), tokens);
+    }
+
+    let stripped = content
+        .find('\n')
+        .map(|pos| &content[pos + 1..])
+        .unwrap_or("")
+        .to_string();
+
+    // Filter the leading Nostr token and adjacent LineBreak from content_tokens
+    let mut skipping = true;
+    let filtered_tokens: Vec<_> = tokens
+        .into_iter()
+        .filter(|token| {
+            if !skipping {
+                return true;
+            }
+            match token {
+                SerializableToken::Nostr(uri) if uri.starts_with("nostr:nevent1") => false,
+                SerializableToken::LineBreak => {
+                    skipping = false;
+                    false
+                }
+                _ => {
+                    skipping = false;
+                    true
+                }
+            }
+        })
+        .collect();
+
+    (stripped, filtered_tokens)
 }
 
 /// Try to process deletion message (kind 5)
@@ -269,31 +326,52 @@ mod tests {
     use mdk_core::prelude::message_types::{Message, MessageState};
 
     use super::*;
-    use crate::nostr_manager::parser::MockParser;
+    use crate::nostr_manager::parser::{MockParser, SerializableToken};
 
     // Test the pure logic functions that don't require complex Message structs
 
     #[test]
-    fn test_extract_reply_info() {
-        // Test with e-tag
+    fn test_extract_reply_info_e_tag() {
         let mut tags = Tags::new();
         tags.push(Tag::parse(vec!["e", "original_message_id"]).unwrap());
 
         let reply_to_id = extract_reply_info(&tags);
         assert_eq!(reply_to_id, Some("original_message_id".to_string()));
+    }
 
-        // Test with no e-tags
-        let empty_tags = Tags::new();
-        let reply_to_id = extract_reply_info(&empty_tags);
+    #[test]
+    fn test_extract_reply_info_empty_tags() {
+        let reply_to_id = extract_reply_info(&Tags::new());
         assert!(reply_to_id.is_none());
+    }
 
-        // Test with multiple e-tags (should use last one per NIP-10)
-        let mut multi_tags = Tags::new();
-        multi_tags.push(Tag::parse(vec!["e", "first_id"]).unwrap());
-        multi_tags.push(Tag::parse(vec!["e", "second_id", "relay", "mention"]).unwrap());
+    #[test]
+    fn test_extract_reply_info_multiple_e_tags_uses_last() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["e", "first_id"]).unwrap());
+        tags.push(Tag::parse(vec!["e", "second_id", "relay", "mention"]).unwrap());
 
-        let reply_to_id = extract_reply_info(&multi_tags);
+        let reply_to_id = extract_reply_info(&tags);
         assert_eq!(reply_to_id, Some("second_id".to_string()));
+    }
+
+    #[test]
+    fn test_extract_reply_info_q_tag() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["q", "quoted_event_id", "", "author_pubkey"]).unwrap());
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert_eq!(reply_to_id, Some("quoted_event_id".to_string()));
+    }
+
+    #[test]
+    fn test_extract_reply_info_q_tag_takes_precedence_over_e_tag() {
+        let mut tags = Tags::new();
+        tags.push(Tag::parse(vec!["e", "e_tag_event_id"]).unwrap());
+        tags.push(Tag::parse(vec!["q", "q_tag_event_id", "", "author_pubkey"]).unwrap());
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert_eq!(reply_to_id, Some("q_tag_event_id".to_string()));
     }
 
     #[test]
@@ -347,17 +425,75 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_reply_info_edge_cases() {
-        // Test with malformed e-tag (no content)
+    fn test_extract_reply_info_malformed_e_tag() {
         let mut malformed_tags = Tags::new();
-        // This will create a tag with just "e" but no content
         if let Ok(tag) = Tag::parse(vec!["e"]) {
             malformed_tags.push(tag);
         }
 
         let reply_to_id = extract_reply_info(&malformed_tags);
-        // Should handle gracefully - return None for malformed tags
         assert!(reply_to_id.is_none());
+    }
+
+    #[test]
+    fn test_extract_reply_info_malformed_q_tag() {
+        let mut tags = Tags::new();
+        if let Ok(tag) = Tag::parse(vec!["q"]) {
+            tags.push(tag);
+        }
+
+        let reply_to_id = extract_reply_info(&tags);
+        assert!(reply_to_id.is_none());
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_with_nevent_prefix() {
+        let content = "nostr:nevent1abc123\nHello world";
+        let tokens = vec![
+            SerializableToken::Nostr("nostr:nevent1abc123".to_string()),
+            SerializableToken::LineBreak,
+            SerializableToken::Text("Hello world".to_string()),
+        ];
+
+        let (stripped, filtered) = strip_reply_event_reference(content, tokens);
+        assert_eq!(stripped, "Hello world");
+        assert_eq!(filtered, vec![SerializableToken::Text("Hello world".to_string())]);
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_no_prefix() {
+        let content = "Just a normal message";
+        let tokens = vec![SerializableToken::Text("Just a normal message".to_string())];
+
+        let (stripped, filtered) = strip_reply_event_reference(content, tokens.clone());
+        assert_eq!(stripped, "Just a normal message");
+        assert_eq!(filtered, tokens);
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_only() {
+        let content = "nostr:nevent1abc123";
+        let tokens = vec![
+            SerializableToken::Nostr("nostr:nevent1abc123".to_string()),
+        ];
+
+        let (stripped, filtered) = strip_reply_event_reference(content, tokens);
+        assert_eq!(stripped, "");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_preserves_note_uri() {
+        let content = "nostr:note1abc123\nHello";
+        let tokens = vec![
+            SerializableToken::Nostr("nostr:note1abc123".to_string()),
+            SerializableToken::LineBreak,
+            SerializableToken::Text("Hello".to_string()),
+        ];
+
+        let (stripped, filtered) = strip_reply_event_reference(content, tokens.clone());
+        assert_eq!(stripped, "nostr:note1abc123\nHello");
+        assert_eq!(filtered, tokens);
     }
 
     #[test]
