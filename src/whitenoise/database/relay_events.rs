@@ -35,7 +35,7 @@ where
         let relay_url = parse_relay_url(row.try_get::<String, _>("relay_url")?)?;
         let plane = parse_relay_plane(row.try_get::<String, _>("plane")?)?;
         let account_pubkey =
-            parse_optional_public_key(row.try_get::<String, _>("account_pubkey")?)?;
+            parse_optional_public_key(row.try_get::<Option<String>, _>("account_pubkey")?)?;
         let occurred_at = parse_timestamp(row, "occurred_at")?;
         let kind = parse_telemetry_kind(row.try_get::<String, _>("telemetry_kind")?)?;
         let subscription_id: Option<String> = row.try_get("subscription_id")?;
@@ -105,28 +105,55 @@ impl RelayEventRecord {
             DatabaseError::Sqlx(sqlx::Error::Protocol("limit overflow".to_string()))
         })?;
 
-        let records = sqlx::query_as::<_, Self>(
-            "SELECT
-                id,
-                relay_url,
-                plane,
-                account_pubkey,
-                occurred_at,
-                telemetry_kind,
-                subscription_id,
-                failure_category,
-                message
-             FROM relay_events
-             WHERE relay_url = ? AND plane = ? AND account_pubkey = ?
-             ORDER BY occurred_at DESC, id DESC
-             LIMIT ?",
-        )
-        .bind(normalize_relay_url(relay_url))
-        .bind(plane.as_str())
-        .bind(serialize_optional_public_key(account_pubkey))
-        .bind(limit)
-        .fetch_all(&database.pool)
-        .await?;
+        let records = match account_pubkey {
+            Some(account_pubkey) => {
+                sqlx::query_as::<_, Self>(
+                    "SELECT
+                        id,
+                        relay_url,
+                        plane,
+                        account_pubkey,
+                        occurred_at,
+                        telemetry_kind,
+                        subscription_id,
+                        failure_category,
+                        message
+                     FROM relay_events
+                     WHERE relay_url = ? AND plane = ? AND account_pubkey = ?
+                     ORDER BY occurred_at DESC, id DESC
+                     LIMIT ?",
+                )
+                .bind(normalize_relay_url(relay_url))
+                .bind(plane.as_str())
+                .bind(account_pubkey.to_hex())
+                .bind(limit)
+                .fetch_all(&database.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, Self>(
+                    "SELECT
+                        id,
+                        relay_url,
+                        plane,
+                        account_pubkey,
+                        occurred_at,
+                        telemetry_kind,
+                        subscription_id,
+                        failure_category,
+                        message
+                     FROM relay_events
+                     WHERE relay_url = ? AND plane = ? AND account_pubkey IS NULL
+                     ORDER BY occurred_at DESC, id DESC
+                     LIMIT ?",
+                )
+                .bind(normalize_relay_url(relay_url))
+                .bind(plane.as_str())
+                .bind(limit)
+                .fetch_all(&database.pool)
+                .await?
+            }
+        };
 
         Ok(records)
     }
@@ -157,20 +184,18 @@ fn parse_failure_category(value: String) -> Result<RelayFailureCategory, sqlx::E
         .map_err(|error| create_column_decode_error("failure_category", &error))
 }
 
-fn parse_optional_public_key(value: String) -> Result<Option<PublicKey>, sqlx::Error> {
-    if value.is_empty() {
+fn parse_optional_public_key(value: Option<String>) -> Result<Option<PublicKey>, sqlx::Error> {
+    let Some(value) = value else {
         return Ok(None);
-    }
+    };
 
     PublicKey::from_hex(&value)
         .map(Some)
         .map_err(|error| create_column_decode_error("account_pubkey", &error.to_string()))
 }
 
-fn serialize_optional_public_key(account_pubkey: Option<PublicKey>) -> String {
-    account_pubkey
-        .map(|pubkey| pubkey.to_hex())
-        .unwrap_or_default()
+fn serialize_optional_public_key(account_pubkey: Option<PublicKey>) -> Option<String> {
+    account_pubkey.map(|pubkey| pubkey.to_hex())
 }
 
 #[cfg(test)]
@@ -195,7 +220,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 relay_url TEXT NOT NULL,
                 plane TEXT NOT NULL,
-                account_pubkey TEXT NOT NULL DEFAULT '',
+                account_pubkey TEXT,
                 occurred_at INTEGER NOT NULL,
                 telemetry_kind TEXT NOT NULL,
                 subscription_id TEXT,
@@ -276,7 +301,7 @@ mod tests {
                 subscription_id,
                 failure_category,
                 message
-            ) VALUES (?, ?, '', ?, ?, NULL, ?, ?)",
+            ) VALUES (?, ?, NULL, ?, ?, NULL, ?, ?)",
         )
         .bind("wss://relay.example.com")
         .bind("ephemeral")

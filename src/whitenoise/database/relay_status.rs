@@ -46,7 +46,7 @@ where
         let relay_url = parse_relay_url(row.try_get::<String, _>("relay_url")?)?;
         let plane = parse_relay_plane(row.try_get::<String, _>("plane")?)?;
         let account_pubkey =
-            parse_optional_public_key(row.try_get::<String, _>("account_pubkey")?)?;
+            parse_optional_public_key(row.try_get::<Option<String>, _>("account_pubkey")?)?;
         let last_connect_attempt_at = parse_optional_timestamp(row, "last_connect_attempt_at")?;
         let last_connect_success_at = parse_optional_timestamp(row, "last_connect_success_at")?;
         let last_failure_at = parse_optional_timestamp(row, "last_failure_at")?;
@@ -95,34 +95,67 @@ impl RelayStatusRecord {
         account_pubkey: Option<PublicKey>,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
-        let record = sqlx::query_as::<_, Self>(
-            "SELECT
-                id,
-                relay_url,
-                plane,
-                account_pubkey,
-                last_connect_attempt_at,
-                last_connect_success_at,
-                last_failure_at,
-                failure_category,
-                last_notice_reason,
-                last_closed_reason,
-                last_auth_reason,
-                auth_required,
-                success_count,
-                failure_count,
-                latency_ms,
-                backoff_until,
-                created_at,
-                updated_at
-             FROM relay_status
-             WHERE relay_url = ? AND plane = ? AND account_pubkey = ?",
-        )
-        .bind(normalize_relay_url(relay_url))
-        .bind(plane.as_str())
-        .bind(serialize_optional_public_key(account_pubkey))
-        .fetch_optional(&database.pool)
-        .await?;
+        let record = match account_pubkey {
+            Some(account_pubkey) => {
+                sqlx::query_as::<_, Self>(
+                    "SELECT
+                        id,
+                        relay_url,
+                        plane,
+                        account_pubkey,
+                        last_connect_attempt_at,
+                        last_connect_success_at,
+                        last_failure_at,
+                        failure_category,
+                        last_notice_reason,
+                        last_closed_reason,
+                        last_auth_reason,
+                        auth_required,
+                        success_count,
+                        failure_count,
+                        latency_ms,
+                        backoff_until,
+                        created_at,
+                        updated_at
+                     FROM relay_status
+                     WHERE relay_url = ? AND plane = ? AND account_pubkey = ?",
+                )
+                .bind(normalize_relay_url(relay_url))
+                .bind(plane.as_str())
+                .bind(account_pubkey.to_hex())
+                .fetch_optional(&database.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, Self>(
+                    "SELECT
+                        id,
+                        relay_url,
+                        plane,
+                        account_pubkey,
+                        last_connect_attempt_at,
+                        last_connect_success_at,
+                        last_failure_at,
+                        failure_category,
+                        last_notice_reason,
+                        last_closed_reason,
+                        last_auth_reason,
+                        auth_required,
+                        success_count,
+                        failure_count,
+                        latency_ms,
+                        backoff_until,
+                        created_at,
+                        updated_at
+                     FROM relay_status
+                     WHERE relay_url = ? AND plane = ? AND account_pubkey IS NULL",
+                )
+                .bind(normalize_relay_url(relay_url))
+                .bind(plane.as_str())
+                .fetch_optional(&database.pool)
+                .await?
+            }
+        };
 
         Ok(record)
     }
@@ -240,69 +273,100 @@ impl RelayStatusRecord {
     }
 
     async fn save(&self, database: &Database) -> Result<(), DatabaseError> {
-        sqlx::query(
-            "INSERT INTO relay_status (
-                relay_url,
-                plane,
-                account_pubkey,
-                last_connect_attempt_at,
-                last_connect_success_at,
-                last_failure_at,
-                failure_category,
-                last_notice_reason,
-                last_closed_reason,
-                last_auth_reason,
-                auth_required,
-                success_count,
-                failure_count,
-                latency_ms,
-                backoff_until,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(relay_url, plane, account_pubkey) DO UPDATE SET
-                last_connect_attempt_at = excluded.last_connect_attempt_at,
-                last_connect_success_at = excluded.last_connect_success_at,
-                last_failure_at = excluded.last_failure_at,
-                failure_category = excluded.failure_category,
-                last_notice_reason = excluded.last_notice_reason,
-                last_closed_reason = excluded.last_closed_reason,
-                last_auth_reason = excluded.last_auth_reason,
-                auth_required = excluded.auth_required,
-                success_count = excluded.success_count,
-                failure_count = excluded.failure_count,
-                latency_ms = excluded.latency_ms,
-                backoff_until = excluded.backoff_until,
-                updated_at = excluded.updated_at",
-        )
-        .bind(normalize_relay_url(&self.relay_url))
-        .bind(self.plane.as_str())
-        .bind(serialize_optional_public_key(self.account_pubkey))
-        .bind(
-            self.last_connect_attempt_at
-                .map(|value| value.timestamp_millis()),
-        )
-        .bind(
-            self.last_connect_success_at
-                .map(|value| value.timestamp_millis()),
-        )
-        .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
-        .bind(
-            self.failure_category
-                .map(|category| category.as_str().to_string()),
-        )
-        .bind(self.last_notice_reason.clone())
-        .bind(self.last_closed_reason.clone())
-        .bind(self.last_auth_reason.clone())
-        .bind(self.auth_required)
-        .bind(self.success_count)
-        .bind(self.failure_count)
-        .bind(self.latency_ms)
-        .bind(self.backoff_until.map(|value| value.timestamp_millis()))
-        .bind(self.created_at.timestamp_millis())
-        .bind(self.updated_at.timestamp_millis())
-        .execute(&database.pool)
-        .await?;
+        if self.id == 0 {
+            sqlx::query(
+                "INSERT INTO relay_status (
+                    relay_url,
+                    plane,
+                    account_pubkey,
+                    last_connect_attempt_at,
+                    last_connect_success_at,
+                    last_failure_at,
+                    failure_category,
+                    last_notice_reason,
+                    last_closed_reason,
+                    last_auth_reason,
+                    auth_required,
+                    success_count,
+                    failure_count,
+                    latency_ms,
+                    backoff_until,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(normalize_relay_url(&self.relay_url))
+            .bind(self.plane.as_str())
+            .bind(serialize_optional_public_key(self.account_pubkey))
+            .bind(
+                self.last_connect_attempt_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(
+                self.last_connect_success_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
+            .bind(
+                self.failure_category
+                    .map(|category| category.as_str().to_string()),
+            )
+            .bind(self.last_notice_reason.clone())
+            .bind(self.last_closed_reason.clone())
+            .bind(self.last_auth_reason.clone())
+            .bind(self.auth_required)
+            .bind(self.success_count)
+            .bind(self.failure_count)
+            .bind(self.latency_ms)
+            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
+            .bind(self.created_at.timestamp_millis())
+            .bind(self.updated_at.timestamp_millis())
+            .execute(&database.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE relay_status SET
+                    last_connect_attempt_at = ?,
+                    last_connect_success_at = ?,
+                    last_failure_at = ?,
+                    failure_category = ?,
+                    last_notice_reason = ?,
+                    last_closed_reason = ?,
+                    last_auth_reason = ?,
+                    auth_required = ?,
+                    success_count = ?,
+                    failure_count = ?,
+                    latency_ms = ?,
+                    backoff_until = ?,
+                    updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(
+                self.last_connect_attempt_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(
+                self.last_connect_success_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
+            .bind(
+                self.failure_category
+                    .map(|category| category.as_str().to_string()),
+            )
+            .bind(self.last_notice_reason.clone())
+            .bind(self.last_closed_reason.clone())
+            .bind(self.last_auth_reason.clone())
+            .bind(self.auth_required)
+            .bind(self.success_count)
+            .bind(self.failure_count)
+            .bind(self.latency_ms)
+            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
+            .bind(self.updated_at.timestamp_millis())
+            .bind(self.id)
+            .execute(&database.pool)
+            .await?;
+        }
 
         Ok(())
     }
@@ -327,20 +391,18 @@ fn parse_failure_category(value: String) -> Result<RelayFailureCategory, sqlx::E
         .map_err(|error| create_column_decode_error("failure_category", &error))
 }
 
-fn parse_optional_public_key(value: String) -> Result<Option<PublicKey>, sqlx::Error> {
-    if value.is_empty() {
+fn parse_optional_public_key(value: Option<String>) -> Result<Option<PublicKey>, sqlx::Error> {
+    let Some(value) = value else {
         return Ok(None);
-    }
+    };
 
     PublicKey::from_hex(&value)
         .map(Some)
         .map_err(|error| create_column_decode_error("account_pubkey", &error.to_string()))
 }
 
-fn serialize_optional_public_key(account_pubkey: Option<PublicKey>) -> String {
-    account_pubkey
-        .map(|pubkey| pubkey.to_hex())
-        .unwrap_or_default()
+fn serialize_optional_public_key(account_pubkey: Option<PublicKey>) -> Option<String> {
+    account_pubkey.map(|pubkey| pubkey.to_hex())
 }
 
 #[cfg(test)]
@@ -365,7 +427,7 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 relay_url TEXT NOT NULL,
                 plane TEXT NOT NULL,
-                account_pubkey TEXT NOT NULL DEFAULT '',
+                account_pubkey TEXT,
                 last_connect_attempt_at INTEGER,
                 last_connect_success_at INTEGER,
                 last_failure_at INTEGER,
@@ -382,6 +444,24 @@ mod tests {
                 updated_at INTEGER NOT NULL,
                 UNIQUE(relay_url, plane, account_pubkey)
             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_relay_status_global_unique
+             ON relay_status(relay_url, plane)
+             WHERE account_pubkey IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_relay_status_account_unique
+             ON relay_status(relay_url, plane, account_pubkey)
+             WHERE account_pubkey IS NOT NULL",
         )
         .execute(&pool)
         .await
