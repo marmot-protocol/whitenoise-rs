@@ -25,6 +25,20 @@ mod publish;
 pub use membership::GroupWithMembership;
 
 impl Whitenoise {
+    fn key_package_incompatibility_error(
+        context: &'static str,
+        failures: &[(PublicKey, WhitenoiseError)],
+    ) -> WhitenoiseError {
+        let details = failures
+            .iter()
+            .map(|(pubkey, reason)| format!("{pubkey}: {reason}"))
+            .collect::<Vec<String>>()
+            .join("; ");
+        WhitenoiseError::InvalidInput(format!(
+            "Incompatible key package(s) while {context}: {details}"
+        ))
+    }
+
     async fn resolve_member_delivery_relays(
         &self,
         member: &User,
@@ -67,22 +81,19 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
+    fn validate_fetched_member_key_package(
+        event: &Event,
+        pk: &PublicKey,
+        expected_ciphersuite: &str,
+    ) -> Result<()> {
         if event.pubkey != *pk {
             return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
+                "key package event {} is signed by {} instead of expected {}",
                 event.id, event.pubkey, pk
             )));
         }
 
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
-
-        Ok(())
+        validate_marmot_key_package_tags(event, expected_ciphersuite)
     }
 
     /// Creates a new MLS group with the specified members and settings
@@ -103,6 +114,7 @@ impl Whitenoise {
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut members = Vec::new();
+        let mut incompatible_members: Vec<(PublicKey, WhitenoiseError)> = Vec::new();
 
         for pk in member_pubkeys.iter() {
             let (mut user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
@@ -154,10 +166,24 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            match Self::validate_fetched_member_key_package(
+                &event,
+                pk,
+                REQUIRED_MLS_CIPHERSUITE_TAG,
+            ) {
+                Ok(()) => {
+                    key_package_events.push(event);
+                    members.push(user);
+                }
+                Err(error) => incompatible_members.push((*pk, error)),
+            }
+        }
 
-            key_package_events.push(event);
-            members.push(user);
+        if !incompatible_members.is_empty() {
+            return Err(Self::key_package_incompatibility_error(
+                "creating group",
+                &incompatible_members,
+            ));
         }
 
         tracing::debug!("Succefully fetched the key packages of members");
@@ -415,6 +441,7 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
+        let mut incompatible_members: Vec<(PublicKey, WhitenoiseError)> = Vec::new();
 
         // Fetch key packages for all members
         for pk in members.iter() {
@@ -442,10 +469,24 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            match Self::validate_fetched_member_key_package(
+                &event,
+                pk,
+                REQUIRED_MLS_CIPHERSUITE_TAG,
+            ) {
+                Ok(()) => {
+                    key_package_events.push(event);
+                    users.push(user);
+                }
+                Err(error) => incompatible_members.push((*pk, error)),
+            }
+        }
 
-            key_package_events.push(event);
-            users.push(user);
+        if !incompatible_members.is_empty() {
+            return Err(Self::key_package_incompatibility_error(
+                "adding members to group",
+                &incompatible_members,
+            ));
         }
 
         let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
