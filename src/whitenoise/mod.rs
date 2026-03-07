@@ -201,7 +201,7 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
-    fn assemble(
+    fn from_components(
         config: WhitenoiseConfig,
         database: Arc<Database>,
         components: WhitenoiseComponents,
@@ -406,7 +406,7 @@ impl Whitenoise {
         } else {
             message_aggregator::MessageAggregator::new()
         };
-        let whitenoise = Self::assemble(
+        let whitenoise = Self::from_components(
             config,
             database,
             WhitenoiseComponents {
@@ -1368,7 +1368,7 @@ pub mod test_utils {
 
         // Create message aggregator for testing
         let message_aggregator = message_aggregator::MessageAggregator::new();
-        let whitenoise = Whitenoise::assemble(
+        let whitenoise = Whitenoise::from_components(
             config,
             database,
             WhitenoiseComponents {
