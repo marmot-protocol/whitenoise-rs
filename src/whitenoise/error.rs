@@ -425,4 +425,29 @@ mod tests {
             "Login error: something broke"
         );
     }
+
+    #[test]
+    fn login_error_keyring_unavailable_display() {
+        let msg = "Platform keyring is not available".to_string();
+        let err = LoginError::KeyringUnavailable(msg.clone());
+        assert_eq!(err.to_string(), msg);
+    }
+
+    #[test]
+    fn secrets_store_error_converts_to_login_keyring_unavailable() {
+        use crate::whitenoise::secrets_store::SecretsStoreError;
+
+        let secrets_err = SecretsStoreError::KeyringUnavailable("test reason".to_string());
+        let wn_err = WhitenoiseError::SecretsStore(secrets_err);
+        let login_err: LoginError = wn_err.into();
+        assert!(
+            matches!(login_err, LoginError::KeyringUnavailable(_)),
+            "Expected KeyringUnavailable, got: {login_err:?}"
+        );
+        assert!(
+            login_err.to_string().contains("test reason"),
+            "Expected original message preserved, got: {}",
+            login_err
+        );
+    }
 }

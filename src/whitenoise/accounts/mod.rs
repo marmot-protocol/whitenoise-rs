@@ -150,6 +150,10 @@ pub enum LoginError {
     #[error("No login in progress for this account")]
     NoLoginInProgress,
 
+    /// The platform keyring/credential store is not available.
+    #[error("{0}")]
+    KeyringUnavailable(String),
+
     /// An internal error that doesn't fit the above categories.
     #[error("Login error: {0}")]
     Internal(String),
@@ -170,6 +174,7 @@ impl From<WhitenoiseError> for LoginError {
             WhitenoiseError::NostrManager(NostrManagerError::Timeout) => {
                 Self::Timeout("relay operation timed out".to_string())
             }
+            WhitenoiseError::SecretsStore(ref e) => Self::KeyringUnavailable(e.to_string()),
             other => Self::Internal(other.to_string()),
         }
     }

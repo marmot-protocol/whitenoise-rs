@@ -135,9 +135,33 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
     match e {
         KeyringError::NoDefaultStore => SecretsStoreError::KeyringNotInitialized(e.to_string()),
         KeyringError::NoStorageAccess(ref err) => {
-            SecretsStoreError::KeyringUnavailable(err.to_string())
+            SecretsStoreError::KeyringUnavailable(format_storage_access_error(err.as_ref()))
         }
         other => SecretsStoreError::KeyringError(other.to_string()),
+    }
+}
+
+/// Produces a user-friendly message for `NoStorageAccess` errors, with
+/// platform-specific remediation hints.
+fn format_storage_access_error(inner: &dyn std::error::Error) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        format!(
+            "Platform keyring is not available. On Linux, White Noise uses the kernel \
+             keyutils subsystem (keyctl) to store secret keys. This error typically \
+             occurs on headless systems, in SSH sessions, or in containers where no \
+             session keyring is active. Try running `keyctl session` before starting \
+             the daemon, or ensure your init system provides a session keyring. \
+             (Original error: {inner})"
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!(
+            "Platform keyring is not available: {inner}. \
+             Ensure your system's credential storage service is running and accessible."
+        )
     }
 }
 
@@ -256,14 +280,22 @@ mod tests {
 
     #[test]
     fn test_map_keyring_error_no_storage_access() {
-        let inner = std::io::Error::other("permission denied");
+        let inner = std::io::Error::other("KeyRevoked");
         let err = map_keyring_error(KeyringError::NoStorageAccess(Box::new(inner)));
         assert!(
             matches!(err, SecretsStoreError::KeyringUnavailable(_)),
             "Expected KeyringUnavailable, got: {:?}",
             err
         );
-        assert!(err.to_string().contains("permission denied"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Platform keyring is not available"),
+            "Expected actionable guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("KeyRevoked"),
+            "Expected original error in message, got: {msg}"
+        );
     }
 
     #[test]
