@@ -305,11 +305,7 @@ impl RelaySession {
                 }
                 for (relay_url, old_ctx) in prev_contexts {
                     self.router
-                        .record_subscription_context(
-                            relay_url,
-                            subscription_id.clone(),
-                            old_ctx,
-                        )
+                        .record_subscription_context(relay_url, subscription_id.clone(), old_ctx)
                         .await;
                 }
                 for relay_url in relay_urls {
