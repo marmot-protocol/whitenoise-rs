@@ -1018,17 +1018,23 @@ impl Whitenoise {
         self.relay_control.discovery().relays().to_vec()
     }
 
+    /// Refreshes discovery subscriptions after a single user's relay metadata
+    /// changes (e.g. after processing a relay-list event for that user).
+    ///
+    /// **Note:** The current implementation performs a full replace of every
+    /// watched-user and follow-list batch, identical to
+    /// `refresh_all_global_subscriptions`. Per-user incremental patching is not
+    /// yet implemented. Callers should not rely on this being cheap for large
+    /// user sets — prefer batching multiple user updates and calling
+    /// `refresh_all_global_subscriptions` once instead.
     pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
         self.sync_discovery_subscriptions().await?;
         Ok(())
     }
 
-    /// Refreshes global subscriptions for ALL batches across ALL relays.
-    ///
-    /// Unlike `refresh_global_subscription_for_user` which only refreshes
-    /// batches containing a specific user, this refreshes every batch on every
-    /// relay. Use after bulk user discovery (e.g. contact list processing)
-    /// where new users may be spread across many different relay batches.
+    /// Refreshes discovery subscriptions for all watched users across all
+    /// relay batches. Use after bulk user discovery (e.g. contact-list
+    /// processing) where many users may have changed simultaneously.
     pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
         self.sync_discovery_subscriptions().await?;
         Ok(())

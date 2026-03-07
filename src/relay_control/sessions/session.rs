@@ -325,6 +325,15 @@ impl RelaySession {
         self.client.unsubscribe_all().await;
     }
 
+    /// Spawns the long-lived relay notification handler.
+    ///
+    /// The returned `JoinHandle` is intentionally not stored. This task is
+    /// expected to run for the lifetime of the session; it exits only when the
+    /// underlying `Client` shuts down (via `RelayPoolNotification::Shutdown`).
+    /// Events queued in the Tokio channel at process-exit time may be dropped —
+    /// this is an accepted trade-off for the current phase. A future `shutdown()`
+    /// method could cancel the client and `await` this handle to drain in-flight
+    /// events gracefully.
     fn spawn_notification_handler(&self, event_sender: Sender<ProcessableEvent>) {
         if self
             .state
