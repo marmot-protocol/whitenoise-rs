@@ -42,10 +42,10 @@ where
         let occurred_at = parse_timestamp(row, "occurred_at")?;
         let kind = parse_telemetry_kind(row.try_get::<String, _>("telemetry_kind")?)?;
         let subscription_id: Option<String> = row.try_get("subscription_id")?;
-        let failure_category = match row.try_get::<Option<String>, _>("failure_category")? {
-            Some(value) => Some(parse_failure_category(value)?),
-            None => None,
-        };
+        let failure_category = row
+            .try_get::<Option<String>, _>("failure_category")?
+            .map(parse_failure_category)
+            .transpose()?;
         let message: Option<String> = row.try_get("message")?;
 
         Ok(Self {

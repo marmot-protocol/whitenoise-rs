@@ -52,10 +52,10 @@ where
         let last_connect_attempt_at = parse_optional_timestamp(row, "last_connect_attempt_at")?;
         let last_connect_success_at = parse_optional_timestamp(row, "last_connect_success_at")?;
         let last_failure_at = parse_optional_timestamp(row, "last_failure_at")?;
-        let failure_category = match row.try_get::<Option<String>, _>("failure_category")? {
-            Some(value) => Some(parse_failure_category(value)?),
-            None => None,
-        };
+        let failure_category = row
+            .try_get::<Option<String>, _>("failure_category")?
+            .map(parse_failure_category)
+            .transpose()?;
         let last_notice_reason: Option<String> = row.try_get("last_notice_reason")?;
         let last_closed_reason: Option<String> = row.try_get("last_closed_reason")?;
         let last_auth_reason: Option<String> = row.try_get("last_auth_reason")?;
