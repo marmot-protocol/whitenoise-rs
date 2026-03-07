@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::reaction_handler;
 use super::types::{AggregatorConfig, ChatMessage, ProcessingError};
-use crate::nostr_manager::parser::{Parser, SerializableToken};
+use crate::nostr_manager::parser::Parser;
 use crate::whitenoise::media_files::MediaFile;
 use mdk_core::prelude::message_types::Message;
 
@@ -128,24 +128,24 @@ pub(crate) async fn process_regular_message(
     parser: &dyn Parser,
     media_files_map: &HashMap<String, MediaFile>,
 ) -> Result<ChatMessage, ProcessingError> {
-    // Parse content tokens
-    let content_tokens = match parser.parse(&message.content) {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            tracing::warn!("Failed to parse message content: {}", e);
-            Vec::new() // Use empty tokens if parsing fails
-        }
-    };
-
     // Check if this is a reply (NIP-C7 q-tag, or legacy e-tag)
     let reply_to_id = extract_reply_info(&message.tags);
     let is_reply = reply_to_id.is_some();
 
-    // NIP-C7: strip the leading nostr:nevent1... reference from reply content
-    let (content, content_tokens) = if is_reply {
-        strip_reply_event_reference(&message.content, content_tokens)
+    // NIP-C7: strip the leading nostr:nevent1... reference from reply content,
+    // then parse tokens from the final content so they always stay aligned.
+    let content = if is_reply {
+        strip_reply_event_reference(&message.content)
     } else {
-        (message.content.clone(), content_tokens)
+        message.content.clone()
+    };
+
+    let content_tokens = match parser.parse(&content) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            tracing::warn!("Failed to parse message content: {}", e);
+            Vec::new()
+        }
     };
 
     // Extract media attachments
@@ -197,47 +197,20 @@ fn extract_reply_info(tags: &Tags) -> Option<String> {
     None
 }
 
-/// Strip the leading `nostr:nevent1...\n` reference from reply content and tokens.
+/// Strip the leading `nostr:nevent1...\n` reference from reply content.
 ///
 /// Per NIP-C7, reply content starts with a `nostr:nevent1...` URI followed by a newline.
 /// This is a protocol-level detail that should not be shown to the user.
-fn strip_reply_event_reference(
-    content: &str,
-    tokens: Vec<SerializableToken>,
-) -> (String, Vec<SerializableToken>) {
+fn strip_reply_event_reference(content: &str) -> String {
     if !content.starts_with("nostr:nevent1") {
-        return (content.to_string(), tokens);
+        return content.to_string();
     }
 
-    let stripped = content
+    content
         .find('\n')
         .map(|pos| &content[pos + 1..])
         .unwrap_or("")
-        .to_string();
-
-    // Filter the leading Nostr token and adjacent LineBreak from content_tokens
-    let mut skipping = true;
-    let filtered_tokens: Vec<_> = tokens
-        .into_iter()
-        .filter(|token| {
-            if !skipping {
-                return true;
-            }
-            match token {
-                SerializableToken::Nostr(uri) if uri.starts_with("nostr:nevent1") => false,
-                SerializableToken::LineBreak => {
-                    skipping = false;
-                    false
-                }
-                _ => {
-                    skipping = false;
-                    true
-                }
-            }
-        })
-        .collect();
-
-    (stripped, filtered_tokens)
+        .to_string()
 }
 
 /// Try to process deletion message (kind 5)
@@ -326,7 +299,7 @@ mod tests {
     use mdk_core::prelude::message_types::{Message, MessageState};
 
     use super::*;
-    use crate::nostr_manager::parser::{MockParser, SerializableToken};
+    use crate::nostr_manager::parser::MockParser;
 
     // Test the pure logic functions that don't require complex Message structs
 
@@ -448,53 +421,26 @@ mod tests {
 
     #[test]
     fn test_strip_reply_event_reference_with_nevent_prefix() {
-        let content = "nostr:nevent1abc123\nHello world";
-        let tokens = vec![
-            SerializableToken::Nostr("nostr:nevent1abc123".to_string()),
-            SerializableToken::LineBreak,
-            SerializableToken::Text("Hello world".to_string()),
-        ];
-
-        let (stripped, filtered) = strip_reply_event_reference(content, tokens);
+        let stripped = strip_reply_event_reference("nostr:nevent1abc123\nHello world");
         assert_eq!(stripped, "Hello world");
-        assert_eq!(
-            filtered,
-            vec![SerializableToken::Text("Hello world".to_string())]
-        );
     }
 
     #[test]
     fn test_strip_reply_event_reference_no_prefix() {
-        let content = "Just a normal message";
-        let tokens = vec![SerializableToken::Text("Just a normal message".to_string())];
-
-        let (stripped, filtered) = strip_reply_event_reference(content, tokens.clone());
+        let stripped = strip_reply_event_reference("Just a normal message");
         assert_eq!(stripped, "Just a normal message");
-        assert_eq!(filtered, tokens);
     }
 
     #[test]
     fn test_strip_reply_event_reference_nevent_only() {
-        let content = "nostr:nevent1abc123";
-        let tokens = vec![SerializableToken::Nostr("nostr:nevent1abc123".to_string())];
-
-        let (stripped, filtered) = strip_reply_event_reference(content, tokens);
+        let stripped = strip_reply_event_reference("nostr:nevent1abc123");
         assert_eq!(stripped, "");
-        assert!(filtered.is_empty());
     }
 
     #[test]
     fn test_strip_reply_event_reference_preserves_note_uri() {
-        let content = "nostr:note1abc123\nHello";
-        let tokens = vec![
-            SerializableToken::Nostr("nostr:note1abc123".to_string()),
-            SerializableToken::LineBreak,
-            SerializableToken::Text("Hello".to_string()),
-        ];
-
-        let (stripped, filtered) = strip_reply_event_reference(content, tokens.clone());
+        let stripped = strip_reply_event_reference("nostr:note1abc123\nHello");
         assert_eq!(stripped, "nostr:note1abc123\nHello");
-        assert_eq!(filtered, tokens);
     }
 
     #[test]
