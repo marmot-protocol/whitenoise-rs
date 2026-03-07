@@ -128,6 +128,27 @@ impl GroupPlane {
         self.accounts.read().await.contains_key(pubkey)
     }
 
+    /// Returns `true` if the account is active and its group plane is healthy.
+    ///
+    /// - Accounts with no groups: entry present in the map is sufficient (empty
+    ///   `relays` is the canonical "activated, nothing to subscribe to" state).
+    /// - Accounts with groups: at least one group relay must be connected.
+    pub(crate) async fn has_active_subscription(&self, pubkey: &PublicKey) -> bool {
+        let state = self.accounts.read().await;
+        match state.get(pubkey) {
+            None => false,
+            Some(account_state) => {
+                if account_state.relays.is_empty() {
+                    true
+                } else {
+                    self.session
+                        .has_any_relay_connected(&account_state.relays)
+                        .await
+                }
+            }
+        }
+    }
+
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
         hash_pubkey_for_subscription_id(&self.session_salt, pubkey)
     }

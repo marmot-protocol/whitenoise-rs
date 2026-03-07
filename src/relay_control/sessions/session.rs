@@ -213,11 +213,38 @@ impl RelaySession {
             self.emit_telemetry(telemetry);
         }
 
-        // Pre-register routing context BEFORE issuing the subscription to the
-        // relay. A relay can deliver the first matching event as soon as it
-        // acknowledges the REQ; the router and subscription_relays map must be
-        // populated by then or the notification handler will hit a missing
-        // context and silently drop the event.
+        // Snapshot existing routing state before overwriting it. When a
+        // stable subscription ID is being replaced in-place (e.g.
+        // DiscoveryPlane::sync reuses "discovery_user_data_0"), the old
+        // relay-side subscription is still live until the new REQ is accepted.
+        // If the new subscribe call fails we must restore the previous mapping
+        // rather than unconditionally delete it, or the old live subscription
+        // becomes unroutable and its events are silently dropped.
+        let prev_sub_relays: Option<Vec<RelayUrl>> = self
+            .state
+            .subscription_relays
+            .read()
+            .await
+            .get(&subscription_id)
+            .cloned();
+
+        let mut prev_contexts: Vec<(RelayUrl, SubscriptionContext)> = Vec::new();
+        if let Some(ref old_urls) = prev_sub_relays {
+            for relay_url in old_urls {
+                if let Some(ctx) = self
+                    .router
+                    .subscription_context(relay_url, &subscription_id)
+                    .await
+                {
+                    prev_contexts.push((relay_url.clone(), ctx));
+                }
+            }
+        }
+
+        // Pre-register new routing context BEFORE issuing the subscription to
+        // the relay. A relay can deliver the first matching event as soon as it
+        // acknowledges the REQ; the router must be populated by then or the
+        // notification handler will hit a missing context and silently drop it.
         self.state
             .subscription_relays
             .write()
@@ -261,16 +288,28 @@ impl RelaySession {
                 Ok(())
             }
             Err(error) => {
-                // Subscribe failed — roll back the pre-registered context so
-                // the router does not retain stale entries.
-                self.state
-                    .subscription_relays
-                    .write()
-                    .await
-                    .remove(&subscription_id);
+                // Subscribe failed — restore previous routing state so any
+                // still-active relay-side subscription remains routable.
+                {
+                    let mut map = self.state.subscription_relays.write().await;
+                    if let Some(prev) = prev_sub_relays {
+                        map.insert(subscription_id.clone(), prev);
+                    } else {
+                        map.remove(&subscription_id);
+                    }
+                }
                 for relay_url in relay_urls {
                     self.router
                         .remove_subscription_context(relay_url, &subscription_id)
+                        .await;
+                }
+                for (relay_url, old_ctx) in prev_contexts {
+                    self.router
+                        .record_subscription_context(
+                            relay_url,
+                            subscription_id.clone(),
+                            old_ctx,
+                        )
                         .await;
                 }
                 for relay_url in relay_urls {
@@ -347,63 +386,89 @@ impl RelaySession {
         let telemetry_sender = self.telemetry_sender.clone();
         let router = self.router.clone();
         let plane = self.config.plane;
+        let state = self.state.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = client
-                .handle_notifications(move |notification| {
-                    let sender = event_sender.clone();
-                    let telemetry_sender = telemetry_sender.clone();
-                    let router = router.clone();
-                    async move {
-                        match notification {
-                            RelayPoolNotification::Event {
-                                relay_url,
-                                subscription_id,
-                                event,
-                            } => {
-                                if let Some(context) = router
-                                    .subscription_context(&relay_url, &subscription_id)
-                                    .await
-                                {
-                                    let _ = sender
-                                        .send(ProcessableEvent::new_routed_nostr_event(
-                                            event.as_ref().clone(),
-                                            context,
-                                        ))
-                                        .await;
-                                } else {
-                                    tracing::error!(
-                                        target: "whitenoise::relay_control::session",
-                                        "Missing subscription context for relay {} subscription {}",
-                                        relay_url,
-                                        subscription_id
-                                    );
+            // Restart the handler on transient errors so a single relay
+            // disconnect does not permanently blind the session. The loop
+            // exits on a graceful Shutdown notification (Ok return) or when
+            // the event_sender channel closes (receiver dropped).
+            loop {
+                // Clone per-iteration so the `move` closure owns fresh handles.
+                let sender_i = event_sender.clone();
+                let telemetry_i = telemetry_sender.clone();
+                let router_i = router.clone();
+
+                let result = client
+                    .handle_notifications(move |notification| {
+                        let sender = sender_i.clone();
+                        let telemetry_sender = telemetry_i.clone();
+                        let router = router_i.clone();
+                        async move {
+                            match notification {
+                                RelayPoolNotification::Event {
+                                    relay_url,
+                                    subscription_id,
+                                    event,
+                                } => {
+                                    if let Some(context) = router
+                                        .subscription_context(&relay_url, &subscription_id)
+                                        .await
+                                    {
+                                        let _ = sender
+                                            .send(ProcessableEvent::new_routed_nostr_event(
+                                                event.as_ref().clone(),
+                                                context,
+                                            ))
+                                            .await;
+                                    } else {
+                                        tracing::error!(
+                                            target: "whitenoise::relay_control::session",
+                                            "Missing subscription context for relay {} subscription {}",
+                                            relay_url,
+                                            subscription_id
+                                        );
+                                    }
+                                    Ok(false)
                                 }
-                                Ok(false)
+                                RelayPoolNotification::Message { relay_url, message } => {
+                                    let notification =
+                                        RelayNotification::from_message(relay_url.clone(), message);
+                                    Self::process_notification(
+                                        notification,
+                                        plane,
+                                        &sender,
+                                        &telemetry_sender,
+                                        &router,
+                                    )
+                                    .await
+                                }
+                                RelayPoolNotification::Shutdown => Ok(true),
                             }
-                            RelayPoolNotification::Message { relay_url, message } => {
-                                let notification =
-                                    RelayNotification::from_message(relay_url.clone(), message);
-                                Self::process_notification(
-                                    notification,
-                                    plane,
-                                    &sender,
-                                    &telemetry_sender,
-                                    &router,
-                                )
-                                .await
-                            }
-                            RelayPoolNotification::Shutdown => Ok(true),
                         }
+                    })
+                    .await;
+
+                match result {
+                    Ok(()) => {
+                        // Graceful shutdown via Shutdown notification.
+                        break;
                     }
-                })
-                .await
-            {
-                tracing::error!(
-                    target: "whitenoise::relay_control::session",
-                    "Notification handler error: {error}"
-                );
+                    Err(error) => {
+                        tracing::error!(
+                            target: "whitenoise::relay_control::session",
+                            "Notification handler error: {error}. Restarting in 1s."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
             }
+
+            // Clear the flag so spawn_notification_handler can be called
+            // again if the session is reused after a clean shutdown.
+            state
+                .notification_handler_registered
+                .store(false, Ordering::SeqCst);
         });
     }
 

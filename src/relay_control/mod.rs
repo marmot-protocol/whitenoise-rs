@@ -173,7 +173,7 @@ impl RelayControlPlane {
             }
         };
 
-        inbox_healthy && self.group_plane.has_account(account_pubkey).await
+        inbox_healthy && self.group_plane.has_active_subscription(account_pubkey).await
     }
 
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {
