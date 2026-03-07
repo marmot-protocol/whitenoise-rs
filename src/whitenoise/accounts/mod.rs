@@ -18,6 +18,7 @@ use crate::nostr_manager::NostrManagerError;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
+use crate::whitenoise::secrets_store::SecretsStoreError;
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
@@ -150,6 +151,10 @@ pub enum LoginError {
     #[error("No login in progress for this account")]
     NoLoginInProgress,
 
+    /// The platform keyring/credential store is not available.
+    #[error("{0}")]
+    KeyringUnavailable(String),
+
     /// An internal error that doesn't fit the above categories.
     #[error("Login error: {0}")]
     Internal(String),
@@ -170,6 +175,16 @@ impl From<WhitenoiseError> for LoginError {
             WhitenoiseError::NostrManager(NostrManagerError::Timeout) => {
                 Self::Timeout("relay operation timed out".to_string())
             }
+            WhitenoiseError::SecretsStore(ref e) => match e {
+                SecretsStoreError::KeyringError(_)
+                | SecretsStoreError::KeyringNotInitialized(_)
+                | SecretsStoreError::KeyringUnavailable(_) => {
+                    Self::KeyringUnavailable(e.to_string())
+                }
+                SecretsStoreError::KeyNotFound | SecretsStoreError::KeyError(_) => {
+                    Self::Internal(e.to_string())
+                }
+            },
             other => Self::Internal(other.to_string()),
         }
     }
