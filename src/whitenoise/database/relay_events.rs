@@ -3,7 +3,11 @@ use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::{
     Database, DatabaseError,
-    utils::{create_column_decode_error, normalize_relay_url, parse_timestamp},
+    relay_observability::{
+        parse_failure_category, parse_optional_public_key, parse_relay_plane, parse_relay_url,
+        parse_telemetry_kind, serialize_optional_public_key,
+    },
+    utils::{normalize_relay_url, parse_timestamp},
 };
 use crate::relay_control::{
     RelayPlane,
@@ -158,46 +162,6 @@ impl RelayEventRecord {
         Ok(records)
     }
 }
-
-fn parse_relay_url(value: String) -> Result<RelayUrl, sqlx::Error> {
-    RelayUrl::parse(&value).map_err(|error| sqlx::Error::ColumnDecode {
-        index: "relay_url".to_string(),
-        source: Box::new(error),
-    })
-}
-
-fn parse_relay_plane(value: String) -> Result<RelayPlane, sqlx::Error> {
-    value
-        .parse::<RelayPlane>()
-        .map_err(|error| create_column_decode_error("plane", &error))
-}
-
-fn parse_telemetry_kind(value: String) -> Result<RelayTelemetryKind, sqlx::Error> {
-    value
-        .parse::<RelayTelemetryKind>()
-        .map_err(|error| create_column_decode_error("telemetry_kind", &error))
-}
-
-fn parse_failure_category(value: String) -> Result<RelayFailureCategory, sqlx::Error> {
-    value
-        .parse::<RelayFailureCategory>()
-        .map_err(|error| create_column_decode_error("failure_category", &error))
-}
-
-fn parse_optional_public_key(value: Option<String>) -> Result<Option<PublicKey>, sqlx::Error> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-
-    PublicKey::from_hex(&value)
-        .map(Some)
-        .map_err(|error| create_column_decode_error("account_pubkey", &error.to_string()))
-}
-
-fn serialize_optional_public_key(account_pubkey: Option<PublicKey>) -> Option<String> {
-    account_pubkey.map(|pubkey| pubkey.to_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
