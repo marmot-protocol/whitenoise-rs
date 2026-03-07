@@ -197,20 +197,37 @@ fn extract_reply_info(tags: &Tags) -> Option<String> {
     None
 }
 
-/// Strip the leading `nostr:nevent1...\n` reference from reply content.
+/// Strip the first `nostr:nevent1...` reference from reply content.
 ///
-/// Per NIP-C7, reply content starts with a `nostr:nevent1...` URI followed by a newline.
-/// This is a protocol-level detail that should not be shown to the user.
+/// Per NIP-C7, reply content includes a `nostr:nevent1...` URI citing the replied-to event.
+/// The NIP does not require this reference to appear at the start of the content, so we scan
+/// for the first occurrence and remove it. Any surrounding whitespace (newlines/spaces) that
+/// was used to separate the reference from the rest of the message is also trimmed.
+///
+/// This is a protocol-level citation that should not be shown to the user — the UI renders
+/// the replied-to message inline above the reply body.
 fn strip_reply_event_reference(content: &str) -> String {
-    if !content.starts_with("nostr:nevent1") {
+    // Find the start of the first nostr:nevent1 token
+    let Some(start) = content.find("nostr:nevent1") else {
         return content.to_string();
-    }
+    };
 
-    content
-        .find('\n')
-        .map(|pos| &content[pos + 1..])
-        .unwrap_or("")
-        .to_string()
+    // Find the end of the token: whitespace or end of string terminates the URI
+    let end = content[start..]
+        .find(|c: char| c.is_ascii_whitespace())
+        .map(|rel| start + rel)
+        .unwrap_or(content.len());
+
+    // Build the stripped string: content before the token + content after the token
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start();
+
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_string(),
+        (false, true) => before.to_string(),
+        (false, false) => format!("{before}\n{after}"),
+    }
 }
 
 /// Try to process deletion message (kind 5)
@@ -420,13 +437,13 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_reply_event_reference_with_nevent_prefix() {
+    fn test_strip_reply_event_reference_at_start() {
         let stripped = strip_reply_event_reference("nostr:nevent1abc123\nHello world");
         assert_eq!(stripped, "Hello world");
     }
 
     #[test]
-    fn test_strip_reply_event_reference_no_prefix() {
+    fn test_strip_reply_event_reference_no_nevent() {
         let stripped = strip_reply_event_reference("Just a normal message");
         assert_eq!(stripped, "Just a normal message");
     }
@@ -435,6 +452,25 @@ mod tests {
     fn test_strip_reply_event_reference_nevent_only() {
         let stripped = strip_reply_event_reference("nostr:nevent1abc123");
         assert_eq!(stripped, "");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_in_middle() {
+        let stripped = strip_reply_event_reference("Hello nostr:nevent1abc123 world");
+        assert_eq!(stripped, "Hello\nworld");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_nevent_at_end() {
+        let stripped = strip_reply_event_reference("Hello world\nnostr:nevent1abc123");
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_strip_reply_event_reference_only_first_nevent_removed() {
+        let stripped =
+            strip_reply_event_reference("nostr:nevent1first\nSome text nostr:nevent1second");
+        assert_eq!(stripped, "Some text nostr:nevent1second");
     }
 
     #[test]
