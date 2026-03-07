@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 use whitenoise::cli::commands::{
     accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, debug::DebugCmd,
-    follows::FollowsCmd, groups::GroupsCmd, identity, messages::MessagesCmd,
+    follows::FollowsCmd, groups::GroupsCmd, identity, media::MediaCmd, messages::MessagesCmd,
     notifications::NotificationsCmd, profile::ProfileCmd, relays::RelaysCmd, settings::SettingsCmd,
     users::UsersCmd,
 };
@@ -76,6 +76,10 @@ enum Cmd {
     #[clap(subcommand)]
     Groups(GroupsCmd),
 
+    /// Manage media files
+    #[clap(subcommand)]
+    Media(MediaCmd),
+
     /// Manage messages
     #[clap(subcommand)]
     Messages(MessagesCmd),
@@ -122,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Accounts(cmd) => cmd.run(&socket, args.json).await,
         Cmd::Chats(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Groups(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Media(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Messages(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Follows(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Profile(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
