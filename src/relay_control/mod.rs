@@ -135,11 +135,18 @@ impl RelayControlPlane {
             self.event_sender.clone(),
             self.session_salt,
         );
-        plane.activate(inbox_relays, since, signer).await?;
         self.account_inbox_planes
             .write()
             .await
-            .insert(account_pubkey, plane);
+            .insert(account_pubkey, plane.clone());
+        if let Err(error) = plane.activate(inbox_relays, since, signer).await {
+            self.account_inbox_planes
+                .write()
+                .await
+                .remove(&account_pubkey);
+            plane.deactivate().await;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -173,7 +180,11 @@ impl RelayControlPlane {
             }
         };
 
-        inbox_healthy && self.group_plane.has_active_subscription(account_pubkey).await
+        inbox_healthy
+            && self
+                .group_plane
+                .has_active_subscription(account_pubkey)
+                .await
     }
 
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {
@@ -183,6 +194,26 @@ impl RelayControlPlane {
     /// Discovery-plane configuration, including the configured relay set.
     pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlane {
         &self.discovery
+    }
+
+    #[cfg(feature = "integration-tests")]
+    pub(crate) async fn reset_for_tests(&self) -> NostrResult<()> {
+        self.sync_discovery_subscriptions(&[], &[], None).await?;
+
+        let inbox_planes = self
+            .account_inbox_planes
+            .write()
+            .await
+            .drain()
+            .map(|(_, plane)| plane)
+            .collect::<Vec<_>>();
+
+        for plane in inbox_planes {
+            plane.deactivate().await;
+        }
+
+        self.group_plane.reset().await;
+        Ok(())
     }
 }
 

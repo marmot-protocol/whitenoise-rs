@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{
     RelayPlane, SubscriptionStream, hash_pubkey_for_subscription_id,
@@ -42,6 +42,7 @@ pub(crate) struct GroupPlane {
     session: RelaySession,
     session_salt: [u8; 16],
     accounts: RwLock<HashMap<PublicKey, GroupAccountState>>,
+    update_lock: Mutex<()>,
 }
 
 impl GroupPlane {
@@ -57,6 +58,7 @@ impl GroupPlane {
             session: RelaySession::new(config, event_sender),
             session_salt,
             accounts: RwLock::new(HashMap::new()),
+            update_lock: Mutex::new(()),
         }
     }
 
@@ -67,10 +69,13 @@ impl GroupPlane {
         group_ids: &[String],
         since: Option<Timestamp>,
     ) -> Result<()> {
+        let _update_guard = self.update_lock.lock().await;
         let subscription_id =
             SubscriptionId::new(format!("{}_mls_messages", self.pubkey_hash(&pubkey)));
 
-        self.session.unsubscribe(&subscription_id).await;
+        if self.accounts.read().await.contains_key(&pubkey) {
+            self.session.unsubscribe(&subscription_id).await;
+        }
 
         if group_ids.is_empty() || relays.is_empty() {
             // Keep the account in the map with empty state so health checks
@@ -130,10 +135,12 @@ impl GroupPlane {
     }
 
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
+        let _update_guard = self.update_lock.lock().await;
         let subscription_id =
             SubscriptionId::new(format!("{}_mls_messages", self.pubkey_hash(pubkey)));
-        self.session.unsubscribe(&subscription_id).await;
-        self.accounts.write().await.remove(pubkey);
+        if self.accounts.write().await.remove(pubkey).is_some() {
+            self.session.unsubscribe(&subscription_id).await;
+        }
     }
 
     #[allow(dead_code)]
@@ -164,6 +171,21 @@ impl GroupPlane {
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
         hash_pubkey_for_subscription_id(&self.session_salt, pubkey)
+    }
+
+    #[cfg(feature = "integration-tests")]
+    pub(crate) async fn reset(&self) {
+        let pubkeys = self
+            .accounts
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for pubkey in pubkeys {
+            self.remove_account(&pubkey).await;
+        }
     }
 }
 

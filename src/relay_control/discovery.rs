@@ -167,11 +167,25 @@ impl DiscoveryPlane {
 
         let mut follow_list_accounts = follow_list_accounts.to_vec();
         follow_list_accounts.sort_unstable_by_key(|(pubkey, _)| pubkey.to_hex());
-        // Deduplicate by pubkey — duplicate entries would create multiple
-        // long-lived ContactList subscriptions for the same author.
-        follow_list_accounts.dedup_by_key(|(pubkey, _)| *pubkey);
 
-        for (index, (account_pubkey, since)) in follow_list_accounts.into_iter().enumerate() {
+        // Deduplicate by pubkey and keep the earliest replay anchor. `None`
+        // is treated as earliest because it means "full replay required".
+        let mut deduped_follow_list_accounts: Vec<(PublicKey, Option<Timestamp>)> =
+            Vec::with_capacity(follow_list_accounts.len());
+        for (pubkey, since) in follow_list_accounts {
+            match deduped_follow_list_accounts.last_mut() {
+                Some((last_pubkey, last_since)) if *last_pubkey == pubkey => {
+                    *last_since = match (*last_since, since) {
+                        (None, _) | (_, None) => None,
+                        (Some(existing), Some(candidate)) => Some(existing.min(candidate)),
+                    };
+                }
+                _ => deduped_follow_list_accounts.push((pubkey, since)),
+            }
+        }
+
+        for (index, (account_pubkey, since)) in deduped_follow_list_accounts.into_iter().enumerate()
+        {
             let mut filter = Filter::new().kind(Kind::ContactList).author(account_pubkey);
             if let Some(since) = since {
                 filter = filter.since(since);
@@ -205,8 +219,7 @@ impl DiscoveryPlane {
 
         let stale_to_remove = {
             let mut state = self.state.write().await;
-            let old_public =
-                std::mem::replace(&mut state.public_subscription_ids, new_public_ids);
+            let old_public = std::mem::replace(&mut state.public_subscription_ids, new_public_ids);
             let old_follow =
                 std::mem::replace(&mut state.follow_list_subscription_ids, new_follow_ids);
             old_public

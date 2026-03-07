@@ -1174,6 +1174,7 @@ impl Whitenoise {
 
     #[cfg(feature = "integration-tests")]
     pub async fn reset_nostr_client(&self) -> Result<()> {
+        self.relay_control.reset_for_tests().await?;
         self.nostr.client.reset().await;
         Ok(())
     }
