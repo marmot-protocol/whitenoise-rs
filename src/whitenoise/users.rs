@@ -342,16 +342,20 @@ impl Whitenoise {
 
         let mut user_clone = user.clone();
 
+        // Always sync relay lists in blocking mode so relay-dependent lookups
+        // (e.g. key_package_status) have accurate data to work with, regardless
+        // of whether this is a new user or an existing one that may have been
+        // created via a prior background sync that hasn't finished yet.
+        if let Err(e) = user_clone.update_relay_lists(self).await {
+            tracing::warn!(
+                target: "whitenoise::users::sync_user_blocking",
+                "Failed to sync relay lists for user {}: {}",
+                user_clone.pubkey,
+                e
+            );
+        }
+
         if is_new {
-            // For new users, sync relay lists first so we have a good chance of finding their events
-            if let Err(e) = user_clone.update_relay_lists(self).await {
-                tracing::warn!(
-                    target: "whitenoise::users::sync_user_blocking",
-                    "Failed to sync relay lists for new user {}: {}",
-                    user_clone.pubkey,
-                    e
-                );
-            }
             // For new users, we need to add the user to the global subscriptions batches so we get updates on their events
             if let Err(e) = self.refresh_global_subscription_for_user(&user_clone).await {
                 tracing::warn!(
