@@ -716,11 +716,8 @@ impl Whitenoise {
             account.pubkey
         );
 
-        // Clean up existing subscriptions before resubscribing.
-        self.relay_control
-            .deactivate_account_subscriptions(&account.pubkey)
-            .await;
-
+        // Gather all inputs before touching existing subscriptions so that a
+        // fallible data-fetch cannot leave the account with no active subs.
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
 
         let (group_relays_urls, nostr_group_ids) =
@@ -731,6 +728,12 @@ impl Whitenoise {
         let since = account.since_timestamp(10);
 
         let signer = self.get_signer_for_account(account)?;
+
+        // All inputs ready — now safe to tear down and replace.
+        self.relay_control
+            .deactivate_account_subscriptions(&account.pubkey)
+            .await;
+
         self.relay_control
             .activate_account_subscriptions(
                 account.pubkey,

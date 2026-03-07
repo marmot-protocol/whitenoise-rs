@@ -53,12 +53,24 @@ impl Default for RetryInfo {
     }
 }
 
-/// Events that can be processed by the Whitenoise event processing system
+/// Identifies where a Nostr event came from in the processing pipeline.
+///
+/// This enum supports gradual migration from legacy subscription management to
+/// the relay-plane architecture. Events flow through one of two paths:
+///
+/// - **Legacy path**: Old `NostrManager` subscriptions identify streams by an
+///   opaque string subscription ID. The processor inspects the ID prefix to
+///   determine whether the event is global- or account-scoped.
+///
+/// - **Relay-plane path**: New relay-plane sessions attach a typed
+///   [`SubscriptionContext`] at event receipt time, so the processor never
+///   needs to parse subscription IDs.
 #[derive(Debug, Clone)]
 pub enum EventSource {
-    /// Legacy compatibility path that still identifies streams by subscription ID.
+    /// Legacy compatibility: the raw subscription ID from the old NostrManager.
+    /// `None` when the event arrived without a subscription ID.
     LegacySubscriptionId(Option<String>),
-    /// Relay-plane path with typed local routing context.
+    /// Relay-plane path: fully typed routing context attached by the session.
     RelaySubscription(SubscriptionContext),
 }
 

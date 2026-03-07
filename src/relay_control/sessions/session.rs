@@ -112,16 +112,30 @@ impl RelaySession {
 
         let mut successful_relays = 0usize;
         let mut last_error: Option<NostrManagerError> = None;
+        let mut failed_relay_urls: Vec<String> = Vec::new();
 
-        for result in results {
+        for (relay_url, result) in relay_urls.iter().zip(results) {
             match result {
                 Ok(_) => successful_relays += 1,
-                Err(err) => last_error = Some(err),
+                Err(err) => {
+                    failed_relay_urls.push(relay_url.to_string());
+                    last_error = Some(err);
+                }
             }
         }
 
         if successful_relays == 0 {
             return Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections));
+        }
+
+        if !failed_relay_urls.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::relay_control::session",
+                "Partial relay connection failure — {} of {} relays failed: [{}]",
+                failed_relay_urls.len(),
+                relay_urls.len(),
+                failed_relay_urls.join(", "),
+            );
         }
 
         self.client.connect().await;
@@ -199,6 +213,32 @@ impl RelaySession {
             self.emit_telemetry(telemetry);
         }
 
+        // Pre-register routing context BEFORE issuing the subscription to the
+        // relay. A relay can deliver the first matching event as soon as it
+        // acknowledges the REQ; the router and subscription_relays map must be
+        // populated by then or the notification handler will hit a missing
+        // context and silently drop the event.
+        self.state
+            .subscription_relays
+            .write()
+            .await
+            .insert(subscription_id.clone(), relay_urls.to_vec());
+
+        for relay_url in relay_urls {
+            self.router
+                .record_subscription_context(
+                    relay_url.clone(),
+                    subscription_id.clone(),
+                    SubscriptionContext {
+                        plane: self.config.plane,
+                        account_pubkey,
+                        relay_url: relay_url.clone(),
+                        stream,
+                    },
+                )
+                .await;
+        }
+
         let result = self
             .client
             .subscribe_with_id_to(relay_urls, subscription_id.clone(), filter, None)
@@ -206,27 +246,6 @@ impl RelaySession {
 
         match result {
             Ok(_) => {
-                self.state
-                    .subscription_relays
-                    .write()
-                    .await
-                    .insert(subscription_id.clone(), relay_urls.to_vec());
-
-                for relay_url in relay_urls {
-                    self.router
-                        .record_subscription_context(
-                            relay_url.clone(),
-                            subscription_id.clone(),
-                            SubscriptionContext {
-                                plane: self.config.plane,
-                                account_pubkey,
-                                relay_url: relay_url.clone(),
-                                stream,
-                            },
-                        )
-                        .await;
-                }
-
                 for relay_url in relay_urls {
                     let mut telemetry = RelayTelemetry::new(
                         RelayTelemetryKind::SubscriptionSuccess,
@@ -242,6 +261,18 @@ impl RelaySession {
                 Ok(())
             }
             Err(error) => {
+                // Subscribe failed — roll back the pre-registered context so
+                // the router does not retain stale entries.
+                self.state
+                    .subscription_relays
+                    .write()
+                    .await
+                    .remove(&subscription_id);
+                for relay_url in relay_urls {
+                    self.router
+                        .remove_subscription_context(relay_url, &subscription_id)
+                        .await;
+                }
                 for relay_url in relay_urls {
                     let mut telemetry = RelayTelemetry::new(
                         RelayTelemetryKind::SubscriptionFailure,
@@ -339,14 +370,6 @@ impl RelaySession {
                                         subscription_id
                                     );
                                 }
-                                let _ = telemetry_sender.send(
-                                    RelayTelemetry::new(
-                                        RelayTelemetryKind::SubscriptionSuccess,
-                                        plane,
-                                        relay_url,
-                                    )
-                                    .with_subscription_id(subscription_id.to_string()),
-                                );
                                 Ok(false)
                             }
                             RelayPoolNotification::Message { relay_url, message } => {

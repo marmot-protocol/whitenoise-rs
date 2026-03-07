@@ -110,6 +110,13 @@ impl RelayControlPlane {
             .await
     }
 
+    /// Activate group and inbox subscriptions for an account.
+    ///
+    /// **Atomicity:** Activation is NOT atomic across planes. Group
+    /// subscriptions are established first; if inbox activation subsequently
+    /// fails, group subscriptions will already be active. Callers that receive
+    /// an error should call [`Self::deactivate_account_subscriptions`] to clean
+    /// up any partially-established state.
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -150,17 +157,23 @@ impl RelayControlPlane {
     }
 
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
-        let plane = self
-            .account_inbox_planes
-            .read()
-            .await
-            .get(account_pubkey)
-            .cloned();
+        // Both planes must confirm the account is active. The group plane
+        // keeps an entry even for accounts with zero groups (empty state), so
+        // a missing entry unambiguously means setup never completed or failed.
+        let inbox_healthy = {
+            let plane = self
+                .account_inbox_planes
+                .read()
+                .await
+                .get(account_pubkey)
+                .cloned();
+            match plane {
+                Some(plane) => plane.has_connected_relay().await,
+                None => false,
+            }
+        };
 
-        match plane {
-            Some(plane) => plane.has_connected_relay().await,
-            None => false,
-        }
+        inbox_healthy && self.group_plane.has_account(account_pubkey).await
     }
 
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {

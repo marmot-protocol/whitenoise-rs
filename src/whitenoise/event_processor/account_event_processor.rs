@@ -247,7 +247,7 @@ impl Whitenoise {
         };
 
         tracing::debug!(
-            target: "whitenoise::event_processor::process_mls_message",
+            target: "whitenoise::event_processor::account_from_event_source",
             "Processing account-scoped event for account: {}",
             target_pubkey.to_hex()
         );

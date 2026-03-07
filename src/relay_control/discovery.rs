@@ -102,32 +102,35 @@ impl DiscoveryPlane {
     ) -> Result<()> {
         self.start().await?;
 
-        // Discovery sync is a full replace. We intentionally tear down and
-        // rebuild the watched-set subscriptions so callers do not need to
-        // reason about incremental relay or batch mutations.
-        let stale_subscription_ids = {
-            let mut state = self.state.write().await;
-            let stale_subscription_ids = state
-                .public_subscription_ids
-                .iter()
-                .chain(state.follow_list_subscription_ids.iter())
-                .cloned()
-                .collect::<Vec<_>>();
-
-            state.public_subscription_ids.clear();
-            state.follow_list_subscription_ids.clear();
-            stale_subscription_ids
-        };
-
-        for subscription_id in stale_subscription_ids {
-            self.session.unsubscribe(&subscription_id).await;
-        }
-
+        // Short-circuit: no relays configured — retire any existing subscriptions.
         if self.config.relays.is_empty() {
+            let stale = {
+                let mut state = self.state.write().await;
+                let stale = state
+                    .public_subscription_ids
+                    .iter()
+                    .chain(state.follow_list_subscription_ids.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                state.public_subscription_ids.clear();
+                state.follow_list_subscription_ids.clear();
+                stale
+            };
+            for id in stale {
+                self.session.unsubscribe(&id).await;
+            }
             return Ok(());
         }
 
-        let mut state = self.state.write().await;
+        // Discovery sync is a full replace. We build ALL new subscriptions
+        // before touching existing state so that a mid-sync failure leaves the
+        // old subscriptions intact (no coverage gap). Subscription IDs are
+        // positional and stable across syncs (e.g. `discovery_user_data_0`),
+        // so re-subscribing with the same ID replaces the filter in-place on
+        // the relay rather than creating a duplicate stream.
+        let mut new_public_ids: Vec<SubscriptionId> = Vec::new();
+        let mut new_follow_ids: Vec<SubscriptionId> = Vec::new();
+
         let mut watched_users = watched_users.to_vec();
         watched_users.sort_unstable_by_key(|pubkey| pubkey.to_hex());
         watched_users.dedup();
@@ -159,11 +162,14 @@ impl DiscoveryPlane {
                     None,
                 )
                 .await?;
-            state.public_subscription_ids.push(subscription_id);
+            new_public_ids.push(subscription_id);
         }
 
         let mut follow_list_accounts = follow_list_accounts.to_vec();
         follow_list_accounts.sort_unstable_by_key(|(pubkey, _)| pubkey.to_hex());
+        // Deduplicate by pubkey — duplicate entries would create multiple
+        // long-lived ContactList subscriptions for the same author.
+        follow_list_accounts.dedup_by_key(|(pubkey, _)| *pubkey);
 
         for (index, (account_pubkey, since)) in follow_list_accounts.into_iter().enumerate() {
             let mut filter = Filter::new().kind(Kind::ContactList).author(account_pubkey);
@@ -184,7 +190,34 @@ impl DiscoveryPlane {
                     Some(account_pubkey),
                 )
                 .await?;
-            state.follow_list_subscription_ids.push(subscription_id);
+            new_follow_ids.push(subscription_id);
+        }
+
+        // All new subscriptions established. Atomically swap state and retire
+        // only the IDs that were NOT reused in the new set. IDs that appear in
+        // both the old and new sets were replaced in-place above and must not
+        // be unsubscribed.
+        let new_id_strings: std::collections::HashSet<String> = new_public_ids
+            .iter()
+            .chain(new_follow_ids.iter())
+            .map(|id| id.to_string())
+            .collect();
+
+        let stale_to_remove = {
+            let mut state = self.state.write().await;
+            let old_public =
+                std::mem::replace(&mut state.public_subscription_ids, new_public_ids);
+            let old_follow =
+                std::mem::replace(&mut state.follow_list_subscription_ids, new_follow_ids);
+            old_public
+                .into_iter()
+                .chain(old_follow.into_iter())
+                .filter(|id| !new_id_strings.contains(&id.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        for id in stale_to_remove {
+            self.session.unsubscribe(&id).await;
         }
 
         Ok(())

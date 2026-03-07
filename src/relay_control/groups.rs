@@ -73,7 +73,16 @@ impl GroupPlane {
         self.session.unsubscribe(&subscription_id).await;
 
         if group_ids.is_empty() || relays.is_empty() {
-            self.accounts.write().await.remove(&pubkey);
+            // Keep the account in the map with empty state so health checks
+            // (has_account_subscriptions) can distinguish "activated with no
+            // groups" from "never activated at all".
+            self.accounts.write().await.insert(
+                pubkey,
+                GroupAccountState {
+                    relays: vec![],
+                    group_ids: vec![],
+                },
+            );
             return Ok(());
         }
 

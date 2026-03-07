@@ -519,8 +519,15 @@ impl Whitenoise {
         if accounts.is_empty() {
             tracing::info!(
                 target: "whitenoise::setup_global_users_subscriptions",
-                "No accounts found, skipping discovery subscriptions"
+                "No accounts found, clearing discovery subscriptions"
             );
+            // Explicitly sync with empty sets so any previously-active
+            // discovery subscriptions are torn down rather than left live.
+            whitenoise_ref
+                .relay_control
+                .sync_discovery_subscriptions(&[], &[], None)
+                .await
+                .map_err(WhitenoiseError::from)?;
             return Ok(());
         }
 
