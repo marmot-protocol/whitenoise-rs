@@ -12,8 +12,6 @@ use crate::{
 };
 
 pub mod parser;
-pub mod publisher;
-pub mod query;
 pub mod utils;
 
 #[derive(Error, Debug)]
@@ -65,67 +63,11 @@ impl From<nostr_sdk::client::Error> for NostrManagerError {
 pub struct NostrManager {
     pub(crate) client: Client,
     session_salt: [u8; 16],
-    timeout: Duration,
     pub(crate) event_tracker: std::sync::Arc<dyn EventTracker>,
-    signer_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     // blossom: BlossomClient,
 }
 
 pub type Result<T> = std::result::Result<T, NostrManagerError>;
-
-struct SignerScopeGuard {
-    client: Client,
-    lock_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
-impl SignerScopeGuard {
-    async fn new<S>(
-        client: Client,
-        signer_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
-        signer: S,
-    ) -> Self
-    where
-        S: NostrSigner + 'static,
-    {
-        let lock_guard = signer_lock.lock_owned().await;
-        client.set_signer(signer).await;
-
-        Self {
-            client,
-            lock_guard: Some(lock_guard),
-        }
-    }
-
-    async fn cleanup(mut self) {
-        self.client.unset_signer().await;
-        self.lock_guard.take();
-    }
-}
-
-impl Drop for SignerScopeGuard {
-    fn drop(&mut self) {
-        let Some(lock_guard) = self.lock_guard.take() else {
-            return;
-        };
-
-        let client = self.client.clone();
-        let runtime_handle = tokio::runtime::Handle::try_current();
-        let Ok(runtime_handle) = runtime_handle else {
-            tracing::warn!(
-                target: "whitenoise::nostr_manager::with_signer",
-                "Cannot spawn signer cleanup task because no Tokio runtime is active"
-            );
-            futures::executor::block_on(client.unset_signer());
-            drop(lock_guard);
-            return;
-        };
-
-        runtime_handle.spawn(async move {
-            client.unset_signer().await;
-            drop(lock_guard);
-        });
-    }
-}
 
 impl NostrManager {
     /// Default timeout for client requests
@@ -141,7 +83,7 @@ impl NostrManager {
     pub(crate) async fn new(
         event_sender: Sender<crate::types::ProcessableEvent>,
         event_tracker: std::sync::Arc<dyn EventTracker>,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<Self> {
         let opts = ClientOptions::default().verify_subscriptions(true);
 
@@ -246,26 +188,8 @@ impl NostrManager {
         Ok(Self {
             client,
             session_salt,
-            timeout,
             event_tracker,
-            signer_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
-    }
-
-    /// Reusable helper to execute operations with a temporary signer.
-    ///
-    /// This helper ensures that the signer is always unset after the operation completes,
-    /// including when the operation future is cancelled.
-    async fn with_signer<F, Fut, T>(&self, signer: impl NostrSigner + 'static, f: F) -> Result<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<T>> + Send,
-    {
-        let signer_guard =
-            SignerScopeGuard::new(self.client.clone(), self.signer_lock.clone(), signer).await;
-        let result = f().await;
-        signer_guard.cleanup().await;
-        result
     }
 
     /// Ensures that the signer is unset and all subscriptions are cleared.
@@ -432,10 +356,6 @@ impl NostrManager {
 #[cfg(test)]
 mod subscription_monitoring_tests {
     use super::*;
-    use crate::whitenoise::event_tracker::NoEventTracker;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tokio::sync::oneshot;
 
     #[test]
     fn test_client_relay_timeout_maps_to_timeout_variant() {
@@ -459,48 +379,5 @@ mod subscription_monitoring_tests {
             "Expected Client variant, got: {:?}",
             err
         );
-    }
-
-    #[tokio::test]
-    async fn test_with_signer_unsets_signer_on_cancellation() {
-        let (event_sender, _receiver) = mpsc::channel(100);
-        let event_tracker = Arc::new(NoEventTracker);
-        let nostr_manager =
-            NostrManager::new(event_sender, event_tracker, NostrManager::default_timeout())
-                .await
-                .unwrap();
-
-        let (started_tx, started_rx) = oneshot::channel();
-        let signer = Keys::generate();
-
-        let manager = nostr_manager.clone();
-        let handle = tokio::spawn(async move {
-            manager
-                .with_signer(signer, || async move {
-                    let _ = started_tx.send(());
-                    std::future::pending::<()>().await;
-                    Ok(())
-                })
-                .await
-        });
-
-        started_rx.await.unwrap();
-        assert!(nostr_manager.client.has_signer().await);
-
-        handle.abort();
-        let join_error = handle.await.unwrap_err();
-        assert!(join_error.is_cancelled());
-
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
-            loop {
-                if !nostr_manager.client.has_signer().await {
-                    return;
-                }
-
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("signer should be unset after cancellation within timeout");
     }
 }

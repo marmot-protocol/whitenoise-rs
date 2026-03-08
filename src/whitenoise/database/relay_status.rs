@@ -274,9 +274,9 @@ impl RelayStatusRecord {
         }
     }
 
-    async fn save(&self, database: &Database) -> Result<(), DatabaseError> {
+    async fn save(&mut self, database: &Database) -> Result<(), DatabaseError> {
         if self.id == 0 {
-            sqlx::query(
+            let insert_result = sqlx::query(
                 "INSERT INTO relay_status (
                     relay_url,
                     plane,
@@ -323,6 +323,68 @@ impl RelayStatusRecord {
             .bind(self.backoff_until.map(|value| value.timestamp_millis()))
             .bind(self.created_at.timestamp_millis())
             .bind(self.updated_at.timestamp_millis())
+            .execute(&database.pool)
+            .await;
+
+            match insert_result {
+                Ok(result) => {
+                    self.id = result.last_insert_rowid();
+                }
+                Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                    if let Some(existing) =
+                        Self::find(&self.relay_url, self.plane, self.account_pubkey, database)
+                            .await?
+                    {
+                        self.id = existing.id;
+                    }
+                }
+                Err(error) => return Err(DatabaseError::Sqlx(error)),
+            }
+
+            if self.id == 0 {
+                return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
+            }
+
+            sqlx::query(
+                "UPDATE relay_status SET
+                    last_connect_attempt_at = ?,
+                    last_connect_success_at = ?,
+                    last_failure_at = ?,
+                    failure_category = ?,
+                    last_notice_reason = ?,
+                    last_closed_reason = ?,
+                    last_auth_reason = ?,
+                    auth_required = ?,
+                    success_count = ?,
+                    failure_count = ?,
+                    latency_ms = ?,
+                    backoff_until = ?,
+                    updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(
+                self.last_connect_attempt_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(
+                self.last_connect_success_at
+                    .map(|value| value.timestamp_millis()),
+            )
+            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
+            .bind(
+                self.failure_category
+                    .map(|category| category.as_str().to_string()),
+            )
+            .bind(self.last_notice_reason.clone())
+            .bind(self.last_closed_reason.clone())
+            .bind(self.last_auth_reason.clone())
+            .bind(self.auth_required)
+            .bind(self.success_count)
+            .bind(self.failure_count)
+            .bind(self.latency_ms)
+            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
+            .bind(self.updated_at.timestamp_millis())
+            .bind(self.id)
             .execute(&database.pool)
             .await?;
         } else {

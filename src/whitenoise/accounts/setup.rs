@@ -139,7 +139,7 @@ impl Whitenoise {
             let relays_urls = Relay::urls(key_package_relays);
 
             if let Some(event) = self
-                .nostr
+                .relay_control
                 .fetch_user_key_package(account.pubkey, &relays_urls)
                 .await?
             {
@@ -454,15 +454,12 @@ impl Whitenoise {
         source_relays: &[Relay],
     ) -> Result<Vec<Relay>> {
         let source_relay_urls = Relay::urls(source_relays);
-        // Ensure source relays are in the client pool before attempting to fetch.
-        // Without this, fetch_events_from will fail with RelayNotFound if the
-        // relays haven't been added to the pool yet (e.g. during login before
-        // activate_account runs).
-        self.nostr
-            .ensure_relays_connected(&source_relay_urls)
-            .await?;
+        if source_relay_urls.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let relay_event = self
-            .nostr
+            .relay_control
             .fetch_user_relays(pubkey, relay_type, &source_relay_urls)
             .await?;
 
@@ -511,8 +508,13 @@ impl Whitenoise {
     {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
-        self.nostr
-            .publish_relay_list_with_signer(&relays_urls, relay_type, &target_relays_urls, signer)
+        self.relay_control
+            .publish_relay_list_with_signer(
+                &relays_urls,
+                relay_type,
+                &target_relays_urls,
+                std::sync::Arc::new(signer),
+            )
             .await?;
         Ok(())
     }
@@ -522,7 +524,7 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let nostr = self.nostr.clone();
+        let ephemeral = self.relay_control.ephemeral();
         let signer = self.get_signer_for_account(account)?;
         let user = account.user(&self.database).await?;
         let relays = account.nip65_relays(self).await?;
@@ -532,7 +534,7 @@ impl Whitenoise {
 
             let relays_urls = Relay::urls(&relays);
 
-            nostr
+            ephemeral
                 .publish_metadata_with_signer(&user.metadata, &relays_urls, signer)
                 .await?;
 
@@ -556,7 +558,7 @@ impl Whitenoise {
         relays: Option<&[Relay]>,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let nostr = self.nostr.clone();
+        let ephemeral = self.relay_control.ephemeral();
         let relays = if let Some(relays) = relays {
             relays.to_vec()
         } else {
@@ -575,7 +577,7 @@ impl Whitenoise {
             let relays_urls = Relay::urls(&relays);
             let target_relays_urls = Relay::urls(&target_relays);
 
-            nostr
+            ephemeral
                 .publish_relay_list_with_signer(
                     &relays_urls,
                     relay_type,
@@ -595,7 +597,7 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let nostr = self.nostr.clone();
+        let ephemeral = self.relay_control.ephemeral();
         let relays = account.nip65_relays(self).await?;
         let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.database).await?;
@@ -605,7 +607,7 @@ impl Whitenoise {
             tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing follow list for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
-            nostr
+            ephemeral
                 .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
                 .await?;
 

@@ -47,7 +47,6 @@ impl DiscoveryPlaneConfig {
         [
             "wss://index.hzrd149.com",
             "wss://indexer.coracle.social",
-            "wss://purplepag.es",
             "wss://relay.primal.net",
             "wss://relay.damus.io",
             "wss://relay.ditto.pub",
@@ -314,12 +313,12 @@ mod tests {
     #[test]
     fn test_curated_default_relays_match_literal_count() {
         let relays = DiscoveryPlaneConfig::curated_default_relays();
-        assert_eq!(relays.len(), 7);
+        assert_eq!(relays.len(), 6);
         assert_eq!(
             relays[0],
             RelayUrl::parse("wss://index.hzrd149.com").unwrap()
         );
-        assert_eq!(relays[6], RelayUrl::parse("wss://nos.lol").unwrap());
+        assert_eq!(relays[5], RelayUrl::parse("wss://nos.lol").unwrap());
     }
 
     #[test]

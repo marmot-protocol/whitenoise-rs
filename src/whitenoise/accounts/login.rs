@@ -309,14 +309,26 @@ impl Whitenoise {
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
                     .map_err(LoginError::from)?;
-                self.publish_relay_list(
-                    &default_relays,
-                    relay_type,
-                    &publish_to_relays,
-                    keys.clone(),
-                )
-                .await
-                .map_err(LoginError::from)?;
+                if let Err(error) = self
+                    .publish_relay_list(
+                        &default_relays,
+                        relay_type,
+                        &publish_to_relays,
+                        keys.clone(),
+                    )
+                    .await
+                {
+                    if discovered.nip65.is_empty() || relay_type == RelayType::Nip65 {
+                        return Err(LoginError::from(error));
+                    }
+
+                    tracing::warn!(
+                        target: "whitenoise::accounts",
+                        pubkey = %pubkey,
+                        ?relay_type,
+                        "Failed to publish default relay list to preserved NIP-65 relays; continuing login with local relay state: {error}"
+                    );
+                }
             } else {
                 tracing::debug!(
                     target: "whitenoise::accounts",
@@ -616,15 +628,27 @@ impl Whitenoise {
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
                     .map_err(LoginError::from)?;
-                self.nostr
+                if let Err(error) = self
+                    .relay_control
                     .publish_relay_list_with_signer(
                         &default_urls,
                         relay_type,
                         &publish_to_urls,
-                        signer.clone(),
+                        std::sync::Arc::new(signer.clone()),
                     )
                     .await
-                    .map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
+                {
+                    if discovered.nip65.is_empty() || relay_type == RelayType::Nip65 {
+                        return Err(LoginError::from(WhitenoiseError::from(error)));
+                    }
+
+                    tracing::warn!(
+                        target: "whitenoise::accounts",
+                        pubkey = %pubkey,
+                        ?relay_type,
+                        "Failed to publish default relay list via external signer to preserved NIP-65 relays; continuing login with local relay state: {error}"
+                    );
+                }
             } else {
                 tracing::debug!(
                     target: "whitenoise::accounts",
@@ -1006,7 +1030,7 @@ impl Whitenoise {
     async fn publish_relay_lists_with_signer(
         &self,
         relay_setup: &ExternalSignerRelaySetup,
-        signer: impl NostrSigner + Clone,
+        signer: impl NostrSigner + Clone + 'static,
     ) -> Result<()> {
         let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
 
@@ -1015,12 +1039,12 @@ impl Whitenoise {
                 target: "whitenoise::accounts",
                 "Publishing NIP-65 relay list (defaults)"
             );
-            self.nostr
+            self.relay_control
                 .publish_relay_list_with_signer(
                     &nip65_urls,
                     RelayType::Nip65,
                     &nip65_urls,
-                    signer.clone(),
+                    std::sync::Arc::new(signer.clone()),
                 )
                 .await?;
         }
@@ -1030,12 +1054,12 @@ impl Whitenoise {
                 target: "whitenoise::accounts",
                 "Publishing inbox relay list (defaults)"
             );
-            self.nostr
+            self.relay_control
                 .publish_relay_list_with_signer(
                     &Relay::urls(&relay_setup.inbox_relays),
                     RelayType::Inbox,
                     &nip65_urls,
-                    signer.clone(),
+                    std::sync::Arc::new(signer.clone()),
                 )
                 .await?;
         }
@@ -1045,12 +1069,12 @@ impl Whitenoise {
                 target: "whitenoise::accounts",
                 "Publishing key package relay list (defaults)"
             );
-            self.nostr
+            self.relay_control
                 .publish_relay_list_with_signer(
                     &Relay::urls(&relay_setup.key_package_relays),
                     RelayType::KeyPackage,
                     &nip65_urls,
-                    signer.clone(),
+                    std::sync::Arc::new(signer.clone()),
                 )
                 .await?;
         }
@@ -1251,19 +1275,19 @@ mod tests {
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         // Check that all three event types were published
         let inbox_events = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_relay_urls)
             .await
             .unwrap();
 
         let key_package_relays_events = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_relay_urls)
             .await
             .unwrap();
 
         let key_package_events = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(
                 account.pubkey,
                 &Relay::urls(&account.nip65_relays(&whitenoise).await.unwrap()),
@@ -1339,7 +1363,7 @@ mod tests {
     async fn verify_account_key_package_exists(whitenoise: &Whitenoise, account: &Account) {
         // Check if key package exists by trying to fetch it
         let key_package_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(
                 account.pubkey,
                 &Relay::urls(&account.key_package_relays(whitenoise).await.unwrap()),
@@ -1680,7 +1704,7 @@ mod tests {
         let nip65_relays = account.nip65_relays(&whitenoise).await.unwrap();
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         let fetched_metadata = whitenoise
-            .nostr
+            .relay_control
             .fetch_metadata_from(&nip65_relay_urls, account.pubkey)
             .await
             .expect("Failed to fetch metadata from relays");

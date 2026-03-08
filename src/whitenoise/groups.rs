@@ -147,7 +147,7 @@ impl Whitenoise {
             }
             let kp_relays_urls = Relay::urls(&kp_relays);
             let some_event = self
-                .nostr
+                .relay_control
                 .fetch_user_key_package(*pk, &kp_relays_urls)
                 .await?;
             let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
@@ -214,8 +214,8 @@ impl Whitenoise {
                 )
                 .await?;
 
-            self.nostr
-                .publish_gift_wrap_to(
+            self.relay_control
+                .publish_welcome(
                     &member_pubkey,
                     welcome_rumor.clone(),
                     &[Tag::expiration(one_month_future)],
@@ -428,7 +428,7 @@ impl Whitenoise {
             }
             let relays_to_use_urls = Relay::urls(&relays_to_use);
             let some_event = self
-                .nostr
+                .relay_control
                 .fetch_user_key_package(*pk, &relays_to_use_urls)
                 .await?;
             let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
@@ -500,8 +500,8 @@ impl Whitenoise {
 
             let relay_urls = Relay::urls(&relays_to_use);
 
-            self.nostr
-                .publish_gift_wrap_to(
+            self.relay_control
+                .publish_welcome(
                     &member_pubkey,
                     welcome_rumor.clone(),
                     &[Tag::expiration(one_month_future)],

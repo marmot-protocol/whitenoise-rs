@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
@@ -33,15 +31,12 @@ impl Whitenoise {
         Ok(group_relays.into_iter().collect())
     }
 
-    /// Maximum number of retry attempts when publishing an event to relays.
-    const MAX_PUBLISH_ATTEMPTS: u32 = 3;
-
     /// Publishes a pre-signed event to relays with retry and exponential backoff.
     ///
-    /// Attempts to publish up to [`Self::MAX_PUBLISH_ATTEMPTS`] times with
-    /// exponential backoff (2 s, 4 s). The event is created once by the caller;
-    /// only the relay publish step is retried. A publish is considered
-    /// successful only when at least one relay accepts the event.
+    /// Relay-control ephemeral sessions own the bounded retry policy for
+    /// one-off publishes. This wrapper keeps the group-evolution call sites on
+    /// a single publish entry point while the rest of the control-plane
+    /// migration lands.
     ///
     /// This is the single entry-point for publishing MLS protocol events
     /// (evolution commits, proposals, etc.) so that retry policy changes are
@@ -53,52 +48,10 @@ impl Whitenoise {
         account_pubkey: &PublicKey,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
-        let mut last_error = None;
-
-        for attempt in 0..Self::MAX_PUBLISH_ATTEMPTS {
-            if attempt > 0 {
-                let delay = Duration::from_secs(1 << attempt);
-                tracing::warn!(
-                    target: "whitenoise::groups::publish_event_with_retry",
-                    "Retrying event publish (attempt {}/{}), backing off {delay:?}",
-                    attempt + 1,
-                    Self::MAX_PUBLISH_ATTEMPTS,
-                );
-                tokio::time::sleep(delay).await;
-            }
-
-            match self
-                .nostr
-                .publish_event_to(event.clone(), account_pubkey, relay_urls)
-                .await
-            {
-                Ok(output) if !output.success.is_empty() => return Ok(()),
-                Ok(output) => {
-                    // API call succeeded but no relay accepted the event
-                    tracing::warn!(
-                        target: "whitenoise::groups::publish_event_with_retry",
-                        "Event publish attempt {}/{}: no relay accepted \
-                         (failed: {:?})",
-                        attempt + 1,
-                        Self::MAX_PUBLISH_ATTEMPTS,
-                        output.failed.keys().collect::<Vec<_>>(),
-                    );
-                    last_error = Some(WhitenoiseError::EventPublishNoRelayAccepted);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::groups::publish_event_with_retry",
-                        "Event publish attempt {}/{} failed: {}",
-                        attempt + 1,
-                        Self::MAX_PUBLISH_ATTEMPTS,
-                        e,
-                    );
-                    last_error = Some(e.into());
-                }
-            }
-        }
-
-        Err(last_error.expect("loop ran at least once"))
+        self.relay_control
+            .publish_event_to(event, account_pubkey, relay_urls)
+            .await?;
+        Ok(())
     }
 
     /// Publishes an evolution event and merges the pending commit on success.

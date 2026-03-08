@@ -175,6 +175,8 @@ impl AggregatedMessageRow {
 }
 
 impl AggregatedMessage {
+    const DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS: [u64; 3] = [25, 50, 100];
+
     /// Count ALL events (kind 9, 7, 5) in cache for a group
     /// Used for sync checking: mdk.len() == cache.len()
     pub async fn count_by_group(group_id: &GroupId, database: &Database) -> Result<usize> {
@@ -574,6 +576,47 @@ impl AggregatedMessage {
         }
     }
 
+    pub async fn update_delivery_status_with_retry(
+        message_id: &str,
+        group_id: &GroupId,
+        status: &DeliveryStatus,
+        database: &Database,
+    ) -> Result<ChatMessage> {
+        let mut last_error = None;
+
+        for (attempt, delay_ms) in Self::DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            match Self::update_delivery_status(message_id, group_id, status, database).await {
+                Ok(message) => return Ok(message),
+                Err(error) if Self::is_database_lock_error(&error) => {
+                    last_error = Some(error);
+                    tracing::debug!(
+                        target: "whitenoise::messages::delivery",
+                        attempt = attempt + 1,
+                        delay_ms,
+                        message_id,
+                        "Retrying delivery-status update after SQLite lock"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if let Some(error) = last_error {
+            match Self::update_delivery_status(message_id, group_id, status, database).await {
+                Ok(message) => Ok(message),
+                Err(final_error) if Self::is_database_lock_error(&final_error) => Err(error),
+                Err(final_error) => Err(final_error),
+            }
+        } else {
+            Self::update_delivery_status(message_id, group_id, status, database).await
+        }
+    }
+
     /// Insert an initial delivery status row for an outgoing event.
     ///
     /// Uses a single INSERT (no transaction) to avoid write contention with
@@ -615,6 +658,11 @@ impl AggregatedMessage {
         .await?;
 
         Ok(exists)
+    }
+
+    fn is_database_lock_error(error: &DatabaseError) -> bool {
+        matches!(error, DatabaseError::Sqlx(sqlx::Error::Database(db_error))
+            if db_error.message().contains("database is locked"))
     }
 
     /// Delete ALL cached events for a group

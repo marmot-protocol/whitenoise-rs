@@ -87,7 +87,7 @@ impl Whitenoise {
 
         // Spawn background publish task with retries + delivery tracking for all kinds.
         // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
-        let nostr = self.nostr.clone();
+        let ephemeral = self.relay_control.ephemeral();
         let event_id_str = event_id.to_string();
         let account_pubkey = account.pubkey;
         let database = self.database.clone();
@@ -98,8 +98,8 @@ impl Whitenoise {
         let reaction_content = mdk_message.content.clone();
 
         tokio::spawn(async move {
-            let success = nostr
-                .publish_with_retries(
+            let success = ephemeral
+                .publish_message_event(
                     message_event,
                     &account_pubkey,
                     &group_relays,
@@ -542,7 +542,7 @@ impl Whitenoise {
         // Mark the original message as Retried so it's excluded from future snapshots.
         // This is best-effort: if it fails, the user sees a duplicate (original Failed +
         // new Sending) which is harmless and self-corrects on next app restart.
-        match AggregatedMessage::update_delivery_status(
+        match AggregatedMessage::update_delivery_status_with_retry(
             &event_id_str,
             group_id,
             &DeliveryStatus::Retried,
@@ -1790,18 +1790,18 @@ mod tests {
                 .unwrap();
         assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
 
-        // Build a test event for publish_with_retries
+        // Build a test event for bounded relay-control publish
         let keys = Keys::generate();
         let event = EventBuilder::text_note("test")
             .sign_with_keys(&keys)
             .unwrap();
 
-        // Call publish_with_retries directly with unreachable relays
+        // Call the relay-control publish helper directly with unreachable relays
         let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
+        let ephemeral = whitenoise.relay_control.ephemeral();
 
-        whitenoise
-            .nostr
-            .publish_with_retries(
+        ephemeral
+            .publish_message_event(
                 event,
                 &creator.pubkey,
                 &unreachable_relays,

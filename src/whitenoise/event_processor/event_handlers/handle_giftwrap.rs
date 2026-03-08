@@ -574,7 +574,7 @@ mod tests {
                 .unwrap(),
         );
         let key_pkg_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(member_pubkey, &relays_urls)
             .await
             .unwrap()

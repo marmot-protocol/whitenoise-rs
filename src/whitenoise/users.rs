@@ -97,7 +97,7 @@ impl User {
     pub async fn sync_metadata(&mut self, whitenoise: &Whitenoise) -> Result<()> {
         let relays_urls: Vec<_> = Relay::urls(&self.get_query_relays(whitenoise).await?);
         let metadata_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_metadata_from(&relays_urls, self.pubkey)
             .await?;
         if let Some(event) = metadata_event {

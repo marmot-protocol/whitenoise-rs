@@ -405,7 +405,7 @@ mod tests {
     ) -> GroupId {
         let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
         let key_pkg_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(member_account.pubkey, &relay_urls)
             .await
             .unwrap()

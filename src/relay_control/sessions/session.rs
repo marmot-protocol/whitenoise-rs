@@ -171,6 +171,8 @@ impl RelaySession {
             ));
         }
 
+        self.ensure_relays_connected(relay_urls).await?;
+
         let result = self
             .client
             .fetch_events_from(relay_urls, filter, timeout)
@@ -201,6 +203,70 @@ impl RelaySession {
                         .with_message(error.to_string()),
                     ));
                 }
+                Err(error.into())
+            }
+        }
+    }
+
+    pub(crate) async fn publish_event_to(
+        &self,
+        relay_urls: &[RelayUrl],
+        event: &Event,
+    ) -> Result<Output<EventId>> {
+        for relay_url in relay_urls {
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::PublishAttempt,
+                    self.config.plane,
+                    relay_url.clone(),
+                ),
+            ));
+        }
+
+        self.ensure_relays_connected(relay_urls).await?;
+
+        let result = self.client.send_event_to(relay_urls, event).await;
+        match result {
+            Ok(output) => {
+                for relay_url in relay_urls {
+                    if output.success.contains(relay_url) {
+                        self.emit_telemetry(Self::apply_telemetry_scope(
+                            self.config.telemetry_account_pubkey,
+                            RelayTelemetry::new(
+                                RelayTelemetryKind::PublishSuccess,
+                                self.config.plane,
+                                relay_url.clone(),
+                            ),
+                        ));
+                    } else if let Some(message) = output.failed.get(relay_url) {
+                        self.emit_telemetry(Self::apply_telemetry_scope(
+                            self.config.telemetry_account_pubkey,
+                            RelayTelemetry::new(
+                                RelayTelemetryKind::PublishFailure,
+                                self.config.plane,
+                                relay_url.clone(),
+                            )
+                            .with_message(message.clone()),
+                        ));
+                    }
+                }
+
+                Ok(output)
+            }
+            Err(error) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishFailure,
+                            self.config.plane,
+                            relay_url.clone(),
+                        )
+                        .with_message(error.to_string()),
+                    ));
+                }
+
                 Err(error.into())
             }
         }
@@ -366,6 +432,11 @@ impl RelaySession {
             }
         }
         self.client.unsubscribe(subscription_id).await;
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.client.reset().await;
+        self.client.shutdown().await;
     }
 
     #[allow(dead_code)]
@@ -846,5 +917,28 @@ mod tests {
         );
 
         assert_eq!(telemetry.account_pubkey, Some(account_pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_publish_emits_attempt_and_failure_telemetry() {
+        let (sender, _) = mpsc::channel(8);
+        let mut config = RelaySessionConfig::new(RelayPlane::Ephemeral);
+        config.connect_timeout = std::time::Duration::from_millis(10);
+        let session = RelaySession::new(config, sender);
+        let mut telemetry = session.telemetry();
+
+        let relay_url = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("ephemeral publish test")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let _ = session.publish_event_to(&[relay_url], &event).await;
+
+        let first = telemetry.recv().await.unwrap();
+        let second = telemetry.recv().await.unwrap();
+
+        assert_eq!(first.kind, RelayTelemetryKind::PublishAttempt);
+        assert_eq!(second.kind, RelayTelemetryKind::PublishFailure);
     }
 }

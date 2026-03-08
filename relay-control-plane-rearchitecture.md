@@ -117,7 +117,6 @@ Relay sources:
 - primary indexers
   - `wss://index.hzrd149.com`
   - `wss://indexer.coracle.social`
-  - `wss://purplepag.es`
 - curated general relays
   - `wss://relay.primal.net`
   - `wss://relay.damus.io`

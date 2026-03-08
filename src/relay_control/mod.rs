@@ -1,8 +1,9 @@
 //! Internal relay-control boundary.
 //!
 //! Long-lived discovery, group, and account-inbox subscriptions now run
-//! through dedicated relay-plane sessions. Query and publish flows still use
-//! the legacy `NostrManager` compatibility path until later migration phases.
+//! through dedicated relay-plane sessions. Query and one-off publish flows now
+//! run through dedicated relay-control sessions as the legacy shared-client
+//! compatibility layer is retired incrementally.
 #![allow(clippy::large_enum_variant)]
 
 use core::str::FromStr;
@@ -28,6 +29,7 @@ pub(crate) mod sessions;
 
 use crate::whitenoise::database::{Database, DatabaseError};
 use crate::{
+    RelayType,
     nostr_manager::Result as NostrResult,
     types::{AccountInboxPlanesStateSnapshot, ProcessableEvent, RelayControlStateSnapshot},
 };
@@ -47,6 +49,7 @@ pub(crate) struct RelayControlPlane {
     discovery: discovery::DiscoveryPlane,
     account_inbox_planes: RwLock<HashMap<PublicKey, account_inbox::AccountInboxPlane>>,
     group_plane: groups::GroupPlane,
+    ephemeral: ephemeral::EphemeralPlane,
     router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
@@ -70,6 +73,12 @@ impl RelayControlPlane {
             event_sender.clone(),
         );
         let group_plane = groups::GroupPlane::new(event_sender.clone(), session_salt);
+        let ephemeral = ephemeral::EphemeralPlane::new(
+            ephemeral::EphemeralPlaneConfig::default(),
+            database.clone(),
+            event_sender.clone(),
+            observability.clone(),
+        );
 
         Self {
             database,
@@ -78,6 +87,7 @@ impl RelayControlPlane {
             discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
             group_plane,
+            ephemeral,
             router: router::RelayRouter::default(),
             observability,
             telemetry_persistors_started: AtomicBool::new(false),
@@ -319,6 +329,130 @@ impl RelayControlPlane {
     /// Discovery-plane configuration, including the configured relay set.
     pub(crate) fn discovery(&self) -> &discovery::DiscoveryPlane {
         &self.discovery
+    }
+
+    pub(crate) fn ephemeral(&self) -> ephemeral::EphemeralPlane {
+        self.ephemeral.clone()
+    }
+
+    pub(crate) async fn fetch_metadata_from(
+        &self,
+        relays: &[RelayUrl],
+        pubkey: PublicKey,
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral.fetch_metadata_from(relays, pubkey).await
+    }
+
+    pub(crate) async fn fetch_user_relays(
+        &self,
+        pubkey: PublicKey,
+        relay_type: RelayType,
+        relays: &[RelayUrl],
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral
+            .fetch_user_relays(pubkey, relay_type, relays)
+            .await
+    }
+
+    pub(crate) async fn fetch_user_key_package(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<Option<nostr_sdk::Event>> {
+        self.ephemeral.fetch_user_key_package(pubkey, relays).await
+    }
+
+    pub(crate) async fn publish_welcome(
+        &self,
+        receiver: &PublicKey,
+        rumor: nostr_sdk::UnsignedEvent,
+        extra_tags: &[nostr_sdk::Tag],
+        account_pubkey: PublicKey,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_gift_wrap_to(receiver, rumor, extra_tags, account_pubkey, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_event_to(
+        &self,
+        event: nostr_sdk::Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_event_to(event, account_pubkey, relays)
+            .await
+    }
+
+    pub(crate) async fn publish_metadata_with_signer(
+        &self,
+        metadata: &nostr_sdk::Metadata,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_metadata_with_signer(metadata, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_relay_list_with_signer(
+        &self,
+        relay_list: &[RelayUrl],
+        relay_type: RelayType,
+        target_relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_follow_list_with_signer(
+        &self,
+        follow_list: &[PublicKey],
+        target_relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .publish_follow_list_with_signer(follow_list, target_relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_key_package_with_signer(
+        &self,
+        encoded_key_package: &str,
+        relays: &[RelayUrl],
+        tags: &[nostr_sdk::Tag],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_event_deletion_with_signer(
+        &self,
+        event_id: &nostr_sdk::EventId,
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_event_deletion_with_signer(event_id, relays, signer)
+            .await
+    }
+
+    pub(crate) async fn publish_batch_event_deletion_with_signer(
+        &self,
+        event_ids: &[nostr_sdk::EventId],
+        relays: &[RelayUrl],
+        signer: Arc<dyn nostr_sdk::NostrSigner>,
+    ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
+        self.ephemeral
+            .publish_batch_event_deletion_with_signer(event_ids, relays, signer)
+            .await
     }
 
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {

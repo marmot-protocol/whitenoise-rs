@@ -345,8 +345,13 @@ impl Whitenoise {
         signer: impl NostrSigner + 'static,
     ) -> Result<EventId> {
         let result = self
-            .nostr
-            .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
+            .relay_control
+            .publish_key_package_with_signer(
+                encoded_key_package,
+                relay_urls,
+                tags,
+                std::sync::Arc::new(signer),
+            )
             .await?;
 
         if result.success.is_empty() {
@@ -497,8 +502,12 @@ impl Whitenoise {
         let key_package_relays_urls = Relay::urls(&key_package_relays);
 
         let result = self
-            .nostr
-            .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
+            .relay_control
+            .publish_event_deletion_with_signer(
+                event_id,
+                &key_package_relays_urls,
+                std::sync::Arc::new(signer),
+            )
             .await?;
         Ok(!result.success.is_empty())
     }
@@ -898,8 +907,12 @@ impl Whitenoise {
         context: &str,
     ) -> Result<()> {
         match self
-            .nostr
-            .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)
+            .relay_control
+            .publish_batch_event_deletion_with_signer(
+                event_ids,
+                relay_urls,
+                std::sync::Arc::new(signer),
+            )
             .await
         {
             Ok(result) => {

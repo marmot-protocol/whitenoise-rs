@@ -61,7 +61,7 @@ impl User {
         let key_package_relays_urls: Vec<RelayUrl> =
             key_package_relays_urls_set.into_iter().collect();
         let key_package_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(self.pubkey, &key_package_relays_urls)
             .await?;
         Ok(key_package_event)

@@ -253,7 +253,7 @@ impl User {
     ) -> Result<bool> {
         let relays_urls: Vec<_> = Relay::urls(query_relays);
         let relay_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_relays(self.pubkey, relay_type, &relays_urls)
             .await
             .map_err(|e| {

@@ -1429,8 +1429,13 @@ pub mod test_utils {
                 Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
 
             let result = whitenoise
-                .nostr
-                .publish_key_package_with_signer(&ekp, &key_package_relays_urls, &tags, keys)
+                .relay_control
+                .publish_key_package_with_signer(
+                    &ekp,
+                    &key_package_relays_urls,
+                    &tags,
+                    Arc::new(keys),
+                )
                 .await
                 .unwrap();
 
@@ -1465,7 +1470,7 @@ pub mod test_utils {
                     );
 
                     match whitenoise
-                        .nostr
+                        .relay_control
                         .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
                         .await
                     {

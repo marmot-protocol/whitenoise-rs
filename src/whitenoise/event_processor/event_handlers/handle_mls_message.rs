@@ -135,7 +135,7 @@ impl Whitenoise {
 
                 mdk.merge_pending_commit(group_id)?;
 
-                self.nostr
+                self.relay_control
                     .publish_event_to(
                         update_result.evolution_event.clone(),
                         &account.pubkey,
@@ -1236,7 +1236,7 @@ mod tests {
         // Fetch the member's key package from relays
         let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
         let key_pkg_event = whitenoise
-            .nostr
+            .relay_control
             .fetch_user_key_package(member_account.pubkey, &relay_urls)
             .await
             .unwrap()
