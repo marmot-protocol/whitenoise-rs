@@ -213,6 +213,7 @@ impl RelaySession {
         filter: Filter,
         stream: SubscriptionStream,
         account_pubkey: Option<PublicKey>,
+        group_ids: &[String],
     ) -> Result<()> {
         for relay_url in relay_urls {
             let mut telemetry = RelayTelemetry::new(
@@ -278,6 +279,7 @@ impl RelaySession {
                         account_pubkey,
                         relay_url: relay_url.clone(),
                         stream,
+                        group_ids: group_ids.to_vec(),
                     },
                 )
                 .await;
@@ -494,12 +496,49 @@ impl RelaySession {
                                         .subscription_context(&relay_url, &subscription_id)
                                         .await
                                     {
-                                        let _ = sender
-                                            .send(ProcessableEvent::new_routed_nostr_event(
-                                                event.as_ref().clone(),
-                                                context,
-                                            ))
-                                            .await;
+                                        let target_contexts = match context.stream {
+                                            SubscriptionStream::GroupMessages => {
+                                                // The shared group plane collapses multiple
+                                                // legacy per-account subscriptions onto one
+                                                // relay session. After receipt we must rebuild
+                                                // the original account-scoped deliveries for
+                                                // every local account subscribed to this group.
+                                                //
+                                                // This fanout does NOT make processing
+                                                // group-scoped. Each forwarded event still
+                                                // carries a concrete account_pubkey in its
+                                                // SubscriptionContext, and the event processor
+                                                // runs account-specific MLS handling from there.
+                                                match Self::extract_group_id(event.as_ref()) {
+                                                    Some(group_id) => {
+                                                        let matches = router
+                                                            .matching_group_contexts(
+                                                                &relay_url,
+                                                                &group_id,
+                                                            )
+                                                            .await;
+                                                        if matches.is_empty() {
+                                                            vec![context.clone()]
+                                                        } else {
+                                                            matches
+                                                        }
+                                                    }
+                                                    None => vec![context.clone()],
+                                                }
+                                            }
+                                            _ => vec![context.clone()],
+                                        };
+
+                                        for target_context in
+                                            Self::dedupe_contexts(target_contexts)
+                                        {
+                                            let _ = sender
+                                                .send(ProcessableEvent::new_routed_nostr_event(
+                                                    event.as_ref().clone(),
+                                                    target_context,
+                                                ))
+                                                .await;
+                                        }
                                     } else {
                                         tracing::error!(
                                             target: "whitenoise::relay_control::session",
@@ -671,6 +710,38 @@ impl RelaySession {
         let _ = self.telemetry_sender.send(telemetry);
     }
 
+    fn extract_group_id(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| match tag.kind() {
+            TagKind::SingleLetter(single_letter)
+                if single_letter == SingleLetterTag::lowercase(Alphabet::H) =>
+            {
+                tag.content().map(|content| content.to_string())
+            }
+            _ => None,
+        })
+    }
+
+    fn dedupe_contexts(contexts: Vec<SubscriptionContext>) -> Vec<SubscriptionContext> {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+
+        for context in contexts {
+            let key = (
+                context.stream,
+                context
+                    .account_pubkey
+                    .map(|pubkey| pubkey.to_hex())
+                    .unwrap_or_default(),
+            );
+
+            if seen.insert(key) {
+                deduped.push(context);
+            }
+        }
+
+        deduped
+    }
+
     fn apply_telemetry_scope(
         telemetry_account_pubkey: Option<PublicKey>,
         telemetry: RelayTelemetry,
@@ -735,6 +806,7 @@ mod tests {
                 filter,
                 SubscriptionStream::GroupMessages,
                 None,
+                &[],
             )
             .await;
 

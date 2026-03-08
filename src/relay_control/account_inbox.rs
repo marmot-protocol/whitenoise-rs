@@ -119,6 +119,7 @@ impl AccountInboxPlane {
                 filter,
                 SubscriptionStream::AccountInboxGiftwraps,
                 Some(self.config.account_pubkey),
+                &[],
             )
             .await
     }

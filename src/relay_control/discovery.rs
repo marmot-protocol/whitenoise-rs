@@ -177,6 +177,7 @@ impl DiscoveryPlane {
                     // account-scoped and feed account follow processing.
                     SubscriptionStream::DiscoveryUserData,
                     None,
+                    &[],
                 )
                 .await?;
             new_public_ids.push(subscription_id);
@@ -221,6 +222,7 @@ impl DiscoveryPlane {
                     // processing and therefore must carry the owning account pubkey.
                     SubscriptionStream::DiscoveryFollowLists,
                     Some(account_pubkey),
+                    &[],
                 )
                 .await?;
             new_follow_ids.push(subscription_id);

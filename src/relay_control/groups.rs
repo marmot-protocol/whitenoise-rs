@@ -119,6 +119,7 @@ impl GroupPlane {
                 filter,
                 SubscriptionStream::GroupMessages,
                 Some(pubkey),
+                group_ids,
             )
             .await
         {

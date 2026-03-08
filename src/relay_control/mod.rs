@@ -383,6 +383,7 @@ pub(crate) struct SubscriptionContext {
     pub(crate) account_pubkey: Option<PublicKey>,
     pub(crate) relay_url: RelayUrl,
     pub(crate) stream: SubscriptionStream,
+    pub(crate) group_ids: Vec<String>,
 }
 
 #[cfg(test)]
