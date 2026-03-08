@@ -342,6 +342,13 @@ impl RelayStatusRecord {
             }
 
             if self.id == 0 {
+                tracing::warn!(
+                    target: "whitenoise::database::relay_status",
+                    relay_url = %self.relay_url,
+                    plane = self.plane.as_str(),
+                    account_pubkey = self.account_pubkey.map(|pubkey| pubkey.to_hex()).unwrap_or_default(),
+                    "Relay status insert hit a unique violation but no row was visible on the follow-up lookup"
+                );
                 return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
             }
 

@@ -394,9 +394,11 @@ impl Whitenoise {
         let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
 
         // Create NostrManager with event_sender for direct event queuing
-        let nostr =
-            NostrManager::new(event_sender.clone(), Arc::new(WhitenoiseEventTracker::new(database.clone())), NostrManager::default_timeout())
-                .await?;
+        let nostr = NostrManager::new(
+            event_sender.clone(),
+            Arc::new(WhitenoiseEventTracker::new(database.clone())),
+        )
+        .await?;
 
         // Create SecretsStore backed by the platform keyring-core store
         let secrets_store = SecretsStore::new(&keyring_service_id);
@@ -1260,7 +1262,6 @@ pub mod test_utils {
         let nostr = NostrManager::new(
             event_sender.clone(),
             Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone())),
-            NostrManager::default_timeout(),
         )
         .await
         .expect("Failed to create NostrManager");

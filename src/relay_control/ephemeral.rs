@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     RelayType,
-    nostr_manager::utils::is_event_timestamp_valid,
+    nostr_manager::utils::{is_event_timestamp_valid, is_relay_list_tag_for_event_kind},
     nostr_manager::{NostrManagerError, Result},
     types::ProcessableEvent,
     whitenoise::{
@@ -62,7 +62,6 @@ pub(crate) struct EphemeralPlane {
     operation_counter: Arc<AtomicU64>,
 }
 
-#[allow(dead_code)]
 impl EphemeralPlane {
     pub(crate) fn new(
         config: EphemeralPlaneConfig,
@@ -247,6 +246,7 @@ impl EphemeralPlane {
         account_pubkey: &PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Output<EventId>> {
+        // Retry schedule is immediate first attempt, then 2 s and 4 s backoff by default.
         let mut last_error: Option<NostrManagerError> = None;
 
         for attempt in 0..self.config.max_publish_attempts {
@@ -265,21 +265,24 @@ impl EphemeralPlane {
 
             let session = self.spawn_session("publish", Some(*account_pubkey));
             let result = session.publish_event_to(relays, &event).await;
-
-            let tracking_result = match &result {
-                Ok(output) if !output.success.is_empty() => {
-                    self.track_published_event(output.id(), account_pubkey)
-                        .await
-                }
-                Ok(_) => Ok(()),
-                Err(_) => Ok(()),
-            };
-
             session.shutdown().await;
-            tracking_result?;
 
             match result {
-                Ok(output) if !output.success.is_empty() => return Ok(output),
+                Ok(output) if !output.success.is_empty() => {
+                    if let Err(error) = self
+                        .track_published_event(output.id(), account_pubkey)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::ephemeral",
+                            account_pubkey = %account_pubkey,
+                            event_id = %output.id(),
+                            "Ephemeral publish succeeded but event tracking failed: {error}"
+                        );
+                    }
+
+                    return Ok(output);
+                }
                 Ok(output) => {
                     last_error = Some(NostrManagerError::NoRelayConnections);
                     tracing::warn!(
@@ -467,6 +470,9 @@ impl EphemeralPlane {
     }
 
     fn should_persist_telemetry(_telemetry: &RelayTelemetry) -> bool {
+        // Ephemeral operations are short-lived and currently all samples are
+        // useful for debugging publish/query behavior. Filter later if this
+        // plane starts emitting high-volume connection noise.
         true
     }
 
@@ -567,7 +573,7 @@ impl EphemeralPlane {
         let relay_tags: Vec<&Tag> = event
             .tags
             .iter()
-            .filter(|tag| Self::is_relay_list_tag_for_event_kind(tag, event.kind))
+            .filter(|tag| is_relay_list_tag_for_event_kind(tag, event.kind))
             .collect();
 
         relay_tags.iter().any(|tag| {
@@ -579,22 +585,6 @@ impl EphemeralPlane {
 
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
         has_encoding_tag(event) && !event.content.trim().is_empty()
-    }
-
-    fn is_relay_list_tag_for_event_kind(tag: &Tag, kind: Kind) -> bool {
-        match kind {
-            Kind::RelayList => Self::is_r_tag(tag),
-            Kind::InboxRelays | Kind::MlsKeyPackageRelays => Self::is_relay_tag(tag),
-            _ => Self::is_relay_tag(tag) || Self::is_r_tag(tag),
-        }
-    }
-
-    fn is_r_tag(tag: &Tag) -> bool {
-        tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::R))
-    }
-
-    fn is_relay_tag(tag: &Tag) -> bool {
-        tag.kind() == TagKind::Relay
     }
 }
 

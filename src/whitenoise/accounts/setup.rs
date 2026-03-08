@@ -458,6 +458,8 @@ impl Whitenoise {
             return Ok(Vec::new());
         }
 
+        // Relay-control ephemeral sessions add/connect target relays internally,
+        // so callers no longer need a separate pre-connection step here.
         let relay_event = self
             .relay_control
             .fetch_user_relays(pubkey, relay_type, &source_relay_urls)

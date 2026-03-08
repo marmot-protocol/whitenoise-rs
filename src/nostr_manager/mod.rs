@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use ::rand::RngCore;
 use nostr_sdk::prelude::*;
 use thiserror::Error;
@@ -70,20 +68,14 @@ pub struct NostrManager {
 pub type Result<T> = std::result::Result<T, NostrManagerError>;
 
 impl NostrManager {
-    /// Default timeout for client requests
-    pub(crate) fn default_timeout() -> Duration {
-        Duration::from_secs(5)
-    }
     /// Create a new Nostr manager
     ///
     /// # Arguments
     ///
     /// * `event_sender` - Channel sender for forwarding events to Whitenoise for processing
-    /// * `timeout` - Timeout for client requests
     pub(crate) async fn new(
         event_sender: Sender<crate::types::ProcessableEvent>,
         event_tracker: std::sync::Arc<dyn EventTracker>,
-        _timeout: Duration,
     ) -> Result<Self> {
         let opts = ClientOptions::default().verify_subscriptions(true);
 

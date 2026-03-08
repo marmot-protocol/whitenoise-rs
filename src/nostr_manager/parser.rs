@@ -107,7 +107,7 @@ impl Parser for MockParser {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use super::*;
     use crate::whitenoise::event_tracker::NoEventTracker;
@@ -117,7 +117,7 @@ mod tests {
         let (event_sender, _event_receiver) = mpsc::channel(500);
         // Use NoEventTracker for parser tests since we don't need event tracking
         let event_tracker = Arc::new(NoEventTracker);
-        NostrManager::new(event_sender, event_tracker, Duration::from_secs(3))
+        NostrManager::new(event_sender, event_tracker)
             .await
             .unwrap()
     }

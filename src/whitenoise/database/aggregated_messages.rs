@@ -582,8 +582,6 @@ impl AggregatedMessage {
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<ChatMessage> {
-        let mut last_error = None;
-
         for (attempt, delay_ms) in Self::DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS
             .iter()
             .copied()
@@ -592,7 +590,6 @@ impl AggregatedMessage {
             match Self::update_delivery_status(message_id, group_id, status, database).await {
                 Ok(message) => return Ok(message),
                 Err(error) if Self::is_database_lock_error(&error) => {
-                    last_error = Some(error);
                     tracing::debug!(
                         target: "whitenoise::messages::delivery",
                         attempt = attempt + 1,
@@ -606,15 +603,7 @@ impl AggregatedMessage {
             }
         }
 
-        if let Some(error) = last_error {
-            match Self::update_delivery_status(message_id, group_id, status, database).await {
-                Ok(message) => Ok(message),
-                Err(final_error) if Self::is_database_lock_error(&final_error) => Err(error),
-                Err(final_error) => Err(final_error),
-            }
-        } else {
-            Self::update_delivery_status(message_id, group_id, status, database).await
-        }
+        Self::update_delivery_status(message_id, group_id, status, database).await
     }
 
     /// Insert an initial delivery status row for an outgoing event.
