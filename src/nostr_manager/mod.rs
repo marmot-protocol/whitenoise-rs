@@ -32,6 +32,8 @@ pub enum NostrManagerError {
     AccountError(String),
     #[error("Failed to connect to any relays")]
     NoRelayConnections,
+    #[error("No relay accepted the event")]
+    NoRelayAccepted,
     #[error("Relay operation timed out")]
     Timeout,
     #[error("Nostr Event error: {0}")]

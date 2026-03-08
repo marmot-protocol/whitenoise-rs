@@ -303,7 +303,12 @@ impl Whitenoise {
             self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
         let event_id = self
-            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+            .publish_key_package_to_relays(
+                &encoded_key_package,
+                &relay_urls,
+                &tags,
+                std::sync::Arc::new(signer),
+            )
             .await?;
         self.track_published_key_package(account, &hash_ref, &event_id)
             .await;
@@ -342,7 +347,7 @@ impl Whitenoise {
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
         let result = self
             .relay_control
@@ -350,7 +355,7 @@ impl Whitenoise {
                 encoded_key_package,
                 relay_urls,
                 tags,
-                std::sync::Arc::new(signer),
+                signer,
             )
             .await?;
 
@@ -433,7 +438,7 @@ impl Whitenoise {
             account,
             event_id,
             delete_mls_stored_keys,
-            signer,
+            std::sync::Arc::new(signer),
         )
         .await
     }
@@ -443,7 +448,7 @@ impl Whitenoise {
         account: &Account,
         event_id: &EventId,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
         // Delete local MLS key material using the hash_ref stored at publish time.
         // This avoids a relay round-trip to fetch and parse the key package event.
@@ -503,11 +508,7 @@ impl Whitenoise {
 
         let result = self
             .relay_control
-            .publish_event_deletion_with_signer(
-                event_id,
-                &key_package_relays_urls,
-                std::sync::Arc::new(signer),
-            )
+            .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
             .await?;
         Ok(!result.success.is_empty())
     }
@@ -642,10 +643,14 @@ impl Whitenoise {
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
-        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
-            .await
+        self.delete_all_key_packages_loop(
+            account,
+            delete_mls_stored_keys,
+            std::sync::Arc::new(signer),
+        )
+        .await
     }
 
     /// Loops fetch-delete rounds until no key packages remain on relays, up to
@@ -656,7 +661,7 @@ impl Whitenoise {
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
         let mut total_deleted = 0;
 
@@ -757,7 +762,7 @@ impl Whitenoise {
         key_package_events: Vec<Event>,
         delete_mls_stored_keys: bool,
         max_retries: u32,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
         if key_package_events.is_empty() {
             tracing::debug!(
@@ -903,16 +908,12 @@ impl Whitenoise {
         &self,
         event_ids: &[EventId],
         relay_urls: &[RelayUrl],
-        signer: impl NostrSigner + 'static,
+        signer: std::sync::Arc<dyn NostrSigner>,
         context: &str,
     ) -> Result<()> {
         match self
             .relay_control
-            .publish_batch_event_deletion_with_signer(
-                event_ids,
-                relay_urls,
-                std::sync::Arc::new(signer),
-            )
+            .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)
             .await
         {
             Ok(result) => {

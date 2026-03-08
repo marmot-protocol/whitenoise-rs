@@ -284,7 +284,7 @@ impl EphemeralPlane {
                     return Ok(output);
                 }
                 Ok(output) => {
-                    last_error = Some(NostrManagerError::NoRelayConnections);
+                    last_error = Some(NostrManagerError::NoRelayAccepted);
                     tracing::warn!(
                         target: "whitenoise::relay_control::ephemeral",
                         account_pubkey = %account_pubkey,
@@ -436,10 +436,6 @@ impl EphemeralPlane {
             loop {
                 match receiver.recv().await {
                     Ok(telemetry) => {
-                        if !Self::should_persist_telemetry(&telemetry) {
-                            continue;
-                        }
-
                         if let Err(error) = observability.record(&database, &telemetry).await {
                             tracing::error!(
                                 target: "whitenoise::relay_control::observability",
@@ -467,13 +463,6 @@ impl EphemeralPlane {
 
     fn next_operation_id(&self) -> u64 {
         self.operation_counter.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    fn should_persist_telemetry(_telemetry: &RelayTelemetry) -> bool {
-        // Ephemeral operations are short-lived and currently all samples are
-        // useful for debugging publish/query behavior. Filter later if this
-        // plane starts emitting high-volume connection noise.
-        true
     }
 
     async fn track_published_event(
