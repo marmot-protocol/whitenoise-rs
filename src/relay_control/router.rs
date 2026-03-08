@@ -97,6 +97,10 @@ impl RelayRouter {
     pub(crate) async fn context_count(&self) -> usize {
         self.subscription_contexts.read().await.len()
     }
+
+    pub(crate) async fn clear(&self) {
+        self.subscription_contexts.write().await.clear();
+    }
 }
 
 #[cfg(test)]

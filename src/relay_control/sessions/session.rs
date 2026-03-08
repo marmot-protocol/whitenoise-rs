@@ -435,6 +435,8 @@ impl RelaySession {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.state.subscription_relays.write().await.clear();
+        self.router.clear().await;
         self.client.reset().await;
         self.client.shutdown().await;
     }
