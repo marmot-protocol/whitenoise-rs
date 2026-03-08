@@ -70,6 +70,30 @@ impl RelayRouter {
             ))
     }
 
+    pub(crate) async fn matching_group_contexts(
+        &self,
+        relay_url: &RelayUrl,
+        group_id: &str,
+    ) -> Vec<SubscriptionContext> {
+        // This is an O(n) scan over active subscription contexts under a read
+        // lock. That is acceptable for the current migrated planes and account
+        // counts; add a secondary index if group fanout becomes hot.
+        self.subscription_contexts
+            .read()
+            .await
+            .iter()
+            .filter(|(key, context)| {
+                key.relay_url == *relay_url
+                    && context.stream == crate::relay_control::SubscriptionStream::GroupMessages
+                    && context
+                        .group_ids
+                        .iter()
+                        .any(|candidate| candidate == group_id)
+            })
+            .map(|(_, context)| context.clone())
+            .collect()
+    }
+
     pub(crate) async fn context_count(&self) -> usize {
         self.subscription_contexts.read().await.len()
     }
@@ -92,6 +116,7 @@ mod tests {
             account_pubkey: None,
             relay_url: relay_url.clone(),
             stream: SubscriptionStream::DiscoveryUserData,
+            group_ids: vec![],
         };
 
         router
@@ -121,12 +146,14 @@ mod tests {
             account_pubkey: None,
             relay_url: relay_url_a.clone(),
             stream: SubscriptionStream::DiscoveryUserData,
+            group_ids: vec![],
         };
         let context_b = SubscriptionContext {
             plane: RelayPlane::Group,
             account_pubkey: None,
             relay_url: relay_url_b.clone(),
             stream: SubscriptionStream::GroupMessages,
+            group_ids: vec!["group-a".to_string()],
         };
 
         router
@@ -156,5 +183,58 @@ mod tests {
                 .await,
             Some(context_b)
         );
+    }
+
+    #[tokio::test]
+    async fn test_matching_group_contexts_finds_all_accounts_for_group_on_relay() {
+        let router = RelayRouter::default();
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let context_a = SubscriptionContext {
+            plane: RelayPlane::Group,
+            account_pubkey: Some(nostr_sdk::Keys::generate().public_key()),
+            relay_url: relay_url.clone(),
+            stream: SubscriptionStream::GroupMessages,
+            group_ids: vec!["group-a".to_string(), "group-b".to_string()],
+        };
+        let context_b = SubscriptionContext {
+            plane: RelayPlane::Group,
+            account_pubkey: Some(nostr_sdk::Keys::generate().public_key()),
+            relay_url: relay_url.clone(),
+            stream: SubscriptionStream::GroupMessages,
+            group_ids: vec!["group-b".to_string()],
+        };
+        let context_c = SubscriptionContext {
+            plane: RelayPlane::Group,
+            account_pubkey: Some(nostr_sdk::Keys::generate().public_key()),
+            relay_url: relay_url.clone(),
+            stream: SubscriptionStream::GroupMessages,
+            group_ids: vec!["group-c".to_string()],
+        };
+
+        router
+            .record_subscription_context(
+                relay_url.clone(),
+                SubscriptionId::new("sub-a"),
+                context_a.clone(),
+            )
+            .await;
+        router
+            .record_subscription_context(
+                relay_url.clone(),
+                SubscriptionId::new("sub-b"),
+                context_b.clone(),
+            )
+            .await;
+        router
+            .record_subscription_context(relay_url.clone(), SubscriptionId::new("sub-c"), context_c)
+            .await;
+
+        let mut matches = router.matching_group_contexts(&relay_url, "group-b").await;
+        matches.sort_by_key(|context| context.account_pubkey.map(|pubkey| pubkey.to_hex()));
+
+        let mut expected = vec![context_a, context_b];
+        expected.sort_by_key(|context| context.account_pubkey.map(|pubkey| pubkey.to_hex()));
+
+        assert_eq!(matches, expected);
     }
 }

@@ -339,6 +339,41 @@ impl RelayControlPlane {
 The important point is the routing boundary: plane selection happens in the
 control plane, not inside a universal client object.
 
+## Implementation Snapshot
+
+Status as of March 8, 2026:
+
+- completed:
+  - `RelayControlPlane`, `RelayPlane`, `SubscriptionContext`, and
+    `SubscriptionStream` are in place
+  - `relay_status` and `relay_events` schema plus DB access helpers are in
+    place
+  - migrated discovery, group, and account inbox sessions now persist
+    telemetry into `relay_status` and `relay_events`
+  - `RelaySession` exists and is used by the dedicated discovery, group, and
+    account inbox planes
+  - long-lived discovery subscriptions run on the discovery plane
+  - long-lived MLS group subscriptions run on the group plane
+  - long-lived giftwrap subscriptions run on per-account inbox planes
+  - relay-plane events already enter the event processor with typed source
+    context instead of legacy subscription-ID parsing
+- in progress:
+  - `NostrManager` still exists as a compatibility path for legacy fetch and
+    publish work
+- still legacy / not started:
+  - one-off discovery fetches still use the shared client
+  - welcome publishing and other targeted publish/query work still use the
+    shared client
+  - the ephemeral plane is still a placeholder
+  - the shared `nostr-sdk::Client` inside `NostrManager` is still the
+    production path for remaining publish/query call sites
+
+This means the migration is no longer a strict phase-by-phase sequence. Some
+later subscription phases landed before the observability runtime wiring and
+before the final removal of shared-client compatibility code. The rest of this
+document keeps the original phase structure, but each phase below now includes
+an explicit implementation status.
+
 ## Migration Rules
 
 Every implementation phase below must obey these rules:
@@ -406,6 +441,8 @@ Success state:
 
 ### Phase 1: Build Observability First
 
+Status: Completed on March 8, 2026.
+
 Objective:
 
 Introduce structured relay telemetry types, classification, and persistence
@@ -454,10 +491,13 @@ Success state:
 - structured relay telemetry can be classified and persisted with plane and
   account context
 - relay status and recent events are persisted in the database
-- existing messaging and discovery flows are unchanged because the legacy shared
-  client is not instrumented in this phase
+- migrated control-plane subscription traffic persists telemetry to
+  `relay_status` and `relay_events`
+- the legacy shared client remains intentionally uninstrumented for now
 
 ### Phase 2: Extract `RelaySession`
+
+Status: Partially completed as of March 8, 2026.
 
 Objective:
 
@@ -504,12 +544,17 @@ Validation steps:
 
 Success state:
 
-- the shared-client path now executes through `RelaySession`
-- production behavior is still functionally the same
+- dedicated relay planes already execute through `RelaySession`
 - the codebase can instantiate more than one client session without
   duplicating setup logic
+- remaining work:
+  - decide whether the legacy shared-client compatibility path should itself be
+    wrapped by `RelaySession` before deletion, or whether we should delete it
+    directly as later call sites migrate
 
 ### Phase 3: Stand Up the Group Plane
+
+Status: Completed on March 8, 2026, for long-lived group subscriptions.
 
 Objective:
 
@@ -561,6 +606,8 @@ Success state:
 
 ### Phase 4: Stand Up the Discovery Plane
 
+Status: Partially completed as of March 8, 2026.
+
 Objective:
 
 Move discovery and indexing work onto a dedicated curated discovery plane.
@@ -609,12 +656,18 @@ Validation steps:
 
 Success state:
 
-- discovery operations no longer depend on unrelated connected relays
-- user discovery and login relay-list lookup succeed through the discovery
-  plane
-- the shared compatibility path no longer owns discovery fetch orchestration
+- completed:
+  - long-lived discovery subscriptions now belong to the curated discovery
+    plane
+- remaining work:
+  - move one-off discovery fetch/query call sites to the discovery or
+    ephemeral plane
+  - remove the old "shared client plus whatever is already connected" fallback
+    model from discovery fetches
 
 ### Phase 5: Introduce Ephemeral Publish and Query Operations
+
+Status: Not started beyond module scaffolding as of March 8, 2026.
 
 Objective:
 
@@ -667,6 +720,9 @@ Success state:
 - no new transient relays are accumulated on long-lived sessions
 
 ### Phase 6: Introduce Per-Account Inbox Planes
+
+Status: Completed on March 8, 2026, for long-lived giftwrap subscriptions and
+session lifecycle.
 
 Objective:
 
@@ -726,6 +782,8 @@ Success state:
 
 ### Phase 7: Remove Shared-Client Assumptions
 
+Status: Partially completed as of March 8, 2026.
+
 Objective:
 
 Finish the migration by making `RelayControlPlane` the real system boundary and
@@ -772,10 +830,13 @@ Validation steps:
 
 Success state:
 
-- there is no production path that depends on one universal shared
-  `nostr-sdk::Client`
-- all relay work is routed through explicit planes
-- `NostrManager` is no longer the relay control-plane boundary
+- completed:
+  - relay-plane event intake already uses typed source context in the event
+    processor
+- remaining work:
+  - migrate remaining query and publish call sites off `NostrManager`
+  - delete or sharply reduce shared-client orchestration helpers
+  - make `RelayControlPlane` the only production relay boundary
 
 ### Phase 8: Re-evaluate Gossip for Discovery
 

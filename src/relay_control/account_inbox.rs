@@ -36,6 +36,7 @@ impl AccountInboxPlaneConfig {
 
     pub(crate) fn session_config(&self) -> RelaySessionConfig {
         let mut config = RelaySessionConfig::new(RelayPlane::AccountInbox);
+        config.telemetry_account_pubkey = Some(self.account_pubkey);
         config.auth_policy = self.auth_policy;
         config.reconnect_policy = self.reconnect_policy;
         config
@@ -92,6 +93,12 @@ impl AccountInboxPlane {
             .await
     }
 
+    pub(crate) fn telemetry(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<super::observability::RelayTelemetry> {
+        self.session.telemetry()
+    }
+
     async fn subscribe_giftwrap(
         &self,
         inbox_relays: &[RelayUrl],
@@ -112,6 +119,7 @@ impl AccountInboxPlane {
                 filter,
                 SubscriptionStream::AccountInboxGiftwraps,
                 Some(self.config.account_pubkey),
+                &[],
             )
             .await
     }

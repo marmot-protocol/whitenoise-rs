@@ -1,16 +1,22 @@
 //! Internal relay-control boundary.
 //!
-//! Phase 0 intentionally introduces only the boundary and shared types. Runtime
-//! behavior continues to flow through the existing `NostrManager` paths until
-//! later phases migrate individual relay workloads onto dedicated sessions.
+//! Long-lived discovery, group, and account-inbox subscriptions now run
+//! through dedicated relay-plane sessions. Query and publish flows still use
+//! the legacy `NostrManager` compatibility path until later migration phases.
 #![allow(clippy::large_enum_variant)]
 
 use core::str::FromStr;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, mpsc::Sender};
+use tokio::sync::{RwLock, broadcast, mpsc::Sender};
 
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
@@ -29,9 +35,9 @@ use crate::{
 /// Top-level relay-control owner hosted by `Whitenoise`.
 ///
 /// This type defines the long-term system boundary described in
-/// `relay-control-plane-rearchitecture.md`. In Phase 0 it only stores shared
-/// state and typed configuration; production code does not yet route relay
-/// work through it.
+/// `relay-control-plane-rearchitecture.md`. Discovery, group, and account
+/// inbox subscriptions already route through this boundary; remaining query
+/// and publish work still migrates incrementally.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RelayControlPlane {
@@ -43,32 +49,52 @@ pub(crate) struct RelayControlPlane {
     group_plane: groups::GroupPlane,
     router: router::RelayRouter,
     observability: observability::RelayObservability,
+    telemetry_persistors_started: AtomicBool,
 }
 
 #[allow(dead_code)]
 impl RelayControlPlane {
-    /// Create the inactive Phase 0 control-plane host.
+    /// Create the relay-control host. Telemetry persistors are started during
+    /// the explicit async startup phase once a Tokio runtime is available.
     pub(crate) fn new(
         database: Arc<Database>,
         discovery_relays: Vec<RelayUrl>,
         event_sender: Sender<ProcessableEvent>,
         session_salt: [u8; 16],
     ) -> Self {
+        let observability = observability::RelayObservability::new(
+            observability::RelayObservabilityConfig::default(),
+        );
+        let discovery = discovery::DiscoveryPlane::new(
+            discovery::DiscoveryPlaneConfig::new(discovery_relays),
+            event_sender.clone(),
+        );
+        let group_plane = groups::GroupPlane::new(event_sender.clone(), session_salt);
+
         Self {
             database,
             event_sender: event_sender.clone(),
             session_salt,
-            discovery: discovery::DiscoveryPlane::new(
-                discovery::DiscoveryPlaneConfig::new(discovery_relays),
-                event_sender.clone(),
-            ),
+            discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
-            group_plane: groups::GroupPlane::new(event_sender, session_salt),
+            group_plane,
             router: router::RelayRouter::default(),
-            observability: observability::RelayObservability::new(
-                observability::RelayObservabilityConfig::default(),
-            ),
+            observability,
+            telemetry_persistors_started: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) async fn start_telemetry_persistors(&self) {
+        if self
+            .telemetry_persistors_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry());
+        self.spawn_telemetry_persistor("group", self.group_plane.telemetry());
     }
 
     /// Access to the shared application database for later relay-control phases.
@@ -91,11 +117,78 @@ impl RelayControlPlane {
         &self,
         telemetry: &observability::RelayTelemetry,
     ) -> std::result::Result<(), DatabaseError> {
+        if !Self::should_persist_telemetry(telemetry) {
+            tracing::debug!(
+                target: "whitenoise::relay_control::observability",
+                plane = telemetry.plane.as_str(),
+                relay_url = %telemetry.relay_url,
+                kind = telemetry.kind.as_str(),
+                "Skipping relay telemetry sample without required account scope"
+            );
+            return Ok(());
+        }
+
         self.observability.record(&self.database, telemetry).await
     }
 
     pub(crate) fn session_salt(&self) -> &[u8; 16] {
         &self.session_salt
+    }
+
+    /// Spawn a fire-and-forget telemetry writer that exits when the telemetry
+    /// sender for the subscribed plane is dropped and the broadcast channel closes.
+    fn spawn_telemetry_persistor(
+        &self,
+        task_name: &str,
+        mut receiver: broadcast::Receiver<observability::RelayTelemetry>,
+    ) {
+        let database = self.database.clone();
+        let observability = self.observability.clone();
+        let task_name = task_name.to_string();
+
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(telemetry) => {
+                        if !Self::should_persist_telemetry(&telemetry) {
+                            tracing::debug!(
+                                target: "whitenoise::relay_control::observability",
+                                task = task_name,
+                                plane = telemetry.plane.as_str(),
+                                relay_url = %telemetry.relay_url,
+                                kind = telemetry.kind.as_str(),
+                                "Skipping relay telemetry sample without required account scope"
+                            );
+                            continue;
+                        }
+
+                        if let Err(error) = observability.record(&database, &telemetry).await {
+                            tracing::error!(
+                                target: "whitenoise::relay_control::observability",
+                                task = task_name,
+                                plane = telemetry.plane.as_str(),
+                                relay_url = %telemetry.relay_url,
+                                kind = telemetry.kind.as_str(),
+                                "Failed to persist relay telemetry: {error}"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::observability",
+                            task = task_name,
+                            skipped,
+                            "Relay telemetry receiver lagged; dropping oldest samples"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    fn should_persist_telemetry(telemetry: &observability::RelayTelemetry) -> bool {
+        !(telemetry.plane == RelayPlane::AccountInbox && telemetry.account_pubkey.is_none())
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
@@ -115,11 +208,11 @@ impl RelayControlPlane {
 
     /// Activate group and inbox subscriptions for an account.
     ///
-    /// **Atomicity:** Activation is NOT atomic across planes. Group
+    /// **Atomicity:** First-time activation is NOT atomic across planes. Group
     /// subscriptions are established first; if inbox activation subsequently
-    /// fails, group subscriptions will already be active. Callers that receive
-    /// an error should call [`Self::deactivate_account_subscriptions`] to clean
-    /// up any partially-established state.
+    /// fails, group subscriptions may already be active. Refreshing an already
+    /// active account attempts to restore the previous group state on inbox
+    /// activation failure.
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -129,6 +222,8 @@ impl RelayControlPlane {
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
+        let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
+
         self.group_plane
             .update_account(account_pubkey, group_relays, group_ids, since)
             .await?;
@@ -141,9 +236,27 @@ impl RelayControlPlane {
 
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
             plane.deactivate().await;
-            self.group_plane.remove_account(&account_pubkey).await;
+
+            if let Some((previous_relays, previous_group_ids)) = previous_group_state {
+                if let Err(restore_error) = self
+                    .group_plane
+                    .update_account(account_pubkey, &previous_relays, &previous_group_ids, since)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::relay_control",
+                        account_pubkey = %account_pubkey,
+                        "Failed to restore previous group-plane state after inbox activation error: {restore_error}"
+                    );
+                }
+            } else {
+                self.group_plane.remove_account(&account_pubkey).await;
+            }
+
             return Err(error);
         }
+
+        let telemetry_receiver = plane.telemetry();
 
         if let Some(previous_plane) = self
             .account_inbox_planes
@@ -153,6 +266,11 @@ impl RelayControlPlane {
         {
             previous_plane.deactivate().await;
         }
+
+        self.spawn_telemetry_persistor(
+            &format!("account_inbox:{}", account_pubkey.to_hex()),
+            telemetry_receiver,
+        );
 
         Ok(())
     }
@@ -331,11 +449,22 @@ pub(crate) struct SubscriptionContext {
     pub(crate) account_pubkey: Option<PublicKey>,
     pub(crate) relay_url: RelayUrl,
     pub(crate) stream: SubscriptionStream,
+    /// Hex-encoded Nostr group IDs carried in `#h` tags for group-message routing.
+    pub(crate) group_ids: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::broadcast;
+    use tokio::time::{Duration, timeout};
+
     use super::*;
+    use crate::relay_control::observability::{RelayTelemetry, RelayTelemetryKind};
+    use crate::whitenoise::database::{
+        Database, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
+    };
 
     #[test]
     fn test_relay_plane_as_str() {
@@ -354,6 +483,158 @@ mod tests {
         assert_eq!(
             SubscriptionStream::AccountInboxGiftwraps.as_str(),
             "account_inbox_giftwraps"
+        );
+    }
+
+    async fn setup_test_db() -> Database {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let database = Database {
+            pool,
+            path: ":memory:".to_owned().into(),
+            last_connected: std::time::SystemTime::now(),
+        };
+        database.migrate_up().await.unwrap();
+        database
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_persistor_records_events_and_status() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control =
+            RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
+        let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
+        relay_control.spawn_telemetry_persistor("test", telemetry_receiver);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let telemetry = RelayTelemetry::new(
+            RelayTelemetryKind::SubscriptionSuccess,
+            RelayPlane::Discovery,
+            relay_url.clone(),
+        )
+        .with_occurred_at(Utc::now())
+        .with_subscription_id("sub-1");
+
+        telemetry_sender.send(telemetry).unwrap();
+        drop(telemetry_sender);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let events = RelayEventRecord::list_recent_for_scope(
+                    &relay_url,
+                    RelayPlane::Discovery,
+                    None,
+                    10,
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                let status =
+                    RelayStatusRecord::find(&relay_url, RelayPlane::Discovery, None, &database)
+                        .await
+                        .unwrap();
+
+                if events.len() == 1 {
+                    assert_eq!(events[0].subscription_id.as_deref(), Some("sub-1"));
+                    assert_eq!(status.unwrap().success_count, 1);
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+        let account_telemetry = RelayTelemetry::new(
+            RelayTelemetryKind::SubscriptionSuccess,
+            RelayPlane::AccountInbox,
+            relay_url.clone(),
+        )
+        .with_account_pubkey(account_pubkey)
+        .with_occurred_at(Utc::now())
+        .with_subscription_id("account-sub-1");
+
+        let (account_sender, account_receiver) = broadcast::channel(8);
+        relay_control.spawn_telemetry_persistor("test-account", account_receiver);
+        account_sender.send(account_telemetry).unwrap();
+        account_sender
+            .send(
+                RelayTelemetry::new(
+                    RelayTelemetryKind::SubscriptionSuccess,
+                    RelayPlane::AccountInbox,
+                    relay_url.clone(),
+                )
+                .with_account_pubkey(account_pubkey)
+                .with_occurred_at(Utc::now())
+                .with_subscription_id("account-sub-2"),
+            )
+            .unwrap();
+        drop(account_sender);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let events = RelayEventRecord::list_recent_for_scope(
+                    &relay_url,
+                    RelayPlane::AccountInbox,
+                    Some(account_pubkey),
+                    10,
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                let status = RelayStatusRecord::find(
+                    &relay_url,
+                    RelayPlane::AccountInbox,
+                    Some(account_pubkey),
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                if events.len() == 2 {
+                    assert_eq!(events[0].subscription_id.as_deref(), Some("account-sub-2"));
+                    assert_eq!(events[0].account_pubkey, Some(account_pubkey));
+
+                    let status = status.unwrap();
+                    assert_eq!(status.account_pubkey, Some(account_pubkey));
+                    assert_eq!(status.success_count, 2);
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        relay_control
+            .record_relay_telemetry(
+                &RelayTelemetry::new(
+                    RelayTelemetryKind::SubscriptionSuccess,
+                    RelayPlane::AccountInbox,
+                    relay_url.clone(),
+                )
+                .with_occurred_at(Utc::now())
+                .with_subscription_id("account-sub-ignored"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            RelayStatusRecord::find(&relay_url, RelayPlane::AccountInbox, None, &database)
+                .await
+                .unwrap()
+                .is_none(),
+            "account inbox telemetry without an account scope must be ignored"
         );
     }
 }

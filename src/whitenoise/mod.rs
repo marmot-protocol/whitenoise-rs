@@ -423,6 +423,7 @@ impl Whitenoise {
                 scheduler_shutdown,
             },
         );
+        whitenoise.relay_control.start_telemetry_persistors().await;
 
         // Create default relays in the database if they don't exist
         // TODO: Make this batch fetch and insert all relays at once
@@ -1291,6 +1292,7 @@ pub mod test_utils {
                 scheduler_shutdown,
             },
         );
+        whitenoise.relay_control.start_telemetry_persistors().await;
 
         (whitenoise, data_temp, logs_temp)
     }
@@ -1444,6 +1446,51 @@ pub mod test_utils {
             }
         }
         accounts
+    }
+
+    pub(crate) async fn wait_for_key_package_publication(
+        whitenoise: &Whitenoise,
+        publisher_accounts: &[&Account],
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut all_available = true;
+
+                for publisher_account in publisher_accounts {
+                    let relay_urls = Relay::urls(
+                        &publisher_account
+                            .key_package_relays(whitenoise)
+                            .await
+                            .unwrap(),
+                    );
+
+                    match whitenoise
+                        .nostr
+                        .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
+                        .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => {
+                            all_available = false;
+                            break;
+                        }
+                    }
+                }
+
+                if all_available {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Timed out waiting for key package publication for {} member(s)",
+                publisher_accounts.len()
+            )
+        });
     }
 }
 

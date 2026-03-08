@@ -36,6 +36,13 @@ impl Scenario for ChatMediaUploadScenario {
             .execute(&mut self.context)
             .await?;
 
+        // The invited member joins asynchronously after processing the welcome.
+        // Wait for that to complete before sending group messages that the
+        // receiver-side media-reference assertions depend on.
+        WaitForWelcomeTestCase::for_account("media_member", "media_upload_test_group")
+            .execute(&mut self.context)
+            .await?;
+
         // Upload image with default options (includes blurhash generation)
         UploadChatImageTestCase::basic()
             .with_account("media_uploader")

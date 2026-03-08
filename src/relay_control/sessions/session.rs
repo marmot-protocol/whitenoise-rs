@@ -161,10 +161,13 @@ impl RelaySession {
         timeout: std::time::Duration,
     ) -> Result<Events> {
         for relay_url in relay_urls {
-            self.emit_telemetry(RelayTelemetry::new(
-                RelayTelemetryKind::QueryAttempt,
-                self.config.plane,
-                relay_url.clone(),
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::QueryAttempt,
+                    self.config.plane,
+                    relay_url.clone(),
+                ),
             ));
         }
 
@@ -175,24 +178,28 @@ impl RelaySession {
         match result {
             Ok(events) => {
                 for relay_url in relay_urls {
-                    self.emit_telemetry(RelayTelemetry::new(
-                        RelayTelemetryKind::QuerySuccess,
-                        self.config.plane,
-                        relay_url.clone(),
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::QuerySuccess,
+                            self.config.plane,
+                            relay_url.clone(),
+                        ),
                     ));
                 }
                 Ok(events)
             }
             Err(error) => {
                 for relay_url in relay_urls {
-                    self.emit_telemetry(
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
                         RelayTelemetry::new(
                             RelayTelemetryKind::QueryFailure,
                             self.config.plane,
                             relay_url.clone(),
                         )
                         .with_message(error.to_string()),
-                    );
+                    ));
                 }
                 Err(error.into())
             }
@@ -206,6 +213,7 @@ impl RelaySession {
         filter: Filter,
         stream: SubscriptionStream,
         account_pubkey: Option<PublicKey>,
+        group_ids: &[String],
     ) -> Result<()> {
         for relay_url in relay_urls {
             let mut telemetry = RelayTelemetry::new(
@@ -217,7 +225,10 @@ impl RelaySession {
             if let Some(account_pubkey) = account_pubkey {
                 telemetry = telemetry.with_account_pubkey(account_pubkey);
             }
-            self.emit_telemetry(telemetry);
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                telemetry,
+            ));
         }
 
         // Snapshot existing routing state before overwriting it. When a
@@ -268,6 +279,7 @@ impl RelaySession {
                         account_pubkey,
                         relay_url: relay_url.clone(),
                         stream,
+                        group_ids: group_ids.to_vec(),
                     },
                 )
                 .await;
@@ -290,7 +302,10 @@ impl RelaySession {
                     if let Some(account_pubkey) = account_pubkey {
                         telemetry = telemetry.with_account_pubkey(account_pubkey);
                     }
-                    self.emit_telemetry(telemetry);
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        telemetry,
+                    ));
                 }
                 Ok(())
             }
@@ -326,7 +341,10 @@ impl RelaySession {
                     if let Some(account_pubkey) = account_pubkey {
                         telemetry = telemetry.with_account_pubkey(account_pubkey);
                     }
-                    self.emit_telemetry(telemetry);
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        telemetry,
+                    ));
                 }
                 Err(error.into())
             }
@@ -448,6 +466,7 @@ impl RelaySession {
         let telemetry_sender = self.telemetry_sender.clone();
         let router = self.router.clone();
         let plane = self.config.plane;
+        let telemetry_account_pubkey = self.config.telemetry_account_pubkey;
         let state = self.state.clone();
 
         tokio::spawn(async move {
@@ -477,12 +496,66 @@ impl RelaySession {
                                         .subscription_context(&relay_url, &subscription_id)
                                         .await
                                     {
-                                        let _ = sender
-                                            .send(ProcessableEvent::new_routed_nostr_event(
-                                                event.as_ref().clone(),
-                                                context,
-                                            ))
-                                            .await;
+                                        let target_contexts = match context.stream {
+                                            SubscriptionStream::GroupMessages => {
+                                                // The shared group plane collapses multiple
+                                                // legacy per-account subscriptions onto one
+                                                // relay session. After receipt we must rebuild
+                                                // the original account-scoped deliveries for
+                                                // every local account subscribed to this group.
+                                                //
+                                                // This fanout does NOT make processing
+                                                // group-scoped. Each forwarded event still
+                                                // carries a concrete account_pubkey in its
+                                                // SubscriptionContext, and the event processor
+                                                // runs account-specific MLS handling from there.
+                                                match Self::extract_group_id(event.as_ref()) {
+                                                    Some(group_id) => {
+                                                        let matches = router
+                                                            .matching_group_contexts(
+                                                                &relay_url,
+                                                                &group_id,
+                                                            )
+                                                            .await;
+                                                        if matches.is_empty() {
+                                                            tracing::debug!(
+                                                                target: "whitenoise::relay_control::sessions",
+                                                                relay_url = %relay_url,
+                                                                subscription_id = %subscription_id,
+                                                                event_id = %event.id,
+                                                                group_id,
+                                                                "Dropping group message for unknown or stale #h routing context"
+                                                            );
+                                                            vec![]
+                                                        } else {
+                                                            matches
+                                                        }
+                                                    }
+                                                    None => {
+                                                        tracing::warn!(
+                                                            target: "whitenoise::relay_control::sessions",
+                                                            relay_url = %relay_url,
+                                                            subscription_id = %subscription_id,
+                                                            event_id = %event.id,
+                                                            "Dropping group message missing #h tag"
+                                                        );
+                                                        vec![]
+                                                    }
+                                                }
+                                            }
+                                            _ => vec![context.clone()],
+                                        };
+
+                                        for target_context in
+                                            Self::dedupe_contexts(target_contexts)
+                                        {
+                                            let _ = sender
+                                                .send(ProcessableEvent::new_routed_nostr_event(
+                                                    event.as_ref().clone(),
+                                                    target_context,
+                                                ))
+                                                .await;
+                                        }
                                     } else {
                                         tracing::error!(
                                             target: "whitenoise::relay_control::session",
@@ -500,6 +573,7 @@ impl RelaySession {
                                             Self::process_notification(
                                                 notification,
                                                 plane,
+                                                telemetry_account_pubkey,
                                                 &sender,
                                                 &telemetry_sender,
                                             )
@@ -540,6 +614,7 @@ impl RelaySession {
     async fn process_notification(
         notification: RelayNotification,
         plane: crate::relay_control::RelayPlane,
+        telemetry_account_pubkey: Option<PublicKey>,
         sender: &Sender<ProcessableEvent>,
         telemetry_sender: &broadcast::Sender<RelayTelemetry>,
     ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
@@ -559,7 +634,10 @@ impl RelaySession {
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
                 }
-                let _ = telemetry_sender.send(telemetry);
+                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
+                    telemetry_account_pubkey,
+                    telemetry,
+                ));
             }
             RelayNotification::Closed {
                 relay_url,
@@ -576,7 +654,10 @@ impl RelaySession {
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
                 }
-                let _ = telemetry_sender.send(telemetry);
+                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
+                    telemetry_account_pubkey,
+                    telemetry,
+                ));
             }
             RelayNotification::Auth {
                 relay_url,
@@ -593,13 +674,15 @@ impl RelaySession {
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
                 }
-                let _ = telemetry_sender.send(telemetry);
+                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
+                    telemetry_account_pubkey,
+                    telemetry,
+                ));
             }
             RelayNotification::Connected { relay_url } => {
-                let _ = telemetry_sender.send(RelayTelemetry::new(
-                    RelayTelemetryKind::Connected,
-                    plane,
-                    relay_url,
+                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
+                    telemetry_account_pubkey,
+                    RelayTelemetry::new(RelayTelemetryKind::Connected, plane, relay_url),
                 ));
             }
             RelayNotification::Disconnected {
@@ -611,7 +694,10 @@ impl RelaySession {
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
                 }
-                let _ = telemetry_sender.send(telemetry);
+                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
+                    telemetry_account_pubkey,
+                    telemetry,
+                ));
             }
             RelayNotification::Shutdown => return Ok(true),
         }
@@ -639,6 +725,46 @@ impl RelaySession {
 
     fn emit_telemetry(&self, telemetry: RelayTelemetry) {
         let _ = self.telemetry_sender.send(telemetry);
+    }
+
+    fn extract_group_id(event: &Event) -> Option<String> {
+        event.tags.iter().find_map(|tag| match tag.kind() {
+            TagKind::SingleLetter(single_letter)
+                if single_letter == SingleLetterTag::lowercase(Alphabet::H) =>
+            {
+                tag.content().map(|content| content.to_string())
+            }
+            _ => None,
+        })
+    }
+
+    fn dedupe_contexts(contexts: Vec<SubscriptionContext>) -> Vec<SubscriptionContext> {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+
+        for context in contexts {
+            // Group fanout already filters to one relay and one stream, so the
+            // concrete local account scope is the only meaningful dedupe key.
+            let key = context.account_pubkey.map(|pubkey| pubkey.to_hex());
+
+            if seen.insert(key) {
+                deduped.push(context);
+            }
+        }
+
+        deduped
+    }
+
+    fn apply_telemetry_scope(
+        telemetry_account_pubkey: Option<PublicKey>,
+        telemetry: RelayTelemetry,
+    ) -> RelayTelemetry {
+        match telemetry_account_pubkey {
+            Some(account_pubkey) if telemetry.account_pubkey.is_none() => {
+                telemetry.with_account_pubkey(account_pubkey)
+            }
+            _ => telemetry,
+        }
     }
 }
 
@@ -693,10 +819,32 @@ mod tests {
                 filter,
                 SubscriptionStream::GroupMessages,
                 None,
+                &[],
             )
             .await;
 
         let first = telemetry.recv().await.unwrap();
         assert_eq!(first.kind, RelayTelemetryKind::SubscriptionAttempt);
+    }
+
+    #[tokio::test]
+    async fn test_session_scope_applies_account_pubkey_to_connection_telemetry() {
+        let (sender, _) = mpsc::channel(8);
+        let account_pubkey = Keys::generate().public_key();
+        let mut config = RelaySessionConfig::new(RelayPlane::AccountInbox);
+        config.telemetry_account_pubkey = Some(account_pubkey);
+        let session = RelaySession::new(config, sender);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let telemetry = RelaySession::apply_telemetry_scope(
+            session.config.telemetry_account_pubkey,
+            RelayTelemetry::new(
+                RelayTelemetryKind::Connected,
+                RelayPlane::AccountInbox,
+                relay_url,
+            ),
+        );
+
+        assert_eq!(telemetry.account_pubkey, Some(account_pubkey));
     }
 }

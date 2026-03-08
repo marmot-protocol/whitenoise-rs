@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use super::{
     RelayPlane, SubscriptionStream, hash_pubkey_for_subscription_id,
@@ -119,6 +119,7 @@ impl GroupPlane {
                 filter,
                 SubscriptionStream::GroupMessages,
                 Some(pubkey),
+                group_ids,
             )
             .await
         {
@@ -146,6 +147,17 @@ impl GroupPlane {
         }
     }
 
+    pub(crate) async fn account_state(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Option<(Vec<RelayUrl>, Vec<String>)> {
+        self.accounts
+            .read()
+            .await
+            .get(pubkey)
+            .map(|state| (state.relays.clone(), state.group_ids.clone()))
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
         self.accounts.read().await.contains_key(pubkey)
@@ -170,6 +182,10 @@ impl GroupPlane {
                 }
             }
         }
+    }
+
+    pub(crate) fn telemetry(&self) -> broadcast::Receiver<super::observability::RelayTelemetry> {
+        self.session.telemetry()
     }
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
