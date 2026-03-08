@@ -419,11 +419,11 @@ impl Whitenoise {
                     let Some(mut parent) =
                         AggregatedMessage::find_by_id(&target_id, group_id, database).await?
                     else {
-                        return Ok(false);
+                        return Ok(None);
                     };
 
                     if !reaction_handler::remove_reaction_from_message(&mut parent, author) {
-                        return Ok(false);
+                        return Ok(None);
                     }
 
                     AggregatedMessage::update_reactions(
@@ -434,26 +434,26 @@ impl Whitenoise {
                     )
                     .await?;
 
-                    stream_manager.emit(
-                        group_id,
-                        MessageUpdate {
-                            trigger: UpdateTrigger::ReactionRemoved,
-                            message: parent,
-                        },
-                    );
-                    Ok(true)
+                    Ok(Some(parent))
                 })
                 .await;
 
                 match result {
-                    Ok(true) => {
+                    Ok(Some(parent)) => {
+                        stream_manager.emit(
+                            group_id,
+                            MessageUpdate {
+                                trigger: UpdateTrigger::ReactionRemoved,
+                                message: parent,
+                            },
+                        );
                         tracing::info!(
                             target: "whitenoise::messages::delivery",
                             "Cascaded reaction failure: removed reaction \
                              '{content}' from message {target_id}",
                         );
                     }
-                    Ok(false) => {}
+                    Ok(None) => {}
                     Err(e) => {
                         tracing::error!(
                             target: "whitenoise::messages::delivery",
