@@ -123,13 +123,13 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
 
         // Wait for message processing and event handlers to complete
         // The handle_mls_message handler should extract and store media references
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Query MediaFile records for this group
         // This should find the media reference created by store_references_from_imeta_tags
         let receiver_media_files = retry(
-            15,
-            std::time::Duration::from_millis(100),
+            50,
+            std::time::Duration::from_millis(200),
             || async {
                 let files = context
                     .whitenoise

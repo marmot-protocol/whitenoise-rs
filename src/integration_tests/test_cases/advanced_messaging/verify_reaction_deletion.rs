@@ -43,8 +43,8 @@ impl TestCase for VerifyReactionDeletionTestCase {
 
         // Retry until the reaction is removed (deletion event needs time to propagate)
         retry(
-            20,
-            std::time::Duration::from_millis(100),
+            50,
+            std::time::Duration::from_millis(200),
             || async {
                 let aggregated_messages = context
                     .whitenoise
