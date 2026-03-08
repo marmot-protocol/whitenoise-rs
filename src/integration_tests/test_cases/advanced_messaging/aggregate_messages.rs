@@ -30,6 +30,13 @@ impl TestCase for AggregateMessagesTestCase {
         let account = context.get_account(&self.account_name)?;
         let group = context.get_group(&self.group_name)?;
 
+        // Request enough messages to satisfy expected_min_messages.  The API caps at 200,
+        // so clamp there; if expected_min_messages exceeds 200 the test will fail with a
+        // clear count mismatch rather than silently truncating.
+        let fetch_limit = u32::try_from(self.expected_min_messages)
+            .unwrap_or(u32::MAX)
+            .min(200);
+
         // Wait for message processing with retry logic
         let aggregated_messages = match retry(
             15,                                    // max retries
@@ -42,7 +49,7 @@ impl TestCase for AggregateMessagesTestCase {
                         &group.mls_group_id,
                         None,
                         None,
-                        None,
+                        Some(fetch_limit),
                     )
                     .await?;
 
@@ -65,7 +72,8 @@ impl TestCase for AggregateMessagesTestCase {
         {
             Ok(messages) => messages,
             Err(retry_error) => {
-                // Perform one final fetch for rich diagnostics
+                // Perform one final fetch for rich diagnostics — same limit so the count
+                // in the error log matches what the retry loop actually observed.
                 let final_messages = context
                     .whitenoise
                     .fetch_aggregated_messages_for_group(
@@ -73,7 +81,7 @@ impl TestCase for AggregateMessagesTestCase {
                         &group.mls_group_id,
                         None,
                         None,
-                        None,
+                        Some(fetch_limit),
                     )
                     .await
                     .unwrap_or_default();
