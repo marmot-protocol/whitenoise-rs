@@ -1,4 +1,6 @@
 mod login;
+mod login_external_signer;
+mod login_multistep;
 mod setup;
 
 use std::fmt;
