@@ -14,13 +14,13 @@ pub enum MessagesCmd {
         /// MLS group ID (hex)
         group_id: String,
 
-        /// Fetch messages created before this Unix timestamp (seconds).
-        /// Used for cursor-based pagination: pass the created_at of the
-        /// oldest message already loaded to fetch the next page.
+        /// Cursor for pagination: Unix timestamp in seconds (use the `created_at`
+        /// value from the oldest message in the current page). Only messages
+        /// created strictly before this timestamp are returned.
         #[arg(long)]
         before: Option<u64>,
 
-        /// Maximum number of messages to return (default: 50)
+        /// Maximum number of messages to return (default: 50, max: 200)
         #[arg(long)]
         limit: Option<u32>,
     },

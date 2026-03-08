@@ -147,7 +147,7 @@ pub enum Request {
         /// Omit (or pass null) to fetch the most recent page.
         #[serde(default)]
         before: Option<u64>,
-        /// Maximum number of messages to return. Defaults to 50 when absent.
+        /// Maximum number of messages to return. Defaults to 50 when absent, capped at 200.
         #[serde(default)]
         limit: Option<u32>,
     },

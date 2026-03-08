@@ -1304,20 +1304,17 @@ async fn unreact_to_message(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    // Normalize to canonical lowercase hex for comparison against ChatMessage.id
+    // Normalize to canonical lowercase hex before the DB lookup
     let canonical_id = nostr_sdk::EventId::from_hex(message_id)
         .map_err(|e| Response::err(format!("invalid message ID '{message_id}': {e}")))?
         .to_hex();
 
-    // Find the user's reaction event ID on this message
-    let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, None, None)
+    // Look up the single target message directly — avoids a full-page scan that would
+    // silently fail for messages outside the most-recent page.
+    let target_msg = wn
+        .fetch_message_by_id(&account.pubkey, &group_id, &canonical_id)
         .await
-        .map_err(|e| Response::err(e.to_string()))?;
-
-    let target_msg = messages
-        .iter()
-        .find(|m| m.id == canonical_id)
+        .map_err(|e| Response::err(e.to_string()))?
         .ok_or_else(|| Response::err(format!("message not found: {message_id}")))?;
 
     let user_reaction = target_msg

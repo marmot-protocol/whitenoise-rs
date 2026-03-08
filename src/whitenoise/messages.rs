@@ -609,10 +609,10 @@ impl Whitenoise {
     /// # Arguments
     /// * `pubkey`  - The public key of the user requesting messages
     /// * `group_id` - The group to fetch messages for
-    /// * `before`  - If `Some`, return only messages created strictly before this timestamp.
-    ///   Pass the `created_at` of the oldest message already held by the caller
-    ///   to page backwards through history (infinite scroll).
-    /// * `limit`   - Maximum number of messages to return.  Defaults to 50 when `None`.
+    /// * `before`  - If `Some`, return only messages with `created_at` strictly less than
+    ///   this timestamp. Pass the `created_at` of the oldest message currently loaded
+    ///   to fetch the preceding page (infinite scroll upward). Omit for the initial load.
+    /// * `limit`   - Maximum number of messages to return. Defaults to 50, capped at 200.
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
@@ -622,10 +622,33 @@ impl Whitenoise {
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
-        AggregatedMessage::find_messages_by_group_paginated(group_id, before, limit, &self.database)
+        AggregatedMessage::find_messages_by_group_paginated(group_id, &self.database, before, limit)
             .await
             .map_err(|e| {
                 WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+            })
+    }
+
+    /// Fetch a single aggregated message by its event ID.
+    ///
+    /// Returns `None` if the message does not exist in the cache or belongs to a different group.
+    ///
+    /// # Arguments
+    /// * `pubkey`   - The public key of the requesting user (security check)
+    /// * `group_id` - The group the message belongs to
+    /// * `message_id` - Hex-encoded event ID of the message
+    pub async fn fetch_message_by_id(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        message_id: &str,
+    ) -> Result<Option<ChatMessage>> {
+        Account::find_by_pubkey(pubkey, &self.database).await?;
+
+        AggregatedMessage::find_by_id(message_id, group_id, &self.database)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached message: {}", e))
             })
     }
 
