@@ -102,6 +102,13 @@ impl RelayControlPlane {
         telemetry: &observability::RelayTelemetry,
     ) -> std::result::Result<(), DatabaseError> {
         if !Self::should_persist_telemetry(telemetry) {
+            tracing::debug!(
+                target: "whitenoise::relay_control::observability",
+                plane = telemetry.plane.as_str(),
+                relay_url = %telemetry.relay_url,
+                kind = telemetry.kind.as_str(),
+                "Skipping relay telemetry sample without required account scope"
+            );
             return Ok(());
         }
 
@@ -112,6 +119,8 @@ impl RelayControlPlane {
         &self.session_salt
     }
 
+    /// Spawn a fire-and-forget telemetry writer that exits when the telemetry
+    /// sender for the subscribed plane is dropped and the broadcast channel closes.
     fn spawn_telemetry_persistor(
         &self,
         task_name: &str,
@@ -132,7 +141,7 @@ impl RelayControlPlane {
                                 plane = telemetry.plane.as_str(),
                                 relay_url = %telemetry.relay_url,
                                 kind = telemetry.kind.as_str(),
-                                "Skipping unscoped account inbox telemetry sample"
+                                "Skipping relay telemetry sample without required account scope"
                             );
                             continue;
                         }
@@ -213,10 +222,7 @@ impl RelayControlPlane {
             return Err(error);
         }
 
-        self.spawn_telemetry_persistor(
-            &format!("account_inbox:{}", account_pubkey.to_hex()),
-            plane.telemetry(),
-        );
+        let telemetry_receiver = plane.telemetry();
 
         if let Some(previous_plane) = self
             .account_inbox_planes
@@ -226,6 +232,11 @@ impl RelayControlPlane {
         {
             previous_plane.deactivate().await;
         }
+
+        self.spawn_telemetry_persistor(
+            &format!("account_inbox:{}", account_pubkey.to_hex()),
+            telemetry_receiver,
+        );
 
         Ok(())
     }
@@ -404,6 +415,7 @@ pub(crate) struct SubscriptionContext {
     pub(crate) account_pubkey: Option<PublicKey>,
     pub(crate) relay_url: RelayUrl,
     pub(crate) stream: SubscriptionStream,
+    /// Hex-encoded Nostr group IDs carried in `#h` tags for group-message routing.
     pub(crate) group_ids: Vec<String>,
 }
 

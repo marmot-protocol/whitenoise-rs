@@ -523,7 +523,16 @@ impl RelaySession {
                                                             matches
                                                         }
                                                     }
-                                                    None => vec![context.clone()],
+                                                    None => {
+                                                        tracing::warn!(
+                                                            target: "whitenoise::relay_control::sessions",
+                                                            relay_url = %relay_url,
+                                                            subscription_id = %subscription_id,
+                                                            event_id = %event.id,
+                                                            "Group message missing #h tag; falling back to original subscription context"
+                                                        );
+                                                        vec![context.clone()]
+                                                    }
                                                 }
                                             }
                                             _ => vec![context.clone()],
@@ -726,13 +735,9 @@ impl RelaySession {
         let mut deduped = Vec::new();
 
         for context in contexts {
-            let key = (
-                context.stream,
-                context
-                    .account_pubkey
-                    .map(|pubkey| pubkey.to_hex())
-                    .unwrap_or_default(),
-            );
+            // Group fanout already filters to one relay and one stream, so the
+            // concrete local account scope is the only meaningful dedupe key.
+            let key = context.account_pubkey.map(|pubkey| pubkey.to_hex());
 
             if seen.insert(key) {
                 deduped.push(context);

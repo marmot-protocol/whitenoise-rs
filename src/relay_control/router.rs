@@ -75,6 +75,9 @@ impl RelayRouter {
         relay_url: &RelayUrl,
         group_id: &str,
     ) -> Vec<SubscriptionContext> {
+        // This is an O(n) scan over active subscription contexts under a read
+        // lock. That is acceptable for the current migrated planes and account
+        // counts; add a secondary index if group fanout becomes hot.
         self.subscription_contexts
             .read()
             .await
