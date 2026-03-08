@@ -182,6 +182,12 @@ pub enum Request {
         account: String,
         group_id: String,
         file_path: String,
+        /// When true, send a kind-9 message with the imeta tag after upload.
+        #[serde(default)]
+        send: bool,
+        /// Optional caption text for the message (only used when `send` is true).
+        #[serde(default)]
+        message: Option<String>,
     },
     #[serde(rename = "download_media")]
     DownloadMedia {
@@ -974,15 +980,57 @@ mod tests {
             account: "npub1abc".to_string(),
             group_id: "abcd1234".to_string(),
             file_path: "/tmp/image.png".to_string(),
+            send: false,
+            message: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::UploadMedia { account, group_id, file_path }
+            Request::UploadMedia { account, group_id, file_path, send, message }
             if account == "npub1abc"
                 && group_id == "abcd1234"
                 && file_path == "/tmp/image.png"
+                && !send
+                && message.is_none()
+        ));
+    }
+
+    #[test]
+    fn upload_media_minimal_roundtrip() {
+        // Old-style wire format without send/message — defaults apply
+        let wire = r#"{"method":"upload_media","params":{"account":"npub1abc","group_id":"abcd1234","file_path":"/tmp/image.png"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UploadMedia { account, group_id, file_path, send, message }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && file_path == "/tmp/image.png"
+                && !send
+                && message.is_none()
+        ));
+    }
+
+    #[test]
+    fn upload_media_with_send_roundtrip() {
+        let req = Request::UploadMedia {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            file_path: "/tmp/image.png".to_string(),
+            send: true,
+            message: Some("check this out".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UploadMedia { account, group_id, file_path, send, message }
+            if account == "npub1abc"
+                && group_id == "abcd1234"
+                && file_path == "/tmp/image.png"
+                && send
+                && message.as_deref() == Some("check this out")
         ));
     }
 

@@ -314,7 +314,9 @@ pub async fn dispatch(req: Request) -> Response {
             account,
             group_id,
             file_path,
-        } => match upload_media(wn, &account, &group_id, &file_path).await {
+            send,
+            message,
+        } => match upload_media(wn, &account, &group_id, &file_path, send, message).await {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1338,6 +1340,8 @@ async fn upload_media(
     account_str: &str,
     group_id_hex: &str,
     file_path: &str,
+    send: bool,
+    message: Option<String>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
@@ -1347,7 +1351,69 @@ async fn upload_media(
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
-    Ok(to_response(&media_file))
+    if !send {
+        return Ok(to_response(&media_file));
+    }
+
+    let imeta_tag = build_imeta_tag(&media_file)?;
+    let caption = message.unwrap_or_default();
+
+    let msg_result = wn
+        .send_message_to_group(&account, &group_id, caption, 9, Some(vec![imeta_tag]))
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(to_response(&serde_json::json!({
+        "media": serde_json::to_value(&media_file).map_err(|e| Response::err(e.to_string()))?,
+        "message": serde_json::to_value(&msg_result).map_err(|e| Response::err(e.to_string()))?,
+    })))
+}
+
+/// Build an `imeta` tag from an uploaded `MediaFile` per MIP-04.
+fn build_imeta_tag(
+    media_file: &crate::whitenoise::database::media_files::MediaFile,
+) -> Result<nostr_sdk::Tag, Response> {
+    let blossom_url = media_file
+        .blossom_url
+        .as_deref()
+        .ok_or_else(|| Response::err("uploaded media has no blossom URL"))?;
+
+    let original_hash_hex = media_file
+        .original_file_hash
+        .as_ref()
+        .map(hex::encode)
+        .ok_or_else(|| Response::err("uploaded media has no original file hash"))?;
+
+    let mut parts: Vec<String> = vec![
+        "imeta".to_string(),
+        format!("url {}", blossom_url),
+        format!("m {}", media_file.mime_type),
+        format!("x {}", original_hash_hex),
+    ];
+
+    if let Some(ref fm) = media_file.file_metadata {
+        if let Some(ref filename) = fm.original_filename {
+            parts.push(format!("filename {}", filename));
+        }
+        if let Some(ref blurhash) = fm.blurhash {
+            parts.push(format!("blurhash {}", blurhash));
+        }
+        if let Some(ref dim) = fm.dimensions {
+            parts.push(format!("dim {}", dim));
+        }
+    }
+
+    if let Some(ref nonce) = media_file.nonce {
+        parts.push(format!("n {}", nonce));
+    }
+
+    if let Some(ref version) = media_file.scheme_version {
+        parts.push(format!("v {}", version));
+    }
+
+    let parts_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+    nostr_sdk::Tag::parse(parts_refs)
+        .map_err(|e| Response::err(format!("failed to create imeta tag: {e}")))
 }
 
 async fn download_media(

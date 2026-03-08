@@ -16,6 +16,14 @@ pub enum MediaCmd {
 
         /// Path to the file to upload
         file_path: String,
+
+        /// Send a message with the uploaded media attachment
+        #[arg(long)]
+        send: bool,
+
+        /// Caption text for the message (implies --send)
+        #[arg(long)]
+        message: Option<String>,
     },
 
     /// Download a media file from a group chat
@@ -45,7 +53,20 @@ impl MediaCmd {
             Self::Upload {
                 group_id,
                 file_path,
-            } => upload(socket, json, account_flag, group_id, file_path).await,
+                send,
+                message,
+            } => {
+                upload(
+                    socket,
+                    json,
+                    account_flag,
+                    group_id,
+                    file_path,
+                    send,
+                    message,
+                )
+                .await
+            }
             Self::Download {
                 group_id,
                 file_hash,
@@ -61,14 +82,20 @@ async fn upload(
     account_flag: Option<&str>,
     group_id: String,
     file_path: String,
+    send: bool,
+    message: Option<String>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
+    // --message implies --send
+    let send = send || message.is_some();
     let resp = client::send(
         socket,
         &Request::UploadMedia {
             account: pubkey,
             group_id,
             file_path,
+            send,
+            message,
         },
     )
     .await?;
