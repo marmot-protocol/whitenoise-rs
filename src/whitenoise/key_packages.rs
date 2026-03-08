@@ -351,12 +351,7 @@ impl Whitenoise {
     ) -> Result<EventId> {
         let result = self
             .relay_control
-            .publish_key_package_with_signer(
-                encoded_key_package,
-                relay_urls,
-                tags,
-                signer,
-            )
+            .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
             .await?;
 
         if result.success.is_empty() {
