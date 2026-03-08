@@ -48,7 +48,12 @@ impl TestCase for VerifyReactionDeletionTestCase {
             || async {
                 let aggregated_messages = context
                     .whitenoise
-                    .fetch_aggregated_messages_for_group(&account.pubkey, &group.mls_group_id)
+                    .fetch_aggregated_messages_for_group(
+                        &account.pubkey,
+                        &group.mls_group_id,
+                        None,
+                        None,
+                    )
                     .await?;
 
                 let target_message = aggregated_messages

@@ -13,6 +13,16 @@ pub enum MessagesCmd {
     List {
         /// MLS group ID (hex)
         group_id: String,
+
+        /// Fetch messages created before this Unix timestamp (seconds).
+        /// Used for cursor-based pagination: pass the created_at of the
+        /// oldest message already loaded to fetch the next page.
+        #[arg(long)]
+        before: Option<u64>,
+
+        /// Maximum number of messages to return (default: 50)
+        #[arg(long)]
+        limit: Option<u32>,
     },
 
     /// Send a message to a group
@@ -83,7 +93,11 @@ impl MessagesCmd {
         account_flag: Option<&str>,
     ) -> anyhow::Result<()> {
         match self {
-            Self::List { group_id } => list(socket, json, account_flag, group_id).await,
+            Self::List {
+                group_id,
+                before,
+                limit,
+            } => list(socket, json, account_flag, group_id, before, limit).await,
             Self::Send {
                 group_id,
                 message,
@@ -115,6 +129,8 @@ async fn list(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
+    before: Option<u64>,
+    limit: Option<u32>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
@@ -122,6 +138,8 @@ async fn list(
         &Request::ListMessages {
             account: pubkey,
             group_id,
+            before,
+            limit,
         },
     )
     .await?;

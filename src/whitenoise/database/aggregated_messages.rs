@@ -202,8 +202,10 @@ impl AggregatedMessage {
         Ok(ids.into_iter().collect())
     }
 
-    /// Fetch ONLY kind 9 messages for a group (main read path)
-    /// This is what fetch_aggregated_messages_for_group calls
+    /// Fetch ALL kind 9 messages for a group (no pagination).
+    ///
+    /// Used internally by unit tests and low-level sync helpers.
+    /// The main consumer-facing API uses `find_messages_by_group_paginated` instead.
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
     pub async fn find_messages_by_group(
@@ -224,6 +226,77 @@ impl AggregatedMessage {
         .await?;
 
         rows.into_iter().map(Self::row_to_chat_message).collect()
+    }
+
+    /// Fetch ONLY kind 9 messages for a group with cursor-based pagination (main read path)
+    ///
+    /// Returns up to `limit` messages ordered oldest-first.  When `before` is `Some`, only
+    /// messages whose `created_at` is strictly less than the supplied timestamp are returned,
+    /// which lets callers walk backwards through history (infinite-scroll "load older messages").
+    ///
+    /// # Arguments
+    /// * `group_id`  – the MLS group to query
+    /// * `before`    – if `Some`, return only messages created before this Unix-seconds timestamp
+    /// * `limit`     – maximum number of rows to return (default 50 when `None`)
+    ///
+    /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
+    pub async fn find_messages_by_group_paginated(
+        group_id: &GroupId,
+        before: Option<Timestamp>,
+        limit: Option<u32>,
+        database: &Database,
+    ) -> Result<Vec<ChatMessage>> {
+        // The DB stores created_at as Unix milliseconds (i64).
+        // nostr_sdk::Timestamp is Unix seconds (u64), so we multiply by 1000.
+        let limit_val = i64::from(limit.unwrap_or(50));
+
+        let rows: Vec<AggregatedMessageRow> = match before {
+            Some(ts) => {
+                // Convert seconds → milliseconds for the DB comparison
+                let before_ms = (ts.as_secs() as i64).saturating_mul(1_000);
+                sqlx::query_as(
+                    "SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND am.created_at < ?
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at DESC
+                     LIMIT ?",
+                )
+                .bind(group_id.as_slice())
+                .bind(before_ms)
+                .bind(limit_val)
+                .fetch_all(&database.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at DESC
+                     LIMIT ?",
+                )
+                .bind(group_id.as_slice())
+                .bind(limit_val)
+                .fetch_all(&database.pool)
+                .await?
+            }
+        };
+
+        // The DB returns rows newest-first (DESC) so we can apply LIMIT correctly,
+        // but callers expect oldest-first ordering — reverse before returning.
+        let mut messages: Vec<ChatMessage> = rows
+            .into_iter()
+            .map(Self::row_to_chat_message)
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
     }
 
     /// Save all events (kind 9, 7, 5) from sync in ONE transaction with single batch INSERT

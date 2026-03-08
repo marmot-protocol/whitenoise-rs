@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
-use nostr_sdk::PublicKey;
+use nostr_sdk::{PublicKey, Timestamp};
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
@@ -256,12 +256,15 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
-        Request::ListMessages { account, group_id } => {
-            match list_messages(wn, &account, &group_id).await {
-                Ok(resp) => resp,
-                Err(resp) => resp,
-            }
-        }
+        Request::ListMessages {
+            account,
+            group_id,
+            before,
+            limit,
+        } => match list_messages(wn, &account, &group_id, before, limit).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
 
         Request::SendMessage {
             account,
@@ -1185,11 +1188,14 @@ async fn list_messages(
     wn: &Whitenoise,
     account_str: &str,
     group_id_hex: &str,
+    before: Option<u64>,
+    limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
+    let before_ts = before.map(Timestamp::from);
     let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, before_ts, limit)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1305,7 +1311,7 @@ async fn unreact_to_message(
 
     // Find the user's reaction event ID on this message
     let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, None, None)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

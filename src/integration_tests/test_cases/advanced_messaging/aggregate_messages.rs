@@ -37,7 +37,12 @@ impl TestCase for AggregateMessagesTestCase {
             || async {
                 let messages = context
                     .whitenoise
-                    .fetch_aggregated_messages_for_group(&account.pubkey, &group.mls_group_id)
+                    .fetch_aggregated_messages_for_group(
+                        &account.pubkey,
+                        &group.mls_group_id,
+                        None,
+                        None,
+                    )
                     .await?;
 
                 if messages.len() >= self.expected_min_messages {
@@ -62,7 +67,12 @@ impl TestCase for AggregateMessagesTestCase {
                 // Perform one final fetch for rich diagnostics
                 let final_messages = context
                     .whitenoise
-                    .fetch_aggregated_messages_for_group(&account.pubkey, &group.mls_group_id)
+                    .fetch_aggregated_messages_for_group(
+                        &account.pubkey,
+                        &group.mls_group_id,
+                        None,
+                        None,
+                    )
                     .await
                     .unwrap_or_default();
 

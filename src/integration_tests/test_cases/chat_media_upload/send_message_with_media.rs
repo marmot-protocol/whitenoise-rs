@@ -101,6 +101,8 @@ impl TestCase for SendMessageWithMediaTestCase {
                     .fetch_aggregated_messages_for_group(
                         &sender_account.pubkey,
                         &group.mls_group_id,
+                        None,
+                        None,
                     )
                     .await?;
 

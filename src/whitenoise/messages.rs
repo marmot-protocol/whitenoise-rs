@@ -601,21 +601,28 @@ impl Whitenoise {
 
     /// Fetch and aggregate messages for a group - Main consumer API
     ///
-    /// Returns pre-aggregated messages from the cache. The cache is kept up-to-date by:
+    /// Returns pre-aggregated messages from the cache in oldest-first order. The cache is
+    /// kept up-to-date by:
     /// - Event processor: Caches messages as they arrive (real-time updates)
     /// - Startup sync: Populates cache with existing messages on initialization
     ///
     /// # Arguments
-    /// * `pubkey` - The public key of the user requesting messages
+    /// * `pubkey`  - The public key of the user requesting messages
     /// * `group_id` - The group to fetch messages for
+    /// * `before`  - If `Some`, return only messages created strictly before this timestamp.
+    ///   Pass the `created_at` of the oldest message already held by the caller
+    ///   to page backwards through history (infinite scroll).
+    /// * `limit`   - Maximum number of messages to return.  Defaults to 50 when `None`.
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
+        before: Option<Timestamp>,
+        limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
-        AggregatedMessage::find_messages_by_group(group_id, &self.database)
+        AggregatedMessage::find_messages_by_group_paginated(group_id, before, limit, &self.database)
             .await
             .map_err(|e| {
                 WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
@@ -1360,7 +1367,7 @@ mod tests {
 
         // Fetch messages via the main API - should read from cache
         let fetched_messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id, None, None)
             .await
             .unwrap();
 
@@ -1431,7 +1438,7 @@ mod tests {
 
         // Fetch messages - should include empty reactions and media
         let messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id, None, None)
             .await
             .unwrap();
 
