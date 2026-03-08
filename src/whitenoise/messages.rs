@@ -609,24 +609,36 @@ impl Whitenoise {
     /// # Arguments
     /// * `pubkey`  - The public key of the user requesting messages
     /// * `group_id` - The group to fetch messages for
-    /// * `before`  - If `Some`, return only messages with `created_at` strictly less than
-    ///   this timestamp. Pass the `created_at` of the oldest message currently loaded
-    ///   to fetch the preceding page (infinite scroll upward). Omit for the initial load.
-    /// * `limit`   - Maximum number of messages to return. Defaults to 50, capped at 200.
+    /// * `before`            - Cursor timestamp. If `Some`, return only messages with
+    ///   `created_at` strictly before this value **or** at the same second but with a
+    ///   lexicographically smaller message ID. Pass the `created_at` of the oldest message
+    ///   currently loaded to fetch the preceding page (infinite scroll upward). Omit for the
+    ///   initial load.
+    /// * `before_message_id` - Companion cursor ID. Pass the `id` of the same oldest message
+    ///   used for `before` so that ties at the same second are resolved deterministically.
+    ///   May be `None` when `before` is `None` or when timestamps are known to be unique.
+    /// * `limit`             - Maximum number of messages to return. Defaults to 50, capped at 200.
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         before: Option<Timestamp>,
+        before_message_id: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
-        AggregatedMessage::find_messages_by_group_paginated(group_id, &self.database, before, limit)
-            .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
-            })
+        AggregatedMessage::find_messages_by_group_paginated(
+            group_id,
+            &self.database,
+            before,
+            before_message_id,
+            limit,
+        )
+        .await
+        .map_err(|e| {
+            WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+        })
     }
 
     /// Fetch a single aggregated message by its event ID.
@@ -1390,7 +1402,13 @@ mod tests {
 
         // Fetch messages via the main API - should read from cache
         let fetched_messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id, None, None)
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1461,7 +1479,13 @@ mod tests {
 
         // Fetch messages - should include empty reactions and media
         let messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id, None, None)
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 

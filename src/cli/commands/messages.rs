@@ -14,11 +14,17 @@ pub enum MessagesCmd {
         /// MLS group ID (hex)
         group_id: String,
 
-        /// Cursor for pagination: Unix timestamp in seconds (use the `created_at`
-        /// value from the oldest message in the current page). Only messages
-        /// created strictly before this timestamp are returned.
+        /// Cursor timestamp: Unix seconds taken from the `created_at` of the oldest
+        /// message in the current page. Only messages strictly before this timestamp
+        /// (or at the same second with a smaller ID) are returned.
         #[arg(long)]
         before: Option<u64>,
+
+        /// Companion cursor ID: the `id` field of the same oldest message used for
+        /// `--before`. Ensures deterministic ordering when multiple messages share
+        /// the same second.
+        #[arg(long)]
+        before_message_id: Option<String>,
 
         /// Maximum number of messages to return (default: 50, max: 200)
         #[arg(long)]
@@ -96,8 +102,20 @@ impl MessagesCmd {
             Self::List {
                 group_id,
                 before,
+                before_message_id,
                 limit,
-            } => list(socket, json, account_flag, group_id, before, limit).await,
+            } => {
+                list(
+                    socket,
+                    json,
+                    account_flag,
+                    group_id,
+                    before,
+                    before_message_id,
+                    limit,
+                )
+                .await
+            }
             Self::Send {
                 group_id,
                 message,
@@ -130,6 +148,7 @@ async fn list(
     account_flag: Option<&str>,
     group_id: String,
     before: Option<u64>,
+    before_message_id: Option<String>,
     limit: Option<u32>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
@@ -139,6 +158,7 @@ async fn list(
             account: pubkey,
             group_id,
             before,
+            before_message_id,
             limit,
         },
     )

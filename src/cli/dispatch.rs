@@ -260,8 +260,18 @@ pub async fn dispatch(req: Request) -> Response {
             account,
             group_id,
             before,
+            before_message_id,
             limit,
-        } => match list_messages(wn, &account, &group_id, before, limit).await {
+        } => match list_messages(
+            wn,
+            &account,
+            &group_id,
+            before,
+            before_message_id.as_deref(),
+            limit,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1189,13 +1199,20 @@ async fn list_messages(
     account_str: &str,
     group_id_hex: &str,
     before: Option<u64>,
+    before_message_id: Option<&str>,
     limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let before_ts = before.map(Timestamp::from);
     let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, before_ts, limit)
+        .fetch_aggregated_messages_for_group(
+            &account.pubkey,
+            &group_id,
+            before_ts,
+            before_message_id,
+            limit,
+        )
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

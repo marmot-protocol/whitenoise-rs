@@ -103,6 +103,7 @@ impl TestCase for SendMessageWithMediaTestCase {
                         &group.mls_group_id,
                         None,
                         None,
+                        None,
                     )
                     .await?;
 

@@ -53,6 +53,7 @@ impl TestCase for VerifyReactionDeletionTestCase {
                         &group.mls_group_id,
                         None,
                         None,
+                        None,
                     )
                     .await?;
 

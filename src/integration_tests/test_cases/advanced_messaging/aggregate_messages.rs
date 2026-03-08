@@ -42,6 +42,7 @@ impl TestCase for AggregateMessagesTestCase {
                         &group.mls_group_id,
                         None,
                         None,
+                        None,
                     )
                     .await?;
 
@@ -70,6 +71,7 @@ impl TestCase for AggregateMessagesTestCase {
                     .fetch_aggregated_messages_for_group(
                         &account.pubkey,
                         &group.mls_group_id,
+                        None,
                         None,
                         None,
                     )

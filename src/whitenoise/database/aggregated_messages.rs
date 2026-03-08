@@ -228,22 +228,32 @@ impl AggregatedMessage {
         rows.into_iter().map(Self::row_to_chat_message).collect()
     }
 
-    /// Fetch ONLY kind 9 messages for a group with cursor-based pagination (main read path)
+    /// Fetch ONLY kind 9 messages for a group with stable cursor-based pagination.
     ///
-    /// Returns up to `limit` messages ordered oldest-first.  When `before` is `Some`, only
-    /// messages whose `created_at` is strictly less than the supplied timestamp are returned,
-    /// which lets callers walk backwards through history (infinite-scroll "load older messages").
+    /// Returns up to `limit` messages ordered oldest-first using a **compound cursor**
+    /// `(created_at, message_id)` so that ties at the same second are deterministic and
+    /// no message is skipped or repeated across pages.
+    ///
+    /// # Pagination protocol
+    ///
+    /// * Initial load: pass `before = None`, `before_message_id = None`.
+    /// * Subsequent pages: pass the `created_at` **and** `id` of the *oldest* message
+    ///   in the current page as `before` and `before_message_id` respectively.
     ///
     /// # Arguments
-    /// * `group_id`  – the MLS group to query
-    /// * `before`    – if `Some`, return only messages created before this Unix-seconds timestamp
-    /// * `limit`     – maximum number of rows to return (default 50 when `None`)
+    /// * `group_id`          – the MLS group to query
+    /// * `database`          – database handle
+    /// * `before`            – cursor timestamp (Unix seconds); `None` means no upper bound
+    /// * `before_message_id` – cursor message ID (hex); required when `before` is `Some` and
+    ///   the timestamp boundary may contain ties
+    /// * `limit`             – maximum rows to return (default 50, capped at 200)
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
     pub async fn find_messages_by_group_paginated(
         group_id: &GroupId,
         database: &Database,
         before: Option<Timestamp>,
+        before_message_id: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         // Clamp limit: default 50, max 200.
@@ -251,12 +261,19 @@ impl AggregatedMessage {
 
         // The DB stores created_at as Unix milliseconds (i64).
         // nostr_sdk::Timestamp is Unix seconds; multiply by 1000 to convert.
-        // When `before` is None we use i64::MAX as a sentinel — SQLite treats
-        // `created_at < 9223372036854775807` as a no-op that still uses the
-        // covering index, letting us keep a single query branch.
+        //
+        // Sentinels when `before` is None:
+        //   before_ms       → i64::MAX  — `created_at < MAX` is always true (no upper bound)
+        //   before_id_str   → ""        — irrelevant; the `created_at = MAX` branch never fires
+        //
+        // When `before` is Some but `before_message_id` is None (e.g. the caller doesn't
+        // know the message ID), the `(created_at = ? AND message_id < ?)` arm evaluates to
+        // false for all real IDs because `message_id < ""` is always false — giving the same
+        // behaviour as the old single-cursor, which is safe when timestamps are unique.
         let before_ms = before
             .map(|ts| (ts.as_secs() as i64).saturating_mul(1_000))
             .unwrap_or(i64::MAX);
+        let before_id_str = before_message_id.unwrap_or("");
 
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT am.*, mds.status AS delivery_status
@@ -264,19 +281,20 @@ impl AggregatedMessage {
              LEFT JOIN message_delivery_status mds
                ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9 AND am.mls_group_id = ?
-               AND am.created_at < ?
+               AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-             ORDER BY am.created_at DESC
+             ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT ?",
         )
         .bind(group_id.as_slice())
         .bind(before_ms)
+        .bind(before_ms)
+        .bind(before_id_str)
         .bind(limit_val)
         .fetch_all(&database.pool)
         .await?;
 
-        // The DB returns rows newest-first (DESC) so the LIMIT selects the right
-        // window; reverse here to restore oldest-first order for callers.
+        // Rows arrive newest-first (DESC, DESC); reverse to restore oldest-first for callers.
         let mut messages: Vec<ChatMessage> = rows
             .into_iter()
             .map(Self::row_to_chat_message)
@@ -2352,6 +2370,7 @@ mod tests {
             &whitenoise.database,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2383,6 +2402,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
+            None,
             None,
             None,
         )
@@ -2440,6 +2460,7 @@ mod tests {
             &whitenoise.database,
             Some(cursor),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2476,6 +2497,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
+            None,
             None,
             Some(3),
         )
@@ -2521,6 +2543,7 @@ mod tests {
             &group_id,
             &whitenoise.database,
             None,
+            None,
             Some(u32::MAX),
         )
         .await
@@ -2555,18 +2578,21 @@ mod tests {
             &group_id,
             &whitenoise.database,
             None,
+            None,
             Some(5),
         )
         .await
         .unwrap();
         assert_eq!(page1.len(), 5);
 
-        // Page 2: 5 messages before the oldest of page 1 (seeds 1–5)
-        let cursor = page1[0].created_at;
+        // Page 2: 5 messages before the oldest of page 1 — use the compound cursor
+        let cursor_ts = page1[0].created_at;
+        let cursor_id = page1[0].id.as_str();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor),
+            Some(cursor_ts),
+            Some(cursor_id),
             Some(5),
         )
         .await
@@ -2583,16 +2609,129 @@ mod tests {
         all_ids.sort();
         assert_eq!(all_ids.len(), 10, "pages together must cover all messages");
 
-        // Page 3 cursor exhausts history
-        let cursor2 = page2[0].created_at;
+        // Page 3: cursor past the oldest of page 2 — should be empty
+        let cursor_ts2 = page2[0].created_at;
+        let cursor_id2 = page2[0].id.as_str();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor2),
+            Some(cursor_ts2),
+            Some(cursor_id2),
             Some(5),
         )
         .await
         .unwrap();
         assert!(page3.is_empty(), "page beyond history should be empty");
+    }
+
+    /// Regression test: multiple messages sharing the same `created_at` second span a page
+    /// boundary. Without compound cursor tie-breaking, rows at the boundary second are
+    /// non-deterministically included or excluded, leading to skipped or duplicated messages
+    /// across pages. This test verifies that every message is returned exactly once.
+    #[tokio::test]
+    async fn test_paginated_tied_timestamps_no_skip_or_duplicate_across_pages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[206; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // 6 messages at the SAME second (the tie), plus one earlier and one later
+        // to ensure the cursor logic handles boundary conditions on both sides.
+        let tie_ts: u64 = 1_700_500_000;
+
+        // Seeds 1–6: all at `tie_ts` (identical created_at seconds)
+        // Seeds 7–8: flanking timestamps to confirm ordering is correct
+        insert_message_at(7, author, tie_ts - 1, &group_id, &whitenoise.database).await; // earlier
+        for i in 1u8..=6 {
+            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.database).await;
+        }
+        insert_message_at(8, author, tie_ts + 1, &group_id, &whitenoise.database).await; // later
+
+        // Total 8 messages. Page size 3 — three pages needed.
+        // Page 1: newest 3
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page1.len(), 3, "page 1 should have 3 messages");
+
+        // Page 2: compound cursor from oldest of page 1
+        let c1_ts = page1[0].created_at;
+        let c1_id = page1[0].id.clone();
+        let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(c1_ts),
+            Some(c1_id.as_str()),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page2.len(), 3, "page 2 should have 3 messages");
+
+        // Page 3: compound cursor from oldest of page 2
+        let c2_ts = page2[0].created_at;
+        let c2_id = page2[0].id.clone();
+        let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(c2_ts),
+            Some(c2_id.as_str()),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page3.len(),
+            2,
+            "page 3 should have the remaining 2 messages"
+        );
+
+        // Page 4: should be empty — history exhausted
+        let c3_ts = page3[0].created_at;
+        let c3_id = page3[0].id.clone();
+        let page4 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(c3_ts),
+            Some(c3_id.as_str()),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert!(page4.is_empty(), "page 4 should be empty");
+
+        // Collect all returned IDs across all pages
+        let all_returned: std::collections::HashSet<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|m| m.id.clone())
+            .collect();
+
+        // Verify: exactly 8 unique messages, no skips, no duplicates
+        assert_eq!(
+            all_returned.len(),
+            8,
+            "all 8 messages must be returned exactly once across pages"
+        );
+
+        // Verify oldest-first ordering within each page
+        for (page_num, page) in [&page1, &page2, &page3].iter().enumerate() {
+            for w in page.windows(2) {
+                assert!(
+                    w[0].created_at < w[1].created_at
+                        || (w[0].created_at == w[1].created_at && w[0].id <= w[1].id),
+                    "page {} must be ordered by (created_at, id) ascending",
+                    page_num + 1
+                );
+            }
+        }
     }
 }

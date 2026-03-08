@@ -1220,6 +1220,7 @@ mod tests {
                 &group.mls_group_id,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
