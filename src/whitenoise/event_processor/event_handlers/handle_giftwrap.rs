@@ -4,7 +4,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
-use tokio::sync::watch;
 
 use crate::whitenoise::{
     Whitenoise,
@@ -186,18 +185,12 @@ impl Whitenoise {
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
-        let cancel_rx = self
-            .background_task_cancellation
-            .get(&account.pubkey)
-            .map(|entry| entry.value().subscribe());
-
         tokio::spawn(Self::background_finalize_welcome(
             account.clone(),
             group_id,
             group_name,
             key_package_event_id,
             welcomer_pubkey,
-            cancel_rx,
         ));
 
         Ok(())
@@ -211,7 +204,6 @@ impl Whitenoise {
         group_name: String,
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
-        cancel_rx: Option<watch::Receiver<bool>>,
     ) {
         let Ok(whitenoise) = Whitenoise::get_instance() else {
             tracing::error!(
@@ -228,7 +220,6 @@ impl Whitenoise {
             &group_name,
             key_package_event_id,
             welcomer_pubkey,
-            cancel_rx,
         )
         .await;
     }
@@ -255,17 +246,7 @@ impl Whitenoise {
         group_name: &str,
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
-        mut cancel_rx: Option<watch::Receiver<bool>>,
     ) {
-        if Self::welcome_background_cancelled(whitenoise, account, cancel_rx.as_mut()).await {
-            tracing::debug!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                account = %account.pubkey.to_hex(),
-                "Account was logged out before welcome finalization started"
-            );
-            return;
-        }
-
         // Get signer early - needed for subscriptions
         let signer = match whitenoise.get_signer_for_account(account) {
             Ok(s) => s,
@@ -307,7 +288,7 @@ impl Whitenoise {
 
         // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
         let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
-            Self::create_group_info(whitenoise, account, group_id, group_name),
+            Self::create_group_info(whitenoise, group_id, group_name),
             Self::rotate_key_package(whitenoise, account, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
@@ -390,17 +371,9 @@ impl Whitenoise {
 
     async fn create_group_info(
         whitenoise: &Whitenoise,
-        account: &Account,
         group_id: &GroupId,
         group_name: &str,
     ) -> Result<()> {
-        if Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-
         GroupInformation::create_for_group(whitenoise, group_id, None, group_name).await?;
         Ok(())
     }
@@ -441,13 +414,6 @@ impl Whitenoise {
         account: &Account,
         key_package_event_id: EventId,
     ) -> Result<()> {
-        if Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-
         // Mark the key package as consumed so the maintenance task knows
         // to clean up local key material after the quiet period.
         if let Err(e) = PublishedKeyPackage::mark_consumed(
@@ -500,24 +466,6 @@ impl Whitenoise {
         }
 
         Ok(())
-    }
-
-    async fn welcome_background_cancelled(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        cancel_rx: Option<&mut watch::Receiver<bool>>,
-    ) -> bool {
-        if Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
-            .await
-            .is_err()
-        {
-            return true;
-        }
-
-        match cancel_rx {
-            Some(cancel_rx) => *cancel_rx.borrow(),
-            None => false,
-        }
     }
 
     /// Sync group image cache if needed
@@ -928,7 +876,6 @@ mod tests {
             group_name,
             EventId::all_zeros(),
             welcomer_pubkey,
-            None,
         )
         .await;
 
@@ -964,7 +911,6 @@ mod tests {
             group_name,
             EventId::all_zeros(),
             welcomer_pubkey,
-            None,
         )
         .await;
 
@@ -975,7 +921,6 @@ mod tests {
             group_name,
             EventId::all_zeros(),
             welcomer_pubkey,
-            None,
         )
         .await;
 
@@ -1025,7 +970,6 @@ mod tests {
             &group.name,
             EventId::all_zeros(),
             creator_account.pubkey,
-            None,
         )
         .await;
 
@@ -1070,7 +1014,6 @@ mod tests {
             "Test Group",
             EventId::all_zeros(),
             welcomer_pubkey,
-            None,
         )
         .await;
 
