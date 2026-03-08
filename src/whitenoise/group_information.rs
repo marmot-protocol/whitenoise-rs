@@ -40,7 +40,7 @@ impl FromStr for GroupType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupInformation {
     pub id: Option<i64>,
     pub mls_group_id: GroupId,
