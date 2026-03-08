@@ -403,7 +403,7 @@ mod tests {
         admin_account: &Account,
         member_account: &Account,
     ) -> GroupId {
-        let relay_urls = Relay::urls(&admin_account.key_package_relays(whitenoise).await.unwrap());
+        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
         let key_pkg_event = whitenoise
             .nostr
             .fetch_user_key_package(member_account.pubkey, &relay_urls)
@@ -545,8 +545,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
-            .await;
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let admin_mdk = whitenoise

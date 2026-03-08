@@ -669,7 +669,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
             .create_group(
@@ -769,7 +769,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
             .create_group(
@@ -844,7 +844,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
             .create_group(
@@ -892,7 +892,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
             .create_group(
@@ -993,7 +993,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let group = whitenoise
             .create_group(
@@ -1164,11 +1164,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        let member_pubkeys = members
+        let member_accounts = members
             .iter()
-            .map(|(account, _)| account.pubkey)
+            .map(|(account, _)| account)
             .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
+        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
             .create_group(
@@ -1234,7 +1234,7 @@ mod tests {
         member_account: &Account,
     ) -> GroupId {
         // Fetch the member's key package from relays
-        let relay_urls = Relay::urls(&admin_account.key_package_relays(whitenoise).await.unwrap());
+        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
         let key_pkg_event = whitenoise
             .nostr
             .fetch_user_key_package(member_account.pubkey, &relay_urls)
@@ -1290,8 +1290,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
-            .await;
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Set up a group where both admin and member have full MLS state
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
@@ -1339,11 +1338,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        let member_pubkeys = members
+        let member_accounts = members
             .iter()
-            .map(|(account, _)| account.pubkey)
+            .map(|(account, _)| account)
             .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
+        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
             .create_group(
@@ -1412,11 +1411,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        let member_pubkeys = members
+        let member_accounts = members
             .iter()
-            .map(|(account, _)| account.pubkey)
+            .map(|(account, _)| account)
             .collect::<Vec<_>>();
-        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
+        wait_for_key_package_publication(&whitenoise, &member_accounts).await;
 
         let group = whitenoise
             .create_group(
@@ -1516,8 +1515,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
-            .await;
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
 

@@ -1448,19 +1448,23 @@ pub mod test_utils {
 
     pub(crate) async fn wait_for_key_package_publication(
         whitenoise: &Whitenoise,
-        account: &Account,
-        member_pubkeys: &[PublicKey],
+        publisher_accounts: &[&Account],
     ) {
-        let relay_urls = Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
-
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let mut all_available = true;
 
-                for pubkey in member_pubkeys {
+                for publisher_account in publisher_accounts {
+                    let relay_urls = Relay::urls(
+                        &publisher_account
+                            .key_package_relays(whitenoise)
+                            .await
+                            .unwrap(),
+                    );
+
                     match whitenoise
                         .nostr
-                        .fetch_user_key_package(*pubkey, &relay_urls)
+                        .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
                         .await
                     {
                         Ok(Some(_)) => {}
@@ -1482,7 +1486,7 @@ pub mod test_utils {
         .unwrap_or_else(|_| {
             panic!(
                 "Timed out waiting for key package publication for {} member(s)",
-                member_pubkeys.len()
+                publisher_accounts.len()
             )
         });
     }

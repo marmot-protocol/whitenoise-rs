@@ -101,6 +101,10 @@ impl RelayControlPlane {
         &self,
         telemetry: &observability::RelayTelemetry,
     ) -> std::result::Result<(), DatabaseError> {
+        if !Self::should_persist_telemetry(telemetry) {
+            return Ok(());
+        }
+
         self.observability.record(&self.database, telemetry).await
     }
 
@@ -121,6 +125,18 @@ impl RelayControlPlane {
             loop {
                 match receiver.recv().await {
                     Ok(telemetry) => {
+                        if !Self::should_persist_telemetry(&telemetry) {
+                            tracing::warn!(
+                                target: "whitenoise::relay_control::observability",
+                                task = task_name,
+                                plane = telemetry.plane.as_str(),
+                                relay_url = %telemetry.relay_url,
+                                kind = telemetry.kind.as_str(),
+                                "Skipping unscoped account inbox telemetry sample"
+                            );
+                            continue;
+                        }
+
                         if let Err(error) = observability.record(&database, &telemetry).await {
                             tracing::error!(
                                 target: "whitenoise::relay_control::observability",
@@ -144,6 +160,10 @@ impl RelayControlPlane {
                 }
             }
         });
+    }
+
+    fn should_persist_telemetry(telemetry: &observability::RelayTelemetry) -> bool {
+        !(telemetry.plane == RelayPlane::AccountInbox && telemetry.account_pubkey.is_none())
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
@@ -389,9 +409,6 @@ pub(crate) struct SubscriptionContext {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::time::SystemTime;
-
     use chrono::Utc;
     use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::broadcast;
@@ -430,72 +447,13 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query(
-            "CREATE TABLE relay_status (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                relay_url TEXT NOT NULL,
-                plane TEXT NOT NULL,
-                account_pubkey TEXT,
-                last_connect_attempt_at INTEGER,
-                last_connect_success_at INTEGER,
-                last_failure_at INTEGER,
-                failure_category TEXT,
-                last_notice_reason TEXT,
-                last_closed_reason TEXT,
-                last_auth_reason TEXT,
-                auth_required INTEGER NOT NULL DEFAULT 0,
-                success_count INTEGER NOT NULL DEFAULT 0,
-                failure_count INTEGER NOT NULL DEFAULT 0,
-                latency_ms INTEGER,
-                backoff_until INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_relay_status_global_unique
-             ON relay_status(relay_url, plane)
-             WHERE account_pubkey IS NULL",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_relay_status_account_unique
-             ON relay_status(relay_url, plane, account_pubkey)
-             WHERE account_pubkey IS NOT NULL",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE relay_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                relay_url TEXT NOT NULL,
-                plane TEXT NOT NULL,
-                account_pubkey TEXT,
-                occurred_at INTEGER NOT NULL,
-                telemetry_kind TEXT NOT NULL,
-                subscription_id TEXT,
-                failure_category TEXT,
-                message TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        Database {
+        let database = Database {
             pool,
-            path: PathBuf::from(":memory:"),
-            last_connected: SystemTime::now(),
-        }
+            path: ":memory:".into(),
+            last_connected: std::time::SystemTime::now(),
+        };
+        database.migrate_up().await.unwrap();
+        database
     }
 
     #[tokio::test]
@@ -611,5 +569,26 @@ mod tests {
         })
         .await
         .unwrap();
+
+        relay_control
+            .record_relay_telemetry(
+                &RelayTelemetry::new(
+                    RelayTelemetryKind::SubscriptionSuccess,
+                    RelayPlane::AccountInbox,
+                    relay_url.clone(),
+                )
+                .with_occurred_at(Utc::now())
+                .with_subscription_id("account-sub-ignored"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            RelayStatusRecord::find(&relay_url, RelayPlane::AccountInbox, None, &database)
+                .await
+                .unwrap()
+                .is_none(),
+            "account inbox telemetry without an account scope must be ignored"
+        );
     }
 }
