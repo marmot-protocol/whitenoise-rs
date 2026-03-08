@@ -2,8 +2,6 @@ use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingResult};
 use nostr_sdk::prelude::*;
 
-#[cfg(test)]
-use crate::types::EventSource;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -14,6 +12,8 @@ use crate::whitenoise::{
     message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
     message_streaming::{MessageUpdate, UpdateTrigger},
 };
+#[cfg(test)]
+use crate::{relay_control::hash_pubkey_for_subscription_id, types::EventSource};
 
 impl Whitenoise {
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
@@ -1435,7 +1435,10 @@ mod tests {
         // Build a valid subscription ID for this account.
         let sub_id = format!(
             "{}_mls_messages",
-            whitenoise.nostr.create_pubkey_hash(&creator_account.pubkey)
+            hash_pubkey_for_subscription_id(
+                whitenoise.nostr.session_salt(),
+                &creator_account.pubkey
+            )
         );
 
         // First pass through process_account_event: succeeds, event is tracked.

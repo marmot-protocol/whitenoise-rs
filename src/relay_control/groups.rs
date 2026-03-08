@@ -190,7 +190,7 @@ impl GroupPlane {
 
         for (pubkey, account_state) in &account_states {
             for relay_url in &account_state.relays {
-                distinct_group_relays.insert(relay_url.to_string());
+                distinct_group_relays.insert(relay_url.clone());
             }
 
             let relay_urls = account_state
@@ -215,13 +215,7 @@ impl GroupPlane {
                 .cmp(&right.account_pubkey)
                 .then(left.group_id.cmp(&right.group_id))
         });
-        let known_relays = distinct_group_relays
-            .into_iter()
-            .map(|relay_url| {
-                RelayUrl::parse(&relay_url)
-                    .unwrap_or_else(|error| panic!("invalid group relay in snapshot: {error}"))
-            })
-            .collect::<Vec<_>>();
+        let known_relays = distinct_group_relays.into_iter().collect::<Vec<_>>();
 
         GroupPlaneStateSnapshot {
             group_count: groups.len(),

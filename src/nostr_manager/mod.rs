@@ -14,7 +14,6 @@ use crate::{
 pub mod parser;
 pub mod publisher;
 pub mod query;
-pub mod subscriptions;
 pub mod utils;
 
 #[derive(Error, Debug)]
