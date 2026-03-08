@@ -1714,7 +1714,8 @@ mod tests {
             original_msg.delivery_status
         );
 
-        // A new message should exist in cache with Sending status and same content
+        // A new message should exist in cache in a non-failure state.
+        // The background publish may complete before we read, so accept Sending OR Sent.
         let all_messages =
             AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
                 .await
@@ -1725,10 +1726,13 @@ mod tests {
             .iter()
             .find(|m| m.content == "Retry happy path" && m.id != original_event_id.to_string())
             .expect("New retry message should exist in cache");
-        assert_eq!(
-            new_msg.delivery_status,
-            Some(DeliveryStatus::Sending),
-            "New message should have Sending status"
+        assert!(
+            matches!(
+                new_msg.delivery_status,
+                Some(DeliveryStatus::Sending) | Some(DeliveryStatus::Sent(_))
+            ),
+            "New message should have Sending or Sent status, got {:?}",
+            new_msg.delivery_status
         );
 
         let retried_update = tokio::time::timeout(Duration::from_secs(5), async {
