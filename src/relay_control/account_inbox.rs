@@ -35,13 +35,10 @@ impl AccountInboxPlaneConfig {
     }
 
     pub(crate) fn session_config(&self) -> RelaySessionConfig {
-        RelaySessionConfig {
-            plane: RelayPlane::AccountInbox,
-            auth_policy: self.auth_policy,
-            reconnect_policy: self.reconnect_policy,
-            relay_policy: RelaySessionConfig::new(RelayPlane::AccountInbox).relay_policy,
-            connect_timeout: RelaySessionConfig::new(RelayPlane::AccountInbox).connect_timeout,
-        }
+        let mut config = RelaySessionConfig::new(RelayPlane::AccountInbox);
+        config.auth_policy = self.auth_policy;
+        config.reconnect_policy = self.reconnect_policy;
+        config
     }
 }
 

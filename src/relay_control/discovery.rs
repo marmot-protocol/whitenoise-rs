@@ -107,8 +107,6 @@ impl DiscoveryPlane {
         follow_list_accounts: &[(PublicKey, Option<Timestamp>)],
         public_since: Option<Timestamp>,
     ) -> Result<()> {
-        self.start().await?;
-
         // Short-circuit: no relays configured — retire any existing subscriptions.
         if self.config.relays.is_empty() {
             let stale = {
@@ -131,6 +129,14 @@ impl DiscoveryPlane {
                 self.session.unsubscribe(&id).await;
             }
             return Ok(());
+        }
+
+        if !self
+            .session
+            .has_any_relay_connected(&self.config.relays)
+            .await
+        {
+            self.start().await?;
         }
 
         // Discovery sync is a full replace. We build ALL new subscriptions

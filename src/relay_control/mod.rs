@@ -138,18 +138,22 @@ impl RelayControlPlane {
             self.event_sender.clone(),
             self.session_salt,
         );
-        self.account_inbox_planes
-            .write()
-            .await
-            .insert(account_pubkey, plane.clone());
+
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
-            self.account_inbox_planes
-                .write()
-                .await
-                .remove(&account_pubkey);
             plane.deactivate().await;
+            self.group_plane.remove_account(&account_pubkey).await;
             return Err(error);
         }
+
+        if let Some(previous_plane) = self
+            .account_inbox_planes
+            .write()
+            .await
+            .insert(account_pubkey, plane)
+        {
+            previous_plane.deactivate().await;
+        }
+
         Ok(())
     }
 

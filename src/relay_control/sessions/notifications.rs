@@ -1,4 +1,4 @@
-use nostr_sdk::{Event, RelayMessage, RelayUrl, SubscriptionId};
+use nostr_sdk::{RelayMessage, RelayUrl};
 
 use crate::relay_control::observability::RelayFailureCategory;
 
@@ -6,11 +6,6 @@ use crate::relay_control::observability::RelayFailureCategory;
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RelayNotification {
-    Event {
-        relay_url: RelayUrl,
-        subscription_id: SubscriptionId,
-        event: Event,
-    },
     Notice {
         relay_url: RelayUrl,
         message: String,
@@ -37,62 +32,58 @@ pub(crate) enum RelayNotification {
 }
 
 impl RelayNotification {
-    pub(crate) fn from_message(relay_url: RelayUrl, message: RelayMessage<'static>) -> Self {
+    pub(crate) fn from_message(
+        relay_url: RelayUrl,
+        message: RelayMessage<'static>,
+    ) -> Option<Self> {
         // This normalization is telemetry-oriented. For message types such as
         // `OK` and `EOSE` we intentionally collapse structured payloads into a
         // coarse notification shape instead of preserving every field.
         match message {
-            RelayMessage::Event {
-                subscription_id,
-                event,
-            } => Self::Event {
-                relay_url,
-                subscription_id: subscription_id.into_owned(),
-                event: event.into_owned(),
-            },
-            RelayMessage::Notice(message) => Self::Notice {
+            RelayMessage::Event { .. } => None,
+            RelayMessage::Notice(message) => Some(Self::Notice {
                 relay_url,
                 failure_category: Some(RelayFailureCategory::classify_notice(&message)),
                 message: message.into_owned(),
-            },
+            }),
             RelayMessage::Closed {
                 subscription_id: _,
                 message,
-            } => Self::Closed {
+            } => Some(Self::Closed {
                 relay_url,
                 failure_category: Some(RelayFailureCategory::classify_closed(&message)),
                 message: message.into_owned(),
-            },
-            RelayMessage::Auth { challenge } => Self::Auth {
+            }),
+            RelayMessage::Auth { challenge } => Some(Self::Auth {
                 relay_url,
                 failure_category: Some(RelayFailureCategory::classify_auth(&challenge)),
                 challenge: challenge.into_owned(),
-            },
-            RelayMessage::Ok { .. } => Self::Notice {
+            }),
+            RelayMessage::Ok { .. } => Some(Self::Notice {
                 relay_url,
                 message: "ok".to_string(),
                 failure_category: None,
-            },
-            RelayMessage::EndOfStoredEvents(_) => Self::Notice {
+            }),
+            RelayMessage::EndOfStoredEvents(_) => Some(Self::Notice {
                 relay_url,
                 message: "eose".to_string(),
                 failure_category: None,
-            },
-            RelayMessage::Count { .. } => Self::Notice {
+            }),
+            RelayMessage::Count { .. } => Some(Self::Notice {
                 relay_url,
                 message: "count".to_string(),
                 failure_category: None,
-            },
-            RelayMessage::NegMsg { .. } => Self::Notice {
+            }),
+            RelayMessage::NegMsg { .. } => Some(Self::Notice {
                 relay_url,
                 message: "negmsg".to_string(),
                 failure_category: None,
-            },
-            RelayMessage::NegErr { .. } => Self::Notice {
+            }),
+            RelayMessage::NegErr { .. } => Some(Self::Notice {
                 relay_url,
                 message: "negerr".to_string(),
                 failure_category: None,
-            },
+            }),
         }
     }
 }

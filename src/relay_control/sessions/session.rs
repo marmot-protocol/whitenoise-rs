@@ -114,10 +114,14 @@ impl RelaySession {
         let mut successful_relays = 0usize;
         let mut last_error: Option<NostrManagerError> = None;
         let mut failed_relay_urls: Vec<String> = Vec::new();
+        let mut added_new_relay = false;
 
         for (relay_url, result) in relay_urls.iter().zip(results) {
             match result {
-                Ok(_) => successful_relays += 1,
+                Ok(was_added) => {
+                    successful_relays += 1;
+                    added_new_relay |= was_added;
+                }
                 Err(err) => {
                     failed_relay_urls.push(relay_url.to_string());
                     last_error = Some(err);
@@ -139,10 +143,12 @@ impl RelaySession {
             );
         }
 
-        self.client.connect().await;
-        self.client
-            .wait_for_connection(self.config.connect_timeout)
-            .await;
+        if added_new_relay || !self.has_any_relay_connected(relay_urls).await {
+            self.client.connect().await;
+            self.client
+                .wait_for_connection(self.config.connect_timeout)
+                .await;
+        }
 
         Ok(())
     }
@@ -488,16 +494,19 @@ impl RelaySession {
                                     Ok(false)
                                 }
                                 RelayPoolNotification::Message { relay_url, message } => {
-                                    let notification =
-                                        RelayNotification::from_message(relay_url.clone(), message);
-                                    Self::process_notification(
-                                        notification,
-                                        plane,
-                                        &sender,
-                                        &telemetry_sender,
-                                        &router,
-                                    )
-                                    .await
+                                    match RelayNotification::from_message(relay_url.clone(), message)
+                                    {
+                                        Some(notification) => {
+                                            Self::process_notification(
+                                                notification,
+                                                plane,
+                                                &sender,
+                                                &telemetry_sender,
+                                            )
+                                            .await
+                                        }
+                                        None => Ok(false),
+                                    }
                                 }
                                 RelayPoolNotification::Shutdown => Ok(true),
                             }
@@ -533,30 +542,8 @@ impl RelaySession {
         plane: crate::relay_control::RelayPlane,
         sender: &Sender<ProcessableEvent>,
         telemetry_sender: &broadcast::Sender<RelayTelemetry>,
-        router: &RelayRouter,
     ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
         match notification {
-            RelayNotification::Event {
-                relay_url,
-                subscription_id,
-                event,
-            } => {
-                if let Some(context) = router
-                    .subscription_context(&relay_url, &subscription_id)
-                    .await
-                {
-                    let _ = sender
-                        .send(ProcessableEvent::new_routed_nostr_event(event, context))
-                        .await;
-                } else {
-                    tracing::error!(
-                        target: "whitenoise::relay_control::session",
-                        "Missing subscription context for relay {} subscription {}",
-                        relay_url,
-                        subscription_id
-                    );
-                }
-            }
             RelayNotification::Notice {
                 relay_url,
                 message,
@@ -632,13 +619,13 @@ impl RelaySession {
         Ok(false)
     }
 
-    async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<()> {
+    async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
         match self.client.relay(relay_url).await {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(false),
             Err(_) => match self.config.relay_policy {
                 RelaySessionRelayPolicy::Dynamic => {
                     self.client.add_relay(relay_url.clone()).await?;
-                    Ok(())
+                    Ok(true)
                 }
                 RelaySessionRelayPolicy::ExplicitOnly => {
                     Err(NostrManagerError::WhitenoiseInstance(format!(
