@@ -537,9 +537,9 @@ impl RelaySession {
                                                             relay_url = %relay_url,
                                                             subscription_id = %subscription_id,
                                                             event_id = %event.id,
-                                                            "Group message missing #h tag; falling back to original subscription context"
+                                                            "Dropping group message missing #h tag"
                                                         );
-                                                        vec![context.clone()]
+                                                        vec![]
                                                     }
                                                 }
                                             }

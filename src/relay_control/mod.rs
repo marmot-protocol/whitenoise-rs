@@ -151,7 +151,7 @@ impl RelayControlPlane {
                 match receiver.recv().await {
                     Ok(telemetry) => {
                         if !Self::should_persist_telemetry(&telemetry) {
-                            tracing::warn!(
+                            tracing::debug!(
                                 target: "whitenoise::relay_control::observability",
                                 task = task_name,
                                 plane = telemetry.plane.as_str(),
