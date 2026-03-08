@@ -78,8 +78,14 @@ pub(crate) fn is_relay_list_tag_for_event_kind(tag: &Tag, kind: Kind) -> bool {
 }
 
 /// Checks if a tag is an "r" tag.
+///
+/// Recognizes both `TagKind::SingleLetter('r')` (canonical) and `TagKind::custom("r")`
+/// (produced by some clients) so that relay-list events are not incorrectly rejected.
 pub(crate) fn is_r_tag(tag: &Tag) -> bool {
-    tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::R))
+    matches!(
+        tag.kind(),
+        TagKind::SingleLetter(s) if s == SingleLetterTag::lowercase(Alphabet::R)
+    ) || tag.kind() == TagKind::Custom(std::borrow::Cow::Borrowed("r"))
 }
 
 /// Checks if a tag is a "relay" tag.

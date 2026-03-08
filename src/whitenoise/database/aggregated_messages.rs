@@ -591,7 +591,6 @@ impl AggregatedMessage {
                 Ok(message) => return Ok(message),
                 Err(error) if Self::is_database_lock_error(&error) => {
                     tracing::debug!(
-                        target: "whitenoise::messages::delivery",
                         attempt = attempt + 1,
                         delay_ms,
                         message_id,
@@ -651,7 +650,8 @@ impl AggregatedMessage {
 
     fn is_database_lock_error(error: &DatabaseError) -> bool {
         matches!(error, DatabaseError::Sqlx(sqlx::Error::Database(db_error))
-            if db_error.message().contains("database is locked"))
+            if db_error.message().contains("database is locked")
+                || matches!(db_error.code().as_deref(), Some("5") | Some("6")))
     }
 
     /// Delete ALL cached events for a group

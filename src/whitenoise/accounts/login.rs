@@ -1030,9 +1030,10 @@ impl Whitenoise {
     async fn publish_relay_lists_with_signer(
         &self,
         relay_setup: &ExternalSignerRelaySetup,
-        signer: impl NostrSigner + Clone + 'static,
+        signer: impl NostrSigner + 'static,
     ) -> Result<()> {
         let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
+        let signer = std::sync::Arc::new(signer);
 
         if relay_setup.should_publish_nip65 {
             tracing::debug!(
@@ -1044,7 +1045,7 @@ impl Whitenoise {
                     &nip65_urls,
                     RelayType::Nip65,
                     &nip65_urls,
-                    std::sync::Arc::new(signer.clone()),
+                    signer.clone(),
                 )
                 .await?;
         }
@@ -1059,7 +1060,7 @@ impl Whitenoise {
                     &Relay::urls(&relay_setup.inbox_relays),
                     RelayType::Inbox,
                     &nip65_urls,
-                    std::sync::Arc::new(signer.clone()),
+                    signer.clone(),
                 )
                 .await?;
         }
@@ -1074,7 +1075,7 @@ impl Whitenoise {
                     &Relay::urls(&relay_setup.key_package_relays),
                     RelayType::KeyPackage,
                     &nip65_urls,
-                    std::sync::Arc::new(signer.clone()),
+                    signer.clone(),
                 )
                 .await?;
         }

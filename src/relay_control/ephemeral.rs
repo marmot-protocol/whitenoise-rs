@@ -33,7 +33,6 @@ use crate::{
 };
 
 /// Configuration for short-lived, targeted relay work.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EphemeralPlaneConfig {
     pub(crate) timeout: Duration,
@@ -175,14 +174,6 @@ impl EphemeralPlane {
         target_relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
-        if follow_list.is_empty() {
-            tracing::debug!(
-                target: "whitenoise::relay_control::ephemeral",
-                "Skipping follow-list publish because the list is empty"
-            );
-            return Ok(());
-        }
-
         let tags: Vec<Tag> = follow_list
             .iter()
             .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
@@ -564,6 +555,11 @@ impl EphemeralPlane {
             .iter()
             .filter(|tag| is_relay_list_tag_for_event_kind(tag, event.kind))
             .collect();
+
+        // An empty relay list is a valid authoritative statement (e.g. "clear all relays").
+        if relay_tags.is_empty() {
+            return true;
+        }
 
         relay_tags.iter().any(|tag| {
             tag.content()
