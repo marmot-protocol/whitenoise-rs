@@ -112,6 +112,12 @@ pub enum Request {
     // Chat list
     #[serde(rename = "chats_list")]
     ChatsList { account: String },
+    #[serde(rename = "archive_chat")]
+    ArchiveChat { account: String, group_id: String },
+    #[serde(rename = "unarchive_chat")]
+    UnarchiveChat { account: String, group_id: String },
+    #[serde(rename = "archived_chats_list")]
+    ArchivedChatsList { account: String },
 
     // Settings
     #[serde(rename = "settings_show")]
@@ -217,6 +223,8 @@ pub enum Request {
     MessagesSubscribe { account: String, group_id: String },
     #[serde(rename = "chats_subscribe")]
     ChatsSubscribe { account: String },
+    #[serde(rename = "archived_chats_subscribe")]
+    ArchivedChatsSubscribe { account: String },
     #[serde(rename = "notifications_subscribe")]
     NotificationsSubscribe,
 
@@ -257,6 +265,7 @@ impl Request {
             self,
             Self::MessagesSubscribe { .. }
                 | Self::ChatsSubscribe { .. }
+                | Self::ArchivedChatsSubscribe { .. }
                 | Self::NotificationsSubscribe
                 | Self::UsersSearch { .. }
         )
@@ -874,6 +883,58 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::ChatsSubscribe { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn archive_chat_roundtrip() {
+        let req = Request::ArchiveChat {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ArchiveChat { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn unarchive_chat_roundtrip() {
+        let req = Request::UnarchiveChat {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::UnarchiveChat { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn archived_chats_list_roundtrip() {
+        let req = Request::ArchivedChatsList {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::ArchivedChatsList { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn archived_chats_subscribe_roundtrip() {
+        let req = Request::ArchivedChatsSubscribe {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, Request::ArchivedChatsSubscribe { account } if account == "npub1abc")
+        );
     }
 
     #[test]

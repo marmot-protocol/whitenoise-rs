@@ -238,6 +238,25 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::ArchiveChat { account, group_id } => {
+            match archive_chat(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::UnarchiveChat { account, group_id } => {
+            match unarchive_chat(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::ArchivedChatsList { account } => match archived_chats_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         Request::SettingsShow => match wn.app_settings().await {
             Ok(settings) => to_response(&settings),
             Err(e) => Response::err(e.to_string()),
@@ -358,6 +377,7 @@ pub async fn dispatch(req: Request) -> Response {
         // Streaming commands should be routed through dispatch_streaming
         Request::MessagesSubscribe { .. }
         | Request::ChatsSubscribe { .. }
+        | Request::ArchivedChatsSubscribe { .. }
         | Request::NotificationsSubscribe
         | Request::UsersSearch { .. } => {
             Response::err("streaming commands must use dispatch_streaming")
@@ -421,6 +441,9 @@ where
         }
         Request::ChatsSubscribe { account } => {
             chats_subscribe(wn, &mut writer, &account).await;
+        }
+        Request::ArchivedChatsSubscribe { account } => {
+            archived_chats_subscribe(wn, &mut writer, &account).await;
         }
         Request::NotificationsSubscribe => {
             notifications_subscribe(wn, &mut writer).await;
@@ -1057,6 +1080,109 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
         clean.push(clean_chat_list_item(wn, item).await);
     }
     Ok(to_response(&clean))
+}
+
+async fn archive_chat(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.archive_chat(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn unarchive_chat(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.unarchive_chat(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let items = wn
+        .get_archived_chat_list(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let mut clean = Vec::with_capacity(items.len());
+    for item in &items {
+        clean.push(clean_chat_list_item(wn, item).await);
+    }
+    Ok(to_response(&clean))
+}
+
+async fn archived_chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let account = match find_account(wn, account_str).await {
+        Ok(a) => a,
+        Err(resp) => {
+            let _ = write_response(writer, &resp).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    let subscription = match wn.subscribe_to_archived_chat_list(&account).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let _ = write_response(writer, &Response::err(e.to_string())).await;
+            write_stream_end(writer).await;
+            return;
+        }
+    };
+
+    // Send initial items
+    for item in &subscription.initial_items {
+        let formatted = clean_chat_list_item(wn, item).await;
+        let resp = Response::ok(serde_json::json!({
+            "trigger": "InitialItem",
+            "item": formatted,
+        }));
+        if !write_response(writer, &resp).await {
+            return;
+        }
+    }
+
+    // Stream live updates
+    let mut updates = subscription.updates;
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                let formatted = clean_chat_list_item(wn, &update.item).await;
+                let resp = Response::ok(serde_json::json!({
+                    "trigger": update.trigger,
+                    "item": formatted,
+                }));
+                if !write_response(writer, &resp).await {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!("archived chat list stream lagged by {n} updates");
+                let _ = write_response(
+                    writer,
+                    &Response::err(format!("stream lagged: {n} updates dropped")),
+                )
+                .await;
+            }
+        }
+    }
+
+    write_stream_end(writer).await;
 }
 
 async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {

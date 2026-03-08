@@ -565,6 +565,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -591,6 +592,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -632,6 +634,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -699,6 +702,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -734,6 +738,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

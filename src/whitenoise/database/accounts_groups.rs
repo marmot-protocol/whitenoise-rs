@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 
-use super::{Database, utils::parse_timestamp};
+use super::{
+    Database,
+    utils::{parse_optional_timestamp, parse_timestamp},
+};
 use crate::whitenoise::accounts_groups::AccountGroup;
 
 /// Internal database row representation for accounts_groups table
@@ -16,6 +19,7 @@ struct AccountGroupRow {
     last_read_message_id: Option<EventId>,
     pin_order: Option<i64>,
     dm_peer_pubkey: Option<PublicKey>,
+    archived_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -65,6 +69,8 @@ where
             None => None,
         };
 
+        let archived_at = parse_optional_timestamp(row, "archived_at")?;
+
         // Parse pubkey from hex string
         let account_pubkey =
             PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
@@ -105,6 +111,7 @@ where
             last_read_message_id,
             pin_order,
             dm_peer_pubkey,
+            archived_at,
             created_at,
             updated_at,
         })
@@ -122,6 +129,7 @@ impl From<AccountGroupRow> for AccountGroup {
             last_read_message_id: row.last_read_message_id,
             pin_order: row.pin_order,
             dm_peer_pubkey: row.dm_peer_pubkey,
+            archived_at: row.archived_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -271,6 +279,8 @@ impl AccountGroup {
                welcomer_pubkey = excluded.welcomer_pubkey,
                last_read_message_id = excluded.last_read_message_id,
                pin_order = excluded.pin_order,
+               -- archived_at is intentionally excluded: archive/unarchive use
+               -- update_archived_at() so save() never clobbers user preference.
                -- Write-once: preserve existing dm_peer_pubkey if already set.
                -- Many code paths construct AccountGroup without knowing the DM peer,
                -- so we only fill this on first write and never overwrite a correct
@@ -310,6 +320,30 @@ impl AccountGroup {
              RETURNING *",
         )
         .bind(pin_order)
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Updates the archived_at timestamp for this AccountGroup.
+    pub(crate) async fn update_archived_at(
+        &self,
+        archived_at: Option<DateTime<Utc>>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET archived_at = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(archived_at.map(|dt| dt.timestamp_millis()))
         .bind(now_ms)
         .bind(id)
         .fetch_one(&database.pool)
@@ -790,6 +824,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -821,6 +856,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: Some(100),
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -839,6 +875,7 @@ mod tests {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey: None,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -848,6 +885,56 @@ mod tests {
         assert!(saved.user_confirmation.is_none());
         assert!(saved.welcomer_pubkey.is_none());
         assert!(saved.pin_order.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_save_does_not_overwrite_archived_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[32; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Archive the group
+        let archived = ag
+            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(archived.is_archived());
+
+        // Re-save via save() — this simulates giftwrap processing
+        let resaved = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        resaved.save(&whitenoise.database).await.unwrap();
+
+        // Fetch and verify archived_at survived the save()
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            found.is_archived(),
+            "save() must not overwrite archived_at — giftwrap processing would silently unarchive chats"
+        );
     }
 
     #[tokio::test]
@@ -1195,6 +1282,85 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.pin_order, Some(77));
+    }
+
+    #[tokio::test]
+    async fn test_update_archived_at_sets_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[63; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(account_group.archived_at.is_none());
+
+        let now = Utc::now();
+        let updated = account_group
+            .update_archived_at(Some(now), &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(updated.archived_at.is_some());
+        assert!(updated.is_archived());
+    }
+
+    #[tokio::test]
+    async fn test_update_archived_at_clears_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[64; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Set archived
+        let archived = account_group
+            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(archived.is_archived());
+
+        // Clear archived
+        let unarchived = archived
+            .update_archived_at(None, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(unarchived.archived_at.is_none());
+        assert!(!unarchived.is_archived());
+    }
+
+    #[tokio::test]
+    async fn test_update_archived_at_persists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[65; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        account_group
+            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Fetch again and verify persistence
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(found.is_archived());
     }
 
     #[tokio::test]

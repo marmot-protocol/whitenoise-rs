@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI message reactions (react/unreact) ([jgmontoya])
 - CLI message delete, retry, and reply commands ([jgmontoya])
 - CLI media commands for uploading files and images ([jgmontoya])
+- Chat archiving: archive/unarchive chats, list archived, subscribe to archived chat list updates ([jgmontoya])
 - Relay control plane with health monitoring scaffold ([erskingardner])
 - Relay observability persistence for connection metrics and failure tracking ([erskingardner])
 
@@ -19,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- CLI interface with account management, group chat, messaging, follows, profile, relays, settings, user search, notifications, and streaming subscriptions ([jgmontoya])
+- CLI with account management, group chat, messaging, follows, profile, relays, settings, user search, notifications, and streaming subscriptions ([jgmontoya])
 
 ### Fixed
 

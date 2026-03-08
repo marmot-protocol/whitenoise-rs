@@ -172,6 +172,7 @@ impl Whitenoise {
             last_read_message_id: None,
             pin_order: None,
             dm_peer_pubkey,
+            archived_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

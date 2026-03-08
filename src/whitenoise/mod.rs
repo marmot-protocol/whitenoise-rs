@@ -145,6 +145,7 @@ pub struct Whitenoise {
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: Arc<message_streaming::MessageStreamManager>,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
+    archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
@@ -193,6 +194,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("message_aggregator", &"<REDACTED>")
             .field("message_stream_manager", &"<REDACTED>")
             .field("chat_list_stream_manager", &"<REDACTED>")
+            .field("archived_chat_list_stream_manager", &"<REDACTED>")
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
@@ -229,6 +231,8 @@ impl Whitenoise {
             message_aggregator: components.message_aggregator,
             message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
+            archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
+            ),
             notification_stream_manager: notification_streaming::NotificationStreamManager::default(
             ),
             event_sender: components.event_sender,
@@ -915,7 +919,10 @@ impl Whitenoise {
                     messages_map.insert(update.message.id.clone(), update.message);
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!("subscription drain lagged by {n} messages");
+                    continue;
+                }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     // Channel closed unexpectedly - should be unreachable since we hold a receiver
                     return Err(WhitenoiseError::Other(anyhow::anyhow!(
@@ -956,16 +963,78 @@ impl Whitenoise {
                 .map(|item| (item.mls_group_id.clone(), item))
                 .collect();
 
+        // Drain updates that arrived during fetch. A ChatArchiveChanged update could
+        // land here with archived_at set — filter it out so only active items remain.
         loop {
             match updates.try_recv() {
                 Ok(update) => {
-                    items_map.insert(update.item.mls_group_id.clone(), update.item);
+                    if update.item.archived_at.is_none() {
+                        items_map.insert(update.item.mls_group_id.clone(), update.item);
+                    } else {
+                        items_map.remove(&update.item.mls_group_id);
+                    }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!("subscription drain lagged by {n} messages");
+                    continue;
+                }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     return Err(WhitenoiseError::Other(anyhow::anyhow!(
                         "Chat list stream closed unexpectedly during subscription"
+                    )));
+                }
+            }
+        }
+
+        let mut initial_items: Vec<chat_list::ChatListItem> = items_map.into_values().collect();
+        chat_list::sort_chat_list(&mut initial_items);
+
+        Ok(chat_list_streaming::ChatListSubscription {
+            initial_items,
+            updates,
+        })
+    }
+
+    /// Subscribe to archived chat list updates for a specific account.
+    ///
+    /// Same race-condition-free design as `subscribe_to_chat_list`, but uses
+    /// `get_archived_chat_list` and the archived stream manager.
+    pub async fn subscribe_to_archived_chat_list(
+        &self,
+        account: &Account,
+    ) -> Result<chat_list_streaming::ChatListSubscription> {
+        let mut updates = self
+            .archived_chat_list_stream_manager
+            .subscribe(&account.pubkey);
+
+        let fetched_items = self.get_archived_chat_list(account).await?;
+
+        let mut items_map: HashMap<mdk_core::prelude::GroupId, chat_list::ChatListItem> =
+            fetched_items
+                .into_iter()
+                .map(|item| (item.mls_group_id.clone(), item))
+                .collect();
+
+        // Drain updates that arrived during fetch. A ChatArchiveChanged update could
+        // land here with archived_at cleared — filter it out so only archived items remain.
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    if update.item.archived_at.is_some() {
+                        items_map.insert(update.item.mls_group_id.clone(), update.item);
+                    } else {
+                        items_map.remove(&update.item.mls_group_id);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!("subscription drain lagged by {n} messages");
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Archived chat list stream closed unexpectedly during subscription"
                     )));
                 }
             }

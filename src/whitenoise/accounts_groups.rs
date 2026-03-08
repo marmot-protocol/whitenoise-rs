@@ -4,7 +4,8 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::whitenoise::{
-    Whitenoise, accounts::Account, aggregated_message::AggregatedMessage, error::WhitenoiseError,
+    Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
+    chat_list_streaming::ChatListUpdateTrigger, error::WhitenoiseError,
 };
 
 /// Represents the relationship between an account and an MLS group.
@@ -32,6 +33,10 @@ pub struct AccountGroup {
     /// For DM groups: the other participant's pubkey from this account's perspective.
     /// `None` for regular group chats.
     pub dm_peer_pubkey: Option<PublicKey>,
+    /// When this chat was archived by this account.
+    /// - `None` = not archived (active in chat list)
+    /// - `Some(timestamp)` = archived at that time (hidden from main chat list)
+    pub archived_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -57,6 +62,11 @@ impl AccountGroup {
     /// Returns true if the user has declined this group.
     pub fn is_declined(&self) -> bool {
         self.user_confirmation == Some(false)
+    }
+
+    /// Returns true if this chat is archived.
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 
     /// Creates or retrieves an AccountGroup for the given account and group.
@@ -141,6 +151,20 @@ impl AccountGroup {
         let updated = self
             .update_user_confirmation(false, &whitenoise.database)
             .await?;
+        Ok(updated)
+    }
+
+    /// Archives this chat by setting archived_at to the current time.
+    pub async fn archive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let updated = self
+            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .await?;
+        Ok(updated)
+    }
+
+    /// Unarchives this chat by clearing archived_at.
+    pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let updated = self.update_archived_at(None, &whitenoise.database).await?;
         Ok(updated)
     }
 }
@@ -259,6 +283,58 @@ impl Whitenoise {
             .update_pin_order(pin_order, &self.database)
             .await?;
 
+        Ok(updated)
+    }
+
+    /// Archives a chat for the given account.
+    ///
+    /// Idempotent: if already archived, returns the existing state unchanged.
+    pub async fn archive_chat(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        if account_group.is_archived() {
+            return Ok(account_group);
+        }
+
+        let updated = account_group.archive(self).await?;
+        self.emit_chat_list_update(
+            account,
+            mls_group_id,
+            ChatListUpdateTrigger::ChatArchiveChanged,
+        )
+        .await;
+        Ok(updated)
+    }
+
+    /// Unarchives a chat for the given account.
+    ///
+    /// Idempotent: if not archived, returns the existing state unchanged.
+    pub async fn unarchive_chat(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        if !account_group.is_archived() {
+            return Ok(account_group);
+        }
+
+        let updated = account_group.unarchive(self).await?;
+        self.emit_chat_list_update(
+            account,
+            mls_group_id,
+            ChatListUpdateTrigger::ChatArchiveChanged,
+        )
+        .await;
         Ok(updated)
     }
 

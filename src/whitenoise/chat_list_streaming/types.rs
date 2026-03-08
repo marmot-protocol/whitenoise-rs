@@ -8,6 +8,10 @@ pub enum ChatListUpdateTrigger {
     NewGroup,
     NewLastMessage,
     LastMessageDeleted,
+    /// The chat's archive status changed (archived or unarchived). The item's
+    /// `archived_at` field indicates direction: `Some` = archived, `None` = unarchived.
+    /// Emitted to both active and archived channels so each can add/remove accordingly.
+    ChatArchiveChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +45,7 @@ mod tests {
             ChatListUpdateTrigger::NewGroup,
             ChatListUpdateTrigger::NewLastMessage,
             ChatListUpdateTrigger::LastMessageDeleted,
+            ChatListUpdateTrigger::ChatArchiveChanged,
         ];
 
         for trigger in triggers {
@@ -61,5 +66,8 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::LastMessageDeleted);
         assert!(debug_str.contains("LastMessageDeleted"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatArchiveChanged);
+        assert!(debug_str.contains("ChatArchiveChanged"));
     }
 }

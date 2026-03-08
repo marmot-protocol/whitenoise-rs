@@ -16,6 +16,7 @@ use crate::whitenoise::{
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
     error::Result,
     group_information::{GroupInformation, GroupType},
+    groups::GroupWithMembership,
     message_aggregator::ChatMessageSummary,
     users::User,
 };
@@ -66,6 +67,11 @@ pub struct ChatListItem {
     /// For DMs: the public key of the other participant.
     /// `None` for Group chats.
     pub dm_peer_pubkey: Option<PublicKey>,
+
+    /// When this chat was archived, if at all.
+    /// - `None` = active (shown in main chat list)
+    /// - `Some(timestamp)` = archived (hidden from main chat list)
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 impl ChatListItem {
@@ -185,6 +191,7 @@ fn assemble_chat_list_items(
             let welcomer_pubkey = account_group.welcomer_pubkey;
             let unread_count = *unread_counts.get(&group.mls_group_id).unwrap_or(&0);
             let pin_order = account_group.pin_order;
+            let archived_at = account_group.archived_at;
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -199,6 +206,7 @@ fn assemble_chat_list_items(
                 unread_count,
                 pin_order,
                 dm_peer_pubkey,
+                archived_at,
             })
         })
         .collect()
@@ -212,24 +220,51 @@ pub(crate) fn sort_chat_list(items: &mut [ChatListItem]) {
 }
 
 impl Whitenoise {
-    /// Retrieves the chat list for an account.
+    /// Retrieves the active (non-archived) chat list for an account.
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
-    /// Groups without messages are sorted by creation date.
-    /// Declined groups are filtered out.
+    /// Declined and archived groups are filtered out.
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        // Use visible_groups() to filter out declined groups and get membership data
-        let visible_groups = self.visible_groups(account).await?;
-        if visible_groups.is_empty() {
+        let visible = self.visible_groups(account).await?;
+        let active: Vec<_> = visible
+            .into_iter()
+            .filter(|gwm| !gwm.membership.is_archived())
+            .collect();
+        self.build_chat_list_for(account, active).await
+    }
+
+    /// Retrieves the archived chat list for an account.
+    ///
+    /// Returns only archived chats, sorted by last activity.
+    pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
+        let visible = self.visible_groups(account).await?;
+        let archived: Vec<_> = visible
+            .into_iter()
+            .filter(|gwm| gwm.membership.is_archived())
+            .collect();
+        self.build_chat_list_for(account, archived).await
+    }
+
+    /// Builds a sorted chat list from a pre-filtered set of groups.
+    ///
+    /// Handles the expensive batch pipeline: group info, messages, users, images,
+    /// unread counts, assembly, and sorting.
+    async fn build_chat_list_for(
+        &self,
+        account: &Account,
+        groups_with_membership: Vec<GroupWithMembership>,
+    ) -> Result<Vec<ChatListItem>> {
+        if groups_with_membership.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Extract groups for existing helper functions
-        let groups: Vec<_> = visible_groups.iter().map(|gwm| gwm.group.clone()).collect();
+        let groups: Vec<_> = groups_with_membership
+            .iter()
+            .map(|gwm| gwm.group.clone())
+            .collect();
         let group_ids: Vec<GroupId> = groups.iter().map(|g| g.mls_group_id.clone()).collect();
 
-        // Build pending status map from membership data
-        let membership_map: HashMap<GroupId, AccountGroup> = visible_groups
+        let membership_map: HashMap<GroupId, AccountGroup> = groups_with_membership
             .iter()
             .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.membership.clone()))
             .collect();
@@ -245,7 +280,6 @@ impl Whitenoise {
             .resolve_group_images(account, &groups, &group_info_map)
             .await;
 
-        // Compute unread counts for all groups in a single batch query
         let group_markers: Vec<_> = membership_map
             .iter()
             .map(|(gid, ag)| (gid.clone(), ag.last_read_message_id))
@@ -366,8 +400,9 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order
+        // 9. Get pin order and archived_at
         let pin_order = account_group.pin_order;
+        let archived_at = account_group.archived_at;
 
         // 10. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
@@ -383,23 +418,28 @@ impl Whitenoise {
             unread_count,
             pin_order,
             dm_peer_pubkey,
+            archived_at,
         }))
     }
 
     /// Emit a chat list update with the given trigger for a specific account.
     ///
-    /// Checks for subscribers first to avoid expensive `build_chat_list_item` calls.
-    /// Errors are logged but don't affect the caller.
+    /// Checks for subscribers on both active and archived channels first to avoid
+    /// expensive `build_chat_list_item` calls. Errors are logged but don't affect the caller.
     pub(crate) async fn emit_chat_list_update(
         &self,
         account: &Account,
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        if !self
+        let has_active = self
             .chat_list_stream_manager
-            .has_subscribers(&account.pubkey)
-        {
+            .has_subscribers(&account.pubkey);
+        let has_archived = self
+            .archived_chat_list_stream_manager
+            .has_subscribers(&account.pubkey);
+
+        if !has_active && !has_archived {
             return;
         }
 
@@ -436,10 +476,14 @@ impl Whitenoise {
         };
 
         for ag in account_groups {
-            if self
+            let has_active = self
                 .chat_list_stream_manager
-                .has_subscribers(&ag.account_pubkey)
-            {
+                .has_subscribers(&ag.account_pubkey);
+            let has_archived = self
+                .archived_chat_list_stream_manager
+                .has_subscribers(&ag.account_pubkey);
+
+            if has_active || has_archived {
                 self.emit_chat_list_update_for_account(&ag.account_pubkey, group_id, trigger)
                     .await;
             }
@@ -447,6 +491,10 @@ impl Whitenoise {
     }
 
     /// Internal helper to emit a chat list update for a specific account pubkey.
+    ///
+    /// Routes updates to the correct channel(s):
+    /// - `ChatArchiveChanged`: both channels (item is moving between lists)
+    /// - Other triggers: the one channel matching the item's archive status
     async fn emit_chat_list_update_for_account(
         &self,
         pubkey: &PublicKey,
@@ -466,10 +514,35 @@ impl Whitenoise {
             }
         };
 
+        let has_active = self.chat_list_stream_manager.has_subscribers(pubkey);
+        let has_archived = self
+            .archived_chat_list_stream_manager
+            .has_subscribers(pubkey);
+
         match self.build_chat_list_item(&account, group_id).await {
             Ok(Some(item)) => {
-                self.chat_list_stream_manager
-                    .emit(pubkey, ChatListUpdate { trigger, item });
+                let update = ChatListUpdate { trigger, item };
+                match trigger {
+                    ChatListUpdateTrigger::ChatArchiveChanged => {
+                        // Item is moving between lists — notify both channels
+                        if has_active {
+                            self.chat_list_stream_manager.emit(pubkey, update.clone());
+                        }
+                        if has_archived {
+                            self.archived_chat_list_stream_manager.emit(pubkey, update);
+                        }
+                    }
+                    _ => {
+                        // Route to the channel matching the item's archive status
+                        if update.item.archived_at.is_some() {
+                            if has_archived {
+                                self.archived_chat_list_stream_manager.emit(pubkey, update);
+                            }
+                        } else if has_active {
+                            self.chat_list_stream_manager.emit(pubkey, update);
+                        }
+                    }
+                }
             }
             Ok(None) => {
                 tracing::debug!(
@@ -1314,6 +1387,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1328,6 +1402,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1342,6 +1417,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1384,6 +1460,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1406,6 +1483,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1428,6 +1506,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1540,6 +1619,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1554,6 +1634,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1584,6 +1665,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1598,6 +1680,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(50),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1612,6 +1695,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(200),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1644,6 +1728,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1658,6 +1743,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1689,6 +1775,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1703,6 +1790,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(10),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1717,6 +1805,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: None,
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[4u8; 32]),
@@ -1731,6 +1820,7 @@ mod tests {
                 unread_count: 0,
                 pin_order: Some(20),
                 dm_peer_pubkey: None,
+                archived_at: None,
             },
         ];
 
@@ -1829,5 +1919,221 @@ mod tests {
         assert_eq!(chat_list[0].name, Some("Group A".to_string()));
         assert_eq!(chat_list[1].name, Some("Group B".to_string()));
         assert_eq!(chat_list[2].name, Some("Group C".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_chat_list_excludes_archived_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group1 = whitenoise
+            .create_group(&creator, vec![member.pubkey], config1, None)
+            .await
+            .unwrap();
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "Archived Group".to_string();
+        let group2 = whitenoise
+            .create_group(&creator, vec![member.pubkey], config2, None)
+            .await
+            .unwrap();
+
+        // Both visible before archiving
+        let list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(list.len(), 2);
+
+        // Archive one group
+        whitenoise
+            .archive_chat(&creator, &group2.mls_group_id)
+            .await
+            .unwrap();
+
+        // Only the unarchived group should remain
+        let list = whitenoise.get_chat_list(&creator).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].mls_group_id, group1.mls_group_id);
+    }
+
+    #[tokio::test]
+    async fn test_get_archived_chat_list_returns_only_archived() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config1 = create_nostr_group_config_data(vec![creator.pubkey]);
+        let _group1 = whitenoise
+            .create_group(&creator, vec![member.pubkey], config1, None)
+            .await
+            .unwrap();
+
+        let mut config2 = create_nostr_group_config_data(vec![creator.pubkey]);
+        config2.name = "Archived Group".to_string();
+        let group2 = whitenoise
+            .create_group(&creator, vec![member.pubkey], config2, None)
+            .await
+            .unwrap();
+
+        // No archived chats initially
+        let archived = whitenoise.get_archived_chat_list(&creator).await.unwrap();
+        assert!(archived.is_empty());
+
+        // Archive one group
+        whitenoise
+            .archive_chat(&creator, &group2.mls_group_id)
+            .await
+            .unwrap();
+
+        // Only the archived group should appear
+        let archived = whitenoise.get_archived_chat_list(&creator).await.unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].mls_group_id, group2.mls_group_id);
+        assert!(archived[0].archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_unarchive_restores_chat_to_main_list() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Archive then unarchive
+        whitenoise
+            .archive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(whitenoise.get_chat_list(&creator).await.unwrap().len(), 0);
+        assert_eq!(
+            whitenoise
+                .get_archived_chat_list(&creator)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        whitenoise
+            .unarchive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(whitenoise.get_chat_list(&creator).await.unwrap().len(), 1);
+        assert!(
+            whitenoise
+                .get_archived_chat_list(&creator)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_chat_emits_to_both_stream_channels() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Subscribe to both channels
+        let mut active_rx = whitenoise
+            .chat_list_stream_manager
+            .subscribe(&creator.pubkey);
+        let mut archived_rx = whitenoise
+            .archived_chat_list_stream_manager
+            .subscribe(&creator.pubkey);
+
+        // Archive the chat
+        whitenoise
+            .archive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        // Both channels should receive the ChatArchiveChanged update
+        let active_update =
+            tokio::time::timeout(std::time::Duration::from_millis(100), active_rx.recv())
+                .await
+                .expect("active channel should receive update")
+                .unwrap();
+        assert_eq!(
+            active_update.trigger,
+            crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger::ChatArchiveChanged
+        );
+
+        let archived_update =
+            tokio::time::timeout(std::time::Duration::from_millis(100), archived_rx.recv())
+                .await
+                .expect("archived channel should receive update")
+                .unwrap();
+        assert_eq!(
+            archived_update.trigger,
+            crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger::ChatArchiveChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_chat_is_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        // First archive
+        let first = whitenoise
+            .archive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+        let first_archived_at = first.archived_at.unwrap();
+
+        // Second archive — should be a no-op
+        let second = whitenoise
+            .archive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        // Timestamp must not change
+        assert_eq!(
+            second.archived_at.unwrap(),
+            first_archived_at,
+            "duplicate archive must not restamp archived_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unarchive_chat_is_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Unarchive a chat that was never archived — should be a no-op
+        let result = whitenoise
+            .unarchive_chat(&creator, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert!(result.archived_at.is_none());
     }
 }
