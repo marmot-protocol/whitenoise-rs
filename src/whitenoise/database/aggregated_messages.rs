@@ -240,12 +240,14 @@ impl AggregatedMessage {
     /// * Subsequent pages: pass the `created_at` **and** `id` of the *oldest* message
     ///   in the current page as `before` and `before_message_id` respectively.
     ///
+    /// Both cursor fields must be provided together.  Supplying only one half returns
+    /// `Err(DatabaseError::InvalidCursor)`.
+    ///
     /// # Arguments
     /// * `group_id`          – the MLS group to query
     /// * `database`          – database handle
     /// * `before`            – cursor timestamp (Unix seconds); `None` means no upper bound
-    /// * `before_message_id` – cursor message ID (hex); required when `before` is `Some` and
-    ///   the timestamp boundary may contain ties
+    /// * `before_message_id` – cursor message ID (hex); must be `Some` when `before` is `Some`
     /// * `limit`             – maximum rows to return (default 50, capped at 200)
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
@@ -259,21 +261,30 @@ impl AggregatedMessage {
         // Clamp limit: default 50, max 200.
         let limit_val = i64::from(limit.unwrap_or(50).min(200));
 
-        // The DB stores created_at as Unix milliseconds (i64).
-        // nostr_sdk::Timestamp is Unix seconds; multiply by 1000 to convert.
+        // Validate and resolve the compound before-cursor.
         //
-        // Sentinels when `before` is None:
-        //   before_ms       → i64::MAX  — `created_at < MAX` is always true (no upper bound)
-        //   before_id_str   → ""        — irrelevant; the `created_at = MAX` branch never fires
+        // Both fields must be present together or both absent.  A half-specified cursor
+        // (one Some, one None) is rejected immediately rather than falling back to lossy
+        // single-field logic that silently skips messages at a tied timestamp.
         //
-        // When `before` is Some but `before_message_id` is None (e.g. the caller doesn't
-        // know the message ID), the `(created_at = ? AND message_id < ?)` arm evaluates to
-        // false for all real IDs because `message_id < ""` is always false — giving the same
-        // behaviour as the old single-cursor, which is safe when timestamps are unique.
-        let before_ms = before
-            .map(|ts| (ts.as_secs() as i64).saturating_mul(1_000))
-            .unwrap_or(i64::MAX);
-        let before_id_str = before_message_id.unwrap_or("");
+        // The DB stores created_at as Unix milliseconds (i64); Timestamp is Unix seconds,
+        // so we multiply by 1000.  When the cursor is absent we use i64::MAX as a sentinel
+        // so that `created_at < MAX` is unconditionally true and the single query branch
+        // still uses the covering index.
+        let (before_ms, before_id_str): (i64, &str) = match (before, before_message_id) {
+            (None, None) => (i64::MAX, ""),
+            (Some(ts), Some(id)) => ((ts.as_secs() as i64).saturating_mul(1_000), id),
+            (Some(_), None) => {
+                return Err(DatabaseError::InvalidCursor {
+                    reason: "before_message_id is required when before is provided",
+                });
+            }
+            (None, Some(_)) => {
+                return Err(DatabaseError::InvalidCursor {
+                    reason: "before is required when before_message_id is provided",
+                });
+            }
+        };
 
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT am.*, mds.status AS delivery_status
@@ -2453,13 +2464,15 @@ mod tests {
             .await;
         }
 
-        // Cursor at ts+3: should return only messages with created_at < ts+3 → ts+1, ts+2
-        let cursor = Timestamp::from(base_ts + 3);
+        // Cursor at ts+3 (seed 3): should return only messages with created_at < ts+3 → ts+1, ts+2.
+        // Both halves of the compound cursor are required.
+        let cursor_ts = Timestamp::from(base_ts + 3);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor),
-            None,
+            Some(cursor_ts),
+            Some(cursor_id.as_str()),
             None,
         )
         .await
@@ -2733,5 +2746,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_paginated_half_specified_cursor_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[207; 32]);
+        let ts = Timestamp::from(1_700_000_000u64);
+
+        // before=Some, before_message_id=None → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(ts),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
+
+        // before=None, before_message_id=Some → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
     }
 }
