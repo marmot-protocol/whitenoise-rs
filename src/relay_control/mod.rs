@@ -1,8 +1,8 @@
 //! Internal relay-control boundary.
 //!
-//! Phase 0 intentionally introduces only the boundary and shared types. Runtime
-//! behavior continues to flow through the existing `NostrManager` paths until
-//! later phases migrate individual relay workloads onto dedicated sessions.
+//! Long-lived discovery, group, and account-inbox subscriptions now run
+//! through dedicated relay-plane sessions. Query and publish flows still use
+//! the legacy `NostrManager` compatibility path until later migration phases.
 #![allow(clippy::large_enum_variant)]
 
 use core::str::FromStr;
@@ -10,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, mpsc::Sender};
+use tokio::sync::{RwLock, broadcast, mpsc::Sender};
 
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
@@ -29,9 +29,9 @@ use crate::{
 /// Top-level relay-control owner hosted by `Whitenoise`.
 ///
 /// This type defines the long-term system boundary described in
-/// `relay-control-plane-rearchitecture.md`. In Phase 0 it only stores shared
-/// state and typed configuration; production code does not yet route relay
-/// work through it.
+/// `relay-control-plane-rearchitecture.md`. Discovery, group, and account
+/// inbox subscriptions already route through this boundary; remaining query
+/// and publish work still migrates incrementally.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RelayControlPlane {
@@ -47,28 +47,38 @@ pub(crate) struct RelayControlPlane {
 
 #[allow(dead_code)]
 impl RelayControlPlane {
-    /// Create the inactive Phase 0 control-plane host.
+    /// Create the relay-control host and attach telemetry persistence for the
+    /// migrated long-lived planes.
     pub(crate) fn new(
         database: Arc<Database>,
         discovery_relays: Vec<RelayUrl>,
         event_sender: Sender<ProcessableEvent>,
         session_salt: [u8; 16],
     ) -> Self {
-        Self {
+        let observability = observability::RelayObservability::new(
+            observability::RelayObservabilityConfig::default(),
+        );
+        let discovery = discovery::DiscoveryPlane::new(
+            discovery::DiscoveryPlaneConfig::new(discovery_relays),
+            event_sender.clone(),
+        );
+        let group_plane = groups::GroupPlane::new(event_sender.clone(), session_salt);
+
+        let relay_control = Self {
             database,
             event_sender: event_sender.clone(),
             session_salt,
-            discovery: discovery::DiscoveryPlane::new(
-                discovery::DiscoveryPlaneConfig::new(discovery_relays),
-                event_sender.clone(),
-            ),
+            discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
-            group_plane: groups::GroupPlane::new(event_sender, session_salt),
+            group_plane,
             router: router::RelayRouter::default(),
-            observability: observability::RelayObservability::new(
-                observability::RelayObservabilityConfig::default(),
-            ),
-        }
+            observability,
+        };
+
+        relay_control.spawn_telemetry_persistor("discovery", relay_control.discovery.telemetry());
+        relay_control.spawn_telemetry_persistor("group", relay_control.group_plane.telemetry());
+
+        relay_control
     }
 
     /// Access to the shared application database for later relay-control phases.
@@ -96,6 +106,44 @@ impl RelayControlPlane {
 
     pub(crate) fn session_salt(&self) -> &[u8; 16] {
         &self.session_salt
+    }
+
+    fn spawn_telemetry_persistor(
+        &self,
+        task_name: &str,
+        mut receiver: broadcast::Receiver<observability::RelayTelemetry>,
+    ) {
+        let database = self.database.clone();
+        let observability = self.observability.clone();
+        let task_name = task_name.to_string();
+
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(telemetry) => {
+                        if let Err(error) = observability.record(&database, &telemetry).await {
+                            tracing::error!(
+                                target: "whitenoise::relay_control::observability",
+                                task = task_name,
+                                plane = telemetry.plane.as_str(),
+                                relay_url = %telemetry.relay_url,
+                                kind = telemetry.kind.as_str(),
+                                "Failed to persist relay telemetry: {error}"
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::observability",
+                            task = task_name,
+                            skipped,
+                            "Relay telemetry receiver lagged; dropping oldest samples"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
@@ -137,6 +185,10 @@ impl RelayControlPlane {
             account_inbox::AccountInboxPlaneConfig::new(account_pubkey, inbox_relays.to_vec()),
             self.event_sender.clone(),
             self.session_salt,
+        );
+        self.spawn_telemetry_persistor(
+            &format!("account_inbox:{}", account_pubkey.to_hex()),
+            plane.telemetry(),
         );
 
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
@@ -335,7 +387,19 @@ pub(crate) struct SubscriptionContext {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use chrono::Utc;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::broadcast;
+    use tokio::time::{Duration, timeout};
+
     use super::*;
+    use crate::relay_control::observability::{RelayTelemetry, RelayTelemetryKind};
+    use crate::whitenoise::database::{
+        Database, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
+    };
 
     #[test]
     fn test_relay_plane_as_str() {
@@ -355,5 +419,131 @@ mod tests {
             SubscriptionStream::AccountInboxGiftwraps.as_str(),
             "account_inbox_giftwraps"
         );
+    }
+
+    async fn setup_test_db() -> Database {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE relay_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay_url TEXT NOT NULL,
+                plane TEXT NOT NULL,
+                account_pubkey TEXT,
+                last_connect_attempt_at INTEGER,
+                last_connect_success_at INTEGER,
+                last_failure_at INTEGER,
+                failure_category TEXT,
+                last_notice_reason TEXT,
+                last_closed_reason TEXT,
+                last_auth_reason TEXT,
+                auth_required INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER,
+                backoff_until INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_relay_status_global_unique
+             ON relay_status(relay_url, plane)
+             WHERE account_pubkey IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_relay_status_account_unique
+             ON relay_status(relay_url, plane, account_pubkey)
+             WHERE account_pubkey IS NOT NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE relay_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay_url TEXT NOT NULL,
+                plane TEXT NOT NULL,
+                account_pubkey TEXT,
+                occurred_at INTEGER NOT NULL,
+                telemetry_kind TEXT NOT NULL,
+                subscription_id TEXT,
+                failure_category TEXT,
+                message TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        Database {
+            pool,
+            path: PathBuf::from(":memory:"),
+            last_connected: SystemTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_persistor_records_events_and_status() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control =
+            RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
+        let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
+        relay_control.spawn_telemetry_persistor("test", telemetry_receiver);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let telemetry = RelayTelemetry::new(
+            RelayTelemetryKind::SubscriptionSuccess,
+            RelayPlane::Discovery,
+            relay_url.clone(),
+        )
+        .with_occurred_at(Utc::now())
+        .with_subscription_id("sub-1");
+
+        telemetry_sender.send(telemetry).unwrap();
+        drop(telemetry_sender);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let events = RelayEventRecord::list_recent_for_scope(
+                    &relay_url,
+                    RelayPlane::Discovery,
+                    None,
+                    10,
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                let status =
+                    RelayStatusRecord::find(&relay_url, RelayPlane::Discovery, None, &database)
+                        .await
+                        .unwrap();
+
+                if events.len() == 1 {
+                    assert_eq!(events[0].subscription_id.as_deref(), Some("sub-1"));
+                    assert_eq!(status.unwrap().success_count, 1);
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

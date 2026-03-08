@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use super::{
     RelayPlane, SubscriptionStream, hash_pubkey_for_subscription_id,
@@ -170,6 +170,10 @@ impl GroupPlane {
                 }
             }
         }
+    }
+
+    pub(crate) fn telemetry(&self) -> broadcast::Receiver<super::observability::RelayTelemetry> {
+        self.session.telemetry()
     }
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {

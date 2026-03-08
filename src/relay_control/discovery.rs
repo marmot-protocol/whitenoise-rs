@@ -1,7 +1,7 @@
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{RwLock, broadcast};
 
 use super::{
     RelayPlane, SubscriptionStream,
@@ -261,6 +261,10 @@ impl DiscoveryPlane {
 
     pub(crate) fn relays(&self) -> &[RelayUrl] {
         &self.config.relays
+    }
+
+    pub(crate) fn telemetry(&self) -> broadcast::Receiver<super::observability::RelayTelemetry> {
+        self.session.telemetry()
     }
 
     pub(crate) async fn has_subscriptions(&self) -> bool {
