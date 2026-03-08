@@ -19,10 +19,11 @@ e2e-test test="":
     set -euo pipefail
     if [ -z "{{test}}" ]; then
         echo "Running all CLI E2E tests..."
-        cargo test --features cli,integration-tests --test cli_e2e
+        cargo test --features cli,integration-tests --test cli_e2e --test cli_relay_control_e2e
     else
         echo "Running CLI E2E test: {{test}}"
         cargo test --features cli,integration-tests --test cli_e2e "{{test}}"
+        cargo test --features cli,integration-tests --test cli_relay_control_e2e "{{test}}"
     fi
 
 # Run integration_test binary using the local relays and data dirs

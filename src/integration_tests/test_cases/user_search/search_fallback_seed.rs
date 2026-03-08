@@ -3,15 +3,12 @@ use nostr_sdk::PublicKey;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::test_fixtures::nostr::{
+    JEFF_PUBKEY_HEX, MAX_PUBKEY_HEX, publish_user_search_seed_events,
+};
 use crate::whitenoise::user_search::{SearchUpdateTrigger, UserSearchParams};
 
 use super::helpers::{collect_search_updates, wait_for_result};
-use super::seeds;
-
-/// Jeff's pubkey (the fallback seed).
-const JEFF_PUBKEY: &str = "1739d937dc8c0c7370aa27585938c119e25c41f6c441a5d34c6d38503e3136ef";
-/// Max's pubkey (one of Jeff's follows).
-const MAX_PUBKEY: &str = "b7ed68b062de6b4a12e51fd5285c1e1e0ed0e5128cda93ab11b4150b55ed32fc";
 
 /// Tests that a new account with no follows can discover users via the
 /// fallback seed injection.
@@ -41,12 +38,12 @@ impl TestCase for SearchFallbackSeedTestCase {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;
 
-        let jeff_pk = PublicKey::parse(JEFF_PUBKEY).expect("valid Jeff pubkey");
-        let max_pk = PublicKey::parse(MAX_PUBKEY).expect("valid Max pubkey");
+        let jeff_pk = PublicKey::parse(JEFF_PUBKEY_HEX).expect("valid Jeff pubkey");
+        let max_pk = PublicKey::parse(MAX_PUBKEY_HEX).expect("valid Max pubkey");
 
         // Seed Jeff's metadata, contact list, and Max's metadata to local relays
         // so the pipeline can resolve them without hitting the public network.
-        seeds::publish_fallback_seed_events(&context.dev_relays).await?;
+        publish_user_search_seed_events(&context.dev_relays).await?;
         tracing::info!("Seeded fallback events to local relays");
 
         // --- Search 1: "Jeff" should find the fallback seed itself ---

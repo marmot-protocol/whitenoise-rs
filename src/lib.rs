@@ -16,6 +16,9 @@ pub mod cli;
 #[cfg(feature = "integration-tests")]
 pub mod integration_tests;
 
+#[cfg(feature = "integration-tests")]
+pub mod test_fixtures;
+
 // Re-export main types for library users
 
 // Core types
