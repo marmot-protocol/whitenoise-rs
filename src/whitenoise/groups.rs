@@ -576,6 +576,8 @@ impl Whitenoise {
     /// 1. Creates an MLS remove members proposal
     /// 2. Publishes the evolution event to relays (with retry)
     /// 3. Only after relay acceptance, merges the pending commit locally
+    /// 4. If any removed members were admins, updates the group
+    ///    data to remove them from the admin list (logged on failure)
     ///
     /// Per MIP-03, the evolution event is published to relays *before* merging
     /// the pending commit locally. This ensures we only advance local state
@@ -604,7 +606,46 @@ impl Whitenoise {
         };
 
         self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+            .await?;
+
+        // Strip removed members from the admin list.
+        // This is a separate MLS commit, so failures must not mask the
+        // successful membership removal above.
+        if let Err(e) = self
+            .strip_removed_members_from_admins(account, group_id, &members)
             .await
+        {
+            tracing::warn!(
+                target: "whitenoise::groups",
+                "Failed to remove admin status for removed members: {e}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Removes any of the given `removed_members` from the group's admin list.
+    ///
+    /// This is a separate MLS evolution commit from the membership removal
+    /// itself, so callers should treat failures as non-fatal.
+    async fn strip_removed_members_from_admins(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        removed_members: &[PublicKey],
+    ) -> Result<()> {
+        let admins = self.group_admins(account, group_id).await?;
+        let updated_admins: Vec<PublicKey> = admins
+            .iter()
+            .filter(|a| !removed_members.contains(a))
+            .copied()
+            .collect();
+        if updated_admins.len() != admins.len() {
+            let admin_update = NostrGroupDataUpdate::new().admins(updated_admins);
+            self.update_group_data(account, group_id, admin_update)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Updates group metadata and publishes the change to group relays.
@@ -2287,6 +2328,58 @@ mod tests {
         assert_eq!(
             group_before.description, group_after.description,
             "Group description should be unchanged when publish fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_member_also_removes_admin_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let member_a_pubkey = members[0].0.pubkey;
+        let member_b_pubkey = members[1].0.pubkey;
+
+        // Create group with creator and member_a as admins
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey, member_a_pubkey]);
+        let group = whitenoise
+            .create_group(
+                &creator_account,
+                vec![member_a_pubkey, member_b_pubkey],
+                config,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Verify member_a is an admin
+        let admins = whitenoise
+            .group_admins(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+        assert!(
+            admins.contains(&member_a_pubkey),
+            "member_a should be admin"
+        );
+
+        // Remove member_a from the group
+        whitenoise
+            .remove_members_from_group(&creator_account, &group.mls_group_id, vec![member_a_pubkey])
+            .await
+            .unwrap();
+
+        // Verify member_a is no longer an admin
+        let admins_after = whitenoise
+            .group_admins(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+        assert!(
+            !admins_after.contains(&member_a_pubkey),
+            "member_a should no longer be admin after removal"
+        );
+        assert!(
+            admins_after.contains(&creator_account.pubkey),
+            "creator should still be admin"
         );
     }
 }
