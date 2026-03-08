@@ -518,7 +518,15 @@ impl RelaySession {
                                                             )
                                                             .await;
                                                         if matches.is_empty() {
-                                                            vec![context.clone()]
+                                                            tracing::debug!(
+                                                                target: "whitenoise::relay_control::sessions",
+                                                                relay_url = %relay_url,
+                                                                subscription_id = %subscription_id,
+                                                                event_id = %event.id,
+                                                                group_id,
+                                                                "Dropping group message for unknown or stale #h routing context"
+                                                            );
+                                                            vec![]
                                                         } else {
                                                             matches
                                                         }
