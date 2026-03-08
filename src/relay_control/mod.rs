@@ -6,7 +6,13 @@
 #![allow(clippy::large_enum_variant)]
 
 use core::str::FromStr;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
@@ -43,12 +49,13 @@ pub(crate) struct RelayControlPlane {
     group_plane: groups::GroupPlane,
     router: router::RelayRouter,
     observability: observability::RelayObservability,
+    telemetry_persistors_started: AtomicBool,
 }
 
 #[allow(dead_code)]
 impl RelayControlPlane {
-    /// Create the relay-control host and attach telemetry persistence for the
-    /// migrated long-lived planes.
+    /// Create the relay-control host. Telemetry persistors are started during
+    /// the explicit async startup phase once a Tokio runtime is available.
     pub(crate) fn new(
         database: Arc<Database>,
         discovery_relays: Vec<RelayUrl>,
@@ -64,7 +71,7 @@ impl RelayControlPlane {
         );
         let group_plane = groups::GroupPlane::new(event_sender.clone(), session_salt);
 
-        let relay_control = Self {
+        Self {
             database,
             event_sender: event_sender.clone(),
             session_salt,
@@ -73,12 +80,21 @@ impl RelayControlPlane {
             group_plane,
             router: router::RelayRouter::default(),
             observability,
-        };
+            telemetry_persistors_started: AtomicBool::new(false),
+        }
+    }
 
-        relay_control.spawn_telemetry_persistor("discovery", relay_control.discovery.telemetry());
-        relay_control.spawn_telemetry_persistor("group", relay_control.group_plane.telemetry());
+    pub(crate) async fn start_telemetry_persistors(&self) {
+        if self
+            .telemetry_persistors_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
 
-        relay_control
+        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry());
+        self.spawn_telemetry_persistor("group", self.group_plane.telemetry());
     }
 
     /// Access to the shared application database for later relay-control phases.
@@ -192,11 +208,11 @@ impl RelayControlPlane {
 
     /// Activate group and inbox subscriptions for an account.
     ///
-    /// **Atomicity:** Activation is NOT atomic across planes. Group
+    /// **Atomicity:** First-time activation is NOT atomic across planes. Group
     /// subscriptions are established first; if inbox activation subsequently
-    /// fails, group subscriptions will already be active. Callers that receive
-    /// an error should call [`Self::deactivate_account_subscriptions`] to clean
-    /// up any partially-established state.
+    /// fails, group subscriptions may already be active. Refreshing an already
+    /// active account attempts to restore the previous group state on inbox
+    /// activation failure.
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -206,6 +222,8 @@ impl RelayControlPlane {
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
+        let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
+
         self.group_plane
             .update_account(account_pubkey, group_relays, group_ids, since)
             .await?;
@@ -218,7 +236,23 @@ impl RelayControlPlane {
 
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
             plane.deactivate().await;
-            self.group_plane.remove_account(&account_pubkey).await;
+
+            if let Some((previous_relays, previous_group_ids)) = previous_group_state {
+                if let Err(restore_error) = self
+                    .group_plane
+                    .update_account(account_pubkey, &previous_relays, &previous_group_ids, since)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::relay_control",
+                        account_pubkey = %account_pubkey,
+                        "Failed to restore previous group-plane state after inbox activation error: {restore_error}"
+                    );
+                }
+            } else {
+                self.group_plane.remove_account(&account_pubkey).await;
+            }
+
             return Err(error);
         }
 
@@ -461,7 +495,7 @@ mod tests {
 
         let database = Database {
             pool,
-            path: ":memory:".into(),
+            path: ":memory:".to_owned().into(),
             last_connected: std::time::SystemTime::now(),
         };
         database.migrate_up().await.unwrap();

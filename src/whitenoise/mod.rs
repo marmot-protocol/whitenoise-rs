@@ -423,6 +423,7 @@ impl Whitenoise {
                 scheduler_shutdown,
             },
         );
+        whitenoise.relay_control.start_telemetry_persistors().await;
 
         // Create default relays in the database if they don't exist
         // TODO: Make this batch fetch and insert all relays at once
@@ -1291,6 +1292,7 @@ pub mod test_utils {
                 scheduler_shutdown,
             },
         );
+        whitenoise.relay_control.start_telemetry_persistors().await;
 
         (whitenoise, data_temp, logs_temp)
     }
