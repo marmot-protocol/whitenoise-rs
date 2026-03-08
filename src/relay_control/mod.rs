@@ -186,16 +186,17 @@ impl RelayControlPlane {
             self.event_sender.clone(),
             self.session_salt,
         );
-        self.spawn_telemetry_persistor(
-            &format!("account_inbox:{}", account_pubkey.to_hex()),
-            plane.telemetry(),
-        );
 
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
             plane.deactivate().await;
             self.group_plane.remove_account(&account_pubkey).await;
             return Err(error);
         }
+
+        self.spawn_telemetry_persistor(
+            &format!("account_inbox:{}", account_pubkey.to_hex()),
+            plane.telemetry(),
+        );
 
         if let Some(previous_plane) = self
             .account_inbox_planes
@@ -538,6 +539,70 @@ mod tests {
                 if events.len() == 1 {
                     assert_eq!(events[0].subscription_id.as_deref(), Some("sub-1"));
                     assert_eq!(status.unwrap().success_count, 1);
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+        let account_telemetry = RelayTelemetry::new(
+            RelayTelemetryKind::SubscriptionSuccess,
+            RelayPlane::AccountInbox,
+            relay_url.clone(),
+        )
+        .with_account_pubkey(account_pubkey)
+        .with_occurred_at(Utc::now())
+        .with_subscription_id("account-sub-1");
+
+        let (account_sender, account_receiver) = broadcast::channel(8);
+        relay_control.spawn_telemetry_persistor("test-account", account_receiver);
+        account_sender.send(account_telemetry).unwrap();
+        account_sender
+            .send(
+                RelayTelemetry::new(
+                    RelayTelemetryKind::SubscriptionSuccess,
+                    RelayPlane::AccountInbox,
+                    relay_url.clone(),
+                )
+                .with_account_pubkey(account_pubkey)
+                .with_occurred_at(Utc::now())
+                .with_subscription_id("account-sub-2"),
+            )
+            .unwrap();
+        drop(account_sender);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let events = RelayEventRecord::list_recent_for_scope(
+                    &relay_url,
+                    RelayPlane::AccountInbox,
+                    Some(account_pubkey),
+                    10,
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                let status = RelayStatusRecord::find(
+                    &relay_url,
+                    RelayPlane::AccountInbox,
+                    Some(account_pubkey),
+                    &database,
+                )
+                .await
+                .unwrap();
+
+                if events.len() == 2 {
+                    assert_eq!(events[0].subscription_id.as_deref(), Some("account-sub-2"));
+                    assert_eq!(events[0].account_pubkey, Some(account_pubkey));
+
+                    let status = status.unwrap();
+                    assert_eq!(status.account_pubkey, Some(account_pubkey));
+                    assert_eq!(status.success_count, 2);
                     break;
                 }
 

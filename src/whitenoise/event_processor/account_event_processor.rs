@@ -385,8 +385,6 @@ fn validate_giftwrap_target(account: &Account, event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use mdk_core::prelude::GroupId;
     use nostr_sdk::prelude::*;
     use sha2::{Digest, Sha256};
@@ -547,12 +545,20 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
+            .await;
 
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let admin_mdk = whitenoise
             .create_mdk_for_account(admin_account.pubkey)
             .unwrap();
+        let nostr_group_id = hex::encode(
+            admin_mdk
+                .get_group(&group_id)
+                .unwrap()
+                .unwrap()
+                .nostr_group_id,
+        );
 
         let mut inner = UnsignedEvent::new(
             admin_account.pubkey,
@@ -574,7 +580,7 @@ mod tests {
                         account_pubkey: Some(account.pubkey),
                         relay_url: relay_url.clone(),
                         stream: SubscriptionStream::GroupMessages,
-                        group_ids: vec![],
+                        group_ids: vec![nostr_group_id.clone()],
                     }),
                     Default::default(),
                 )

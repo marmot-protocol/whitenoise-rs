@@ -554,7 +554,7 @@ Success state:
 
 ### Phase 3: Stand Up the Group Plane
 
-Status: Completed on March 8, 2026 for long-lived group subscriptions.
+Status: Completed on March 8, 2026, for long-lived group subscriptions.
 
 Objective:
 
@@ -721,7 +721,7 @@ Success state:
 
 ### Phase 6: Introduce Per-Account Inbox Planes
 
-Status: Completed on March 8, 2026 for long-lived giftwrap subscriptions and
+Status: Completed on March 8, 2026, for long-lived giftwrap subscriptions and
 session lifecycle.
 
 Objective:

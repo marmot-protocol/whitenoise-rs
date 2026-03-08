@@ -1445,6 +1445,47 @@ pub mod test_utils {
         }
         accounts
     }
+
+    pub(crate) async fn wait_for_key_package_publication(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        member_pubkeys: &[PublicKey],
+    ) {
+        let relay_urls = Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut all_available = true;
+
+                for pubkey in member_pubkeys {
+                    match whitenoise
+                        .nostr
+                        .fetch_user_key_package(*pubkey, &relay_urls)
+                        .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => {
+                            all_available = false;
+                            break;
+                        }
+                    }
+                }
+
+                if all_available {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Timed out waiting for key package publication for {} member(s)",
+                member_pubkeys.len()
+            )
+        });
+    }
 }
 
 #[cfg(test)]

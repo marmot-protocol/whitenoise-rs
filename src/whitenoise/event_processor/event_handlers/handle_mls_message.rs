@@ -654,8 +654,6 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
     use crate::whitenoise::{
         aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus, relays::Relay,
@@ -671,7 +669,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
 
         let group = whitenoise
             .create_group(
@@ -771,7 +769,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
 
         let group = whitenoise
             .create_group(
@@ -846,7 +844,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
 
         let group = whitenoise
             .create_group(
@@ -894,7 +892,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
 
         let group = whitenoise
             .create_group(
@@ -995,7 +993,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &creator_account, &[member_pubkey]).await;
 
         let group = whitenoise
             .create_group(
@@ -1166,7 +1164,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let member_pubkeys = members
+            .iter()
+            .map(|(account, _)| account.pubkey)
+            .collect::<Vec<_>>();
+        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
 
         let group = whitenoise
             .create_group(
@@ -1288,7 +1290,8 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
+            .await;
 
         // Set up a group where both admin and member have full MLS state
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
@@ -1336,7 +1339,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let member_pubkeys = members
+            .iter()
+            .map(|(account, _)| account.pubkey)
+            .collect::<Vec<_>>();
+        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
 
         let group = whitenoise
             .create_group(
@@ -1405,7 +1412,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let member_pubkeys = members
+            .iter()
+            .map(|(account, _)| account.pubkey)
+            .collect::<Vec<_>>();
+        wait_for_key_package_publication(&whitenoise, &creator_account, &member_pubkeys).await;
 
         let group = whitenoise
             .create_group(
@@ -1505,7 +1516,8 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_for_key_package_publication(&whitenoise, &admin_account, &[member_account.pubkey])
+            .await;
 
         let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
 
