@@ -1108,14 +1108,9 @@ impl Whitenoise {
         }
 
         // Unsubscribe from account-specific subscriptions before logout
-        if let Err(e) = self.nostr.unsubscribe_account_subscriptions(pubkey).await {
-            tracing::warn!(
-                target: "whitenoise::accounts",
-                "Failed to unsubscribe from account subscriptions for {}: {}",
-                pubkey, e
-            );
-            // Don't fail logout if unsubscribe fails
-        }
+        self.relay_control
+            .deactivate_account_subscriptions(pubkey)
+            .await;
 
         // Delete the account from the database
         account.delete(&self.database).await?;

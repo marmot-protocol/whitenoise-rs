@@ -233,15 +233,8 @@ impl Whitenoise {
             relays.insert(db_relay);
         }
 
-        self.nostr
-            .setup_group_messages_subscriptions_with_signer(
-                creator_account.pubkey,
-                &Relay::urls(&relays),
-                &group_ids,
-                signer,
-            )
-            .await
-            .map_err(WhitenoiseError::from)?;
+        let _ = (group_ids, relays, signer);
+        self.refresh_account_subscriptions(creator_account).await?;
 
         let group_info = GroupInformation::create_for_group(
             self,

@@ -16,10 +16,17 @@ pub mod cli;
 #[cfg(feature = "integration-tests")]
 pub mod integration_tests;
 
+#[cfg(feature = "integration-tests")]
+pub mod test_fixtures;
+
 // Re-export main types for library users
 
 // Core types
-pub use types::{ImageType, MessageWithTokens};
+pub use types::{
+    AccountInboxPlaneStateSnapshot, AccountInboxPlanesStateSnapshot, DiscoveryPlaneStateSnapshot,
+    GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ImageType, MessageWithTokens,
+    RelayControlStateSnapshot, RelaySessionRelayStateSnapshot, RelaySessionStateSnapshot,
+};
 pub use whitenoise::{Whitenoise, WhitenoiseConfig};
 
 // Error handling

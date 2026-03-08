@@ -1,19 +1,702 @@
-use super::RelaySessionConfig;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-/// Phase-0 skeleton for the future single-client session primitive.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RelaySession {
-    config: RelaySessionConfig,
+use nostr_sdk::prelude::*;
+use tokio::sync::{RwLock, broadcast, mpsc::Sender};
+
+use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
+use crate::{
+    nostr_manager::{NostrManagerError, Result},
+    relay_control::{
+        SubscriptionContext, SubscriptionStream,
+        observability::{RelayTelemetry, RelayTelemetryKind},
+        router::RelayRouter,
+    },
+    types::ProcessableEvent,
+    types::{RelaySessionRelayStateSnapshot, RelaySessionStateSnapshot},
+};
+
+#[derive(Debug)]
+struct RelaySessionState {
+    notification_handler_registered: AtomicBool,
+    subscription_relays: RwLock<HashMap<SubscriptionId, Vec<RelayUrl>>>,
 }
 
-#[allow(dead_code)]
+/// Reusable single-client relay session used by relay planes.
+#[derive(Debug, Clone)]
+pub(crate) struct RelaySession {
+    client: Client,
+    config: RelaySessionConfig,
+    telemetry_sender: broadcast::Sender<RelayTelemetry>,
+    router: Arc<RelayRouter>,
+    state: Arc<RelaySessionState>,
+}
+
 impl RelaySession {
-    pub(crate) fn new(config: RelaySessionConfig) -> Self {
-        Self { config }
+    pub(crate) fn new(config: RelaySessionConfig, event_sender: Sender<ProcessableEvent>) -> Self {
+        let opts = ClientOptions::default().verify_subscriptions(true);
+        let client = Client::builder().opts(opts).build();
+        let (telemetry_sender, _) = broadcast::channel(256);
+
+        let session = Self {
+            client,
+            config,
+            telemetry_sender,
+            router: Arc::new(RelayRouter::default()),
+            state: Arc::new(RelaySessionState {
+                notification_handler_registered: AtomicBool::new(false),
+                subscription_relays: RwLock::new(HashMap::new()),
+            }),
+        };
+
+        session.spawn_notification_handler(event_sender);
+        session
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> &RelaySessionConfig {
         &self.config
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn telemetry(&self) -> broadcast::Receiver<RelayTelemetry> {
+        self.telemetry_sender.subscribe()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn notification_handler_registered(&self) -> bool {
+        self.state
+            .notification_handler_registered
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn set_signer(&self, signer: impl NostrSigner + 'static) {
+        self.client.set_signer(signer).await;
+    }
+
+    pub(crate) async fn unset_signer(&self) {
+        self.client.unset_signer().await;
+    }
+
+    pub(crate) async fn has_any_relay_connected(&self, relay_urls: &[RelayUrl]) -> bool {
+        for relay_url in relay_urls {
+            if let Ok(relay) = self.client.relay(relay_url).await {
+                match relay.status() {
+                    RelayStatus::Connected | RelayStatus::Connecting => return true,
+                    _ => {}
+                }
+            }
+        }
+
+        false
+    }
+
+    pub(crate) async fn ensure_relays_connected(&self, relay_urls: &[RelayUrl]) -> Result<()> {
+        if relay_urls.is_empty() {
+            return Ok(());
+        }
+
+        let relay_futures = relay_urls
+            .iter()
+            .map(|relay_url| self.ensure_relay_in_client(relay_url));
+        let results = futures::future::join_all(relay_futures).await;
+
+        let mut successful_relays = 0usize;
+        let mut last_error: Option<NostrManagerError> = None;
+        let mut failed_relay_urls: Vec<String> = Vec::new();
+        let mut added_new_relay = false;
+
+        for (relay_url, result) in relay_urls.iter().zip(results) {
+            match result {
+                Ok(was_added) => {
+                    successful_relays += 1;
+                    added_new_relay |= was_added;
+                }
+                Err(err) => {
+                    failed_relay_urls.push(relay_url.to_string());
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        if successful_relays == 0 {
+            return Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections));
+        }
+
+        if !failed_relay_urls.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::relay_control::session",
+                "Partial relay connection failure — {} of {} relays failed: [{}]",
+                failed_relay_urls.len(),
+                relay_urls.len(),
+                failed_relay_urls.join(", "),
+            );
+        }
+
+        if added_new_relay || !self.has_any_relay_connected(relay_urls).await {
+            self.client.connect().await;
+            self.client
+                .wait_for_connection(self.config.connect_timeout)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn fetch_events_from(
+        &self,
+        relay_urls: &[RelayUrl],
+        filter: Filter,
+        timeout: std::time::Duration,
+    ) -> Result<Events> {
+        for relay_url in relay_urls {
+            self.emit_telemetry(RelayTelemetry::new(
+                RelayTelemetryKind::QueryAttempt,
+                self.config.plane,
+                relay_url.clone(),
+            ));
+        }
+
+        let result = self
+            .client
+            .fetch_events_from(relay_urls, filter, timeout)
+            .await;
+        match result {
+            Ok(events) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(RelayTelemetry::new(
+                        RelayTelemetryKind::QuerySuccess,
+                        self.config.plane,
+                        relay_url.clone(),
+                    ));
+                }
+                Ok(events)
+            }
+            Err(error) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::QueryFailure,
+                            self.config.plane,
+                            relay_url.clone(),
+                        )
+                        .with_message(error.to_string()),
+                    );
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    pub(crate) async fn subscribe_with_id_to(
+        &self,
+        relay_urls: &[RelayUrl],
+        subscription_id: SubscriptionId,
+        filter: Filter,
+        stream: SubscriptionStream,
+        account_pubkey: Option<PublicKey>,
+    ) -> Result<()> {
+        for relay_url in relay_urls {
+            let mut telemetry = RelayTelemetry::new(
+                RelayTelemetryKind::SubscriptionAttempt,
+                self.config.plane,
+                relay_url.clone(),
+            )
+            .with_subscription_id(subscription_id.to_string());
+            if let Some(account_pubkey) = account_pubkey {
+                telemetry = telemetry.with_account_pubkey(account_pubkey);
+            }
+            self.emit_telemetry(telemetry);
+        }
+
+        // Snapshot existing routing state before overwriting it. When a
+        // stable subscription ID is being replaced in-place (e.g.
+        // DiscoveryPlane::sync reuses "discovery_user_data_0"), the old
+        // relay-side subscription is still live until the new REQ is accepted.
+        // If the new subscribe call fails we must restore the previous mapping
+        // rather than unconditionally delete it, or the old live subscription
+        // becomes unroutable and its events are silently dropped.
+        let prev_sub_relays: Option<Vec<RelayUrl>> = self
+            .state
+            .subscription_relays
+            .read()
+            .await
+            .get(&subscription_id)
+            .cloned();
+
+        let mut prev_contexts: Vec<(RelayUrl, SubscriptionContext)> = Vec::new();
+        if let Some(ref old_urls) = prev_sub_relays {
+            for relay_url in old_urls {
+                if let Some(ctx) = self
+                    .router
+                    .subscription_context(relay_url, &subscription_id)
+                    .await
+                {
+                    prev_contexts.push((relay_url.clone(), ctx));
+                }
+            }
+        }
+
+        // Pre-register new routing context BEFORE issuing the subscription to
+        // the relay. A relay can deliver the first matching event as soon as it
+        // acknowledges the REQ; the router must be populated by then or the
+        // notification handler will hit a missing context and silently drop it.
+        self.state
+            .subscription_relays
+            .write()
+            .await
+            .insert(subscription_id.clone(), relay_urls.to_vec());
+
+        for relay_url in relay_urls {
+            self.router
+                .record_subscription_context(
+                    relay_url.clone(),
+                    subscription_id.clone(),
+                    SubscriptionContext {
+                        plane: self.config.plane,
+                        account_pubkey,
+                        relay_url: relay_url.clone(),
+                        stream,
+                    },
+                )
+                .await;
+        }
+
+        let result = self
+            .client
+            .subscribe_with_id_to(relay_urls, subscription_id.clone(), filter, None)
+            .await;
+
+        match result {
+            Ok(_) => {
+                for relay_url in relay_urls {
+                    let mut telemetry = RelayTelemetry::new(
+                        RelayTelemetryKind::SubscriptionSuccess,
+                        self.config.plane,
+                        relay_url.clone(),
+                    )
+                    .with_subscription_id(subscription_id.to_string());
+                    if let Some(account_pubkey) = account_pubkey {
+                        telemetry = telemetry.with_account_pubkey(account_pubkey);
+                    }
+                    self.emit_telemetry(telemetry);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // Subscribe failed — restore previous routing state so any
+                // still-active relay-side subscription remains routable.
+                {
+                    let mut map = self.state.subscription_relays.write().await;
+                    if let Some(prev) = prev_sub_relays {
+                        map.insert(subscription_id.clone(), prev);
+                    } else {
+                        map.remove(&subscription_id);
+                    }
+                }
+                for relay_url in relay_urls {
+                    self.router
+                        .remove_subscription_context(relay_url, &subscription_id)
+                        .await;
+                }
+                for (relay_url, old_ctx) in prev_contexts {
+                    self.router
+                        .record_subscription_context(relay_url, subscription_id.clone(), old_ctx)
+                        .await;
+                }
+                for relay_url in relay_urls {
+                    let mut telemetry = RelayTelemetry::new(
+                        RelayTelemetryKind::SubscriptionFailure,
+                        self.config.plane,
+                        relay_url.clone(),
+                    )
+                    .with_subscription_id(subscription_id.to_string())
+                    .with_message(error.to_string());
+                    if let Some(account_pubkey) = account_pubkey {
+                        telemetry = telemetry.with_account_pubkey(account_pubkey);
+                    }
+                    self.emit_telemetry(telemetry);
+                }
+                Err(error.into())
+            }
+        }
+    }
+
+    pub(crate) async fn unsubscribe(&self, subscription_id: &SubscriptionId) {
+        if let Some(relay_urls) = self
+            .state
+            .subscription_relays
+            .write()
+            .await
+            .remove(subscription_id)
+        {
+            for relay_url in relay_urls {
+                self.router
+                    .remove_subscription_context(&relay_url, subscription_id)
+                    .await;
+            }
+        }
+        self.client.unsubscribe(subscription_id).await;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn unsubscribe_all(&self) {
+        let subscription_ids: Vec<SubscriptionId> = self
+            .state
+            .subscription_relays
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+
+        for subscription_id in subscription_ids {
+            self.unsubscribe(&subscription_id).await;
+        }
+        self.client.unsubscribe_all().await;
+    }
+
+    pub(crate) async fn snapshot(&self, known_relays: &[RelayUrl]) -> RelaySessionStateSnapshot {
+        let notification_handler_registered = self.notification_handler_registered();
+        let router_context_count = self.router.context_count().await;
+        let subscription_relays = self.state.subscription_relays.read().await.clone();
+
+        let mut registered_subscription_ids = subscription_relays
+            .keys()
+            .map(|subscription_id| subscription_id.to_string())
+            .collect::<Vec<_>>();
+        registered_subscription_ids.sort_unstable();
+
+        let mut all_relay_urls = BTreeSet::new();
+        for relay_url in known_relays {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+        for relay_url in subscription_relays.values().flatten() {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+
+        let client_relays = self.client.relays().await;
+        for relay_url in client_relays.keys() {
+            all_relay_urls.insert(relay_url.to_string());
+        }
+
+        let mut relay_snapshots = Vec::with_capacity(all_relay_urls.len());
+        for relay_url in all_relay_urls {
+            let relay_url = RelayUrl::parse(&relay_url)
+                .unwrap_or_else(|error| panic!("invalid relay url in session snapshot: {error}"));
+
+            let mut relay_subscription_ids = subscription_relays
+                .iter()
+                .filter(|(_, relay_urls)| {
+                    relay_urls.iter().any(|candidate| candidate == &relay_url)
+                })
+                .map(|(subscription_id, _)| subscription_id.to_string())
+                .collect::<Vec<_>>();
+            relay_subscription_ids.sort_unstable();
+
+            let status = client_relays
+                .get(&relay_url)
+                .map(|relay| format!("{:?}", relay.status()))
+                .unwrap_or_else(|| "NotRegistered".to_string());
+
+            relay_snapshots.push(RelaySessionRelayStateSnapshot {
+                relay_url: relay_url.to_string(),
+                status,
+                subscription_ids: relay_subscription_ids,
+            });
+        }
+
+        RelaySessionStateSnapshot {
+            notification_handler_registered,
+            router_context_count,
+            registered_subscription_count: registered_subscription_ids.len(),
+            registered_subscription_ids,
+            relays: relay_snapshots,
+        }
+    }
+
+    /// Spawns the long-lived relay notification handler.
+    ///
+    /// The returned `JoinHandle` is intentionally not stored. This task is
+    /// expected to run for the lifetime of the session; it exits only when the
+    /// underlying `Client` shuts down (via `RelayPoolNotification::Shutdown`).
+    /// Events queued in the Tokio channel at process-exit time may be dropped —
+    /// this is an accepted trade-off for the current phase. A future `shutdown()`
+    /// method could cancel the client and `await` this handle to drain in-flight
+    /// events gracefully.
+    fn spawn_notification_handler(&self, event_sender: Sender<ProcessableEvent>) {
+        if self
+            .state
+            .notification_handler_registered
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let client = self.client.clone();
+        let telemetry_sender = self.telemetry_sender.clone();
+        let router = self.router.clone();
+        let plane = self.config.plane;
+        let state = self.state.clone();
+
+        tokio::spawn(async move {
+            // Restart the handler on transient errors so a single relay
+            // disconnect does not permanently blind the session. The loop
+            // exits on a graceful Shutdown notification (Ok return) or when
+            // the event_sender channel closes (receiver dropped).
+            loop {
+                // Clone per-iteration so the `move` closure owns fresh handles.
+                let sender_i = event_sender.clone();
+                let telemetry_i = telemetry_sender.clone();
+                let router_i = router.clone();
+
+                let result = client
+                    .handle_notifications(move |notification| {
+                        let sender = sender_i.clone();
+                        let telemetry_sender = telemetry_i.clone();
+                        let router = router_i.clone();
+                        async move {
+                            match notification {
+                                RelayPoolNotification::Event {
+                                    relay_url,
+                                    subscription_id,
+                                    event,
+                                } => {
+                                    if let Some(context) = router
+                                        .subscription_context(&relay_url, &subscription_id)
+                                        .await
+                                    {
+                                        let _ = sender
+                                            .send(ProcessableEvent::new_routed_nostr_event(
+                                                event.as_ref().clone(),
+                                                context,
+                                            ))
+                                            .await;
+                                    } else {
+                                        tracing::error!(
+                                            target: "whitenoise::relay_control::session",
+                                            "Missing subscription context for relay {} subscription {}",
+                                            relay_url,
+                                            subscription_id
+                                        );
+                                    }
+                                    Ok(false)
+                                }
+                                RelayPoolNotification::Message { relay_url, message } => {
+                                    match RelayNotification::from_message(relay_url.clone(), message)
+                                    {
+                                        Some(notification) => {
+                                            Self::process_notification(
+                                                notification,
+                                                plane,
+                                                &sender,
+                                                &telemetry_sender,
+                                            )
+                                            .await
+                                        }
+                                        None => Ok(false),
+                                    }
+                                }
+                                RelayPoolNotification::Shutdown => Ok(true),
+                            }
+                        }
+                    })
+                    .await;
+
+                match result {
+                    Ok(()) => {
+                        // Graceful shutdown via Shutdown notification.
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            target: "whitenoise::relay_control::session",
+                            "Notification handler error: {error}. Restarting in 1s."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+
+            // Clear the flag so spawn_notification_handler can be called
+            // again if the session is reused after a clean shutdown.
+            state
+                .notification_handler_registered
+                .store(false, Ordering::SeqCst);
+        });
+    }
+
+    async fn process_notification(
+        notification: RelayNotification,
+        plane: crate::relay_control::RelayPlane,
+        sender: &Sender<ProcessableEvent>,
+        telemetry_sender: &broadcast::Sender<RelayTelemetry>,
+    ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+        match notification {
+            RelayNotification::Notice {
+                relay_url,
+                message,
+                failure_category,
+            } => {
+                let _ = sender
+                    .send(ProcessableEvent::RelayMessage(
+                        relay_url.clone(),
+                        "Notice".to_string(),
+                    ))
+                    .await;
+                let mut telemetry = RelayTelemetry::notice(plane, relay_url, &message);
+                if let Some(failure_category) = failure_category {
+                    telemetry = telemetry.with_failure_category(failure_category);
+                }
+                let _ = telemetry_sender.send(telemetry);
+            }
+            RelayNotification::Closed {
+                relay_url,
+                message,
+                failure_category,
+            } => {
+                let _ = sender
+                    .send(ProcessableEvent::RelayMessage(
+                        relay_url.clone(),
+                        "Closed".to_string(),
+                    ))
+                    .await;
+                let mut telemetry = RelayTelemetry::closed(plane, relay_url, &message);
+                if let Some(failure_category) = failure_category {
+                    telemetry = telemetry.with_failure_category(failure_category);
+                }
+                let _ = telemetry_sender.send(telemetry);
+            }
+            RelayNotification::Auth {
+                relay_url,
+                challenge,
+                failure_category,
+            } => {
+                let _ = sender
+                    .send(ProcessableEvent::RelayMessage(
+                        relay_url.clone(),
+                        "Auth".to_string(),
+                    ))
+                    .await;
+                let mut telemetry = RelayTelemetry::auth_challenge(plane, relay_url, &challenge);
+                if let Some(failure_category) = failure_category {
+                    telemetry = telemetry.with_failure_category(failure_category);
+                }
+                let _ = telemetry_sender.send(telemetry);
+            }
+            RelayNotification::Connected { relay_url } => {
+                let _ = telemetry_sender.send(RelayTelemetry::new(
+                    RelayTelemetryKind::Connected,
+                    plane,
+                    relay_url,
+                ));
+            }
+            RelayNotification::Disconnected {
+                relay_url,
+                failure_category,
+            } => {
+                let mut telemetry =
+                    RelayTelemetry::new(RelayTelemetryKind::Disconnected, plane, relay_url);
+                if let Some(failure_category) = failure_category {
+                    telemetry = telemetry.with_failure_category(failure_category);
+                }
+                let _ = telemetry_sender.send(telemetry);
+            }
+            RelayNotification::Shutdown => return Ok(true),
+        }
+
+        Ok(false)
+    }
+
+    async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
+        match self.client.relay(relay_url).await {
+            Ok(_) => Ok(false),
+            Err(_) => match self.config.relay_policy {
+                RelaySessionRelayPolicy::Dynamic => {
+                    self.client.add_relay(relay_url.clone()).await?;
+                    Ok(true)
+                }
+                RelaySessionRelayPolicy::ExplicitOnly => {
+                    Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {} is not allowed by explicit-only session policy",
+                        relay_url
+                    )))
+                }
+            },
+        }
+    }
+
+    fn emit_telemetry(&self, telemetry: RelayTelemetry) {
+        let _ = self.telemetry_sender.send(telemetry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::relay_control::{RelayPlane, SubscriptionStream};
+
+    #[tokio::test]
+    async fn test_sessions_do_not_share_clients() {
+        let (sender, _) = mpsc::channel(8);
+        let session_a = RelaySession::new(RelaySessionConfig::new(RelayPlane::Discovery), sender);
+
+        let (sender, _) = mpsc::channel(8);
+        let session_b = RelaySession::new(RelaySessionConfig::new(RelayPlane::Discovery), sender);
+
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        session_a.client().add_relay(relay.clone()).await.unwrap();
+
+        assert!(session_a.client().relay(&relay).await.is_ok());
+        assert!(session_b.client().relay(&relay).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_notification_handler_registers_once() {
+        let (sender, _) = mpsc::channel(8);
+        let session = RelaySession::new(RelaySessionConfig::new(RelayPlane::Discovery), sender);
+
+        assert!(session.notification_handler_registered());
+        let clone = session.clone();
+        assert!(clone.notification_handler_registered());
+        assert!(Arc::ptr_eq(&session.state, &clone.state));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_emits_telemetry() {
+        let (sender, _) = mpsc::channel(8);
+        let session = RelaySession::new(RelaySessionConfig::new(RelayPlane::Group), sender);
+        let mut telemetry = session.telemetry();
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let subscription_id = SubscriptionId::new("group-sub");
+        let filter = Filter::new().kind(Kind::MlsGroupMessage);
+
+        let _ = session
+            .subscribe_with_id_to(
+                &[relay],
+                subscription_id,
+                filter,
+                SubscriptionStream::GroupMessages,
+                None,
+            )
+            .await;
+
+        let first = telemetry.recv().await.unwrap();
+        assert_eq!(first.kind, RelayTelemetryKind::SubscriptionAttempt);
     }
 }

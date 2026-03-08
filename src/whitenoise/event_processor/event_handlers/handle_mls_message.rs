@@ -12,6 +12,8 @@ use crate::whitenoise::{
     message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
     message_streaming::{MessageUpdate, UpdateTrigger},
 };
+#[cfg(test)]
+use crate::{relay_control::hash_pubkey_for_subscription_id, types::EventSource};
 
 impl Whitenoise {
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
@@ -1433,12 +1435,19 @@ mod tests {
         // Build a valid subscription ID for this account.
         let sub_id = format!(
             "{}_mls_messages",
-            whitenoise.nostr.create_pubkey_hash(&creator_account.pubkey)
+            hash_pubkey_for_subscription_id(
+                whitenoise.nostr.session_salt(),
+                &creator_account.pubkey
+            )
         );
 
         // First pass through process_account_event: succeeds, event is tracked.
         whitenoise
-            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .process_account_event(
+                event.clone(),
+                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
+                Default::default(),
+            )
             .await;
 
         let tracked_after_first = whitenoise
@@ -1457,7 +1466,11 @@ mod tests {
         // is not advanced for a duplicate.  This is the intended guard.
         // We verify the skip path by confirming it doesn't panic or double-advance.
         whitenoise
-            .process_account_event(event.clone(), sub_id.clone(), Default::default())
+            .process_account_event(
+                event.clone(),
+                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
+                Default::default(),
+            )
             .await;
 
         // Still tracked — no double-entry, no crash.

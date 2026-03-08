@@ -12,17 +12,30 @@ clear-dev-data:
 
 # Run CLI end-to-end tests (requires local relays via docker compose)
 # Usage:
-#   just e2e-test                             # Run all E2E tests
-#   just e2e-test account_profile_and_export  # Run specific test
+#   just e2e-test                                      # Run all CLI E2E tests
+#   just e2e-test account_profile_and_export           # Run a test in cli_e2e
+#   just e2e-test relay_control_snapshot_tracks_live_planes  # Run a test in cli_relay_control_e2e
 e2e-test test="":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -z "{{test}}" ]; then
         echo "Running all CLI E2E tests..."
-        cargo test --features cli,integration-tests --test cli_e2e
+        cargo test --features cli,integration-tests --test cli_e2e --test cli_relay_control_e2e
     else
         echo "Running CLI E2E test: {{test}}"
-        cargo test --features cli,integration-tests --test cli_e2e "{{test}}"
+        matched=0
+        if cargo test --features cli,integration-tests --test cli_e2e -- --list | grep -Eq "^{{test}}:"; then
+            matched=1
+            cargo test --features cli,integration-tests --test cli_e2e "{{test}}"
+        fi
+        if cargo test --features cli,integration-tests --test cli_relay_control_e2e -- --list | grep -Eq "^{{test}}:"; then
+            matched=1
+            cargo test --features cli,integration-tests --test cli_relay_control_e2e "{{test}}"
+        fi
+        if [ "$matched" -eq 0 ]; then
+            echo "No CLI E2E test named '{{test}}' found in cli_e2e or cli_relay_control_e2e" >&2
+            exit 1
+        fi
     fi
 
 # Run integration_test binary using the local relays and data dirs

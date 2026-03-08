@@ -199,6 +199,10 @@ pub enum Request {
     ChatsSubscribe { account: String },
     #[serde(rename = "notifications_subscribe")]
     NotificationsSubscribe,
+
+    // Debug
+    #[serde(rename = "debug_relay_control_state")]
+    DebugRelayControlState,
 }
 
 fn default_radius_start() -> u8 {

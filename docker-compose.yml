@@ -27,7 +27,7 @@ services:
         condition: service_completed_successfully
 
   blossom:
-    image: ghcr.io/hzrd149/blossom-server:master
+    image: ghcr.io/hzrd149/blossom-server@sha256:efef9fa3ef47934aff586dd2161f221bd9549f0ace4c3432f65e1afb5d3f4d0a
     volumes:
       - ./dev/data/blossom-ts-server:/app/data
       - ./dev/blossom-server-ts-config.yml:/app/config.yml

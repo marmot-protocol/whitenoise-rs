@@ -382,7 +382,7 @@ impl Whitenoise {
     async fn setup_group_subscriptions(
         whitenoise: &Whitenoise,
         account: &Account,
-        signer: Arc<dyn NostrSigner>,
+        _signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
         let (group_ids, group_relays) =
             Self::get_group_subscription_info(whitenoise, &account.pubkey)?;
@@ -399,15 +399,8 @@ impl Whitenoise {
             }
         }
 
-        whitenoise
-            .nostr
-            .setup_group_messages_subscriptions_with_signer(
-                account.pubkey,
-                &group_relays,
-                &group_ids,
-                signer,
-            )
-            .await?;
+        let _ = group_ids;
+        whitenoise.refresh_account_subscriptions(account).await?;
 
         Ok(())
     }
