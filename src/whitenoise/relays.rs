@@ -158,7 +158,17 @@ impl Whitenoise {
                 .ok()
                 .flatten()
                 .map(|s| {
-                    if s.success_count > 0 {
+                    // A relay is currently connected when it has a recorded
+                    // success and that success is more recent than any failure.
+                    // Using timestamps rather than the cumulative success_count
+                    // prevents a relay that once connected but has since
+                    // disconnected from appearing as Connected indefinitely.
+                    let connected = match (s.last_connect_success_at, s.last_failure_at) {
+                        (Some(success), Some(failure)) => success > failure,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if connected {
                         RelayStatus::Connected
                     } else {
                         RelayStatus::Disconnected

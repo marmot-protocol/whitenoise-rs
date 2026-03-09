@@ -33,7 +33,6 @@ impl Whitenoise {
         account: &Account,
         user: &User,
         is_new_account: bool,
-        _nip65_relays: &[Relay],
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
@@ -67,9 +66,7 @@ impl Whitenoise {
         &self,
         account: &Account,
         user: &User,
-        _nip65_relays: &[Relay],
         inbox_relays: &[Relay],
-        _key_package_relays: &[Relay],
     ) -> Result<()> {
         let (cancel_tx, _) = tokio::sync::watch::channel(false);
         self.background_task_cancellation

@@ -1801,12 +1801,23 @@ mod tests {
             .unwrap();
 
         // Call the relay-control publish helper directly with unreachable relays.
-        // Pause time so exponential backoff sleeps complete instantly, then resume
-        // before reading from the DB.
+        // Use max_publish_attempts=1 so there are no retry sleeps and the test
+        // runs without needing to pause the Tokio clock (which would break DB
+        // pool timeouts on the status-update write inside publish_message_event).
         let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
-        let ephemeral = whitenoise.relay_control.ephemeral();
+        let ephemeral = crate::relay_control::ephemeral::EphemeralPlane::new(
+            crate::relay_control::ephemeral::EphemeralPlaneConfig {
+                timeout: std::time::Duration::from_millis(200),
+                reconnect_policy:
+                    crate::relay_control::sessions::RelaySessionReconnectPolicy::Disabled,
+                auth_policy: crate::relay_control::sessions::RelaySessionAuthPolicy::Disabled,
+                max_publish_attempts: 1,
+            },
+            whitenoise.database.clone(),
+            whitenoise.event_sender.clone(),
+            whitenoise.relay_control.observability().clone(),
+        );
 
-        tokio::time::pause();
         ephemeral
             .publish_message_event(
                 event,
@@ -1818,7 +1829,6 @@ mod tests {
                 &whitenoise.message_stream_manager,
             )
             .await;
-        tokio::time::resume();
 
         // Verify status transitioned to Failed
         let msg =

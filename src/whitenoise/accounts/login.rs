@@ -29,7 +29,7 @@ impl Whitenoise {
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
-        self.activate_account(&account, &user, true, &relays, &relays, &relays)
+        self.activate_account(&account, &user, true, &relays, &relays)
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
@@ -71,20 +71,13 @@ impl Whitenoise {
         // Always check for existing relay lists when logging in, even if the user is
         // newly created in our database, because the keypair might already exist in
         // the Nostr ecosystem with published relay lists from other apps
-        let (nip65_relays, inbox_relays, key_package_relays) =
+        let (_nip65_relays, inbox_relays, key_package_relays) =
             self.setup_relays_for_existing_account(&mut account).await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
         let user = account.user(&self.database).await?;
-        self.activate_account(
-            &account,
-            &user,
-            false,
-            &nip65_relays,
-            &inbox_relays,
-            &key_package_relays,
-        )
-        .await?;
+        self.activate_account(&account, &user, false, &inbox_relays, &key_package_relays)
+            .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
         tracing::debug!(target: "whitenoise::accounts", "Successfully logged in: {}", account.pubkey.to_hex());
@@ -137,14 +130,8 @@ impl Whitenoise {
         self.insert_external_signer(pubkey, signer.clone()).await?;
 
         let user = account.user(&self.database).await?;
-        self.activate_account_without_publishing(
-            &account,
-            &user,
-            &relay_setup.nip65_relays,
-            &relay_setup.inbox_relays,
-            &relay_setup.key_package_relays,
-        )
-        .await?;
+        self.activate_account_without_publishing(&account, &user, &relay_setup.inbox_relays)
+            .await?;
 
         self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
             .await?;
@@ -221,7 +208,6 @@ impl Whitenoise {
             // Happy path: all three relay lists found, complete the login.
             self.complete_login(
                 &account,
-                discovered.relays(RelayType::Nip65),
                 discovered.relays(RelayType::Inbox),
                 discovered.relays(RelayType::KeyPackage),
             )
@@ -345,7 +331,6 @@ impl Whitenoise {
 
         self.complete_login(
             &account,
-            discovered.relays_or(RelayType::Nip65, &default_relays),
             discovered.relays_or(RelayType::Inbox, &default_relays),
             discovered.relays_or(RelayType::KeyPackage, &default_relays),
         )
@@ -416,7 +401,6 @@ impl Whitenoise {
         if merged.is_complete() {
             self.complete_login(
                 &account,
-                merged.relays(RelayType::Nip65),
                 merged.relays(RelayType::Inbox),
                 merged.relays(RelayType::KeyPackage),
             )
@@ -540,9 +524,7 @@ impl Whitenoise {
             // Happy path -- complete the login using the external signer.
             self.complete_external_signer_login(
                 &account,
-                discovered.relays(RelayType::Nip65),
                 discovered.relays(RelayType::Inbox),
-                discovered.relays(RelayType::KeyPackage),
                 signer,
             )
             .await?;
@@ -665,9 +647,7 @@ impl Whitenoise {
 
         self.complete_external_signer_login(
             &account,
-            discovered.relays_or(RelayType::Nip65, &default_relays),
             discovered.relays_or(RelayType::Inbox, &default_relays),
-            discovered.relays_or(RelayType::KeyPackage, &default_relays),
             signer,
         )
         .await?;
@@ -720,14 +700,8 @@ impl Whitenoise {
         let merged = self.merge_into_stash(pubkey, discovered)?;
 
         if merged.is_complete() {
-            self.complete_external_signer_login(
-                &account,
-                merged.relays(RelayType::Nip65),
-                merged.relays(RelayType::Inbox),
-                merged.relays(RelayType::KeyPackage),
-                signer,
-            )
-            .await?;
+            self.complete_external_signer_login(&account, merged.relays(RelayType::Inbox), signer)
+                .await?;
             self.pending_logins.remove(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
@@ -850,7 +824,6 @@ impl Whitenoise {
     async fn complete_login(
         &self,
         account: &Account,
-        nip65_relays: &[Relay],
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> core::result::Result<(), LoginError> {
@@ -858,25 +831,16 @@ impl Whitenoise {
             .user(&self.database)
             .await
             .map_err(LoginError::from)?;
-        self.activate_account(
-            account,
-            &user,
-            false,
-            nip65_relays,
-            inbox_relays,
-            key_package_relays,
-        )
-        .await
-        .map_err(LoginError::from)
+        self.activate_account(account, &user, false, inbox_relays, key_package_relays)
+            .await
+            .map_err(LoginError::from)
     }
 
     /// Activate an external-signer account after relay lists have been resolved.
     async fn complete_external_signer_login<S>(
         &self,
         account: &Account,
-        nip65_relays: &[Relay],
         inbox_relays: &[Relay],
-        key_package_relays: &[Relay],
         signer: S,
     ) -> core::result::Result<(), LoginError>
     where
@@ -892,15 +856,9 @@ impl Whitenoise {
             .user(&self.database)
             .await
             .map_err(LoginError::from)?;
-        self.activate_account_without_publishing(
-            account,
-            &user,
-            nip65_relays,
-            inbox_relays,
-            key_package_relays,
-        )
-        .await
-        .map_err(LoginError::from)?;
+        self.activate_account_without_publishing(account, &user, inbox_relays)
+            .await
+            .map_err(LoginError::from)?;
 
         self.publish_key_package_for_account_with_signer(account, signer)
             .await
@@ -1103,14 +1061,8 @@ impl Whitenoise {
         self.insert_external_signer(pubkey, keys).await?;
 
         let user = account.user(&self.database).await?;
-        self.activate_account_without_publishing(
-            &account,
-            &user,
-            &relay_setup.nip65_relays,
-            &relay_setup.inbox_relays,
-            &relay_setup.key_package_relays,
-        )
-        .await?;
+        self.activate_account_without_publishing(&account, &user, &relay_setup.inbox_relays)
+            .await?;
 
         Ok(account)
     }

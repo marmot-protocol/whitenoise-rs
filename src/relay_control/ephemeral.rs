@@ -237,7 +237,10 @@ impl EphemeralPlane {
         account_pubkey: &PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Output<EventId>> {
-        // Retry schedule is immediate first attempt, then 2 s and 4 s backoff by default.
+        // One session for the full retry group — connect once, retry the publish,
+        // then disconnect. Creating a new client per attempt would reconnect on
+        // every backoff cycle unnecessarily.
+        let session = self.spawn_session("publish", Some(*account_pubkey));
         let mut last_error: Option<NostrManagerError> = None;
 
         for attempt in 0..self.config.max_publish_attempts {
@@ -254,9 +257,7 @@ impl EphemeralPlane {
                 tokio::time::sleep(delay).await;
             }
 
-            let session = self.spawn_session("publish", Some(*account_pubkey));
             let result = session.publish_event_to(relays, &event).await;
-            session.shutdown().await;
 
             match result {
                 Ok(output) if !output.success.is_empty() => {
@@ -272,6 +273,7 @@ impl EphemeralPlane {
                         );
                     }
 
+                    session.shutdown().await;
                     return Ok(output);
                 }
                 Ok(output) => {
@@ -298,6 +300,7 @@ impl EphemeralPlane {
             }
         }
 
+        session.shutdown().await;
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
     }
 
