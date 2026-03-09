@@ -43,6 +43,7 @@ pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
 // Groups and relays
 pub use whitenoise::accounts_groups::AccountGroup;
 pub use whitenoise::group_information::{GroupInformation, GroupType};
+pub use whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use whitenoise::relays::{Relay, RelayType};
 
 // Drafts

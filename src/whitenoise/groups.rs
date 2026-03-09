@@ -22,7 +22,7 @@ mod media;
 mod membership;
 mod publish;
 
-pub use membership::GroupWithMembership;
+pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 
 impl Whitenoise {
     async fn resolve_member_delivery_relays(
@@ -315,6 +315,60 @@ impl Whitenoise {
                     .map(|membership| GroupWithMembership { group, membership })
             })
             .collect())
+    }
+
+    /// Returns visible groups for the account, each paired with its [`GroupInformation`].
+    ///
+    /// This eliminates the N+1 pattern of calling [`Whitenoise::visible_groups`] and then
+    /// fetching [`GroupInformation`] individually for each group. Group metadata (including
+    /// [`crate::whitenoise::group_information::GroupType`]) is fetched in a single batch
+    /// query and included in every returned item, so callers can filter or branch on
+    /// `group_type` without any further round-trips.
+    ///
+    /// Groups with no `group_information` row are excluded from the result. In practice
+    /// this is safe: the row is created eagerly at group creation and welcome time.
+    ///
+    /// # Arguments
+    /// * `account` - The account to get visible groups for
+    ///
+    /// # Returns
+    /// * `Ok(Vec<GroupWithInfoAndMembership>)` - Visible groups with info and membership data
+    /// * `Err(WhitenoiseError)` - If there is an error accessing storage
+    pub async fn visible_groups_with_info(
+        &self,
+        account: &Account,
+    ) -> Result<Vec<GroupWithInfoAndMembership>> {
+        let visible = self.visible_groups(account).await?;
+
+        if visible.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Batch-fetch all GroupInformation rows for the visible group IDs.
+        let group_ids: Vec<_> = visible
+            .iter()
+            .map(|gwm| gwm.group.mls_group_id.clone())
+            .collect();
+        let info_list = GroupInformation::find_by_mls_group_ids(&group_ids, &self.database).await?;
+        let info_by_id: HashMap<_, _> = info_list
+            .into_iter()
+            .map(|gi| (gi.mls_group_id.clone(), gi))
+            .collect();
+
+        // Pair each visible group with its GroupInformation, dropping any without a row.
+        let result = visible
+            .into_iter()
+            .filter_map(|gwm| {
+                let info = info_by_id.get(&gwm.group.mls_group_id)?.clone();
+                Some(GroupWithInfoAndMembership {
+                    group: gwm.group,
+                    info,
+                    membership: gwm.membership,
+                })
+            })
+            .collect();
+
+        Ok(result)
     }
 
     /// Retrieves a single group by its MLS group ID
@@ -1486,6 +1540,121 @@ mod tests {
         assert_eq!(visible[1].group.mls_group_id, group_pending.mls_group_id);
         assert!(visible[1].is_pending());
         assert!(!visible[1].is_accepted());
+    }
+
+    #[tokio::test]
+    async fn test_visible_groups_with_info_includes_group_information() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+
+        // Regular group (non-empty name → GroupType::Group)
+        let regular_group = whitenoise
+            .create_group(
+                &account,
+                vec![members[0].0.pubkey],
+                create_nostr_group_config_data(vec![account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // DM group (empty name → GroupType::DirectMessage)
+        let mut dm_config =
+            create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
+        dm_config.name = "".to_string();
+        let dm_group = whitenoise
+            .create_group(&account, vec![members[1].0.pubkey], dm_config, None)
+            .await
+            .unwrap();
+
+        let mut with_info = whitenoise.visible_groups_with_info(&account).await.unwrap();
+
+        // Both groups are visible; GroupInformation is included for each.
+        assert_eq!(with_info.len(), 2, "Both groups should be returned");
+        with_info.sort_by_key(|g| g.membership.created_at);
+
+        let regular = with_info
+            .iter()
+            .find(|g| g.group.mls_group_id == regular_group.mls_group_id)
+            .expect("regular group not found");
+        assert_eq!(regular.info.group_type, GroupType::Group);
+
+        let dm = with_info
+            .iter()
+            .find(|g| g.group.mls_group_id == dm_group.mls_group_id)
+            .expect("DM group not found");
+        assert_eq!(dm.info.group_type, GroupType::DirectMessage);
+    }
+
+    #[tokio::test]
+    async fn test_visible_groups_with_info_excludes_declined() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+
+        let group_accepted =
+            create_mdk_group_without_auto_accept(&whitenoise, &account, vec![members[0].0.pubkey])
+                .await;
+        let group_declined =
+            create_mdk_group_without_auto_accept(&whitenoise, &account, vec![members[1].0.pubkey])
+                .await;
+
+        let (ag_accepted, _) = whitenoise
+            .get_or_create_account_group(&account, &group_accepted.mls_group_id, None)
+            .await
+            .unwrap();
+        ag_accepted.accept(&whitenoise).await.unwrap();
+
+        let (ag_declined, _) = whitenoise
+            .get_or_create_account_group(&account, &group_declined.mls_group_id, None)
+            .await
+            .unwrap();
+        ag_declined.decline(&whitenoise).await.unwrap();
+
+        let with_info = whitenoise.visible_groups_with_info(&account).await.unwrap();
+
+        assert_eq!(with_info.len(), 1, "Declined group should be excluded");
+        assert_eq!(with_info[0].group.mls_group_id, group_accepted.mls_group_id);
+        assert_eq!(with_info[0].info.group_type, GroupType::Group);
+    }
+
+    #[tokio::test]
+    async fn test_visible_groups_with_info_caller_can_filter_dms() {
+        // Demonstrates the intended usage: caller filters on group_type.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+
+        // One regular group, one DM
+        let regular_group = whitenoise
+            .create_group(
+                &account,
+                vec![members[0].0.pubkey],
+                create_nostr_group_config_data(vec![account.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut dm_config =
+            create_nostr_group_config_data(vec![account.pubkey, members[1].0.pubkey]);
+        dm_config.name = "".to_string();
+        let _dm = whitenoise
+            .create_group(&account, vec![members[1].0.pubkey], dm_config, None)
+            .await
+            .unwrap();
+
+        let non_dms: Vec<_> = whitenoise
+            .visible_groups_with_info(&account)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.info.group_type == GroupType::Group)
+            .collect();
+
+        assert_eq!(non_dms.len(), 1);
+        assert_eq!(non_dms[0].group.mls_group_id, regular_group.mls_group_id);
     }
 
     #[tokio::test]
