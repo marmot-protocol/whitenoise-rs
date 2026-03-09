@@ -162,6 +162,9 @@ pub enum WhitenoiseError {
     #[error("Invalid timestamp")]
     InvalidTimestamp,
 
+    #[error("Invalid cursor: {reason}")]
+    InvalidCursor { reason: &'static str },
+
     #[error("Media cache operation failed: {0}")]
     MediaCache(String),
 

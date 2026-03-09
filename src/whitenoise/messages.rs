@@ -601,24 +601,72 @@ impl Whitenoise {
 
     /// Fetch and aggregate messages for a group - Main consumer API
     ///
-    /// Returns pre-aggregated messages from the cache. The cache is kept up-to-date by:
+    /// Returns pre-aggregated messages from the cache in oldest-first order. The cache is
+    /// kept up-to-date by:
     /// - Event processor: Caches messages as they arrive (real-time updates)
     /// - Startup sync: Populates cache with existing messages on initialization
     ///
     /// # Arguments
-    /// * `pubkey` - The public key of the user requesting messages
+    /// * `pubkey`  - The public key of the user requesting messages
     /// * `group_id` - The group to fetch messages for
+    /// * `before`            - Cursor timestamp. If `Some`, return only messages with
+    ///   `created_at` strictly before this value **or** at the same second but with a
+    ///   lexicographically smaller message ID. Pass the `created_at` of the oldest message
+    ///   currently loaded to fetch the preceding page (infinite scroll upward). Omit for the
+    ///   initial load.
+    /// * `before_message_id` - Companion cursor ID. Pass the `id` of the same oldest message
+    ///   used for `before` so that ties at the same second are resolved deterministically.
+    ///   Must be `Some` whenever `before` is `Some`; `None` is only valid when `before` is also
+    ///   `None` (initial load). Passing `before` without `before_message_id` returns an error.
+    /// * `limit`             - Maximum number of messages to return. Defaults to 50, capped at 200.
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
+        before: Option<Timestamp>,
+        before_message_id: Option<&str>,
+        limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
-        AggregatedMessage::find_messages_by_group(group_id, &self.database)
+        AggregatedMessage::find_messages_by_group_paginated(
+            group_id,
+            &self.database,
+            before,
+            before_message_id,
+            limit,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::whitenoise::database::DatabaseError::InvalidCursor { reason } => {
+                WhitenoiseError::InvalidCursor { reason }
+            }
+            other => {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", other))
+            }
+        })
+    }
+
+    /// Fetch a single aggregated message by its event ID.
+    ///
+    /// Returns `None` if the message does not exist in the cache or belongs to a different group.
+    ///
+    /// # Arguments
+    /// * `pubkey`   - The public key of the requesting user (security check)
+    /// * `group_id` - The group the message belongs to
+    /// * `message_id` - Hex-encoded event ID of the message
+    pub async fn fetch_message_by_id(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        message_id: &str,
+    ) -> Result<Option<ChatMessage>> {
+        Account::find_by_pubkey(pubkey, &self.database).await?;
+
+        AggregatedMessage::find_by_id(message_id, group_id, &self.database)
             .await
             .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached message: {}", e))
             })
     }
 
@@ -1360,7 +1408,13 @@ mod tests {
 
         // Fetch messages via the main API - should read from cache
         let fetched_messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1431,7 +1485,13 @@ mod tests {
 
         // Fetch messages - should include empty reactions and media
         let messages = whitenoise
-            .fetch_aggregated_messages_for_group(&creator.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(
+                &creator.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -2502,5 +2562,116 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert!(msg.is_deleted, "Last message should be marked deleted");
+    }
+
+    /// fetch_message_by_id returns Some with the correct message when the message exists.
+    #[tokio::test]
+    async fn test_fetch_message_by_id_returns_message_when_it_exists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sent = whitenoise
+            .send_message_to_group(&creator, &group.mls_group_id, "Hello".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        let message_id = sent.message.id.to_hex();
+
+        let result = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &message_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_some(), "Expected Some for an existing message");
+        assert_eq!(result.unwrap().id, message_id);
+    }
+
+    /// fetch_message_by_id returns None for an ID that does not exist in the cache.
+    #[tokio::test]
+    async fn test_fetch_message_by_id_returns_none_for_unknown_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let nonexistent_id = format!("{:0>64}", "deadbeef");
+
+        let result = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &nonexistent_id)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "Expected None for an unknown message ID");
+    }
+
+    /// fetch_message_by_id enforces the account-existence security check: an unregistered
+    /// public key is rejected before any database lookup is attempted.
+    #[tokio::test]
+    async fn test_fetch_message_by_id_rejects_unknown_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let sent = whitenoise
+            .send_message_to_group(&creator, &group.mls_group_id, "Hello".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        let message_id = sent.message.id.to_hex();
+
+        // Use a random key that was never registered with this Whitenoise instance.
+        let stranger_pubkey = Keys::generate().public_key();
+
+        let result = whitenoise
+            .fetch_message_by_id(&stranger_pubkey, &group.mls_group_id, &message_id)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Expected error when account does not exist"
+        );
+        assert!(
+            matches!(result.unwrap_err(), WhitenoiseError::AccountNotFound),
+            "Expected AccountNotFound for an unregistered public key"
+        );
     }
 }

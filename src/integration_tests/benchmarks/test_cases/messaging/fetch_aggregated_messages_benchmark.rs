@@ -35,7 +35,13 @@ impl BenchmarkTestCase for FetchAggregatedMessagesBenchmark {
 
         let messages = context
             .whitenoise
-            .fetch_aggregated_messages_for_group(&account.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(
+                &account.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await?;
 
         let duration = start.elapsed();

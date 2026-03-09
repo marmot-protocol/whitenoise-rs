@@ -1222,7 +1222,13 @@ mod tests {
 
         // Verify messages are accessible via public API
         let fetched = whitenoise
-            .fetch_aggregated_messages_for_group(&creator_account.pubkey, &group.mls_group_id)
+            .fetch_aggregated_messages_for_group(
+                &creator_account.pubkey,
+                &group.mls_group_id,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(fetched.len(), 3, "Should fetch all cached messages");

@@ -140,7 +140,21 @@ pub enum Request {
 
     // Messages
     #[serde(rename = "list_messages")]
-    ListMessages { account: String, group_id: String },
+    ListMessages {
+        account: String,
+        group_id: String,
+        /// Cursor timestamp: fetch messages created before this Unix timestamp (seconds).
+        /// Omit (or pass null) for the most-recent page.
+        #[serde(default)]
+        before: Option<u64>,
+        /// Companion cursor ID: the `id` of the oldest message in the current page.
+        /// Pair with `before` so that ties at the same second are resolved deterministically.
+        #[serde(default)]
+        before_message_id: Option<String>,
+        /// Maximum number of messages to return. Defaults to 50 when absent, capped at 200.
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     #[serde(rename = "send_message")]
     SendMessage {
         account: String,
@@ -450,12 +464,33 @@ mod tests {
         let req = Request::ListMessages {
             account: "npub1abc".to_string(),
             group_id: "abcd1234".to_string(),
+            before: None,
+            before_message_id: None,
+            limit: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::ListMessages { account, group_id }
+            Request::ListMessages { account, group_id, before: None, before_message_id: None, limit: None }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn list_messages_with_pagination_roundtrip() {
+        let req = Request::ListMessages {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            before: Some(1_700_000_000),
+            before_message_id: Some("abc123".to_string()),
+            limit: Some(20),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ListMessages { account, group_id, before: Some(1_700_000_000), before_message_id: Some(_), limit: Some(20) }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }

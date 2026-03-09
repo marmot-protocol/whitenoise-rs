@@ -1739,7 +1739,7 @@ mod tests {
 
             // Fetching messages for a non-existent group should return empty list (no error)
             let result = whitenoise
-                .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+                .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, None, None, None)
                 .await;
 
             assert!(result.is_ok(), "Should succeed with empty list");

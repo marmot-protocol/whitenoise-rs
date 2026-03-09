@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
-use nostr_sdk::{PublicKey, RelayUrl};
+use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
@@ -263,12 +263,25 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
-        Request::ListMessages { account, group_id } => {
-            match list_messages(wn, &account, &group_id).await {
-                Ok(resp) => resp,
-                Err(resp) => resp,
-            }
-        }
+        Request::ListMessages {
+            account,
+            group_id,
+            before,
+            before_message_id,
+            limit,
+        } => match list_messages(
+            wn,
+            &account,
+            &group_id,
+            before,
+            before_message_id.as_deref(),
+            limit,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
 
         Request::SendMessage {
             account,
@@ -1201,11 +1214,21 @@ async fn list_messages(
     wn: &Whitenoise,
     account_str: &str,
     group_id_hex: &str,
+    before: Option<u64>,
+    before_message_id: Option<&str>,
+    limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
+    let before_ts = before.map(Timestamp::from);
     let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+        .fetch_aggregated_messages_for_group(
+            &account.pubkey,
+            &group_id,
+            before_ts,
+            before_message_id,
+            limit,
+        )
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
@@ -1314,20 +1337,17 @@ async fn unreact_to_message(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    // Normalize to canonical lowercase hex for comparison against ChatMessage.id
+    // Normalize to canonical lowercase hex before the DB lookup
     let canonical_id = nostr_sdk::EventId::from_hex(message_id)
         .map_err(|e| Response::err(format!("invalid message ID '{message_id}': {e}")))?
         .to_hex();
 
-    // Find the user's reaction event ID on this message
-    let messages = wn
-        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id)
+    // Look up the single target message directly — avoids a full-page scan that would
+    // silently fail for messages outside the most-recent page.
+    let target_msg = wn
+        .fetch_message_by_id(&account.pubkey, &group_id, &canonical_id)
         .await
-        .map_err(|e| Response::err(e.to_string()))?;
-
-    let target_msg = messages
-        .iter()
-        .find(|m| m.id == canonical_id)
+        .map_err(|e| Response::err(e.to_string()))?
         .ok_or_else(|| Response::err(format!("message not found: {message_id}")))?;
 
     let user_reaction = target_msg

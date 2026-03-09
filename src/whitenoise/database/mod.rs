@@ -46,6 +46,8 @@ pub enum DatabaseError {
     FileSystem(#[from] std::io::Error),
     #[error("Invalid timestamp: {timestamp} cannot be converted to DateTime")]
     InvalidTimestamp { timestamp: i64 },
+    #[error("Invalid cursor: {reason}")]
+    InvalidCursor { reason: &'static str },
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
