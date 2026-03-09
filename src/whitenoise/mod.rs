@@ -576,24 +576,7 @@ impl Whitenoise {
 
     #[perf_instrument("whitenoise")]
     async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
-        let accounts = Account::all(&whitenoise_ref.database).await?;
-        if accounts.is_empty() {
-            tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "No accounts found, clearing discovery subscriptions"
-            );
-            // Explicitly sync with empty sets so any previously-active
-            // discovery subscriptions are torn down rather than left live.
-            whitenoise_ref
-                .relay_control
-                .sync_discovery_subscriptions(&[], &[], None)
-                .await
-                .map_err(WhitenoiseError::from)?;
-            return Ok(());
-        }
-
-        whitenoise_ref.sync_discovery_subscriptions().await?;
-        Ok(())
+        whitenoise_ref.sync_discovery_subscriptions().await
     }
 
     // Compute a shared since timestamp for global user subscriptions.
@@ -1310,8 +1293,18 @@ impl Whitenoise {
 
     #[perf_instrument("whitenoise")]
     async fn sync_discovery_subscriptions(&self) -> Result<()> {
-        let watched_users = User::all_pubkeys(&self.database).await?;
         let accounts = Account::all(&self.database).await?;
+        if accounts.is_empty() {
+            // No accounts — tear down any active discovery subscriptions so they
+            // don't linger after the last account logs out.
+            self.relay_control
+                .sync_discovery_subscriptions(&[], &[], None)
+                .await
+                .map_err(WhitenoiseError::from)?;
+            return Ok(());
+        }
+
+        let watched_users = User::all_pubkeys(&self.database).await?;
         let follow_list_accounts = accounts
             .iter()
             .map(|account| (account.pubkey, account.since_timestamp(10)))
