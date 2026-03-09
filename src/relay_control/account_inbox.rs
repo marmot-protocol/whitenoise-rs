@@ -29,7 +29,7 @@ impl AccountInboxPlaneConfig {
         Self {
             account_pubkey,
             inbox_relays,
-            auth_policy: RelaySessionAuthPolicy::Allowed,
+            auth_policy: RelaySessionAuthPolicy::Disabled,
             reconnect_policy: RelaySessionReconnectPolicy::Conservative,
         }
     }
@@ -149,7 +149,7 @@ mod tests {
     fn test_new_sets_account_inbox_defaults() {
         let config = AccountInboxPlaneConfig::new(Keys::generate().public_key(), Vec::new());
 
-        assert_eq!(config.auth_policy, RelaySessionAuthPolicy::Allowed);
+        assert_eq!(config.auth_policy, RelaySessionAuthPolicy::Disabled);
         assert_eq!(
             config.reconnect_policy,
             RelaySessionReconnectPolicy::Conservative

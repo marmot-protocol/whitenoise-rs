@@ -55,7 +55,10 @@ pub(crate) struct RelaySession {
 
 impl RelaySession {
     pub(crate) fn new(config: RelaySessionConfig, event_sender: Sender<ProcessableEvent>) -> Self {
-        let opts = ClientOptions::default().verify_subscriptions(true);
+        let automatic_auth = config.auth_policy != super::RelaySessionAuthPolicy::Disabled;
+        let opts = ClientOptions::default()
+            .verify_subscriptions(true)
+            .automatic_authentication(automatic_auth);
         let client = Client::builder().opts(opts).build();
         let (telemetry_sender, _) = broadcast::channel(256);
 

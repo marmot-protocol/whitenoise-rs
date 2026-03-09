@@ -5,6 +5,19 @@ use nostr_sdk::PublicKey;
 use crate::relay_control::RelayPlane;
 
 /// Session-level auth policy.
+///
+/// Controls the nostr-sdk `automatic_authentication` setting on the underlying
+/// `Client`. When `Disabled`, the client will not respond to NIP-42 AUTH
+/// challenges from relays.
+///
+/// Auth is disabled by default because the current shared-client and
+/// temporary-signer model is a poor fit for long-lived NIP-42 authenticated
+/// reconnect behaviour. Re-enabling auth requires:
+///
+/// - Ensuring each authenticated session has a stable, long-lived signer
+///   (not the current set/unset pattern around activation/deactivation).
+/// - Handling auth-required relay reconnection without amplifying retry churn.
+/// - Separating auth-capable relay pools from unauthenticated discovery pools.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionAuthPolicy {
