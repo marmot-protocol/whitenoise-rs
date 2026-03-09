@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use mdk_core::prelude::{GroupId, NostrGroupConfigData};
-use nostr_sdk::PublicKey;
+use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
@@ -739,6 +739,19 @@ async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<Str
         .cloned()
 }
 
+fn cli_group_relay_urls() -> Result<Vec<RelayUrl>, Response> {
+    [
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+        "wss://relay.damus.io",
+    ]
+    .into_iter()
+    .map(|url| {
+        RelayUrl::parse(url).map_err(|e| Response::err(format!("invalid group relay URL: {e}")))
+    })
+    .collect()
+}
+
 async fn create_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -753,19 +766,13 @@ async fn create_group(
         .map(|s| parse_pubkey(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let relays = account
-        .inbox_relays(wn)
-        .await
-        .map_err(|e| Response::err(format!("failed to get relays: {e}")))?;
-    let relay_urls = relays.into_iter().map(|r| r.url).collect();
-
     let config = NostrGroupConfigData::new(
         name,
         description.unwrap_or_default(),
         None, // image_hash
         None, // image_key
         None, // image_nonce
-        relay_urls,
+        cli_group_relay_urls()?,
         vec![account.pubkey], // admins — creator only
     );
 

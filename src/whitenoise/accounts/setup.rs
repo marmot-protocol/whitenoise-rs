@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use nostr_sdk::prelude::*;
 
 use crate::RelayType;
+use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
@@ -386,17 +387,17 @@ impl Whitenoise {
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
             .await?;
 
-        let user = account.user(&self.database).await?;
         match fetched_relays {
             None => {
                 // No existing relay list found on network — use defaults, mark for publishing.
-                user.add_relays(default_relays, relay_type, &self.database)
+                self.sync_account_relays(account, default_relays, relay_type)
                     .await?;
                 Ok((default_relays.to_vec(), true))
             }
             Some(relays) => {
                 // Found an existing relay list — use it, no publishing needed.
-                user.add_relays(&relays, relay_type, &self.database).await?;
+                self.sync_account_relays(account, &relays, relay_type)
+                    .await?;
                 Ok((relays, false))
             }
         }
@@ -423,8 +424,8 @@ impl Whitenoise {
             }
             Some(relays) => {
                 // Found an existing relay list — use it, no publishing needed.
-                let user = account.user(&self.database).await?;
-                user.add_relays(&relays, relay_type, &self.database).await?;
+                self.sync_account_relays(account, &relays, relay_type)
+                    .await?;
                 Ok((relays, false))
             }
         }
@@ -472,14 +473,32 @@ impl Whitenoise {
             return Ok(());
         }
 
-        let user = account.user(&self.database).await?;
-        user.add_relays(relays, relay_type, &self.database).await?;
+        self.sync_account_relays(account, relays, relay_type)
+            .await?;
 
         self.background_publish_account_relay_list(account, relay_type, Some(relays))
             .await?;
 
-        tracing::debug!(target: "whitenoise::accounts", "Added {} relays of type {:?} to account", relays.len(), relay_type);
+        tracing::debug!(
+            target: "whitenoise::accounts",
+            "Stored {} relays of type {:?} for account",
+            relays.len(),
+            relay_type
+        );
 
+        Ok(())
+    }
+
+    pub(super) async fn sync_account_relays(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+        relay_type: RelayType,
+    ) -> Result<()> {
+        let user = account.user(&self.database).await?;
+        let relay_urls = Relay::urls(relays).into_iter().collect::<HashSet<_>>();
+        user.sync_relay_urls(self, relay_type, &relay_urls, None)
+            .await?;
         Ok(())
     }
 
@@ -604,25 +623,73 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Extract group data including relay URLs and group IDs for subscription setup.
-    pub(crate) async fn extract_groups_relays_and_ids(
+    /// Extract per-group relay specs for subscription setup.
+    pub(crate) async fn extract_group_subscription_specs(
         &self,
         account: &Account,
-    ) -> Result<(Vec<RelayUrl>, Vec<String>)> {
+    ) -> Result<Vec<GroupSubscriptionSpec>> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut group_relays_set = HashSet::new();
-        let mut group_ids = vec![];
+        let mut group_specs = Vec::with_capacity(groups.len());
 
         for group in &groups {
             let relays = mdk.get_relays(&group.mls_group_id)?;
-            group_relays_set.extend(relays);
-            group_ids.push(hex::encode(group.nostr_group_id));
+            group_specs.push(GroupSubscriptionSpec {
+                group_id: hex::encode(group.nostr_group_id),
+                relays: relays.into_iter().collect(),
+            });
         }
 
-        let group_relays_urls = group_relays_set.into_iter().collect::<Vec<_>>();
+        Ok(group_specs)
+    }
 
-        Ok((group_relays_urls, group_ids))
+    pub(crate) async fn refresh_account_group_subscriptions(
+        &self,
+        account: &Account,
+    ) -> Result<()> {
+        let group_specs = self.extract_group_subscription_specs(account).await?;
+
+        for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
+            Relay::find_or_create_by_url(relay_url, &self.database).await?;
+        }
+
+        self.relay_control
+            .sync_account_group_subscriptions(
+                account.pubkey,
+                &group_specs,
+                account.since_timestamp(10),
+            )
+            .await
+            .map_err(WhitenoiseError::from)
+    }
+
+    pub(crate) fn background_refresh_account_group_subscriptions(account: &Account) {
+        let account_clone = account.clone();
+        tokio::spawn(async move {
+            let whitenoise = match Whitenoise::get_instance() {
+                Ok(wn) => wn,
+                Err(error) => {
+                    tracing::error!(
+                        target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                        "Failed to get Whitenoise instance for background group subscription refresh: {}",
+                        error
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = whitenoise
+                .refresh_account_group_subscriptions(&account_clone)
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                    account_pubkey = %account_clone.pubkey,
+                    "Background group subscription refresh failed: {}",
+                    error
+                );
+            }
+        });
     }
 
     pub(crate) async fn setup_subscriptions(
@@ -638,11 +705,10 @@ impl Whitenoise {
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(inbox_relays);
 
-        let (group_relays_urls, nostr_group_ids) =
-            self.extract_groups_relays_and_ids(account).await?;
+        let group_specs = self.extract_group_subscription_specs(account).await?;
 
         // Ensure group relays are in the database
-        for relay_url in &group_relays_urls {
+        for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
             Relay::find_or_create_by_url(relay_url, &self.database).await?;
         }
 
@@ -667,8 +733,7 @@ impl Whitenoise {
             .activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
+                &group_specs,
                 since,
                 signer,
             )
@@ -709,8 +774,7 @@ impl Whitenoise {
         // fallible data-fetch cannot leave the account with no active subs.
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
 
-        let (group_relays_urls, nostr_group_ids) =
-            self.extract_groups_relays_and_ids(account).await?;
+        let group_specs = self.extract_group_subscription_specs(account).await?;
 
         // 10s buffer to avoid missing events at the boundary of the last sync window.
         // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
@@ -727,8 +791,7 @@ impl Whitenoise {
             .activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
-                &group_relays_urls,
-                &nostr_group_ids,
+                &group_specs,
                 since,
                 signer,
             )
@@ -745,27 +808,23 @@ mod tests {
     use mdk_core::prelude::*;
 
     #[tokio::test]
-    async fn test_extract_groups_relays_and_ids_no_groups() {
+    async fn test_extract_group_subscription_specs_no_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
 
-        let (relays, group_ids) = whitenoise
-            .extract_groups_relays_and_ids(&account)
+        let group_specs = whitenoise
+            .extract_group_subscription_specs(&account)
             .await
             .unwrap();
 
         assert!(
-            relays.is_empty(),
-            "Should have no relays when account has no groups"
-        );
-        assert!(
-            group_ids.is_empty(),
-            "Should have no group IDs when account has no groups"
+            group_specs.is_empty(),
+            "Should have no group specs when account has no groups"
         );
     }
 
     #[tokio::test]
-    async fn test_extract_groups_relays_and_ids_with_groups() {
+    async fn test_extract_group_subscription_specs_with_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Create creator and member accounts
@@ -794,29 +853,73 @@ mod tests {
             .await
             .unwrap();
 
-        // Extract groups relays and IDs
-        let (relays, group_ids) = whitenoise
-            .extract_groups_relays_and_ids(&creator_account)
+        // Extract per-group relay specs
+        let group_specs = whitenoise
+            .extract_group_subscription_specs(&creator_account)
             .await
             .unwrap();
 
-        // Verify relays were extracted
-        assert!(!relays.is_empty(), "Should have relays from the group");
+        assert_eq!(group_specs.len(), 1, "Should have one group spec");
+        let spec = &group_specs[0];
+
+        // Verify relays were extracted for the group
         assert!(
-            relays.contains(&relay1),
+            spec.relays.contains(&relay1),
             "Should contain relay1 from group config"
         );
         assert!(
-            relays.contains(&relay2),
+            spec.relays.contains(&relay2),
             "Should contain relay2 from group config"
         );
 
         // Verify group ID was extracted
-        assert_eq!(group_ids.len(), 1, "Should have one group ID");
         assert_eq!(
-            group_ids[0],
+            spec.group_id,
             hex::encode(group.nostr_group_id),
             "Group ID should match the created group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_account_relays_replaces_stale_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let replacement_a = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://replacement-a.example.com").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let replacement_b = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://replacement-b.example.com").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        whitenoise
+            .sync_account_relays(
+                &account,
+                &[replacement_a.clone(), replacement_b.clone()],
+                RelayType::Nip65,
+            )
+            .await
+            .unwrap();
+
+        let stored_urls = account
+            .nip65_relays(&whitenoise)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|relay| relay.url)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            stored_urls,
+            [replacement_a.url, replacement_b.url]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 

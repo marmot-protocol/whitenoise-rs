@@ -641,7 +641,9 @@ impl Whitenoise {
         };
 
         self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
-            .await
+            .await?;
+        Self::background_refresh_account_group_subscriptions(account);
+        Ok(())
     }
 
     /// Initiates the process to leave a group by creating a self-removal proposal.

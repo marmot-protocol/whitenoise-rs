@@ -160,6 +160,8 @@ impl Whitenoise {
                     hex::encode(group_id.as_slice())
                 );
 
+                Self::background_refresh_account_group_subscriptions(account);
+
                 self.emit_chat_list_update(
                     account,
                     group_id,
@@ -207,6 +209,7 @@ impl Whitenoise {
                     "Processed commit for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
+                Self::background_refresh_account_group_subscriptions(account);
                 Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
             }
 

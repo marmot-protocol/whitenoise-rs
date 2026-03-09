@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
@@ -35,9 +35,22 @@ impl Default for GroupPlaneConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct GroupAccountState {
+pub(crate) struct GroupSubscriptionSpec {
+    pub(crate) group_id: String,
+    pub(crate) relays: Vec<RelayUrl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupRelaySetSubscription {
+    subscription_index: usize,
     relays: Vec<RelayUrl>,
     group_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct GroupAccountState {
+    groups: Vec<GroupSubscriptionSpec>,
+    subscriptions: Vec<GroupRelaySetSubscription>,
 }
 
 #[derive(Debug)]
@@ -68,70 +81,82 @@ impl GroupPlane {
     pub(crate) async fn update_account(
         &self,
         pubkey: PublicKey,
-        relays: &[RelayUrl],
-        group_ids: &[String],
+        group_specs: &[GroupSubscriptionSpec],
         since: Option<Timestamp>,
     ) -> Result<()> {
         let _update_guard = self.update_lock.lock().await;
-        let subscription_id =
-            SubscriptionId::new(format!("{}_mls_messages", self.pubkey_hash(&pubkey)));
 
-        if self.accounts.read().await.contains_key(&pubkey) {
-            self.session.unsubscribe(&subscription_id).await;
+        if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
+            for subscription in previous_state.subscriptions {
+                self.session
+                    .unsubscribe(&self.subscription_id(&pubkey, subscription.subscription_index))
+                    .await;
+            }
         }
 
-        if group_ids.is_empty() || relays.is_empty() {
+        if group_specs.is_empty() {
             // Keep the account in the map with empty state so health checks
             // (has_account_subscriptions) can distinguish "activated with no
             // groups" from "never activated at all".
-            self.accounts.write().await.insert(
-                pubkey,
-                GroupAccountState {
-                    relays: vec![],
-                    group_ids: vec![],
-                },
-            );
+            self.accounts
+                .write()
+                .await
+                .insert(pubkey, GroupAccountState::default());
             return Ok(());
         }
 
-        let mut filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
-
-        if let Some(since) = since {
-            filter = filter.since(since);
-        }
+        let normalized_groups = Self::normalize_group_specs(group_specs);
+        let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
 
         // On any failure below, remove the accounts entry so that
         // has_active_subscription() returns false and recovery is triggered.
         // (The unsubscribe above already tore down the previous subscription,
         // so leaving stale relay info in the map would make the health check
         // falsely report healthy with no live subscription.)
-        if let Err(e) = self.session.ensure_relays_connected(relays).await {
-            self.accounts.write().await.remove(&pubkey);
-            return Err(e);
-        }
-        if let Err(e) = self
-            .session
-            .subscribe_with_id_to(
-                relays,
-                subscription_id,
-                filter,
-                SubscriptionStream::GroupMessages,
-                Some(pubkey),
-                group_ids,
-            )
-            .await
-        {
-            self.accounts.write().await.remove(&pubkey);
-            return Err(e);
+        for subscription in &subscriptions {
+            if subscription.relays.is_empty() || subscription.group_ids.is_empty() {
+                continue;
+            }
+
+            let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+                SingleLetterTag::lowercase(Alphabet::H),
+                subscription.group_ids.iter(),
+            );
+
+            if let Some(since) = since {
+                filter = filter.since(since);
+            }
+
+            if let Err(e) = self
+                .session
+                .ensure_relays_connected(&subscription.relays)
+                .await
+            {
+                self.accounts.write().await.remove(&pubkey);
+                return Err(e);
+            }
+            if let Err(e) = self
+                .session
+                .subscribe_with_id_to(
+                    &subscription.relays,
+                    self.subscription_id(&pubkey, subscription.subscription_index),
+                    filter,
+                    SubscriptionStream::GroupMessages,
+                    Some(pubkey),
+                    &subscription.group_ids,
+                )
+                .await
+            {
+                self.accounts.write().await.remove(&pubkey);
+                return Err(e);
+            }
         }
 
         self.accounts.write().await.insert(
             pubkey,
             GroupAccountState {
-                relays: relays.to_vec(),
-                group_ids: group_ids.to_vec(),
+                groups: normalized_groups,
+                subscriptions,
             },
         );
 
@@ -140,22 +165,24 @@ impl GroupPlane {
 
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
         let _update_guard = self.update_lock.lock().await;
-        let subscription_id =
-            SubscriptionId::new(format!("{}_mls_messages", self.pubkey_hash(pubkey)));
-        if self.accounts.write().await.remove(pubkey).is_some() {
-            self.session.unsubscribe(&subscription_id).await;
+        if let Some(state) = self.accounts.write().await.remove(pubkey) {
+            for subscription in state.subscriptions {
+                self.session
+                    .unsubscribe(&self.subscription_id(pubkey, subscription.subscription_index))
+                    .await;
+            }
         }
     }
 
     pub(crate) async fn account_state(
         &self,
         pubkey: &PublicKey,
-    ) -> Option<(Vec<RelayUrl>, Vec<String>)> {
+    ) -> Option<Vec<GroupSubscriptionSpec>> {
         self.accounts
             .read()
             .await
             .get(pubkey)
-            .map(|state| (state.relays.clone(), state.group_ids.clone()))
+            .map(|state| state.groups.clone())
     }
 
     #[allow(dead_code)]
@@ -173,12 +200,11 @@ impl GroupPlane {
         match state.get(pubkey) {
             None => false,
             Some(account_state) => {
-                if account_state.relays.is_empty() {
+                let relays = Self::distinct_relays(account_state.groups.iter());
+                if relays.is_empty() {
                     true
                 } else {
-                    self.session
-                        .has_any_relay_connected(&account_state.relays)
-                        .await
+                    self.session.has_any_relay_connected(&relays).await
                 }
             }
         }
@@ -190,6 +216,73 @@ impl GroupPlane {
 
     fn pubkey_hash(&self, pubkey: &PublicKey) -> String {
         hash_pubkey_for_subscription_id(&self.session_salt, pubkey)
+    }
+
+    fn subscription_id(&self, pubkey: &PublicKey, subscription_index: usize) -> SubscriptionId {
+        SubscriptionId::new(format!(
+            "{}_mls_messages_{}",
+            self.pubkey_hash(pubkey),
+            subscription_index
+        ))
+    }
+
+    fn normalize_group_specs(group_specs: &[GroupSubscriptionSpec]) -> Vec<GroupSubscriptionSpec> {
+        let mut merged: HashMap<String, BTreeSet<RelayUrl>> = HashMap::new();
+
+        for spec in group_specs {
+            let entry = merged.entry(spec.group_id.clone()).or_default();
+            entry.extend(spec.relays.iter().cloned());
+        }
+
+        let mut normalized = merged
+            .into_iter()
+            .map(|(group_id, relays)| GroupSubscriptionSpec {
+                group_id,
+                relays: relays.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        normalized.sort_unstable_by(|left, right| left.group_id.cmp(&right.group_id));
+        normalized
+    }
+
+    fn distinct_relays<'a, I>(groups: I) -> Vec<RelayUrl>
+    where
+        I: IntoIterator<Item = &'a GroupSubscriptionSpec>,
+    {
+        let mut relays = BTreeSet::new();
+        for group in groups {
+            relays.extend(group.relays.iter().cloned());
+        }
+        relays.into_iter().collect()
+    }
+
+    fn build_relay_set_subscriptions(
+        groups: &[GroupSubscriptionSpec],
+    ) -> Vec<GroupRelaySetSubscription> {
+        let mut relay_buckets: BTreeMap<Vec<RelayUrl>, Vec<String>> = BTreeMap::new();
+
+        for group in groups {
+            relay_buckets
+                .entry(group.relays.clone())
+                .or_default()
+                .push(group.group_id.clone());
+        }
+
+        relay_buckets
+            .into_iter()
+            .enumerate()
+            .filter_map(|(subscription_index, (relays, group_ids))| {
+                if relays.is_empty() || group_ids.is_empty() {
+                    None
+                } else {
+                    Some(GroupRelaySetSubscription {
+                        subscription_index,
+                        relays,
+                        group_ids,
+                    })
+                }
+            })
+            .collect()
     }
 
     pub(crate) async fn snapshot(&self) -> GroupPlaneStateSnapshot {
@@ -205,23 +298,34 @@ impl GroupPlane {
         let mut groups = Vec::new();
 
         for (pubkey, account_state) in &account_states {
-            for relay_url in &account_state.relays {
-                distinct_group_relays.insert(relay_url.clone());
-            }
-
-            let relay_urls = account_state
-                .relays
+            let group_subscription_ids = account_state
+                .subscriptions
                 .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
+                .flat_map(|subscription| {
+                    subscription.group_ids.iter().map(move |group_id| {
+                        (
+                            group_id.clone(),
+                            self.subscription_id(pubkey, subscription.subscription_index)
+                                .to_string(),
+                        )
+                    })
+                })
+                .collect::<HashMap<_, _>>();
 
-            for group_id in &account_state.group_ids {
+            for group in &account_state.groups {
+                for relay_url in &group.relays {
+                    distinct_group_relays.insert(relay_url.clone());
+                }
+
                 groups.push(GroupPlaneGroupStateSnapshot {
                     account_pubkey: pubkey.to_hex(),
-                    group_id: group_id.clone(),
-                    subscription_id: format!("{}_mls_messages", self.pubkey_hash(pubkey)),
-                    relay_count: relay_urls.len(),
-                    relay_urls: relay_urls.clone(),
+                    group_id: group.group_id.clone(),
+                    subscription_id: group_subscription_ids
+                        .get(&group.group_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    relay_count: group.relays.len(),
+                    relay_urls: group.relays.iter().map(ToString::to_string).collect(),
                 });
             }
         }
@@ -297,7 +401,7 @@ mod tests {
         let update_tasks = (0..10)
             .map(|_| {
                 let plane = plane.clone();
-                tokio::spawn(async move { plane.update_account(pubkey, &[], &[], None).await })
+                tokio::spawn(async move { plane.update_account(pubkey, &[], None).await })
             })
             .collect::<Vec<_>>();
 
@@ -313,7 +417,56 @@ mod tests {
         assert_eq!(accounts.len(), 1);
 
         let account_state = accounts.get(&pubkey).unwrap();
-        assert!(account_state.relays.is_empty());
-        assert!(account_state.group_ids.is_empty());
+        assert!(account_state.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_keeps_per_group_relays_separate() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [9; 16]);
+        let pubkey = Keys::generate().public_key();
+        let relay_a = RelayUrl::parse("wss://relay-a.example.com").unwrap();
+        let relay_b = RelayUrl::parse("wss://relay-b.example.com").unwrap();
+        let relay_c = RelayUrl::parse("wss://relay-c.example.com").unwrap();
+
+        let groups = vec![
+            GroupSubscriptionSpec {
+                group_id: "group-a".to_string(),
+                relays: vec![relay_a.clone(), relay_b.clone()],
+            },
+            GroupSubscriptionSpec {
+                group_id: "group-b".to_string(),
+                relays: vec![relay_c.clone()],
+            },
+        ];
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&groups);
+
+        plane.accounts.write().await.insert(
+            pubkey,
+            GroupAccountState {
+                groups,
+                subscriptions,
+            },
+        );
+
+        let snapshot = plane.snapshot().await;
+        assert_eq!(snapshot.group_count, 2);
+
+        let group_a = snapshot
+            .groups
+            .iter()
+            .find(|group| group.group_id == "group-a")
+            .unwrap();
+        assert_eq!(
+            group_a.relay_urls,
+            vec![relay_a.to_string(), relay_b.to_string()]
+        );
+
+        let group_b = snapshot
+            .groups
+            .iter()
+            .find(|group| group.group_id == "group-b")
+            .unwrap();
+        assert_eq!(group_b.relay_urls, vec![relay_c.to_string()]);
     }
 }

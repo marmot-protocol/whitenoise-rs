@@ -227,15 +227,14 @@ impl RelayControlPlane {
         &self,
         account_pubkey: PublicKey,
         inbox_relays: &[RelayUrl],
-        group_relays: &[RelayUrl],
-        group_ids: &[String],
+        group_specs: &[groups::GroupSubscriptionSpec],
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
         let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
 
         self.group_plane
-            .update_account(account_pubkey, group_relays, group_ids, since)
+            .update_account(account_pubkey, group_specs, since)
             .await?;
 
         let plane = account_inbox::AccountInboxPlane::new(
@@ -247,10 +246,10 @@ impl RelayControlPlane {
         if let Err(error) = plane.activate(inbox_relays, since, signer).await {
             plane.deactivate().await;
 
-            if let Some((previous_relays, previous_group_ids)) = previous_group_state {
+            if let Some(previous_group_specs) = previous_group_state {
                 if let Err(restore_error) = self
                     .group_plane
-                    .update_account(account_pubkey, &previous_relays, &previous_group_ids, since)
+                    .update_account(account_pubkey, &previous_group_specs, since)
                     .await
                 {
                     tracing::error!(
@@ -283,6 +282,17 @@ impl RelayControlPlane {
         );
 
         Ok(())
+    }
+
+    pub(crate) async fn sync_account_group_subscriptions(
+        &self,
+        account_pubkey: PublicKey,
+        group_specs: &[groups::GroupSubscriptionSpec],
+        since: Option<nostr_sdk::Timestamp>,
+    ) -> NostrResult<()> {
+        self.group_plane
+            .update_account(account_pubkey, group_specs, since)
+            .await
     }
 
     pub(crate) async fn deactivate_account_subscriptions(&self, account_pubkey: &PublicKey) {

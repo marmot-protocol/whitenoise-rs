@@ -775,22 +775,18 @@ impl Whitenoise {
 
         // Persist only the lists that were actually found so the DB reflects
         // what exists on the network, not assumed defaults.
-        let user = account
-            .user(&self.database)
-            .await
-            .map_err(LoginError::from)?;
         if let Some(ref relays) = nip65_relays {
-            user.add_relays(relays, RelayType::Nip65, &self.database)
+            self.sync_account_relays(account, relays, RelayType::Nip65)
                 .await
                 .map_err(LoginError::from)?;
         }
         if let Some(ref relays) = inbox_relays {
-            user.add_relays(relays, RelayType::Inbox, &self.database)
+            self.sync_account_relays(account, relays, RelayType::Inbox)
                 .await
                 .map_err(LoginError::from)?;
         }
         if let Some(ref relays) = key_package_relays {
-            user.add_relays(relays, RelayType::KeyPackage, &self.database)
+            self.sync_account_relays(account, relays, RelayType::KeyPackage)
                 .await
                 .map_err(LoginError::from)?;
         }

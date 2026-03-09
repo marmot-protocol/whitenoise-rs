@@ -578,12 +578,14 @@ impl RelaySession {
                 let sender_i = event_sender.clone();
                 let telemetry_i = telemetry_sender.clone();
                 let router_i = router.clone();
+                let state_i = state.clone();
 
                 let result = client
                     .handle_notifications(move |notification| {
                         let sender = sender_i.clone();
                         let telemetry_sender = telemetry_i.clone();
                         let router = router_i.clone();
+                        let state = state_i.clone();
                         async move {
                             match notification {
                                 RelayPoolNotification::Event {
@@ -656,12 +658,26 @@ impl RelaySession {
                                                 .await;
                                         }
                                     } else {
-                                        tracing::error!(
-                                            target: "whitenoise::relay_control::session",
-                                            "Missing subscription context for relay {} subscription {}",
-                                            relay_url,
-                                            subscription_id
-                                        );
+                                        let is_registered = state
+                                            .subscription_relays
+                                            .read()
+                                            .await
+                                            .contains_key(&subscription_id);
+                                        if is_registered {
+                                            tracing::error!(
+                                                target: "whitenoise::relay_control::sessions",
+                                                relay_url = %relay_url,
+                                                subscription_id = %subscription_id,
+                                                "Missing routing context for tracked subscription"
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                target: "whitenoise::relay_control::sessions",
+                                                relay_url = %relay_url,
+                                                subscription_id = %subscription_id,
+                                                "Ignoring event for untracked subscription"
+                                            );
+                                        }
                                     }
                                     Ok(false)
                                 }
