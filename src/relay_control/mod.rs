@@ -298,6 +298,20 @@ impl RelayControlPlane {
         self.group_plane.remove_account(account_pubkey).await;
     }
 
+    /// Deactivates all account subscriptions. Called during full data teardown.
+    pub(crate) async fn shutdown_all(&self) {
+        let pubkeys: Vec<_> = self
+            .account_inbox_planes
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        for pubkey in pubkeys {
+            self.deactivate_account_subscriptions(&pubkey).await;
+        }
+    }
+
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
         // Both planes must confirm the account is active. The group plane
         // keeps an entry even for accounts with zero groups (empty state), so

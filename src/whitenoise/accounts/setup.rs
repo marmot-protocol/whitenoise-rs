@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use nostr_sdk::prelude::*;
 
 use crate::RelayType;
-use crate::nostr_manager::NostrManager;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
@@ -34,7 +33,7 @@ impl Whitenoise {
         account: &Account,
         user: &User,
         is_new_account: bool,
-        nip65_relays: &[Relay],
+        _nip65_relays: &[Relay],
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
@@ -45,14 +44,6 @@ impl Whitenoise {
         self.background_task_cancellation
             .insert(account.pubkey, cancel_tx);
 
-        let relay_urls: Vec<RelayUrl> = Relay::urls(
-            nip65_relays
-                .iter()
-                .chain(inbox_relays)
-                .chain(key_package_relays),
-        );
-        self.nostr.ensure_relays_connected(&relay_urls).await?;
-        tracing::debug!(target: "whitenoise::accounts", "Relays connected");
         if let Err(e) = self.refresh_global_subscription_for_user().await {
             tracing::warn!(
                 target: "whitenoise::accounts",
@@ -76,22 +67,13 @@ impl Whitenoise {
         &self,
         account: &Account,
         user: &User,
-        nip65_relays: &[Relay],
+        _nip65_relays: &[Relay],
         inbox_relays: &[Relay],
-        key_package_relays: &[Relay],
+        _key_package_relays: &[Relay],
     ) -> Result<()> {
         let (cancel_tx, _) = tokio::sync::watch::channel(false);
         self.background_task_cancellation
             .insert(account.pubkey, cancel_tx);
-
-        let relay_urls: Vec<RelayUrl> = Relay::urls(
-            nip65_relays
-                .iter()
-                .chain(inbox_relays)
-                .chain(key_package_relays),
-        );
-        self.nostr.ensure_relays_connected(&relay_urls).await?;
-        tracing::debug!(target: "whitenoise::accounts", "Relays connected");
 
         if let Err(e) = self.refresh_global_subscription_for_user().await {
             tracing::warn!(
@@ -472,7 +454,7 @@ impl Whitenoise {
         match relay_event {
             None => Ok(None),
             Some(event) => {
-                let relay_urls = NostrManager::relay_urls_from_event(&event);
+                let relay_urls = crate::nostr_manager::utils::relay_urls_from_event(&event);
                 let mut relays = Vec::with_capacity(relay_urls.len());
                 for url in relay_urls {
                     let relay = self.find_or_create_relay_by_url(&url).await?;

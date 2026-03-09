@@ -20,8 +20,7 @@ impl Whitenoise {
                     user.metadata = metadata;
                     user.save(&self.database).await?;
 
-                    self.nostr
-                        .event_tracker
+                    self.event_tracker
                         .track_processed_global_event(&event)
                         .await?;
 

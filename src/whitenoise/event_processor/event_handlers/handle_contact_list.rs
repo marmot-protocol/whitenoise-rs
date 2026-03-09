@@ -4,16 +4,13 @@ use futures::stream::{self, StreamExt};
 use nostr_sdk::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::{
-    nostr_manager::NostrManager,
-    whitenoise::{
-        Whitenoise,
-        accounts::Account,
-        database::processed_events::ProcessedEvent,
-        error::{Result, WhitenoiseError},
-        users::User,
-        utils::timestamp_to_datetime,
-    },
+use crate::whitenoise::{
+    Whitenoise,
+    accounts::Account,
+    database::processed_events::ProcessedEvent,
+    error::{Result, WhitenoiseError},
+    users::User,
+    utils::timestamp_to_datetime,
 };
 
 /// Maximum number of concurrent user data fetches when processing a contact list.
@@ -32,15 +29,14 @@ impl Whitenoise {
             return Ok(());
         }
 
-        let contacts = NostrManager::pubkeys_from_event(&event);
+        let contacts = crate::nostr_manager::utils::pubkeys_from_event(&event);
         let newly_created = account
             .update_follows_from_event(contacts.clone(), &self.database)
             .await?;
 
         self.schedule_background_user_fetch(&newly_created, &account.pubkey);
 
-        self.nostr
-            .event_tracker
+        self.event_tracker
             .track_processed_account_event(&event, &account.pubkey)
             .await?;
 

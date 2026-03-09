@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use ::rand::RngCore;
+
 use anyhow::Context;
 use dashmap::DashMap;
 use nostr_sdk::prelude::NostrSigner;
@@ -48,7 +50,6 @@ use mdk_core::prelude::MDK;
 use mdk_sqlite_storage::MdkSqliteStorage;
 
 use crate::init_tracing;
-use crate::nostr_manager::NostrManager;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::discovery::DiscoveryPlaneConfig;
 
@@ -135,9 +136,10 @@ impl WhitenoiseConfig {
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
     database: Arc<Database>,
+    event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
+    content_parser: crate::nostr_manager::parser::ContentParser,
     #[allow(dead_code)]
     relay_control: RelayControlPlane,
-    nostr: NostrManager,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
@@ -169,7 +171,7 @@ pub struct Whitenoise {
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
 
 struct WhitenoiseComponents {
-    nostr: NostrManager,
+    event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
@@ -183,8 +185,9 @@ impl std::fmt::Debug for Whitenoise {
         f.debug_struct("Whitenoise")
             .field("config", &self.config)
             .field("database", &"<REDACTED>")
+            .field("event_tracker", &"<REDACTED>")
+            .field("content_parser", &"<REDACTED>")
             .field("relay_control", &"<REDACTED>")
-            .field("nostr", &"<REDACTED>")
             .field("secrets_store", &"<REDACTED>")
             .field("storage", &"<REDACTED>")
             .field("message_aggregator", &"<REDACTED>")
@@ -206,18 +209,21 @@ impl Whitenoise {
         database: Arc<Database>,
         components: WhitenoiseComponents,
     ) -> Self {
+        let mut session_salt = [0u8; 16];
+        ::rand::rng().fill_bytes(&mut session_salt);
         let relay_control = RelayControlPlane::new(
             database.clone(),
             config.discovery_relays.clone(),
             components.event_sender.clone(),
-            *components.nostr.session_salt(),
+            session_salt,
         );
 
         Self {
             config,
             database,
+            event_tracker: components.event_tracker,
+            content_parser: crate::nostr_manager::parser::ContentParser::new(),
             relay_control,
-            nostr: components.nostr,
             secrets_store: components.secrets_store,
             storage: components.storage,
             message_aggregator: components.message_aggregator,
@@ -393,12 +399,9 @@ impl Whitenoise {
 
         let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
 
-        // Create NostrManager with event_sender for direct event queuing
-        let nostr = NostrManager::new(
-            event_sender.clone(),
-            Arc::new(WhitenoiseEventTracker::new(database.clone())),
-        )
-        .await?;
+        // Create the event tracker.
+        let event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
+            Arc::new(WhitenoiseEventTracker::new(database.clone()));
 
         // Create SecretsStore backed by the platform keyring-core store
         let secrets_store = SecretsStore::new(&keyring_service_id);
@@ -416,7 +419,7 @@ impl Whitenoise {
             config,
             database,
             WhitenoiseComponents {
-                nostr,
+                event_tracker,
                 secrets_store,
                 storage,
                 message_aggregator,
@@ -435,22 +438,6 @@ impl Whitenoise {
 
         // Create default app settings in the database if they don't exist
         AppSettings::find_or_create_default(&whitenoise.database).await?;
-
-        // Add default relays to the Nostr client if they aren't already added
-        if whitenoise.nostr.client.relays().await.is_empty() {
-            // First time starting the app
-            for relay in Relay::defaults() {
-                whitenoise.nostr.client.add_relay(relay.url).await?;
-            }
-        }
-
-        // No need to wait for all the relays to be up
-        tokio::spawn({
-            let client = whitenoise.nostr.client.clone();
-            async move {
-                client.connect().await;
-            }
-        });
 
         whitenoise.relay_control.start_discovery_plane().await?;
         Ok(whitenoise)
@@ -662,8 +649,8 @@ impl Whitenoise {
         // Shutdown gracefully before deleting data
         self.shutdown().await?;
 
-        // Remove nostr cache
-        self.nostr.delete_all_data().await?;
+        // Tear down all relay-control subscriptions
+        self.relay_control.shutdown_all().await;
 
         // Remove database (accounts and media) data
         self.database.delete_all_data().await?;
@@ -1183,7 +1170,6 @@ impl Whitenoise {
     #[cfg(feature = "integration-tests")]
     pub async fn reset_nostr_client(&self) -> Result<()> {
         self.relay_control.reset_for_tests().await?;
-        self.nostr.client.reset().await;
         Ok(())
     }
 }
@@ -1257,23 +1243,9 @@ pub mod test_utils {
         let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
         let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
 
-        // Create NostrManager for testing - now with actual relay connections
-        // to use the local development relays running in docker
-        let nostr = NostrManager::new(
-            event_sender.clone(),
-            Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone())),
-        )
-        .await
-        .expect("Failed to create NostrManager");
-
-        // connect to default relays
-        let default_relays_urls: Vec<RelayUrl> = Relay::urls(&Relay::defaults());
-
-        for relay in default_relays_urls {
-            nostr.client.add_relay(relay).await.unwrap();
-        }
-
-        nostr.client.connect().await;
+        // Create the event tracker.
+        let test_event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
+            Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone()));
 
         // Create Storage
         let storage = storage::Storage::new(data_temp.path()).await.unwrap();
@@ -1284,7 +1256,7 @@ pub mod test_utils {
             config,
             database,
             WhitenoiseComponents {
-                nostr,
+                event_tracker: test_event_tracker,
                 secrets_store,
                 storage,
                 message_aggregator,
@@ -2646,18 +2618,13 @@ mod tests {
         #[tokio::test]
         async fn test_fallback_relay_urls_excludes_disconnected_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            // A relay URL that was never added to the discovery plane must not appear in fallback.
             let extra_url = RelayUrl::parse("wss://extra.relay.test").unwrap();
-            whitenoise
-                .nostr
-                .client
-                .add_relay(extra_url.clone())
-                .await
-                .unwrap();
 
             let fallback = whitenoise.fallback_relay_urls().await;
             assert!(
                 !fallback.contains(&extra_url),
-                "Fallback should not include disconnected relay"
+                "Fallback should not include a relay that was never added to discovery"
             );
         }
 

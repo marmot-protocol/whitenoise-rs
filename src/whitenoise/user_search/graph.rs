@@ -24,11 +24,6 @@ use crate::whitenoise::users::User;
 /// but we cap at 200 to match PUBKEY_BATCH_SIZE and avoid unnecessary splits.
 const MAX_AUTHORS_PER_FILTER: usize = 200;
 
-/// Timeout for relay requests during search graph traversal.
-/// Longer than the default 5s because search fetches large batches of authors
-/// that compete with background sync for relay connections.
-const SEARCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Number of times to retry a failed relay request before giving up.
 /// Only used by `fetch_events_with_retries` (follows producer).
 /// Metadata tiers use queue-based retries managed by their consumers.
@@ -101,17 +96,9 @@ pub(super) async fn get_group_co_member_pubkeys(
     co_members
 }
 
-/// Collect relay URLs the client is currently connected to.
+/// Collect discovery relay URLs to use for user-search queries.
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
-    whitenoise
-        .nostr
-        .client
-        .relays()
-        .await
-        .into_iter()
-        .filter(|(_, relay)| relay.is_connected())
-        .map(|(url, _)| url)
-        .collect()
+    whitenoise.relay_control.discovery().relays().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,9 +190,9 @@ pub(super) async fn try_fetch_network_metadata(
         .kinds([Kind::Metadata]);
 
     let events = whitenoise
-        .nostr
-        .client
-        .fetch_events_from(&all_relays, filter, SEARCH_FETCH_TIMEOUT)
+        .relay_control
+        .ephemeral()
+        .fetch_events_from(&all_relays, filter)
         .await
         .map_err(|e| {
             tracing::debug!(
@@ -263,9 +250,9 @@ pub(super) async fn try_fetch_relay_lists(
         .kinds([Kind::RelayList]);
 
     let events = whitenoise
-        .nostr
-        .client
-        .fetch_events_from(&all_relays, filter, SEARCH_FETCH_TIMEOUT)
+        .relay_control
+        .ephemeral()
+        .fetch_events_from(&all_relays, filter)
         .await
         .map_err(|e| {
             tracing::debug!(
@@ -323,9 +310,9 @@ pub(super) async fn try_fetch_user_relay_metadata(
     let filter = Filter::new().authors([*pubkey]).kinds([Kind::Metadata]);
 
     match whitenoise
-        .nostr
-        .client
-        .fetch_events_from(relays, filter, SEARCH_FETCH_TIMEOUT)
+        .relay_control
+        .ephemeral()
+        .fetch_events_from(relays, filter)
         .await
     {
         Ok(events) => {
@@ -558,9 +545,9 @@ async fn fetch_events_with_retries(
         for chunk in &pending_chunks {
             let filter = Filter::new().authors(chunk.clone()).kinds([kind]);
             match whitenoise
-                .nostr
-                .client
-                .fetch_events_from(relays, filter, SEARCH_FETCH_TIMEOUT)
+                .relay_control
+                .ephemeral()
+                .fetch_events_from(relays, filter)
                 .await
             {
                 Ok(events) => {

@@ -544,16 +544,12 @@ impl Whitenoise {
             .kind(Kind::MlsKeyPackage)
             .author(account.pubkey);
 
-        let mut key_package_stream = self
-            .nostr
-            .client
-            .stream_events_from(relay_urls, key_package_filter, Duration::from_secs(10))
+        let fetched = self
+            .relay_control
+            .ephemeral()
+            .fetch_events_from(&relay_urls, key_package_filter)
             .await?;
-
-        let mut key_package_events = Vec::new();
-        while let Some(event) = key_package_stream.next().await {
-            key_package_events.push(event);
-        }
+        let key_package_events: Vec<Event> = fetched.into_iter().collect();
 
         let (key_package_events, dropped_wrong_kind, dropped_wrong_author) =
             filter_key_package_events_for_account(account.pubkey, key_package_events);

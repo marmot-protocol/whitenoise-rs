@@ -1,11 +1,8 @@
 use nostr_sdk::prelude::*;
 
-use crate::{
-    nostr_manager::NostrManager,
-    whitenoise::{
-        Whitenoise, accounts::Account, database::processed_events::ProcessedEvent, error::Result,
-        users::User, utils::timestamp_to_datetime,
-    },
+use crate::whitenoise::{
+    Whitenoise, accounts::Account, database::processed_events::ProcessedEvent, error::Result,
+    users::User, utils::timestamp_to_datetime,
 };
 
 impl Whitenoise {
@@ -32,7 +29,7 @@ impl Whitenoise {
             User::find_or_create_by_pubkey(&event.pubkey, &self.database).await?;
 
         let relay_type = event.kind.into();
-        let relay_urls = NostrManager::relay_urls_from_event(&event);
+        let relay_urls = crate::nostr_manager::utils::relay_urls_from_event(&event);
         let event_created_at = Some(timestamp_to_datetime(event.created_at)?);
         let relays_changed = user
             .sync_relay_urls(self, relay_type, &relay_urls, event_created_at)

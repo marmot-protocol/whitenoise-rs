@@ -60,7 +60,7 @@ impl Whitenoise {
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
 
-        let tokens = self.nostr.parse(&mdk_message.content);
+        let tokens = self.content_parser.parse(&mdk_message.content);
 
         // Proactive caching + delivery tracking for all outgoing event kinds.
         // Kind 9 (chat): full message processing + NewMessage emission
@@ -143,7 +143,7 @@ impl Whitenoise {
             .message_aggregator
             .process_single_message(
                 mdk_message,
-                &self.nostr,
+                &self.content_parser,
                 MediaFile::find_by_group(&self.database, group_id).await?,
             )
             .await
@@ -593,7 +593,7 @@ impl Whitenoise {
             .iter()
             .map(|message| MessageWithTokens {
                 message: message.clone(),
-                tokens: self.nostr.parse(&message.content),
+                tokens: self.content_parser.parse(&message.content),
             })
             .collect::<Vec<MessageWithTokens>>();
         Ok(messages_with_tokens)
@@ -775,7 +775,7 @@ impl Whitenoise {
                 pubkey,
                 group_id,
                 new_events.clone(),
-                &self.nostr,
+                &self.content_parser,
                 media_files,
             )
             .await

@@ -51,7 +51,6 @@ impl Whitenoise {
         match result {
             Ok(()) => {
                 if let Err(e) = self
-                    .nostr
                     .event_tracker
                     .track_processed_global_event(&event)
                     .await
@@ -79,7 +78,6 @@ impl Whitenoise {
     /// Returns Some(reason) if should skip, None if should process
     async fn should_skip_global_event_processing(&self, event: &Event) -> Option<&'static str> {
         let already_processed = match self
-            .nostr
             .event_tracker
             .already_processed_global_event(&event.id)
             .await
@@ -100,12 +98,7 @@ impl Whitenoise {
         }
 
         // For global events, check if WE published this event
-        let should_skip = match self
-            .nostr
-            .event_tracker
-            .global_published_event(&event.id)
-            .await
-        {
+        let should_skip = match self.event_tracker.global_published_event(&event.id).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(

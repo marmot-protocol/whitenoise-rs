@@ -69,6 +69,7 @@ impl Default for RetryInfo {
 pub enum EventSource {
     /// Legacy compatibility: the raw subscription ID from the old NostrManager.
     /// `None` when the event arrived without a subscription ID.
+    #[allow(dead_code)]
     LegacySubscriptionId(Option<String>),
     /// Relay-plane path: fully typed routing context attached by the session.
     RelaySubscription(SubscriptionContext),
@@ -90,6 +91,7 @@ pub enum ProcessableEvent {
 
 impl ProcessableEvent {
     /// Create a new legacy NostrEvent with default retry settings.
+    #[allow(dead_code)]
     pub fn new_nostr_event(event: Event, subscription_id: Option<String>) -> Self {
         Self::NostrEvent {
             event,

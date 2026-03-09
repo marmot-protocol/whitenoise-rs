@@ -79,7 +79,6 @@ impl Whitenoise {
             Ok(()) => {
                 // Record that we processed this event successfully
                 if let Err(e) = self
-                    .nostr
                     .event_tracker
                     .track_processed_account_event(&event, &account.pubkey)
                     .await
@@ -211,7 +210,7 @@ impl Whitenoise {
         let accounts = Account::all(&self.database).await?;
         for account in accounts.iter() {
             let pubkey_hash =
-                hash_pubkey_for_subscription_id(self.nostr.session_salt(), &account.pubkey);
+                hash_pubkey_for_subscription_id(self.relay_control.session_salt(), &account.pubkey);
             if pubkey_hash == hash_str {
                 return Ok(account.pubkey);
             }
@@ -263,7 +262,6 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<Option<&'static str>> {
         let already_processed = match self
-            .nostr
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
             .await
@@ -290,7 +288,6 @@ impl Whitenoise {
             Kind::MlsGroupMessage => false,
             Kind::GiftWrap => false,
             _ => match self
-                .nostr
                 .event_tracker
                 .account_published_event(&event.id, &account.pubkey)
                 .await
@@ -502,7 +499,7 @@ mod tests {
 
         // Build the expected subscription hash for this account
         let mut hasher = Sha256::new();
-        hasher.update(whitenoise.nostr.session_salt());
+        hasher.update(whitenoise.relay_control.session_salt());
         hasher.update(account.pubkey.to_bytes());
         let hash = hasher.finalize();
         let pubkey_hash = format!("{:x}", hash)[..12].to_string();
@@ -588,7 +585,6 @@ mod tests {
 
         assert!(
             whitenoise
-                .nostr
                 .event_tracker
                 .already_processed_account_event(&event.id, &admin_account.pubkey)
                 .await
@@ -597,7 +593,6 @@ mod tests {
         );
         assert!(
             whitenoise
-                .nostr
                 .event_tracker
                 .already_processed_account_event(&event.id, &member_account.pubkey)
                 .await

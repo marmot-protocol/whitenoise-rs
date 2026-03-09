@@ -113,7 +113,6 @@ impl User {
                 self.save(&whitenoise.database).await?;
 
                 whitenoise
-                    .nostr
                     .event_tracker
                     .track_processed_global_event(&event)
                     .await?;
@@ -642,15 +641,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_query_relays_with_no_stored_relays_excludes_disconnected() {
+    async fn test_get_query_relays_with_no_stored_relays_excludes_unknown_relay() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        // A relay not configured in the discovery plane must not appear in fallback.
         let extra_url = RelayUrl::parse("wss://extra.relay.test").unwrap();
-        whitenoise
-            .nostr
-            .client
-            .add_relay(extra_url.clone())
-            .await
-            .unwrap();
 
         let test_pubkey = nostr_sdk::Keys::generate().public_key();
         let user = User {
@@ -666,7 +660,7 @@ mod tests {
 
         assert!(
             !query_urls.contains(&extra_url),
-            "Fallback query relays should not include disconnected relay"
+            "Fallback query relays should not include a relay not in the discovery plane"
         );
     }
 

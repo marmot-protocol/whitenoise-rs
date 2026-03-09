@@ -145,20 +145,27 @@ impl Whitenoise {
             unique_relay_urls.insert(relay.url);
         }
 
-        // Get current relay statuses from the Nostr client
+        // Get current relay statuses from the relay_status DB table
         let mut relay_statuses = Vec::new();
 
         for relay_url in unique_relay_urls {
-            // Try to get relay status from NostrManager
-            match self.nostr.get_relay_status(&relay_url).await {
-                Ok(status) => {
-                    relay_statuses.push((relay_url, status));
-                }
-                Err(_) => {
-                    // If we can't get the relay status, it's likely not connected
-                    relay_statuses.push((relay_url, RelayStatus::Disconnected));
-                }
-            }
+            let status =
+                crate::whitenoise::database::relay_status::RelayStatusRecord::find_any_plane(
+                    &relay_url,
+                    &self.database,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|s| {
+                    if s.success_count > 0 {
+                        RelayStatus::Connected
+                    } else {
+                        RelayStatus::Disconnected
+                    }
+                })
+                .unwrap_or(RelayStatus::Disconnected);
+            relay_statuses.push((relay_url, status));
         }
 
         Ok(relay_statuses)

@@ -398,10 +398,7 @@ impl Account {
         let user = self.user(&whitenoise.database).await?;
         user.add_relay(relay, relay_type, &whitenoise.database)
             .await?;
-        whitenoise
-            .nostr
-            .ensure_relays_connected(std::slice::from_ref(&relay.url))
-            .await?;
+
         whitenoise
             .background_publish_account_relay_list(self, relay_type, None)
             .await?;
