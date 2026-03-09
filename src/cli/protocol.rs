@@ -144,7 +144,23 @@ pub enum Request {
 
     // Relays
     #[serde(rename = "relays_list")]
-    RelaysList { account: String },
+    RelaysList {
+        account: String,
+        #[serde(default)]
+        relay_type: Option<String>,
+    },
+    #[serde(rename = "relays_add")]
+    RelaysAdd {
+        account: String,
+        url: String,
+        relay_type: String,
+    },
+    #[serde(rename = "relays_remove")]
+    RelaysRemove {
+        account: String,
+        url: String,
+        relay_type: String,
+    },
 
     // Messages
     #[serde(rename = "list_messages")]
@@ -830,10 +846,77 @@ mod tests {
     fn relays_list_roundtrip() {
         let req = Request::RelaysList {
             account: "npub1abc".to_string(),
+            relay_type: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::RelaysList { account } if account == "npub1abc"));
+        assert!(matches!(
+            parsed,
+            Request::RelaysList { account, relay_type }
+            if account == "npub1abc" && relay_type.is_none()
+        ));
+    }
+
+    #[test]
+    fn relays_list_with_type_roundtrip() {
+        let req = Request::RelaysList {
+            account: "npub1abc".to_string(),
+            relay_type: Some("inbox".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RelaysList { account, relay_type }
+            if account == "npub1abc" && relay_type.as_deref() == Some("inbox")
+        ));
+    }
+
+    #[test]
+    fn relays_list_without_type_field() {
+        let wire = r#"{"method":"relays_list","params":{"account":"npub1abc"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RelaysList { account, relay_type }
+            if account == "npub1abc" && relay_type.is_none()
+        ));
+    }
+
+    #[test]
+    fn relays_add_roundtrip() {
+        let req = Request::RelaysAdd {
+            account: "npub1abc".to_string(),
+            url: "wss://relay.example.com".to_string(),
+            relay_type: "inbox".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RelaysAdd { account, url, relay_type }
+            if account == "npub1abc"
+                && url == "wss://relay.example.com"
+                && relay_type == "inbox"
+        ));
+    }
+
+    #[test]
+    fn relays_remove_roundtrip() {
+        let req = Request::RelaysRemove {
+            account: "npub1abc".to_string(),
+            url: "wss://relay.example.com".to_string(),
+            relay_type: "nip65".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::RelaysRemove { account, url, relay_type }
+            if account == "npub1abc"
+                && url == "wss://relay.example.com"
+                && relay_type == "nip65"
+        ));
     }
 
     #[test]

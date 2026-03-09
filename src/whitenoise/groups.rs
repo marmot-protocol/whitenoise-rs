@@ -410,7 +410,7 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<BTreeSet<RelayUrl>> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        Ok(mdk.get_relays(group_id).map_err(WhitenoiseError::from)?)
+        mdk.get_relays(group_id).map_err(WhitenoiseError::from)
     }
 
     pub async fn group_admins(

@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 use crate::Whitenoise;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
-use crate::whitenoise::relays::Relay;
+use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::UserSyncMode;
 
 use super::protocol::{Request, Response};
@@ -280,7 +280,28 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
-        Request::RelaysList { account } => match relays_list(wn, &account).await {
+        Request::RelaysList {
+            account,
+            relay_type,
+        } => match relays_list(wn, &account, relay_type.as_deref()).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::RelaysAdd {
+            account,
+            url,
+            relay_type,
+        } => match relays_add(wn, &account, &url, &relay_type).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::RelaysRemove {
+            account,
+            url,
+            relay_type,
+        } => match relays_remove(wn, &account, &url, &relay_type).await {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1226,24 +1247,120 @@ async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, 
     Ok(Response::ok(serde_json::json!(null)))
 }
 
-async fn relays_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+fn parse_relay_type(s: &str) -> Result<RelayType, Response> {
+    s.parse::<RelayType>()
+        .map_err(|e| Response::err(format!("{e}. Valid types: nip65, inbox, key_package")))
+}
+
+fn parse_relay_url(s: &str) -> Result<RelayUrl, Response> {
+    RelayUrl::parse(s).map_err(|e| Response::err(format!("invalid relay URL: {e}")))
+}
+
+async fn relays_list(
+    wn: &Whitenoise,
+    account_str: &str,
+    type_filter: Option<&str>,
+) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
+
+    let types_to_query = match type_filter {
+        Some(s) => vec![parse_relay_type(s)?],
+        None => vec![RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage],
+    };
+
+    // Collect relay URLs and their associated types
+    let mut relay_types: HashMap<RelayUrl, Vec<String>> = HashMap::new();
+    for rt in &types_to_query {
+        let relays = account
+            .relays(*rt, wn)
+            .await
+            .map_err(|e| Response::err(e.to_string()))?;
+        let type_str: String = (*rt).into();
+        for relay in relays {
+            relay_types
+                .entry(relay.url)
+                .or_default()
+                .push(type_str.clone());
+        }
+    }
+
+    // Get connection statuses for these relays
     let statuses = wn
         .get_account_relay_statuses(&account)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
+    let status_map: HashMap<_, _> = statuses.into_iter().collect();
 
-    let relays: Vec<serde_json::Value> = statuses
+    let mut relays: Vec<serde_json::Value> = relay_types
         .into_iter()
-        .map(|(url, status)| {
+        .map(|(url, types)| {
+            let status = status_map
+                .get(&url)
+                .map(|s| format!("{s}"))
+                .unwrap_or_else(|| "Disconnected".to_string());
             serde_json::json!({
                 "url": url.to_string(),
-                "status": format!("{status}"),
+                "types": types,
+                "status": status,
             })
         })
         .collect();
+    relays.sort_by(|a, b| a["url"].as_str().cmp(&b["url"].as_str()));
 
     Ok(to_response(&relays))
+}
+
+async fn relays_add(
+    wn: &Whitenoise,
+    account_str: &str,
+    url_str: &str,
+    type_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let relay_type = parse_relay_type(type_str)?;
+    let relay_url = parse_relay_url(url_str)?;
+    let relay = wn
+        .find_or_create_relay_by_url(&relay_url)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    account
+        .add_relay(&relay, relay_type, wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!({
+        "url": relay_url.to_string(),
+        "type": type_str,
+    })))
+}
+
+async fn relays_remove(
+    wn: &Whitenoise,
+    account_str: &str,
+    url_str: &str,
+    type_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let relay_type = parse_relay_type(type_str)?;
+    let relay_url = parse_relay_url(url_str)?;
+    let relay = account
+        .relays(relay_type, wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .into_iter()
+        .find(|r| r.url == relay_url)
+        .ok_or_else(|| Response::err(format!("relay not found for type {type_str}: {url_str}")))?;
+
+    account
+        .remove_relay(&relay, relay_type, wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!({
+        "url": relay_url.to_string(),
+        "type": type_str,
+    })))
 }
 
 async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
@@ -1712,5 +1829,47 @@ mod tests {
     fn to_response_string() {
         let resp = to_response(&"hello");
         assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
+    }
+
+    // --- parse_relay_type ---
+
+    #[test]
+    fn parse_relay_type_nip65() {
+        assert_eq!(parse_relay_type("nip65").unwrap(), RelayType::Nip65);
+    }
+
+    #[test]
+    fn parse_relay_type_inbox() {
+        assert_eq!(parse_relay_type("inbox").unwrap(), RelayType::Inbox);
+    }
+
+    #[test]
+    fn parse_relay_type_key_package() {
+        assert_eq!(
+            parse_relay_type("key_package").unwrap(),
+            RelayType::KeyPackage
+        );
+    }
+
+    #[test]
+    fn parse_relay_type_invalid() {
+        let err = parse_relay_type("bogus").unwrap_err();
+        let msg = err.error.unwrap().message;
+        assert!(msg.contains("bogus"));
+        assert!(msg.contains("Valid types"));
+    }
+
+    // --- parse_relay_url ---
+
+    #[test]
+    fn parse_relay_url_valid_wss() {
+        let url = parse_relay_url("wss://relay.example.com").unwrap();
+        assert_eq!(url.as_str(), "wss://relay.example.com");
+    }
+
+    #[test]
+    fn parse_relay_url_invalid() {
+        let err = parse_relay_url("not-a-url").unwrap_err();
+        assert!(err.error.unwrap().message.contains("invalid relay URL"));
     }
 }

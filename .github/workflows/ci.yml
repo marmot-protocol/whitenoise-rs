@@ -212,8 +212,10 @@ jobs:
         with:
           key: coverage-linux
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -247,7 +249,7 @@ jobs:
           # Clean and run tests with coverage (library only, no integration-tests feature).
           # Exclude CLI e2e test binaries for the same reason as the test-linux job.
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --all-targets \
+          cargo llvm-cov nextest --workspace --all-targets \
             --ignore-filename-regex "$IGNORE_REGEX" \
             --filter-expr 'not binary(cli_e2e) and not binary(cli_relay_control_e2e)' \
             --lcov --output-path lcov.info

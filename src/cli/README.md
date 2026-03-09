@@ -87,7 +87,9 @@ wn (client)                         wnd (daemon)
 | ---------------------------------------------- | ------------------------------ |
 | `wn profile show`                              | Show account metadata          |
 | `wn profile update [--name ...] [--about ...]` | Update profile fields          |
-| `wn relays list`                               | Show relay connection statuses |
+| `wn relays list [--type <type>]`               | Show relays with types/status  |
+| `wn relays add <url> --type <type>`            | Add a relay to account         |
+| `wn relays remove <url> --type <type>`         | Remove a relay from account    |
 | `wn settings show`                             | Show current settings          |
 | `wn settings theme <light\|dark\|system>`      | Set theme                      |
 | `wn settings language <en\|es\|fr\|...>`       | Set language                   |
@@ -152,15 +154,16 @@ src/bin/
 
 ## Tests
 
-94 unit tests across the CLI modules:
+109 unit tests across the CLI modules:
 
-| Module        | Tests | Coverage                                                 |
-| ------------- | ----: | -------------------------------------------------------- |
-| `protocol.rs` |    45 | Serde roundtrip for every Request variant                |
-| `output.rs`   |    28 | Human-readable formatting, field hiding, npub conversion |
-| `server.rs`   |     9 | Stale socket cleanup, PID file parsing                   |
-| `account.rs`  |     6 | Account resolution logic                                 |
-| `client.rs`   |     3 | Client-server roundtrip on temp socket                   |
-| `config.rs`   |     3 | Platform defaults, CLI overrides, socket path            |
+| Module         | Tests | Coverage                                                    |
+| -------------- | ----: | ----------------------------------------------------------- |
+| `protocol.rs`  |    45 | Serde roundtrip for every Request variant                   |
+| `output.rs`    |    28 | Human-readable formatting, field hiding, npub conversion    |
+| `dispatch.rs`  |    15 | Argument parsing helpers (pubkey, group ID, relay type/URL) |
+| `server.rs`    |     9 | Stale socket cleanup, PID file parsing                      |
+| `account.rs`   |     6 | Account resolution logic                                    |
+| `client.rs`    |     3 | Client-server roundtrip on temp socket                      |
+| `config.rs`    |     3 | Platform defaults, CLI overrides, socket path               |
 
 E2E tests live in `tests/cli_e2e.rs` (requires `--features cli,integration-tests` + local relays).
