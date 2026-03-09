@@ -597,14 +597,18 @@ impl Whitenoise {
     }
 
     // Compute a shared since timestamp for global user subscriptions.
-    // - Assumes at least one account exists (caller checked signer presence)
+    // - Accepts the already-loaded account list to avoid TOCTOU races
     // - If any account is unsynced (last_synced_at = None), return None
     // - Otherwise, use min(last_synced_at) minus a 10s buffer, floored at 0
-    #[perf_instrument("whitenoise")]
-    async fn compute_global_since_timestamp(
-        whitenoise_ref: &Whitenoise,
-    ) -> Result<Option<nostr_sdk::Timestamp>> {
-        let accounts = Account::all(&whitenoise_ref.database).await?;
+    fn compute_global_since_timestamp(accounts: &[Account]) -> Option<nostr_sdk::Timestamp> {
+        if accounts.is_empty() {
+            tracing::debug!(
+                target: "whitenoise::setup_global_users_subscriptions",
+                "No accounts; defaulting to since=None"
+            );
+            return None;
+        }
+
         if accounts.iter().any(|a| a.last_synced_at.is_none()) {
             let unsynced = accounts
                 .iter()
@@ -615,7 +619,7 @@ impl Whitenoise {
                 "Global subscriptions using since=None due to {} unsynced accounts",
                 unsynced
             );
-            return Ok(None);
+            return None;
         }
 
         const BUFFER_SECS: u64 = 10;
@@ -624,19 +628,23 @@ impl Whitenoise {
             .filter_map(|a| a.since_timestamp(BUFFER_SECS))
             .min_by_key(|t| t.as_secs());
 
-        if let Some(ts) = since {
-            tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "Global subscriptions using since={} ({}s buffer)",
-                ts.as_secs(), BUFFER_SECS
-            );
-        } else {
-            tracing::warn!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "No minimum last_synced_at found; defaulting to since=None"
-            );
+        match since {
+            Some(ts) => {
+                tracing::info!(
+                    target: "whitenoise::setup_global_users_subscriptions",
+                    "Global subscriptions using since={} ({}s buffer)",
+                    ts.as_secs(), BUFFER_SECS
+                );
+            }
+            None => {
+                tracing::debug!(
+                    target: "whitenoise::setup_global_users_subscriptions",
+                    "All accounts synced but since_timestamp returned None for all; \
+                     defaulting to since=None"
+                );
+            }
         }
-        Ok(since)
+        since
     }
 
     #[perf_instrument("whitenoise")]
@@ -1303,12 +1311,12 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     async fn sync_discovery_subscriptions(&self) -> Result<()> {
         let watched_users = User::all_pubkeys(&self.database).await?;
-        let follow_list_accounts = Account::all(&self.database)
-            .await?
-            .into_iter()
+        let accounts = Account::all(&self.database).await?;
+        let follow_list_accounts = accounts
+            .iter()
             .map(|account| (account.pubkey, account.since_timestamp(10)))
             .collect::<Vec<_>>();
-        let public_since = Self::compute_global_since_timestamp(self).await?;
+        let public_since = Self::compute_global_since_timestamp(&accounts);
 
         self.relay_control
             .sync_discovery_subscriptions(&watched_users, &follow_list_accounts, public_since)
