@@ -272,6 +272,19 @@ impl AggregatedMessage {
         // so that `created_at < MAX` is unconditionally true and the single query branch
         // still uses the covering index.
         let (before_ms, before_id_str): (i64, &str) = match (before, before_message_id) {
+            // No cursor: use i64::MAX so `created_at < MAX` is unconditionally true for every
+            // real timestamp, returning the newest page without a cursor filter.
+            //
+            // The SQL predicate is:
+            //   AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
+            //
+            // With before_ms = i64::MAX and before_id_str = "", the second conjunct becomes
+            // `am.message_id < ''`, which is always false because no hex string is
+            // lexicographically less than the empty string in SQLite.  That is intentional:
+            // the first OR branch (`created_at < i64::MAX`) already matches every row whose
+            // timestamp is a realistic value, so the second conjunct is unreachable and its
+            // falseness is harmless.  Both bind slots must still be filled to satisfy sqlx's
+            // parameter count, hence the empty string placeholder.
             (None, None) => (i64::MAX, ""),
             (Some(ts), Some(id)) => ((ts.as_secs() as i64).saturating_mul(1_000), id),
             (Some(_), None) => {
