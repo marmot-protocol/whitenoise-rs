@@ -773,23 +773,29 @@ impl Whitenoise {
         let inbox_relays = inbox_result.map_err(LoginError::from)?;
         let key_package_relays = key_package_result.map_err(LoginError::from)?;
 
-        // Persist only the lists that were actually found so the DB reflects
-        // what exists on the network, not assumed defaults.
-        if let Some(ref relays) = nip65_relays {
-            self.sync_account_relays(account, relays, RelayType::Nip65)
-                .await
-                .map_err(LoginError::from)?;
-        }
-        if let Some(ref relays) = inbox_relays {
-            self.sync_account_relays(account, relays, RelayType::Inbox)
-                .await
-                .map_err(LoginError::from)?;
-        }
-        if let Some(ref relays) = key_package_relays {
-            self.sync_account_relays(account, relays, RelayType::KeyPackage)
-                .await
-                .map_err(LoginError::from)?;
-        }
+        // Persist the exact discovered network state, including empty results,
+        // so stale relay rows are removed when a relay list no longer exists.
+        self.sync_account_relays(
+            account,
+            nip65_relays.as_deref().unwrap_or(&[]),
+            RelayType::Nip65,
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.sync_account_relays(
+            account,
+            inbox_relays.as_deref().unwrap_or(&[]),
+            RelayType::Inbox,
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.sync_account_relays(
+            account,
+            key_package_relays.as_deref().unwrap_or(&[]),
+            RelayType::KeyPackage,
+        )
+        .await
+        .map_err(LoginError::from)?;
 
         Ok(DiscoveredRelayLists {
             nip65: nip65_relays,

@@ -665,7 +665,8 @@ impl Whitenoise {
 
     pub(crate) fn background_refresh_account_group_subscriptions(account: &Account) {
         let account_clone = account.clone();
-        tokio::spawn(async move {
+        let account_pubkey = account.pubkey;
+        let refresh_task = tokio::spawn(async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(wn) => wn,
                 Err(error) => {
@@ -686,6 +687,16 @@ impl Whitenoise {
                     target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
                     account_pubkey = %account_clone.pubkey,
                     "Background group subscription refresh failed: {}",
+                    error
+                );
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(error) = refresh_task.await {
+                tracing::error!(
+                    target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                    account_pubkey = %account_pubkey,
+                    "Background group subscription refresh task panicked: {}",
                     error
                 );
             }

@@ -134,6 +134,7 @@ impl Whitenoise {
                 let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
                 mdk.merge_pending_commit(group_id)?;
+                Self::background_refresh_account_group_subscriptions(account);
 
                 self.relay_control
                     .publish_event_to(
@@ -159,8 +160,6 @@ impl Whitenoise {
                     "Published auto-committed proposal evolution event for group {}",
                     hex::encode(group_id.as_slice())
                 );
-
-                Self::background_refresh_account_group_subscriptions(account);
 
                 self.emit_chat_list_update(
                     account,
