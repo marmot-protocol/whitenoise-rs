@@ -134,7 +134,7 @@ impl Whitenoise {
                 let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
                 mdk.merge_pending_commit(group_id)?;
-                Self::background_refresh_account_group_subscriptions(account);
+                self.background_refresh_account_group_subscriptions(account);
 
                 self.relay_control
                     .publish_event_to(
@@ -208,7 +208,7 @@ impl Whitenoise {
                     "Processed commit for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
-                Self::background_refresh_account_group_subscriptions(account);
+                self.background_refresh_account_group_subscriptions(account);
                 Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
             }
 

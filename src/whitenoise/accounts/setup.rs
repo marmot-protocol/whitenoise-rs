@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
+use mdk_core::prelude::group_types::GroupState;
 use nostr_sdk::prelude::*;
+use tokio::sync::watch;
 
 use crate::RelayType;
 use crate::relay_control::groups::GroupSubscriptionSpec;
@@ -633,6 +635,9 @@ impl Whitenoise {
         let mut group_specs = Vec::with_capacity(groups.len());
 
         for group in &groups {
+            if group.state != GroupState::Active {
+                continue;
+            }
             let relays = mdk.get_relays(&group.mls_group_id)?;
             group_specs.push(GroupSubscriptionSpec {
                 group_id: hex::encode(group.nostr_group_id),
@@ -643,14 +648,33 @@ impl Whitenoise {
         Ok(group_specs)
     }
 
-    pub(crate) async fn refresh_account_group_subscriptions(
+    async fn refresh_account_group_subscriptions_with_cancel(
         &self,
         account: &Account,
+        cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> Result<()> {
+        if Self::is_background_task_cancelled(cancel_rx) {
+            tracing::debug!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                account_pubkey = %account.pubkey,
+                "Skipping group subscription refresh because the account was cancelled",
+            );
+            return Ok(());
+        }
+
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
         for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
             Relay::find_or_create_by_url(relay_url, &self.database).await?;
+        }
+
+        if Self::is_background_task_cancelled(cancel_rx) {
+            tracing::debug!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                account_pubkey = %account.pubkey,
+                "Skipping group subscription sync because the account was cancelled",
+            );
+            return Ok(());
         }
 
         self.relay_control
@@ -663,9 +687,25 @@ impl Whitenoise {
             .map_err(WhitenoiseError::from)
     }
 
-    pub(crate) fn background_refresh_account_group_subscriptions(account: &Account) {
+    fn is_background_task_cancelled(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
+        cancel_rx.map(|rx| *rx.borrow()).unwrap_or(true)
+    }
+
+    pub(crate) fn background_refresh_account_group_subscriptions(&self, account: &Account) {
         let account_clone = account.clone();
         let account_pubkey = account.pubkey;
+        let cancel_rx = self
+            .background_task_cancellation
+            .get(&account.pubkey)
+            .map(|entry| entry.value().subscribe());
+        if cancel_rx.is_none() {
+            tracing::debug!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                account_pubkey = %account.pubkey,
+                "Skipping background group subscription refresh because the account has no cancellation channel",
+            );
+            return;
+        }
         let refresh_task = tokio::spawn(async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(wn) => wn,
@@ -680,7 +720,7 @@ impl Whitenoise {
             };
 
             if let Err(error) = whitenoise
-                .refresh_account_group_subscriptions(&account_clone)
+                .refresh_account_group_subscriptions_with_cancel(&account_clone, cancel_rx.as_ref())
                 .await
             {
                 tracing::warn!(
@@ -895,6 +935,14 @@ mod tests {
     async fn test_sync_account_relays_replaces_stale_relays() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let user = account.user(&whitenoise.database).await.unwrap();
+
+        let stale_relay = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://stale-relay.example.com").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let replacement_a = Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://replacement-a.example.com").unwrap(),
@@ -908,6 +956,26 @@ mod tests {
         )
         .await
         .unwrap();
+
+        user.add_relays(
+            std::slice::from_ref(&stale_relay),
+            RelayType::Nip65,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let initial_urls = account
+            .nip65_relays(&whitenoise)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|relay| relay.url)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            initial_urls.contains(&stale_relay.url),
+            "Test setup should create an initial stale relay entry"
+        );
 
         whitenoise
             .sync_account_relays(
@@ -931,6 +999,10 @@ mod tests {
             [replacement_a.url, replacement_b.url]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(
+            !stored_urls.contains(&stale_relay.url),
+            "Stale relay should be removed during sync"
         );
     }
 

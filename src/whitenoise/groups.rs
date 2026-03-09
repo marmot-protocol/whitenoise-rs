@@ -642,7 +642,7 @@ impl Whitenoise {
 
         self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
             .await?;
-        Self::background_refresh_account_group_subscriptions(account);
+        self.background_refresh_account_group_subscriptions(account);
         Ok(())
     }
 
