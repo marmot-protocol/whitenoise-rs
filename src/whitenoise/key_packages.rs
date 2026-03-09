@@ -1027,8 +1027,9 @@ mod tests {
             .store_private_key(&keys)
             .expect("Should store keys");
         let user = account.user(&whitenoise.database).await.unwrap();
+        // Use a loopback IP so connection refusal is instant (no DNS lookup).
         let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
-            &RelayUrl::parse("wss://unreachable.test.relay").unwrap(),
+            &RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
             &whitenoise.database,
         )
         .await
@@ -1642,8 +1643,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = create_account_with_relay(&whitenoise).await;
 
-        // With no real relay connected, publish will fail after all retry attempts
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise.publish_key_package_for_account(&account).await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
@@ -1653,9 +1656,12 @@ mod tests {
         let account = create_account_with_relay(&whitenoise).await;
 
         let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise
             .create_and_publish_key_package(&account, &relays)
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
@@ -1664,9 +1670,12 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = create_account_with_relay(&whitenoise).await;
 
+        // Pause time so exponential backoff sleeps complete instantly.
+        tokio::time::pause();
         let result = whitenoise
             .publish_key_package_for_account_with_signer(&account, Keys::generate())
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 

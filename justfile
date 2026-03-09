@@ -145,13 +145,15 @@ benchmark-save scenario="":
     echo "Results saved to ./benchmark_results/${FILENAME}"
 
 # Run all tests (unit tests, integration tests, and doc tests)
+# CLI e2e binaries are excluded here — run them explicitly with `just e2e-test`.
 # Uses nextest for faster parallel execution if available, falls back to cargo test
 test:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v cargo-nextest &> /dev/null; then
         echo "Running tests with nextest (parallel)..."
-        cargo nextest run --all-features --all-targets
+        cargo nextest run --all-features --all-targets \
+            --filter-expr 'not binary(cli_e2e) and not binary(cli_relay_control_e2e)'
         cargo test --all-features --doc
     else
         echo "Running tests with cargo test..."

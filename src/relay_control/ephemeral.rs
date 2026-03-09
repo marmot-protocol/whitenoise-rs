@@ -655,6 +655,9 @@ mod tests {
         );
     }
 
+    // Use a loopback URL so there is no DNS lookup and connection refusal is instant.
+    // Time is paused only around the publish call so that retry backoff sleeps
+    // complete without burning real seconds, but DB setup runs with real time.
     #[tokio::test]
     async fn test_publish_does_not_mutate_other_session_state() {
         let database = Arc::new(setup_test_db().await);
@@ -663,7 +666,7 @@ mod tests {
         let (event_sender, _) = mpsc::channel(8);
         let long_lived_session =
             RelaySession::new(RelaySessionConfig::new(RelayPlane::Discovery), event_sender);
-        let long_lived_relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let long_lived_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
         long_lived_session
             .client()
             .add_relay(long_lived_relay.clone())
@@ -685,6 +688,7 @@ mod tests {
         );
         let target_relays = [RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
 
+        tokio::time::pause();
         let _ = plane
             .publish_gift_wrap_to(
                 &receiver_keys.public_key(),
@@ -695,6 +699,7 @@ mod tests {
                 Arc::new(sender_keys),
             )
             .await;
+        tokio::time::resume();
 
         let after = long_lived_session
             .snapshot(std::slice::from_ref(&long_lived_relay))
@@ -720,6 +725,10 @@ mod tests {
         long_lived_session.shutdown().await;
     }
 
+    // Time is paused only around the publish call so that retry backoff sleeps
+    // complete without burning real seconds, but DB setup runs with real time.
+    // After the publish we resume real time and wait briefly for the background
+    // telemetry-persistor task to flush its records to the database.
     #[tokio::test]
     async fn test_publish_attempts_are_bounded_and_persisted() {
         let database = Arc::new(setup_test_db().await);
@@ -745,6 +754,7 @@ mod tests {
             "retry test".to_string(),
         );
 
+        tokio::time::pause();
         let _ = plane
             .publish_gift_wrap_to(
                 &receiver_keys.public_key(),
@@ -755,7 +765,10 @@ mod tests {
                 Arc::new(sender_keys),
             )
             .await;
+        tokio::time::resume();
 
+        // Wait briefly for the background telemetry-persistor task to flush
+        // its records to the database before we query it.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let events = RelayEventRecord::list_recent_for_scope(

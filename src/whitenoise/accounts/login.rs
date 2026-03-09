@@ -2980,9 +2980,9 @@ mod tests {
 
         // Add relays to each type.
         let user = account.user(&whitenoise.database).await.unwrap();
-        let url1 = RelayUrl::parse("wss://nip65.example.com").unwrap();
-        let url2 = RelayUrl::parse("wss://inbox.example.com").unwrap();
-        let url3 = RelayUrl::parse("wss://kp.example.com").unwrap();
+        let url1 = RelayUrl::parse("ws://127.0.0.1:19010").unwrap();
+        let url2 = RelayUrl::parse("ws://127.0.0.1:19011").unwrap();
+        let url3 = RelayUrl::parse("ws://127.0.0.1:19012").unwrap();
         let relay1 = whitenoise.find_or_create_relay_by_url(&url1).await.unwrap();
         let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
         let relay3 = whitenoise.find_or_create_relay_by_url(&url3).await.unwrap();
@@ -3918,9 +3918,9 @@ mod tests {
     #[test]
     fn test_relays_or_works_for_all_relay_types() {
         // Verify the correct field is selected for each RelayType variant.
-        let nip65_relay = dummy_relay("wss://nip65.example.com");
-        let inbox_relay = dummy_relay("wss://inbox.example.com");
-        let kp_relay = dummy_relay("wss://kp.example.com");
+        let nip65_relay = dummy_relay("ws://127.0.0.1:19010");
+        let inbox_relay = dummy_relay("ws://127.0.0.1:19011");
+        let kp_relay = dummy_relay("ws://127.0.0.1:19012");
         let fallback = dummy_relay("wss://fallback.example.com");
         let fallback_slice = [fallback.clone()];
 
@@ -4006,8 +4006,8 @@ mod tests {
         };
         let incoming = DiscoveredRelayLists {
             nip65: Some(vec![dummy_relay("wss://new.example.com")]), // must NOT overwrite
-            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
-            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
+            inbox: Some(vec![dummy_relay("ws://127.0.0.1:19011")]),
+            key_package: Some(vec![dummy_relay("ws://127.0.0.1:19012")]),
         };
         stash.merge(incoming);
         // nip65 should still be the original relay, not the incoming one.
@@ -4057,7 +4057,7 @@ mod tests {
 
         // First retry finds nip65.
         stash.merge(DiscoveredRelayLists {
-            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            nip65: Some(vec![dummy_relay("ws://127.0.0.1:19010")]),
             inbox: None,
             key_package: None,
         });
@@ -4066,13 +4066,13 @@ mod tests {
         // Second retry finds inbox and key_package.
         stash.merge(DiscoveredRelayLists {
             nip65: Some(vec![dummy_relay("wss://other.example.com")]), // ignored — nip65 already set
-            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
-            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
+            inbox: Some(vec![dummy_relay("ws://127.0.0.1:19011")]),
+            key_package: Some(vec![dummy_relay("ws://127.0.0.1:19012")]),
         });
         assert!(stash.is_complete(), "All three found across two retries");
         assert_eq!(
             stash.nip65.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://nip65.example.com").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:19010").unwrap(),
             "First nip65 preserved — not overwritten"
         );
     }
@@ -4120,7 +4120,7 @@ mod tests {
         //   login_start  → found nip65 only           → stash incomplete
         //   custom relay → found inbox + key_package  → stash now complete
         let mut stash = DiscoveredRelayLists {
-            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            nip65: Some(vec![dummy_relay("ws://127.0.0.1:19010")]),
             inbox: None,
             key_package: None,
         };
@@ -4132,8 +4132,8 @@ mod tests {
         // Simulate what try_discover_relay_lists returns for the custom relay.
         let custom_relay_finds = DiscoveredRelayLists {
             nip65: None, // custom relay has no 10002
-            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
-            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
+            inbox: Some(vec![dummy_relay("ws://127.0.0.1:19011")]),
+            key_package: Some(vec![dummy_relay("ws://127.0.0.1:19012")]),
         };
         stash.merge(custom_relay_finds);
 
@@ -4145,7 +4145,7 @@ mod tests {
         // The original nip65 must not have been overwritten.
         assert_eq!(
             stash.nip65.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://nip65.example.com").unwrap()
+            RelayUrl::parse("ws://127.0.0.1:19010").unwrap()
         );
     }
 
@@ -4155,7 +4155,7 @@ mod tests {
         // reaches is_complete() after the second merge — the core invariant
         // that the post-merge recheck relies on.
         let mut stash = DiscoveredRelayLists {
-            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            nip65: Some(vec![dummy_relay("ws://127.0.0.1:19010")]),
             inbox: None,
             key_package: None,
         };
@@ -4163,8 +4163,8 @@ mod tests {
 
         stash.merge(DiscoveredRelayLists {
             nip65: Some(vec![dummy_relay("wss://ignored.example.com")]), // already set, ignored
-            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
-            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
+            inbox: Some(vec![dummy_relay("ws://127.0.0.1:19011")]),
+            key_package: Some(vec![dummy_relay("ws://127.0.0.1:19012")]),
         });
 
         assert!(
@@ -4174,7 +4174,7 @@ mod tests {
         // The original nip65 relay must be preserved.
         assert_eq!(
             stash.nip65.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://nip65.example.com").unwrap()
+            RelayUrl::parse("ws://127.0.0.1:19010").unwrap()
         );
     }
 
@@ -4216,7 +4216,7 @@ mod tests {
         let pubkey = keys.public_key();
 
         let nip65_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://127.0.0.1:19010").unwrap())
             .await
             .unwrap();
         setup_partial_pending_login(
@@ -4268,16 +4268,17 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
+        // Use Docker relays so complete_login publishes successfully without retries.
         let nip65_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:8080").unwrap())
             .await
             .unwrap();
         let inbox_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://inbox.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:8080").unwrap())
             .await
             .unwrap();
         let kp_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://kp.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:7777").unwrap())
             .await
             .unwrap();
 
@@ -4330,8 +4331,9 @@ mod tests {
         let pubkey = keys.public_key();
 
         // Build the partial stash that would exist after login_start found nip65.
+        // Use Docker relays so complete_login publishes successfully without retries.
         let nip65_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:8080").unwrap())
             .await
             .unwrap();
 
@@ -4339,11 +4341,11 @@ mod tests {
         // those relays into the DB and stash (mirroring what try_discover_relay_lists
         // does inside login_with_custom_relay when it actually finds events).
         let inbox_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://inbox.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:8080").unwrap())
             .await
             .unwrap();
         let kp_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://kp.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://localhost:7777").unwrap())
             .await
             .unwrap();
 
@@ -4466,7 +4468,7 @@ mod tests {
         let pubkey = keys.public_key();
 
         let nip65_relay = whitenoise
-            .find_or_create_relay_by_url(&RelayUrl::parse("wss://nip65.example.com").unwrap())
+            .find_or_create_relay_by_url(&RelayUrl::parse("ws://127.0.0.1:19010").unwrap())
             .await
             .unwrap();
         setup_partial_pending_login_external_signer(
@@ -4708,7 +4710,7 @@ mod tests {
         // the full merged state, so login_publish_default_relays will not
         // publish defaults over relays that were already found.
         let mut stash = DiscoveredRelayLists {
-            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            nip65: Some(vec![dummy_relay("ws://127.0.0.1:19010")]),
             inbox: None,
             key_package: None,
         };
@@ -4716,8 +4718,8 @@ mod tests {
         // Simulate what try_discover_relay_lists returns on the custom relay.
         let discovered = DiscoveredRelayLists {
             nip65: None,
-            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
-            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
+            inbox: Some(vec![dummy_relay("ws://127.0.0.1:19011")]),
+            key_package: Some(vec![dummy_relay("ws://127.0.0.1:19012")]),
         };
 
         // This is the upfront merge that now happens before complete_login.
@@ -4732,16 +4734,16 @@ mod tests {
         );
         assert_eq!(
             stash.nip65.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://nip65.example.com").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:19010").unwrap(),
             "Original nip65 relay must be preserved"
         );
         assert_eq!(
             stash.inbox.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://inbox.example.com").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:19011").unwrap(),
         );
         assert_eq!(
             stash.key_package.as_ref().unwrap()[0].url,
-            RelayUrl::parse("wss://kp.example.com").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:19012").unwrap(),
         );
     }
 
@@ -4896,7 +4898,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let nip65_relay = whitenoise
             .find_or_create_relay_by_url(&nip65_url)
             .await
@@ -4956,7 +4958,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let inbox_relay = whitenoise
             .find_or_create_relay_by_url(&inbox_url)
             .await
@@ -5006,7 +5008,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let kp_url = RelayUrl::parse("ws://localhost:7777").unwrap();
         let kp_relay = whitenoise
             .find_or_create_relay_by_url(&kp_url)
             .await
@@ -5054,8 +5056,8 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
-        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let nip65_relay = whitenoise
             .find_or_create_relay_by_url(&nip65_url)
             .await
@@ -5103,8 +5105,8 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-nip65.example.com").unwrap();
-        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+        let kp_url = RelayUrl::parse("ws://localhost:7777").unwrap();
         let nip65_relay = whitenoise
             .find_or_create_relay_by_url(&nip65_url)
             .await
@@ -5152,8 +5154,8 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let inbox_url = RelayUrl::parse("wss://custom-inbox.example.com").unwrap();
-        let kp_url = RelayUrl::parse("wss://custom-kp.example.com").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+        let kp_url = RelayUrl::parse("ws://localhost:7777").unwrap();
         let inbox_relay = whitenoise
             .find_or_create_relay_by_url(&inbox_url)
             .await
@@ -5418,7 +5420,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-ext-nip65.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let nip65_relay = whitenoise
             .find_or_create_relay_by_url(&nip65_url)
             .await
@@ -5542,7 +5544,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let inbox_url = RelayUrl::parse("wss://custom-ext-inbox.example.com").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let inbox_relay = whitenoise
             .find_or_create_relay_by_url(&inbox_url)
             .await
@@ -5646,8 +5648,8 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-ext-nip65b.example.com").unwrap();
-        let inbox_url = RelayUrl::parse("wss://custom-ext-inboxb.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let nip65_relay = whitenoise
             .find_or_create_relay_by_url(&nip65_url)
             .await
@@ -5702,7 +5704,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let nip65_url = RelayUrl::parse("wss://custom-ext-nip65c.example.com").unwrap();
+        let nip65_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         // Use the local Docker relay for the key package relay so publishing succeeds.
         let kp_url = RelayUrl::parse("ws://localhost:7777").unwrap();
         let nip65_relay = whitenoise
@@ -5757,7 +5759,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
 
-        let inbox_url = RelayUrl::parse("wss://custom-ext-inboxd.example.com").unwrap();
+        let inbox_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         // Use the local Docker relay for the key package relay so publishing succeeds.
         let kp_url = RelayUrl::parse("ws://localhost:7777").unwrap();
         let inbox_relay = whitenoise

@@ -1952,15 +1952,19 @@ mod tests {
         let event = EventBuilder::text_note("retry-test-failure")
             .sign_with_keys(&keys)
             .unwrap();
-        // Use ports with nothing listening so the publish genuinely fails
+        // Use loopback IPs so connection refusal is instant (no DNS lookup).
         let unreachable = vec![
-            RelayUrl::parse("ws://localhost:1").unwrap(),
-            RelayUrl::parse("ws://localhost:2").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
+            RelayUrl::parse("ws://127.0.0.1:2").unwrap(),
         ];
 
+        // Pause time so exponential backoff sleeps complete without burning
+        // real seconds.  The whitenoise + relay setup above ran with real time.
+        tokio::time::pause();
         let result = whitenoise
             .publish_event_with_retry(event, &keys.public_key(), &unreachable)
             .await;
+        tokio::time::resume();
         assert!(
             result.is_err(),
             "publish_event_with_retry should fail when no relay accepts the event"
@@ -2034,11 +2038,14 @@ mod tests {
         let new_members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let new_pk = new_members[0].0.pubkey;
 
+        // Pause time so backoff sleeps complete instantly; resume before DB reads.
+        tokio::time::pause();
         // Call the actual production method — it will fail at publish
         // because the group's relays are now unreachable.
         let result = whitenoise
             .add_members_to_group(&creator, group_id, vec![new_pk])
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: group membership is unchanged (merge did not happen)
@@ -2065,10 +2072,13 @@ mod tests {
         let members_before = whitenoise.group_members(&creator, group_id).await.unwrap();
         assert!(members_before.contains(&member_to_remove));
 
+        // Pause time so backoff sleeps complete instantly; resume before DB reads.
+        tokio::time::pause();
         // Call the actual production method — fails at publish
         let result = whitenoise
             .remove_members_from_group(&creator, group_id, vec![member_to_remove])
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: member is still in the group (merge did not happen)
@@ -2092,6 +2102,8 @@ mod tests {
 
         let group_before = whitenoise.group(&creator, group_id).await.unwrap();
 
+        // Pause time so backoff sleeps complete instantly; resume before DB reads.
+        tokio::time::pause();
         // Call the actual production method — fails at publish
         let new_data = NostrGroupDataUpdate {
             name: Some("Should Not Appear".to_string()),
@@ -2107,6 +2119,7 @@ mod tests {
         let result = whitenoise
             .update_group_data(&creator, group_id, new_data)
             .await;
+        tokio::time::resume();
         assert!(result.is_err(), "Should fail when relays are unreachable");
 
         // Verify: group data is unchanged (merge did not happen)

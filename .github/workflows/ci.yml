@@ -175,7 +175,13 @@ jobs:
           ./scripts/wait_for_relays.sh
 
       - name: Unit and integration tests (non-Docker)
-        run: cargo nextest run --all-features --all-targets
+        # Exclude CLI e2e test binaries: they spawn real daemon processes and
+        # require human-scale wait loops (up to 60 s per test). They are not
+        # suitable for the shared CI test runner and must be run locally with
+        # `just docker-up` beforehand.
+        run: >
+          cargo nextest run --all-features --all-targets
+          --filter-expr 'not binary(cli_e2e) and not binary(cli_relay_control_e2e)'
 
       - name: Doc tests
         run: cargo test --workspace --doc
@@ -238,10 +244,12 @@ jobs:
           # These inflate the line count without measuring library code quality.
           IGNORE_REGEX='(integration_tests/|bin/integration_test\.rs|bin/benchmark_test\.rs)'
 
-          # Clean and run tests with coverage (library only, no integration-tests feature)
+          # Clean and run tests with coverage (library only, no integration-tests feature).
+          # Exclude CLI e2e test binaries for the same reason as the test-linux job.
           cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --all-targets \
             --ignore-filename-regex "$IGNORE_REGEX" \
+            --filter-expr 'not binary(cli_e2e) and not binary(cli_relay_control_e2e)' \
             --lcov --output-path lcov.info
 
           # Also run doc tests (without coverage - requires nightly for coverage)

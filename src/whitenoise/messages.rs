@@ -1800,10 +1800,13 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        // Call the relay-control publish helper directly with unreachable relays
+        // Call the relay-control publish helper directly with unreachable relays.
+        // Pause time so exponential backoff sleeps complete instantly, then resume
+        // before reading from the DB.
         let unreachable_relays = vec![RelayUrl::parse("ws://127.0.0.1:1").unwrap()];
         let ephemeral = whitenoise.relay_control.ephemeral();
 
+        tokio::time::pause();
         ephemeral
             .publish_message_event(
                 event,
@@ -1815,6 +1818,7 @@ mod tests {
                 &whitenoise.message_stream_manager,
             )
             .await;
+        tokio::time::resume();
 
         // Verify status transitioned to Failed
         let msg =
