@@ -2718,6 +2718,9 @@ mod tests {
     }
 
     mod subscription_tests {
+        use chrono::{TimeDelta, Utc};
+        use nostr_sdk::Keys;
+
         use super::*;
 
         #[tokio::test]
@@ -2730,6 +2733,85 @@ mod tests {
                 result.is_ok(),
                 "refresh_all_global_subscriptions should succeed with no accounts"
             );
+        }
+
+        #[test]
+        fn test_compute_global_since_empty_accounts_returns_none() {
+            assert!(Whitenoise::compute_global_since_timestamp(&[]).is_none());
+        }
+
+        #[test]
+        fn test_compute_global_since_unsynced_account_returns_none() {
+            let accounts = vec![Account {
+                id: None,
+                pubkey: Keys::generate().public_key(),
+                user_id: 1,
+                account_type: AccountType::Local,
+                last_synced_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }];
+            assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
+        }
+
+        #[test]
+        fn test_compute_global_since_all_synced_returns_min_with_buffer() {
+            let now = Utc::now();
+            let older = now - TimeDelta::seconds(200);
+            let newer = now - TimeDelta::seconds(100);
+
+            let accounts = vec![
+                Account {
+                    id: None,
+                    pubkey: Keys::generate().public_key(),
+                    user_id: 1,
+                    account_type: AccountType::Local,
+                    last_synced_at: Some(older),
+                    created_at: now,
+                    updated_at: now,
+                },
+                Account {
+                    id: None,
+                    pubkey: Keys::generate().public_key(),
+                    user_id: 2,
+                    account_type: AccountType::Local,
+                    last_synced_at: Some(newer),
+                    created_at: now,
+                    updated_at: now,
+                },
+            ];
+
+            let ts = Whitenoise::compute_global_since_timestamp(&accounts).unwrap();
+            // Should use the older timestamp minus the 10s buffer
+            let expected = (older.timestamp().max(0) as u64).saturating_sub(10);
+            assert_eq!(ts.as_secs(), expected);
+        }
+
+        #[test]
+        fn test_compute_global_since_mixed_synced_unsynced_returns_none() {
+            let now = Utc::now();
+            let accounts = vec![
+                Account {
+                    id: None,
+                    pubkey: Keys::generate().public_key(),
+                    user_id: 1,
+                    account_type: AccountType::Local,
+                    last_synced_at: Some(now - TimeDelta::seconds(100)),
+                    created_at: now,
+                    updated_at: now,
+                },
+                Account {
+                    id: None,
+                    pubkey: Keys::generate().public_key(),
+                    user_id: 2,
+                    account_type: AccountType::Local,
+                    last_synced_at: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ];
+            // One unsynced account forces since=None
+            assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
         }
     }
 
