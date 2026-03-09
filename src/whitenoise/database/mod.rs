@@ -256,32 +256,23 @@ where
     Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
 {
     const MAX_RETRIES: u32 = 3;
-    let mut last_error = None;
+    let mut attempt: u32 = 0;
 
-    for attempt in 1..=MAX_RETRIES {
+    loop {
+        attempt += 1;
         match op().await {
             Ok(val) => return Ok(val),
-            Err(e) => {
-                if e.is_sqlite_lock_error() && attempt < MAX_RETRIES {
-                    tracing::warn!(
-                        target: "whitenoise::database",
-                        "SQLite lock on attempt {attempt}/{MAX_RETRIES}, \
-                         retrying...",
-                    );
-                    tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
-                    last_error = Some(e);
-                    continue;
-                }
-                return Err(e);
+            Err(e) if e.is_sqlite_lock_error() && attempt < MAX_RETRIES => {
+                tracing::warn!(
+                    target: "whitenoise::database",
+                    "SQLite lock on attempt {attempt}/{MAX_RETRIES}, \
+                     retrying...",
+                );
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
             }
+            Err(e) => return Err(e),
         }
     }
-
-    Err(last_error.unwrap_or_else(|| {
-        DatabaseError::Sqlx(sqlx::Error::Protocol(
-            "Unexpected retry failure".to_string(),
-        ))
-    }))
 }
 
 #[cfg(test)]
