@@ -271,7 +271,7 @@ impl AggregatedMessage {
         // so we multiply by 1000.  When the cursor is absent we use i64::MAX as a sentinel
         // so that `created_at < MAX` is unconditionally true and the single query branch
         // still uses the covering index.
-        let (before_ms, before_id_str): (i64, &str) = match (before, before_message_id) {
+        let (before_ms, before_id_str): (i64, String) = match (before, before_message_id) {
             // No cursor: use i64::MAX so `created_at < MAX` is unconditionally true for every
             // real timestamp, returning the newest page without a cursor filter.
             //
@@ -285,8 +285,19 @@ impl AggregatedMessage {
             // timestamp is a realistic value, so the second conjunct is unreachable and its
             // falseness is harmless.  Both bind slots must still be filled to satisfy sqlx's
             // parameter count, hence the empty string placeholder.
-            (None, None) => (i64::MAX, ""),
-            (Some(ts), Some(id)) => ((ts.as_secs() as i64).saturating_mul(1_000), id),
+            (None, None) => (i64::MAX, String::new()),
+            (Some(ts), Some(id)) => {
+                // Canonicalize to lowercase hex so the lexicographic tie-break comparison
+                // against stored message_ids (always lowercase) is stable regardless of the
+                // case the caller used.  An invalid or wrong-length ID is rejected here
+                // rather than silently producing an incorrect page boundary.
+                let canonical = EventId::from_hex(id).map(|eid| eid.to_hex()).map_err(|_| {
+                    DatabaseError::InvalidCursor {
+                        reason: "before_message_id is not a valid 64-character hex event ID",
+                    }
+                })?;
+                ((ts.as_secs() as i64).saturating_mul(1_000), canonical)
+            }
             (Some(_), None) => {
                 return Err(DatabaseError::InvalidCursor {
                     reason: "before_message_id is required when before is provided",
@@ -2795,6 +2806,43 @@ mod tests {
         assert!(
             matches!(err, DatabaseError::InvalidCursor { .. }),
             "expected InvalidCursor, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginated_invalid_before_message_id_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[208; 32]);
+        let ts = Timestamp::from(1_700_000_000u64);
+
+        // Non-hex string → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(ts),
+            Some("not-valid-hex-at-all"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor for non-hex id, got: {err}"
+        );
+
+        // Valid hex but wrong length (32 chars instead of 64) → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(ts),
+            Some("00000000000000000000000000000001"),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor for short hex id, got: {err}"
         );
     }
 }
