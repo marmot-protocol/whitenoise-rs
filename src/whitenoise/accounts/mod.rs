@@ -78,54 +78,69 @@ pub struct LoginResult {
 /// The three relay lists discovered during login.
 ///
 /// Each field holds the relays found on the network for that list type.
-/// An empty `Vec` means that list was **not found** and must be published
-/// (either from defaults or from a user-provided relay) before login can
-/// complete.  Use [`DiscoveredRelayLists::is_complete`] to check whether all
-/// three are present.
+/// `None` means that list was **not found** on the network and must be
+/// published (either from defaults or from a user-provided relay) before
+/// login can complete.  `Some(vec![])` means the author intentionally
+/// published an empty relay list.  Use [`DiscoveredRelayLists::is_complete`]
+/// to check whether all three are present.
 #[derive(Debug, Clone)]
 pub struct DiscoveredRelayLists {
-    /// NIP-65 relay list (kind 10002).  Empty if not found on the network.
-    pub nip65: Vec<Relay>,
-    /// Inbox relays (kind 10050).  Empty if not found on the network.
-    pub inbox: Vec<Relay>,
-    /// Key-package relays (kind 10051).  Empty if not found on the network.
-    pub key_package: Vec<Relay>,
+    /// NIP-65 relay list (kind 10002).  `None` if not found on the network.
+    pub nip65: Option<Vec<Relay>>,
+    /// Inbox relays (kind 10050).  `None` if not found on the network.
+    pub inbox: Option<Vec<Relay>>,
+    /// Key-package relays (kind 10051).  `None` if not found on the network.
+    pub key_package: Option<Vec<Relay>>,
 }
 
 impl DiscoveredRelayLists {
     /// Returns `true` when all three relay lists were found on the network.
     pub fn is_complete(&self) -> bool {
-        !self.nip65.is_empty() && !self.inbox.is_empty() && !self.key_package.is_empty()
+        self.nip65.is_some() && self.inbox.is_some() && self.key_package.is_some()
     }
 
-    /// Returns the relay slice for the given `relay_type`.
+    /// Returns `true` when the relay list for `relay_type` was found on the
+    /// network (even if it was intentionally empty).
+    pub fn found(&self, relay_type: RelayType) -> bool {
+        match relay_type {
+            RelayType::Nip65 => self.nip65.is_some(),
+            RelayType::Inbox => self.inbox.is_some(),
+            RelayType::KeyPackage => self.key_package.is_some(),
+        }
+    }
+
+    /// Returns the relay slice for the given `relay_type`, or an empty slice
+    /// when the list was not found.
     pub fn relays(&self, relay_type: RelayType) -> &[Relay] {
         match relay_type {
-            RelayType::Nip65 => &self.nip65,
-            RelayType::Inbox => &self.inbox,
-            RelayType::KeyPackage => &self.key_package,
+            RelayType::Nip65 => self.nip65.as_deref().unwrap_or(&[]),
+            RelayType::Inbox => self.inbox.as_deref().unwrap_or(&[]),
+            RelayType::KeyPackage => self.key_package.as_deref().unwrap_or(&[]),
         }
     }
 
-    /// Returns the relays for `relay_type` when non-empty, otherwise `fallback`.
+    /// Returns the relays for `relay_type` when the list was found, otherwise `fallback`.
     pub fn relays_or<'a>(&'a self, relay_type: RelayType, fallback: &'a [Relay]) -> &'a [Relay] {
-        let found = self.relays(relay_type);
-        if found.is_empty() { fallback } else { found }
+        if self.found(relay_type) {
+            self.relays(relay_type)
+        } else {
+            fallback
+        }
     }
 
-    /// Merge `other` into `self`, keeping any non-empty field from either side.
+    /// Merge `other` into `self`, keeping any `Some` field from either side.
     ///
-    /// Each field is updated only when the current value is empty and the
-    /// incoming value is non-empty, so previously discovered relays are never
-    /// discarded.
+    /// Each field is updated only when the current value is `None` and the
+    /// incoming value is `Some`, so previously discovered relay lists are
+    /// never discarded.
     pub fn merge(&mut self, other: Self) {
-        if self.nip65.is_empty() && !other.nip65.is_empty() {
+        if self.nip65.is_none() && other.nip65.is_some() {
             self.nip65 = other.nip65;
         }
-        if self.inbox.is_empty() && !other.inbox.is_empty() {
+        if self.inbox.is_none() && other.inbox.is_some() {
             self.inbox = other.inbox;
         }
-        if self.key_package.is_empty() && !other.key_package.is_empty() {
+        if self.key_package.is_none() && other.key_package.is_some() {
             self.key_package = other.key_package;
         }
     }

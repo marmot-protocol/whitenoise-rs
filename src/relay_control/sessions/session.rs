@@ -171,7 +171,20 @@ impl RelaySession {
             ));
         }
 
-        self.ensure_relays_connected(relay_urls).await?;
+        if let Err(error) = self.ensure_relays_connected(relay_urls).await {
+            for relay_url in relay_urls {
+                self.emit_telemetry(Self::apply_telemetry_scope(
+                    self.config.telemetry_account_pubkey,
+                    RelayTelemetry::new(
+                        RelayTelemetryKind::QueryFailure,
+                        self.config.plane,
+                        relay_url.clone(),
+                    )
+                    .with_message(error.to_string()),
+                ));
+            }
+            return Err(error);
+        }
 
         let result = self
             .client
@@ -224,7 +237,20 @@ impl RelaySession {
             ));
         }
 
-        self.ensure_relays_connected(relay_urls).await?;
+        if let Err(error) = self.ensure_relays_connected(relay_urls).await {
+            for relay_url in relay_urls {
+                self.emit_telemetry(Self::apply_telemetry_scope(
+                    self.config.telemetry_account_pubkey,
+                    RelayTelemetry::new(
+                        RelayTelemetryKind::PublishFailure,
+                        self.config.plane,
+                        relay_url.clone(),
+                    )
+                    .with_message(error.to_string()),
+                ));
+            }
+            return Err(error);
+        }
 
         let result = self.client.send_event_to(relay_urls, event).await;
         match result {
@@ -937,10 +963,18 @@ mod tests {
 
         let _ = session.publish_event_to(&[relay_url], &event).await;
 
-        let first = telemetry.recv().await.unwrap();
-        let second = telemetry.recv().await.unwrap();
-
-        assert_eq!(first.kind, RelayTelemetryKind::PublishAttempt);
-        assert_eq!(second.kind, RelayTelemetryKind::PublishFailure);
+        let mut saw_attempt = false;
+        let mut saw_failure = false;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !(saw_attempt && saw_failure) {
+                match telemetry.recv().await.unwrap().kind {
+                    RelayTelemetryKind::PublishAttempt => saw_attempt = true,
+                    RelayTelemetryKind::PublishFailure => saw_failure = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -340,36 +340,59 @@ control plane, not inside a universal client object.
 
 ## Implementation Snapshot
 
-Status as of March 8, 2026:
+Status as of March 9, 2026:
 
 - completed:
   - `RelayControlPlane`, `RelayPlane`, `SubscriptionContext`, and
     `SubscriptionStream` are in place
   - `relay_status` and `relay_events` schema plus DB access helpers are in
     place
-  - migrated discovery, group, and account inbox sessions now persist
-    telemetry into `relay_status` and `relay_events`
-  - `RelaySession` exists and is used by the dedicated discovery, group, and
-    account inbox planes
-  - long-lived discovery subscriptions run on the discovery plane
-  - long-lived MLS group subscriptions run on the group plane
-  - long-lived giftwrap subscriptions run on per-account inbox planes
-  - relay-plane events already enter the event processor with typed source
-    context instead of legacy subscription-ID parsing
-- in progress:
-  - `NostrManager` still exists as a compatibility path for legacy fetch and
-    publish work
+  - `RelaySession` exists with one client per session, one notification
+    handler, pre-registered routing context before REQ is sent, routing
+    rollback on subscribe failure, and telemetry emission for all operations
+  - discovery, group, and account inbox sessions all use `RelaySession` and
+    persist telemetry into `relay_status` and `relay_events`
+  - long-lived discovery subscriptions run on the discovery plane with the
+    curated six-relay seed set; subscription IDs are stable and positional so
+    re-sync replaces filters in-place without creating duplicate streams
+  - long-lived MLS group subscriptions run on the group plane; auth is
+    explicitly disabled; per-account subscriptions use salted opaque IDs; group
+    fanout routes by `#h` tag via `RelayRouter::matching_group_contexts`
+  - long-lived giftwrap subscriptions run on per-account inbox planes; auth is
+    allowed only on this plane; signer is attached for the full session
+    lifetime
+  - the ephemeral plane is fully implemented: short-lived per-operation
+    `RelaySession` instances with bounded retry, telemetry persistors, and
+    welcome publishing already routing here
+  - relay-plane events enter the event processor with typed `EventSource`
+    carrying a `SubscriptionContext` rather than a raw subscription ID string;
+    the event processor dispatches by `context.stream`
+- in progress / partial:
+  - `NostrManager` still exists and its shared `Client` is still live
+    alongside the new planes
+  - `Whitenoise` initialization still adds default relays to
+    `self.nostr.client` and calls `client.connect()` in parallel with
+    `relay_control.start_discovery_plane()`
+  - `activate_account` and `activate_account_without_publishing` in
+    `accounts/setup.rs` still call `self.nostr.ensure_relays_connected` with
+    the merged NIP-65 + inbox + key-package relay set on the legacy client
+  - `is_event_global()` in the event processor still uses string-prefix parsing
+    (`"global_users_"`) for the legacy subscription-ID path; this survives
+    alongside the new typed path
+  - `AccountInboxPlane::deactivate()` unsubscribes and unsets the signer but
+    does not call `session.shutdown()`, leaving relay connections open after
+    logout
 - still legacy / not started:
-  - one-off discovery fetches still use the shared client
-  - welcome publishing and other targeted publish/query work still use the
-    shared client
-  - the ephemeral plane is still a placeholder
-  - the shared `nostr-sdk::Client` inside `NostrManager` is still the
-    production path for remaining publish/query call sites
+  - the legacy shared `Client` inside `NostrManager` is still the production
+    path for relay-status queries (`get_relay_status`) and for the relay-pool
+    accumulation triggered by account activation
+  - Phase 8 (gossip evaluation) not started
 
-This means the migration is no longer a strict phase-by-phase sequence. Some
-later subscription phases landed before the observability runtime wiring and
-before the final removal of shared-client compatibility code. The rest of this
+This means the migration is no longer a strict phase-by-phase sequence. The
+long-lived subscription planes, ephemeral plane, observability layer, and typed
+event routing all landed. The remaining work is concentrated in Phase 7:
+retiring the legacy shared `NostrManager` client from the two production
+activation paths and cleaning up the dual-client startup. The rest of this
 document keeps the original phase structure, but each phase below now includes
 an explicit implementation status.
 
@@ -1004,3 +1027,228 @@ shape or move to a more privacy-preserving strategy, for example:
 - rotating or partitioned group filters
 - another approach that reduces group-set disclosure without making relay load
   or recovery behavior unacceptable
+
+## What Is Still Left to Do
+
+### Mandatory before the migration is complete
+
+**1. Remove dual-client startup (`Whitenoise::initialize_whitenoise`)**
+
+`src/whitenoise/mod.rs` lines 440–453 still add default relays to
+`self.nostr.client` and call `client.connect()` alongside
+`relay_control.start_discovery_plane()`. After this call both a legacy
+`NostrManager` client and the discovery-plane `RelaySession` are connected to
+overlapping relay sets simultaneously. This should be removed once the
+discovery plane owns startup. The legacy default-relay seeding can be dropped
+entirely; the discovery plane has its own curated seed set.
+
+**2. Migrate account activation off `ensure_relays_connected` on the legacy client**
+
+`src/whitenoise/accounts/setup.rs` lines 54 and 93 call
+`self.nostr.ensure_relays_connected(&relay_urls)` with the merged
+NIP-65 + inbox + key-package relay set. This is the primary remaining source
+of uncontrolled relay-pool growth on the legacy shared client. The fix is to
+route this relay setup through the control plane instead:
+
+- inbox relays → already handled by `activate_account_subscriptions` (inbox
+  plane)
+- group relays → already handled by `activate_account_subscriptions` (group
+  plane)
+- NIP-65 and key-package relays → should be handled by the ephemeral plane
+  for key-package fetching, or simply removed since the discovery plane covers
+  those relays for public discovery work
+
+**3. Fix `AccountInboxPlane::deactivate` to call `session.shutdown()`**
+
+`src/relay_control/account_inbox.rs` `deactivate()` unsubscribes the giftwrap
+subscription and unsets the signer but does not call `self.session.shutdown()`.
+This leaves the underlying `nostr-sdk::Client` with open relay connections
+after logout. `RelaySession::shutdown()` already exists and calls
+`client.reset()` followed by `client.shutdown()`.
+
+**4. Remove `is_event_global()` string-prefix routing once the legacy client is gone**
+
+`src/whitenoise/event_processor/mod.rs` line 151 uses
+`subscription_id.starts_with("global_users_")` to route legacy-path events.
+Once the `NostrManager` shared client is removed and all events arrive with
+typed `EventSource::RelaySubscription` context, this branch and the helper can
+be deleted.
+
+**5. Delete or reduce `NostrManager` to a parser facade**
+
+Once the two activation call sites above are migrated, the only remaining uses
+of `self.nostr` in production paths will be:
+
+- `nostr.delete_all_data()` — `client.unset_signer()` + `unsubscribe_all()`;
+  can be replaced with a shutdown hook on the relay control plane
+- `nostr.client.reset()` in the reset path — replace with
+  `relay_control.reset_for_tests()` or equivalent
+- `nostr.session_salt()` used in `account_event_processor.rs` for subscription
+  ID hashing — the salt is already on `RelayControlPlane`; expose it from
+  there
+- `nostr.parse(...)` calls in `messages.rs` — the parser lives in
+  `nostr_manager/parser.rs` and is independent of the client; keep the module
+  but remove the `Client` field
+
+### Nice-to-have before tagging this complete
+
+**6. Telemetry write volume and DB contention**
+
+See the separate analysis section below. The short version: the current design
+writes to both `relay_events` (append) and `relay_status` (read-modify-write)
+for every telemetry sample including `attempt` kinds that carry no actionable
+information. With the discovery plane alone subscribing across six relays and
+emitting `SubscriptionAttempt` + `SubscriptionSuccess` per relay per sync, and
+the ephemeral plane spawning a new session with its own telemetry persistor for
+every operation, the write rate can be significant. The
+`upsert_from_telemetry` path does a SELECT then INSERT-or-UPDATE inside a
+shared SQLite WAL pool, which serializes on write transactions and can compete
+with application writes.
+
+The recommended fix is described in the telemetry section below.
+
+**7. Telemetry retention / eviction**
+
+`relay_events` is an unbounded append-only table. There is no eviction or
+pruning logic yet. For a mobile app this will grow without bound. Add a
+migration or a scheduled task that deletes rows older than a configurable
+window (e.g. 7 days) and caps the total row count per scope.
+
+---
+
+## Telemetry Write Volume: Analysis and Recommendation
+
+### What is written today
+
+Every call to `RelayObservability::record` writes two rows in sequence:
+
+1. `RelayEventRecord::create` — unconditional `INSERT` into `relay_events`
+2. `RelayStatusRecord::upsert_from_telemetry` — SELECT, then INSERT or UPDATE
+   into `relay_status`
+
+The `upsert_from_telemetry` path does a separate SELECT before every write
+because `RelayStatusRecord` holds the full in-memory state that must be read,
+mutated, and written back. This is a read-modify-write cycle per telemetry
+sample under a shared WAL connection pool.
+
+The kinds currently emitted per relay per operation are:
+
+- subscribe: `SubscriptionAttempt` + (`SubscriptionSuccess` or
+  `SubscriptionFailure`) — 2 writes per relay
+- publish: `PublishAttempt` + (`PublishSuccess` or `PublishFailure`) — 2
+  writes per relay
+- query: `QueryAttempt` + (`QuerySuccess` or `QueryFailure`) — 2 writes per
+  relay
+- connection lifecycle: `Connected`, `Disconnected` — 1 write each
+- relay messages: `Notice`, `Closed`, `AuthChallenge` — 1 write each
+
+For a typical session with six discovery relays and several group and inbox
+relays, a single account activation emits roughly 30–50 telemetry samples
+before reaching steady state. Every ephemeral operation (key-package fetch,
+welcome publish, metadata fetch) spawns a fresh session and emits at least 2
+samples per relay targeted. These all funnel through independent
+`spawn_telemetry_persistor` tasks that compete for write transactions on the
+same WAL file.
+
+### Why WAL helps but does not eliminate the problem
+
+SQLite WAL mode allows one writer and multiple concurrent readers. It does not
+allow multiple concurrent writers. All telemetry persistor tasks are writers.
+When several persistors fire simultaneously (e.g. discovery plane sync across
+six relays) they queue behind the WAL writer lock. With `busy_timeout=5000ms`
+the worst case is a 5-second stall. For `attempt`-kind events that carry no
+information useful for retry or health decisions, this is wasted write pressure.
+
+### Recommendation: filter `attempt` events out of persistence
+
+The cleanest fix with the smallest diff is to stop persisting the three
+`*Attempt` telemetry kinds to both tables. They exist as in-flight markers and
+are only useful if paired with the matching success or failure that always
+follows in the same operation. Storing the attempt separately adds no
+information to `relay_status` (the `apply_telemetry` branch for attempt kinds
+already does nothing) and adds noise to `relay_events`.
+
+Change `RelayObservability::record` to skip persistence for:
+
+- `RelayTelemetryKind::PublishAttempt`
+- `RelayTelemetryKind::QueryAttempt`
+- `RelayTelemetryKind::SubscriptionAttempt`
+
+This halves the write volume for the common success path immediately.
+
+### Secondary recommendation: filter `relay_events` to failure and state-change kinds only
+
+For the history table (`relay_events`), the value of knowing that a
+subscription succeeded is low once the `relay_status` row reflects it. The
+value of knowing it failed, or that a `NOTICE`/`CLOSED`/`AUTH` was received,
+is high. Consider writing to `relay_events` only for:
+
+- `Disconnected`
+- `Notice`
+- `Closed`
+- `AuthChallenge`
+- `*Failure` kinds
+
+And writing `Connected` and `*Success` kinds only to `relay_status` (the
+counter update) without appending to `relay_events`. This makes the history
+table a failure and anomaly log rather than a full audit trail, which is more
+useful and much smaller.
+
+### Why not a queue/channel sink?
+
+A dedicated write-serialization channel (option 1 from the original question)
+would eliminate concurrent writer contention entirely by funneling all writes
+through one task. This is a valid architecture but it adds complexity: the
+channel needs a bounded buffer, a drain-on-shutdown path, and the
+`spawn_telemetry_persistor` pattern already provides per-plane serialization
+within each plane. The root problem is not concurrent writers within one plane;
+it is the `attempt` events doubling the write count and the ephemeral plane
+spawning a new persistor per operation. Filtering first is the right move. If
+write pressure remains measurable after filtering, a single shared write sink
+becomes worth the complexity.
+
+### Concrete change
+
+In `src/relay_control/observability.rs`, add a filter in `record()`:
+
+```rust
+pub(crate) async fn record(
+    &self,
+    database: &Database,
+    telemetry: &RelayTelemetry,
+) -> Result<(), DatabaseError> {
+    // Attempt events carry no actionable state; skip persistence entirely.
+    if matches!(
+        telemetry.kind,
+        RelayTelemetryKind::PublishAttempt
+            | RelayTelemetryKind::QueryAttempt
+            | RelayTelemetryKind::SubscriptionAttempt
+    ) {
+        return Ok(());
+    }
+
+    // Write to relay_events only for failure and state-change kinds.
+    let should_append_event = matches!(
+        telemetry.kind,
+        RelayTelemetryKind::Disconnected
+            | RelayTelemetryKind::Notice
+            | RelayTelemetryKind::Closed
+            | RelayTelemetryKind::AuthChallenge
+            | RelayTelemetryKind::PublishFailure
+            | RelayTelemetryKind::QueryFailure
+            | RelayTelemetryKind::SubscriptionFailure
+    );
+
+    if should_append_event {
+        RelayEventRecord::create(telemetry, database).await?;
+    }
+
+    RelayStatusRecord::upsert_from_telemetry(telemetry, database).await?;
+
+    Ok(())
+}
+```
+
+This change is backward-compatible with all existing tests (adjust tests that
+assert `relay_events` contains `SubscriptionSuccess` rows to instead assert
+`relay_status` counters), and it does not change any public API.

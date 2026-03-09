@@ -166,278 +166,119 @@ impl RelayStatusRecord {
         telemetry: &RelayTelemetry,
         database: &Database,
     ) -> Result<(), DatabaseError> {
-        let mut record = match Self::find(
-            &telemetry.relay_url,
-            telemetry.plane,
-            telemetry.account_pubkey,
-            database,
-        )
-        .await?
-        {
-            Some(existing) => existing,
-            None => Self::new_scope(
-                telemetry.relay_url.clone(),
-                telemetry.plane,
-                telemetry.account_pubkey,
-                telemetry.occurred_at,
-            ),
-        };
-
-        record.apply_telemetry(telemetry);
-        record.save(database).await
-    }
-
-    fn new_scope(
-        relay_url: RelayUrl,
-        plane: RelayPlane,
-        account_pubkey: Option<PublicKey>,
-        timestamp: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            id: 0,
-            relay_url,
-            plane,
-            account_pubkey,
-            last_connect_attempt_at: None,
-            last_connect_success_at: None,
-            last_failure_at: None,
-            failure_category: None,
-            last_notice_reason: None,
-            last_closed_reason: None,
-            last_auth_reason: None,
-            auth_required: false,
-            success_count: 0,
-            failure_count: 0,
-            latency_ms: None,
-            backoff_until: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-        }
-    }
-
-    fn apply_telemetry(&mut self, telemetry: &RelayTelemetry) {
-        self.updated_at = telemetry.occurred_at;
-
-        match telemetry.kind {
-            RelayTelemetryKind::Connected => {
-                self.last_connect_attempt_at = Some(telemetry.occurred_at);
-                self.last_connect_success_at = Some(telemetry.occurred_at);
-                self.backoff_until = None;
-                self.success_count += 1;
-            }
-            RelayTelemetryKind::Disconnected => {
-                self.last_connect_attempt_at = Some(telemetry.occurred_at);
-                self.record_failure(telemetry);
-            }
-            RelayTelemetryKind::Notice => {
-                self.last_notice_reason = telemetry.message.clone();
-                self.record_failure(telemetry);
-            }
-            RelayTelemetryKind::Closed => {
-                self.last_closed_reason = telemetry.message.clone();
-                self.record_failure(telemetry);
-            }
-            RelayTelemetryKind::AuthChallenge => {
-                self.last_auth_reason = telemetry.message.clone();
-                self.auth_required = true;
-                self.record_failure(telemetry);
-            }
+        // Compute per-event deltas rather than read-modify-write, so two concurrent
+        // persistors cannot race and both write `success_count = 1` from a read of 0.
+        let (success_delta, failure_delta) = match telemetry.kind {
+            RelayTelemetryKind::Connected
+            | RelayTelemetryKind::PublishSuccess
+            | RelayTelemetryKind::QuerySuccess
+            | RelayTelemetryKind::SubscriptionSuccess => (1i64, 0i64),
+            RelayTelemetryKind::Disconnected
+            | RelayTelemetryKind::Notice
+            | RelayTelemetryKind::Closed
+            | RelayTelemetryKind::AuthChallenge
+            | RelayTelemetryKind::PublishFailure
+            | RelayTelemetryKind::QueryFailure
+            | RelayTelemetryKind::SubscriptionFailure => (0i64, 1i64),
             RelayTelemetryKind::PublishAttempt
             | RelayTelemetryKind::QueryAttempt
-            | RelayTelemetryKind::SubscriptionAttempt => {}
-            RelayTelemetryKind::PublishSuccess
-            | RelayTelemetryKind::QuerySuccess
-            | RelayTelemetryKind::SubscriptionSuccess => {
-                self.success_count += 1;
-            }
-            RelayTelemetryKind::PublishFailure
-            | RelayTelemetryKind::QueryFailure
-            | RelayTelemetryKind::SubscriptionFailure => {
-                self.record_failure(telemetry);
-            }
-        }
+            | RelayTelemetryKind::SubscriptionAttempt => (0i64, 0i64),
+        };
 
-        if matches!(
+        let connect_attempt_at = match telemetry.kind {
+            RelayTelemetryKind::Connected | RelayTelemetryKind::Disconnected => {
+                Some(telemetry.occurred_at.timestamp_millis())
+            }
+            _ => None,
+        };
+
+        let connect_success_at = if telemetry.kind == RelayTelemetryKind::Connected {
+            Some(telemetry.occurred_at.timestamp_millis())
+        } else {
+            None
+        };
+
+        let failure_at = if failure_delta > 0 {
+            Some(telemetry.occurred_at.timestamp_millis())
+        } else {
+            None
+        };
+
+        let is_auth = matches!(
             telemetry.failure_category,
             Some(RelayFailureCategory::AuthRequired | RelayFailureCategory::AuthFailed)
-        ) {
-            self.auth_required = true;
-        }
-    }
+        ) || telemetry.kind == RelayTelemetryKind::AuthChallenge;
 
-    fn record_failure(&mut self, telemetry: &RelayTelemetry) {
-        self.last_failure_at = Some(telemetry.occurred_at);
-        self.failure_count += 1;
-
-        if let Some(failure_category) = telemetry.failure_category {
-            self.failure_category = Some(failure_category);
-        }
-    }
-
-    async fn save(&mut self, database: &Database) -> Result<(), DatabaseError> {
-        if self.id == 0 {
-            let insert_result = sqlx::query(
-                "INSERT INTO relay_status (
-                    relay_url,
-                    plane,
-                    account_pubkey,
-                    last_connect_attempt_at,
-                    last_connect_success_at,
-                    last_failure_at,
-                    failure_category,
-                    last_notice_reason,
-                    last_closed_reason,
-                    last_auth_reason,
-                    auth_required,
-                    success_count,
-                    failure_count,
-                    latency_ms,
-                    backoff_until,
-                    created_at,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(normalize_relay_url(&self.relay_url))
-            .bind(self.plane.as_str())
-            .bind(serialize_optional_public_key(self.account_pubkey))
-            .bind(
-                self.last_connect_attempt_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(
-                self.last_connect_success_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
-            .bind(
-                self.failure_category
-                    .map(|category| category.as_str().to_string()),
-            )
-            .bind(self.last_notice_reason.clone())
-            .bind(self.last_closed_reason.clone())
-            .bind(self.last_auth_reason.clone())
-            .bind(self.auth_required)
-            .bind(self.success_count)
-            .bind(self.failure_count)
-            .bind(self.latency_ms)
-            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
-            .bind(self.created_at.timestamp_millis())
-            .bind(self.updated_at.timestamp_millis())
-            .execute(&database.pool)
-            .await;
-
-            match insert_result {
-                Ok(result) => {
-                    self.id = result.last_insert_rowid();
-                }
-                Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                    if let Some(existing) =
-                        Self::find(&self.relay_url, self.plane, self.account_pubkey, database)
-                            .await?
-                    {
-                        self.id = existing.id;
-                    }
-                }
-                Err(error) => return Err(DatabaseError::Sqlx(error)),
-            }
-
-            if self.id == 0 {
-                tracing::warn!(
-                    target: "whitenoise::database::relay_status",
-                    relay_url = %self.relay_url,
-                    plane = self.plane.as_str(),
-                    account_pubkey = self.account_pubkey.map(|pubkey| pubkey.to_hex()).unwrap_or_default(),
-                    "Relay status insert hit a unique violation but no row was visible on the follow-up lookup"
-                );
-                return Err(DatabaseError::Sqlx(sqlx::Error::RowNotFound));
-            }
-
-            sqlx::query(
-                "UPDATE relay_status SET
-                    last_connect_attempt_at = ?,
-                    last_connect_success_at = ?,
-                    last_failure_at = ?,
-                    failure_category = ?,
-                    last_notice_reason = ?,
-                    last_closed_reason = ?,
-                    last_auth_reason = ?,
-                    auth_required = ?,
-                    success_count = ?,
-                    failure_count = ?,
-                    latency_ms = ?,
-                    backoff_until = ?,
-                    updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(
-                self.last_connect_attempt_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(
-                self.last_connect_success_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
-            .bind(
-                self.failure_category
-                    .map(|category| category.as_str().to_string()),
-            )
-            .bind(self.last_notice_reason.clone())
-            .bind(self.last_closed_reason.clone())
-            .bind(self.last_auth_reason.clone())
-            .bind(self.auth_required)
-            .bind(self.success_count)
-            .bind(self.failure_count)
-            .bind(self.latency_ms)
-            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
-            .bind(self.updated_at.timestamp_millis())
-            .bind(self.id)
-            .execute(&database.pool)
-            .await?;
+        let notice_reason = if telemetry.kind == RelayTelemetryKind::Notice {
+            telemetry.message.clone()
         } else {
-            sqlx::query(
-                "UPDATE relay_status SET
-                    last_connect_attempt_at = ?,
-                    last_connect_success_at = ?,
-                    last_failure_at = ?,
-                    failure_category = ?,
-                    last_notice_reason = ?,
-                    last_closed_reason = ?,
-                    last_auth_reason = ?,
-                    auth_required = ?,
-                    success_count = ?,
-                    failure_count = ?,
-                    latency_ms = ?,
-                    backoff_until = ?,
-                    updated_at = ?
-                 WHERE id = ?",
-            )
-            .bind(
-                self.last_connect_attempt_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(
-                self.last_connect_success_at
-                    .map(|value| value.timestamp_millis()),
-            )
-            .bind(self.last_failure_at.map(|value| value.timestamp_millis()))
-            .bind(
-                self.failure_category
-                    .map(|category| category.as_str().to_string()),
-            )
-            .bind(self.last_notice_reason.clone())
-            .bind(self.last_closed_reason.clone())
-            .bind(self.last_auth_reason.clone())
-            .bind(self.auth_required)
-            .bind(self.success_count)
-            .bind(self.failure_count)
-            .bind(self.latency_ms)
-            .bind(self.backoff_until.map(|value| value.timestamp_millis()))
-            .bind(self.updated_at.timestamp_millis())
-            .bind(self.id)
-            .execute(&database.pool)
-            .await?;
-        }
+            None
+        };
+        let closed_reason = if telemetry.kind == RelayTelemetryKind::Closed {
+            telemetry.message.clone()
+        } else {
+            None
+        };
+        let auth_reason = if telemetry.kind == RelayTelemetryKind::AuthChallenge {
+            telemetry.message.clone()
+        } else {
+            None
+        };
+        let failure_category = telemetry.failure_category.map(|c| c.as_str().to_string());
+        let now = telemetry.occurred_at.timestamp_millis();
+
+        sqlx::query(
+            "INSERT INTO relay_status (
+                relay_url, plane, account_pubkey,
+                last_connect_attempt_at, last_connect_success_at, last_failure_at,
+                failure_category, last_notice_reason, last_closed_reason, last_auth_reason,
+                auth_required, success_count, failure_count, latency_ms, backoff_until,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT DO UPDATE SET
+                last_connect_attempt_at = CASE WHEN excluded.last_connect_attempt_at IS NOT NULL
+                    THEN excluded.last_connect_attempt_at
+                    ELSE relay_status.last_connect_attempt_at END,
+                last_connect_success_at = CASE WHEN excluded.last_connect_success_at IS NOT NULL
+                    THEN excluded.last_connect_success_at
+                    ELSE relay_status.last_connect_success_at END,
+                last_failure_at = CASE WHEN excluded.last_failure_at IS NOT NULL
+                    THEN excluded.last_failure_at
+                    ELSE relay_status.last_failure_at END,
+                failure_category = CASE WHEN excluded.failure_category IS NOT NULL
+                    THEN excluded.failure_category
+                    ELSE relay_status.failure_category END,
+                last_notice_reason = CASE WHEN excluded.last_notice_reason IS NOT NULL
+                    THEN excluded.last_notice_reason
+                    ELSE relay_status.last_notice_reason END,
+                last_closed_reason = CASE WHEN excluded.last_closed_reason IS NOT NULL
+                    THEN excluded.last_closed_reason
+                    ELSE relay_status.last_closed_reason END,
+                last_auth_reason = CASE WHEN excluded.last_auth_reason IS NOT NULL
+                    THEN excluded.last_auth_reason
+                    ELSE relay_status.last_auth_reason END,
+                auth_required = MAX(relay_status.auth_required, excluded.auth_required),
+                success_count = relay_status.success_count + excluded.success_count,
+                failure_count = relay_status.failure_count + excluded.failure_count,
+                updated_at = excluded.updated_at",
+        )
+        .bind(normalize_relay_url(&telemetry.relay_url))
+        .bind(telemetry.plane.as_str())
+        .bind(serialize_optional_public_key(telemetry.account_pubkey))
+        .bind(connect_attempt_at)
+        .bind(connect_success_at)
+        .bind(failure_at)
+        .bind(failure_category)
+        .bind(notice_reason)
+        .bind(closed_reason)
+        .bind(auth_reason)
+        .bind(is_auth)
+        .bind(success_delta)
+        .bind(failure_delta)
+        .bind(now) // created_at
+        .bind(now) // updated_at
+        .execute(&database.pool)
+        .await?;
 
         Ok(())
     }

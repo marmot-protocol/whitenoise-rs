@@ -556,9 +556,11 @@ impl EphemeralPlane {
             .filter(|tag| is_relay_list_tag_for_event_kind(tag, event.kind))
             .collect();
 
-        // An empty relay list is a valid authoritative statement (e.g. "clear all relays").
+        // An empty relay list is a valid authoritative statement only when the event itself
+        // carries no tags at all (i.e. the author intentionally published an empty list).
+        // If the event has tags but none are relay-list tags the event is malformed.
         if relay_tags.is_empty() {
-            return true;
+            return event.tags.is_empty();
         }
 
         relay_tags.iter().any(|tag| {
@@ -766,11 +768,13 @@ mod tests {
         .await
         .unwrap();
 
-        let publish_attempts = events
+        // PublishAttempt is no longer persisted to relay_events (Fix 6).
+        // Each failed attempt emits PublishFailure instead (Fix 4).
+        let publish_failures = events
             .iter()
-            .filter(|event| event.kind == RelayTelemetryKind::PublishAttempt)
+            .filter(|event| event.kind == RelayTelemetryKind::PublishFailure)
             .count();
 
-        assert_eq!(publish_attempts, 2);
+        assert_eq!(publish_failures, 2);
     }
 }

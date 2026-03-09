@@ -596,9 +596,7 @@ mod tests {
 
     use super::*;
     use crate::relay_control::observability::{RelayTelemetry, RelayTelemetryKind};
-    use crate::whitenoise::database::{
-        Database, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
-    };
+    use crate::whitenoise::database::{Database, relay_status::RelayStatusRecord};
 
     #[test]
     fn test_relay_plane_as_str() {
@@ -657,26 +655,18 @@ mod tests {
         telemetry_sender.send(telemetry).unwrap();
         drop(telemetry_sender);
 
+        // SubscriptionSuccess no longer writes to relay_events (Fix 6); verify
+        // via relay_status counters instead.
         timeout(Duration::from_secs(1), async {
             loop {
-                let events = RelayEventRecord::list_recent_for_scope(
-                    &relay_url,
-                    RelayPlane::Discovery,
-                    None,
-                    10,
-                    &database,
-                )
-                .await
-                .unwrap();
-
                 let status =
                     RelayStatusRecord::find(&relay_url, RelayPlane::Discovery, None, &database)
                         .await
                         .unwrap();
 
-                if events.len() == 1 {
-                    assert_eq!(events[0].subscription_id.as_deref(), Some("sub-1"));
-                    assert_eq!(status.unwrap().success_count, 1);
+                if let Some(s) = status
+                    && s.success_count == 1
+                {
                     break;
                 }
 
@@ -713,18 +703,10 @@ mod tests {
             .unwrap();
         drop(account_sender);
 
+        // SubscriptionSuccess no longer writes to relay_events (Fix 6); check
+        // relay_status success_count reached 2 instead.
         timeout(Duration::from_secs(1), async {
             loop {
-                let events = RelayEventRecord::list_recent_for_scope(
-                    &relay_url,
-                    RelayPlane::AccountInbox,
-                    Some(account_pubkey),
-                    10,
-                    &database,
-                )
-                .await
-                .unwrap();
-
                 let status = RelayStatusRecord::find(
                     &relay_url,
                     RelayPlane::AccountInbox,
@@ -734,13 +716,10 @@ mod tests {
                 .await
                 .unwrap();
 
-                if events.len() == 2 {
-                    assert_eq!(events[0].subscription_id.as_deref(), Some("account-sub-2"));
-                    assert_eq!(events[0].account_pubkey, Some(account_pubkey));
-
-                    let status = status.unwrap();
-                    assert_eq!(status.account_pubkey, Some(account_pubkey));
-                    assert_eq!(status.success_count, 2);
+                if let Some(s) = status
+                    && s.success_count == 2
+                {
+                    assert_eq!(s.account_pubkey, Some(account_pubkey));
                     break;
                 }
 

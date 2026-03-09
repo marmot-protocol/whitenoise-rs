@@ -316,6 +316,16 @@ impl RelayObservability {
         database: &Database,
         telemetry: &RelayTelemetry,
     ) -> Result<(), DatabaseError> {
+        // Attempt events carry no actionable state; skip persistence entirely.
+        if matches!(
+            telemetry.kind,
+            RelayTelemetryKind::PublishAttempt
+                | RelayTelemetryKind::QueryAttempt
+                | RelayTelemetryKind::SubscriptionAttempt
+        ) {
+            return Ok(());
+        }
+
         tracing::debug!(
             target: "whitenoise::relay_control::observability",
             plane = telemetry.plane.as_str(),
@@ -332,7 +342,21 @@ impl RelayObservability {
             "Recording relay telemetry"
         );
 
-        RelayEventRecord::create(telemetry, database).await?;
+        // Only append to relay_events for failure and state-change events.
+        // Success and connection events update relay_status counters only.
+        if matches!(
+            telemetry.kind,
+            RelayTelemetryKind::Disconnected
+                | RelayTelemetryKind::Notice
+                | RelayTelemetryKind::Closed
+                | RelayTelemetryKind::AuthChallenge
+                | RelayTelemetryKind::PublishFailure
+                | RelayTelemetryKind::QueryFailure
+                | RelayTelemetryKind::SubscriptionFailure
+        ) {
+            RelayEventRecord::create(telemetry, database).await?;
+        }
+
         RelayStatusRecord::upsert_from_telemetry(telemetry, database).await?;
 
         Ok(())

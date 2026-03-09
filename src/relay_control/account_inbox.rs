@@ -85,6 +85,7 @@ impl AccountInboxPlane {
             )))
             .await;
         self.session.unset_signer().await;
+        self.session.shutdown().await;
     }
 
     pub(crate) async fn has_connected_relay(&self) -> bool {

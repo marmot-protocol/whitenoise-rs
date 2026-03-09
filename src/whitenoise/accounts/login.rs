@@ -221,9 +221,9 @@ impl Whitenoise {
             // Happy path: all three relay lists found, complete the login.
             self.complete_login(
                 &account,
-                &discovered.nip65,
-                &discovered.inbox,
-                &discovered.key_package,
+                discovered.relays(RelayType::Nip65),
+                discovered.relays(RelayType::Inbox),
+                discovered.relays(RelayType::KeyPackage),
             )
             .await?;
             tracing::info!(
@@ -243,9 +243,9 @@ impl Whitenoise {
                 target: "whitenoise::accounts",
                 "Relay lists incomplete for {} (nip65={}, inbox={}, key_package={}); awaiting user decision",
                 pubkey.to_hex(),
-                !discovered.nip65.is_empty(),
-                !discovered.inbox.is_empty(),
-                !discovered.key_package.is_empty(),
+                discovered.found(RelayType::Nip65),
+                discovered.found(RelayType::Inbox),
+                discovered.found(RelayType::KeyPackage),
             );
             self.pending_logins.insert(pubkey, discovered);
             Ok(LoginResult {
@@ -276,9 +276,9 @@ impl Whitenoise {
             target: "whitenoise::accounts",
             "Publishing missing default relay lists for {} (nip65_missing={}, inbox_missing={}, key_package_missing={})",
             pubkey.to_hex(),
-            discovered.nip65.is_empty(),
-            discovered.inbox.is_empty(),
-            discovered.key_package.is_empty(),
+            !discovered.found(RelayType::Nip65),
+            !discovered.found(RelayType::Inbox),
+            !discovered.found(RelayType::KeyPackage),
         );
 
         let account = Account::find_by_pubkey(pubkey, &self.database)
@@ -304,7 +304,7 @@ impl Whitenoise {
         // missing. Already-found lists were already persisted to the DB by
         // try_discover_relay_lists in step 1, so no second write is needed.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            if discovered.relays(relay_type).is_empty() {
+            if !discovered.found(relay_type) {
                 // Missing — assign defaults in the DB and publish to the network.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
@@ -318,7 +318,7 @@ impl Whitenoise {
                     )
                     .await
                 {
-                    if discovered.nip65.is_empty() || relay_type == RelayType::Nip65 {
+                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
                         return Err(LoginError::from(error));
                     }
 
@@ -414,8 +414,13 @@ impl Whitenoise {
         let merged = self.merge_into_stash(pubkey, discovered)?;
 
         if merged.is_complete() {
-            self.complete_login(&account, &merged.nip65, &merged.inbox, &merged.key_package)
-                .await?;
+            self.complete_login(
+                &account,
+                merged.relays(RelayType::Nip65),
+                merged.relays(RelayType::Inbox),
+                merged.relays(RelayType::KeyPackage),
+            )
+            .await?;
             self.pending_logins.remove(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
@@ -433,9 +438,9 @@ impl Whitenoise {
                 "Relay lists still incomplete after {} for {} (nip65={}, inbox={}, key_package={})",
                 relay_url,
                 pubkey.to_hex(),
-                !merged.nip65.is_empty(),
-                !merged.inbox.is_empty(),
-                !merged.key_package.is_empty(),
+                merged.found(RelayType::Nip65),
+                merged.found(RelayType::Inbox),
+                merged.found(RelayType::KeyPackage),
             );
             Ok(LoginResult {
                 account,
@@ -535,9 +540,9 @@ impl Whitenoise {
             // Happy path -- complete the login using the external signer.
             self.complete_external_signer_login(
                 &account,
-                &discovered.nip65,
-                &discovered.inbox,
-                &discovered.key_package,
+                discovered.relays(RelayType::Nip65),
+                discovered.relays(RelayType::Inbox),
+                discovered.relays(RelayType::KeyPackage),
                 signer,
             )
             .await?;
@@ -560,9 +565,9 @@ impl Whitenoise {
                 target: "whitenoise::accounts",
                 "Relay lists incomplete for {} (nip65={}, inbox={}, key_package={}); awaiting user decision",
                 pubkey.to_hex(),
-                !discovered.nip65.is_empty(),
-                !discovered.inbox.is_empty(),
-                !discovered.key_package.is_empty(),
+                discovered.found(RelayType::Nip65),
+                discovered.found(RelayType::Inbox),
+                discovered.found(RelayType::KeyPackage),
             );
             self.pending_logins.insert(pubkey, discovered);
             Ok(LoginResult {
@@ -599,9 +604,9 @@ impl Whitenoise {
             target: "whitenoise::accounts",
             "Publishing missing default relay lists for {} (nip65_missing={}, inbox_missing={}, key_package_missing={})",
             pubkey.to_hex(),
-            discovered.nip65.is_empty(),
-            discovered.inbox.is_empty(),
-            discovered.key_package.is_empty(),
+            !discovered.found(RelayType::Nip65),
+            !discovered.found(RelayType::Inbox),
+            !discovered.found(RelayType::KeyPackage),
         );
 
         let account = Account::find_by_pubkey(pubkey, &self.database)
@@ -623,7 +628,7 @@ impl Whitenoise {
         // missing. Already-found lists were already persisted to the DB by
         // try_discover_relay_lists in step 1, so no second write is needed.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
-            if discovered.relays(relay_type).is_empty() {
+            if !discovered.found(relay_type) {
                 // Missing — assign defaults in the DB and publish via the signer.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
@@ -638,7 +643,7 @@ impl Whitenoise {
                     )
                     .await
                 {
-                    if discovered.nip65.is_empty() || relay_type == RelayType::Nip65 {
+                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
                         return Err(LoginError::from(WhitenoiseError::from(error)));
                     }
 
@@ -717,9 +722,9 @@ impl Whitenoise {
         if merged.is_complete() {
             self.complete_external_signer_login(
                 &account,
-                &merged.nip65,
-                &merged.inbox,
-                &merged.key_package,
+                merged.relays(RelayType::Nip65),
+                merged.relays(RelayType::Inbox),
+                merged.relays(RelayType::KeyPackage),
                 signer,
             )
             .await?;
@@ -740,9 +745,9 @@ impl Whitenoise {
                 "Relay lists still incomplete after {} for {} (nip65={}, inbox={}, key_package={})",
                 relay_url,
                 pubkey.to_hex(),
-                !merged.nip65.is_empty(),
-                !merged.inbox.is_empty(),
-                !merged.key_package.is_empty(),
+                merged.found(RelayType::Nip65),
+                merged.found(RelayType::Inbox),
+                merged.found(RelayType::KeyPackage),
             );
             Ok(LoginResult {
                 account,
@@ -757,11 +762,12 @@ impl Whitenoise {
 
     /// Attempt to fetch all three relay lists from the network.
     ///
-    /// Returns a [`DiscoveredRelayLists`] whose fields contain the relays found
-    /// for each list type.  Any field that is empty was **not found** on the
-    /// network.  When 10050/10051 are searched, the source is the NIP-65 relays
-    /// (if found); otherwise the original `source_relays` are used as a fallback
-    /// so we still try all three even when 10002 is missing.
+    /// Returns a [`DiscoveredRelayLists`] whose fields are `Some(relays)` when
+    /// a list was found on the network (even if it contains zero relays) and
+    /// `None` when the list was not published at all.  When 10050/10051 are
+    /// searched, the source is the NIP-65 relays (if found); otherwise the
+    /// original `source_relays` are used as a fallback so we still try all
+    /// three even when 10002 is missing.
     ///
     /// Callers should check [`DiscoveredRelayLists::is_complete`] to determine
     /// whether login can proceed or whether the user must provide relay lists.
@@ -779,10 +785,9 @@ impl Whitenoise {
         // Use the discovered NIP-65 relays as the source for 10050/10051 when
         // available; otherwise fall back to the original source relays so we
         // still make a best-effort attempt even when 10002 is absent.
-        let secondary_source = if nip65_relays.is_empty() {
-            source_relays.to_vec()
-        } else {
-            nip65_relays.clone()
+        let secondary_source = match &nip65_relays {
+            Some(relays) if !relays.is_empty() => relays.clone(),
+            _ => source_relays.to_vec(),
         };
 
         // Steps 2 & 3: Fetch Inbox (10050) and KeyPackage (10051) concurrently.
@@ -800,18 +805,18 @@ impl Whitenoise {
             .user(&self.database)
             .await
             .map_err(LoginError::from)?;
-        if !nip65_relays.is_empty() {
-            user.add_relays(&nip65_relays, RelayType::Nip65, &self.database)
+        if let Some(ref relays) = nip65_relays {
+            user.add_relays(relays, RelayType::Nip65, &self.database)
                 .await
                 .map_err(LoginError::from)?;
         }
-        if !inbox_relays.is_empty() {
-            user.add_relays(&inbox_relays, RelayType::Inbox, &self.database)
+        if let Some(ref relays) = inbox_relays {
+            user.add_relays(relays, RelayType::Inbox, &self.database)
                 .await
                 .map_err(LoginError::from)?;
         }
-        if !key_package_relays.is_empty() {
-            user.add_relays(&key_package_relays, RelayType::KeyPackage, &self.database)
+        if let Some(ref relays) = key_package_relays {
+            user.add_relays(relays, RelayType::KeyPackage, &self.database)
                 .await
                 .map_err(LoginError::from)?;
         }
@@ -3173,9 +3178,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -3184,16 +3189,16 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
         // The stash now reflects the second insert, not the first.
         let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
         assert!(
-            stash.nip65.is_empty(),
+            stash.nip65.is_none(),
             "Second insert must overwrite the first stash — nip65 discovered in the first run is lost"
         );
         drop(stash);
@@ -3217,9 +3222,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -3256,9 +3261,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -3324,9 +3329,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -3358,9 +3363,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -3749,9 +3754,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_all_present() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![dummy_relay("wss://b.example.com")],
-            key_package: vec![dummy_relay("wss://c.example.com")],
+            nip65: Some(vec![dummy_relay("wss://a.example.com")]),
+            inbox: Some(vec![dummy_relay("wss://b.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://c.example.com")]),
         };
         assert!(
             lists.is_complete(),
@@ -3762,9 +3767,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_all_empty() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
         assert!(!lists.is_complete(), "All empty — should not be complete");
     }
@@ -3772,9 +3777,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_only_nip65() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://a.example.com")]),
+            inbox: None,
+            key_package: None,
         };
         assert!(
             !lists.is_complete(),
@@ -3785,9 +3790,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_only_inbox() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![dummy_relay("wss://b.example.com")],
-            key_package: vec![],
+            nip65: None,
+            inbox: Some(vec![dummy_relay("wss://b.example.com")]),
+            key_package: None,
         };
         assert!(
             !lists.is_complete(),
@@ -3798,9 +3803,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_only_key_package() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![dummy_relay("wss://c.example.com")],
+            nip65: None,
+            inbox: None,
+            key_package: Some(vec![dummy_relay("wss://c.example.com")]),
         };
         assert!(
             !lists.is_complete(),
@@ -3811,9 +3816,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_nip65_and_inbox_only() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![dummy_relay("wss://b.example.com")],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://a.example.com")]),
+            inbox: Some(vec![dummy_relay("wss://b.example.com")]),
+            key_package: None,
         };
         assert!(
             !lists.is_complete(),
@@ -3825,9 +3830,9 @@ mod tests {
     fn test_discovered_relay_lists_is_complete_nip65_and_key_package_only() {
         // This is the bug scenario: user has 10002 and 10051 but no 10050.
         let lists = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![],
-            key_package: vec![dummy_relay("wss://c.example.com")],
+            nip65: Some(vec![dummy_relay("wss://a.example.com")]),
+            inbox: None,
+            key_package: Some(vec![dummy_relay("wss://c.example.com")]),
         };
         assert!(
             !lists.is_complete(),
@@ -3838,9 +3843,9 @@ mod tests {
     #[test]
     fn test_discovered_relay_lists_is_complete_inbox_and_key_package_only() {
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![dummy_relay("wss://b.example.com")],
-            key_package: vec![dummy_relay("wss://c.example.com")],
+            nip65: None,
+            inbox: Some(vec![dummy_relay("wss://b.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://c.example.com")]),
         };
         assert!(
             !lists.is_complete(),
@@ -3852,15 +3857,15 @@ mod tests {
     fn test_discovered_relay_lists_multiple_relays_per_list() {
         // Multiple entries per list should still count as complete.
         let lists = DiscoveredRelayLists {
-            nip65: vec![
+            nip65: Some(vec![
                 dummy_relay("wss://a1.example.com"),
                 dummy_relay("wss://a2.example.com"),
-            ],
-            inbox: vec![
+            ]),
+            inbox: Some(vec![
                 dummy_relay("wss://b1.example.com"),
                 dummy_relay("wss://b2.example.com"),
-            ],
-            key_package: vec![dummy_relay("wss://c.example.com")],
+            ]),
+            key_package: Some(vec![dummy_relay("wss://c.example.com")]),
         };
         assert!(
             lists.is_complete(),
@@ -3879,9 +3884,9 @@ mod tests {
         let relay_a = dummy_relay("wss://a.example.com");
         let relay_fallback = dummy_relay("wss://fallback.example.com");
         let lists = DiscoveredRelayLists {
-            nip65: vec![relay_a.clone()],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![relay_a.clone()]),
+            inbox: None,
+            key_package: None,
         };
         let fallback_slice = [relay_fallback.clone()];
         let result = lists.relays_or(RelayType::Nip65, &fallback_slice);
@@ -3897,9 +3902,9 @@ mod tests {
         // When the field is empty, relays_or must return the fallback slice.
         let relay_fallback = dummy_relay("wss://fallback.example.com");
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
         let fallback_slice = [relay_fallback.clone()];
         let result = lists.relays_or(RelayType::Nip65, &fallback_slice);
@@ -3920,9 +3925,9 @@ mod tests {
         let fallback_slice = [fallback.clone()];
 
         let lists = DiscoveredRelayLists {
-            nip65: vec![nip65_relay.clone()],
-            inbox: vec![inbox_relay.clone()],
-            key_package: vec![kp_relay.clone()],
+            nip65: Some(vec![nip65_relay.clone()]),
+            inbox: Some(vec![inbox_relay.clone()]),
+            key_package: Some(vec![kp_relay.clone()]),
         };
 
         let r = lists.relays_or(RelayType::Nip65, &fallback_slice);
@@ -3941,9 +3946,9 @@ mod tests {
         let fallback = dummy_relay("wss://fallback.example.com");
         let fallback_slice = [fallback.clone()];
         let lists = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
 
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
@@ -3965,19 +3970,27 @@ mod tests {
         // When the existing stash has nothing, merge should adopt all non-empty
         // fields from the incoming discovery.
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
         let incoming = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://a.example.com")],
-            inbox: vec![dummy_relay("wss://b.example.com")],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://a.example.com")]),
+            inbox: Some(vec![dummy_relay("wss://b.example.com")]),
+            key_package: None,
         };
         stash.merge(incoming);
-        assert_eq!(stash.nip65.len(), 1, "nip65 adopted from incoming");
-        assert_eq!(stash.inbox.len(), 1, "inbox adopted from incoming");
-        assert!(stash.key_package.is_empty(), "key_package stays empty");
+        assert_eq!(
+            stash.nip65.as_ref().map_or(0, |v| v.len()),
+            1,
+            "nip65 adopted from incoming"
+        );
+        assert_eq!(
+            stash.inbox.as_ref().map_or(0, |v| v.len()),
+            1,
+            "inbox adopted from incoming"
+        );
+        assert!(stash.key_package.is_none(), "key_package stays empty");
         assert!(!stash.is_complete());
     }
 
@@ -3987,25 +4000,30 @@ mod tests {
         // NOT overwrite it even if the incoming also has a value.
         let original_relay = dummy_relay("wss://original.example.com");
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![original_relay.clone()],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![original_relay.clone()]),
+            inbox: None,
+            key_package: None,
         };
         let incoming = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://new.example.com")], // must NOT overwrite
-            inbox: vec![dummy_relay("wss://inbox.example.com")],
-            key_package: vec![dummy_relay("wss://kp.example.com")],
+            nip65: Some(vec![dummy_relay("wss://new.example.com")]), // must NOT overwrite
+            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
         };
         stash.merge(incoming);
         // nip65 should still be the original relay, not the incoming one.
-        assert_eq!(stash.nip65.len(), 1);
+        assert_eq!(stash.nip65.as_ref().map_or(0, |v| v.len()), 1);
         assert_eq!(
-            stash.nip65[0].url, original_relay.url,
+            stash.nip65.as_ref().unwrap()[0].url,
+            original_relay.url,
             "nip65 must not be overwritten by merge"
         );
-        assert_eq!(stash.inbox.len(), 1, "inbox adopted from incoming");
         assert_eq!(
-            stash.key_package.len(),
+            stash.inbox.as_ref().map_or(0, |v| v.len()),
+            1,
+            "inbox adopted from incoming"
+        );
+        assert_eq!(
+            stash.key_package.as_ref().map_or(0, |v| v.len()),
             1,
             "key_package adopted from incoming"
         );
@@ -4015,14 +4033,14 @@ mod tests {
     #[test]
     fn test_merge_both_empty_stays_empty() {
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
         stash.merge(DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         });
         assert!(!stash.is_complete());
     }
@@ -4032,28 +4050,28 @@ mod tests {
         // Simulate two login_with_custom_relay retries, each finding one new list.
         // After both, the stash should be complete.
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: None,
+            inbox: None,
+            key_package: None,
         };
 
         // First retry finds nip65.
         stash.merge(DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://nip65.example.com")],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            inbox: None,
+            key_package: None,
         });
         assert!(!stash.is_complete(), "Still missing inbox and key_package");
 
         // Second retry finds inbox and key_package.
         stash.merge(DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://other.example.com")], // ignored — nip65 already set
-            inbox: vec![dummy_relay("wss://inbox.example.com")],
-            key_package: vec![dummy_relay("wss://kp.example.com")],
+            nip65: Some(vec![dummy_relay("wss://other.example.com")]), // ignored — nip65 already set
+            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
         });
         assert!(stash.is_complete(), "All three found across two retries");
         assert_eq!(
-            stash.nip65[0].url,
+            stash.nip65.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://nip65.example.com").unwrap(),
             "First nip65 preserved — not overwritten"
         );
@@ -4070,9 +4088,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4102,9 +4120,9 @@ mod tests {
         //   login_start  → found nip65 only           → stash incomplete
         //   custom relay → found inbox + key_package  → stash now complete
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://nip65.example.com")],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            inbox: None,
+            key_package: None,
         };
         assert!(
             !stash.is_complete(),
@@ -4113,9 +4131,9 @@ mod tests {
 
         // Simulate what try_discover_relay_lists returns for the custom relay.
         let custom_relay_finds = DiscoveredRelayLists {
-            nip65: vec![], // custom relay has no 10002
-            inbox: vec![dummy_relay("wss://inbox.example.com")],
-            key_package: vec![dummy_relay("wss://kp.example.com")],
+            nip65: None, // custom relay has no 10002
+            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
         };
         stash.merge(custom_relay_finds);
 
@@ -4126,7 +4144,7 @@ mod tests {
         );
         // The original nip65 must not have been overwritten.
         assert_eq!(
-            stash.nip65[0].url,
+            stash.nip65.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://nip65.example.com").unwrap()
         );
     }
@@ -4137,16 +4155,16 @@ mod tests {
         // reaches is_complete() after the second merge — the core invariant
         // that the post-merge recheck relies on.
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://nip65.example.com")],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            inbox: None,
+            key_package: None,
         };
         assert!(!stash.is_complete(), "Incomplete before second relay");
 
         stash.merge(DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://ignored.example.com")], // already set, ignored
-            inbox: vec![dummy_relay("wss://inbox.example.com")],
-            key_package: vec![dummy_relay("wss://kp.example.com")],
+            nip65: Some(vec![dummy_relay("wss://ignored.example.com")]), // already set, ignored
+            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
         });
 
         assert!(
@@ -4155,7 +4173,7 @@ mod tests {
         );
         // The original nip65 relay must be preserved.
         assert_eq!(
-            stash.nip65[0].url,
+            stash.nip65.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://nip65.example.com").unwrap()
         );
     }
@@ -4205,9 +4223,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4225,12 +4243,12 @@ mod tests {
         // Stash must still exist and retain the nip65 relay.
         let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
         assert_eq!(
-            stash.nip65.len(),
+            stash.nip65.as_ref().map_or(0, |v| v.len()),
             1,
             "nip65 relay must be preserved in stash"
         );
-        assert!(stash.inbox.is_empty());
-        assert!(stash.key_package.is_empty());
+        assert!(stash.inbox.is_none());
+        assert!(stash.key_package.is_none());
         drop(stash);
 
         let _ = whitenoise.login_cancel(&pubkey).await;
@@ -4267,9 +4285,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![inbox_relay.clone()],
-                key_package: vec![kp_relay.clone()],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: Some(vec![inbox_relay.clone()]),
+                key_package: Some(vec![kp_relay.clone()]),
             },
         )
         .await;
@@ -4335,9 +4353,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![inbox_relay.clone()],
-                key_package: vec![kp_relay.clone()],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: Some(vec![inbox_relay.clone()]),
+                key_package: Some(vec![kp_relay.clone()]),
             },
         )
         .await;
@@ -4395,9 +4413,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4455,9 +4473,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4472,9 +4490,13 @@ mod tests {
 
         assert_eq!(result.status, LoginStatus::NeedsRelayLists);
         let stash = whitenoise.pending_logins.get(&pubkey).unwrap();
-        assert_eq!(stash.nip65.len(), 1, "nip65 must be preserved");
-        assert!(stash.inbox.is_empty());
-        assert!(stash.key_package.is_empty());
+        assert_eq!(
+            stash.nip65.as_ref().map_or(0, |v| v.len()),
+            1,
+            "nip65 must be preserved"
+        );
+        assert!(stash.inbox.is_none());
+        assert!(stash.key_package.is_none());
         drop(stash);
 
         let _ = whitenoise.login_cancel(&pubkey).await;
@@ -4505,9 +4527,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![inbox_relay],
-                key_package: vec![kp_relay],
+                nip65: Some(vec![nip65_relay]),
+                inbox: Some(vec![inbox_relay]),
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -4539,9 +4561,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4604,9 +4626,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4617,9 +4639,9 @@ mod tests {
         {
             let mut stash = whitenoise.pending_logins.get_mut(&pubkey).unwrap();
             stash.merge(DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![inbox_relay.clone()],
-                key_package: vec![kp_relay.clone()],
+                nip65: None,
+                inbox: Some(vec![inbox_relay.clone()]),
+                key_package: Some(vec![kp_relay.clone()]),
             });
             assert!(
                 stash.is_complete(),
@@ -4686,16 +4708,16 @@ mod tests {
         // the full merged state, so login_publish_default_relays will not
         // publish defaults over relays that were already found.
         let mut stash = DiscoveredRelayLists {
-            nip65: vec![dummy_relay("wss://nip65.example.com")],
-            inbox: vec![],
-            key_package: vec![],
+            nip65: Some(vec![dummy_relay("wss://nip65.example.com")]),
+            inbox: None,
+            key_package: None,
         };
 
         // Simulate what try_discover_relay_lists returns on the custom relay.
         let discovered = DiscoveredRelayLists {
-            nip65: vec![],
-            inbox: vec![dummy_relay("wss://inbox.example.com")],
-            key_package: vec![dummy_relay("wss://kp.example.com")],
+            nip65: None,
+            inbox: Some(vec![dummy_relay("wss://inbox.example.com")]),
+            key_package: Some(vec![dummy_relay("wss://kp.example.com")]),
         };
 
         // This is the upfront merge that now happens before complete_login.
@@ -4709,16 +4731,16 @@ mod tests {
             "Stash must be complete after upfront merge, before complete_login is called"
         );
         assert_eq!(
-            stash.nip65[0].url,
+            stash.nip65.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://nip65.example.com").unwrap(),
             "Original nip65 relay must be preserved"
         );
         assert_eq!(
-            stash.inbox[0].url,
+            stash.inbox.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://inbox.example.com").unwrap(),
         );
         assert_eq!(
-            stash.key_package[0].url,
+            stash.key_package.as_ref().unwrap()[0].url,
             RelayUrl::parse("wss://kp.example.com").unwrap(),
         );
     }
@@ -4837,9 +4859,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4884,9 +4906,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -4944,9 +4966,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![inbox_relay],
-                key_package: vec![],
+                nip65: None,
+                inbox: Some(vec![inbox_relay]),
+                key_package: None,
             },
         )
         .await;
@@ -4994,9 +5016,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![kp_relay],
+                nip65: None,
+                inbox: None,
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5047,9 +5069,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![inbox_relay],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay]),
+                inbox: Some(vec![inbox_relay]),
+                key_package: None,
             },
         )
         .await;
@@ -5096,9 +5118,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![],
-                key_package: vec![kp_relay],
+                nip65: Some(vec![nip65_relay]),
+                inbox: None,
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5145,9 +5167,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![inbox_relay],
-                key_package: vec![kp_relay],
+                nip65: None,
+                inbox: Some(vec![inbox_relay]),
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5183,9 +5205,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -5233,9 +5255,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -5263,9 +5285,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay]),
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -5301,9 +5323,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay.clone()],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay.clone()]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -5359,9 +5381,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -5406,9 +5428,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay]),
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -5461,9 +5483,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         )
         .await;
@@ -5488,9 +5510,9 @@ mod tests {
         whitenoise.pending_logins.insert(
             pubkey,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![],
+                nip65: None,
+                inbox: None,
+                key_package: None,
             },
         );
 
@@ -5530,9 +5552,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![inbox_relay],
-                key_package: vec![],
+                nip65: None,
+                inbox: Some(vec![inbox_relay]),
+                key_package: None,
             },
         )
         .await;
@@ -5585,9 +5607,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![],
-                key_package: vec![kp_relay],
+                nip65: None,
+                inbox: None,
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5639,9 +5661,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![inbox_relay],
-                key_package: vec![],
+                nip65: Some(vec![nip65_relay]),
+                inbox: Some(vec![inbox_relay]),
+                key_package: None,
             },
         )
         .await;
@@ -5696,9 +5718,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![nip65_relay],
-                inbox: vec![],
-                key_package: vec![kp_relay],
+                nip65: Some(vec![nip65_relay]),
+                inbox: None,
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5751,9 +5773,9 @@ mod tests {
             &whitenoise,
             &keys,
             DiscoveredRelayLists {
-                nip65: vec![],
-                inbox: vec![inbox_relay],
-                key_package: vec![kp_relay],
+                nip65: None,
+                inbox: Some(vec![inbox_relay]),
+                key_package: Some(vec![kp_relay]),
             },
         )
         .await;
@@ -5806,9 +5828,9 @@ mod tests {
 
         // This is what try_discover_relay_lists now returns for the bug user.
         let partial = DiscoveredRelayLists {
-            nip65: vec![nip65_relay],
-            inbox: vec![],       // 10050 absent
-            key_package: vec![], // 10051 absent
+            nip65: Some(vec![nip65_relay]),
+            inbox: None,       // 10050 absent
+            key_package: None, // 10051 absent
         };
 
         assert!(

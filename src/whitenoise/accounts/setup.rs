@@ -394,7 +394,7 @@ impl Whitenoise {
     /// Fetches from network or uses defaults, but never publishes.
     ///
     /// Returns the relays and a boolean indicating whether they should be published
-    /// (true if defaults were used because no existing relays were found).
+    /// (true if defaults were used because no existing relay list was found on the network).
     async fn setup_external_account_relay_type(
         &self,
         account: &Account,
@@ -408,16 +408,18 @@ impl Whitenoise {
             .await?;
 
         let user = account.user(&self.database).await?;
-        if fetched_relays.is_empty() {
-            // No existing relay lists - use defaults, mark for publishing
-            user.add_relays(default_relays, relay_type, &self.database)
-                .await?;
-            Ok((default_relays.to_vec(), true))
-        } else {
-            // Found existing relay lists - use them, no publishing needed
-            user.add_relays(&fetched_relays, relay_type, &self.database)
-                .await?;
-            Ok((fetched_relays, false))
+        match fetched_relays {
+            None => {
+                // No existing relay list found on network — use defaults, mark for publishing.
+                user.add_relays(default_relays, relay_type, &self.database)
+                    .await?;
+                Ok((default_relays.to_vec(), true))
+            }
+            Some(relays) => {
+                // Found an existing relay list — use it, no publishing needed.
+                user.add_relays(&relays, relay_type, &self.database).await?;
+                Ok((relays, false))
+            }
         }
     }
 
@@ -433,17 +435,19 @@ impl Whitenoise {
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
             .await?;
 
-        if fetched_relays.is_empty() {
-            // No existing relay lists - use defaults and publish
-            self.add_relays_to_account(account, default_relays, relay_type)
-                .await?;
-            Ok((default_relays.to_vec(), true))
-        } else {
-            // Found existing relay lists - use them, no publishing needed
-            let user = account.user(&self.database).await?;
-            user.add_relays(&fetched_relays, relay_type, &self.database)
-                .await?;
-            Ok((fetched_relays, false))
+        match fetched_relays {
+            None => {
+                // No existing relay list found on network — use defaults and publish.
+                self.add_relays_to_account(account, default_relays, relay_type)
+                    .await?;
+                Ok((default_relays.to_vec(), true))
+            }
+            Some(relays) => {
+                // Found an existing relay list — use it, no publishing needed.
+                let user = account.user(&self.database).await?;
+                user.add_relays(&relays, relay_type, &self.database).await?;
+                Ok((relays, false))
+            }
         }
     }
 
@@ -452,10 +456,10 @@ impl Whitenoise {
         pubkey: PublicKey,
         relay_type: RelayType,
         source_relays: &[Relay],
-    ) -> Result<Vec<Relay>> {
+    ) -> Result<Option<Vec<Relay>>> {
         let source_relay_urls = Relay::urls(source_relays);
         if source_relay_urls.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
         // Relay-control ephemeral sessions add/connect target relays internally,
@@ -465,16 +469,18 @@ impl Whitenoise {
             .fetch_user_relays(pubkey, relay_type, &source_relay_urls)
             .await?;
 
-        let mut relays = Vec::new();
-        if let Some(event) = relay_event {
-            let relay_urls = NostrManager::relay_urls_from_event(&event);
-            for url in relay_urls {
-                let relay = self.find_or_create_relay_by_url(&url).await?;
-                relays.push(relay);
+        match relay_event {
+            None => Ok(None),
+            Some(event) => {
+                let relay_urls = NostrManager::relay_urls_from_event(&event);
+                let mut relays = Vec::with_capacity(relay_urls.len());
+                for url in relay_urls {
+                    let relay = self.find_or_create_relay_by_url(&url).await?;
+                    relays.push(relay);
+                }
+                Ok(Some(relays))
             }
         }
-
-        Ok(relays)
     }
 
     pub(super) async fn add_relays_to_account(
