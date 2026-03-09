@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use crate::Whitenoise;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
+use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::UserSyncMode;
 
 use super::protocol::{Request, Response};
@@ -752,17 +753,11 @@ async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<Str
         .cloned()
 }
 
-fn cli_group_relay_urls() -> Result<Vec<RelayUrl>, Response> {
-    [
-        "wss://nos.lol",
-        "wss://relay.primal.net",
-        "wss://relay.damus.io",
-    ]
-    .into_iter()
-    .map(|url| {
-        RelayUrl::parse(url).map_err(|e| Response::err(format!("invalid group relay URL: {e}")))
-    })
-    .collect()
+fn cli_group_relay_urls() -> Vec<RelayUrl> {
+    Relay::defaults()
+        .into_iter()
+        .map(|relay| relay.url)
+        .collect()
 }
 
 async fn create_group(
@@ -785,7 +780,7 @@ async fn create_group(
         None, // image_hash
         None, // image_key
         None, // image_nonce
-        cli_group_relay_urls()?,
+        cli_group_relay_urls(),
         vec![account.pubkey], // admins — creator only
     );
 

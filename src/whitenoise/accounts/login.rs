@@ -399,6 +399,7 @@ impl Whitenoise {
         let merged = self.merge_into_stash(pubkey, discovered)?;
 
         if merged.is_complete() {
+            self.sync_discovered_relay_lists(&account, &merged).await?;
             self.complete_login(
                 &account,
                 merged.relays(RelayType::Inbox),
@@ -700,6 +701,7 @@ impl Whitenoise {
         let merged = self.merge_into_stash(pubkey, discovered)?;
 
         if merged.is_complete() {
+            self.sync_discovered_relay_lists(&account, &merged).await?;
             self.complete_external_signer_login(&account, merged.relays(RelayType::Inbox), signer)
                 .await?;
             self.pending_logins.remove(pubkey);
@@ -820,6 +822,35 @@ impl Whitenoise {
         let snapshot = stash.clone();
         drop(stash);
         Ok(snapshot)
+    }
+
+    async fn sync_discovered_relay_lists(
+        &self,
+        account: &Account,
+        discovered: &DiscoveredRelayLists,
+    ) -> core::result::Result<(), LoginError> {
+        self.sync_account_relays(
+            account,
+            discovered.relays(RelayType::Nip65),
+            RelayType::Nip65,
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.sync_account_relays(
+            account,
+            discovered.relays(RelayType::Inbox),
+            RelayType::Inbox,
+        )
+        .await
+        .map_err(LoginError::from)?;
+        self.sync_account_relays(
+            account,
+            discovered.relays(RelayType::KeyPackage),
+            RelayType::KeyPackage,
+        )
+        .await
+        .map_err(LoginError::from)?;
+        Ok(())
     }
 
     /// Activate a local-key account after relay lists have been resolved.

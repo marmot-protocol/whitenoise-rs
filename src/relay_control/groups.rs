@@ -113,6 +113,7 @@ impl GroupPlane {
         // (The unsubscribe above already tore down the previous subscription,
         // so leaving stale relay info in the map would make the health check
         // falsely report healthy with no live subscription.)
+        let mut installed_subscription_indices = Vec::new();
         for subscription in &subscriptions {
             if subscription.relays.is_empty() || subscription.group_ids.is_empty() {
                 continue;
@@ -132,6 +133,8 @@ impl GroupPlane {
                 .ensure_relays_connected(&subscription.relays)
                 .await
             {
+                self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
+                    .await;
                 self.accounts.write().await.remove(&pubkey);
                 return Err(e);
             }
@@ -147,9 +150,12 @@ impl GroupPlane {
                 )
                 .await
             {
+                self.unsubscribe_indices(&pubkey, &installed_subscription_indices)
+                    .await;
                 self.accounts.write().await.remove(&pubkey);
                 return Err(e);
             }
+            installed_subscription_indices.push(subscription.subscription_index);
         }
 
         self.accounts.write().await.insert(
@@ -166,11 +172,13 @@ impl GroupPlane {
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
         let _update_guard = self.update_lock.lock().await;
         if let Some(state) = self.accounts.write().await.remove(pubkey) {
-            for subscription in state.subscriptions {
-                self.session
-                    .unsubscribe(&self.subscription_id(pubkey, subscription.subscription_index))
-                    .await;
-            }
+            let subscription_indices = state
+                .subscriptions
+                .into_iter()
+                .map(|subscription| subscription.subscription_index)
+                .collect::<Vec<_>>();
+            self.unsubscribe_indices(pubkey, &subscription_indices)
+                .await;
         }
     }
 
@@ -283,6 +291,14 @@ impl GroupPlane {
                 }
             })
             .collect()
+    }
+
+    async fn unsubscribe_indices(&self, pubkey: &PublicKey, subscription_indices: &[usize]) {
+        for subscription_index in subscription_indices {
+            self.session
+                .unsubscribe(&self.subscription_id(pubkey, *subscription_index))
+                .await;
+        }
     }
 
     pub(crate) async fn snapshot(&self) -> GroupPlaneStateSnapshot {
