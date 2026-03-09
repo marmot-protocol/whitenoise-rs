@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use mdk_core::prelude::*;
@@ -402,6 +402,15 @@ impl Whitenoise {
             .map_err(WhitenoiseError::from)?
             .into_iter()
             .collect::<Vec<PublicKey>>())
+    }
+
+    pub async fn group_relays(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<BTreeSet<RelayUrl>> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        Ok(mdk.get_relays(group_id).map_err(WhitenoiseError::from)?)
     }
 
     pub async fn group_admins(

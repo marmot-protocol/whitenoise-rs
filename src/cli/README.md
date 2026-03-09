@@ -41,6 +41,7 @@ wn (client)                         wnd (daemon)
 | `wn groups show <group-id>`                | Show group details   |
 | `wn groups members <group-id>`             | List members         |
 | `wn groups admins <group-id>`              | List admins          |
+| `wn groups relays <group-id>`              | List group relays    |
 | `wn groups add-members <id> <npubs...>`    | Add members          |
 | `wn groups remove-members <id> <npubs...>` | Remove members       |
 | `wn groups leave <group-id>`               | Leave a group        |
@@ -109,7 +110,7 @@ wn (client)                         wnd (daemon)
 
 ## File Structure
 
-```
+```text
 src/cli/
   mod.rs            Module root
   protocol.rs       Request/Response types (serde-tagged enum)
@@ -153,13 +154,13 @@ src/bin/
 
 94 unit tests across the CLI modules:
 
-| Module | Tests | Coverage |
-|--------|------:|----------|
-| `protocol.rs` | 45 | Serde roundtrip for every Request variant |
-| `output.rs` | 28 | Human-readable formatting, field hiding, npub conversion |
-| `server.rs` | 9 | Stale socket cleanup, PID file parsing |
-| `account.rs` | 6 | Account resolution logic |
-| `client.rs` | 3 | Client-server roundtrip on temp socket |
-| `config.rs` | 3 | Platform defaults, CLI overrides, socket path |
+| Module        | Tests | Coverage                                                 |
+| ------------- | ----: | -------------------------------------------------------- |
+| `protocol.rs` |    45 | Serde roundtrip for every Request variant                |
+| `output.rs`   |    28 | Human-readable formatting, field hiding, npub conversion |
+| `server.rs`   |     9 | Stale socket cleanup, PID file parsing                   |
+| `account.rs`  |     6 | Account resolution logic                                 |
+| `client.rs`   |     3 | Client-server roundtrip on temp socket                   |
+| `config.rs`   |     3 | Platform defaults, CLI overrides, socket path            |
 
 E2E tests live in `tests/cli_e2e.rs` (requires `--features cli,integration-tests` + local relays).

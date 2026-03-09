@@ -64,6 +64,12 @@ pub enum GroupsCmd {
         group_id: String,
     },
 
+    /// List group relays
+    Relays {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
     /// Leave a group
     Leave {
         /// MLS group ID (hex)
@@ -118,6 +124,7 @@ impl GroupsCmd {
             }
             Self::Members { group_id } => members(socket, json, account_flag, group_id).await,
             Self::Admins { group_id } => admins(socket, json, account_flag, group_id).await,
+            Self::Relays { group_id } => relays(socket, json, account_flag, group_id).await,
             Self::Leave { group_id } => leave(socket, json, account_flag, group_id).await,
             Self::Rename { group_id, name } => {
                 rename(socket, json, account_flag, group_id, name).await
@@ -237,6 +244,24 @@ async fn admins(
     let resp = client::send(
         socket,
         &Request::GroupAdmins {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn relays(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GroupRelays {
             account: pubkey,
             group_id,
         },

@@ -133,6 +133,13 @@ pub async fn dispatch(req: Request) -> Response {
             }
         }
 
+        Request::GroupRelays { account, group_id } => {
+            match group_relay_list(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
         Request::RemoveMembers {
             account,
             group_id,
@@ -873,6 +880,22 @@ async fn group_pubkey_list(
         }));
     }
     Ok(to_response(&members))
+}
+
+async fn group_relay_list(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let relays = wn
+        .group_relays(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let urls: Vec<&str> = relays.iter().map(|r| r.as_str()).collect();
+    Ok(to_response(&urls))
 }
 
 async fn remove_members(

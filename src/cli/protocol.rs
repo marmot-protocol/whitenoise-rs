@@ -58,6 +58,8 @@ pub enum Request {
     GroupMembers { account: String, group_id: String },
     #[serde(rename = "group_admins")]
     GroupAdmins { account: String, group_id: String },
+    #[serde(rename = "group_relays")]
+    GroupRelays { account: String, group_id: String },
     #[serde(rename = "remove_members")]
     RemoveMembers {
         account: String,
@@ -547,6 +549,21 @@ mod tests {
         assert!(matches!(
             parsed,
             Request::GroupAdmins { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn group_relays_roundtrip() {
+        let req = Request::GroupRelays {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupRelays { account, group_id }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
