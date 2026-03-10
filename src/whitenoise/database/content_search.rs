@@ -1,3 +1,5 @@
+use unicode_normalization::UnicodeNormalization;
+
 /// Returns `true` if `c` should be considered part of a search token.
 ///
 /// A word character is defined as either:
