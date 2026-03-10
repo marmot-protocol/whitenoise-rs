@@ -14,7 +14,6 @@ use crate::{
 };
 
 /// Configuration for the per-account inbox plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AccountInboxPlaneConfig {
     pub(crate) account_pubkey: PublicKey,
@@ -23,7 +22,6 @@ pub(crate) struct AccountInboxPlaneConfig {
     pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
 }
 
-#[allow(dead_code)]
 impl AccountInboxPlaneConfig {
     pub(crate) fn new(account_pubkey: PublicKey, inbox_relays: Vec<RelayUrl>) -> Self {
         Self {

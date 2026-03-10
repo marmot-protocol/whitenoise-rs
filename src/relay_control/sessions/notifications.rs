@@ -3,7 +3,6 @@ use nostr_sdk::{RelayMessage, RelayUrl};
 use crate::relay_control::observability::RelayFailureCategory;
 
 /// Normalized relay notification surface for future `RelaySession` wiring.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RelayNotification {
     Notice {
@@ -21,13 +20,16 @@ pub(crate) enum RelayNotification {
         challenge: String,
         failure_category: Option<RelayFailureCategory>,
     },
+    #[allow(dead_code)]
     Connected {
         relay_url: RelayUrl,
     },
+    #[allow(dead_code)]
     Disconnected {
         relay_url: RelayUrl,
         failure_category: Option<RelayFailureCategory>,
     },
+    #[allow(dead_code)]
     Shutdown,
 }
 

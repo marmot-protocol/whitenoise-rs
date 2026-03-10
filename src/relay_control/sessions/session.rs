@@ -85,12 +85,10 @@ impl RelaySession {
         &self.config
     }
 
-    #[allow(dead_code)]
     pub(crate) fn telemetry(&self) -> broadcast::Receiver<RelayTelemetry> {
         self.telemetry_sender.subscribe()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn notification_handler_registered(&self) -> bool {
         self.state
             .notification_handler_registered
@@ -242,7 +240,6 @@ impl RelaySession {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn fetch_events_from(
         &self,
         relay_urls: &[RelayUrl],
