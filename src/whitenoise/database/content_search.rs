@@ -111,7 +111,6 @@ fn is_combining_mark(c: char) -> bool {
 /// This function is used both when storing `content_normalized` and when building the
 /// LIKE pattern from the query, ensuring both sides use the same form.
 pub fn normalize_for_search(s: &str) -> String {
-    use unicode_normalization::UnicodeNormalization as _;
     s.nfc().collect::<String>().to_lowercase()
 }
 
