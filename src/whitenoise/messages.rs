@@ -1872,6 +1872,7 @@ mod tests {
                     crate::relay_control::sessions::RelaySessionReconnectPolicy::Disabled,
                 auth_policy: crate::relay_control::sessions::RelaySessionAuthPolicy::Disabled,
                 max_publish_attempts: 1,
+                ad_hoc_relay_ttl: std::time::Duration::from_secs(30),
             },
             whitenoise.database.clone(),
             whitenoise.event_sender.clone(),

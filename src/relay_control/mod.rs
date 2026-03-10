@@ -22,6 +22,7 @@ use tokio::sync::{RwLock, broadcast, mpsc::Sender};
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
 pub(crate) mod ephemeral;
+pub(crate) mod ephemeral_executor;
 pub(crate) mod groups;
 pub(crate) mod observability;
 pub(crate) mod router;
@@ -202,7 +203,14 @@ impl RelayControlPlane {
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
-        self.discovery.start().await
+        self.discovery.start().await?;
+        if let Err(error) = self.ephemeral.warm_relays(self.discovery.relays()).await {
+            tracing::warn!(
+                target: "whitenoise::relay_control",
+                "Failed to warm discovery relays on the ephemeral executor: {error}"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) async fn sync_discovery_subscriptions(
@@ -306,6 +314,7 @@ impl RelayControlPlane {
         }
 
         self.group_plane.remove_account(account_pubkey).await;
+        self.ephemeral.remove_account_scope(account_pubkey).await;
     }
 
     /// Deactivates all account subscriptions. Called during full data teardown.
@@ -357,6 +366,24 @@ impl RelayControlPlane {
 
     pub(crate) fn ephemeral(&self) -> ephemeral::EphemeralPlane {
         self.ephemeral.clone()
+    }
+
+    pub(crate) async fn warm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
+        self.ephemeral.warm_relays(relays).await
+    }
+
+    pub(crate) async fn warm_ephemeral_relays_for_account(
+        &self,
+        account_pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .warm_relays_for_account(account_pubkey, relays)
+            .await
+    }
+
+    pub(crate) async fn unwarm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
+        self.ephemeral.unwarm_relays(relays).await
     }
 
     pub(crate) async fn fetch_metadata_from(
@@ -525,6 +552,7 @@ impl RelayControlPlane {
         }
 
         self.group_plane.reset().await;
+        self.ephemeral.remove_all_account_scopes().await;
         Ok(())
     }
 }

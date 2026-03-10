@@ -54,24 +54,44 @@ impl Whitenoise {
     }
 
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
-        // Refresh global subscriptions for this user (metadata, relay lists, key packages)
-        if let Err(e) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::handle_relay_list",
-                "Failed to refresh global subscriptions after relay list change for {}: {}",
-                event.pubkey, e
-            );
-        }
+        let account = Account::find_by_pubkey(&user.pubkey, &self.database)
+            .await
+            .ok();
+        let event_pubkey = event.pubkey;
 
-        // If there's an account for this user, also refresh their account subscriptions
-        if let Ok(account) = Account::find_by_pubkey(&user.pubkey, &self.database).await
-            && let Err(e) = self.refresh_account_subscriptions(&account).await
-        {
-            tracing::warn!(
-                target: "whitenoise::handle_relay_list",
-                "Failed to refresh account subscriptions after relay list change for {}: {}",
-                event.pubkey, e
-            );
-        }
+        tokio::spawn(async move {
+            let whitenoise = match Whitenoise::get_instance() {
+                Ok(instance) => instance,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::handle_relay_list",
+                        "Failed to get Whitenoise instance for relay list refresh {}: {}",
+                        event_pubkey,
+                        error
+                    );
+                    return;
+                }
+            };
+
+            if let Err(error) = whitenoise.refresh_global_subscription_for_user().await {
+                tracing::warn!(
+                    target: "whitenoise::handle_relay_list",
+                    "Failed to refresh global subscriptions after relay list change for {}: {}",
+                    event_pubkey,
+                    error
+                );
+            }
+
+            if let Some(account) = account
+                && let Err(error) = whitenoise.refresh_account_subscriptions(&account).await
+            {
+                tracing::warn!(
+                    target: "whitenoise::handle_relay_list",
+                    "Failed to refresh account subscriptions after relay list change for {}: {}",
+                    event_pubkey,
+                    error
+                );
+            }
+        });
     }
 }

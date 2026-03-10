@@ -1,6 +1,5 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use futures::stream::{self, StreamExt};
 use nostr_sdk::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
@@ -9,16 +8,18 @@ use crate::whitenoise::{
     accounts::Account,
     database::processed_events::ProcessedEvent,
     error::{Result, WhitenoiseError},
-    users::User,
     utils::timestamp_to_datetime,
 };
+use crate::{
+    relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
+    types::ProcessableEvent,
+};
 
-/// Maximum number of concurrent user data fetches when processing a contact list.
-/// Each fetch does ~4 network round-trips (3 relay list + 1 metadata), so 35
-/// concurrent fetches means ~140 in-flight requests — well within the relay
-/// pool's internal channel capacity (1024) while balancing login speed against
-/// follow list population time.
-const CONTACT_LIST_FETCH_CONCURRENCY: usize = 35;
+/// Maximum number of authors to include in one discovery catch-up query.
+const CONTACT_LIST_CATCH_UP_BATCH_SIZE: usize = 500;
+
+/// Timeout for each batched discovery catch-up query.
+const CONTACT_LIST_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Whitenoise {
     pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
@@ -34,7 +35,7 @@ impl Whitenoise {
             .update_follows_from_event(contacts.clone(), &self.database)
             .await?;
 
-        self.schedule_background_user_fetch(&newly_created, &account.pubkey);
+        self.schedule_background_user_fetch(&contacts, &account.pubkey);
 
         self.event_tracker
             .track_processed_account_event(&event, &account.pubkey)
@@ -101,16 +102,11 @@ impl Whitenoise {
         }
     }
 
-    /// Spawns a single background task that fetches relay lists and metadata for
-    /// newly discovered users from a contact list, with bounded concurrency and
-    /// cancellation support.
+    /// Spawns a single background task that refreshes discovery subscriptions
+    /// and then catches up contact-list users in discovery-sized batches.
     ///
-    /// Instead of spawning one unbounded task per user (which overwhelms the
-    /// relay pool), this processes users in a stream with at most
-    /// [`CONTACT_LIST_FETCH_CONCURRENCY`] fetches in flight at any time.
-    ///
-    /// `refresh_global_subscription_for_user` is called once after the entire
-    /// batch completes, rather than per-user.
+    /// This avoids the login bootstrap flood where each followed user triggers
+    /// its own relay-list and metadata fetch workflow.
     fn schedule_background_user_fetch(&self, pubkeys: &[PublicKey], account_pubkey: &PublicKey) {
         if pubkeys.is_empty() {
             return;
@@ -141,106 +137,136 @@ impl Whitenoise {
 
             tracing::info!(
                 target: "whitenoise::handle_contact_list",
-                "Starting background fetch for {} new users (concurrency: {})",
+                "Starting discovery catch-up for {} followed users",
                 total,
-                CONTACT_LIST_FETCH_CONCURRENCY
             );
+
+            if let Err(error) = whitenoise.refresh_all_global_subscriptions().await {
+                tracing::warn!(
+                    target: "whitenoise::handle_contact_list",
+                    "Failed to refresh discovery subscriptions before catch-up: {}",
+                    error
+                );
+            }
 
             let fetched = Self::fetch_users_batch(whitenoise, &pubkeys, cancel_rx).await;
 
             tracing::info!(
                 target: "whitenoise::handle_contact_list",
-                "Background fetch complete: {}/{} users fetched",
+                "Discovery catch-up complete: {}/{} users queued for processing",
                 fetched,
                 total
             );
-
-            // Refresh all global subscriptions once after all users are
-            // processed. This refreshes every batch on every relay so that
-            // newly discovered users (who may be spread across many different
-            // relay batches) are properly subscribed to.
-            if fetched > 0
-                && let Err(e) = whitenoise.refresh_all_global_subscriptions().await
-            {
-                tracing::warn!(
-                    target: "whitenoise::handle_contact_list",
-                    "Failed to refresh global subscriptions after batch fetch: {}",
-                    e
-                );
-            }
         });
     }
 
-    /// Fetches relay lists and metadata for a batch of users with bounded
-    /// concurrency. Returns the number of users successfully fetched.
-    ///
-    /// Uses `take_while` on the stream to stop yielding new items when
-    /// cancellation is signalled (e.g. on logout). Any in-flight fetches
-    /// finish naturally, but no new futures are created.
+    /// Fetches relay lists and metadata for a batch of users via the discovery
+    /// plane. Returns the number of users whose catch-up work was queued.
     async fn fetch_users_batch(
         whitenoise: &Whitenoise,
         pubkeys: &[PublicKey],
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> usize {
-        let results: Vec<bool> = stream::iter(pubkeys.iter().copied())
-            .take_while({
-                let cancel_rx = cancel_rx.clone();
-                move |_| {
-                    let cancelled = cancel_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
-                    async move {
-                        if cancelled {
-                            tracing::debug!(
-                                target: "whitenoise::handle_contact_list",
-                                "Background fetch cancelled, stopping"
-                            );
-                        }
-                        !cancelled
-                    }
-                }
-            })
-            .map(|pubkey| async move {
-                let user = match User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await
-                {
-                    Ok((user, _)) => user,
-                    Err(e) => {
+        let mut unique_pubkeys = pubkeys.to_vec();
+        unique_pubkeys.sort_unstable_by_key(|pubkey| pubkey.to_hex());
+        unique_pubkeys.dedup();
+
+        let Some(context_relay) = whitenoise
+            .relay_control
+            .discovery()
+            .relays()
+            .first()
+            .cloned()
+        else {
+            tracing::warn!(
+                target: "whitenoise::handle_contact_list",
+                "Skipping discovery catch-up because no discovery relays are configured"
+            );
+            return 0;
+        };
+
+        let mut queued_user_count = 0usize;
+
+        for authors in unique_pubkeys.chunks(CONTACT_LIST_CATCH_UP_BATCH_SIZE) {
+            let cancelled = cancel_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
+            if cancelled {
+                tracing::debug!(
+                    target: "whitenoise::handle_contact_list",
+                    "Discovery catch-up cancelled, stopping"
+                );
+                break;
+            }
+
+            let filter = Filter::new().authors(authors.to_vec()).kinds([
+                Kind::Metadata,
+                Kind::RelayList,
+                Kind::InboxRelays,
+                Kind::MlsKeyPackageRelays,
+            ]);
+
+            match whitenoise
+                .relay_control
+                .discovery()
+                .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT)
+                .await
+            {
+                Ok(events) => {
+                    if let Err(error) =
+                        Self::queue_discovery_catch_up_events(whitenoise, &events, &context_relay)
+                            .await
+                    {
                         tracing::warn!(
                             target: "whitenoise::handle_contact_list",
-                            "Failed to find/create user {}: {}",
-                            pubkey.to_hex(),
-                            e
+                            "Failed to queue discovery catch-up events: {}",
+                            error
                         );
-                        return false;
+                    } else {
+                        queued_user_count += authors.len();
                     }
-                };
-
-                // Fetch relay lists then metadata (serial per user since
-                // metadata fetch benefits from knowing the user's relays)
-                if let Err(e) = user.update_relay_lists(whitenoise).await {
+                }
+                Err(error) => {
                     tracing::warn!(
                         target: "whitenoise::handle_contact_list",
-                        "Failed to fetch relay lists for {}: {}",
-                        pubkey.to_hex(),
-                        e
+                        "Discovery catch-up query failed for batch of {} users: {}",
+                        authors.len(),
+                        error
                     );
                 }
+            }
+        }
 
-                let mut user_for_metadata = user.clone();
-                if let Err(e) = user_for_metadata.sync_metadata(whitenoise).await {
-                    tracing::warn!(
-                        target: "whitenoise::handle_contact_list",
-                        "Failed to fetch metadata for {}: {}",
-                        pubkey.to_hex(),
-                        e
-                    );
-                }
+        queued_user_count
+    }
 
-                true
-            })
-            .buffer_unordered(CONTACT_LIST_FETCH_CONCURRENCY)
-            .collect()
-            .await;
+    async fn queue_discovery_catch_up_events(
+        whitenoise: &Whitenoise,
+        events: &Events,
+        relay_url: &RelayUrl,
+    ) -> Result<()> {
+        let source = SubscriptionContext {
+            plane: RelayPlane::Discovery,
+            account_pubkey: None,
+            relay_url: relay_url.clone(),
+            stream: SubscriptionStream::DiscoveryUserData,
+            group_ids: Vec::new(),
+        };
 
-        results.iter().filter(|&&ok| ok).count()
+        for event in events.iter() {
+            whitenoise
+                .event_sender
+                .send(ProcessableEvent::new_routed_nostr_event(
+                    event.clone(),
+                    source.clone(),
+                ))
+                .await
+                .map_err(|error| {
+                    WhitenoiseError::EventProcessor(format!(
+                        "Failed to enqueue discovery catch-up event: {error}"
+                    ))
+                })?;
+        }
+
+        Ok(())
     }
 }
 

@@ -19,7 +19,14 @@ impl Whitenoise {
         let keys = Keys::generate();
         tracing::debug!(target: "whitenoise::accounts", "Generated new keypair: {}", keys.public_key().to_hex());
 
-        let mut account = self.create_base_account_with_private_key(&keys).await?;
+        let account = self.create_identity_with_keys(&keys).await?;
+
+        tracing::debug!(target: "whitenoise::accounts", "Successfully created new identity: {}", account.pubkey.to_hex());
+        Ok(account)
+    }
+
+    async fn create_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
+        let mut account = self.create_base_account_with_private_key(keys).await?;
         tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
 
         let user = account.user(&self.database).await?;
@@ -33,8 +40,12 @@ impl Whitenoise {
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
-        tracing::debug!(target: "whitenoise::accounts", "Successfully created new identity: {}", account.pubkey.to_hex());
         Ok(account)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_test_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
+        self.create_identity_with_keys(keys).await
     }
 
     /// Logs in an existing user using a private key (nsec or hex format).
@@ -1115,6 +1126,17 @@ impl Whitenoise {
     /// * `account` - The account to log out.
     pub async fn logout(&self, pubkey: &PublicKey) -> Result<()> {
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
+        let ephemeral_warm_relays = self
+            .account_ephemeral_warm_relay_urls(&account)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %pubkey,
+                    "Failed to collect ephemeral warm relays during logout: {error}"
+                );
+                Vec::new()
+            });
 
         // Cancel any running background tasks (contact list user fetches, etc.)
         // before tearing down subscriptions and relay connections.
@@ -1126,6 +1148,19 @@ impl Whitenoise {
         self.relay_control
             .deactivate_account_subscriptions(pubkey)
             .await;
+
+        if !ephemeral_warm_relays.is_empty()
+            && let Err(error) = self
+                .relay_control
+                .unwarm_ephemeral_relays(&ephemeral_warm_relays)
+                .await
+        {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %pubkey,
+                "Failed to unwarm anonymous ephemeral relays during logout: {error}"
+            );
+        }
 
         // Delete the account from the database
         account.delete(&self.database).await?;

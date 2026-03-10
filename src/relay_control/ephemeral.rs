@@ -1,21 +1,13 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
-use tokio::sync::{broadcast, mpsc::Sender};
+use tokio::sync::mpsc::Sender;
 
 use super::{
-    RelayPlane,
-    observability::{RelayObservability, RelayTelemetry},
-    sessions::{
-        RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
-    },
+    ephemeral_executor::{EphemeralExecutor, EphemeralExecutorConfig},
+    observability::RelayObservability,
+    sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy},
 };
 use crate::{
     RelayType,
@@ -39,6 +31,7 @@ pub(crate) struct EphemeralPlaneConfig {
     pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
     pub(crate) auth_policy: RelaySessionAuthPolicy,
     pub(crate) max_publish_attempts: u32,
+    pub(crate) ad_hoc_relay_ttl: Duration,
 }
 
 impl Default for EphemeralPlaneConfig {
@@ -48,6 +41,7 @@ impl Default for EphemeralPlaneConfig {
             reconnect_policy: RelaySessionReconnectPolicy::Disabled,
             auth_policy: RelaySessionAuthPolicy::Disabled,
             max_publish_attempts: 3,
+            ad_hoc_relay_ttl: Duration::from_secs(300),
         }
     }
 }
@@ -56,9 +50,13 @@ impl Default for EphemeralPlaneConfig {
 pub(crate) struct EphemeralPlane {
     config: EphemeralPlaneConfig,
     database: Arc<Database>,
-    event_sender: Sender<ProcessableEvent>,
-    observability: RelayObservability,
-    operation_counter: Arc<AtomicU64>,
+    executor: EphemeralExecutor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EphemeralScope {
+    plane: EphemeralPlane,
+    scope_account_pubkey: Option<PublicKey>,
 }
 
 impl EphemeralPlane {
@@ -69,11 +67,59 @@ impl EphemeralPlane {
         observability: RelayObservability,
     ) -> Self {
         Self {
+            executor: EphemeralExecutor::new(
+                EphemeralExecutorConfig {
+                    timeout: config.timeout,
+                    reconnect_policy: config.reconnect_policy,
+                    auth_policy: config.auth_policy,
+                    ad_hoc_relay_ttl: config.ad_hoc_relay_ttl,
+                },
+                database.clone(),
+                event_sender,
+                observability,
+            ),
             config,
             database,
-            event_sender,
-            observability,
-            operation_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
+        self.executor.warm_relays(relays).await
+    }
+
+    pub(crate) async fn warm_relays_for_account(
+        &self,
+        account_pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> Result<()> {
+        self.executor
+            .warm_relays_for_account(account_pubkey, relays)
+            .await
+    }
+
+    pub(crate) async fn unwarm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
+        self.executor.unwarm_relays(relays).await
+    }
+
+    pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {
+        self.executor.remove_account_scope(account_pubkey).await;
+    }
+
+    pub(crate) async fn remove_all_account_scopes(&self) {
+        self.executor.remove_all_account_scopes().await;
+    }
+
+    pub(crate) fn anonymous_scope(&self) -> EphemeralScope {
+        EphemeralScope {
+            plane: self.clone(),
+            scope_account_pubkey: None,
+        }
+    }
+
+    pub(crate) fn account_scope(&self, account_pubkey: PublicKey) -> EphemeralScope {
+        EphemeralScope {
+            plane: self.clone(),
+            scope_account_pubkey: Some(account_pubkey),
         }
     }
 
@@ -82,12 +128,9 @@ impl EphemeralPlane {
         relays: &[RelayUrl],
         pubkey: PublicKey,
     ) -> Result<Option<Event>> {
-        let filter = Filter::new().author(pubkey).kind(Kind::Metadata);
-        let events = self.fetch_events_from(relays, filter).await?;
-
-        Self::latest_from_events_with_validation(events, Kind::Metadata, |event| {
-            Self::is_metadata_event_semantically_valid(event)
-        })
+        self.anonymous_scope()
+            .fetch_metadata_from(relays, pubkey)
+            .await
     }
 
     pub(crate) async fn fetch_user_relays(
@@ -96,12 +139,9 @@ impl EphemeralPlane {
         relay_type: RelayType,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let filter = Filter::new().author(pubkey).kind(relay_type.into());
-        let events = self.fetch_events_from(relays, filter).await?;
-
-        Self::latest_from_events_with_validation(events, relay_type.into(), |event| {
-            Self::is_relay_event_semantically_valid(event)
-        })
+        self.anonymous_scope()
+            .fetch_user_relays(pubkey, relay_type, relays)
+            .await
     }
 
     pub(crate) async fn fetch_user_key_package(
@@ -109,12 +149,9 @@ impl EphemeralPlane {
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let filter = Filter::new().kind(Kind::MlsKeyPackage).author(pubkey);
-        let events = self.fetch_events_from(relays, filter).await?;
-
-        Self::latest_from_events_with_validation(events, Kind::MlsKeyPackage, |event| {
-            Self::is_key_package_event_semantically_valid(event)
-        })
+        self.anonymous_scope()
+            .fetch_user_key_package(pubkey, relays)
+            .await
     }
 
     pub(crate) async fn publish_gift_wrap_to(
@@ -237,10 +274,17 @@ impl EphemeralPlane {
         account_pubkey: &PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Output<EventId>> {
-        // One session for the full retry group — connect once, retry the publish,
-        // then disconnect. Creating a new client per attempt would reconnect on
-        // every backoff cycle unnecessarily.
-        let session = self.spawn_session("publish", Some(*account_pubkey));
+        self.publish_event_to_scope(event, account_pubkey, relays, Some(*account_pubkey))
+            .await
+    }
+
+    async fn publish_event_to_scope(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        scope_account_pubkey: Option<PublicKey>,
+    ) -> Result<Output<EventId>> {
         let mut last_error: Option<NostrManagerError> = None;
 
         for attempt in 0..self.config.max_publish_attempts {
@@ -257,7 +301,10 @@ impl EphemeralPlane {
                 tokio::time::sleep(delay).await;
             }
 
-            let result = session.publish_event_to(relays, &event).await;
+            let result = self
+                .executor
+                .publish_event_to_scope(scope_account_pubkey, relays, &event)
+                .await;
 
             match result {
                 Ok(output) if !output.success.is_empty() => {
@@ -273,7 +320,6 @@ impl EphemeralPlane {
                         );
                     }
 
-                    session.shutdown().await;
                     return Ok(output);
                 }
                 Ok(output) => {
@@ -300,7 +346,6 @@ impl EphemeralPlane {
             }
         }
 
-        session.shutdown().await;
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
     }
 
@@ -368,12 +413,18 @@ impl EphemeralPlane {
         relays: &[RelayUrl],
         filter: Filter,
     ) -> Result<Events> {
-        let session = self.spawn_session("query", None);
-        let result = session
-            .fetch_events_from(relays, filter, self.config.timeout)
-            .await;
-        session.shutdown().await;
-        result
+        self.fetch_events_from_scope(None, relays, filter).await
+    }
+
+    async fn fetch_events_from_scope(
+        &self,
+        scope_account_pubkey: Option<PublicKey>,
+        relays: &[RelayUrl],
+        filter: Filter,
+    ) -> Result<Events> {
+        self.executor
+            .fetch_events_from_scope(scope_account_pubkey, relays, filter)
+            .await
     }
 
     async fn publish_event_builder_with_signer(
@@ -385,78 +436,9 @@ impl EphemeralPlane {
         let account_pubkey = signer.get_public_key().await?;
         let event = event_builder.sign(&signer).await?;
 
-        self.publish_event_to(event, &account_pubkey, relays).await
-    }
-
-    fn session_config(&self, account_pubkey: Option<PublicKey>) -> RelaySessionConfig {
-        let mut config = RelaySessionConfig::new(RelayPlane::Ephemeral);
-        config.telemetry_account_pubkey = account_pubkey;
-        config.auth_policy = self.config.auth_policy;
-        config.reconnect_policy = self.config.reconnect_policy;
-        config.connect_timeout = self.config.timeout;
-        config
-    }
-
-    fn spawn_session(&self, operation: &str, account_pubkey: Option<PublicKey>) -> RelaySession {
-        let session = RelaySession::new(
-            self.session_config(account_pubkey),
-            self.event_sender.clone(),
-        );
-
-        self.spawn_telemetry_persistor(
-            &format!(
-                "ephemeral:{operation}:{}:{}",
-                account_pubkey
-                    .map(|pubkey| pubkey.to_hex())
-                    .unwrap_or_else(|| "anonymous".to_string()),
-                self.next_operation_id()
-            ),
-            session.telemetry(),
-        );
-
-        session
-    }
-
-    fn spawn_telemetry_persistor(
-        &self,
-        task_name: &str,
-        mut receiver: broadcast::Receiver<RelayTelemetry>,
-    ) {
-        let database = self.database.clone();
-        let observability = self.observability.clone();
-        let task_name = task_name.to_string();
-
-        tokio::spawn(async move {
-            loop {
-                match receiver.recv().await {
-                    Ok(telemetry) => {
-                        if let Err(error) = observability.record(&database, &telemetry).await {
-                            tracing::error!(
-                                target: "whitenoise::relay_control::observability",
-                                task = task_name,
-                                plane = telemetry.plane.as_str(),
-                                relay_url = %telemetry.relay_url,
-                                kind = telemetry.kind.as_str(),
-                                "Failed to persist relay telemetry: {error}"
-                            );
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            target: "whitenoise::relay_control::observability",
-                            task = task_name,
-                            skipped,
-                            "Relay telemetry receiver lagged; dropping oldest samples"
-                        );
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
-
-    fn next_operation_id(&self) -> u64 {
-        self.operation_counter.fetch_add(1, Ordering::Relaxed) + 1
+        self.account_scope(account_pubkey)
+            .publish_event_to(event, relays)
+            .await
     }
 
     async fn track_published_event(
@@ -578,6 +560,74 @@ impl EphemeralPlane {
     }
 }
 
+impl EphemeralScope {
+    pub(crate) async fn fetch_events_from(
+        &self,
+        relays: &[RelayUrl],
+        filter: Filter,
+    ) -> Result<Events> {
+        self.plane
+            .fetch_events_from_scope(self.scope_account_pubkey, relays, filter)
+            .await
+    }
+
+    pub(crate) async fn fetch_metadata_from(
+        &self,
+        relays: &[RelayUrl],
+        pubkey: PublicKey,
+    ) -> Result<Option<Event>> {
+        let filter = Filter::new().author(pubkey).kind(Kind::Metadata);
+        let events = self.fetch_events_from(relays, filter).await?;
+
+        EphemeralPlane::latest_from_events_with_validation(events, Kind::Metadata, |event| {
+            EphemeralPlane::is_metadata_event_semantically_valid(event)
+        })
+    }
+
+    pub(crate) async fn fetch_user_relays(
+        &self,
+        pubkey: PublicKey,
+        relay_type: RelayType,
+        relays: &[RelayUrl],
+    ) -> Result<Option<Event>> {
+        let filter = Filter::new().author(pubkey).kind(relay_type.into());
+        let events = self.fetch_events_from(relays, filter).await?;
+
+        EphemeralPlane::latest_from_events_with_validation(events, relay_type.into(), |event| {
+            EphemeralPlane::is_relay_event_semantically_valid(event)
+        })
+    }
+
+    pub(crate) async fn fetch_user_key_package(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> Result<Option<Event>> {
+        let filter = Filter::new().kind(Kind::MlsKeyPackage).author(pubkey);
+        let events = self.fetch_events_from(relays, filter).await?;
+
+        EphemeralPlane::latest_from_events_with_validation(events, Kind::MlsKeyPackage, |event| {
+            EphemeralPlane::is_key_package_event_semantically_valid(event)
+        })
+    }
+
+    pub(crate) async fn publish_event_to(
+        &self,
+        event: Event,
+        relays: &[RelayUrl],
+    ) -> Result<Output<EventId>> {
+        let account_pubkey = self.scope_account_pubkey.ok_or_else(|| {
+            NostrManagerError::WhitenoiseInstance(
+                "Cannot publish from an anonymous ephemeral scope".to_string(),
+            )
+        })?;
+
+        self.plane
+            .publish_event_to_scope(event, &account_pubkey, relays, self.scope_account_pubkey)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::PathBuf, time::SystemTime};
@@ -590,7 +640,7 @@ mod tests {
         relay_control::{
             RelayPlane,
             observability::{RelayObservabilityConfig, RelayTelemetryKind},
-            sessions::RelaySessionConfig,
+            sessions::{RelaySession, RelaySessionConfig},
         },
         whitenoise::database::{Database, relay_events::RelayEventRecord},
     };
@@ -632,6 +682,7 @@ mod tests {
             RelaySessionReconnectPolicy::Disabled
         );
         assert_eq!(config.max_publish_attempts, 3);
+        assert_eq!(config.ad_hoc_relay_ttl, Duration::from_secs(300));
     }
 
     #[tokio::test]
@@ -656,6 +707,91 @@ mod tests {
             sender_keys.public_key(),
             "Giftwrap should use an ephemeral outer key, not the sender key"
         );
+    }
+
+    #[tokio::test]
+    async fn test_executor_reuses_sessions_by_scope() {
+        let database = Arc::new(setup_test_db().await);
+        let plane = test_plane(database, EphemeralPlaneConfig::default());
+
+        let anonymous_a = plane.executor.session_for_scope(None).await;
+        let anonymous_b = plane.executor.session_for_scope(None).await;
+        let relay_url = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+
+        anonymous_a
+            .client()
+            .add_relay(relay_url.clone())
+            .await
+            .unwrap();
+
+        assert!(anonymous_b.client().relay(&relay_url).await.is_ok());
+
+        let scoped = plane
+            .executor
+            .session_for_scope(Some(Keys::generate().public_key()))
+            .await;
+        assert!(scoped.client().relay(&relay_url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ad_hoc_relays_are_evicted_after_ttl() {
+        let database = Arc::new(setup_test_db().await);
+        let plane = test_plane(
+            database,
+            EphemeralPlaneConfig {
+                timeout: Duration::from_millis(5),
+                reconnect_policy: RelaySessionReconnectPolicy::Disabled,
+                auth_policy: RelaySessionAuthPolicy::Disabled,
+                max_publish_attempts: 1,
+                ad_hoc_relay_ttl: Duration::from_millis(20),
+            },
+        );
+        let scope = plane.anonymous_scope();
+        let relay_a = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+        let relay_b = RelayUrl::parse("ws://127.0.0.1:2").unwrap();
+        let filter = Filter::new().kind(Kind::Metadata);
+
+        let _ = scope
+            .fetch_events_from(std::slice::from_ref(&relay_a), filter.clone())
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = scope
+            .fetch_events_from(std::slice::from_ref(&relay_b), filter)
+            .await;
+
+        let anonymous = plane.executor.session_for_scope(None).await;
+        assert!(anonymous.client().relay(&relay_a).await.is_err());
+        assert!(anonymous.client().relay(&relay_b).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pinned_relays_survive_ad_hoc_eviction() {
+        let database = Arc::new(setup_test_db().await);
+        let plane = test_plane(
+            database,
+            EphemeralPlaneConfig {
+                timeout: Duration::from_millis(5),
+                reconnect_policy: RelaySessionReconnectPolicy::Disabled,
+                auth_policy: RelaySessionAuthPolicy::Disabled,
+                max_publish_attempts: 1,
+                ad_hoc_relay_ttl: Duration::from_millis(20),
+            },
+        );
+        let pinned_relay = RelayUrl::parse("ws://127.0.0.1:3").unwrap();
+        let ad_hoc_relay = RelayUrl::parse("ws://127.0.0.1:4").unwrap();
+        let scope = plane.anonymous_scope();
+
+        let _ = plane.warm_relays(std::slice::from_ref(&pinned_relay)).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = scope
+            .fetch_events_from(
+                std::slice::from_ref(&ad_hoc_relay),
+                Filter::new().kind(Kind::Metadata),
+            )
+            .await;
+
+        let anonymous = plane.executor.session_for_scope(None).await;
+        assert!(anonymous.client().relay(&pinned_relay).await.is_ok());
     }
 
     // Use a loopback URL so there is no DNS lookup and connection refusal is instant.
@@ -742,6 +878,7 @@ mod tests {
                 reconnect_policy: RelaySessionReconnectPolicy::Disabled,
                 auth_policy: RelaySessionAuthPolicy::Disabled,
                 max_publish_attempts: 2,
+                ad_hoc_relay_ttl: Duration::from_millis(50),
             },
         );
 

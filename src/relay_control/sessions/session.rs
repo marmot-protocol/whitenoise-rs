@@ -7,7 +7,7 @@ use std::{
 };
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{RwLock, broadcast, mpsc::Sender};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 
 use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
 use crate::{
@@ -24,6 +24,7 @@ use crate::{
 #[derive(Debug)]
 struct RelaySessionState {
     notification_handler_registered: AtomicBool,
+    publish_lock: Mutex<()>,
     subscription_relays: RwLock<HashMap<SubscriptionId, Vec<RelayUrl>>>,
 }
 
@@ -50,6 +51,7 @@ impl RelaySession {
             router: Arc::new(RelayRouter::default()),
             state: Arc::new(RelaySessionState {
                 notification_handler_registered: AtomicBool::new(false),
+                publish_lock: Mutex::new(()),
                 subscription_relays: RwLock::new(HashMap::new()),
             }),
         };
@@ -143,11 +145,75 @@ impl RelaySession {
             );
         }
 
-        if added_new_relay || !self.has_any_relay_connected(relay_urls).await {
-            self.client.connect().await;
-            self.client
-                .wait_for_connection(self.config.connect_timeout)
-                .await;
+        let mut relays_to_wait = Vec::new();
+        for relay_url in relay_urls {
+            let relay = match self.client.relay(relay_url).await {
+                Ok(relay) => relay,
+                Err(error) => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} disappeared from session client: {error}"
+                    )));
+                }
+            };
+
+            match relay.status() {
+                RelayStatus::Connected => {}
+                RelayStatus::Connecting => {
+                    relays_to_wait.push(relay);
+                }
+                RelayStatus::Disconnected => {
+                    relay.disconnect();
+                    relay.connect();
+                    relays_to_wait.push(relay);
+                }
+                RelayStatus::Banned => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} is banned and cannot be used"
+                    )));
+                }
+                _ => {
+                    relay.connect();
+                    relays_to_wait.push(relay);
+                }
+            }
+        }
+
+        if added_new_relay || !relays_to_wait.is_empty() {
+            for relay in relays_to_wait {
+                relay.wait_for_connection(self.config.connect_timeout).await;
+            }
+        }
+
+        let mut connected_relays = 0usize;
+        let mut disconnected_after_wait = Vec::new();
+
+        for relay_url in relay_urls {
+            let relay = match self.client.relay(relay_url).await {
+                Ok(relay) => relay,
+                Err(error) => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} disappeared from session client after connect wait: {error}"
+                    )));
+                }
+            };
+
+            match relay.status() {
+                RelayStatus::Connected => connected_relays += 1,
+                status => disconnected_after_wait.push(format!("{relay_url} ({status:?})")),
+            }
+        }
+
+        if connected_relays == 0 {
+            if !disconnected_after_wait.is_empty() {
+                tracing::warn!(
+                    target: "whitenoise::relay_control::session",
+                    "No requested relays connected after waiting {}ms: [{}]",
+                    self.config.connect_timeout.as_millis(),
+                    disconnected_after_wait.join(", "),
+                );
+            }
+
+            return Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections));
         }
 
         Ok(())
@@ -226,6 +292,8 @@ impl RelaySession {
         relay_urls: &[RelayUrl],
         event: &Event,
     ) -> Result<Output<EventId>> {
+        let _publish_guard = self.state.publish_lock.lock().await;
+
         for relay_url in relay_urls {
             self.emit_telemetry(Self::apply_telemetry_scope(
                 self.config.telemetry_account_pubkey,
@@ -275,6 +343,13 @@ impl RelaySession {
                             )
                             .with_message(message.clone()),
                         ));
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::session",
+                            plane = self.config.plane.as_str(),
+                            relay_url = %relay_url,
+                            event_id = %event.id,
+                            "Relay rejected publish: {message}"
+                        );
                     }
                 }
 
@@ -296,6 +371,11 @@ impl RelaySession {
                 Err(error.into())
             }
         }
+    }
+
+    pub(crate) async fn remove_relay(&self, relay_url: &RelayUrl) -> Result<()> {
+        self.client.force_remove_relay(relay_url.clone()).await?;
+        Ok(())
     }
 
     pub(crate) async fn subscribe_with_id_to(

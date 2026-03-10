@@ -1212,11 +1212,7 @@ impl Whitenoise {
     }
 
     async fn sync_discovery_subscriptions(&self) -> Result<()> {
-        let watched_users = User::all_users_with_relay_urls(self)
-            .await?
-            .into_iter()
-            .map(|(pubkey, _)| pubkey)
-            .collect::<Vec<_>>();
+        let watched_users = User::all_pubkeys(&self.database).await?;
         let follow_list_accounts = Account::all(&self.database)
             .await?
             .into_iter()
@@ -1452,45 +1448,17 @@ pub mod test_utils {
     ) -> Vec<(Account, Keys)> {
         let mut accounts = Vec::new();
         for _ in 0..count {
-            // Generate keys first
             let keys = create_test_keys();
-            // Use login to create and register the account properly
             let account = whitenoise
-                .login(keys.secret_key().to_secret_hex())
+                .create_test_identity_with_keys(&keys)
                 .await
                 .unwrap();
-            accounts.push((account.clone(), keys.clone()));
-            // publish keypackage to relays
             let key_package_relays = account.key_package_relays(whitenoise).await.unwrap();
-            let (ekp, tags, hash_ref) = whitenoise
-                .encoded_key_package(&account, &key_package_relays)
+            whitenoise
+                .create_and_publish_key_package(&account, &key_package_relays)
                 .await
                 .unwrap();
-
-            let key_package_relays_urls =
-                Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
-
-            let result = whitenoise
-                .relay_control
-                .publish_key_package_with_signer(
-                    &ekp,
-                    &key_package_relays_urls,
-                    &tags,
-                    Arc::new(keys),
-                )
-                .await
-                .unwrap();
-
-            // Track the published key package for lifecycle management in tests
-            if !result.success.is_empty() {
-                let _ = crate::whitenoise::database::published_key_packages::PublishedKeyPackage::create(
-                    &account.pubkey,
-                    &hash_ref,
-                    &result.id().to_hex(),
-                    &whitenoise.database,
-                )
-                .await;
-            }
+            accounts.push((account, keys));
         }
         accounts
     }

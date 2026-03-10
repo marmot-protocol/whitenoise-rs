@@ -338,6 +338,75 @@ impl RelayControlPlane {
 The important point is the routing boundary: plane selection happens in the
 control plane, not inside a universal client object.
 
+## Focused Next Step: Ephemeral Executor And Discovery Catch-Up
+
+The next implementation slice should address two linked problems together:
+
+1. targeted relay work still reconnects too often because the ephemeral plane
+   creates and tears down a session per operation
+2. initial contact-list bootstrap still behaves like "N users, N network
+   workflows" instead of discovery-sized batched catch-up
+
+### Target State
+
+#### Ephemeral Executor
+
+- `EphemeralPlane` should use a reusable `EphemeralExecutor` instead of
+  spawning a fresh `RelaySession` per fetch/publish
+- the executor should own:
+  - one anonymous session for unauthenticated query/fetch work
+  - one reusable session per publishing account for account-scoped telemetry
+- the executor should keep these relays warm:
+  - discovery relays
+  - NIP-65 relays for logged-in accounts
+  - key-package relays for logged-in accounts
+- inbox relays must NOT be warmed here; they remain exclusive to account inbox
+  planes
+- arbitrary target relays must still be accepted per operation and added on
+  demand
+
+Initial implementation can allow dynamic relay growth. Later work should add
+idle eviction / warm-set reconciliation so ad hoc relay fanout does not become
+permanent accumulation.
+
+#### Discovery Catch-Up
+
+- newly-followed users should be added to the main long-lived discovery watched
+  set immediately
+- the watched set should include all users stored in the local database, not
+  only users that already have relay rows
+- initial catch-up for newly-added users should run through the already-warm
+  discovery session in large author batches
+- the steady-state target is transient discovery catch-up subscriptions that
+  close on EOSE / timeout
+
+Initial implementation can use batched discovery queries. The EOSE-based
+subscription variant should come next once structured EOSE handling is added to
+`RelaySession`.
+
+### Concrete Landing Order
+
+1. introduce `EphemeralExecutor` and move ephemeral fetch/publish methods onto
+   reusable sessions
+2. warm discovery relays plus logged-in account NIP-65 / key-package relays on
+   the executor
+3. change discovery watched-user selection to all locally stored users
+4. replace contact-list bootstrap's per-user relay/metadata fetch loop with
+   batched discovery catch-up
+5. add first-class EOSE handling and swap catch-up from queries to
+   EOSE-terminated subscriptions
+
+### Validation
+
+- `just precommit-quick`
+- Docker-backed scenarios:
+  - `just docker-up`
+  - `just int-test login-flow`
+  - `just int-test user-discovery`
+  - `just int-test follow-management`
+  - `just int-test notification-streaming`
+  - `just docker-down`
+
 ## Implementation Snapshot
 
 Status as of March 9, 2026:

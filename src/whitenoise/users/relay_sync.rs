@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
+use crate::relay_control::ephemeral::EphemeralScope;
 use crate::whitenoise::{
     Whitenoise,
     database::processed_events::ProcessedEvent,
@@ -15,6 +16,17 @@ use crate::whitenoise::{
 impl User {
     /// Fetches the latest relay lists for this user from Nostr and updates the local database
     pub(crate) async fn update_relay_lists(&self, whitenoise: &Whitenoise) -> Result<()> {
+        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        self.update_relay_lists_with_scope(whitenoise, &scope)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_relay_lists_with_scope(
+        &self,
+        whitenoise: &Whitenoise,
+        scope: &EphemeralScope,
+    ) -> Result<Vec<Relay>> {
         let initial_query_relays = self.get_query_relays(whitenoise).await?;
 
         tracing::info!(
@@ -25,10 +37,10 @@ impl User {
         );
 
         let updated_query_relays = self
-            .update_nip65_relays(whitenoise, &initial_query_relays)
+            .update_nip65_relays_with_scope(whitenoise, scope, &initial_query_relays)
             .await?;
 
-        self.update_secondary_relay_types(whitenoise, &updated_query_relays)
+        self.update_secondary_relay_types_with_scope(whitenoise, scope, &updated_query_relays)
             .await?;
 
         tracing::info!(
@@ -37,7 +49,7 @@ impl User {
             self.pubkey
         );
 
-        Ok(())
+        Ok(updated_query_relays)
     }
 
     pub(super) async fn get_query_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
@@ -56,13 +68,25 @@ impl User {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn update_nip65_relays(
         &self,
         whitenoise: &Whitenoise,
         query_relays: &[Relay],
     ) -> Result<Vec<Relay>> {
+        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        self.update_nip65_relays_with_scope(whitenoise, &scope, query_relays)
+            .await
+    }
+
+    async fn update_nip65_relays_with_scope(
+        &self,
+        whitenoise: &Whitenoise,
+        scope: &EphemeralScope,
+        query_relays: &[Relay],
+    ) -> Result<Vec<Relay>> {
         match self
-            .sync_relays_for_type(whitenoise, RelayType::Nip65, query_relays)
+            .sync_relays_for_type_with_scope(whitenoise, scope, RelayType::Nip65, query_relays)
             .await
         {
             Ok(true) => {
@@ -95,26 +119,60 @@ impl User {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn update_secondary_relay_types(
         &self,
         whitenoise: &Whitenoise,
         query_relays: &[Relay],
     ) -> Result<()> {
-        const SECONDARY_RELAY_TYPES: &[RelayType] = &[RelayType::Inbox, RelayType::KeyPackage];
+        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        self.update_secondary_relay_types_with_scope(whitenoise, &scope, query_relays)
+            .await
+    }
 
-        for &relay_type in SECONDARY_RELAY_TYPES {
-            if let Err(e) = self
-                .sync_relays_for_type(whitenoise, relay_type, query_relays)
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::users::update_secondary_relay_types",
-                    "Failed to update {:?} relays for user {}: {}",
-                    relay_type,
-                    self.pubkey,
-                    e
-                );
-                // Continue with other relay types - individual failures shouldn't stop the process
+    async fn update_secondary_relay_types_with_scope(
+        &self,
+        whitenoise: &Whitenoise,
+        scope: &EphemeralScope,
+        query_relays: &[Relay],
+    ) -> Result<()> {
+        const SECONDARY_RELAY_TYPES: &[RelayType] = &[RelayType::Inbox, RelayType::KeyPackage];
+        let relays_urls: Vec<_> = Relay::urls(query_relays);
+
+        let (inbox_result, key_package_result) = tokio::join!(
+            scope.fetch_user_relays(self.pubkey, RelayType::Inbox, &relays_urls),
+            scope.fetch_user_relays(self.pubkey, RelayType::KeyPackage, &relays_urls),
+        );
+
+        for (relay_type, relay_event_result) in SECONDARY_RELAY_TYPES
+            .iter()
+            .copied()
+            .zip([inbox_result, key_package_result])
+        {
+            match relay_event_result {
+                Ok(relay_event) => {
+                    if let Err(error) = self
+                        .apply_relay_event(whitenoise, relay_type, relay_event)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::users::update_secondary_relay_types",
+                            "Failed to update {:?} relays for user {}: {}",
+                            relay_type,
+                            self.pubkey,
+                            error
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::users::update_secondary_relay_types",
+                        "Failed to fetch {:?} relays for user {}: {}",
+                        relay_type,
+                        self.pubkey,
+                        error
+                    );
+                }
             }
         }
 
@@ -242,15 +300,27 @@ impl User {
     /// Synchronizes relays for a specific type with the network state.
     ///
     /// Returns `true` if changes were made, `false` if no changes needed.
+    #[cfg(test)]
     pub(super) async fn sync_relays_for_type(
         &self,
         whitenoise: &Whitenoise,
         relay_type: RelayType,
         query_relays: &[Relay],
     ) -> Result<bool> {
+        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        self.sync_relays_for_type_with_scope(whitenoise, &scope, relay_type, query_relays)
+            .await
+    }
+
+    async fn sync_relays_for_type_with_scope(
+        &self,
+        whitenoise: &Whitenoise,
+        scope: &EphemeralScope,
+        relay_type: RelayType,
+        query_relays: &[Relay],
+    ) -> Result<bool> {
         let relays_urls: Vec<_> = Relay::urls(query_relays);
-        let relay_event = whitenoise
-            .relay_control
+        let relay_event = scope
             .fetch_user_relays(self.pubkey, relay_type, &relays_urls)
             .await
             .map_err(|e| {
@@ -262,6 +332,16 @@ impl User {
                 e
             })?;
 
+        self.apply_relay_event(whitenoise, relay_type, relay_event)
+            .await
+    }
+
+    async fn apply_relay_event(
+        &self,
+        whitenoise: &Whitenoise,
+        relay_type: RelayType,
+        relay_event: Option<Event>,
+    ) -> Result<bool> {
         match relay_event {
             Some(event) => {
                 let relay_hashset: HashSet<_> =
@@ -301,6 +381,7 @@ impl User {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn all_users_with_relay_urls(
         whitenoise: &Whitenoise,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>> {
