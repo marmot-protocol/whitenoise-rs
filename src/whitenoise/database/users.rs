@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Metadata, PublicKey, RelayUrl};
+#[cfg(test)]
+use nostr_sdk::RelayUrl;
+use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
 use crate::{
@@ -90,6 +92,7 @@ impl User {
     /// This uses a LEFT JOIN to avoid the N+1 query problem of fetching
     /// each user's relays individually. Users with no NIP-65 relays are
     /// included with an empty relay URL list.
+    #[cfg(test)]
     pub(crate) async fn all_with_nip65_relay_urls(
         database: &Database,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>, WhitenoiseError> {
@@ -127,6 +130,26 @@ impl User {
         }
 
         Ok(result)
+    }
+
+    /// Fetches the distinct pubkeys for every user stored in the local database.
+    pub(crate) async fn all_pubkeys(
+        database: &Database,
+    ) -> Result<Vec<PublicKey>, WhitenoiseError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT pubkey
+             FROM users
+             ORDER BY pubkey",
+        )
+        .fetch_all(&database.pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+
+        rows.into_iter()
+            .map(|pubkey_hex| {
+                PublicKey::parse(&pubkey_hex).map_err(|error| WhitenoiseError::Other(error.into()))
+            })
+            .collect()
     }
 
     /// Finds an existing user by public key or creates a new one if not found.

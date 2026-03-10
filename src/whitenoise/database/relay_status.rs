@@ -36,6 +36,13 @@ pub(crate) struct RelayStatusRecord {
     pub(crate) updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RelayStatusLookupKey {
+    pub(crate) relay_url: RelayUrl,
+    pub(crate) plane: RelayPlane,
+    pub(crate) account_pubkey: Option<PublicKey>,
+}
+
 impl<'r, R> sqlx::FromRow<'r, R> for RelayStatusRecord
 where
     R: sqlx::Row,
@@ -91,6 +98,14 @@ where
 }
 
 impl RelayStatusRecord {
+    pub(crate) fn lookup_key(&self) -> RelayStatusLookupKey {
+        RelayStatusLookupKey {
+            relay_url: self.relay_url.clone(),
+            plane: self.plane,
+            account_pubkey: self.account_pubkey,
+        }
+    }
+
     pub(crate) async fn find(
         relay_url: &RelayUrl,
         plane: RelayPlane,
@@ -162,16 +177,15 @@ impl RelayStatusRecord {
         Ok(record)
     }
 
-    /// Return the best status record for a relay URL across all planes.
-    ///
-    /// Selects the row with the highest `success_count` so the caller can
-    /// derive a meaningful connection state without knowing which plane
-    /// the relay belongs to.
-    pub(crate) async fn find_any_plane(
-        relay_url: &RelayUrl,
+    pub(crate) async fn find_many(
+        lookup_keys: &[RelayStatusLookupKey],
         database: &Database,
-    ) -> Result<Option<Self>, DatabaseError> {
-        let record = sqlx::query_as::<_, Self>(
+    ) -> Result<Vec<Self>, DatabaseError> {
+        if lookup_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query_builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT
                 id,
                 relay_url,
@@ -192,15 +206,39 @@ impl RelayStatusRecord {
                 created_at,
                 updated_at
              FROM relay_status
-             WHERE relay_url = ?
-             ORDER BY success_count DESC
-             LIMIT 1",
-        )
-        .bind(normalize_relay_url(relay_url))
-        .fetch_optional(&database.pool)
-        .await?;
+             WHERE ",
+        );
 
-        Ok(record)
+        for (index, lookup_key) in lookup_keys.iter().enumerate() {
+            if index > 0 {
+                query_builder.push(" OR ");
+            }
+
+            query_builder.push("(");
+            query_builder.push("relay_url = ");
+            query_builder.push_bind(normalize_relay_url(&lookup_key.relay_url));
+            query_builder.push(" AND plane = ");
+            query_builder.push_bind(lookup_key.plane.as_str());
+
+            match lookup_key.account_pubkey {
+                Some(account_pubkey) => {
+                    query_builder.push(" AND account_pubkey = ");
+                    query_builder.push_bind(account_pubkey.to_hex());
+                }
+                None => {
+                    query_builder.push(" AND account_pubkey IS NULL");
+                }
+            }
+
+            query_builder.push(")");
+        }
+
+        let records = query_builder
+            .build_query_as::<Self>()
+            .fetch_all(&database.pool)
+            .await?;
+
+        Ok(records)
     }
 
     pub(crate) async fn upsert_from_telemetry(

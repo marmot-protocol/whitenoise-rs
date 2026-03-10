@@ -3,6 +3,7 @@ use crate::{RelayType, WhitenoiseError};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// Test case for subscription-driven updates using builder pattern
 pub struct PublishSubscriptionUpdateTestCase {
@@ -14,6 +15,10 @@ pub struct PublishSubscriptionUpdateTestCase {
 }
 
 impl PublishSubscriptionUpdateTestCase {
+    fn verification_retry_config() -> RetryConfig {
+        RetryConfig::new(30, Duration::from_millis(200))
+    }
+
     /// Create test case for account-based updates
     pub fn for_account(account_name: &str) -> Self {
         Self {
@@ -93,7 +98,7 @@ impl PublishSubscriptionUpdateTestCase {
                 .whitenoise
                 .find_or_create_user_by_pubkey(
                     &pubkey,
-                    crate::whitenoise::users::UserSyncMode::Background,
+                    crate::whitenoise::users::UserSyncMode::Blocking,
                 )
                 .await?;
 
@@ -182,39 +187,58 @@ impl PublishSubscriptionUpdateTestCase {
         keys: &Keys,
     ) -> Result<(), WhitenoiseError> {
         if let Some(account_name) = &self.account_name {
-            // Account-based verification
             let account = context.get_account(account_name)?;
-            let updated_metadata = account.metadata(context.whitenoise).await?;
+            let expected_name = expected_metadata.name.clone();
+            let expected_about = expected_metadata.about.clone();
+            let expected_display_name = expected_metadata.display_name.clone();
 
-            assert_eq!(
-                updated_metadata.name, expected_metadata.name,
-                "Account subscription-driven metadata update did not apply"
-            );
+            retry_until(
+                Self::verification_retry_config(),
+                || async {
+                    let updated_metadata = account.metadata(context.whitenoise).await?;
+
+                    if updated_metadata.name == expected_name
+                        && updated_metadata.about == expected_about
+                        && updated_metadata.display_name == expected_display_name
+                    {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "Account subscription-driven metadata update not yet applied"
+                        )))
+                    }
+                },
+                "account subscription metadata update",
+            )
+            .await?;
         } else {
-            // External user verification
             let pubkey = keys.public_key();
-            let updated_user = context.whitenoise.find_user_by_pubkey(&pubkey).await?;
+            let expected_name = expected_metadata.name.clone();
+            let expected_about = expected_metadata.about.clone();
+            let expected_display_name = expected_metadata.display_name.clone();
 
-            assert_eq!(
-                updated_user.metadata.name, expected_metadata.name,
-                "External user subscription-driven metadata update did not apply"
-            );
+            retry_until(
+                Self::verification_retry_config(),
+                || async {
+                    let updated_user = context.whitenoise.find_user_by_pubkey(&pubkey).await?;
 
-            if let Some(expected_about) = &expected_metadata.about {
-                assert_eq!(
-                    updated_user.metadata.about.as_ref(),
-                    Some(expected_about),
-                    "External user subscription-driven about field did not apply"
-                );
-            }
-
-            if let Some(expected_display_name) = &expected_metadata.display_name {
-                assert_eq!(
-                    updated_user.metadata.display_name.as_ref(),
-                    Some(expected_display_name),
-                    "External user subscription-driven display_name field did not apply"
-                );
-            }
+                    if updated_user.metadata.name == expected_name
+                        && updated_user.metadata.about == expected_about
+                        && updated_user.metadata.display_name == expected_display_name
+                    {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "External user subscription-driven metadata update not yet applied"
+                        )))
+                    }
+                },
+                &format!(
+                    "external user subscription metadata update for {}",
+                    &pubkey.to_hex()[..8]
+                ),
+            )
+            .await?;
         }
 
         tracing::info!("✓ Subscription-driven metadata update verified");
@@ -228,34 +252,75 @@ impl PublishSubscriptionUpdateTestCase {
         expected_relay_url: &str,
         keys: &Keys,
     ) -> Result<(), WhitenoiseError> {
-        let user = if let Some(account_name) = &self.account_name {
-            let account = context.get_account(account_name)?;
-            context
-                .whitenoise
-                .find_user_by_pubkey(&account.pubkey)
-                .await?
-        } else {
-            let pubkey = keys.public_key();
-            context.whitenoise.find_user_by_pubkey(&pubkey).await?
-        };
-
-        let nip65_relays = user
-            .relays_by_type(RelayType::Nip65, context.whitenoise)
-            .await?;
         let expected_relay = RelayUrl::parse(expected_relay_url).unwrap();
-        let has_new_relay = nip65_relays.iter().any(|r| r.url == expected_relay);
-
         let user_type = if self.account_name.is_some() {
             "Account"
         } else {
             "External user"
         };
 
-        assert!(
-            has_new_relay,
-            "{} NIP-65 relays should include subscription-updated relay: {}, got: {:?}",
-            user_type, expected_relay_url, nip65_relays
-        );
+        if let Some(account_name) = &self.account_name {
+            let account_pubkey = context.get_account(account_name)?.pubkey;
+
+            retry_until(
+                Self::verification_retry_config(),
+                || async {
+                    let user = context
+                        .whitenoise
+                        .find_user_by_pubkey(&account_pubkey)
+                        .await?;
+                    let nip65_relays = user
+                        .relays_by_type(RelayType::Nip65, context.whitenoise)
+                        .await?;
+                    let has_new_relay = nip65_relays.iter().any(|r| r.url == expected_relay);
+
+                    if has_new_relay {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "{} NIP-65 relays missing subscription-updated relay: {}, got: {:?}",
+                            user_type,
+                            expected_relay_url,
+                            nip65_relays
+                        )))
+                    }
+                },
+                &format!(
+                    "{} subscription relay list update",
+                    user_type.to_lowercase()
+                ),
+            )
+            .await?;
+        } else {
+            let pubkey = keys.public_key();
+
+            retry_until(
+                Self::verification_retry_config(),
+                || async {
+                    let user = context.whitenoise.find_user_by_pubkey(&pubkey).await?;
+                    let nip65_relays = user
+                        .relays_by_type(RelayType::Nip65, context.whitenoise)
+                        .await?;
+                    let has_new_relay = nip65_relays.iter().any(|r| r.url == expected_relay);
+
+                    if has_new_relay {
+                        Ok(())
+                    } else {
+                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "{} NIP-65 relays missing subscription-updated relay: {}, got: {:?}",
+                            user_type,
+                            expected_relay_url,
+                            nip65_relays
+                        )))
+                    }
+                },
+                &format!(
+                    "external user subscription relay list update for {}",
+                    &pubkey.to_hex()[..8]
+                ),
+            )
+            .await?;
+        }
 
         tracing::info!(
             "✓ {} subscription-driven relay list update verified",
@@ -277,17 +342,27 @@ impl PublishSubscriptionUpdateTestCase {
         };
 
         let account = context.get_account(account_name)?;
-        let follows = context.whitenoise.follows(account).await?;
-
         let expected: HashSet<PublicKey> = expected_follows.iter().copied().collect();
-        let actual: HashSet<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
 
-        assert!(
-            actual == expected,
-            "Account follows do not match expected follows. Missing: {:?}, Extra: {:?}",
-            expected.difference(&actual).collect::<Vec<_>>(),
-            actual.difference(&expected).collect::<Vec<_>>()
-        );
+        retry_until(
+            Self::verification_retry_config(),
+            || async {
+                let follows = context.whitenoise.follows(account).await?;
+                let actual: HashSet<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
+
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Account follows do not match expected follows. Missing: {:?}, Extra: {:?}",
+                        expected.difference(&actual).collect::<Vec<_>>(),
+                        actual.difference(&expected).collect::<Vec<_>>()
+                    )))
+                }
+            },
+            &format!("account follow list update for {}", account_name),
+        )
+        .await?;
 
         tracing::info!("✓ Account follow list exactly matches expected set");
         Ok(())

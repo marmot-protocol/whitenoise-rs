@@ -537,7 +537,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let saved_user = user.save(&whitenoise.database).await.unwrap();
-        let initial_relay_url = RelayUrl::parse("wss://initial.example.com").unwrap();
+        let initial_relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
         let initial_relay = whitenoise
             .find_or_create_relay_by_url(&initial_relay_url)
             .await
@@ -2053,7 +2053,7 @@ mod tests {
             };
             let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-            let initial_relay = RelayUrl::parse("wss://initial.example.com").unwrap();
+            let initial_relay = RelayUrl::parse("ws://localhost:8080").unwrap();
             let r = whitenoise
                 .find_or_create_relay_by_url(&initial_relay)
                 .await
@@ -2142,7 +2142,7 @@ mod tests {
             };
             let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-            let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+            let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
             let query_relays = vec![crate::whitenoise::relays::Relay {
                 id: None,
                 url: relay_url,

@@ -268,6 +268,24 @@ impl DiscoveryPlane {
         self.session.telemetry()
     }
 
+    pub(crate) async fn fetch_events(
+        &self,
+        filter: Filter,
+        timeout: std::time::Duration,
+    ) -> Result<Events> {
+        if !self
+            .session
+            .has_any_relay_connected(&self.config.relays)
+            .await
+        {
+            self.start().await?;
+        }
+
+        self.session
+            .fetch_events_from(&self.config.relays, filter, timeout)
+            .await
+    }
+
     pub(crate) async fn has_subscriptions(&self) -> bool {
         let state = self.state.read().await;
         !state.public_subscription_ids.is_empty() || !state.follow_list_subscription_ids.is_empty()

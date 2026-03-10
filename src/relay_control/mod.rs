@@ -22,6 +22,7 @@ use tokio::sync::{RwLock, broadcast, mpsc::Sender};
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
 pub(crate) mod ephemeral;
+pub(crate) mod ephemeral_executor;
 pub(crate) mod groups;
 pub(crate) mod observability;
 pub(crate) mod router;
@@ -202,7 +203,14 @@ impl RelayControlPlane {
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
-        self.discovery.start().await
+        self.discovery.start().await?;
+        if let Err(error) = self.ephemeral.warm_relays(self.discovery.relays()).await {
+            tracing::warn!(
+                target: "whitenoise::relay_control",
+                "Failed to warm discovery relays on the ephemeral executor: {error}"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) async fn sync_discovery_subscriptions(
@@ -306,6 +314,7 @@ impl RelayControlPlane {
         }
 
         self.group_plane.remove_account(account_pubkey).await;
+        self.ephemeral.remove_account_scope(account_pubkey).await;
     }
 
     /// Deactivates all account subscriptions. Called during full data teardown.
@@ -357,6 +366,24 @@ impl RelayControlPlane {
 
     pub(crate) fn ephemeral(&self) -> ephemeral::EphemeralPlane {
         self.ephemeral.clone()
+    }
+
+    pub(crate) async fn warm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
+        self.ephemeral.warm_relays(relays).await
+    }
+
+    pub(crate) async fn warm_ephemeral_relays_for_account(
+        &self,
+        account_pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<()> {
+        self.ephemeral
+            .warm_relays_for_account(account_pubkey, relays)
+            .await
+    }
+
+    pub(crate) async fn unwarm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
+        self.ephemeral.unwarm_relays(relays).await
     }
 
     pub(crate) async fn fetch_metadata_from(
@@ -481,6 +508,7 @@ impl RelayControlPlane {
 
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
         let discovery = self.discovery.snapshot().await;
+        let ephemeral = self.ephemeral.snapshot().await;
 
         let inbox_planes = self
             .account_inbox_planes
@@ -500,6 +528,7 @@ impl RelayControlPlane {
         RelayControlStateSnapshot {
             generated_at: nostr_sdk::Timestamp::now().as_secs(),
             discovery,
+            ephemeral,
             account_inbox: AccountInboxPlanesStateSnapshot {
                 active_account_count: account_snapshots.len(),
                 accounts: account_snapshots,
@@ -525,6 +554,7 @@ impl RelayControlPlane {
         }
 
         self.group_plane.reset().await;
+        self.ephemeral.remove_all_account_scopes().await;
         Ok(())
     }
 }
@@ -773,5 +803,18 @@ mod tests {
                 .is_none(),
             "account inbox telemetry without an account scope must be ignored"
         );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_includes_ephemeral_plane() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+
+        let snapshot = relay_control.snapshot().await;
+
+        assert_eq!(snapshot.ephemeral.account_scope_count, 0);
+        assert!(snapshot.ephemeral.anonymous.is_none());
+        assert!(snapshot.ephemeral.accounts.is_empty());
     }
 }

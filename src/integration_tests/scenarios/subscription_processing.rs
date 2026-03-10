@@ -40,7 +40,7 @@ impl Scenario for SubscriptionProcessingScenario {
             .await?;
 
         // Test 2: Account relay list update
-        let account_relay_url = "wss://sub-update.example.com".to_string();
+        let account_relay_url = "ws://localhost:8780".to_string();
         PublishSubscriptionUpdateTestCase::for_account("subscription_test_account")
             .with_relay_update(account_relay_url)
             .execute(&mut self.context)
@@ -59,7 +59,7 @@ impl Scenario for SubscriptionProcessingScenario {
             .await?;
 
         // Test 4: External user relay list update
-        let alice_relay_url = "wss://alice-relay.example.com".to_string();
+        let alice_relay_url = "ws://localhost:8781".to_string();
         PublishSubscriptionUpdateTestCase::for_external_user(alice_keys.clone())
             .with_relay_update(alice_relay_url)
             .execute(&mut self.context)

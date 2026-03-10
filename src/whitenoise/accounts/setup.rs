@@ -790,6 +790,8 @@ impl Whitenoise {
             )
             .await?;
 
+        self.warm_ephemeral_account_relays(account).await?;
+
         tracing::debug!(
             target: "whitenoise::accounts",
             "Subscriptions setup"
@@ -847,7 +849,61 @@ impl Whitenoise {
                 signer,
             )
             .await
-            .map_err(WhitenoiseError::from)
+            .map_err(WhitenoiseError::from)?;
+
+        self.warm_ephemeral_account_relays(account).await?;
+
+        Ok(())
+    }
+
+    async fn warm_ephemeral_account_relays(&self, account: &Account) -> Result<()> {
+        let warm_relays = match self.account_ephemeral_warm_relay_urls(account).await {
+            Ok(warm_relays) => warm_relays,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %account.pubkey,
+                    "Failed to resolve ephemeral warm relays for account: {error}"
+                );
+                Vec::new()
+            }
+        };
+        if warm_relays.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(error) = self.relay_control.warm_ephemeral_relays(&warm_relays).await {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %account.pubkey,
+                "Failed to warm anonymous ephemeral relays for account: {error}"
+            );
+        }
+
+        if let Err(error) = self
+            .relay_control
+            .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %account.pubkey,
+                "Failed to warm account-scoped ephemeral relays: {error}"
+            );
+        }
+
+        Ok(())
+    }
+
+    pub(super) async fn account_ephemeral_warm_relay_urls(
+        &self,
+        account: &Account,
+    ) -> Result<Vec<RelayUrl>> {
+        let mut warm_relays: HashSet<RelayUrl> = HashSet::new();
+        warm_relays.extend(Relay::urls(&account.nip65_relays(self).await?));
+        warm_relays.extend(Relay::urls(&account.key_package_relays(self).await?));
+
+        Ok(warm_relays.into_iter().collect())
     }
 }
 

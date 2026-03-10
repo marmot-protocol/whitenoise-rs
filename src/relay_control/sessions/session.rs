@@ -6,8 +6,9 @@ use std::{
     },
 };
 
+use futures::future::join_all;
 use nostr_sdk::prelude::*;
-use tokio::sync::{RwLock, broadcast, mpsc::Sender};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 
 use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
 use crate::{
@@ -24,7 +25,22 @@ use crate::{
 #[derive(Debug)]
 struct RelaySessionState {
     notification_handler_registered: AtomicBool,
+    publish_lock: Mutex<()>,
     subscription_relays: RwLock<HashMap<SubscriptionId, Vec<RelayUrl>>>,
+}
+
+#[derive(Debug)]
+struct PreparedRelayUrls {
+    usable_relay_urls: Vec<RelayUrl>,
+    failed_relays: Vec<(RelayUrl, String)>,
+}
+
+#[derive(Debug)]
+struct RelaySetupOutcome {
+    usable_relay_urls: Vec<RelayUrl>,
+    failed_relays: Vec<(RelayUrl, String)>,
+    added_new_relay: bool,
+    last_error: Option<NostrManagerError>,
 }
 
 /// Reusable single-client relay session used by relay planes.
@@ -50,6 +66,7 @@ impl RelaySession {
             router: Arc::new(RelayRouter::default()),
             state: Arc::new(RelaySessionState {
                 notification_handler_registered: AtomicBool::new(false),
+                publish_lock: Mutex::new(()),
                 subscription_relays: RwLock::new(HashMap::new()),
             }),
         };
@@ -102,8 +119,16 @@ impl RelaySession {
     }
 
     pub(crate) async fn ensure_relays_connected(&self, relay_urls: &[RelayUrl]) -> Result<()> {
+        self.prepare_relay_urls(relay_urls).await?;
+        Ok(())
+    }
+
+    async fn prepare_relay_urls(&self, relay_urls: &[RelayUrl]) -> Result<PreparedRelayUrls> {
         if relay_urls.is_empty() {
-            return Ok(());
+            return Ok(PreparedRelayUrls {
+                usable_relay_urls: Vec::new(),
+                failed_relays: Vec::new(),
+            });
         }
 
         let relay_futures = relay_urls
@@ -111,29 +136,22 @@ impl RelaySession {
             .map(|relay_url| self.ensure_relay_in_client(relay_url));
         let results = futures::future::join_all(relay_futures).await;
 
-        let mut successful_relays = 0usize;
-        let mut last_error: Option<NostrManagerError> = None;
-        let mut failed_relay_urls: Vec<String> = Vec::new();
-        let mut added_new_relay = false;
+        let RelaySetupOutcome {
+            usable_relay_urls,
+            failed_relays,
+            added_new_relay,
+            last_error,
+        } = Self::partition_relay_setup_results(relay_urls, results);
 
-        for (relay_url, result) in relay_urls.iter().zip(results) {
-            match result {
-                Ok(was_added) => {
-                    successful_relays += 1;
-                    added_new_relay |= was_added;
-                }
-                Err(err) => {
-                    failed_relay_urls.push(relay_url.to_string());
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        if successful_relays == 0 {
+        if usable_relay_urls.is_empty() {
             return Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections));
         }
 
-        if !failed_relay_urls.is_empty() {
+        if !failed_relays.is_empty() {
+            let failed_relay_urls = failed_relays
+                .iter()
+                .map(|(relay_url, _)| relay_url.to_string())
+                .collect::<Vec<_>>();
             tracing::warn!(
                 target: "whitenoise::relay_control::session",
                 "Partial relay connection failure — {} of {} relays failed: [{}]",
@@ -143,14 +161,85 @@ impl RelaySession {
             );
         }
 
-        if added_new_relay || !self.has_any_relay_connected(relay_urls).await {
-            self.client.connect().await;
-            self.client
-                .wait_for_connection(self.config.connect_timeout)
-                .await;
+        let mut relays_to_wait = Vec::new();
+        for relay_url in &usable_relay_urls {
+            let relay = match self.client.relay(relay_url).await {
+                Ok(relay) => relay,
+                Err(error) => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} disappeared from session client: {error}"
+                    )));
+                }
+            };
+
+            match relay.status() {
+                RelayStatus::Connected => {}
+                RelayStatus::Connecting => {
+                    relays_to_wait.push(relay);
+                }
+                RelayStatus::Disconnected => {
+                    relay.disconnect();
+                    relay.connect();
+                    relays_to_wait.push(relay);
+                }
+                RelayStatus::Banned => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} is banned and cannot be used"
+                    )));
+                }
+                _ => {
+                    relay.connect();
+                    relays_to_wait.push(relay);
+                }
+            }
         }
 
-        Ok(())
+        if added_new_relay || !relays_to_wait.is_empty() {
+            let connect_timeout = self.config.connect_timeout;
+            join_all(
+                relays_to_wait
+                    .into_iter()
+                    .map(|relay| async move { relay.wait_for_connection(connect_timeout).await }),
+            )
+            .await;
+        }
+
+        let mut connected_relays = 0usize;
+        let mut disconnected_after_wait = Vec::new();
+
+        for relay_url in &usable_relay_urls {
+            let relay = match self.client.relay(relay_url).await {
+                Ok(relay) => relay,
+                Err(error) => {
+                    return Err(NostrManagerError::WhitenoiseInstance(format!(
+                        "relay {relay_url} disappeared from session client after connect wait: {error}"
+                    )));
+                }
+            };
+
+            match relay.status() {
+                RelayStatus::Connected => connected_relays += 1,
+                status => disconnected_after_wait.push(format!("{relay_url} ({status:?})")),
+            }
+        }
+
+        if connected_relays == 0 {
+            if !disconnected_after_wait.is_empty() {
+                tracing::warn!(
+                    target: "whitenoise::relay_control::session",
+                    "No requested relays connected after waiting {}ms: [{}]",
+                    self.config.connect_timeout.as_millis(),
+                    disconnected_after_wait.join(", "),
+                );
+            }
+
+            return Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections));
+        }
+
+        Ok(PreparedRelayUrls {
+            usable_relay_urls,
+            failed_relays,
+        })
     }
 
     #[allow(dead_code)]
@@ -171,28 +260,45 @@ impl RelaySession {
             ));
         }
 
-        if let Err(error) = self.ensure_relays_connected(relay_urls).await {
-            for relay_url in relay_urls {
-                self.emit_telemetry(Self::apply_telemetry_scope(
-                    self.config.telemetry_account_pubkey,
-                    RelayTelemetry::new(
-                        RelayTelemetryKind::QueryFailure,
-                        self.config.plane,
-                        relay_url.clone(),
-                    )
-                    .with_message(error.to_string()),
-                ));
+        let prepared_relays = match self.prepare_relay_urls(relay_urls).await {
+            Ok(prepared_relays) => prepared_relays,
+            Err(error) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::QueryFailure,
+                            self.config.plane,
+                            relay_url.clone(),
+                        )
+                        .with_message(error.to_string()),
+                    ));
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+
+        for (relay_url, message) in &prepared_relays.failed_relays {
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::QueryFailure,
+                    self.config.plane,
+                    relay_url.clone(),
+                )
+                .with_message(message.clone()),
+            ));
         }
+
+        let usable_relay_urls = prepared_relays.usable_relay_urls;
 
         let result = self
             .client
-            .fetch_events_from(relay_urls, filter, timeout)
+            .fetch_events_from(&usable_relay_urls, filter, timeout)
             .await;
         match result {
             Ok(events) => {
-                for relay_url in relay_urls {
+                for relay_url in &usable_relay_urls {
                     self.emit_telemetry(Self::apply_telemetry_scope(
                         self.config.telemetry_account_pubkey,
                         RelayTelemetry::new(
@@ -205,7 +311,7 @@ impl RelaySession {
                 Ok(events)
             }
             Err(error) => {
-                for relay_url in relay_urls {
+                for relay_url in &usable_relay_urls {
                     self.emit_telemetry(Self::apply_telemetry_scope(
                         self.config.telemetry_account_pubkey,
                         RelayTelemetry::new(
@@ -226,6 +332,8 @@ impl RelaySession {
         relay_urls: &[RelayUrl],
         event: &Event,
     ) -> Result<Output<EventId>> {
+        let _publish_guard = self.state.publish_lock.lock().await;
+
         for relay_url in relay_urls {
             self.emit_telemetry(Self::apply_telemetry_scope(
                 self.config.telemetry_account_pubkey,
@@ -237,25 +345,42 @@ impl RelaySession {
             ));
         }
 
-        if let Err(error) = self.ensure_relays_connected(relay_urls).await {
-            for relay_url in relay_urls {
-                self.emit_telemetry(Self::apply_telemetry_scope(
-                    self.config.telemetry_account_pubkey,
-                    RelayTelemetry::new(
-                        RelayTelemetryKind::PublishFailure,
-                        self.config.plane,
-                        relay_url.clone(),
-                    )
-                    .with_message(error.to_string()),
-                ));
+        let prepared_relays = match self.prepare_relay_urls(relay_urls).await {
+            Ok(prepared_relays) => prepared_relays,
+            Err(error) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishFailure,
+                            self.config.plane,
+                            relay_url.clone(),
+                        )
+                        .with_message(error.to_string()),
+                    ));
+                }
+                return Err(error);
             }
-            return Err(error);
+        };
+
+        for (relay_url, message) in &prepared_relays.failed_relays {
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::PublishFailure,
+                    self.config.plane,
+                    relay_url.clone(),
+                )
+                .with_message(message.clone()),
+            ));
         }
 
-        let result = self.client.send_event_to(relay_urls, event).await;
+        let usable_relay_urls = prepared_relays.usable_relay_urls;
+
+        let result = self.client.send_event_to(&usable_relay_urls, event).await;
         match result {
             Ok(output) => {
-                for relay_url in relay_urls {
+                for relay_url in &usable_relay_urls {
                     if output.success.contains(relay_url) {
                         self.emit_telemetry(Self::apply_telemetry_scope(
                             self.config.telemetry_account_pubkey,
@@ -275,13 +400,20 @@ impl RelaySession {
                             )
                             .with_message(message.clone()),
                         ));
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::session",
+                            plane = self.config.plane.as_str(),
+                            relay_url = %relay_url,
+                            event_id = %event.id,
+                            "Relay rejected publish: {message}"
+                        );
                     }
                 }
 
                 Ok(output)
             }
             Err(error) => {
-                for relay_url in relay_urls {
+                for relay_url in &usable_relay_urls {
                     self.emit_telemetry(Self::apply_telemetry_scope(
                         self.config.telemetry_account_pubkey,
                         RelayTelemetry::new(
@@ -296,6 +428,11 @@ impl RelaySession {
                 Err(error.into())
             }
         }
+    }
+
+    pub(crate) async fn remove_relay(&self, relay_url: &RelayUrl) -> Result<()> {
+        self.client.force_remove_relay(relay_url.clone()).await?;
+        Ok(())
     }
 
     pub(crate) async fn subscribe_with_id_to(
@@ -820,6 +957,36 @@ impl RelaySession {
         Ok(false)
     }
 
+    fn partition_relay_setup_results(
+        relay_urls: &[RelayUrl],
+        results: Vec<Result<bool>>,
+    ) -> RelaySetupOutcome {
+        let mut usable_relay_urls = Vec::new();
+        let mut failed_relays = Vec::new();
+        let mut added_new_relay = false;
+        let mut last_error = None;
+
+        for (relay_url, result) in relay_urls.iter().zip(results) {
+            match result {
+                Ok(was_added) => {
+                    usable_relay_urls.push(relay_url.clone());
+                    added_new_relay |= was_added;
+                }
+                Err(error) => {
+                    failed_relays.push((relay_url.clone(), error.to_string()));
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        RelaySetupOutcome {
+            usable_relay_urls,
+            failed_relays,
+            added_new_relay,
+            last_error,
+        }
+    }
+
     async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
         match self.client.relay(relay_url).await {
             Ok(_) => Ok(false),
@@ -916,6 +1083,28 @@ mod tests {
         let clone = session.clone();
         assert!(clone.notification_handler_registered());
         assert!(Arc::ptr_eq(&session.state, &clone.state));
+    }
+
+    #[test]
+    fn test_partition_relay_setup_results_skips_failed_relay_urls() {
+        let relay_a = RelayUrl::parse("wss://relay-a.example.com").unwrap();
+        let relay_b = RelayUrl::parse("wss://relay-b.example.com").unwrap();
+
+        let outcome = RelaySession::partition_relay_setup_results(
+            &[relay_a.clone(), relay_b.clone()],
+            vec![Ok(false), Err(NostrManagerError::NoRelayConnections)],
+        );
+
+        assert_eq!(outcome.usable_relay_urls, vec![relay_a]);
+        assert_eq!(
+            outcome.failed_relays,
+            vec![(relay_b, NostrManagerError::NoRelayConnections.to_string())]
+        );
+        assert!(!outcome.added_new_relay);
+        assert!(matches!(
+            outcome.last_error,
+            Some(NostrManagerError::NoRelayConnections)
+        ));
     }
 
     #[tokio::test]
