@@ -609,10 +609,12 @@ impl Whitenoise {
     /// Walks through every external account and tries to restore its NIP-46
     /// signer from saved credentials (app keys + bunker URI).
     ///
-    /// Accounts that don't have NIP-46 credentials — typically NIP-55/Amber
-    /// accounts — are quietly skipped. If something goes wrong for a
-    /// specific account we log a warning and keep going; one broken
-    /// reconnect shouldn't take down the whole startup.
+    /// Reconnections run concurrently so a slow or stalled remote signer
+    /// cannot delay unrelated accounts or overall startup. Accounts that
+    /// don't have NIP-46 credentials — typically NIP-55/Amber accounts —
+    /// are quietly skipped. If something goes wrong for a specific account
+    /// we log a warning and keep going; one broken reconnect shouldn't take
+    /// down the whole startup.
     async fn reconnect_nip46_signers(whitenoise_ref: &Whitenoise) {
         const NIP46_RECONNECT_TIMEOUT_SECS: u64 = 30;
 
@@ -628,15 +630,29 @@ impl Whitenoise {
             }
         };
 
-        for account in &accounts {
-            if !account.uses_external_signer() {
-                continue;
-            }
+        let external_accounts: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.uses_external_signer())
+            .collect();
 
-            match whitenoise_ref
-                .reconnect_nip46(account, NIP46_RECONNECT_TIMEOUT_SECS)
-                .await
-            {
+        if external_accounts.is_empty() {
+            return;
+        }
+
+        let futures: Vec<_> = external_accounts
+            .iter()
+            .map(|account| async move {
+                let result = whitenoise_ref
+                    .reconnect_nip46(account, NIP46_RECONNECT_TIMEOUT_SECS)
+                    .await;
+                (account.pubkey, result)
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        for (pubkey, result) in results {
+            match result {
                 Ok(()) => {}
                 Err(WhitenoiseError::SecretsStore(
                     crate::whitenoise::secrets_store::SecretsStoreError::KeyNotFound,
@@ -647,14 +663,14 @@ impl Whitenoise {
                     tracing::debug!(
                         target: "whitenoise::initialize_whitenoise",
                         "No NIP-46 credentials for external account {} (likely NIP-55)",
-                        account.pubkey.to_hex()
+                        pubkey.to_hex()
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::initialize_whitenoise",
                         "Failed to reconnect NIP-46 signer for account {}: {}",
-                        account.pubkey.to_hex(),
+                        pubkey.to_hex(),
                         e
                     );
                 }
@@ -900,8 +916,9 @@ impl Whitenoise {
     /// Picks the right signer for an account.
     ///
     /// External accounts (NIP-55/Amber or NIP-46/Nostr Connect) use whatever
-    /// signer was registered for them. Local accounts fall back to the secret
-    /// key in the keychain.
+    /// signer was registered for them — the keychain is never consulted
+    /// because external accounts have no local secret key.  Local accounts
+    /// fall back to the secret key in the keychain.
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
@@ -915,7 +932,18 @@ impl Whitenoise {
             return Ok(external_signer);
         }
 
-        // Fall back to local keys from secrets store
+        // External accounts must have a registered signer — don't fall
+        // through to the keychain which will never have their key.
+        if account.uses_external_signer() {
+            tracing::warn!(
+                target: "whitenoise::signer",
+                "No external signer registered for external account {}",
+                account.pubkey.to_hex()
+            );
+            return Err(WhitenoiseError::AccountNotAuthorized);
+        }
+
+        // Local accounts: look up the secret key in the keychain.
         let keys = self
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;

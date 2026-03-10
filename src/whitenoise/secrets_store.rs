@@ -18,6 +18,16 @@ pub enum SecretsStoreError {
 
     #[error("Key not found")]
     KeyNotFound,
+
+    #[error("Malformed NIP-46 credentials in keychain: {0}")]
+    MalformedNip46Blob(String),
+}
+
+/// Shape of the JSON blob stored in the keychain for NIP-46 accounts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Nip46Payload {
+    app_secret_key: String,
+    bunker_uri: String,
 }
 
 pub struct SecretsStore {
@@ -143,14 +153,15 @@ impl SecretsStore {
         let entry_key = format!("nip46:{}", account_pubkey.to_hex());
         let entry = Entry::new(&self.service_name, &entry_key).map_err(map_keyring_error)?;
 
-        let value = serde_json::json!({
-            "app_secret_key": app_secret_key.to_secret_hex(),
-            "bunker_uri": bunker_uri,
-        });
+        let payload = Nip46Payload {
+            app_secret_key: app_secret_key.to_secret_hex(),
+            bunker_uri: bunker_uri.to_string(),
+        };
 
-        entry
-            .set_password(&value.to_string())
-            .map_err(map_keyring_error)?;
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| SecretsStoreError::MalformedNip46Blob(e.to_string()))?;
+
+        entry.set_password(&json).map_err(map_keyring_error)?;
         Ok(())
     }
 
@@ -168,18 +179,11 @@ impl SecretsStore {
 
         match entry.get_password() {
             Ok(json_str) => {
-                let parsed: serde_json::Value = serde_json::from_str(&json_str)
-                    .map_err(|e| SecretsStoreError::KeyringError(e.to_string()))?;
+                let payload: Nip46Payload = serde_json::from_str(&json_str)
+                    .map_err(|e| SecretsStoreError::MalformedNip46Blob(e.to_string()))?;
 
-                let app_secret_hex = parsed["app_secret_key"]
-                    .as_str()
-                    .ok_or(SecretsStoreError::KeyNotFound)?;
-                let bunker_uri = parsed["bunker_uri"]
-                    .as_str()
-                    .ok_or(SecretsStoreError::KeyNotFound)?;
-
-                let secret_key = SecretKey::parse(app_secret_hex)?;
-                Ok((secret_key, bunker_uri.to_string()))
+                let secret_key = SecretKey::parse(&payload.app_secret_key)?;
+                Ok((secret_key, payload.bunker_uri))
             }
             Err(KeyringError::NoEntry) => Err(SecretsStoreError::KeyNotFound),
             Err(e) => Err(map_keyring_error(e)),

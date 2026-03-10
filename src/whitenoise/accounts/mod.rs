@@ -196,9 +196,9 @@ impl From<WhitenoiseError> for LoginError {
                 | SecretsStoreError::KeyringUnavailable(_) => {
                     Self::KeyringUnavailable(e.to_string())
                 }
-                SecretsStoreError::KeyNotFound | SecretsStoreError::KeyError(_) => {
-                    Self::Internal(e.to_string())
-                }
+                SecretsStoreError::KeyNotFound
+                | SecretsStoreError::KeyError(_)
+                | SecretsStoreError::MalformedNip46Blob(_) => Self::Internal(e.to_string()),
             },
             other => Self::Internal(other.to_string()),
         }

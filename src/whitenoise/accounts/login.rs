@@ -467,6 +467,17 @@ impl Whitenoise {
         // Remove any stashed external signer for this pubkey.
         self.remove_external_signer(pubkey);
 
+        // Clean up NIP-46 credentials if they were stored during a
+        // partially-completed NIP-46 login flow.
+        if let Err(e) = self.secrets_store.delete_nip46_credentials(pubkey) {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                "Failed to clean up NIP-46 credentials during login cancel for {}: {}",
+                pubkey.to_hex(),
+                e
+            );
+        }
+
         // Clean up the partial account if it exists.
         if let Ok(account) = Account::find_by_pubkey(pubkey, &self.database).await {
             // Remove relay associations that try_discover_relay_lists may have
@@ -758,22 +769,25 @@ impl Whitenoise {
     /// Parses a `bunker://` URI, generates a fresh app keypair, and builds a
     /// [`NostrConnect`] signer ready for use.
     ///
-    /// The app keys and bunker URI are saved to the keychain so we can
-    /// rebuild the signer on future app launches without asking the user to
-    /// re-authorize.
+    /// **Does not persist credentials.** Callers are responsible for calling
+    /// [`store_nip46_credentials`](crate::whitenoise::secrets_store::SecretsStore::store_nip46_credentials)
+    /// after the login flow has fully succeeded. This avoids orphaned
+    /// keychain entries when a subsequent step (relay discovery, account
+    /// activation, etc.) fails.
     ///
     /// This only creates the signer — it doesn't log in. For the all-in-one
     /// version call [`login_nip46`](Self::login_nip46), or pass the returned
     /// signer to [`login_with_external_signer`](Self::login_with_external_signer)
     /// yourself.
     ///
-    /// Returns `(user_pubkey, signer)`. The pubkey comes from the remote
-    /// signer during the initial NIP-46 handshake.
+    /// Returns `(user_pubkey, signer, app_keys)`. The pubkey comes from the
+    /// remote signer during the initial NIP-46 handshake. The app_keys are
+    /// needed by the caller to persist credentials after a successful login.
     pub async fn create_nip46_signer(
         &self,
         bunker_uri: &str,
         timeout_secs: u64,
-    ) -> Result<(PublicKey, NostrConnect)> {
+    ) -> Result<(PublicKey, NostrConnect, Keys)> {
         let uri = NostrConnectURI::parse(bunker_uri)
             .map_err(|e| WhitenoiseError::Nip46InvalidUri(e.to_string()))?;
 
@@ -791,20 +805,13 @@ impl Whitenoise {
             .await
             .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
 
-        // Save credentials so we can rebuild the signer after an app restart.
-        self.secrets_store.store_nip46_credentials(
-            &user_pubkey,
-            app_keys.secret_key(),
-            bunker_uri,
-        )?;
-
         tracing::info!(
             target: "whitenoise::accounts::nip46",
             "NIP-46 signer created for user pubkey: {}",
             user_pubkey.to_hex()
         );
 
-        Ok((user_pubkey, signer))
+        Ok((user_pubkey, signer, app_keys))
     }
 
     /// Builds a `nostrconnect://` URI for the client-initiated NIP-46 flow.
@@ -850,14 +857,17 @@ impl Whitenoise {
             .await
             .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
 
-        // Save for next app launch.
+        let account = self.login_with_external_signer(user_pubkey, signer).await?;
+
+        // Persist credentials only after login succeeds so we don't leave
+        // orphaned keychain entries on failure.
         self.secrets_store.store_nip46_credentials(
             &user_pubkey,
             app_keys.secret_key(),
             bunker_uri,
         )?;
 
-        self.login_with_external_signer(user_pubkey, signer).await
+        Ok(account)
     }
 
     /// One-shot NIP-46 login: parses the bunker URI, sets up the signer,
@@ -866,8 +876,14 @@ impl Whitenoise {
     /// If you need the multi-step flow (to let the user choose relays),
     /// start with [`login_nip46_start`](Self::login_nip46_start) instead.
     pub async fn login_nip46(&self, bunker_uri: &str, timeout_secs: u64) -> Result<Account> {
-        let (pubkey, signer) = self.create_nip46_signer(bunker_uri, timeout_secs).await?;
-        self.login_with_external_signer(pubkey, signer).await
+        let (pubkey, signer, app_keys) = self.create_nip46_signer(bunker_uri, timeout_secs).await?;
+        let account = self.login_with_external_signer(pubkey, signer).await?;
+
+        // Persist credentials only after login succeeds.
+        self.secrets_store
+            .store_nip46_credentials(&pubkey, app_keys.secret_key(), bunker_uri)?;
+
+        Ok(account)
     }
 
     /// Multi-step NIP-46 login, step 1: creates the signer from the bunker
@@ -881,11 +897,20 @@ impl Whitenoise {
         bunker_uri: &str,
         timeout_secs: u64,
     ) -> core::result::Result<LoginResult, LoginError> {
-        let (pubkey, signer) = self
+        let (pubkey, signer, app_keys) = self
             .create_nip46_signer(bunker_uri, timeout_secs)
             .await
             .map_err(LoginError::from)?;
-        self.login_external_signer_start(pubkey, signer).await
+        let result = self.login_external_signer_start(pubkey, signer).await?;
+
+        // Persist credentials after the start step succeeds (regardless of
+        // whether relay lists were found). If login_cancel is called later,
+        // it will clean these up.
+        self.secrets_store
+            .store_nip46_credentials(&pubkey, app_keys.secret_key(), bunker_uri)
+            .map_err(|e| LoginError::Internal(e.to_string()))?;
+
+        Ok(result)
     }
 
     /// Multi-step NIP-46 login, step 2a: publishes default relay lists for
@@ -927,12 +952,26 @@ impl Whitenoise {
         let signer = NostrConnect::new(uri, app_keys, timeout, None)
             .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
 
-        // Skip the round-trip get_public_key call — we already know the pubkey
-        // from the account record and verified it during the original login.
-        // Avoids blocking startup on a network request to the remote signer.
+        // Seed the cached pubkey so the signer knows which identity it
+        // represents, then verify via a get_public_key() round-trip that the
+        // remote bunker still controls this key. This catches stale or
+        // corrupted keychain entries before they can register a wrong identity.
         signer
             .non_secure_set_user_public_key(account.pubkey)
             .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        let remote_pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        if remote_pubkey != account.pubkey {
+            return Err(WhitenoiseError::Nip46Connection(format!(
+                "Remote signer pubkey mismatch during reconnect: expected {}, got {}",
+                account.pubkey.to_hex(),
+                remote_pubkey.to_hex()
+            )));
+        }
 
         self.insert_external_signer(account.pubkey, signer).await?;
 
