@@ -1327,6 +1327,54 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_roundtrip_with_limit() {
+        let req = Request::SearchMessages {
+            account: "npub1abc".to_string(),
+            group_id: "group123".to_string(),
+            query: "hello world".to_string(),
+            limit: Some(25),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""method":"search_messages""#));
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchMessages { account, group_id, query, limit }
+            if account == "npub1abc"
+                && group_id == "group123"
+                && query == "hello world"
+                && limit == Some(25)
+        ));
+    }
+
+    #[test]
+    fn search_messages_roundtrip_limit_omitted() {
+        let req = Request::SearchMessages {
+            account: "npub1abc".to_string(),
+            group_id: "group123".to_string(),
+            query: "marmot".to_string(),
+            limit: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // limit: None should serialize as null (serde default)
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchMessages { limit, .. }
+            if limit.is_none()
+        ));
+
+        // Also verify that omitting the field entirely in incoming JSON gives None
+        let wire = r#"{"method":"search_messages","params":{"account":"npub1abc","group_id":"group123","query":"marmot"}}"#;
+        let parsed_wire: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed_wire,
+            Request::SearchMessages { limit, .. }
+            if limit.is_none()
+        ));
+    }
+
+    #[test]
     fn debug_health_roundtrip() {
         let req = Request::DebugHealth {
             account: "npub1abc".to_string(),

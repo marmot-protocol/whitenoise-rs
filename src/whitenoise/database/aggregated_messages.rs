@@ -342,8 +342,9 @@ impl AggregatedMessage {
 
     /// Search messages within a group by content using forward-order substring matching.
     ///
-    /// Builds a `LOWER(content) LIKE '%tok1%tok2%...'` pattern from the query so
-    /// matching is handled entirely by SQLite with no custom function registration.
+    /// Matches against `content_normalized`, a NFC-lowercased copy of the content
+    /// stored at insert time — so that case folding is correct for all Unicode scripts,
+    /// including those where SQLite's built-in `LOWER()` is a no-op.
     pub async fn search_messages_in_group(
         group_id: &GroupId,
         query: &str,
@@ -362,7 +363,7 @@ impl AggregatedMessage {
                AND am.mls_group_id = ?
                AND am.deletion_event_id IS NULL
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-               AND LOWER(am.content) LIKE ?
+               AND am.content_normalized LIKE ?
              ORDER BY am.created_at DESC
              LIMIT ?",
         )
@@ -423,15 +424,19 @@ impl AggregatedMessage {
 
                     sqlx::query(
                         "INSERT OR IGNORE INTO aggregated_messages
-                         (message_id, mls_group_id, author, created_at, kind, content, tags,
-                          reply_to_id, content_tokens, reactions, media_attachments)
-                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)",
+                         (message_id, mls_group_id, author, created_at, kind, content,
+                          content_normalized, tags, reply_to_id, content_tokens, reactions,
+                          media_attachments)
+                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .bind(message.id.to_string())
                     .bind(group_id.as_slice())
                     .bind(message.pubkey.to_hex())
                     .bind(created_at.timestamp_millis())
                     .bind(&message.content)
+                    .bind(super::content_search::normalize_for_search(
+                        &message.content,
+                    ))
                     .bind(serde_json::to_string(&message.tags)?)
                     .bind(chat_msg.reply_to_id.as_ref())
                     .bind(serde_json::to_string(&chat_msg.content_tokens)?)
@@ -485,11 +490,12 @@ impl AggregatedMessage {
 
         sqlx::query(
             "INSERT INTO aggregated_messages
-             (message_id, mls_group_id, author, created_at, kind, content, tags,
-              reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)
+             (message_id, mls_group_id, author, created_at, kind, content, content_normalized,
+              tags, reply_to_id, content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
+               content_normalized = excluded.content_normalized,
                tags = excluded.tags,
                reply_to_id = excluded.reply_to_id,
                content_tokens = excluded.content_tokens,
@@ -501,6 +507,9 @@ impl AggregatedMessage {
         .bind(message.author.to_hex())
         .bind(created_at.timestamp_millis())
         .bind(&message.content)
+        .bind(super::content_search::normalize_for_search(
+            &message.content,
+        ))
         .bind(serde_json::to_string(&message.tags)?)
         .bind(&message.reply_to_id)
         .bind(serde_json::to_string(&message.content_tokens)?)

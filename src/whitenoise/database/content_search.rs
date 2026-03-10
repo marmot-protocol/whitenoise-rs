@@ -101,19 +101,37 @@ fn is_combining_mark(c: char) -> bool {
     )
 }
 
+/// Normalize a string for search storage and comparison.
+///
+/// Applies NFC normalization followed by Unicode-aware lowercasing so that:
+/// - Composed and decomposed forms (e.g. `é` as U+00E9 vs `e` + U+0301) compare equal
+/// - Case folding works for all scripts where SQLite's built-in `LOWER()` is a no-op
+///   (Cyrillic, Greek, Turkish, Armenian, etc.)
+///
+/// This function is used both when storing `content_normalized` and when building the
+/// LIKE pattern from the query, ensuring both sides use the same form.
+pub fn normalize_for_search(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    s.nfc().collect::<String>().to_lowercase()
+}
+
 /// Convert a search query into a SQLite LIKE pattern.
 ///
-/// Splits on characters that are neither alphanumeric nor combining marks,
-/// lowercases each token, then joins as `%tok1%tok2%...%`.
+/// Normalizes the query via [`normalize_for_search`], then splits on characters
+/// that are neither alphanumeric nor combining marks, and joins tokens as
+/// `%tok1%tok2%...%`.
+///
 /// Since tokens contain only alphanumeric chars and combining marks,
 /// LIKE metacharacters (`%`, `_`) are always treated as separators.
 ///
 /// Returns `%` (match everything) when the query has no tokens.
 pub fn query_to_like_pattern(query: &str) -> String {
-    let tokens: Vec<String> = query
+    let normalized = normalize_for_search(query);
+
+    let tokens: Vec<String> = normalized
         .split(|c: char| !is_word_char(c))
         .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
+        .map(|t| t.to_string())
         .collect();
 
     if tokens.is_empty() {
