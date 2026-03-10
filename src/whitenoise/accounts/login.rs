@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use nostr_connect::prelude::NostrConnect;
 use nostr_sdk::prelude::*;
 
 use super::{
@@ -744,6 +747,205 @@ impl Whitenoise {
     }
 
     // -----------------------------------------------------------------------
+    // NIP-46 (Nostr Connect / Remote Signer) login API
+    //
+    // Same shape as the NIP-55 (Amber) methods above, but we handle bunker
+    // URI parsing, app key generation, and credential persistence ourselves.
+    // Under the hood NostrConnect implements NostrSigner, so everything
+    // downstream (signing, decryption, giftwrap) just works.
+    // -----------------------------------------------------------------------
+
+    /// Parses a `bunker://` URI, generates a fresh app keypair, and builds a
+    /// [`NostrConnect`] signer ready for use.
+    ///
+    /// The app keys and bunker URI are saved to the keychain so we can
+    /// rebuild the signer on future app launches without asking the user to
+    /// re-authorize.
+    ///
+    /// This only creates the signer — it doesn't log in. For the all-in-one
+    /// version call [`login_nip46`](Self::login_nip46), or pass the returned
+    /// signer to [`login_with_external_signer`](Self::login_with_external_signer)
+    /// yourself.
+    ///
+    /// Returns `(user_pubkey, signer)`. The pubkey comes from the remote
+    /// signer during the initial NIP-46 handshake.
+    pub async fn create_nip46_signer(
+        &self,
+        bunker_uri: &str,
+        timeout_secs: u64,
+    ) -> Result<(PublicKey, NostrConnect)> {
+        let uri = NostrConnectURI::parse(bunker_uri)
+            .map_err(|e| WhitenoiseError::Nip46InvalidUri(e.to_string()))?;
+
+        let app_keys = Keys::generate();
+        let timeout = Duration::from_secs(timeout_secs);
+
+        let signer = NostrConnect::new(uri, app_keys.clone(), timeout, None)
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        // Ask the remote signer for the user's pubkey. This is also what
+        // kicks off the NIP-46 bootstrap (connects to relays, does the
+        // handshake, etc.).
+        let user_pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        // Save credentials so we can rebuild the signer after an app restart.
+        self.secrets_store.store_nip46_credentials(
+            &user_pubkey,
+            app_keys.secret_key(),
+            bunker_uri,
+        )?;
+
+        tracing::info!(
+            target: "whitenoise::accounts::nip46",
+            "NIP-46 signer created for user pubkey: {}",
+            user_pubkey.to_hex()
+        );
+
+        Ok((user_pubkey, signer))
+    }
+
+    /// Builds a `nostrconnect://` URI for the client-initiated NIP-46 flow.
+    ///
+    /// The idea: the app shows this URI as a QR code, the user scans it with
+    /// their signer app, and the signer connects back. We generate fresh app
+    /// keys and hand them back with the URI — hang onto them, you'll need
+    /// them for [`complete_nip46_client_connect`](Self::complete_nip46_client_connect)
+    /// once the signer responds.
+    ///
+    /// Returns `(app_keys, nostrconnect_uri)`.
+    pub fn create_nip46_client_uri(
+        &self,
+        relays: Vec<RelayUrl>,
+        app_name: &str,
+    ) -> (Keys, NostrConnectURI) {
+        let app_keys = Keys::generate();
+        let uri = NostrConnectURI::client(app_keys.public_key(), relays, app_name);
+        (app_keys, uri)
+    }
+
+    /// Finishes the client-initiated NIP-46 flow once the remote signer has
+    /// responded with a `bunker://` URI.
+    ///
+    /// Pass in the same `app_keys` you got from
+    /// [`create_nip46_client_uri`](Self::create_nip46_client_uri) — we need
+    /// them to talk to the signer and to save for future reconnects.
+    pub async fn complete_nip46_client_connect(
+        &self,
+        bunker_uri: &str,
+        app_keys: Keys,
+        timeout_secs: u64,
+    ) -> Result<Account> {
+        let uri = NostrConnectURI::parse(bunker_uri)
+            .map_err(|e| WhitenoiseError::Nip46InvalidUri(e.to_string()))?;
+
+        let timeout = Duration::from_secs(timeout_secs);
+        let signer = NostrConnect::new(uri, app_keys.clone(), timeout, None)
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        let user_pubkey = signer
+            .get_public_key()
+            .await
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        // Save for next app launch.
+        self.secrets_store.store_nip46_credentials(
+            &user_pubkey,
+            app_keys.secret_key(),
+            bunker_uri,
+        )?;
+
+        self.login_with_external_signer(user_pubkey, signer).await
+    }
+
+    /// One-shot NIP-46 login: parses the bunker URI, sets up the signer,
+    /// and runs the full login in a single call.
+    ///
+    /// If you need the multi-step flow (to let the user choose relays),
+    /// start with [`login_nip46_start`](Self::login_nip46_start) instead.
+    pub async fn login_nip46(&self, bunker_uri: &str, timeout_secs: u64) -> Result<Account> {
+        let (pubkey, signer) = self.create_nip46_signer(bunker_uri, timeout_secs).await?;
+        self.login_with_external_signer(pubkey, signer).await
+    }
+
+    /// Multi-step NIP-46 login, step 1: creates the signer from the bunker
+    /// URI and tries to discover relay lists on the network.
+    ///
+    /// Works the same way as [`login_start`](Self::login_start) — returns
+    /// [`LoginStatus::Complete`] if relay lists were found, or
+    /// [`LoginStatus::NeedsRelayLists`] if the caller needs to choose.
+    pub async fn login_nip46_start(
+        &self,
+        bunker_uri: &str,
+        timeout_secs: u64,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        let (pubkey, signer) = self
+            .create_nip46_signer(bunker_uri, timeout_secs)
+            .await
+            .map_err(LoginError::from)?;
+        self.login_external_signer_start(pubkey, signer).await
+    }
+
+    /// Multi-step NIP-46 login, step 2a: publishes default relay lists for
+    /// whichever kinds are still missing, then finishes the login.
+    pub async fn login_nip46_publish_default_relays(
+        &self,
+        pubkey: &PublicKey,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        self.login_external_signer_publish_default_relays(pubkey)
+            .await
+    }
+
+    /// Multi-step NIP-46 login, step 2b: looks for relay lists on a
+    /// user-provided relay. If that fills the gaps, login completes.
+    pub async fn login_nip46_with_custom_relay(
+        &self,
+        pubkey: &PublicKey,
+        relay_url: RelayUrl,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        self.login_external_signer_with_custom_relay(pubkey, relay_url)
+            .await
+    }
+
+    /// Rebuilds the NIP-46 signer from saved credentials and registers it.
+    ///
+    /// Runs automatically at startup for external accounts that have NIP-46
+    /// credentials in the keychain. The user doesn't have to re-authorize —
+    /// we already proved the pubkey matches during the original login.
+    pub(crate) async fn reconnect_nip46(&self, account: &Account, timeout_secs: u64) -> Result<()> {
+        let (app_secret_key, bunker_uri_str) =
+            self.secrets_store.get_nip46_credentials(&account.pubkey)?;
+
+        let uri = NostrConnectURI::parse(&bunker_uri_str)
+            .map_err(|e| WhitenoiseError::Nip46InvalidUri(e.to_string()))?;
+
+        let app_keys = Keys::new(app_secret_key);
+        let timeout = Duration::from_secs(timeout_secs);
+
+        let signer = NostrConnect::new(uri, app_keys, timeout, None)
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        // Skip the round-trip get_public_key call — we already know the pubkey
+        // from the account record and verified it during the original login.
+        // Avoids blocking startup on a network request to the remote signer.
+        signer
+            .non_secure_set_user_public_key(account.pubkey)
+            .map_err(|e| WhitenoiseError::Nip46Connection(e.to_string()))?;
+
+        self.insert_external_signer(account.pubkey, signer).await?;
+
+        tracing::info!(
+            target: "whitenoise::accounts::nip46",
+            "Reconnected NIP-46 signer for account: {}",
+            account.pubkey.to_hex()
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Shared helpers for multi-step login
     // -----------------------------------------------------------------------
 
@@ -1173,6 +1375,18 @@ impl Whitenoise {
             (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
             _ => {}
         }
+
+        // Wipe NIP-46 app keys and bunker URI if they exist. Harmless no-op
+        // for NIP-55 or local accounts.
+        if let Err(e) = self.secrets_store.delete_nip46_credentials(pubkey) {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                "Failed to clean up NIP-46 credentials during logout for {}: {}",
+                pubkey.to_hex(),
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -5893,6 +6107,80 @@ mod tests {
         assert!(
             !kp.is_empty(),
             "KeyPackage must be filled after publish_default_relays"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nip46_invalid_bunker_uri_produces_error() {
+        let result = NostrConnectURI::parse("not-a-bunker-uri");
+        assert!(result.is_err(), "Should fail on invalid URI scheme");
+    }
+
+    #[test]
+    fn nip46_valid_bunker_uri_parses() {
+        let uri_str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+        let uri = NostrConnectURI::parse(uri_str).expect("Valid bunker URI should parse");
+        assert!(uri.is_bunker());
+        assert!(uri.remote_signer_public_key().is_some());
+        assert_eq!(uri.relays().len(), 1);
+    }
+
+    #[test]
+    fn nip46_bunker_uri_roundtrips() {
+        let uri_str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+        let uri = NostrConnectURI::parse(uri_str).unwrap();
+        let displayed = uri.to_string();
+        let reparsed = NostrConnectURI::parse(&displayed).expect("Roundtrip should succeed");
+        assert_eq!(
+            uri.remote_signer_public_key(),
+            reparsed.remote_signer_public_key()
+        );
+    }
+
+    #[test]
+    fn nip46_create_client_uri_has_correct_scheme() {
+        let whitenoise = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { test_get_whitenoise().await });
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (app_keys, uri) =
+            whitenoise.create_nip46_client_uri(vec![relay_url.clone()], "Test App");
+
+        let uri_str = uri.to_string();
+        assert!(
+            uri_str.starts_with("nostrconnect://"),
+            "Client URI should start with nostrconnect://"
+        );
+        assert!(
+            uri_str.contains(&app_keys.public_key().to_hex()),
+            "Client URI should contain the app pubkey"
+        );
+        assert!(
+            uri_str.contains("relay.example.com"),
+            "Client URI should contain the relay URL"
+        );
+    }
+
+    #[test]
+    fn nip46_nostr_connect_signer_creation_fails_with_invalid_uri() {
+        let app_keys = Keys::generate();
+        // Construct a Client URI but pass it as if it were bunker — the NostrConnect
+        // constructor should reject it because the pubkey won't match the app_keys.
+        let different_keys = Keys::generate();
+        let uri = NostrConnectURI::client(
+            different_keys.public_key(),
+            vec![RelayUrl::parse("wss://relay.example.com").unwrap()],
+            "Test",
+        );
+        let result = NostrConnect::new(uri, app_keys, Duration::from_secs(10), None);
+        assert!(
+            result.is_err(),
+            "Should fail when client URI pubkey doesn't match app keys"
         );
     }
 }

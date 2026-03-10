@@ -92,6 +92,7 @@ tempfile = "3.19.1"
 dirs = { version = "6", optional = true }
 rpassword = { version = "7", optional = true }
 indicatif = { version = "0.18.3", optional = true }
+nostr-connect = { version = "0.44", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "0.2", features = ["keychain"] }

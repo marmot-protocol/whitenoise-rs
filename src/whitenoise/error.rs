@@ -192,6 +192,12 @@ pub enum WhitenoiseError {
     #[error("Unsupported media format: {0}")]
     UnsupportedMediaFormat(String),
 
+    #[error("NIP-46 invalid bunker URI: {0}")]
+    Nip46InvalidUri(String),
+
+    #[error("NIP-46 connection error: {0}")]
+    Nip46Connection(String),
+
     #[error(
         "Cannot deliver MLS welcome for {member_pubkey}: no inbox/NIP-65 relays configured and account {account_pubkey} has no fallback relays"
     )]
@@ -310,6 +316,18 @@ mod tests {
         assert_eq!(
             WhitenoiseError::UserNotPersisted.to_string(),
             "User not persisted - save the user before performing this operation"
+        );
+    }
+
+    #[test]
+    fn test_nip46_error_display_messages() {
+        assert_eq!(
+            WhitenoiseError::Nip46InvalidUri("bad uri".to_string()).to_string(),
+            "NIP-46 invalid bunker URI: bad uri"
+        );
+        assert_eq!(
+            WhitenoiseError::Nip46Connection("timeout".to_string()).to_string(),
+            "NIP-46 connection error: timeout"
         );
     }
 

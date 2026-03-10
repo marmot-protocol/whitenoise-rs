@@ -155,8 +155,8 @@ pub struct Whitenoise {
     scheduler_shutdown: watch::Sender<bool>,
     /// Handles for spawned scheduler tasks
     scheduler_handles: Mutex<Vec<JoinHandle<()>>>,
-    /// External signers for accounts using NIP-55 (Amber) or similar.
-    /// Maps account pubkey to their signer implementation.
+    /// External signers keyed by account pubkey. Covers NIP-55 (Amber),
+    /// NIP-46 (Nostr Connect), or anything else that implements `NostrSigner`.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
     /// Per-account cancellation signals for background tasks (e.g. contact list
     /// user fetches). Sending `true` tells all background tasks for that account
@@ -491,6 +491,11 @@ impl Whitenoise {
         );
         *whitenoise_ref.scheduler_handles.lock().await = scheduler_handles;
 
+        // Bring back NIP-46 signers for any external accounts that have saved
+        // credentials. Needs to happen before subscriptions go up — otherwise
+        // relays that require NIP-42 AUTH won't have a signer to talk to.
+        Self::reconnect_nip46_signers(whitenoise_ref).await;
+
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
 
@@ -599,6 +604,62 @@ impl Whitenoise {
             }
         }
         Ok(())
+    }
+
+    /// Walks through every external account and tries to restore its NIP-46
+    /// signer from saved credentials (app keys + bunker URI).
+    ///
+    /// Accounts that don't have NIP-46 credentials — typically NIP-55/Amber
+    /// accounts — are quietly skipped. If something goes wrong for a
+    /// specific account we log a warning and keep going; one broken
+    /// reconnect shouldn't take down the whole startup.
+    async fn reconnect_nip46_signers(whitenoise_ref: &Whitenoise) {
+        const NIP46_RECONNECT_TIMEOUT_SECS: u64 = 30;
+
+        let accounts = match Account::all(&whitenoise_ref.database).await {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::initialize_whitenoise",
+                    "Failed to load accounts for NIP-46 reconnection: {}",
+                    e
+                );
+                return;
+            }
+        };
+
+        for account in &accounts {
+            if !account.uses_external_signer() {
+                continue;
+            }
+
+            match whitenoise_ref
+                .reconnect_nip46(account, NIP46_RECONNECT_TIMEOUT_SECS)
+                .await
+            {
+                Ok(()) => {}
+                Err(WhitenoiseError::SecretsStore(
+                    crate::whitenoise::secrets_store::SecretsStoreError::KeyNotFound,
+                )) => {
+                    // Nothing stored — probably a NIP-55 (Amber) account. The
+                    // Flutter layer will bring its own signer later via
+                    // register_external_signer().
+                    tracing::debug!(
+                        target: "whitenoise::initialize_whitenoise",
+                        "No NIP-46 credentials for external account {} (likely NIP-55)",
+                        account.pubkey.to_hex()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::initialize_whitenoise",
+                        "Failed to reconnect NIP-46 signer for account {}: {}",
+                        account.pubkey.to_hex(),
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Returns a reference to the global Whitenoise singleton instance.
@@ -836,10 +897,11 @@ impl Whitenoise {
         self.external_signers.get(pubkey).map(|r| r.clone())
     }
 
-    /// Gets the appropriate signer for an account.
+    /// Picks the right signer for an account.
     ///
-    /// For external accounts (Amber/NIP-55), returns the stored external signer.
-    /// For local accounts, returns the keys from the secrets store.
+    /// External accounts (NIP-55/Amber or NIP-46/Nostr Connect) use whatever
+    /// signer was registered for them. Local accounts fall back to the secret
+    /// key in the keychain.
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
