@@ -227,8 +227,9 @@ update:
 # - RUSTSEC-2023-0071: RSA Marvin Attack (transitive via sqlx-mysql, not used in our SQLite-only app)
 # - RUSTSEC-2024-0384: instant unmaintained (transitive via rust-nostr, low risk)
 # - RUSTSEC-2026-0002: lru unsound (transitive via nostr-sdk, awaiting upstream fix)
+# - RUSTSEC-2026-0037: quinn-proto DoS via malformed QUIC handshake (transitive via nostr-blossom → reqwest → quinn; awaiting upstream fix)
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002
+    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2026-0002 --ignore RUSTSEC-2026-0037
 
 # Generate and open documentation
 doc:
