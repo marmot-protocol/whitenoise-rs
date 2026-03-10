@@ -13,7 +13,7 @@ use crate::{
     RelayType,
     nostr_manager::utils::{is_event_timestamp_valid, is_relay_list_tag_for_event_kind},
     nostr_manager::{NostrManagerError, Result},
-    types::ProcessableEvent,
+    types::{EphemeralPlaneStateSnapshot, ProcessableEvent},
     whitenoise::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
@@ -107,6 +107,23 @@ impl EphemeralPlane {
 
     pub(crate) async fn remove_all_account_scopes(&self) {
         self.executor.remove_all_account_scopes().await;
+    }
+
+    pub(crate) async fn snapshot(&self) -> EphemeralPlaneStateSnapshot {
+        let (anonymous, accounts) = self.executor.snapshot_scopes().await;
+
+        EphemeralPlaneStateSnapshot {
+            max_publish_attempts: self.config.max_publish_attempts,
+            ad_hoc_relay_ttl_ms: self
+                .config
+                .ad_hoc_relay_ttl
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            anonymous,
+            account_scope_count: accounts.len(),
+            accounts,
+        }
     }
 
     pub(crate) fn anonymous_scope(&self) -> EphemeralScope {

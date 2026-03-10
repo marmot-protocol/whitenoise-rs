@@ -14,7 +14,11 @@ use super::{
         RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     },
 };
-use crate::{nostr_manager::Result, types::ProcessableEvent, whitenoise::database::Database};
+use crate::{
+    nostr_manager::Result,
+    types::{EphemeralPinnedRelayStateSnapshot, EphemeralScopeStateSnapshot, ProcessableEvent},
+    whitenoise::database::Database,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EphemeralExecutorConfig {
@@ -236,6 +240,38 @@ impl EphemeralExecutor {
     ) -> RelaySession {
         self.session_entry(account_pubkey).await.session.clone()
     }
+
+    pub(crate) async fn snapshot_scopes(
+        &self,
+    ) -> (
+        Option<EphemeralScopeStateSnapshot>,
+        Vec<EphemeralScopeStateSnapshot>,
+    ) {
+        let entries = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .map(|(account_pubkey, entry)| (*account_pubkey, entry.clone()))
+            .collect::<Vec<_>>();
+
+        let mut anonymous = None;
+        let mut accounts = Vec::new();
+
+        for (account_pubkey, entry) in entries {
+            let snapshot = entry.snapshot(account_pubkey).await;
+            match account_pubkey {
+                Some(_) => accounts.push(snapshot),
+                None => anonymous = Some(snapshot),
+            }
+        }
+
+        accounts.sort_unstable_by(|left, right| {
+            left.scope_account_pubkey.cmp(&right.scope_account_pubkey)
+        });
+
+        (anonymous, accounts)
+    }
 }
 
 impl EphemeralSessionEntry {
@@ -332,5 +368,48 @@ impl EphemeralSessionEntry {
         }
 
         Ok(())
+    }
+
+    async fn snapshot(&self, account_pubkey: Option<PublicKey>) -> EphemeralScopeStateSnapshot {
+        let (known_relays, pinned_relays, ad_hoc_relays) = {
+            let tracking = self.tracking.lock().await;
+
+            let mut known_relays = tracking
+                .pinned_relays
+                .keys()
+                .cloned()
+                .chain(tracking.ad_hoc_relays.keys().cloned())
+                .collect::<Vec<_>>();
+            known_relays.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+            known_relays.dedup();
+
+            let mut pinned_relays = tracking
+                .pinned_relays
+                .iter()
+                .map(|(relay_url, ref_count)| EphemeralPinnedRelayStateSnapshot {
+                    relay_url: relay_url.to_string(),
+                    ref_count: *ref_count,
+                })
+                .collect::<Vec<_>>();
+            pinned_relays.sort_unstable_by(|left, right| left.relay_url.cmp(&right.relay_url));
+
+            let mut ad_hoc_relays = tracking
+                .ad_hoc_relays
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            ad_hoc_relays.sort_unstable();
+
+            (known_relays, pinned_relays, ad_hoc_relays)
+        };
+
+        EphemeralScopeStateSnapshot {
+            scope_account_pubkey: account_pubkey.map(|pubkey| pubkey.to_hex()),
+            pinned_relay_count: pinned_relays.len(),
+            ad_hoc_relay_count: ad_hoc_relays.len(),
+            pinned_relays,
+            ad_hoc_relays,
+            session: self.session.snapshot(&known_relays).await,
+        }
     }
 }

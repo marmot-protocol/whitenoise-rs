@@ -117,6 +117,8 @@ pub struct RelayControlStateSnapshot {
     pub generated_at: u64,
     /// Discovery-plane state and session details.
     pub discovery: DiscoveryPlaneStateSnapshot,
+    /// Shared ephemeral executor state.
+    pub ephemeral: EphemeralPlaneStateSnapshot,
     /// Per-account inbox plane state.
     pub account_inbox: AccountInboxPlanesStateSnapshot,
     /// Shared group plane state.
@@ -131,6 +133,34 @@ pub struct DiscoveryPlaneStateSnapshot {
     pub public_subscription_ids: Vec<String>,
     pub follow_list_subscription_ids: Vec<String>,
     pub session: RelaySessionStateSnapshot,
+}
+
+/// Live snapshot of the ephemeral executor plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct EphemeralPlaneStateSnapshot {
+    pub max_publish_attempts: u32,
+    pub ad_hoc_relay_ttl_ms: u64,
+    pub anonymous: Option<EphemeralScopeStateSnapshot>,
+    pub account_scope_count: usize,
+    pub accounts: Vec<EphemeralScopeStateSnapshot>,
+}
+
+/// Live snapshot of one anonymous or account-scoped ephemeral session.
+#[derive(Debug, Clone, Serialize)]
+pub struct EphemeralScopeStateSnapshot {
+    pub scope_account_pubkey: Option<String>,
+    pub pinned_relay_count: usize,
+    pub pinned_relays: Vec<EphemeralPinnedRelayStateSnapshot>,
+    pub ad_hoc_relay_count: usize,
+    pub ad_hoc_relays: Vec<String>,
+    pub session: RelaySessionStateSnapshot,
+}
+
+/// Pinned relay state inside an ephemeral session scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct EphemeralPinnedRelayStateSnapshot {
+    pub relay_url: String,
+    pub ref_count: usize,
 }
 
 /// Live snapshot of all account inbox planes.

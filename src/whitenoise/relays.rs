@@ -1,10 +1,18 @@
-use std::{collections::HashSet, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{Whitenoise, accounts::Account, error::Result};
+use crate::{
+    relay_control::RelayPlane,
+    whitenoise::{
+        Whitenoise, accounts::Account, database::relay_status::RelayStatusRecord, error::Result,
+    },
+};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Relay {
@@ -120,7 +128,7 @@ impl Whitenoise {
     /// This method returns a list of relay statuses for relays that are configured
     /// for the given account. It retrieves relay URLs from the account's relay lists
     /// (NIP-65, inbox, and key package relays) and returns the current connection
-    /// status from the Nostr client.
+    /// status from the relay-control planes that own those relay types.
     ///
     /// # Arguments
     ///
@@ -133,50 +141,80 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<(RelayUrl, RelayStatus)>> {
-        // Get all relay URLs for this user across all types
-        let mut all_relays = Vec::new();
-        all_relays.extend(account.nip65_relays(self).await?);
-        all_relays.extend(account.inbox_relays(self).await?);
-        all_relays.extend(account.key_package_relays(self).await?);
-
-        // Remove duplicates by collecting unique relay URLs
-        let mut unique_relay_urls = HashSet::new();
-        for relay in all_relays {
-            unique_relay_urls.insert(relay.url);
+        fn record_is_connected(record: &RelayStatusRecord) -> bool {
+            match (record.last_connect_success_at, record.last_failure_at) {
+                (Some(success), Some(failure)) => success > failure,
+                (Some(_), None) => true,
+                _ => false,
+            }
         }
 
-        // Get current relay statuses from the relay_status DB table
-        let mut relay_statuses = Vec::new();
+        let mut relay_types_by_url: HashMap<RelayUrl, HashSet<RelayType>> = HashMap::new();
+        for (relay_type, relays) in [
+            (RelayType::Nip65, account.nip65_relays(self).await?),
+            (RelayType::Inbox, account.inbox_relays(self).await?),
+            (
+                RelayType::KeyPackage,
+                account.key_package_relays(self).await?,
+            ),
+        ] {
+            for relay in relays {
+                relay_types_by_url
+                    .entry(relay.url)
+                    .or_default()
+                    .insert(relay_type);
+            }
+        }
 
-        for relay_url in unique_relay_urls {
-            let status =
-                crate::whitenoise::database::relay_status::RelayStatusRecord::find_any_plane(
-                    &relay_url,
-                    &self.database,
-                )
-                .await
-                .ok()
-                .flatten()
-                .map(|s| {
-                    // A relay is currently connected when it has a recorded
-                    // success and that success is more recent than any failure.
-                    // Using timestamps rather than the cumulative success_count
-                    // prevents a relay that once connected but has since
-                    // disconnected from appearing as Connected indefinitely.
-                    let connected = match (s.last_connect_success_at, s.last_failure_at) {
-                        (Some(success), Some(failure)) => success > failure,
-                        (Some(_), None) => true,
-                        _ => false,
-                    };
-                    if connected {
-                        RelayStatus::Connected
-                    } else {
-                        RelayStatus::Disconnected
-                    }
-                })
-                .unwrap_or(RelayStatus::Disconnected);
+        let mut relay_statuses = Vec::with_capacity(relay_types_by_url.len());
+
+        for (relay_url, relay_types) in relay_types_by_url {
+            let mut relevant_records = Vec::new();
+
+            if relay_types.contains(&RelayType::Inbox) {
+                relevant_records.push(
+                    RelayStatusRecord::find(
+                        &relay_url,
+                        RelayPlane::AccountInbox,
+                        Some(account.pubkey),
+                        &self.database,
+                    )
+                    .await?,
+                );
+            }
+
+            if relay_types.contains(&RelayType::Nip65)
+                || relay_types.contains(&RelayType::KeyPackage)
+            {
+                relevant_records.push(
+                    RelayStatusRecord::find(
+                        &relay_url,
+                        RelayPlane::Ephemeral,
+                        Some(account.pubkey),
+                        &self.database,
+                    )
+                    .await?,
+                );
+                relevant_records.push(
+                    RelayStatusRecord::find(
+                        &relay_url,
+                        RelayPlane::Ephemeral,
+                        None,
+                        &self.database,
+                    )
+                    .await?,
+                );
+            }
+
+            let status = if relevant_records.iter().flatten().any(record_is_connected) {
+                RelayStatus::Connected
+            } else {
+                RelayStatus::Disconnected
+            };
             relay_statuses.push((relay_url, status));
         }
+
+        relay_statuses.sort_unstable_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
 
         Ok(relay_statuses)
     }
@@ -185,6 +223,10 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        relay_control::observability::{RelayTelemetry, RelayTelemetryKind},
+        whitenoise::test_utils::*,
+    };
 
     fn create_test_relay(url: &RelayUrl) -> super::Relay {
         super::Relay {
@@ -193,6 +235,25 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn persist_connected_status(
+        whitenoise: &Whitenoise,
+        relay_url: &RelayUrl,
+        plane: RelayPlane,
+        account_pubkey: Option<PublicKey>,
+    ) {
+        let telemetry = match account_pubkey {
+            Some(account_pubkey) => {
+                RelayTelemetry::new(RelayTelemetryKind::Connected, plane, relay_url.clone())
+                    .with_account_pubkey(account_pubkey)
+            }
+            None => RelayTelemetry::new(RelayTelemetryKind::Connected, plane, relay_url.clone()),
+        };
+
+        RelayStatusRecord::upsert_from_telemetry(&telemetry, &whitenoise.database)
+            .await
+            .unwrap();
     }
 
     mod relay_tests {
@@ -386,7 +447,6 @@ mod tests {
 
     mod whitenoise_relay_tests {
         use super::*;
-        use crate::whitenoise::test_utils::*;
 
         #[tokio::test]
         async fn test_get_account_relay_statuses_empty() {
@@ -470,6 +530,99 @@ mod tests {
                 1,
                 "Duplicate relay URLs should be deduplicated"
             );
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_ignores_unrelated_discovery_status() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            persist_connected_status(&whitenoise, &relay_url, RelayPlane::Discovery, None).await;
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+
+            assert_eq!(statuses, vec![(relay_url, RelayStatus::Disconnected)]);
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_reads_account_inbox_plane() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            user.add_relays(&[relay], RelayType::Inbox, &whitenoise.database)
+                .await
+                .unwrap();
+
+            persist_connected_status(
+                &whitenoise,
+                &relay_url,
+                RelayPlane::AccountInbox,
+                Some(account.pubkey),
+            )
+            .await;
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+
+            assert_eq!(statuses, vec![(relay_url, RelayStatus::Connected)]);
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_reads_ephemeral_plane_for_nip65() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            persist_connected_status(
+                &whitenoise,
+                &relay_url,
+                RelayPlane::Ephemeral,
+                Some(account.pubkey),
+            )
+            .await;
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+
+            assert_eq!(statuses, vec![(relay_url, RelayStatus::Connected)]);
         }
     }
 }

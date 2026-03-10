@@ -162,47 +162,6 @@ impl RelayStatusRecord {
         Ok(record)
     }
 
-    /// Return the best status record for a relay URL across all planes.
-    ///
-    /// Selects the row with the highest `success_count` so the caller can
-    /// derive a meaningful connection state without knowing which plane
-    /// the relay belongs to.
-    pub(crate) async fn find_any_plane(
-        relay_url: &RelayUrl,
-        database: &Database,
-    ) -> Result<Option<Self>, DatabaseError> {
-        let record = sqlx::query_as::<_, Self>(
-            "SELECT
-                id,
-                relay_url,
-                plane,
-                account_pubkey,
-                last_connect_attempt_at,
-                last_connect_success_at,
-                last_failure_at,
-                failure_category,
-                last_notice_reason,
-                last_closed_reason,
-                last_auth_reason,
-                auth_required,
-                success_count,
-                failure_count,
-                latency_ms,
-                backoff_until,
-                created_at,
-                updated_at
-             FROM relay_status
-             WHERE relay_url = ?
-             ORDER BY success_count DESC
-             LIMIT 1",
-        )
-        .bind(normalize_relay_url(relay_url))
-        .fetch_optional(&database.pool)
-        .await?;
-
-        Ok(record)
-    }
-
     pub(crate) async fn upsert_from_telemetry(
         telemetry: &RelayTelemetry,
         database: &Database,

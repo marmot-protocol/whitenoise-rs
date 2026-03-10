@@ -508,6 +508,7 @@ impl RelayControlPlane {
 
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
         let discovery = self.discovery.snapshot().await;
+        let ephemeral = self.ephemeral.snapshot().await;
 
         let inbox_planes = self
             .account_inbox_planes
@@ -527,6 +528,7 @@ impl RelayControlPlane {
         RelayControlStateSnapshot {
             generated_at: nostr_sdk::Timestamp::now().as_secs(),
             discovery,
+            ephemeral,
             account_inbox: AccountInboxPlanesStateSnapshot {
                 active_account_count: account_snapshots.len(),
                 accounts: account_snapshots,
@@ -801,5 +803,18 @@ mod tests {
                 .is_none(),
             "account inbox telemetry without an account scope must be ignored"
         );
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_includes_ephemeral_plane() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+
+        let snapshot = relay_control.snapshot().await;
+
+        assert_eq!(snapshot.ephemeral.account_scope_count, 0);
+        assert!(snapshot.ephemeral.anonymous.is_none());
+        assert!(snapshot.ephemeral.accounts.is_empty());
     }
 }
