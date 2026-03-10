@@ -395,6 +395,16 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::SearchMessages {
+            account,
+            group_id,
+            query,
+            limit,
+        } => match search_messages(wn, &account, &group_id, &query, limit).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         Request::SendMessage {
             account,
             group_id,
@@ -1554,6 +1564,30 @@ async fn list_messages(
             before_message_id,
             limit,
         )
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let display_names = resolve_chat_display_names(wn, &messages).await;
+
+    let clean: Vec<serde_json::Value> = messages
+        .iter()
+        .filter_map(|m| format_chat_message(m, &display_names))
+        .collect();
+
+    Ok(to_response(&clean))
+}
+
+async fn search_messages(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    query: &str,
+    limit: Option<u32>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let messages = wn
+        .search_messages_in_group(&account.pubkey, &group_id, query, limit)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

@@ -670,6 +670,27 @@ impl Whitenoise {
             })
     }
 
+    /// Search messages within a group by content.
+    ///
+    /// Uses forward-order substring matching: query tokens must appear in
+    /// the message content in the same order as typed.
+    pub async fn search_messages_in_group(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<ChatMessage>> {
+        Account::find_by_pubkey(pubkey, &self.database).await?;
+
+        let limit_val = limit.unwrap_or(50);
+        AggregatedMessage::search_messages_in_group(group_id, query, limit_val, &self.database)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to search messages: {}", e))
+            })
+    }
+
     /// Creates an unsigned nostr event with the given parameters
     fn create_unsigned_nostr_event(
         &self,

@@ -214,6 +214,15 @@ pub enum Request {
         message_id: String,
     },
 
+    #[serde(rename = "search_messages")]
+    SearchMessages {
+        account: String,
+        group_id: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+
     // Media
     #[serde(rename = "upload_media")]
     UploadMedia {

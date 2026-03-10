@@ -340,6 +340,45 @@ impl AggregatedMessage {
         Ok(messages)
     }
 
+    /// Search messages within a group by content using forward-order substring matching.
+    ///
+    /// Builds a `LOWER(content) LIKE '%tok1%tok2%...'` pattern from the query so
+    /// matching is handled entirely by SQLite with no custom function registration.
+    pub async fn search_messages_in_group(
+        group_id: &GroupId,
+        query: &str,
+        limit: u32,
+        database: &Database,
+    ) -> Result<Vec<ChatMessage>> {
+        let limit_val = i64::from(limit.min(200));
+        let like_pattern = super::content_search::query_to_like_pattern(query);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9
+               AND am.mls_group_id = ?
+               AND am.deletion_event_id IS NULL
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+               AND LOWER(am.content) LIKE ?
+             ORDER BY am.created_at DESC
+             LIMIT ?",
+        )
+        .bind(group_id.as_slice())
+        .bind(&like_pattern)
+        .bind(limit_val)
+        .fetch_all(&database.pool)
+        .await?;
+
+        let messages: Vec<ChatMessage> = rows
+            .into_iter()
+            .map(Self::row_to_chat_message)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
     /// Save all events (kind 9, 7, 5) from sync in ONE transaction with single batch INSERT
     ///
     /// All events inserted in one batch - kind 9 gets full data, kind 7/5 get empty defaults
@@ -2881,5 +2920,155 @@ mod tests {
             matches!(err, DatabaseError::InvalidCursor { .. }),
             "expected InvalidCursor for short hex id, got: {err}"
         );
+    }
+
+    fn create_test_chat_message_with_content(
+        seed: u8,
+        author: PublicKey,
+        content: &str,
+    ) -> ChatMessage {
+        let id = format!("{:0>64}", format!("{:x}", seed));
+        ChatMessage {
+            id,
+            author,
+            content: content.to_string(),
+            created_at: Timestamp::from(1_700_000_000u64 + seed as u64),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_messages_in_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[42; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        let messages = vec![
+            create_test_chat_message_with_content(1, author, "hello world"),
+            create_test_chat_message_with_content(2, author, "marmot protocol is the future"),
+            create_test_chat_message_with_content(
+                3,
+                author,
+                "our big plans are bigger than you imagine",
+            ),
+            create_test_chat_message_with_content(4, author, "日本語のメッセージ"),
+            create_test_chat_message_with_content(5, author, "привет мир from the colony"),
+            create_test_chat_message_with_content(6, author, "नमस्ते दुनिया"),
+        ];
+
+        for msg in &messages {
+            AggregatedMessage::insert_message(msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Basic single-word search
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "hello", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "hello world");
+
+        // Forward-order multi-word search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "big plans",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "our big plans are bigger than you imagine");
+
+        // Substring matching ("big" matches "bigger")
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "big", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Case insensitive
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "MARMOT",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "marmot protocol is the future");
+
+        // CJK search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "日本語",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "日本語のメッセージ");
+
+        // Cyrillic search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "привет",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Devanagari search (with combining marks)
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "नमस्ते",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "नमस्ते दुनिया");
+
+        // No match
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "nonexistent",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(results.is_empty());
+
+        // Empty query matches all
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 6);
+
+        // Limit is respected
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "", 2, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 2);
     }
 }
