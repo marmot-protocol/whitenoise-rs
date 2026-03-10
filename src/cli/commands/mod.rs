@@ -5,6 +5,7 @@ pub mod debug;
 pub mod follows;
 pub mod groups;
 pub mod identity;
+pub mod keys;
 pub mod media;
 pub mod messages;
 pub mod notifications;

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mdk_core::prelude::{GroupId, NostrGroupConfigData};
+use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate};
 use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
 use tokio::io::AsyncWriteExt;
 
@@ -8,7 +8,7 @@ use crate::Whitenoise;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::relays::{Relay, RelayType};
-use crate::whitenoise::users::UserSyncMode;
+use crate::whitenoise::users::{KeyPackageStatus, UserSyncMode};
 
 use super::protocol::{Request, Response};
 
@@ -28,6 +28,70 @@ pub async fn dispatch(req: Request) -> Response {
                 Err(e) => Response::err(e.to_string()),
             }
         }
+
+        Request::DebugHealth { account } => match debug_health(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::DebugRatchetTree { account, group_id } => {
+            match debug_ratchet_tree(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::DeleteAllData => match wn.delete_all_data().await {
+            Ok(()) => Response::ok(serde_json::json!({
+                "message": "all data deleted; restart the daemon"
+            })),
+            Err(e) => Response::err(e.to_string()),
+        },
+
+        Request::GroupPromote {
+            account,
+            group_id,
+            pubkey,
+        } => match promote_admin(wn, &account, &group_id, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::GroupDemote {
+            account,
+            group_id,
+            pubkey,
+        } => match demote_admin(wn, &account, &group_id, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::KeysList { account } => match keys_list(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::KeysPublish { account } => match keys_publish(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::KeysDelete { account, event_id } => {
+            match keys_delete(wn, &account, &event_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
+        Request::KeysDeleteAll { account } => match keys_delete_all(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::KeysCheck { pubkey } => match keys_check(wn, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
 
         Request::CreateIdentity => match wn.create_identity().await {
             Ok(account) => to_response(&account),
@@ -960,7 +1024,7 @@ async fn rename_group(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let update = mdk_core::prelude::NostrGroupDataUpdate::new().name(name);
+    let update = NostrGroupDataUpdate::new().name(name);
     wn.update_group_data(&account, &group_id, update)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
@@ -1760,6 +1824,200 @@ fn to_response<T: serde::Serialize>(value: &T) -> Response {
         Ok(v) => Response::ok(v),
         Err(e) => Response::err(format!("serialization error: {e}")),
     }
+}
+
+async fn debug_health(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let account_ok = wn
+        .is_account_subscriptions_operational(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    let global_ok = wn
+        .is_global_subscriptions_operational()
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!({
+        "account_subscriptions": account_ok,
+        "discovery_subscriptions": global_ok,
+    })))
+}
+
+async fn debug_ratchet_tree(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let info = wn
+        .ratchet_tree_info(&account, &group_id)
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let leaf_nodes: Vec<serde_json::Value> = info
+        .leaf_nodes
+        .iter()
+        .map(|leaf| {
+            serde_json::json!({
+                "index": leaf.index,
+                "encryption_key": leaf.encryption_key,
+                "signature_key": leaf.signature_key,
+                "credential_identity": leaf.credential_identity,
+            })
+        })
+        .collect();
+
+    Ok(Response::ok(serde_json::json!({
+        "tree_hash": info.tree_hash,
+        "serialized_tree": info.serialized_tree,
+        "leaf_nodes": leaf_nodes,
+    })))
+}
+
+async fn promote_admin(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let target_pk = parse_pubkey(pubkey_str)?;
+
+    let members = wn
+        .group_members(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    if !members.contains(&target_pk) {
+        return Err(Response::err("user is not a group member"));
+    }
+
+    let mut admins = wn
+        .group_admins(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    if admins.contains(&target_pk) {
+        return Err(Response::err("user is already an admin"));
+    }
+    admins.push(target_pk);
+
+    // Authorization (caller must be admin) is enforced by update_group_data.
+    let update = NostrGroupDataUpdate::new().admins(admins);
+    wn.update_group_data(&account, &group_id, update)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn demote_admin(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let target_pk = parse_pubkey(pubkey_str)?;
+
+    let admins = wn
+        .group_admins(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    if !admins.contains(&target_pk) {
+        return Err(Response::err("user is not an admin"));
+    }
+    if admins.len() == 1 {
+        return Err(Response::err("cannot demote the last admin"));
+    }
+    let admins: Vec<_> = admins.into_iter().filter(|pk| pk != &target_pk).collect();
+
+    // Authorization (caller must be admin) is enforced by update_group_data.
+    let update = NostrGroupDataUpdate::new().admins(admins);
+    wn.update_group_data(&account, &group_id, update)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn keys_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let packages = wn
+        .fetch_all_key_packages_for_account(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let items: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "event_id": event.id.to_hex(),
+                "created_at": event.created_at.as_secs(),
+            })
+        })
+        .collect();
+    Ok(Response::ok(serde_json::json!({ "key_packages": items })))
+}
+
+async fn keys_publish(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    wn.publish_key_package_for_account(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn keys_delete(
+    wn: &Whitenoise,
+    account_str: &str,
+    event_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let event_id = nostr_sdk::EventId::from_hex(event_id_hex)
+        .map_err(|e| Response::err(format!("invalid event ID: {e}")))?;
+    let deleted = wn
+        .delete_key_package_for_account(&account, &event_id, true)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!({ "deleted": deleted })))
+}
+
+async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let count = wn
+        .delete_all_key_packages_for_account(&account, true)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!({ "deleted_count": count })))
+}
+
+async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
+    let pubkey = parse_pubkey(pubkey_str)?;
+    // Side effect: creates a local user record if not already present.
+    let user = wn
+        .find_or_create_user_by_pubkey(&pubkey, UserSyncMode::Blocking)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    let status = user
+        .key_package_status(wn)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    let result = match status {
+        KeyPackageStatus::Valid(event) => serde_json::json!({
+            "status": "valid",
+            "event_id": event.id.to_hex(),
+            "created_at": event.created_at.as_secs(),
+        }),
+        KeyPackageStatus::NotFound => serde_json::json!({
+            "status": "not_found",
+        }),
+        KeyPackageStatus::Incompatible => serde_json::json!({
+            "status": "incompatible",
+        }),
+    };
+    Ok(Response::ok(result))
 }
 
 #[cfg(test)]

@@ -4,11 +4,13 @@ use clap::{Parser, Subcommand};
 
 use whitenoise::cli::commands::{
     accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, debug::DebugCmd,
-    follows::FollowsCmd, groups::GroupsCmd, identity, media::MediaCmd, messages::MessagesCmd,
-    notifications::NotificationsCmd, profile::ProfileCmd, relays::RelaysCmd, settings::SettingsCmd,
-    users::UsersCmd,
+    follows::FollowsCmd, groups::GroupsCmd, identity, keys::KeysCmd, media::MediaCmd,
+    messages::MessagesCmd, notifications::NotificationsCmd, profile::ProfileCmd, relays::RelaysCmd,
+    settings::SettingsCmd, users::UsersCmd,
 };
 use whitenoise::cli::config::Config;
+use whitenoise::cli::protocol::Request;
+use whitenoise::cli::{client, output};
 
 #[derive(Parser, Debug)]
 #[clap(name = "wn", about = "Whitenoise CLI", version)]
@@ -107,6 +109,17 @@ enum Cmd {
     /// Subscribe to notifications
     #[clap(subcommand)]
     Notifications(NotificationsCmd),
+
+    /// Manage MLS key packages
+    #[clap(subcommand)]
+    Keys(KeysCmd),
+
+    /// Delete all data (database, MLS state, logs). Daemon must be restarted after this command.
+    Reset {
+        /// Required to confirm destructive operation
+        #[clap(long)]
+        confirm: bool,
+    },
 }
 
 #[tokio::main]
@@ -117,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Cmd::Daemon(cmd) => cmd.run(&config).await,
-        Cmd::Debug(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Debug(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::CreateIdentity => identity::create_identity(&socket, args.json).await,
         Cmd::Login { relay } => identity::login(&socket, args.json, relay).await,
         Cmd::Logout { pubkey } => identity::logout(&socket, &pubkey, args.json).await,
@@ -134,5 +147,15 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Settings(cmd) => cmd.run(&socket, args.json).await,
         Cmd::Users(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Notifications(cmd) => cmd.run(&socket, args.json).await,
+        Cmd::Keys(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
+        Cmd::Reset { confirm } => {
+            if !confirm {
+                anyhow::bail!(
+                    "this will delete ALL data (database, MLS state, logs). Pass --confirm to proceed."
+                );
+            }
+            let resp = client::send(&socket, &Request::DeleteAllData).await?;
+            output::print_and_exit(&resp, args.json)
+        }
     }
 }

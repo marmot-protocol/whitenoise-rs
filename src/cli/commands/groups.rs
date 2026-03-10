@@ -99,6 +99,24 @@ pub enum GroupsCmd {
         /// MLS group ID (hex)
         group_id: String,
     },
+
+    /// Promote a member to admin
+    Promote {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Member pubkey (npub or hex) to promote
+        pubkey: String,
+    },
+
+    /// Demote an admin to regular member
+    Demote {
+        /// MLS group ID (hex)
+        group_id: String,
+
+        /// Admin pubkey (npub or hex) to demote
+        pubkey: String,
+    },
 }
 
 impl GroupsCmd {
@@ -132,6 +150,12 @@ impl GroupsCmd {
             Self::Invites => invites(socket, json, account_flag).await,
             Self::Accept { group_id } => accept(socket, json, account_flag, group_id).await,
             Self::Decline { group_id } => decline(socket, json, account_flag, group_id).await,
+            Self::Promote { group_id, pubkey } => {
+                promote(socket, json, account_flag, group_id, pubkey).await
+            }
+            Self::Demote { group_id, pubkey } => {
+                demote(socket, json, account_flag, group_id, pubkey).await
+            }
         }
     }
 }
@@ -350,6 +374,46 @@ async fn decline(
         &Request::DeclineInvite {
             account: pubkey,
             group_id,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn promote(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    pubkey: String,
+) -> anyhow::Result<()> {
+    let account = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GroupPromote {
+            account,
+            group_id,
+            pubkey,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn demote(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+    pubkey: String,
+) -> anyhow::Result<()> {
+    let account = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GroupDemote {
+            account,
+            group_id,
+            pubkey,
         },
     )
     .await?;
