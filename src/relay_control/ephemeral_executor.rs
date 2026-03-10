@@ -117,6 +117,7 @@ impl EphemeralExecutor {
         }
     }
 
+    #[cfg(feature = "integration-tests")]
     pub(crate) async fn remove_all_account_scopes(&self) {
         let account_keys = self
             .sessions
