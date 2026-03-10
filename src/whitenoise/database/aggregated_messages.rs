@@ -9,7 +9,9 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary},
+    message_aggregator::{
+        ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary, SearchResult,
+    },
     utils::timestamp_to_datetime,
 };
 
@@ -345,12 +347,16 @@ impl AggregatedMessage {
     /// Matches against `content_normalized`, a NFC-lowercased copy of the content
     /// stored at insert time — so that case folding is correct for all Unicode scripts,
     /// including those where SQLite's built-in `LOWER()` is a no-op.
+    ///
+    /// Each returned [`SearchResult`] includes the matched [`ChatMessage`] and
+    /// `highlight_spans`: char-index `[start, end]` pairs for each query token in the
+    /// order they appear in the message content, ready for frontend highlighting.
     pub async fn search_messages_in_group(
         group_id: &GroupId,
         query: &str,
         limit: u32,
         database: &Database,
-    ) -> Result<Vec<ChatMessage>> {
+    ) -> Result<Vec<SearchResult>> {
         let limit_val = i64::from(limit.min(200));
         let like_pattern = super::content_search::query_to_like_pattern(query);
 
@@ -373,11 +379,17 @@ impl AggregatedMessage {
         .fetch_all(&database.pool)
         .await?;
 
-        let messages: Vec<ChatMessage> = rows
-            .into_iter()
-            .map(Self::row_to_chat_message)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(messages)
+        rows.into_iter()
+            .map(|row| {
+                let message = Self::row_to_chat_message(row)?;
+                let highlight_spans =
+                    super::content_search::find_highlight_spans(&message.content, query);
+                Ok(SearchResult {
+                    message,
+                    highlight_spans,
+                })
+            })
+            .collect()
     }
 
     /// Save all events (kind 9, 7, 5) from sync in ONE transaction with single batch INSERT

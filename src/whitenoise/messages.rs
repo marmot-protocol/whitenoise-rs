@@ -8,7 +8,9 @@ use crate::{
         database::Database,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
-        message_aggregator::{ChatMessage, DeliveryStatus, emoji_utils, reaction_handler},
+        message_aggregator::{
+            ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
+        },
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
 };
@@ -673,14 +675,16 @@ impl Whitenoise {
     /// Search messages within a group by content.
     ///
     /// Uses forward-order substring matching: query tokens must appear in
-    /// the message content in the same order as typed.
+    /// the message content in the same order as typed. Each result includes
+    /// `highlight_spans` — char-index `[start, end]` pairs for each token in
+    /// the order they appear in the message content, for frontend highlighting.
     pub async fn search_messages_in_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         query: &str,
         limit: Option<u32>,
-    ) -> Result<Vec<ChatMessage>> {
+    ) -> Result<Vec<SearchResult>> {
         Account::find_by_pubkey(pubkey, &self.database).await?;
 
         let limit_val = limit.unwrap_or(50);

@@ -1586,16 +1586,22 @@ async fn search_messages(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let messages = wn
+    let results = wn
         .search_messages_in_group(&account.pubkey, &group_id, query, limit)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
+    let messages: Vec<crate::whitenoise::message_aggregator::ChatMessage> =
+        results.iter().map(|r| r.message.clone()).collect();
     let display_names = resolve_chat_display_names(wn, &messages).await;
 
-    let clean: Vec<serde_json::Value> = messages
+    let clean: Vec<serde_json::Value> = results
         .iter()
-        .filter_map(|m| format_chat_message(m, &display_names))
+        .filter_map(|r| {
+            let mut msg = format_chat_message(&r.message, &display_names)?;
+            msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans).unwrap_or_default();
+            Some(msg)
+        })
         .collect();
 
     Ok(to_response(&clean))

@@ -116,6 +116,82 @@ pub fn normalize_for_search(s: &str) -> String {
     s.nfc().collect::<String>().to_lowercase()
 }
 
+/// Extract non-empty search tokens from a query string.
+///
+/// Normalizes via [`normalize_for_search`] and splits on non-word characters.
+/// Returns an empty `Vec` when the query has no tokens.
+pub fn query_tokens(query: &str) -> Vec<String> {
+    let normalized = normalize_for_search(query);
+    normalized
+        .split(|c: char| !is_word_char(c))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Compute highlight spans for a query against message content.
+///
+/// Matches each query token in forward order against the normalized form of
+/// `content`, then maps the match positions back to **char indices** into the
+/// original `content` string.
+///
+/// Returns a `Vec` of `[start, end]` pairs (char indices, half-open: `content[start..end]`
+/// is the matched substring) in the order the tokens were found.
+///
+/// If any token is not found (content does not match the query), returns an
+/// empty `Vec` rather than a partial result.
+pub fn find_highlight_spans(content: &str, query: &str) -> Vec<[usize; 2]> {
+    let tokens = query_tokens(query);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized_content = normalize_for_search(content);
+
+    // Build a mapping from byte offset in normalized_content → char index in content.
+    // Both strings have the same number of Unicode scalar values because
+    // normalize_for_search is NFC (preserves codepoints) + to_lowercase (may change byte
+    // width but not codepoint count for any script we support). We walk both char
+    // iterators in parallel to pair char indices.
+    let content_chars: Vec<(usize, char)> = content.char_indices().collect();
+    let norm_chars: Vec<(usize, char)> = normalized_content.char_indices().collect();
+
+    let mut spans = Vec::with_capacity(tokens.len());
+    let mut search_byte_start = 0usize; // byte offset into normalized_content
+
+    for token in &tokens {
+        // Find the token (already normalized) in normalized_content starting from
+        // the current forward position.
+        let Some(match_byte_start) = normalized_content[search_byte_start..].find(token.as_str())
+        else {
+            // Token not found — content doesn't actually match this query.
+            return Vec::new();
+        };
+
+        let abs_byte_start = search_byte_start + match_byte_start;
+        let abs_byte_end = abs_byte_start + token.len();
+
+        // Convert byte offsets in normalized_content to char indices in content.
+        // Because we walk both char arrays simultaneously, the i-th char in
+        // normalized_content corresponds to the i-th char in content.
+        let char_start = norm_chars
+            .iter()
+            .position(|(b, _)| *b == abs_byte_start)
+            .unwrap_or(0);
+        let char_end = norm_chars
+            .iter()
+            .position(|(b, _)| *b == abs_byte_end)
+            .unwrap_or(content_chars.len());
+
+        spans.push([char_start, char_end]);
+
+        // Advance past this match so the next token is searched forward only.
+        search_byte_start = abs_byte_end;
+    }
+
+    spans
+}
+
 /// Convert a search query into a SQLite LIKE pattern.
 ///
 /// Normalizes the query via [`normalize_for_search`], then splits on characters
@@ -127,13 +203,7 @@ pub fn normalize_for_search(s: &str) -> String {
 ///
 /// Returns `%` (match everything) when the query has no tokens.
 pub fn query_to_like_pattern(query: &str) -> String {
-    let normalized = normalize_for_search(query);
-
-    let tokens: Vec<String> = normalized
-        .split(|c: char| !is_word_char(c))
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-        .collect();
+    let tokens = query_tokens(query);
 
     if tokens.is_empty() {
         return "%".to_string();
@@ -215,6 +285,49 @@ mod tests {
             query_to_like_pattern("hello 世界 привет"),
             "%hello%世界%привет%"
         );
+    }
+
+    #[test]
+    fn highlight_single_token() {
+        let spans = find_highlight_spans("Hello world", "world");
+        assert_eq!(spans, vec![[6, 11]]);
+    }
+
+    #[test]
+    fn highlight_multiple_tokens_forward_order() {
+        let spans = find_highlight_spans("big plans for the marmot colony", "big plans");
+        assert_eq!(spans, vec![[0, 3], [4, 9]]);
+    }
+
+    #[test]
+    fn highlight_case_insensitive() {
+        let spans = find_highlight_spans("Hello World", "hello");
+        assert_eq!(spans, vec![[0, 5]]);
+    }
+
+    #[test]
+    fn highlight_no_match_returns_empty() {
+        let spans = find_highlight_spans("Hello world", "marmot");
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn highlight_empty_query_returns_empty() {
+        let spans = find_highlight_spans("Hello world", "");
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn highlight_cjk() {
+        let spans = find_highlight_spans("こんにちは世界", "世界");
+        assert_eq!(spans, vec![[5, 7]]);
+    }
+
+    #[test]
+    fn highlight_multiword_gap_between_tokens() {
+        // tokens are "big" and "colony" — they appear with other words in between
+        let spans = find_highlight_spans("big marmot colony", "big colony");
+        assert_eq!(spans, vec![[0, 3], [11, 17]]);
     }
 
     #[test]

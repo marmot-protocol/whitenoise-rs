@@ -15,7 +15,7 @@ mod tests;
 
 pub use types::{
     AggregatorConfig, ChatMessage, ChatMessageSummary, DeliveryStatus, EmojiReaction,
-    GroupStatistics, ProcessingError, ReactionSummary, UserReaction,
+    GroupStatistics, ProcessingError, ReactionSummary, SearchResult, UserReaction,
 };
 
 use mdk_core::prelude::message_types::Message;
