@@ -379,7 +379,7 @@ Remaining follow-ups are smaller and more focused:
 
 ## Implementation Snapshot
 
-Status as of March 9, 2026:
+Status as of March 10, 2026:
 
 - completed:
   - `RelayControlPlane`, `RelayPlane`, `SubscriptionContext`, and
@@ -399,41 +399,35 @@ Status as of March 9, 2026:
     fanout routes by `#h` tag via `RelayRouter::matching_group_contexts`
   - long-lived giftwrap subscriptions run on per-account inbox planes; auth is
     allowed only on this plane; signer is attached for the full session
-    lifetime
-  - the ephemeral plane is fully implemented: short-lived per-operation
-    `RelaySession` instances with bounded retry, telemetry persistors, and
-    welcome publishing already routing here
+    lifetime; logout now shuts the inbox session down fully
+  - the ephemeral plane now runs through `EphemeralExecutor` with one reusable
+    anonymous session plus one reusable session per logged-in account; welcome
+    publishing and targeted fetches already route here
   - relay-plane events enter the event processor with typed `EventSource`
     carrying a `SubscriptionContext` rather than a raw subscription ID string;
     the event processor dispatches by `context.stream`
+  - `Whitenoise` runtime relay ownership is on `RelayControlPlane`; there is no
+    production shared `NostrManager` client field, no dual-client startup, and
+    no remaining `self.nostr.ensure_relays_connected(...)` activation path
 - in progress / partial:
-  - `NostrManager` still exists and its shared `Client` is still live
-    alongside the new planes
-  - `Whitenoise` initialization still adds default relays to
-    `self.nostr.client` and calls `client.connect()` in parallel with
-    `relay_control.start_discovery_plane()`
-  - `activate_account` and `activate_account_without_publishing` in
-    `accounts/setup.rs` still call `self.nostr.ensure_relays_connected` with
-    the merged NIP-65 + inbox + key-package relay set on the legacy client
-  - `is_event_global()` in the event processor still uses string-prefix parsing
-    (`"global_users_"`) for the legacy subscription-ID path; this survives
-    alongside the new typed path
-  - `AccountInboxPlane::deactivate()` unsubscribes and unsets the signer but
-    does not call `session.shutdown()`, leaving relay connections open after
-    logout
-- still legacy / not started:
-  - the legacy shared `Client` inside `NostrManager` is still the production
-    path for relay-status queries (`get_relay_status`) and for the relay-pool
-    accumulation triggered by account activation
+  - discovery catch-up still uses batched queries on the warm discovery session
+    instead of EOSE-terminated subscriptions
+  - `EventSource::LegacySubscriptionId` and `is_event_global()` remain as
+    compatibility branches even though current relay-control production traffic
+    uses typed `EventSource::RelaySubscription`
+  - telemetry persistence still records high-volume `*Attempt` samples and has
+    no retention / eviction policy
+- still deferred / not started:
   - Phase 8 (gossip evaluation) not started
 
-This means the migration is no longer a strict phase-by-phase sequence. The
-long-lived subscription planes, ephemeral plane, observability layer, and typed
-event routing all landed. The remaining work is concentrated in Phase 7:
-retiring the legacy shared `NostrManager` client from the two production
-activation paths and cleaning up the dual-client startup. The rest of this
-document keeps the original phase structure, but each phase below now includes
-an explicit implementation status.
+This means the migration is no longer a shared-client retirement project. The
+long-lived subscription planes, ephemeral executor, observability layer, and
+typed event routing all landed. The remaining work is smaller and more focused:
+warm-set reconciliation in the ephemeral executor, discovery catch-up EOSE
+support, cleanup of the now-unused legacy event-source compatibility path, and
+telemetry retention / write-volume tuning. The rest of this document keeps the
+original phase structure, but the current-state summaries below reflect the
+codebase as it exists today.
 
 ## Migration Rules
 
@@ -558,7 +552,7 @@ Success state:
 
 ### Phase 2: Extract `RelaySession`
 
-Status: Partially completed as of March 8, 2026.
+Status: Completed on March 10, 2026.
 
 Objective:
 
@@ -608,10 +602,8 @@ Success state:
 - dedicated relay planes already execute through `RelaySession`
 - the codebase can instantiate more than one client session without
   duplicating setup logic
-- remaining work:
-  - decide whether the legacy shared-client compatibility path should itself be
-    wrapped by `RelaySession` before deletion, or whether we should delete it
-    directly as later call sites migrate
+- the legacy shared-client compatibility path is gone; `RelaySession` is the
+  only runtime client/session primitive used by relay-control code
 
 ### Phase 3: Stand Up the Group Plane
 
@@ -667,7 +659,8 @@ Success state:
 
 ### Phase 4: Stand Up the Discovery Plane
 
-Status: Partially completed as of March 8, 2026.
+Status: Completed on March 9, 2026, for curated discovery ownership and
+batched catch-up.
 
 Objective:
 
@@ -720,15 +713,18 @@ Success state:
 - completed:
   - long-lived discovery subscriptions now belong to the curated discovery
     plane
+  - initial contact-list bootstrap refreshes the discovery watched set and runs
+    catch-up through the warm discovery session rather than per-user ephemeral
+    fanout
 - remaining work:
-  - move one-off discovery fetch/query call sites to the discovery or
-    ephemeral plane
-  - remove the old "shared client plus whatever is already connected" fallback
-    model from discovery fetches
+  - add first-class EOSE handling in `RelaySession`
+  - move discovery catch-up from batched queries to EOSE-terminated
+    subscriptions that can close immediately on completion
 
 ### Phase 5: Introduce Ephemeral Publish and Query Operations
 
-Status: Not started beyond module scaffolding as of March 8, 2026.
+Status: Completed on March 9, 2026, for executor-backed ephemeral publish and
+query operations.
 
 Objective:
 
@@ -776,9 +772,11 @@ Success state:
 
 - welcome delivery and targeted fallback fetches run through ephemeral
   operations
-- long-lived plane relay membership remains stable before and after ephemeral
-  work
-- no new transient relays are accumulated on long-lived sessions
+- one reusable anonymous session plus one reusable session per account replaced
+  the previous per-operation session churn
+- remaining work:
+  - reconcile long-lived warm sets as relay lists change over time
+  - keep refining ad-hoc idle-eviction so stale relays converge out cleanly
 
 ### Phase 6: Introduce Per-Account Inbox Planes
 
@@ -843,7 +841,7 @@ Success state:
 
 ### Phase 7: Remove Shared-Client Assumptions
 
-Status: Partially completed as of March 8, 2026.
+Status: Substantially completed as of March 10, 2026.
 
 Objective:
 
@@ -892,12 +890,15 @@ Validation steps:
 Success state:
 
 - completed:
+  - `Whitenoise` is wired through `RelayControlPlane` for runtime relay
+    ownership
   - relay-plane event intake already uses typed source context in the event
     processor
+  - `NostrManager` no longer owns a production shared client
 - remaining work:
-  - migrate remaining query and publish call sites off `NostrManager`
-  - delete or sharply reduce shared-client orchestration helpers
-  - make `RelayControlPlane` the only production relay boundary
+  - remove `EventSource::LegacySubscriptionId`,
+    `ProcessableEvent::new_nostr_event`, and `is_event_global()` once the
+    remaining compatibility-only producers and tests are migrated or deleted
 
 ### Phase 8: Re-evaluate Gossip for Discovery
 
@@ -1071,67 +1072,37 @@ shape or move to a more privacy-preserving strategy, for example:
 
 ### Mandatory before the migration is complete
 
-**1. Remove dual-client startup (`Whitenoise::initialize_whitenoise`)**
+**1. Add warm-set reconciliation to `EphemeralExecutor`**
 
-`src/whitenoise/mod.rs` lines 440–453 still add default relays to
-`self.nostr.client` and call `client.connect()` alongside
-`relay_control.start_discovery_plane()`. After this call both a legacy
-`NostrManager` client and the discovery-plane `RelaySession` are connected to
-overlapping relay sets simultaneously. This should be removed once the
-discovery plane owns startup. The legacy default-relay seeding can be dropped
-entirely; the discovery plane has its own curated seed set.
+The executor currently tracks pinned relay ref-counts and TTL-managed ad-hoc
+relays, but it does not have a "desired warm set changed from A to B" reconcile
+operation. That means long-lived anonymous and account-scoped warm sessions can
+drift when relay lists change over time. The fix is to add owner-aware
+reconciliation or an equivalent desired-set API so stale warm relays are
+removed automatically rather than only when a caller happens to unpin the exact
+old set.
 
-**2. Migrate account activation off `ensure_relays_connected` on the legacy client**
+**2. Add first-class EOSE handling to `RelaySession` and move discovery catch-up to it**
 
-`src/whitenoise/accounts/setup.rs` lines 54 and 93 call
-`self.nostr.ensure_relays_connected(&relay_urls)` with the merged
-NIP-65 + inbox + key-package relay set. This is the primary remaining source
-of uncontrolled relay-pool growth on the legacy shared client. The fix is to
-route this relay setup through the control plane instead:
+Discovery catch-up still runs through batched `fetch_events_from(...)` queries
+on the warm discovery session. Functional behavior is correct, but this keeps
+discovery catch-up heavier and longer-lived than necessary. The remaining work
+is to make `RelaySession` understand EOSE explicitly, then convert discovery
+catch-up into EOSE-terminated subscriptions that close immediately after the
+relays finish replay.
 
-- inbox relays → already handled by `activate_account_subscriptions` (inbox
-  plane)
-- group relays → already handled by `activate_account_subscriptions` (group
-  plane)
-- NIP-65 and key-package relays → should be handled by the ephemeral plane
-  for key-package fetching, or simply removed since the discovery plane covers
-  those relays for public discovery work
+**3. Delete the legacy `LegacySubscriptionId` compatibility path**
 
-**3. Fix `AccountInboxPlane::deactivate` to call `session.shutdown()`**
-
-`src/relay_control/account_inbox.rs` `deactivate()` unsubscribes the giftwrap
-subscription and unsets the signer but does not call `self.session.shutdown()`.
-This leaves the underlying `nostr-sdk::Client` with open relay connections
-after logout. `RelaySession::shutdown()` already exists and calls
-`client.reset()` followed by `client.shutdown()`.
-
-**4. Remove `is_event_global()` string-prefix routing once the legacy client is gone**
-
-`src/whitenoise/event_processor/mod.rs` line 151 uses
-`subscription_id.starts_with("global_users_")` to route legacy-path events.
-Once the `NostrManager` shared client is removed and all events arrive with
-typed `EventSource::RelaySubscription` context, this branch and the helper can
-be deleted.
-
-**5. Delete or reduce `NostrManager` to a parser facade**
-
-Once the two activation call sites above are migrated, the only remaining uses
-of `self.nostr` in production paths will be:
-
-- `nostr.delete_all_data()` — `client.unset_signer()` + `unsubscribe_all()`;
-  can be replaced with a shutdown hook on the relay control plane
-- `nostr.client.reset()` in the reset path — replace with
-  `relay_control.reset_for_tests()` or equivalent
-- `nostr.session_salt()` used in `account_event_processor.rs` for subscription
-  ID hashing — the salt is already on `RelayControlPlane`; expose it from
-  there
-- `nostr.parse(...)` calls in `messages.rs` — the parser lives in
-  `nostr_manager/parser.rs` and is independent of the client; keep the module
-  but remove the `Client` field
+Runtime relay traffic already enters the event processor with typed
+`EventSource::RelaySubscription` context. The remaining string-prefix routing
+through `EventSource::LegacySubscriptionId`,
+`ProcessableEvent::new_nostr_event`, and `is_event_global()` is now a
+compatibility layer that exists mostly for older tests and synthetic paths. The
+migration is not fully complete until that branch is removed.
 
 ### Nice-to-have before tagging this complete
 
-**6. Telemetry write volume and DB contention**
+**4. Telemetry write volume and DB contention**
 
 See the separate analysis section below. The short version: the current design
 writes to both `relay_events` (append) and `relay_status` (read-modify-write)
@@ -1146,7 +1117,7 @@ with application writes.
 
 The recommended fix is described in the telemetry section below.
 
-**7. Telemetry retention / eviction**
+**5. Telemetry retention / eviction**
 
 `relay_events` is an unbounded append-only table. There is no eviction or
 pruning logic yet. For a mobile app this will grow without bound. Add a
