@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use futures::future::join_all;
 use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 
@@ -179,9 +180,13 @@ impl RelaySession {
         }
 
         if added_new_relay || !relays_to_wait.is_empty() {
-            for relay in relays_to_wait {
-                relay.wait_for_connection(self.config.connect_timeout).await;
-            }
+            let connect_timeout = self.config.connect_timeout;
+            join_all(
+                relays_to_wait
+                    .into_iter()
+                    .map(|relay| async move { relay.wait_for_connection(connect_timeout).await }),
+            )
+            .await;
         }
 
         let mut connected_relays = 0usize;

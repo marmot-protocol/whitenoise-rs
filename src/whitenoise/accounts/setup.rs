@@ -857,7 +857,17 @@ impl Whitenoise {
     }
 
     async fn warm_ephemeral_account_relays(&self, account: &Account) -> Result<()> {
-        let warm_relays = self.account_ephemeral_warm_relay_urls(account).await?;
+        let warm_relays = match self.account_ephemeral_warm_relay_urls(account).await {
+            Ok(warm_relays) => warm_relays,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %account.pubkey,
+                    "Failed to resolve ephemeral warm relays for account: {error}"
+                );
+                Vec::new()
+            }
+        };
         if warm_relays.is_empty() {
             return Ok(());
         }

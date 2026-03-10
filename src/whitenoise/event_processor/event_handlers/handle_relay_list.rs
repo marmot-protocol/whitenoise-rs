@@ -1,8 +1,12 @@
 use nostr_sdk::prelude::*;
 
 use crate::whitenoise::{
-    Whitenoise, accounts::Account, database::processed_events::ProcessedEvent, error::Result,
-    users::User, utils::timestamp_to_datetime,
+    Whitenoise,
+    accounts::Account,
+    database::processed_events::ProcessedEvent,
+    error::{Result, WhitenoiseError},
+    users::User,
+    utils::timestamp_to_datetime,
 };
 
 impl Whitenoise {
@@ -54,9 +58,7 @@ impl Whitenoise {
     }
 
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
-        let account = Account::find_by_pubkey(&user.pubkey, &self.database)
-            .await
-            .ok();
+        let user_pubkey = user.pubkey;
         let event_pubkey = event.pubkey;
 
         tokio::spawn(async move {
@@ -70,6 +72,20 @@ impl Whitenoise {
                         error
                     );
                     return;
+                }
+            };
+
+            let account = match Account::find_by_pubkey(&user_pubkey, &whitenoise.database).await {
+                Ok(account) => Some(account),
+                Err(WhitenoiseError::AccountNotFound) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::handle_relay_list",
+                        "Failed to look up account for relay list refresh {}: {}",
+                        event_pubkey,
+                        error
+                    );
+                    None
                 }
             };
 

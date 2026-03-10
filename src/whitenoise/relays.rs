@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     relay_control::RelayPlane,
     whitenoise::{
-        Whitenoise, accounts::Account, database::relay_status::RelayStatusRecord, error::Result,
+        Whitenoise,
+        accounts::Account,
+        database::relay_status::{RelayStatusLookupKey, RelayStatusRecord},
+        error::Result,
     },
 };
 
@@ -166,45 +169,54 @@ impl Whitenoise {
             }
         }
 
-        let mut relay_statuses = Vec::with_capacity(relay_types_by_url.len());
+        let mut lookup_keys_by_url: HashMap<RelayUrl, Vec<RelayStatusLookupKey>> = HashMap::new();
+        let mut all_lookup_keys = Vec::new();
 
-        for (relay_url, relay_types) in relay_types_by_url {
-            let mut relevant_records = Vec::new();
+        for (relay_url, relay_types) in &relay_types_by_url {
+            let mut lookup_keys = Vec::new();
 
             if relay_types.contains(&RelayType::Inbox) {
-                relevant_records.push(
-                    RelayStatusRecord::find(
-                        &relay_url,
-                        RelayPlane::AccountInbox,
-                        Some(account.pubkey),
-                        &self.database,
-                    )
-                    .await?,
-                );
+                lookup_keys.push(RelayStatusLookupKey {
+                    relay_url: relay_url.clone(),
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(account.pubkey),
+                });
             }
 
             if relay_types.contains(&RelayType::Nip65)
                 || relay_types.contains(&RelayType::KeyPackage)
             {
-                relevant_records.push(
-                    RelayStatusRecord::find(
-                        &relay_url,
-                        RelayPlane::Ephemeral,
-                        Some(account.pubkey),
-                        &self.database,
-                    )
-                    .await?,
-                );
-                relevant_records.push(
-                    RelayStatusRecord::find(
-                        &relay_url,
-                        RelayPlane::Ephemeral,
-                        None,
-                        &self.database,
-                    )
-                    .await?,
-                );
+                lookup_keys.push(RelayStatusLookupKey {
+                    relay_url: relay_url.clone(),
+                    plane: RelayPlane::Ephemeral,
+                    account_pubkey: Some(account.pubkey),
+                });
+                lookup_keys.push(RelayStatusLookupKey {
+                    relay_url: relay_url.clone(),
+                    plane: RelayPlane::Ephemeral,
+                    account_pubkey: None,
+                });
             }
+
+            all_lookup_keys.extend(lookup_keys.iter().cloned());
+            lookup_keys_by_url.insert(relay_url.clone(), lookup_keys);
+        }
+
+        let status_records = RelayStatusRecord::find_many(&all_lookup_keys, &self.database).await?;
+        let records_by_key = status_records
+            .into_iter()
+            .map(|record| (record.lookup_key(), record))
+            .collect::<HashMap<_, _>>();
+
+        let mut relay_statuses = Vec::with_capacity(relay_types_by_url.len());
+
+        for relay_url in relay_types_by_url.into_keys() {
+            let relevant_records = lookup_keys_by_url
+                .remove(&relay_url)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|lookup_key| records_by_key.get(&lookup_key).cloned())
+                .collect::<Vec<_>>();
 
             let status = if relevant_records.iter().flatten().any(record_is_connected) {
                 RelayStatus::Connected
@@ -616,6 +628,33 @@ mod tests {
                 Some(account.pubkey),
             )
             .await;
+
+            let statuses = whitenoise
+                .get_account_relay_statuses(&account)
+                .await
+                .unwrap();
+
+            assert_eq!(statuses, vec![(relay_url, RelayStatus::Connected)]);
+        }
+
+        #[tokio::test]
+        async fn test_get_account_relay_statuses_reads_unscoped_ephemeral_plane_for_nip65() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, keys) = create_test_account(&whitenoise).await;
+            let account = account.save(&whitenoise.database).await.unwrap();
+            whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+            let user = account.user(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("ws://localhost:7777").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            user.add_relays(&[relay], RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            persist_connected_status(&whitenoise, &relay_url, RelayPlane::Ephemeral, None).await;
 
             let statuses = whitenoise
                 .get_account_relay_statuses(&account)
