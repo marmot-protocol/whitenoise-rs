@@ -3003,7 +3003,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "hello world");
+        assert_eq!(results[0].message.content, "hello world");
 
         // Forward-order multi-word search
         let results = AggregatedMessage::search_messages_in_group(
@@ -3016,7 +3016,7 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].content,
+            results[0].message.content,
             "our big plans are bigger than you imagine"
         );
 
@@ -3037,7 +3037,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "marmot protocol is the future");
+        assert_eq!(results[0].message.content, "marmot protocol is the future");
 
         // CJK search
         let results = AggregatedMessage::search_messages_in_group(
@@ -3049,7 +3049,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "日本語のメッセージ");
+        assert_eq!(results[0].message.content, "日本語のメッセージ");
 
         // Cyrillic search
         let results = AggregatedMessage::search_messages_in_group(
@@ -3072,7 +3072,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "नमस्ते दुनिया");
+        assert_eq!(results[0].message.content, "नमस्ते दुनिया");
 
         // No match
         let results = AggregatedMessage::search_messages_in_group(
