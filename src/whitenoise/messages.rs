@@ -686,9 +686,7 @@ impl Whitenoise {
         let limit_val = limit.unwrap_or(50);
         AggregatedMessage::search_messages_in_group(group_id, query, limit_val, &self.database)
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to search messages: {}", e))
-            })
+            .map_err(|e| WhitenoiseError::from(anyhow::anyhow!("Failed to search messages: {}", e)))
     }
 
     /// Creates an unsigned nostr event with the given parameters

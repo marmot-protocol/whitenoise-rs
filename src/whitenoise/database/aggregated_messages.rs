@@ -2973,10 +2973,14 @@ mod tests {
         }
 
         // Basic single-word search
-        let results =
-            AggregatedMessage::search_messages_in_group(&group_id, "hello", 50, &whitenoise.database)
-                .await
-                .unwrap();
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "hello",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "hello world");
 
@@ -2990,7 +2994,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].content, "our big plans are bigger than you imagine");
+        assert_eq!(
+            results[0].content,
+            "our big plans are bigger than you imagine"
+        );
 
         // Substring matching ("big" matches "bigger")
         let results =
