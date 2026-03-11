@@ -5,8 +5,7 @@ use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
-    perf_span,
+    WhitenoiseError, perf_span,
     whitenoise::cached_graph_user::{CachedGraphUser, DEFAULT_CACHE_TTL_HOURS},
 };
 

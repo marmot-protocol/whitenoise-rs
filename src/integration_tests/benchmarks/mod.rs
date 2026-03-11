@@ -22,7 +22,5 @@ pub static PERF_LAYER: OnceLock<PerfTracingLayer> = OnceLock::new();
 /// [`PERF_LAYER`], so the layer added to the subscriber stack and the one read
 /// via `PERF_LAYER.get()` share the same backing sample buffer.
 pub fn init_perf_layer() -> PerfTracingLayer {
-    PERF_LAYER
-        .get_or_init(PerfTracingLayer::new)
-        .clone()
+    PERF_LAYER.get_or_init(PerfTracingLayer::new).clone()
 }

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use nostr_sdk::{RelayUrl, SubscriptionId};
 use tokio::sync::RwLock;
 
-use crate::perf_span;
 use super::SubscriptionContext;
+use crate::perf_span;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RelaySubscriptionKey {
