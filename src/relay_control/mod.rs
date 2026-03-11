@@ -83,7 +83,7 @@ impl RelayControlPlane {
 
         Self {
             database,
-            event_sender: event_sender.clone(),
+            event_sender,
             session_salt,
             discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
