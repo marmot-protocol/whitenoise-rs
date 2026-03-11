@@ -31,28 +31,58 @@
 /// by parsing the `duration_ns` field from the event. Call
 /// `PerfTracingLayer::drain()` after a benchmark loop to retrieve them.
 ///
+/// # Trace format
+///
+/// Each guard emits a single log line at drop time with four fields:
+///
+/// ```text
+/// whitenoise::perf: name="..." span_id=NNN ts_begin_us=NNN duration_ns=NNN
+/// ```
+///
+/// - `span_id` — monotonically incrementing ID, unique per guard instance.
+///   Use as `tid` in Chrome Trace Format so concurrent async operations render
+///   as parallel lanes rather than false nesting.
+/// - `ts_begin_us` — microseconds since Unix epoch at the moment the guard was
+///   created.  Use as the `B` timestamp; `ts_begin_us + duration_ns/1000` gives
+///   the `E` timestamp.
+///
 /// # Design note: why not `tracing::EnteredSpan`?
 ///
 /// `EnteredSpan` is `!Send`, so holding one across an `.await` point causes a
 /// compile error in `tokio::spawn` futures. This custom guard emits a regular
 /// `info!` event (which is `Send`) on drop instead, sidestepping the problem
 /// entirely.
-use std::time::Instant;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// RAII performance guard. Emits a `tracing::info!` event with target
-/// `"whitenoise::perf"` and field `duration_ns` when dropped.
+/// `"whitenoise::perf"` and fields `span_id`, `ts_begin_us`, and `duration_ns`
+/// when dropped.
 ///
 /// This type is `Send`, so it is safe to hold across `.await` points.
 pub struct PerfGuard {
     name: &'static str,
+    span_id: u64,
+    ts_begin_us: u64,
     start: Instant,
 }
 
 impl PerfGuard {
     #[inline]
     pub fn new(name: &'static str) -> Self {
+        let span_id = NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed);
+        let ts_begin_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
         Self {
             name,
+            span_id,
+            ts_begin_us,
             start: Instant::now(),
         }
     }
@@ -65,6 +95,8 @@ impl Drop for PerfGuard {
         tracing::info!(
             target: "whitenoise::perf",
             name = self.name,
+            span_id = self.span_id,
+            ts_begin_us = self.ts_begin_us,
             duration_ns = ns,
             "perf"
         );
