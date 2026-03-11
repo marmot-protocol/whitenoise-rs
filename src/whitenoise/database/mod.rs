@@ -112,8 +112,8 @@ impl Database {
 
         let connect_options = format!("{db_url}?mode=rwc")
             .parse::<SqliteConnectOptions>()?
-            .log_statements(log::LevelFilter::Info)
-            .log_slow_statements(log::LevelFilter::Warn, Duration::from_millis(500));
+            .log_statements(tracing::log::LevelFilter::Info)
+            .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_millis(500));
 
         let pool = SqlitePoolOptions::new()
             .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))

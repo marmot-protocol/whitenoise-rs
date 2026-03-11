@@ -5435,7 +5435,6 @@ dependencies = [
  "keyring-core",
  "lightning-invoice",
  "linux-keyutils-keyring-store",
- "log",
  "mdk-core",
  "mdk-sqlite-storage",
  "mdk-storage-traits",
