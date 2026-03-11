@@ -146,24 +146,28 @@ impl BenchmarkRegistry {
                 tracing::info!("");
                 tracing::info!("  Perf Breakdown (sorted by call count):");
                 tracing::info!(
-                    "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
+                    "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
                     "Marker",
                     "Calls",
                     "Mean",
                     "Median",
                     "P95",
-                    "P99"
+                    "P99",
+                    "Min",
+                    "Max"
                 );
-                tracing::info!("  {}", "-".repeat(105));
+                tracing::info!("  {}", "-".repeat(127));
                 for b in breakdown {
                     tracing::info!(
-                        "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}",
+                        "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
                         b.marker,
                         b.call_count,
                         format!("{:.2?}", b.mean),
                         format!("{:.2?}", b.median),
                         format!("{:.2?}", b.p95),
                         format!("{:.2?}", b.p99),
+                        format!("{:.2?}", b.min),
+                        format!("{:.2?}", b.max),
                     );
                 }
             }

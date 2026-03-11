@@ -304,6 +304,23 @@ impl User {
         Ok(relays)
     }
 
+    /// Bumps `updated_at` to now without changing any other fields.
+    ///
+    /// Use this to record "we checked this user's metadata" even when no new
+    /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
+    /// for empty-profile users.
+    pub(crate) async fn touch_updated_at(&self, database: &Database) -> Result<(), WhitenoiseError> {
+        let current_time = Utc::now().timestamp_millis();
+        sqlx::query("UPDATE users SET updated_at = ? WHERE pubkey = ?")
+            .bind(current_time)
+            .bind(self.pubkey.to_hex().as_str())
+            .execute(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)
+            .map_err(WhitenoiseError::Database)?;
+        Ok(())
+    }
+
     /// Saves this user to the database.
     ///
     /// # Arguments

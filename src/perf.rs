@@ -159,7 +159,11 @@ impl Drop for PerfGuard {
 /// Emits a performance timing event with target `"whitenoise::perf"` when
 /// the returned guard is dropped.
 ///
-/// The returned `PerfGuard` is `Send` and safe to hold across `.await` points.
+/// Returns `Option<PerfGuard>`: `Some` when the `whitenoise::perf` target is
+/// enabled by the current tracing subscriber, `None` otherwise.  When `None`,
+/// no `Instant::now()` or `SystemTime::now()` call is made — truly zero cost.
+///
+/// The returned value is `Send` and safe to hold across `.await` points.
 /// Name the guard with a leading underscore (`_span`) to keep the RAII lifetime
 /// intact without triggering the unused-variable warning.
 ///
@@ -168,11 +172,15 @@ impl Drop for PerfGuard {
 /// ```ignore
 /// let _span = perf_span!("messages::send_message_to_group");
 /// // ... async work including awaits ...
-/// // guard dropped here → timing event emitted
+/// // guard dropped here → timing event emitted (or no-op if tracing disabled)
 /// ```
 #[macro_export]
 macro_rules! perf_span {
     ($name:literal) => {
-        $crate::perf::PerfGuard::new($name)
+        if tracing::enabled!(target: "whitenoise::perf", tracing::Level::INFO) {
+            Some($crate::perf::PerfGuard::new($name))
+        } else {
+            None
+        }
     };
 }

@@ -110,9 +110,17 @@ impl Database {
     async fn create_connection_pool(db_url: &str) -> Result<SqlitePool, DatabaseError> {
         tracing::debug!("Creating connection pool...");
 
+        // Log every SQL statement only when explicitly opted in (e.g. benchmarks).
+        // Slow-query logging stays unconditional as a safety net.
+        let log_statements_level = if std::env::var("SQLX_LOG_STATEMENTS").is_ok() {
+            tracing::log::LevelFilter::Info
+        } else {
+            tracing::log::LevelFilter::Off
+        };
+
         let connect_options = format!("{db_url}?mode=rwc")
             .parse::<SqliteConnectOptions>()?
-            .log_statements(tracing::log::LevelFilter::Info)
+            .log_statements(log_statements_level)
             .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_millis(500));
 
         let pool = SqlitePoolOptions::new()

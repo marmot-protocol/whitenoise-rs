@@ -116,7 +116,6 @@ impl Whitenoise {
     /// Only when the app explicitly interacts with a result (follow, message, etc.)
     /// should a User record be created via `find_or_create_user_by_pubkey`.
     pub async fn search_users(&self, params: UserSearchParams) -> Result<UserSearchSubscription> {
-        let _span = perf_span!("user_search::search_users");
         if params.radius_start > params.radius_end {
             return Err(crate::whitenoise::error::WhitenoiseError::InvalidInput(
                 format!(
@@ -136,6 +135,8 @@ impl Whitenoise {
         let radius_end = params.radius_end;
 
         tokio::spawn(async move {
+            let _span = perf_span!("user_search::search_users");
+
             // Get singleton instance inside spawned task (follows existing pattern in groups.rs)
             let whitenoise = match Self::get_instance() {
                 Ok(wn) => wn,

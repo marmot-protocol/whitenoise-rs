@@ -75,12 +75,11 @@ impl User {
         let ttl_duration = Duration::hours(METADATA_TTL_HOURS);
         let stale_threshold = now - ttl_duration;
 
-        // Always refresh if metadata is default (empty)
-        if self.metadata == Metadata::new() {
-            return true;
-        }
-
-        // Refresh if updated_at is older than TTL
+        // Refresh if updated_at is older than TTL.
+        // We rely solely on updated_at rather than checking metadata content,
+        // because sync_metadata always bumps updated_at after checking — even
+        // when no kind-0 event is found.  This lets empty-profile users hit
+        // the fast path once we've confirmed there's nothing to fetch.
         self.updated_at < stale_threshold
     }
 
@@ -104,6 +103,7 @@ impl User {
             .relay_control
             .fetch_metadata_from(&relays_urls, self.pubkey)
             .await?;
+        let mut saved = false;
         if let Some(event) = metadata_event {
             let metadata = Metadata::from_json(&event.content)?;
             let should_update = self
@@ -113,8 +113,9 @@ impl User {
             if should_update {
                 self.metadata = metadata;
 
-                // Save the updated user metadata
+                // Save the updated user metadata (also bumps updated_at)
                 self.save(&whitenoise.database).await?;
+                saved = true;
 
                 whitenoise
                     .event_tracker
@@ -128,6 +129,12 @@ impl User {
                     event.created_at
                 );
             }
+        }
+        // Always record that we checked, even if no metadata was found or
+        // the event didn't need updating.  This lets needs_metadata_refresh()
+        // respect the TTL for empty-profile users.
+        if !saved {
+            self.touch_updated_at(&whitenoise.database).await?;
         }
         Ok(())
     }
@@ -1328,17 +1335,34 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_needs_metadata_refresh_default_metadata() {
+        async fn test_needs_metadata_refresh_default_metadata_fresh_updated_at() {
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
             let user = User {
                 id: Some(1),
                 pubkey: test_pubkey,
                 metadata: Metadata::new(), // Default empty metadata
                 created_at: Utc::now(),
-                updated_at: Utc::now(), // Even if recently updated
+                updated_at: Utc::now(), // Recently checked
             };
 
-            // Should always refresh if metadata is default/empty
+            // Should NOT refresh: updated_at is recent, meaning we already
+            // checked and found no kind-0 event.  Empty metadata is fine.
+            assert!(!user.needs_metadata_refresh());
+        }
+
+        #[tokio::test]
+        async fn test_needs_metadata_refresh_default_metadata_stale_updated_at() {
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let stale_time = Utc::now() - Duration::hours(METADATA_TTL_HOURS + 1);
+            let user = User {
+                id: Some(1),
+                pubkey: test_pubkey,
+                metadata: Metadata::new(), // Default empty metadata
+                created_at: stale_time,
+                updated_at: stale_time, // Haven't checked in a while
+            };
+
+            // Should refresh: updated_at is past TTL, time to re-check
             assert!(user.needs_metadata_refresh());
         }
 
