@@ -126,10 +126,11 @@ pub fn init_tracing_with_perf_layer(logs_dir: &std::path::Path, perf_layer: Perf
         let env_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info,refinery_core=warn,refinery=warn"));
 
-        // Add a dedicated INFO-level filter for the perf target so the layer
-        // receives events even when the global filter would suppress them.
+        // Add a dedicated INFO-level filter so the perf layer receives events
+        // from both our manual perf_span! markers and sqlx's query logger.
         let perf_filter = tracing_subscriber::filter::Targets::new()
-            .with_target("whitenoise::perf", LevelFilter::INFO);
+            .with_target("whitenoise::perf", LevelFilter::INFO)
+            .with_target("sqlx::query", LevelFilter::INFO);
 
         Registry::default()
             .with(env_filter)

@@ -1,17 +1,15 @@
-//! PerfTracingLayer — a `tracing_subscriber` layer that captures `whitenoise::perf`
-//! events and records their durations.
+//! PerfTracingLayer — a `tracing_subscriber` layer that captures performance
+//! events from two sources and records their durations:
 //!
-//! # How it works
+//! 1. **`whitenoise::perf`** — manual `perf_span!` markers emitted by `PerfGuard`
+//!    on drop, carrying `name` (str) and `duration_ns` (u64) fields.
+//! 2. **`sqlx::query`** — automatic query timing emitted by sqlx's `QueryLogger`
+//!    on drop, carrying `summary` (str) and `elapsed_secs` (f64) fields.
 //!
-//! The layer is registered **once** at benchmark binary startup. Every time a
-//! `tracing::info!` event whose target is `"whitenoise::perf"` is recorded, the
-//! layer extracts the `name` and `duration_ns` fields and pushes a `PerfSample`
-//! into a shared `Vec`. After a benchmark loop finishes, call
+//! Both event shapes are normalised into [`PerfSample`] structs and accumulated
+//! in a shared `Vec`. After a benchmark loop finishes, call
 //! [`PerfTracingLayer::drain`] to consume the accumulated samples and compute
 //! per-marker [`PerfBreakdown`] statistics.
-//!
-//! The `PerfGuard` type in `src/perf.rs` emits these events on drop, which means
-//! the layer is notified synchronously at the moment the guard goes out of scope.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -26,6 +24,7 @@ use tracing_subscriber::registry::LookupSpan;
 use super::stats;
 
 const PERF_TARGET: &str = "whitenoise::perf";
+const SQLX_TARGET: &str = "sqlx::query";
 
 /// A single timing observation for a named perf marker.
 #[derive(Debug, Clone)]
@@ -80,22 +79,35 @@ impl PerfBreakdown {
     }
 }
 
-// Visitor that extracts `name` (str) and `duration_ns` (u64) from event fields.
+// Visitor that extracts fields from both event shapes:
+// - perf events:  `name` (str) + `duration_ns` (u64)
+// - sqlx events:  `summary` (str) + `elapsed_secs` (f64)
 struct PerfEventVisitor {
     name: Option<String>,
     duration_ns: Option<u64>,
+    // sqlx fields
+    summary: Option<String>,
+    elapsed_secs: Option<f64>,
 }
 
 impl Visit for PerfEventVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "name" {
-            self.name = Some(value.to_string());
+        match field.name() {
+            "name" => self.name = Some(value.to_string()),
+            "summary" => self.summary = Some(value.to_string()),
+            _ => {}
         }
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
         if field.name() == "duration_ns" {
             self.duration_ns = Some(value);
+        }
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        if field.name() == "elapsed_secs" {
+            self.elapsed_secs = Some(value);
         }
     }
 
@@ -160,25 +172,43 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        // Only process events from the perf target
-        if event.metadata().target() != PERF_TARGET {
-            return;
-        }
+        let target = event.metadata().target();
 
         let mut visitor = PerfEventVisitor {
             name: None,
             duration_ns: None,
+            summary: None,
+            elapsed_secs: None,
         };
         event.record(&mut visitor);
 
-        if let (Some(name), Some(ns)) = (visitor.name, visitor.duration_ns) {
+        let sample = if target == PERF_TARGET {
+            // perf_span! events: name + duration_ns
+            match (visitor.name, visitor.duration_ns) {
+                (Some(name), Some(ns)) => Some(PerfSample {
+                    name,
+                    duration: Duration::from_nanos(ns),
+                }),
+                _ => None,
+            }
+        } else if target == SQLX_TARGET {
+            // sqlx query events: summary + elapsed_secs
+            match (visitor.summary, visitor.elapsed_secs) {
+                (Some(summary), Some(secs)) => Some(PerfSample {
+                    name: format!("sqlx::{summary}"),
+                    duration: Duration::from_secs_f64(secs),
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(sample) = sample {
             self.samples
                 .lock()
                 .expect("perf layer mutex poisoned")
-                .push(PerfSample {
-                    name,
-                    duration: Duration::from_nanos(ns),
-                });
+                .push(sample);
         }
     }
 }
