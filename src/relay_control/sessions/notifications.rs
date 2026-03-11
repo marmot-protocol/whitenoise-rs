@@ -21,9 +21,7 @@ pub(crate) enum RelayNotification {
         failure_category: Option<RelayFailureCategory>,
     },
     #[allow(dead_code)]
-    Connected {
-        relay_url: RelayUrl,
-    },
+    Connected { relay_url: RelayUrl },
     #[allow(dead_code)]
     Disconnected {
         relay_url: RelayUrl,
