@@ -32,6 +32,17 @@ impl Scenario for AccountManagementScenario {
         .execute(&mut self.context)
         .await?;
 
+        // Regression: new identities must have last_synced_at set immediately.
+        // Without this, a single unsynced account poisons global subscriptions
+        // for ALL accounts on the daemon (since=None unbounded re-fetch).
+        VerifyNewIdentitySyncedTestCase::for_accounts(vec![
+            "acct_mgmt_account1",
+            "acct_mgmt_account2",
+            "acct_mgmt_account3",
+        ])
+        .execute(&mut self.context)
+        .await?;
+
         LoginTestCase::new("account_with_previous_keys")
             .with_metadata("known_user", "A user with previous keys that logged in")
             .execute(&mut self.context)

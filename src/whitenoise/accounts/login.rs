@@ -1,3 +1,4 @@
+use chrono::Utc;
 use nostr_sdk::prelude::*;
 
 use super::{
@@ -28,6 +29,14 @@ impl Whitenoise {
     async fn create_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
         let mut account = self.create_base_account_with_private_key(keys).await?;
         tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
+
+        // A brand new identity has no history to catch up on — mark as synced
+        // immediately. Without this, `last_synced_at = NULL` poisons
+        // `compute_global_since_timestamp()` for ALL accounts, forcing
+        // global subscriptions to use `since=None` (unbounded re-fetch).
+        let now_ms = Utc::now().timestamp_millis();
+        Account::update_last_synced_max(&account.pubkey, now_ms, &self.database).await?;
+        account.last_synced_at = Some(Utc::now());
 
         let user = account.user(&self.database).await?;
 
@@ -1422,6 +1431,20 @@ mod tests {
 
         // Create a new identity
         let account = whitenoise.create_identity().await.unwrap();
+
+        // New identities must be marked as synced immediately so they don't
+        // poison compute_global_since_timestamp() for other accounts.
+        assert!(
+            account.last_synced_at.is_some(),
+            "New identity should have last_synced_at set to prevent global subscription poisoning"
+        );
+        let db_account = Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            db_account.last_synced_at.is_some(),
+            "New identity last_synced_at should be persisted in database"
+        );
 
         // Give the events time to be published and processed
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
