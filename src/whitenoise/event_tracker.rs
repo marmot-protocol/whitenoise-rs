@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 
+use crate::perf_span;
 use crate::whitenoise::{
     accounts::Account,
     database::{Database, processed_events::ProcessedEvent, published_events::PublishedEvent},
@@ -136,6 +137,7 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::track_published_event");
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
         let account_id = account
             .id
@@ -151,6 +153,7 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::account_published_event");
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
         let account_id = account
             .id
@@ -164,6 +167,7 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::global_published_event");
         PublishedEvent::exists(event_id, None, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -174,6 +178,7 @@ impl EventTracker for WhitenoiseEventTracker {
         event: &Event,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::track_processed_account_event");
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
         let account_id = account
             .id
@@ -195,6 +200,7 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::already_processed_account_event");
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
         let account_id = account
             .id
@@ -208,6 +214,7 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event: &Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::track_processed_global_event");
         ProcessedEvent::create(
             &event.id,
             None,
@@ -224,6 +231,7 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::already_processed_global_event");
         ProcessedEvent::exists(event_id, None, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)

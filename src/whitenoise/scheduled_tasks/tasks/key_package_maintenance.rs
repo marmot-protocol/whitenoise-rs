@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use nostr_sdk::{Event, Timestamp};
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::WhitenoiseError;
@@ -29,6 +30,7 @@ impl Task for KeyPackageMaintenance {
     }
 
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("scheduled::key_package_maintenance");
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Starting key package maintenance"
@@ -134,6 +136,7 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
 }
 
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
+    let _span = perf_span!("scheduled::maintain_key_packages");
     let packages = match whitenoise.fetch_all_key_packages_for_account(account).await {
         Ok(packages) => packages,
         Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {
@@ -235,6 +238,7 @@ fn find_expired_packages(packages: &[Event]) -> Vec<Event> {
 
 /// Publishes a new key package when account has none.
 async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
+    let _span = perf_span!("scheduled::publish_new_key_package");
     tracing::info!(
         target: "whitenoise::scheduler::key_package_maintenance",
         "Account {} has no key packages, publishing new one",
@@ -266,6 +270,7 @@ async fn rotate_expired_packages(
     expired_packages: Vec<Event>,
     total_package_count: usize,
 ) -> MaintenanceResult {
+    let _span = perf_span!("scheduled::rotate_expired_packages");
     let non_expired_count = total_package_count - expired_packages.len();
 
     tracing::info!(
@@ -323,6 +328,7 @@ async fn delete_outdated_packages(
     account: &Account,
     outdated_packages: Vec<Event>,
 ) -> MaintenanceResult {
+    let _span = perf_span!("scheduled::delete_outdated_packages");
     match whitenoise
         .delete_key_packages_for_account(account, outdated_packages, false, 1)
         .await

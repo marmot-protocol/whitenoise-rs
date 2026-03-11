@@ -1,6 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::{
+    perf_span,
     types::{EventSource, RetryInfo},
     whitenoise::{
         Whitenoise,
@@ -15,6 +16,7 @@ impl Whitenoise {
         source: EventSource,
         retry_info: RetryInfo,
     ) {
+        let _span = perf_span!("event_processor::process_global_event");
         // Relay-plane events already carry typed source context. The
         // `global_users_*` prefix check only exists for the legacy shared-client
         // compatibility path.
@@ -77,6 +79,7 @@ impl Whitenoise {
     /// Check if a global event should be skipped (not processed)
     /// Returns Some(reason) if should skip, None if should process
     async fn should_skip_global_event_processing(&self, event: &Event) -> Option<&'static str> {
+        let _span = perf_span!("event_processor::should_skip_global_event");
         let already_processed = match self
             .event_tracker
             .already_processed_global_event(&event.id)
@@ -118,6 +121,7 @@ impl Whitenoise {
     }
 
     async fn route_global_event_for_processing(&self, event: &Event) -> Result<()> {
+        let _span = perf_span!("event_processor::route_global_event");
         match event.kind {
             Kind::Metadata => self.handle_metadata(event.clone()).await,
             Kind::RelayList | Kind::InboxRelays | Kind::MlsKeyPackageRelays => {

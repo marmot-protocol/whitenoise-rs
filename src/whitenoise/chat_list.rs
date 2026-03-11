@@ -8,6 +8,7 @@ use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
+use crate::perf_span;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -225,6 +226,7 @@ impl Whitenoise {
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Declined and archived groups are filtered out.
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
+        let _span = perf_span!("chat_list::get_chat_list");
         let visible = self.visible_groups(account).await?;
         let active: Vec<_> = visible
             .into_iter()
@@ -237,6 +239,7 @@ impl Whitenoise {
     ///
     /// Returns only archived chats, sorted by last activity.
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
+        let _span = perf_span!("chat_list::get_archived_chat_list");
         let visible = self.visible_groups(account).await?;
         let archived: Vec<_> = visible
             .into_iter()
@@ -254,6 +257,7 @@ impl Whitenoise {
         account: &Account,
         groups_with_membership: Vec<GroupWithMembership>,
     ) -> Result<Vec<ChatListItem>> {
+        let _span = perf_span!("chat_list::build_chat_list_for");
         if groups_with_membership.is_empty() {
             return Ok(Vec::new());
         }
@@ -316,6 +320,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
+        let _span = perf_span!("chat_list::build_chat_list_item");
         // 1. Get group from MDK
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let Some(group) = mdk.get_group(group_id)? else {
@@ -432,6 +437,7 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
+        let _span = perf_span!("chat_list::emit_chat_list_update");
         let has_active = self
             .chat_list_stream_manager
             .has_subscribers(&account.pubkey);
@@ -462,6 +468,7 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
+        let _span = perf_span!("chat_list::emit_chat_list_update_for_group");
         let account_groups = match AccountGroup::find_by_group(group_id, &self.database).await {
             Ok(groups) => groups,
             Err(e) => {
@@ -569,6 +576,7 @@ impl Whitenoise {
         account_pubkey: PublicKey,
         group_ids: &[GroupId],
     ) -> Result<HashMap<GroupId, GroupInformation>> {
+        let _span = perf_span!("chat_list::build_group_info_map");
         let group_infos =
             GroupInformation::get_by_mls_group_ids(account_pubkey, group_ids, self).await?;
         Ok(group_infos
@@ -583,6 +591,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<HashMap<GroupId, PublicKey>> {
+        let _span = perf_span!("chat_list::identify_dm_participants");
         let pairs =
             AccountGroup::find_dm_peers_for_account(&account.pubkey, &self.database).await?;
         Ok(pairs.into_iter().collect())
@@ -592,6 +601,7 @@ impl Whitenoise {
         &self,
         group_ids: &[GroupId],
     ) -> Result<HashMap<GroupId, ChatMessageSummary>> {
+        let _span = perf_span!("chat_list::build_last_message_map");
         let summaries =
             AggregatedMessage::find_last_by_group_ids(group_ids, &self.database).await?;
         Ok(summaries
@@ -604,6 +614,7 @@ impl Whitenoise {
         &self,
         pubkeys: &[PublicKey],
     ) -> Result<HashMap<PublicKey, User>> {
+        let _span = perf_span!("chat_list::build_users_by_pubkey");
         let users = User::find_by_pubkeys(pubkeys, &self.database).await?;
         Ok(users.into_iter().map(|u| (u.pubkey, u)).collect())
     }
@@ -615,6 +626,7 @@ impl Whitenoise {
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> HashMap<GroupId, PathBuf> {
+        let _span = perf_span!("chat_list::resolve_group_images");
         let group_type_groups: Vec<_> = groups
             .iter()
             .filter(|g| {
@@ -642,6 +654,7 @@ impl Whitenoise {
         account: &Account,
         groups: &[group_types::Group],
     ) -> HashMap<GroupId, PathBuf> {
+        let _span = perf_span!("chat_list::resolve_group_image_paths");
         let futures = groups.iter().map(|group| {
             let group_id = group.mls_group_id.clone();
             async move {

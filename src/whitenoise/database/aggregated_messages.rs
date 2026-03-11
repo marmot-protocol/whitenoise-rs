@@ -6,6 +6,7 @@ use nostr_sdk::prelude::*;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::nostr_manager::parser::SerializableToken;
+use crate::perf_span;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
@@ -180,6 +181,7 @@ impl AggregatedMessage {
     /// Count ALL events (kind 9, 7, 5) in cache for a group
     /// Used for sync checking: mdk.len() == cache.len()
     pub async fn count_by_group(group_id: &GroupId, database: &Database) -> Result<usize> {
+        let _span = perf_span!("db::aggregated_msg_count_by_group");
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM aggregated_messages WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -195,6 +197,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<HashSet<String>> {
+        let _span = perf_span!("db::aggregated_msg_get_event_ids");
         let ids: Vec<String> =
             sqlx::query_scalar("SELECT message_id FROM aggregated_messages WHERE mls_group_id = ?")
                 .bind(group_id.as_slice())
@@ -214,6 +217,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<ChatMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_by_group");
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
@@ -260,6 +264,7 @@ impl AggregatedMessage {
         before_message_id: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_paginated");
         // Clamp limit: default 50, max 200.
         let limit_val = i64::from(limit.unwrap_or(50).min(200));
 
@@ -350,6 +355,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_save_events");
         if events.is_empty() {
             return Ok(());
         }
@@ -436,6 +442,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_insert_message");
         let created_at = timestamp_to_datetime(message.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
                 timestamp: message.created_at.as_secs() as i64,
@@ -494,6 +501,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_insert_reaction");
         let created_at = timestamp_to_datetime(reaction.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
                 timestamp: reaction.created_at.as_secs() as i64,
@@ -532,6 +540,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_insert_deletion");
         let created_at = timestamp_to_datetime(deletion.created_at).map_err(|_| {
             DatabaseError::InvalidTimestamp {
                 timestamp: deletion.created_at.as_secs() as i64,
@@ -570,6 +579,7 @@ impl AggregatedMessage {
         reactions: &ReactionSummary,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_update_reactions");
         sqlx::query(
             "UPDATE aggregated_messages
              SET reactions = ?
@@ -591,6 +601,7 @@ impl AggregatedMessage {
         deletion_event_id: &str,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_mark_deleted");
         sqlx::query(
             "UPDATE aggregated_messages
              SET deletion_event_id = ?
@@ -614,6 +625,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_unmark_deleted");
         sqlx::query(
             "UPDATE aggregated_messages
              SET deletion_event_id = NULL
@@ -639,6 +651,7 @@ impl AggregatedMessage {
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<ChatMessage> {
+        let _span = perf_span!("db::aggregated_msg_update_delivery_status");
         let mut tx = database.pool.begin().await?;
 
         // Verify the parent message exists before upserting delivery status
@@ -694,6 +707,7 @@ impl AggregatedMessage {
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<ChatMessage> {
+        let _span = perf_span!("db::aggregated_msg_update_delivery_with_retry");
         for (attempt, delay_ms) in Self::DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS
             .iter()
             .copied()
@@ -728,6 +742,7 @@ impl AggregatedMessage {
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_insert_delivery_status");
         sqlx::query(
             "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
              VALUES (?, ?, ?)
@@ -820,6 +835,7 @@ impl AggregatedMessage {
         read_marker: Option<&EventId>,
         database: &Database,
     ) -> Result<usize> {
+        let _span = perf_span!("db::aggregated_msg_count_unread_for_group");
         let count: i64 = match read_marker {
             Some(message_id) => {
                 // Count messages after the read marker's timestamp
@@ -863,6 +879,7 @@ impl AggregatedMessage {
         group_markers: &[(GroupId, Option<EventId>)],
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
+        let _span = perf_span!("db::aggregated_msg_count_unread_for_groups");
         use sqlx::Row;
 
         if group_markers.is_empty() {
@@ -1032,6 +1049,7 @@ impl AggregatedMessage {
         group_ids: &[GroupId],
         database: &Database,
     ) -> Result<Vec<ChatMessageSummary>> {
+        let _span = perf_span!("db::aggregated_msg_find_last_by_groups");
         use sqlx::Row;
 
         if group_ids.is_empty() {

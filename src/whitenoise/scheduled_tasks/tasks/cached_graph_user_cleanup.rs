@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::error::WhitenoiseError;
@@ -26,6 +27,7 @@ impl Task for CachedGraphUserCleanup {
     }
 
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("scheduled::cached_graph_user_cleanup");
         let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database).await?;
 
         if deleted > 0 {

@@ -1,5 +1,6 @@
 use nostr_sdk::PublicKey;
 
+use crate::perf_span;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -19,6 +20,7 @@ impl Whitenoise {
     /// * `account` - The account that will follow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be followed
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
+        let _span = perf_span!("follows::follow_user");
         let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
         if newly_created {
@@ -41,6 +43,7 @@ impl Whitenoise {
     /// * `account` - The account that will unfollow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be unfollowed
     pub async fn unfollow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
+        let _span = perf_span!("follows::unfollow_user");
         let user = match self.find_user_by_pubkey(pubkey).await {
             Ok(user) => user,
             Err(WhitenoiseError::UserNotFound) => return Ok(()),

@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
@@ -39,6 +40,7 @@ impl Task for ConsumedKeyPackageCleanup {
     }
 
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("scheduled::consumed_key_package_cleanup");
         tracing::debug!(
             target: "whitenoise::scheduler::consumed_key_package_cleanup",
             "Starting consumed key package cleanup"
@@ -115,6 +117,7 @@ async fn cleanup_consumed_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,
 ) -> Result<usize, WhitenoiseError> {
+    let _span = perf_span!("scheduled::cleanup_consumed_key_packages");
     let eligible = PublishedKeyPackage::find_eligible_for_cleanup(
         &account.pubkey,
         CONSUMED_KP_QUIET_PERIOD_SECS,

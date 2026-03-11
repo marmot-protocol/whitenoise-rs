@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
+use crate::perf_span;
 use crate::relay_control::ephemeral::EphemeralScope;
 use crate::whitenoise::{
     Whitenoise,
@@ -16,6 +17,7 @@ use crate::whitenoise::{
 impl User {
     /// Fetches the latest relay lists for this user from Nostr and updates the local database
     pub(crate) async fn update_relay_lists(&self, whitenoise: &Whitenoise) -> Result<()> {
+        let _span = perf_span!("relay_sync::update_relay_lists");
         let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
         self.update_relay_lists_with_scope(whitenoise, &scope)
             .await?;
@@ -27,6 +29,7 @@ impl User {
         whitenoise: &Whitenoise,
         scope: &EphemeralScope,
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("relay_sync::update_relay_lists_with_scope");
         let initial_query_relays = self.get_query_relays(whitenoise).await?;
 
         tracing::info!(
@@ -85,6 +88,7 @@ impl User {
         scope: &EphemeralScope,
         query_relays: &[Relay],
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("relay_sync::update_nip65_relays");
         match self
             .sync_relays_for_type_with_scope(whitenoise, scope, RelayType::Nip65, query_relays)
             .await
@@ -136,6 +140,7 @@ impl User {
         scope: &EphemeralScope,
         query_relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("relay_sync::update_secondary_relay_types");
         const SECONDARY_RELAY_TYPES: &[RelayType] = &[RelayType::Inbox, RelayType::KeyPackage];
         let relays_urls: Vec<_> = Relay::urls(query_relays);
 
@@ -189,6 +194,7 @@ impl User {
         new_relay_urls: &HashSet<RelayUrl>,
         event_created_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
+        let _span = perf_span!("relay_sync::sync_relay_urls");
         // First, check if we should process this event based on timestamp
         if let Some(new_timestamp) = event_created_at {
             let newest_stored_timestamp = ProcessedEvent::newest_relay_event_timestamp(
@@ -319,6 +325,7 @@ impl User {
         relay_type: RelayType,
         query_relays: &[Relay],
     ) -> Result<bool> {
+        let _span = perf_span!("relay_sync::sync_relays_for_type");
         let relays_urls: Vec<_> = Relay::urls(query_relays);
         let relay_event = scope
             .fetch_user_relays(self.pubkey, relay_type, &relays_urls)
@@ -342,6 +349,7 @@ impl User {
         relay_type: RelayType,
         relay_event: Option<Event>,
     ) -> Result<bool> {
+        let _span = perf_span!("relay_sync::apply_relay_event");
         match relay_event {
             Some(event) => {
                 let relay_hashset: HashSet<_> =

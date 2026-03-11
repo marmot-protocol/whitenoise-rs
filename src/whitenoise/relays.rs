@@ -8,6 +8,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    perf_span,
     relay_control::RelayPlane,
     whitenoise::{
         Whitenoise,
@@ -123,6 +124,7 @@ impl Relay {
 
 impl Whitenoise {
     pub async fn find_or_create_relay_by_url(&self, url: &RelayUrl) -> Result<Relay> {
+        let _span = perf_span!("relays::find_or_create_by_url");
         Relay::find_or_create_by_url(url, &self.database).await
     }
 
@@ -144,6 +146,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<(RelayUrl, RelayStatus)>> {
+        let _span = perf_span!("relays::get_account_relay_statuses");
         fn record_is_connected(record: &RelayStatusRecord) -> bool {
             match (record.last_connect_success_at, record.last_failure_at) {
                 (Some(success), Some(failure)) => success > failure,

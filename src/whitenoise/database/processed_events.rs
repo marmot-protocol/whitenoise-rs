@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::{EventId, Kind, PublicKey};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
+use crate::perf_span;
 use crate::whitenoise::{error::WhitenoiseError, relays::RelayType};
 
 /// Row structure for processed_events table
@@ -81,6 +82,7 @@ impl ProcessedEvent {
         author: Option<&PublicKey>,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::processed_event_create");
         // Convert event_created_at to milliseconds if present
         let event_timestamp_ms = event_created_at.map(|dt| dt.timestamp_millis());
         let event_kind_i64 = event_kind.map(|k| k.as_u16() as i64);
@@ -106,6 +108,7 @@ impl ProcessedEvent {
         account_id: Option<i64>,
         database: &Database,
     ) -> Result<bool, DatabaseError> {
+        let _span = perf_span!("db::processed_event_exists");
         let (query, bind_account_id) = match account_id {
             Some(id) => (
                 "SELECT EXISTS(SELECT 1 FROM processed_events WHERE event_id = ? AND account_id = ?)",
@@ -136,6 +139,7 @@ impl ProcessedEvent {
         author_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, DatabaseError> {
+        let _span = perf_span!("db::processed_event_newest_timestamp_for_kind");
         // Build query based on parameters
         let query = match (account_id.is_some(), author_pubkey.is_some()) {
             (true, _) => {
