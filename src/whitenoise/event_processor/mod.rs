@@ -3,6 +3,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::{
     nostr_manager::utils::is_event_timestamp_valid,
+    perf,
     relay_control::SubscriptionStream,
     types::{EventSource, ProcessableEvent, RetryInfo},
     whitenoise::{
@@ -51,6 +52,11 @@ impl Whitenoise {
         loop {
             tokio::select! {
                 Some(event) = receiver.recv() => {
+                    // Assign a fresh trace ID for every event so that all
+                    // perf_span! calls in the synchronous dispatch tree share
+                    // one Chrome Trace tid, giving accurate flamegraph nesting.
+                    perf::set_trace_id(perf::next_trace_id());
+
                     tracing::debug!(
                         target: "whitenoise::event_processor::process_events",
                         "Received event for processing"
