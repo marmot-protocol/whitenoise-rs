@@ -176,6 +176,13 @@ impl RelaySession {
                 RelayStatus::Connecting => {
                     relays_to_wait.push(relay);
                 }
+                RelayStatus::Pending => {
+                    // Pending relays have can_connect() == false, so relay.connect()
+                    // is a no-op. Terminate first to reset to a connectable state.
+                    relay.disconnect();
+                    relay.connect();
+                    relays_to_wait.push(relay);
+                }
                 RelayStatus::Disconnected => {
                     relay.disconnect();
                     relay.connect();
@@ -1178,6 +1185,55 @@ mod tests {
         );
 
         assert_eq!(telemetry.account_pubkey, Some(account_pubkey));
+    }
+
+    /// Validates the disconnect-before-connect mechanism used in `prepare_relay_urls`
+    /// to recover relays stuck in `Pending` state.
+    ///
+    /// In nostr-sdk 0.44, `relay.connect()` is a no-op when status is `Pending`
+    /// because `can_connect()` returns false for that state. Without intervention,
+    /// a Pending relay stays stuck permanently. The fix calls `disconnect()` first
+    /// to transition to `Terminated` (where `can_connect()` is true), then `connect()`.
+    #[tokio::test]
+    async fn test_disconnect_recovers_relay_stuck_in_pending() {
+        let (sender, _) = mpsc::channel(8);
+        let session = RelaySession::new(RelaySessionConfig::new(RelayPlane::Ephemeral), sender);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        session.client().add_relay(relay_url.clone()).await.unwrap();
+
+        let relay = session.client().relay(&relay_url).await.unwrap();
+        assert_eq!(relay.status(), RelayStatus::Initialized);
+
+        // Put relay into Pending state (simulates a connection attempt in progress)
+        relay.connect();
+        assert_eq!(relay.status(), RelayStatus::Pending);
+
+        // Demonstrate the bug: connect() is a no-op when already Pending
+        relay.connect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Pending,
+            "connect() should be a no-op for Pending relays"
+        );
+
+        // The fix: disconnect() synchronously sets status to Terminated.
+        // No .await between disconnect() and assertion — on current_thread
+        // runtime, spawned connection tasks can't interfere.
+        relay.disconnect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Terminated,
+            "disconnect() should transition Pending to Terminated"
+        );
+
+        // Now connect() works again — spawns a fresh connection task
+        relay.connect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Pending,
+            "connect() from Terminated should start a fresh connection attempt"
+        );
     }
 
     #[tokio::test]
