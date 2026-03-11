@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 
 use crate::perf_span;
@@ -119,14 +120,38 @@ impl EventTracker for NoEventTracker {
     }
 }
 
-/// Database-backed event tracker with dependency injection
+/// Database-backed event tracker with dependency injection.
+///
+/// Caches `PublicKey → account_id` mappings to avoid redundant
+/// `Account::find_by_pubkey()` queries on every event.  The cache is
+/// append-only — accounts are never deleted during a session.
 pub struct WhitenoiseEventTracker {
     database: Arc<Database>,
+    account_id_cache: DashMap<PublicKey, i64>,
 }
 
 impl WhitenoiseEventTracker {
     pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
+        Self {
+            database,
+            account_id_cache: DashMap::new(),
+        }
+    }
+
+    /// Resolve account_id from pubkey, using the cache to avoid repeated DB lookups.
+    async fn resolve_account_id(
+        &self,
+        pubkey: &PublicKey,
+    ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(id) = self.account_id_cache.get(pubkey) {
+            return Ok(*id);
+        }
+        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
+        let account_id = account
+            .id
+            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        self.account_id_cache.insert(*pubkey, account_id);
+        Ok(account_id)
     }
 }
 
@@ -138,10 +163,7 @@ impl EventTracker for WhitenoiseEventTracker {
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _span = perf_span!("event_tracker::track_published_event");
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::create(event_id, account_id, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
@@ -154,10 +176,7 @@ impl EventTracker for WhitenoiseEventTracker {
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let _span = perf_span!("event_tracker::account_published_event");
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -179,10 +198,7 @@ impl EventTracker for WhitenoiseEventTracker {
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _span = perf_span!("event_tracker::track_processed_account_event");
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::create(
             &event.id,
             Some(account_id),
@@ -201,10 +217,7 @@ impl EventTracker for WhitenoiseEventTracker {
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let _span = perf_span!("event_tracker::already_processed_account_event");
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)

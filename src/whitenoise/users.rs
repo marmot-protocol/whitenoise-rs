@@ -339,10 +339,25 @@ impl Whitenoise {
 
     async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
         let _span = perf_span!("users::sync_user_blocking");
+
+        // For existing users with fresh metadata, skip the expensive network sync.
+        // This matches the TTL check that Background mode already performs.
+        if !is_new && !user.needs_metadata_refresh() {
+            tracing::debug!(
+                target: "whitenoise::users::sync_user_blocking",
+                "User {} metadata is fresh (updated_at: {}), skipping blocking sync",
+                user.pubkey,
+                user.updated_at
+            );
+            return Ok(user.clone());
+        }
+
         tracing::debug!(
             target: "whitenoise::users::sync_user_blocking",
-            "Force sync requested for user {}, performing blocking metadata and relay sync",
-            user.pubkey
+            "Sync required for user {} (is_new={}, needs_refresh={}), performing blocking metadata and relay sync",
+            user.pubkey,
+            is_new,
+            user.needs_metadata_refresh()
         );
 
         let mut user_clone = user.clone();
@@ -368,7 +383,6 @@ impl Whitenoise {
             }
         }
 
-        // Always sync metadata when force_sync is true
         if let Err(e) = user_clone.sync_metadata(self).await {
             tracing::warn!(
                 target: "whitenoise::users::sync_user_blocking",
