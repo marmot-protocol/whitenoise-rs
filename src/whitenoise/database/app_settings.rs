@@ -3,6 +3,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 
 use super::{Database, utils::parse_timestamp};
+use crate::perf_span;
 use crate::whitenoise::{
     app_settings::{AppSettings, Language, ThemeMode},
     error::WhitenoiseError,
@@ -64,6 +65,7 @@ impl AppSettings {
     pub(crate) async fn find_or_create_default(
         database: &Database,
     ) -> Result<AppSettings, WhitenoiseError> {
+        let _span = perf_span!("db::app_settings_find_or_create");
         match sqlx::query_as::<_, AppSettingsRow>("SELECT * FROM app_settings WHERE id = 1")
             .fetch_one(&database.pool)
             .await
@@ -95,6 +97,7 @@ impl AppSettings {
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
     pub(crate) async fn save(&self, database: &Database) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::app_settings_save");
         sqlx::query(
             "INSERT INTO app_settings (id, theme_mode, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET theme_mode = excluded.theme_mode, language = excluded.language, updated_at = ?"
         )
@@ -129,6 +132,7 @@ impl AppSettings {
         theme_mode: ThemeMode,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::app_settings_update_theme");
         sqlx::query("UPDATE app_settings SET theme_mode = ?, updated_at = ? WHERE id = 1")
             .bind(theme_mode.to_string())
             .bind(Utc::now().timestamp_millis())
@@ -157,6 +161,7 @@ impl AppSettings {
         language: Language,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::app_settings_update_language");
         sqlx::query("UPDATE app_settings SET language = ?, updated_at = ? WHERE id = 1")
             .bind(language.to_string())
             .bind(Utc::now().timestamp_millis())

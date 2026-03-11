@@ -16,6 +16,7 @@ pub mod matcher;
 mod metrics;
 mod types;
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::error::Result;
@@ -115,6 +116,7 @@ impl Whitenoise {
     /// Only when the app explicitly interacts with a result (follow, message, etc.)
     /// should a User record be created via `find_or_create_user_by_pubkey`.
     pub async fn search_users(&self, params: UserSearchParams) -> Result<UserSearchSubscription> {
+        let _span = perf_span!("user_search::search_users");
         if params.radius_start > params.radius_end {
             return Err(crate::whitenoise::error::WhitenoiseError::InvalidInput(
                 format!(

@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
+    perf_span,
     types::{GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ProcessableEvent},
 };
 
@@ -84,6 +85,7 @@ impl GroupPlane {
         group_specs: &[GroupSubscriptionSpec],
         since: Option<Timestamp>,
     ) -> Result<()> {
+        let _span = perf_span!("relay::group_plane_update_account");
         let _update_guard = self.update_lock.lock().await;
 
         if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
@@ -170,6 +172,7 @@ impl GroupPlane {
     }
 
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
+        let _span = perf_span!("relay::group_plane_remove_account");
         let _update_guard = self.update_lock.lock().await;
         if let Some(state) = self.accounts.write().await.remove(pubkey) {
             let subscription_indices = state
@@ -204,6 +207,7 @@ impl GroupPlane {
     ///   `relays` is the canonical "activated, nothing to subscribe to" state).
     /// - Accounts with groups: at least one group relay must be connected.
     pub(crate) async fn has_active_subscription(&self, pubkey: &PublicKey) -> bool {
+        let _span = perf_span!("relay::group_plane_has_active_subscription");
         let state = self.accounts.read().await;
         match state.get(pubkey) {
             None => false,

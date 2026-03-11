@@ -6,6 +6,7 @@ use nostr_sdk::{Metadata, PublicKey};
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
     WhitenoiseError,
+    perf_span,
     whitenoise::cached_graph_user::{CachedGraphUser, DEFAULT_CACHE_TTL_HOURS},
 };
 
@@ -135,6 +136,7 @@ impl CachedGraphUser {
         pubkeys: &[PublicKey],
         database: &Database,
     ) -> Result<Vec<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_find_fresh_metadata_batch");
         Self::find_fresh_batch_by_field(
             pubkeys,
             "metadata_updated_at",
@@ -152,6 +154,7 @@ impl CachedGraphUser {
         pubkeys: &[PublicKey],
         database: &Database,
     ) -> Result<Vec<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_find_fresh_follows_batch");
         Self::find_fresh_batch_by_field(
             pubkeys,
             "follows_updated_at",
@@ -170,6 +173,7 @@ impl CachedGraphUser {
         max_age_hours: i64,
         database: &Database,
     ) -> Result<Vec<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_find_fresh_batch_by_field");
         if pubkeys.is_empty() {
             return Ok(Vec::new());
         }
@@ -274,6 +278,7 @@ impl CachedGraphUser {
         metadata: &Metadata,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_upsert_metadata_only");
         let pubkey_hex = pubkey.to_hex();
         let metadata_json =
             serde_json::to_string(metadata).map_err(DatabaseError::Serialization)?;
@@ -309,6 +314,7 @@ impl CachedGraphUser {
         follows: &[PublicKey],
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_upsert_follows_only");
         let pubkey_hex = pubkey.to_hex();
         let follows_hex: Vec<String> = follows.iter().map(|pk| pk.to_hex()).collect();
         let follows_json =
@@ -340,6 +346,7 @@ impl CachedGraphUser {
     ///
     /// Returns the number of deleted rows.
     pub(crate) async fn cleanup_stale(database: &Database) -> Result<u64, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_cleanup_stale");
         Self::cleanup_stale_with_ttl(DEFAULT_CACHE_TTL_HOURS, database).await
     }
 
@@ -350,6 +357,7 @@ impl CachedGraphUser {
         max_age_hours: i64,
         database: &Database,
     ) -> Result<u64, WhitenoiseError> {
+        let _span = perf_span!("db::cached_graph_user_cleanup_stale_with_ttl");
         let cutoff = (Utc::now() - Duration::hours(max_age_hours)).timestamp_millis();
 
         let result = sqlx::query("DELETE FROM cached_graph_users WHERE updated_at <= ?")
