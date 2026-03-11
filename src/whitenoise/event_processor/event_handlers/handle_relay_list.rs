@@ -1,16 +1,20 @@
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    database::processed_events::ProcessedEvent,
-    error::{Result, WhitenoiseError},
-    users::User,
-    utils::timestamp_to_datetime,
+use crate::{
+    perf_span,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        database::processed_events::ProcessedEvent,
+        error::{Result, WhitenoiseError},
+        users::User,
+        utils::timestamp_to_datetime,
+    },
 };
 
 impl Whitenoise {
     pub async fn handle_relay_list(&self, event: Event) -> Result<()> {
+        let _span = perf_span!("event_handlers::handle_relay_list");
         // Check if we've already processed this specific event from this author
         let already_processed = ProcessedEvent::exists(
             &event.id,

@@ -5,6 +5,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::watch;
 
 use crate::RelayType;
+use crate::perf_span;
 use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
@@ -39,6 +40,7 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("accounts::activate_account");
         // Create a fresh cancellation channel for this account's background tasks.
         // Any previous channel (from a prior login) is replaced, which also drops
         // any stale receivers.
@@ -114,6 +116,7 @@ impl Whitenoise {
         is_new_account: bool,
         key_package_relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("accounts::setup_key_package");
         let mut needs_publish = true;
 
         if !is_new_account {
@@ -748,6 +751,7 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("accounts::setup_subscriptions");
         tracing::debug!(
             target: "whitenoise::accounts",
             "Setting up subscriptions for account: {:?}",

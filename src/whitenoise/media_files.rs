@@ -8,13 +8,16 @@ use mdk_core::{
 use nostr_sdk::prelude::*;
 
 pub use crate::whitenoise::database::media_files::MediaFile;
-use crate::whitenoise::{
-    database::{
-        Database,
-        media_files::{FileMetadata, MediaFileParams},
+use crate::{
+    perf_span,
+    whitenoise::{
+        database::{
+            Database,
+            media_files::{FileMetadata, MediaFileParams},
+        },
+        error::{Result, WhitenoiseError},
+        storage::Storage,
     },
-    error::{Result, WhitenoiseError},
-    storage::Storage,
 };
 
 /// Parsed media reference with additional fields not in MDK's MediaReference
@@ -167,6 +170,7 @@ impl<'a> MediaFiles<'a> {
         filename: &str,
         upload: MediaFileUpload<'_>,
     ) -> Result<MediaFile> {
+        let _span = perf_span!("media_files::store_and_record");
         // Store file to filesystem (deduplicated by content)
         let file_path = self
             .storage
@@ -344,6 +348,7 @@ impl<'a> MediaFiles<'a> {
         account_pubkey: &PublicKey,
         parsed_references: Vec<ParsedMediaReference>,
     ) -> Result<()> {
+        let _span = perf_span!("media_files::store_parsed_references");
         for parsed in parsed_references {
             let reference = parsed.reference;
             let encrypted_hash = parsed.encrypted_hash;

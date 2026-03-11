@@ -2,9 +2,12 @@ use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    error::{Result, WhitenoiseError},
+use crate::{
+    perf_span,
+    whitenoise::{
+        Whitenoise,
+        error::{Result, WhitenoiseError},
+    },
 };
 
 impl Whitenoise {
@@ -48,6 +51,7 @@ impl Whitenoise {
         account_pubkey: &PublicKey,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
+        let _span = perf_span!("groups::publish_event_with_retry");
         self.relay_control
             .publish_event_to(event, account_pubkey, relay_urls)
             .await?;
@@ -75,6 +79,7 @@ impl Whitenoise {
         group_id: &GroupId,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
+        let _span = perf_span!("groups::publish_and_merge_commit");
         let mdk = self.create_mdk_for_account(*account_pubkey)?;
 
         if let Err(publish_err) = self

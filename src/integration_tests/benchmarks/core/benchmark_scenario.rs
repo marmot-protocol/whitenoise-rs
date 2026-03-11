@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use super::benchmark_config::BenchmarkConfig;
 use super::benchmark_result::BenchmarkResult;
+use crate::integration_tests::benchmarks::PERF_LAYER;
 use crate::integration_tests::core::ScenarioContext;
 use crate::{Whitenoise, WhitenoiseError};
 
@@ -68,6 +69,11 @@ pub trait BenchmarkScenario {
 
             // Reset counter for actual benchmark
             context.tests_count = 0;
+
+            // Clear perf samples accumulated during warmup so they don't skew benchmark stats
+            if let Some(layer) = PERF_LAYER.get() {
+                layer.clear();
+            }
         }
 
         // Benchmark phase
@@ -94,12 +100,16 @@ pub trait BenchmarkScenario {
         pb.finish_with_message("Benchmark complete");
         let total_duration = overall_start.elapsed();
 
+        // Drain perf layer if available
+        let perf_breakdown = PERF_LAYER.get().map(|layer| layer.drain());
+
         // Calculate and return results
         Ok(BenchmarkResult::from_timings(
             self.name().to_string(),
             &config,
             timings,
             total_duration,
+            perf_breakdown,
         ))
     }
 }

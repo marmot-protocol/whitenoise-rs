@@ -11,6 +11,7 @@ use crate::whitenoise::{
     utils::timestamp_to_datetime,
 };
 use crate::{
+    perf_span,
     relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
     types::ProcessableEvent,
 };
@@ -23,6 +24,7 @@ const CONTACT_LIST_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Whitenoise {
     pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
+        let _span = perf_span!("event_handlers::handle_contact_list");
         let _permit = self.acquire_contact_list_guard(account).await?;
         let account_id = account.id.ok_or(WhitenoiseError::AccountNotFound)?;
 

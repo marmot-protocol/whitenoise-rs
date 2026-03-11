@@ -2,12 +2,15 @@ use chrono::{DateTime, Duration, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{
-    Whitenoise,
-    database::processed_events::ProcessedEvent,
-    error::{Result, WhitenoiseError},
-    relays::{Relay, RelayType},
-    utils::timestamp_to_datetime,
+use crate::{
+    perf_span,
+    whitenoise::{
+        Whitenoise,
+        database::processed_events::ProcessedEvent,
+        error::{Result, WhitenoiseError},
+        relays::{Relay, RelayType},
+        utils::timestamp_to_datetime,
+    },
 };
 
 mod key_package;
@@ -95,6 +98,7 @@ impl User {
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
     pub async fn sync_metadata(&mut self, whitenoise: &Whitenoise) -> Result<()> {
+        let _span = perf_span!("users::sync_metadata");
         let relays_urls: Vec<_> = Relay::urls(&self.get_query_relays(whitenoise).await?);
         let metadata_event = whitenoise
             .relay_control
@@ -321,6 +325,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
         sync_mode: UserSyncMode,
     ) -> Result<User> {
+        let _span = perf_span!("users::find_or_create");
         let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
         if sync_mode == UserSyncMode::Blocking {
@@ -333,6 +338,7 @@ impl Whitenoise {
     }
 
     async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
+        let _span = perf_span!("users::sync_user_blocking");
         tracing::debug!(
             target: "whitenoise::users::sync_user_blocking",
             "Force sync requested for user {}, performing blocking metadata and relay sync",

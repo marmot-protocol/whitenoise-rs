@@ -3,7 +3,11 @@ use std::sync::{Mutex, OnceLock};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::EnvFilter, fmt::Layer, prelude::*, registry::Registry};
 
+#[cfg(feature = "benchmark-tests")]
+use crate::integration_tests::benchmarks::PerfTracingLayer;
+
 mod nostr_manager;
+pub mod perf;
 pub(crate) mod relay_control;
 mod types;
 pub mod whitenoise;
@@ -83,6 +87,60 @@ static TRACING_GUARDS: OnceLock<Mutex<Option<(WorkerGuard, WorkerGuard)>>> = Onc
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
 fn init_tracing(logs_dir: &std::path::Path) {
+    init_tracing_base(logs_dir);
+}
+
+/// Initialise tracing and attach the given `PerfTracingLayer` to the subscriber
+/// stack so that `perf_span!` markers are captured during benchmarks.
+///
+/// Only available when the `benchmark-tests` feature is enabled.
+#[cfg(feature = "benchmark-tests")]
+pub fn init_tracing_with_perf_layer(logs_dir: &std::path::Path, perf_layer: PerfTracingLayer) {
+    use tracing_subscriber::filter::LevelFilter;
+
+    TRACING_INIT.get_or_init(|| {
+        let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("whitenoise")
+            .filename_suffix("log")
+            .build(logs_dir)
+            .expect("Failed to create file appender");
+
+        let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking_stdout, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+
+        TRACING_GUARDS
+            .set(Mutex::new(Some((file_guard, stdout_guard))))
+            .ok();
+
+        let stdout_layer = Layer::new()
+            .with_writer(non_blocking_stdout)
+            .with_ansi(true)
+            .with_target(true);
+
+        let file_layer = Layer::new()
+            .with_writer(non_blocking_file)
+            .with_ansi(false)
+            .with_target(true);
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,refinery_core=warn,refinery=warn"));
+
+        // Add a dedicated INFO-level filter for the perf target so the layer
+        // receives events even when the global filter would suppress them.
+        let perf_filter = tracing_subscriber::filter::Targets::new()
+            .with_target("whitenoise::perf", LevelFilter::INFO);
+
+        Registry::default()
+            .with(env_filter)
+            .with(stdout_layer)
+            .with(file_layer)
+            .with(perf_layer.with_filter(perf_filter))
+            .init();
+    });
+}
+
+fn init_tracing_base(logs_dir: &std::path::Path) {
     TRACING_INIT.get_or_init(|| {
         let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
             .rotation(tracing_appender::rolling::Rotation::DAILY)

@@ -2,6 +2,7 @@ use nostr_sdk::prelude::*;
 
 use crate::{
     nostr_manager::utils::cap_timestamp_to_now,
+    perf_span,
     relay_control::hash_pubkey_for_subscription_id,
     types::{EventSource, RetryInfo},
     whitenoise::{
@@ -18,6 +19,7 @@ impl Whitenoise {
         source: EventSource,
         retry_info: RetryInfo,
     ) {
+        let _span = perf_span!("event_processor::process_account_event");
         // Get the account from the subscription ID, skip if we can't find it
         let account = match self.account_from_event_source(&source).await {
             Ok(account) => account,
@@ -318,6 +320,7 @@ impl Whitenoise {
         event: &Event,
         account: &Account,
     ) -> Result<()> {
+        let _span = perf_span!("event_processor::route_account_event");
         match event.kind {
             Kind::GiftWrap => match validate_giftwrap_target(account, event) {
                 Ok(()) => self.handle_giftwrap(account, event.clone()).await,

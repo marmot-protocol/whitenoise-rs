@@ -5,19 +5,23 @@ use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    accounts_groups::AccountGroup,
-    chat_list_streaming::ChatListUpdateTrigger,
-    database::published_key_packages::PublishedKeyPackage,
-    error::{Result, WhitenoiseError},
-    group_information::{GroupInformation, GroupType},
-    relays::Relay,
+use crate::{
+    perf_span,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        accounts_groups::AccountGroup,
+        chat_list_streaming::ChatListUpdateTrigger,
+        database::published_key_packages::PublishedKeyPackage,
+        error::{Result, WhitenoiseError},
+        group_information::{GroupInformation, GroupType},
+        relays::Relay,
+    },
 };
 
 impl Whitenoise {
     pub async fn handle_giftwrap(&self, account: &Account, event: Event) -> Result<()> {
+        let _span = perf_span!("event_handlers::handle_giftwrap");
         tracing::debug!(
             target: "whitenoise::event_handlers::handle_giftwrap",
             "Giftwrap received for account: {}",
@@ -26,6 +30,7 @@ impl Whitenoise {
 
         // For external signer accounts, use the registered signer.
         // For local accounts, use the keys from the secrets store.
+        let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
         let unwrapped = if account.uses_external_signer() {
             let signer = self.get_external_signer(&account.pubkey).ok_or_else(|| {
                 WhitenoiseError::Configuration(format!(
@@ -53,8 +58,11 @@ impl Whitenoise {
             })?
         };
 
+        drop(_decrypt_span);
+
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
+                let _welcome_span = perf_span!("event_handlers::process_welcome");
                 self.process_welcome(account, event, unwrapped.rumor)
                     .await?;
             }

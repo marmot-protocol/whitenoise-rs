@@ -2,21 +2,25 @@ use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingResult};
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    aggregated_message::AggregatedMessage,
-    chat_list_streaming::ChatListUpdateTrigger,
-    error::{Result, WhitenoiseError},
-    media_files::MediaFile,
-    message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
-    message_streaming::{MessageUpdate, UpdateTrigger},
+use crate::{
+    perf_span,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        aggregated_message::AggregatedMessage,
+        chat_list_streaming::ChatListUpdateTrigger,
+        error::{Result, WhitenoiseError},
+        media_files::MediaFile,
+        message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
+        message_streaming::{MessageUpdate, UpdateTrigger},
+    },
 };
 #[cfg(test)]
 use crate::{relay_control::hash_pubkey_for_subscription_id, types::EventSource};
 
 impl Whitenoise {
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
+        let _span = perf_span!("event_handlers::handle_mls_message");
         tracing::debug!(
           target: "whitenoise::event_handlers::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",
@@ -26,6 +30,7 @@ impl Whitenoise {
         );
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let _mls_proc = perf_span!("event_handlers::mls_process_message");
         let result = match mdk.process_message(&event) {
             Ok(result) => {
                 tracing::debug!(
@@ -55,6 +60,7 @@ impl Whitenoise {
                 return Err(WhitenoiseError::MdkCoreError(e));
             }
         };
+        drop(_mls_proc);
 
         // Extract and store media references synchronously for application messages.
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&result) {
@@ -289,6 +295,7 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<ChatMessage> {
+        let _span = perf_span!("event_handlers::cache_chat_message");
         let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
 
         let mut chat_message = self
@@ -333,6 +340,7 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
+        let _span = perf_span!("event_handlers::cache_reaction");
         // If this reaction already has a delivery status, it was sent by us and already
         // applied to the parent — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
@@ -420,6 +428,7 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
+        let _span = perf_span!("event_handlers::cache_deletion");
         // If this deletion already has a delivery status, it was sent by us and already
         // applied to targets — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.

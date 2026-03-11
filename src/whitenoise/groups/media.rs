@@ -10,6 +10,7 @@ use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
+use crate::perf_span;
 use crate::types::ImageType;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
@@ -239,6 +240,7 @@ impl Whitenoise {
         blossom_server_url: Option<Url>,
         options: Option<MediaProcessingOptions>,
     ) -> Result<MediaFile> {
+        let _span = perf_span!("media::upload_chat_media");
         let file_data = tokio::fs::read(file_path).await?;
         let media_detection = crate::types::detect_media_type(&file_data)?;
 
@@ -320,6 +322,7 @@ impl Whitenoise {
         group_id: &GroupId,
         original_file_hash: &[u8; 32],
     ) -> Result<MediaFile> {
+        let _span = perf_span!("media::download_chat_media");
         let media_file = MediaFile::find_by_original_hash_and_group(
             &self.database,
             original_file_hash,

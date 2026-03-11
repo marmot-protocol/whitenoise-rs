@@ -117,11 +117,16 @@ impl BenchmarkScenario for UserSearchBenchmark {
 
         let total_duration: Duration = all_timings.iter().sum();
 
+        let perf_breakdown = crate::integration_tests::benchmarks::PERF_LAYER
+            .get()
+            .map(|layer| layer.drain());
+
         Ok(BenchmarkResult::from_timings(
             self.name().to_string(),
             &self.config(),
             all_timings,
             total_duration,
+            perf_breakdown,
         ))
     }
 }

@@ -4,6 +4,7 @@ use std::time::Duration;
 use base64ct::{Base64, Encoding};
 use nostr_sdk::prelude::*;
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
@@ -207,6 +208,7 @@ impl Whitenoise {
         account: &Account,
         key_package_relays: &[Relay],
     ) -> Result<(String, Vec<Tag>, Vec<u8>)> {
+        let _span = perf_span!("key_packages::encode");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
@@ -325,6 +327,7 @@ impl Whitenoise {
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("key_packages::create_and_publish");
         let (encoded_key_package, tags, hash_ref) =
             self.encoded_key_package(account, relays).await?;
         let relay_urls = Relay::urls(relays);
@@ -349,6 +352,7 @@ impl Whitenoise {
         tags: &[Tag],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
+        let _span = perf_span!("key_packages::publish_to_relays");
         let result = self
             .relay_control
             .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
