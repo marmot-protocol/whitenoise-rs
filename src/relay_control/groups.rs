@@ -16,8 +16,8 @@ use crate::{
 };
 
 /// Configuration for the long-lived group-message plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct GroupPlaneConfig {
     pub(crate) relays: Vec<RelayUrl>,
     pub(crate) group_ids: Vec<String>,

@@ -41,7 +41,6 @@ use crate::{
 /// `relay-control-plane-rearchitecture.md`. Discovery, group, and account
 /// inbox subscriptions already route through this boundary; remaining query
 /// and publish work still migrates incrementally.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct RelayControlPlane {
     database: Arc<Database>,
@@ -51,12 +50,12 @@ pub(crate) struct RelayControlPlane {
     account_inbox_planes: RwLock<HashMap<PublicKey, account_inbox::AccountInboxPlane>>,
     group_plane: groups::GroupPlane,
     ephemeral: ephemeral::EphemeralPlane,
+    #[allow(dead_code)]
     router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
 }
 
-#[allow(dead_code)]
 impl RelayControlPlane {
     /// Create the relay-control host. Telemetry persistors are started during
     /// the explicit async startup phase once a Tokio runtime is available.
@@ -109,21 +108,25 @@ impl RelayControlPlane {
     }
 
     /// Access to the shared application database for later relay-control phases.
+    #[allow(dead_code)]
     pub(crate) fn database(&self) -> &Arc<Database> {
         &self.database
     }
 
     /// Local relay-routing metadata owned by the control plane.
+    #[allow(dead_code)]
     pub(crate) fn router(&self) -> &router::RelayRouter {
         &self.router
     }
 
     /// Structured relay observability configuration and helpers.
+    #[allow(dead_code)]
     pub(crate) fn observability(&self) -> &observability::RelayObservability {
         &self.observability
     }
 
     /// Persist structured relay telemetry for later observability and retry work.
+    #[allow(dead_code)]
     pub(crate) async fn record_relay_telemetry(
         &self,
         telemetry: &observability::RelayTelemetry,
@@ -438,6 +441,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
         metadata: &nostr_sdk::Metadata,
@@ -461,6 +465,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
         follow_list: &[PublicKey],
@@ -560,7 +565,6 @@ impl RelayControlPlane {
 }
 
 /// Logical relay workload partition.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayPlane {
     Discovery,
@@ -569,7 +573,6 @@ pub(crate) enum RelayPlane {
     Ephemeral,
 }
 
-#[allow(dead_code)]
 impl RelayPlane {
     /// Stable identifier used for logs, persistence, and metrics labels.
     pub(crate) fn as_str(&self) -> &'static str {
@@ -597,7 +600,6 @@ impl FromStr for RelayPlane {
 }
 
 /// Logical stream within a relay plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SubscriptionStream {
     DiscoveryUserData,
@@ -606,9 +608,9 @@ pub(crate) enum SubscriptionStream {
     AccountInboxGiftwraps,
 }
 
-#[allow(dead_code)]
 impl SubscriptionStream {
     /// Stable identifier used only within White Noise.
+    #[allow(dead_code)]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::DiscoveryUserData => "discovery_user_data",
@@ -630,7 +632,6 @@ pub(crate) fn hash_pubkey_for_subscription_id(
 }
 
 /// Local subscription-routing metadata for an opaque relay-facing subscription.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SubscriptionContext {
     pub(crate) plane: RelayPlane,

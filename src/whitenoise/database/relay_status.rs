@@ -106,6 +106,7 @@ impl RelayStatusRecord {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn find(
         relay_url: &RelayUrl,
         plane: RelayPlane,

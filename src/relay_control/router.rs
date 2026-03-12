@@ -21,13 +21,11 @@ impl RelaySubscriptionKey {
 }
 
 /// Local routing table from opaque relay subscription IDs to internal context.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct RelayRouter {
     subscription_contexts: RwLock<HashMap<RelaySubscriptionKey, SubscriptionContext>>,
 }
 
-#[allow(dead_code)]
 impl RelayRouter {
     pub(crate) async fn record_subscription_context(
         &self,

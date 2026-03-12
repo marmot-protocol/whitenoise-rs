@@ -5,17 +5,16 @@ use nostr_sdk::PublicKey;
 use crate::relay_control::RelayPlane;
 
 /// Session-level auth policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionAuthPolicy {
     #[default]
     Disabled,
     Allowed,
+    #[allow(dead_code)]
     Required,
 }
 
 /// Session-level reconnect policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionReconnectPolicy {
     Conservative,
@@ -25,16 +24,15 @@ pub(crate) enum RelaySessionReconnectPolicy {
 }
 
 /// Session-level relay membership policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionRelayPolicy {
     #[default]
     Dynamic,
+    #[allow(dead_code)]
     ExplicitOnly,
 }
 
 /// Shared session configuration reused by all future relay planes.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelaySessionConfig {
     pub(crate) plane: RelayPlane,
