@@ -255,16 +255,25 @@ impl Whitenoise {
     /// `keyring_core::set_default_store()` before any `Entry` operations.
     ///
     /// In test and integration-test builds the mock (in-memory) store is used so
-    /// that unit tests never touch the real platform keychain.
+    /// that unit tests never touch the real platform keychain. The
+    /// `benchmark-tests` feature selects the real keyring only for the
+    /// benchmark binary (`cargo run --bin`), not for `cargo test` builds.
     ///
     /// This function is safe to call multiple times; only the first call has
     /// an effect.
     fn initialize_keyring_store() {
         static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
         KEYRING_STORE_INIT.get_or_init(|| {
-            // In test / integration-test builds, always use the mock store so
-            // tests never interact with the real platform keychain.
-            #[cfg(any(test, feature = "integration-tests"))]
+            // Always use the mock store in `cargo test` builds so unit tests
+            // never interact with the real platform keychain. The
+            // `benchmark-tests` feature only overrides the mock for the
+            // *benchmark binary* (`cargo run --bin benchmark_test`), which is
+            // not a `cfg(test)` build. The `integration-tests` feature
+            // selects mock for `cargo run --bin integration_test` as well.
+            #[cfg(any(
+                test,
+                all(feature = "integration-tests", not(feature = "benchmark-tests"))
+            ))]
             {
                 keyring_core::set_default_store(
                     keyring_core::mock::Store::new()
@@ -272,7 +281,10 @@ impl Whitenoise {
                 );
             }
 
-            #[cfg(not(any(test, feature = "integration-tests")))]
+            #[cfg(all(
+                not(test),
+                any(not(feature = "integration-tests"), feature = "benchmark-tests")
+            ))]
             {
                 #[cfg(target_os = "macos")]
                 {
@@ -527,8 +539,17 @@ impl Whitenoise {
     }
 
     pub async fn setup_all_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
-        Self::setup_global_users_subscriptions(whitenoise_ref).await?;
-        Self::setup_accounts_subscriptions(whitenoise_ref).await?;
+        // Global (discovery plane) and per-account (inbox + group planes) subscriptions
+        // operate on completely disjoint relay sessions with no shared mutable state,
+        // so they can run concurrently. Using join! (not try_join!) ensures both run
+        // to completion — avoids cancelling a partially-activated account if the
+        // discovery sync fails.
+        let (global_result, accounts_result) = tokio::join!(
+            Self::setup_global_users_subscriptions(whitenoise_ref),
+            Self::setup_accounts_subscriptions(whitenoise_ref),
+        );
+        global_result?;
+        accounts_result?;
         Ok(())
     }
 

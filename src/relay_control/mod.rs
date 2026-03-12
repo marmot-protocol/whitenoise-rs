@@ -206,8 +206,11 @@ impl RelayControlPlane {
     }
 
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
-        self.discovery.start().await?;
-        if let Err(error) = self.ephemeral.warm_relays(self.discovery.relays()).await {
+        let relays = self.discovery.relays();
+        let (discovery_result, warm_result) =
+            tokio::join!(self.discovery.start(), self.ephemeral.warm_relays(relays));
+        discovery_result?;
+        if let Err(error) = warm_result {
             tracing::warn!(
                 target: "whitenoise::relay_control",
                 "Failed to warm discovery relays on the ephemeral executor: {error}"
