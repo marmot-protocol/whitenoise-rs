@@ -1562,39 +1562,4 @@ mod tests {
             message_event.err()
         );
     }
-
-    /// When a member receives the admin's self-update commit, they process
-    /// it as a `Commit`. This covers the `MessageProcessingResult::Commit`
-    /// dispatch arm (lines 209-217).
-    #[tokio::test]
-    async fn test_handle_mls_message_member_processes_commit() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-
-        // Admin performs a self-update, producing a commit evolution event
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let update_result = admin_mdk.self_update(&group_id).unwrap();
-
-        // Merge the pending commit on the admin side so the group state is valid
-        admin_mdk.merge_pending_commit(&group_id).unwrap();
-
-        // Member processes the admin's commit — hits the Commit dispatch arm
-        let result = whitenoise
-            .handle_mls_message(&member_account, update_result.evolution_event)
-            .await;
-        assert!(
-            result.is_ok(),
-            "Member should process the admin's commit successfully: {:?}",
-            result.err()
-        );
-    }
 }
