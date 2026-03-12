@@ -32,6 +32,7 @@ pub mod event_tracker;
 pub mod follows;
 pub mod group_information;
 pub mod groups;
+mod init_timing;
 pub mod key_packages;
 pub mod media_files;
 pub mod message_aggregator;
@@ -365,6 +366,8 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+        init_timing::start();
+
         // Ensure keyring-core has a credential store before any MDK or
         // SecretsStore operations attempt to create or read keyring entries.
         Self::initialize_keyring_store();
@@ -384,6 +387,8 @@ impl Whitenoise {
         // Create scheduler shutdown channel
         let (scheduler_shutdown, scheduler_shutdown_rx) = watch::channel(false);
 
+        init_timing::record("keyring_and_channels");
+
         let whitenoise_res: Result<&'static Whitenoise> = GLOBAL_WHITENOISE.get_or_try_init(|| async {
         let data_dir = &config.data_dir;
         let logs_dir = &config.logs_dir;
@@ -401,7 +406,11 @@ impl Whitenoise {
 
         tracing::debug!(target: "whitenoise::initialize_whitenoise", "Logging initialized in directory: {:?}", logs_dir);
 
+        init_timing::record("directories_and_logging");
+
         let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
+
+        init_timing::record("database");
 
         // Create the event tracker.
         let event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
@@ -434,6 +443,8 @@ impl Whitenoise {
         );
         whitenoise.relay_control.start_telemetry_persistors().await;
 
+        init_timing::record("core_services");
+
         // Create default relays in the database if they don't exist
         // TODO: Make this batch fetch and insert all relays at once
         for relay in Relay::defaults() {
@@ -443,7 +454,12 @@ impl Whitenoise {
         // Create default app settings in the database if they don't exist
         AppSettings::find_or_create_default(&whitenoise.database).await?;
 
+        init_timing::record("database_seeding");
+
         whitenoise.relay_control.start_discovery_plane().await?;
+
+        init_timing::record("discovery_plane");
+
         Ok(whitenoise)
         }).await;
 
@@ -460,6 +476,8 @@ impl Whitenoise {
             target: "whitenoise::initialize_whitenoise",
             "Message cache synchronization complete"
         );
+
+        init_timing::record("message_cache_sync");
 
         // Backfill dm_peer_pubkey for existing DM groups missing it
         if let Err(e) = whitenoise_ref.backfill_dm_peer_pubkeys().await {
@@ -491,13 +509,19 @@ impl Whitenoise {
         );
         *whitenoise_ref.scheduler_handles.lock().await = scheduler_handles;
 
+        init_timing::record("background_tasks");
+
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
+
+        init_timing::record("subscription_setup");
 
         tracing::debug!(
             target: "whitenoise::initialize_whitenoise",
             "Completed initialization for all loaded accounts"
         );
+
+        init_timing::report();
 
         Ok(())
     }
