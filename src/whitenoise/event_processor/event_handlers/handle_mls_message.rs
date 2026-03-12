@@ -130,19 +130,23 @@ impl Whitenoise {
                 // self-removal): publish the resulting commit event so other group
                 // members learn about the change, then merge the pending commit into
                 // our local MLS state.
+                //
+                // Uses publish_and_merge_commit to ensure MIP-03 ordering:
+                // publish first, merge only on success, clear pending commit on
+                // failure. This prevents local state from advancing to an epoch
+                // that no other group member knows about.
                 let group_id = &update_result.mls_group_id;
                 let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
-                mdk.merge_pending_commit(group_id)?;
-                self.background_refresh_account_group_subscriptions(account);
+                self.publish_and_merge_commit(
+                    update_result.evolution_event.clone(),
+                    &account.pubkey,
+                    group_id,
+                    &relay_urls,
+                )
+                .await?;
 
-                self.relay_control
-                    .publish_event_to(
-                        update_result.evolution_event.clone(),
-                        &account.pubkey,
-                        &relay_urls,
-                    )
-                    .await?;
+                self.background_refresh_account_group_subscriptions(account);
 
                 if let Some(welcome_rumors) = &update_result.welcome_rumors
                     && !welcome_rumors.is_empty()
