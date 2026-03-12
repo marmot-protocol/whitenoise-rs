@@ -780,17 +780,22 @@ impl Whitenoise {
         }
 
         let signer = self.get_signer_for_account(account)?;
-        self.relay_control
-            .activate_account_subscriptions(
+
+        // Activation (group + inbox planes) and ephemeral warming operate on
+        // completely disjoint relay sessions with no shared mutable state, so
+        // they can run concurrently. Using join! ensures both run to completion
+        // — avoids cancelling a partially-warmed session if activation fails.
+        let (activation_result, _) = tokio::join!(
+            self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
                 &group_specs,
                 since,
                 signer,
-            )
-            .await?;
-
-        self.warm_ephemeral_account_relays(account).await?;
+            ),
+            self.warm_ephemeral_account_relays(account),
+        );
+        activation_result?;
 
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -840,18 +845,17 @@ impl Whitenoise {
             .deactivate_account_subscriptions(&account.pubkey)
             .await;
 
-        self.relay_control
-            .activate_account_subscriptions(
+        let (activation_result, _) = tokio::join!(
+            self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
                 &group_specs,
                 since,
                 signer,
-            )
-            .await
-            .map_err(WhitenoiseError::from)?;
-
-        self.warm_ephemeral_account_relays(account).await?;
+            ),
+            self.warm_ephemeral_account_relays(account),
+        );
+        activation_result.map_err(WhitenoiseError::from)?;
 
         Ok(())
     }
