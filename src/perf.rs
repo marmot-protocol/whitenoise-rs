@@ -41,7 +41,7 @@
 ///
 /// - `trace_id` — stable ID for the current logical operation (e.g. one event
 ///   being processed, one user-initiated action).  Set by calling
-///   [`set_trace_id`] or [`next_trace_id`] at the start of each logical unit of
+///   [`with_trace_id`] or [`next_trace_id`] at the start of each logical unit of
 ///   work and read by every `perf_span!` within that call tree.  Falls back to
 ///   `0` when not set.  Use as `tid` in Chrome Trace Format: all spans
 ///   belonging to the same operation share a lane; independent concurrent
@@ -52,27 +52,26 @@
 ///
 /// # Trace context setup
 ///
-/// Call [`set_trace_id`] (or let [`next_trace_id`] generate one) at the
-/// outermost entry point of each logical unit of work — typically at the top of
-/// each event handler iteration or each user-facing API call:
+/// Wrap each logical unit of work with [`with_trace_id`] — typically at the top
+/// of each event handler iteration or each user-facing API call:
 ///
 /// ```ignore
 /// // In the event processing loop, before dispatching each event:
-/// crate::perf::set_trace_id(crate::perf::next_trace_id());
-/// handle_event(event).await;
+/// crate::perf::with_trace_id(crate::perf::next_trace_id(), async {
+///     handle_event(event).await;
+/// }).await;
 /// ```
 ///
-/// All `perf_span!` calls in the synchronous call tree below that point will
-/// inherit the same `trace_id`.  For work spawned onto a new Tokio task, capture
-/// the current ID and restore it inside the spawn:
+/// All `perf_span!` calls within the wrapped future inherit the same `trace_id`,
+/// even across `.await` points and Tokio worker-thread rescheduling.  For work
+/// spawned onto a new Tokio task, capture the current ID and wrap the spawn body:
 ///
 /// ```ignore
 /// let tid = crate::perf::current_trace_id();
-/// tokio::spawn(async move {
-///     crate::perf::set_trace_id(tid);
+/// tokio::spawn(crate::perf::with_trace_id(tid, async move {
 ///     let _span = perf_span!("my::background_work");
 ///     do_work().await;
-/// });
+/// }));
 /// ```
 ///
 /// # Design note: why not `tracing::EnteredSpan`?
@@ -81,16 +80,24 @@
 /// compile error in `tokio::spawn` futures. This custom guard emits a regular
 /// `info!` event (which is `Send`) on drop instead, sidestepping the problem
 /// entirely.
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+///
+/// # Design note: why `tokio::task_local!` instead of `thread_local!`?
+///
+/// Tokio's multi-thread runtime uses a work-stealing scheduler: a task may
+/// resume on a different worker thread after any `.await` point.
+/// `std::thread_local!` is OS-thread-scoped, so a rescheduled task would see
+/// a different (or unset) value.  `tokio::task_local!` is scoped to the
+/// *task* (future) rather than the OS thread, so it propagates correctly
+/// across rescheduling.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::task_local;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-thread_local! {
-    static TRACE_ID: Cell<u64> = const { Cell::new(0) };
+task_local! {
+    static TRACE_ID: u64;
 }
 
 /// Returns a new monotonically increasing trace ID.
@@ -99,18 +106,29 @@ pub fn next_trace_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Sets the trace ID for the current thread.  All `perf_span!` calls on this
-/// thread will use this ID until it is changed.
-#[inline]
-pub fn set_trace_id(id: u64) {
-    TRACE_ID.with(|cell| cell.set(id));
+/// Wraps `fut` in a task-local scope where [`current_trace_id`] returns `id`.
+///
+/// Use this at the outermost entry point of each logical unit of work so that
+/// all `perf_span!` calls within the future — including those that resume after
+/// `.await` on a different Tokio worker thread — share the same `trace_id`.
+///
+/// For spawned tasks, pass the future directly to `tokio::spawn`:
+///
+/// ```ignore
+/// let tid = crate::perf::current_trace_id();
+/// tokio::spawn(crate::perf::with_trace_id(tid, async move { ... }));
+/// ```
+pub fn with_trace_id<F: std::future::Future>(
+    id: u64,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> {
+    TRACE_ID.scope(id, fut)
 }
 
-/// Returns the trace ID currently set on this thread, or `0` if none has been
-/// set.
+/// Returns the trace ID for the current task, or `0` if none has been set.
 #[inline]
 pub fn current_trace_id() -> u64 {
-    TRACE_ID.with(|cell| cell.get())
+    TRACE_ID.try_with(|id| *id).unwrap_or(0)
 }
 
 /// RAII performance guard. Emits a `tracing::info!` event with target

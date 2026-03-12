@@ -128,8 +128,7 @@ impl Whitenoise {
             .map(|entry| entry.value().subscribe());
 
         let tid = crate::perf::current_trace_id();
-        tokio::spawn(async move {
-            crate::perf::set_trace_id(tid);
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(wn) => wn,
                 Err(e) => {
@@ -164,7 +163,7 @@ impl Whitenoise {
                 fetched,
                 total
             );
-        });
+        }));
     }
 
     /// Fetches relay lists and metadata for a batch of users via the discovery

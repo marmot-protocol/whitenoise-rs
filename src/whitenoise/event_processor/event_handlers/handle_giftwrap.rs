@@ -196,8 +196,7 @@ impl Whitenoise {
         // All operations are idempotent and failures are logged but don't stop other operations
         let tid = crate::perf::current_trace_id();
         let account_owned = account.clone();
-        tokio::spawn(async move {
-            crate::perf::set_trace_id(tid);
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             Self::background_finalize_welcome(
                 account_owned,
                 group_id,
@@ -206,7 +205,7 @@ impl Whitenoise {
                 welcomer_pubkey,
             )
             .await;
-        });
+        }));
 
         Ok(())
     }

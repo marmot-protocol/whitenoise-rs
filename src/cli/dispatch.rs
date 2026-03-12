@@ -515,7 +515,6 @@ where
 ///
 /// This function takes ownership of the writer and writes response lines until
 /// the stream ends or the client disconnects. The final line has `stream_end: true`.
-#[perf_instrument("dispatch")]
 pub async fn dispatch_streaming<W>(req: Request, mut writer: W)
 where
     W: AsyncWriteExt + Unpin + Send,
@@ -561,7 +560,6 @@ where
     }
 }
 
-#[perf_instrument("dispatch")]
 async fn messages_subscribe<W>(
     wn: &Whitenoise,
     writer: &mut W,
@@ -652,7 +650,6 @@ async fn messages_subscribe<W>(
     write_stream_end(writer).await;
 }
 
-#[perf_instrument("dispatch")]
 async fn chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
 where
     W: AsyncWriteExt + Unpin,
@@ -716,7 +713,6 @@ where
     write_stream_end(writer).await;
 }
 
-#[perf_instrument("dispatch")]
 async fn notifications_subscribe<W>(wn: &Whitenoise, writer: &mut W)
 where
     W: AsyncWriteExt + Unpin,
@@ -756,7 +752,6 @@ where
     write_stream_end(writer).await;
 }
 
-#[perf_instrument("dispatch")]
 async fn users_search<W>(
     wn: &Whitenoise,
     writer: &mut W,
@@ -1263,7 +1258,6 @@ async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Respo
     Ok(to_response(&clean))
 }
 
-#[perf_instrument("dispatch")]
 async fn archived_chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
 where
     W: AsyncWriteExt + Unpin,
