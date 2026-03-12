@@ -71,9 +71,7 @@ impl Whitenoise {
             Err(WhitenoiseError::UserNotFound) => return Ok(false),
             Err(e) => return Err(e),
         };
-        account
-            .is_following_user(&user, &self.database)
-            .await
+        account.is_following_user(&user, &self.database).await
     }
 
     /// Retrieves all users that an account follows.

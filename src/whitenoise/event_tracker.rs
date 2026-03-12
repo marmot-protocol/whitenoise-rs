@@ -514,7 +514,10 @@ mod tests {
             let tracker = WhitenoiseEventTracker::new(database.clone());
 
             // First call populates the cache
-            let id1 = tracker.resolve_account_id(&keys.public_key()).await.unwrap();
+            let id1 = tracker
+                .resolve_account_id(&keys.public_key())
+                .await
+                .unwrap();
 
             // Remove the account from the DB so only the cache can serve it
             sqlx::query("DELETE FROM accounts WHERE pubkey = ?")
@@ -524,7 +527,10 @@ mod tests {
                 .unwrap();
 
             // Second call should succeed via cache
-            let id2 = tracker.resolve_account_id(&keys.public_key()).await.unwrap();
+            let id2 = tracker
+                .resolve_account_id(&keys.public_key())
+                .await
+                .unwrap();
             assert_eq!(id1, id2);
         }
 

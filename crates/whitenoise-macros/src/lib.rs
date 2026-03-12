@@ -43,8 +43,8 @@ pub fn perf_instrument(attr: TokenStream, item: TokenStream) -> TokenStream {
         let prefix_tt = tokens
             .next()
             .expect("perf_instrument: expected a prefix string argument");
-        let prefix: LitStr =
-            syn::parse2(prefix_tt.into()).expect("perf_instrument: prefix must be a string literal");
+        let prefix: LitStr = syn::parse2(prefix_tt.into())
+            .expect("perf_instrument: prefix must be a string literal");
 
         // Check for optional `, name = "..."` override
         let mut explicit_name: Option<String> = None;
