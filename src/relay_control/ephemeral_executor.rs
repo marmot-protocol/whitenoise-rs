@@ -188,6 +188,7 @@ impl EphemeralExecutor {
         config.auth_policy = self.config.auth_policy;
         config.reconnect_policy = self.config.reconnect_policy;
         config.connect_timeout = self.config.timeout;
+        config.min_connected_relays = Some(2);
         config
     }
 

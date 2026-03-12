@@ -37,6 +37,7 @@ impl AccountInboxPlaneConfig {
         config.telemetry_account_pubkey = Some(self.account_pubkey);
         config.auth_policy = self.auth_policy;
         config.reconnect_policy = self.reconnect_policy;
+        config.min_connected_relays = Some(2);
         config
     }
 }

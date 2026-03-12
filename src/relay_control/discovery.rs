@@ -84,6 +84,7 @@ impl DiscoveryPlane {
         let mut session_config = RelaySessionConfig::new(RelayPlane::Discovery);
         session_config.auth_policy = RelaySessionAuthPolicy::Disabled;
         session_config.reconnect_policy = config.reconnect_policy;
+        session_config.min_connected_relays = Some(2);
 
         Self {
             config,

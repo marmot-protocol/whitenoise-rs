@@ -69,6 +69,7 @@ impl GroupPlane {
         let mut config = RelaySessionConfig::new(RelayPlane::Group);
         config.auth_policy = RelaySessionAuthPolicy::Disabled;
         config.reconnect_policy = RelaySessionReconnectPolicy::FreshnessBiased;
+        config.min_connected_relays = Some(2);
 
         Self {
             session: RelaySession::new(config, event_sender),
