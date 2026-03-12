@@ -211,7 +211,7 @@ impl MediaFile {
     ///
     /// # Returns
     /// The MediaFile if found, None otherwise
-    #[perf_instrument("db")]
+    #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_hash(
         database: &Database,
         encrypted_file_hash: &[u8; 32],
@@ -251,7 +251,7 @@ impl MediaFile {
     ///
     /// # Errors
     /// Returns a [`WhitenoiseError`] if the database operation fails.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::media_files")]
     pub(crate) async fn save(
         database: &Database,
         mls_group_id: &GroupId,
@@ -336,7 +336,7 @@ impl MediaFile {
     /// # Arguments
     /// * `database` - Database connection
     /// * `group_id` - The MLS group ID to fetch media files for
-    #[perf_instrument("db")]
+    #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_group(
         database: &Database,
         group_id: &GroupId,
@@ -388,7 +388,7 @@ impl MediaFile {
     ///     // Download and decrypt the file
     /// }
     /// ```
-    #[perf_instrument("db")]
+    #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_original_hash_and_group(
         database: &Database,
         original_file_hash: &[u8; 32],
@@ -438,7 +438,7 @@ impl MediaFile {
     /// let cached_path = PathBuf::from("/cache/media/abc123.jpg");
     /// let updated = MediaFile::update_file_path(&db, media_file.id.unwrap(), &cached_path).await?;
     /// ```
-    #[perf_instrument("db")]
+    #[perf_instrument("db::media_files")]
     pub(crate) async fn update_file_path(
         database: &Database,
         id: i64,

@@ -65,8 +65,10 @@ impl Whitenoise {
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
         let user_pubkey = user.pubkey;
         let event_pubkey = event.pubkey;
+        let tid = crate::perf::current_trace_id();
 
         tokio::spawn(async move {
+            crate::perf::set_trace_id(tid);
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(instance) => instance,
                 Err(error) => {

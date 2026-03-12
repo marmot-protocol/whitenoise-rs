@@ -66,12 +66,13 @@ impl Whitenoise {
     /// * `pubkey` - The public key of the user to check if followed
     #[perf_instrument("follows")]
     pub async fn is_following_user(&self, account: &Account, pubkey: &PublicKey) -> Result<bool> {
-        let user = self.find_user_by_pubkey(pubkey).await;
-        if user.is_err() {
-            return Ok(false);
-        }
+        let user = match self.find_user_by_pubkey(pubkey).await {
+            Ok(user) => user,
+            Err(WhitenoiseError::UserNotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
         account
-            .is_following_user(&user.unwrap(), &self.database)
+            .is_following_user(&user, &self.database)
             .await
     }
 

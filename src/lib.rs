@@ -129,17 +129,23 @@ pub fn init_tracing_with_perf_layer(logs_dir: &std::path::Path, perf_layer: Perf
         // Per-layer filter for stdout/file: pass everything the env_filter
         // would pass, but suppress perf-only targets that should only reach
         // the dedicated PerfTracingLayer.
-        let output_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
+        let output_filter = match EnvFilter::try_from_default_env() {
+            Ok(env_filter) => env_filter
+                .add_directive("whitenoise::perf=off".parse().unwrap())
+                .add_directive("sqlx::query=off".parse().unwrap()),
+            Err(_) => EnvFilter::new(
                 "info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off",
-            )
-        });
+            ),
+        };
 
-        let file_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(
+        let file_filter = match EnvFilter::try_from_default_env() {
+            Ok(env_filter) => env_filter
+                .add_directive("whitenoise::perf=off".parse().unwrap())
+                .add_directive("sqlx::query=off".parse().unwrap()),
+            Err(_) => EnvFilter::new(
                 "info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off",
-            )
-        });
+            ),
+        };
 
         // Add a dedicated INFO-level filter so the perf layer receives events
         // from both our manual perf_span! markers and sqlx's query logger.

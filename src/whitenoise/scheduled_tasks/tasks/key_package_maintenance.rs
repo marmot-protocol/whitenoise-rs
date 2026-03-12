@@ -29,7 +29,7 @@ impl Task for KeyPackageMaintenance {
         Duration::from_secs(60 * 10)
     }
 
-    #[perf_instrument("scheduled")]
+    #[perf_instrument("scheduled::key_package_maintenance")]
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
@@ -135,7 +135,7 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
     summary
 }
 
-#[perf_instrument("scheduled")]
+#[perf_instrument("scheduled::key_package_maintenance")]
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     let packages = match whitenoise.fetch_all_key_packages_for_account(account).await {
         Ok(packages) => packages,
@@ -237,7 +237,7 @@ fn find_expired_packages(packages: &[Event]) -> Vec<Event> {
 }
 
 /// Publishes a new key package when account has none.
-#[perf_instrument("scheduled")]
+#[perf_instrument("scheduled::key_package_maintenance")]
 async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     tracing::info!(
         target: "whitenoise::scheduler::key_package_maintenance",
@@ -264,7 +264,7 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 /// If the account would be left with zero key packages after deletion, a new one is
 /// published first to avoid a gap. Otherwise, only the expired packages are deleted
 /// without republishing, since the account already has a valid package.
-#[perf_instrument("scheduled")]
+#[perf_instrument("scheduled::key_package_maintenance")]
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
     account: &Account,
@@ -323,7 +323,7 @@ async fn rotate_expired_packages(
 /// was enforced. They cause interop failures with newer MDK versions. We only delete
 /// them (without republishing) because the account already has at least one valid key
 /// package. This avoids unnecessary key package churn.
-#[perf_instrument("scheduled")]
+#[perf_instrument("scheduled::key_package_maintenance")]
 async fn delete_outdated_packages(
     whitenoise: &Whitenoise,
     account: &Account,

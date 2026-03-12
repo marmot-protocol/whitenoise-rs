@@ -180,7 +180,7 @@ impl AggregatedMessage {
 
     /// Count ALL events (kind 9, 7, 5) in cache for a group
     /// Used for sync checking: mdk.len() == cache.len()
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn count_by_group(group_id: &GroupId, database: &Database) -> Result<usize> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM aggregated_messages WHERE mls_group_id = ?")
@@ -193,7 +193,7 @@ impl AggregatedMessage {
 
     /// Get ALL event IDs (all kinds) for a group
     /// Used for incremental sync: filter out cached events
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn get_all_event_ids_by_group(
         group_id: &GroupId,
         database: &Database,
@@ -213,7 +213,7 @@ impl AggregatedMessage {
     /// The main consumer-facing API uses `find_messages_by_group_paginated` instead.
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group(
         group_id: &GroupId,
         database: &Database,
@@ -257,7 +257,7 @@ impl AggregatedMessage {
     /// * `limit`             – maximum rows to return (default 50, capped at 200)
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group_paginated(
         group_id: &GroupId,
         database: &Database,
@@ -349,7 +349,7 @@ impl AggregatedMessage {
     ///
     /// All events inserted in one batch - kind 9 gets full data, kind 7/5 get empty defaults
     /// Single pass - no UPDATE needed. This ensures atomicity: either all events are saved or none are
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn save_events(
         events: Vec<Message>,                 // All events (kind 9, 7, 5)
         processed_messages: Vec<ChatMessage>, // Processed kind 9 with aggregated data
@@ -437,7 +437,7 @@ impl AggregatedMessage {
 
     /// Insert a single kind 9 message with full pre-aggregated data
     /// Used by event processor for real-time caching
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_message(
         message: &ChatMessage,
         group_id: &GroupId,
@@ -496,7 +496,7 @@ impl AggregatedMessage {
     }
 
     /// Insert a kind 7 reaction event (audit trail)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_reaction(
         reaction: &Message,
         group_id: &GroupId,
@@ -535,7 +535,7 @@ impl AggregatedMessage {
     }
 
     /// Insert a kind 5 deletion event (audit trail)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_deletion(
         deletion: &Message,
         group_id: &GroupId,
@@ -573,7 +573,7 @@ impl AggregatedMessage {
     }
 
     /// Update a kind 9 message's reaction summary
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn update_reactions(
         message_id: &str,
         group_id: &GroupId,
@@ -595,7 +595,7 @@ impl AggregatedMessage {
     }
 
     /// Mark a message or reaction as deleted
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn mark_deleted(
         message_id: &str,
         group_id: &GroupId,
@@ -620,7 +620,7 @@ impl AggregatedMessage {
     ///
     /// Used to cascade delivery failure: if a kind-5 deletion fails to publish,
     /// we undo its effect on the target messages.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn unmark_deleted(
         deletion_event_id: &str,
         group_id: &GroupId,
@@ -645,7 +645,7 @@ impl AggregatedMessage {
     /// full message via LEFT JOIN. Runs in a transaction for atomicity.
     ///
     /// Returns an error if no matching message was found.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn update_delivery_status(
         message_id: &str,
         group_id: &GroupId,
@@ -701,7 +701,7 @@ impl AggregatedMessage {
         }
     }
 
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn update_delivery_status_with_retry(
         message_id: &str,
         group_id: &GroupId,
@@ -736,7 +736,7 @@ impl AggregatedMessage {
     /// Uses a single INSERT (no transaction) to avoid write contention with
     /// `publish_with_retries` which may be running concurrently for other events.
     /// Only suitable when the parent `aggregated_messages` row was just inserted.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_delivery_status(
         message_id: &str,
         group_id: &GroupId,
@@ -758,7 +758,7 @@ impl AggregatedMessage {
     }
 
     /// Check whether an event has a delivery status row (i.e. was sent by us).
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn has_delivery_status(
         message_id: &str,
         group_id: &GroupId,
@@ -783,7 +783,7 @@ impl AggregatedMessage {
     }
 
     /// Delete ALL cached events for a group
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn delete_by_group(group_id: &GroupId, database: &Database) -> Result<()> {
         sqlx::query("DELETE FROM aggregated_messages WHERE mls_group_id = ?")
             .bind(group_id.as_slice())
@@ -793,7 +793,7 @@ impl AggregatedMessage {
     }
 
     /// Find a cached message by ID (for updating with reactions/deletions)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_by_id(
         message_id: &str,
         group_id: &GroupId,
@@ -816,7 +816,7 @@ impl AggregatedMessage {
 
     /// Find a message by its EventId only (without requiring group_id).
     /// Returns the lightweight AggregatedMessage with mls_group_id for lookup purposes.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_by_message_id(
         message_id: &EventId,
         database: &Database,
@@ -834,7 +834,7 @@ impl AggregatedMessage {
     ///
     /// If no read marker is provided, returns total non-deleted message count.
     /// If read marker message doesn't exist, returns total count (safe fallback).
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn count_unread_for_group(
         group_id: &GroupId,
         read_marker: Option<&EventId>,
@@ -879,7 +879,7 @@ impl AggregatedMessage {
     ///
     /// Takes a slice of (group_id, optional_read_marker) pairs and returns a map
     /// of group_id -> unread_count. Groups with no messages return 0.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn count_unread_for_groups(
         group_markers: &[(GroupId, Option<EventId>)],
         database: &Database,
@@ -962,7 +962,7 @@ impl AggregatedMessage {
 
     /// Find a cached reaction (kind 7) by its event ID
     /// Only returns reactions that haven't been deleted yet
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_reaction_by_id(
         message_id: &str,
         group_id: &GroupId,
@@ -985,7 +985,7 @@ impl AggregatedMessage {
     /// Find orphaned reactions targeting a specific message
     /// Returns reactions (kind 7) that reference the target message_id
     /// Uses json_each to properly parse the tags array
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_orphaned_reactions(
         message_id: &str,
         group_id: &GroupId,
@@ -1017,7 +1017,7 @@ impl AggregatedMessage {
     /// Find orphaned deletions targeting a specific message
     /// Returns the event IDs of deletions (kind 5) that reference the target message_id
     /// Uses json_each to properly parse the tags array
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_orphaned_deletions(
         message_id: &str,
         group_id: &GroupId,
@@ -1052,7 +1052,7 @@ impl AggregatedMessage {
     ///
     /// Groups without messages or with only deleted messages are not included
     /// in the result.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::aggregated_messages")]
     pub async fn find_last_by_group_ids(
         group_ids: &[GroupId],
         database: &Database,

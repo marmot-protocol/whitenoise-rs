@@ -62,7 +62,6 @@ impl Whitenoise {
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
-                let _welcome_span = perf_span!("event_handlers::process_welcome");
                 self.process_welcome(account, event, unwrapped.rumor)
                     .await?;
             }
@@ -195,13 +194,19 @@ impl Whitenoise {
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
-        tokio::spawn(Self::background_finalize_welcome(
-            account.clone(),
-            group_id,
-            group_name,
-            key_package_event_id,
-            welcomer_pubkey,
-        ));
+        let tid = crate::perf::current_trace_id();
+        let account_owned = account.clone();
+        tokio::spawn(async move {
+            crate::perf::set_trace_id(tid);
+            Self::background_finalize_welcome(
+                account_owned,
+                group_id,
+                group_name,
+                key_package_event_id,
+                welcomer_pubkey,
+            )
+            .await;
+        });
 
         Ok(())
     }

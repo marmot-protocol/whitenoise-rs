@@ -74,7 +74,7 @@ where
 
 impl ProcessedEvent {
     /// Records that we processed a specific event to ensure idempotency
-    #[perf_instrument("db")]
+    #[perf_instrument("db::processed_events")]
     pub(crate) async fn create(
         event_id: &EventId,
         account_id: Option<i64>,
@@ -103,7 +103,7 @@ impl ProcessedEvent {
 
     /// Checks if we already processed a specific event
     /// - account_id: Some(id) for account-specific processing, None for global processing
-    #[perf_instrument("db")]
+    #[perf_instrument("db::processed_events")]
     pub(crate) async fn exists(
         event_id: &EventId,
         account_id: Option<i64>,
@@ -133,7 +133,7 @@ impl ProcessedEvent {
 
     /// Gets the newest event timestamp for specific event kind and account
     /// Optionally filters by author for global events (when account_id is None)
-    #[perf_instrument("db")]
+    #[perf_instrument("db::processed_events")]
     pub(crate) async fn newest_event_timestamp_for_kind(
         account_id: Option<i64>,
         event_kind: u16,
@@ -175,7 +175,7 @@ impl ProcessedEvent {
     }
 
     /// Gets the newest relay event timestamp for a user
-    #[perf_instrument("db")]
+    #[perf_instrument("db::processed_events")]
     pub(crate) async fn newest_relay_event_timestamp(
         user_pubkey: &PublicKey,
         relay_type: RelayType,
@@ -196,7 +196,7 @@ impl ProcessedEvent {
     }
 
     /// Gets the newest contact list event timestamp for an account
-    #[perf_instrument("db")]
+    #[perf_instrument("db::processed_events")]
     pub(crate) async fn newest_contact_list_timestamp(
         account_id: i64,
         database: &Database,

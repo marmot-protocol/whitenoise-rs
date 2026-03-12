@@ -152,8 +152,12 @@ impl PerfTracingLayer {
             .map(|(name, durations)| PerfBreakdown::from_samples(name, durations))
             .collect();
 
-        // Hottest markers (most calls) first
-        breakdowns.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        // Hottest markers (most total time) first
+        breakdowns.sort_by(|a, b| {
+            let a_total = a.mean * a.call_count as u32;
+            let b_total = b.mean * b.call_count as u32;
+            b_total.cmp(&a_total)
+        });
         breakdowns
     }
 

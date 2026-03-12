@@ -76,6 +76,12 @@ pub trait BenchmarkScenario {
             }
         }
 
+        // Clear perf samples before the timed phase (catches setup spans
+        // when warmup_iterations == 0, since the warmup branch handles its own clear)
+        if let Some(layer) = PERF_LAYER.get() {
+            layer.clear();
+        }
+
         // Benchmark phase
         tracing::info!("Running {} benchmark iterations...", config.iterations);
         let mut timings = Vec::with_capacity(config.iterations as usize);

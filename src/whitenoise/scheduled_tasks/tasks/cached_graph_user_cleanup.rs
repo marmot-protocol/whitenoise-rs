@@ -26,7 +26,7 @@ impl Task for CachedGraphUserCleanup {
         Duration::from_secs(6 * 60 * 60) // 6 hours
     }
 
-    #[perf_instrument("scheduled")]
+    #[perf_instrument("scheduled::cached_graph_cleanup")]
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
         let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database).await?;
 

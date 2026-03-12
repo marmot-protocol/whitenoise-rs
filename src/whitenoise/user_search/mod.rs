@@ -135,7 +135,9 @@ impl Whitenoise {
         let radius_start = params.radius_start;
         let radius_end = params.radius_end;
 
+        let tid = crate::perf::current_trace_id();
         tokio::spawn(async move {
+            crate::perf::set_trace_id(tid);
             // Get singleton instance inside spawned task (follows existing pattern in groups.rs)
             let whitenoise = match Self::get_instance() {
                 Ok(wn) => wn,

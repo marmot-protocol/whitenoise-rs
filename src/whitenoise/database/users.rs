@@ -133,7 +133,7 @@ impl User {
     }
 
     /// Fetches the distinct pubkeys for every user stored in the local database.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::users")]
     pub(crate) async fn all_pubkeys(
         database: &Database,
     ) -> Result<Vec<PublicKey>, WhitenoiseError> {
@@ -167,7 +167,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operations fail.
-    #[perf_instrument("db")]
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_or_create_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
@@ -312,10 +312,11 @@ impl User {
     /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
     /// for empty-profile users.
     pub(crate) async fn touch_updated_at(
-        &self,
+        &mut self,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
-        let current_time = Utc::now().timestamp_millis();
+        let now = Utc::now();
+        let current_time = now.timestamp_millis();
         sqlx::query("UPDATE users SET updated_at = ? WHERE pubkey = ?")
             .bind(current_time)
             .bind(self.pubkey.to_hex().as_str())
@@ -323,6 +324,7 @@ impl User {
             .await
             .map_err(DatabaseError::Sqlx)
             .map_err(WhitenoiseError::Database)?;
+        self.updated_at = now;
         Ok(())
     }
 
