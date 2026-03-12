@@ -50,6 +50,7 @@ use mdk_core::prelude::MDK;
 use mdk_sqlite_storage::MdkSqliteStorage;
 
 use crate::init_tracing;
+use crate::perf_span;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::discovery::DiscoveryPlaneConfig;
 
@@ -365,6 +366,7 @@ impl Whitenoise {
     ///
     /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+        let _span = perf_span!("whitenoise::initialize_whitenoise");
         // Ensure keyring-core has a credential store before any MDK or
         // SecretsStore operations attempt to create or read keyring entries.
         Self::initialize_keyring_store();
@@ -503,12 +505,14 @@ impl Whitenoise {
     }
 
     pub async fn setup_all_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
+        let _span = perf_span!("whitenoise::setup_all_subscriptions");
         Self::setup_global_users_subscriptions(whitenoise_ref).await?;
         Self::setup_accounts_subscriptions(whitenoise_ref).await?;
         Ok(())
     }
 
     async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
+        let _span = perf_span!("whitenoise::setup_global_users_subscriptions");
         let accounts = Account::all(&whitenoise_ref.database).await?;
         if accounts.is_empty() {
             tracing::info!(
@@ -536,6 +540,7 @@ impl Whitenoise {
     async fn compute_global_since_timestamp(
         whitenoise_ref: &Whitenoise,
     ) -> Result<Option<nostr_sdk::Timestamp>> {
+        let _span = perf_span!("whitenoise::compute_global_since_timestamp");
         let accounts = Account::all(&whitenoise_ref.database).await?;
         if accounts.iter().any(|a| a.last_synced_at.is_none()) {
             let unsynced = accounts
@@ -572,6 +577,7 @@ impl Whitenoise {
     }
 
     async fn setup_accounts_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
+        let _span = perf_span!("whitenoise::setup_accounts_subscriptions");
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
             let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
@@ -632,6 +638,7 @@ impl Whitenoise {
     /// # }
     /// ```
     pub async fn shutdown(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::shutdown");
         tracing::info!(target: "whitenoise::shutdown", "Initiating graceful shutdown");
 
         self.shutdown_event_processing().await?;
@@ -648,6 +655,7 @@ impl Whitenoise {
     /// If the MLS directory exists, it is removed and then recreated as an empty directory.
     /// This is useful for resetting the application to a clean state.
     pub async fn delete_all_data(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::delete_all_data");
         tracing::debug!(target: "whitenoise::delete_all_data", "Deleting all data");
 
         // Shutdown gracefully before deleting data
@@ -696,6 +704,7 @@ impl Whitenoise {
     /// Sends shutdown signal to all running tasks and waits for them to complete.
     /// Any panicked tasks are logged but do not cause this method to fail.
     async fn shutdown_scheduled_tasks(&self) {
+        let _span = perf_span!("whitenoise::shutdown_scheduled_tasks");
         tracing::info!(target: "whitenoise::scheduler", "Initiating scheduler shutdown");
 
         // Signal all tasks to stop
@@ -735,10 +744,12 @@ impl Whitenoise {
     /// This is primarily useful for integration testing to verify the scheduler is running.
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn scheduler_task_count(&self) -> usize {
+        let _span = perf_span!("whitenoise::scheduler_task_count");
         self.scheduler_handles.lock().await.len()
     }
 
     pub async fn export_account_nsec(&self, account: &Account) -> Result<String> {
+        let _span = perf_span!("whitenoise::export_account_nsec");
         if account.uses_external_signer() {
             return Err(WhitenoiseError::ExternalSignerCannotExportNsec);
         }
@@ -751,6 +762,7 @@ impl Whitenoise {
     }
 
     pub async fn export_account_npub(&self, account: &Account) -> Result<String> {
+        let _span = perf_span!("whitenoise::export_account_npub");
         Ok(account.pubkey.to_bech32().unwrap())
     }
 
@@ -766,6 +778,7 @@ impl Whitenoise {
     where
         S: NostrSigner + 'static,
     {
+        let _span = perf_span!("whitenoise::register_external_signer");
         let account = self.find_account_by_pubkey(&pubkey).await?;
         if !account.uses_external_signer() {
             return Err(WhitenoiseError::NotExternalSignerAccount);
@@ -821,6 +834,7 @@ impl Whitenoise {
     where
         S: NostrSigner + 'static,
     {
+        let _span = perf_span!("whitenoise::insert_external_signer");
         self.validate_signer_pubkey(&pubkey, &signer).await?;
         tracing::info!(
             target: "whitenoise::external_signer",
@@ -898,6 +912,7 @@ impl Whitenoise {
         &self,
         group_id: &mdk_core::prelude::GroupId,
     ) -> Result<message_streaming::GroupMessageSubscription> {
+        let _span = perf_span!("whitenoise::subscribe_to_group_messages");
         let mut updates = self.message_stream_manager.subscribe(group_id);
 
         let fetched_messages =
@@ -953,6 +968,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<chat_list_streaming::ChatListSubscription> {
+        let _span = perf_span!("whitenoise::subscribe_to_chat_list");
         let mut updates = self.chat_list_stream_manager.subscribe(&account.pubkey);
 
         let fetched_items = self.get_chat_list(account).await?;
@@ -1004,6 +1020,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<chat_list_streaming::ChatListSubscription> {
+        let _span = perf_span!("whitenoise::subscribe_to_archived_chat_list");
         let mut updates = self
             .archived_chat_list_stream_manager
             .subscribe(&account.pubkey);
@@ -1073,6 +1090,7 @@ impl Whitenoise {
     /// Discovery fallback is owned by the discovery plane rather than whatever
     /// other relays happen to be connected for unrelated workloads.
     pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
+        let _span = perf_span!("whitenoise::fallback_relay_urls");
         self.relay_control.discovery().relays().to_vec()
     }
 
@@ -1086,6 +1104,7 @@ impl Whitenoise {
     /// user sets — prefer batching multiple user updates and calling
     /// `refresh_all_global_subscriptions` once instead.
     pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::refresh_global_subscription_for_user");
         self.sync_discovery_subscriptions().await?;
         Ok(())
     }
@@ -1094,11 +1113,13 @@ impl Whitenoise {
     /// relay batches. Use after bulk user discovery (e.g. contact-list
     /// processing) where many users may have changed simultaneously.
     pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::refresh_all_global_subscriptions");
         self.sync_discovery_subscriptions().await?;
         Ok(())
     }
 
     pub async fn ensure_account_subscriptions(&self, account: &Account) -> Result<()> {
+        let _span = perf_span!("whitenoise::ensure_account_subscriptions");
         let is_operational = self.is_account_subscriptions_operational(account).await?;
 
         if !is_operational {
@@ -1114,6 +1135,7 @@ impl Whitenoise {
     }
 
     pub async fn ensure_global_subscriptions(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::ensure_global_subscriptions");
         let is_operational = self.is_global_subscriptions_operational().await?;
 
         if !is_operational {
@@ -1161,6 +1183,7 @@ impl Whitenoise {
     /// # }
     /// ```
     pub async fn ensure_all_subscriptions(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::ensure_all_subscriptions");
         // Best-effort: log and continue on error
         if let Err(e) = self.ensure_global_subscriptions().await {
             tracing::warn!(
@@ -1192,6 +1215,7 @@ impl Whitenoise {
     /// Returns true if the account inbox plane exists and at least one of its
     /// relays is connected or connecting.
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
+        let _span = perf_span!("whitenoise::is_account_subscriptions_operational");
         Ok(self
             .relay_control
             .has_account_subscriptions(&account.pubkey)
@@ -1203,15 +1227,18 @@ impl Whitenoise {
     /// Returns true if at least one relay (from the client pool) is connected or connecting
     /// AND at least one global subscription exists.
     pub async fn is_global_subscriptions_operational(&self) -> Result<bool> {
+        let _span = perf_span!("whitenoise::is_global_subscriptions_operational");
         Ok(self.relay_control.has_discovery_subscriptions().await)
     }
 
     /// Returns a live in-memory snapshot of relay-plane state for debugging.
     pub async fn get_relay_control_state(&self) -> RelayControlStateSnapshot {
+        let _span = perf_span!("whitenoise::get_relay_control_state");
         self.relay_control.snapshot().await
     }
 
     async fn sync_discovery_subscriptions(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::sync_discovery_subscriptions");
         let watched_users = User::all_pubkeys(&self.database).await?;
         let follow_list_accounts = Account::all(&self.database)
             .await?
@@ -1228,12 +1255,14 @@ impl Whitenoise {
 
     #[cfg(feature = "integration-tests")]
     pub async fn wipe_database(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::wipe_database");
         self.database.delete_all_data().await?;
         Ok(())
     }
 
     #[cfg(feature = "integration-tests")]
     pub async fn reset_nostr_client(&self) -> Result<()> {
+        let _span = perf_span!("whitenoise::reset_nostr_client");
         self.relay_control.reset_for_tests().await?;
         Ok(())
     }

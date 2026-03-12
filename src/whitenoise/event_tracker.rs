@@ -143,6 +143,7 @@ impl WhitenoiseEventTracker {
         &self,
         pubkey: &PublicKey,
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        let _span = perf_span!("event_tracker::resolve_account_id");
         if let Some(id) = self.account_id_cache.get(pubkey) {
             return Ok(*id);
         }

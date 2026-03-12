@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::RelayPlane;
+use crate::perf_span;
 use crate::whitenoise::database::{
     Database, DatabaseError, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
 };
@@ -311,6 +312,7 @@ impl RelayObservability {
         database: &Database,
         telemetry: &RelayTelemetry,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("relay::telemetry_record");
         // Attempt events carry no actionable state; skip persistence entirely.
         if matches!(
             telemetry.kind,
@@ -365,6 +367,7 @@ impl RelayObservability {
         plane: RelayPlane,
         account_pubkey: Option<PublicKey>,
     ) -> Result<Option<RelayStatusRecord>, DatabaseError> {
+        let _span = perf_span!("relay::telemetry_status");
         RelayStatusRecord::find(relay_url, plane, account_pubkey, database).await
     }
 
@@ -376,6 +379,7 @@ impl RelayObservability {
         plane: RelayPlane,
         account_pubkey: Option<PublicKey>,
     ) -> Result<Vec<RelayEventRecord>, DatabaseError> {
+        let _span = perf_span!("relay::telemetry_recent_events");
         RelayEventRecord::list_recent_for_scope(
             relay_url,
             plane,

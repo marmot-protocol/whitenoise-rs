@@ -508,6 +508,7 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
+        let _span = perf_span!("chat_list::emit_chat_list_update_for_account");
         let account = match Account::find_by_pubkey(pubkey, &self.database).await {
             Ok(acc) => acc,
             Err(e) => {

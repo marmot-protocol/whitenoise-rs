@@ -180,6 +180,7 @@ impl ProcessedEvent {
         relay_type: RelayType,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, WhitenoiseError> {
+        let _span = perf_span!("db::processed_event_newest_relay_event_timestamp");
         // Map relay types to their corresponding event kinds
         let kind = match relay_type {
             RelayType::Nip65 => 10002,
@@ -199,6 +200,7 @@ impl ProcessedEvent {
         account_id: i64,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, WhitenoiseError> {
+        let _span = perf_span!("db::processed_event_newest_contact_list_timestamp");
         // Query processed_events for kind 3 events with specific account_id
         Self::newest_event_timestamp_for_kind(Some(account_id), 3, None, database)
             .await

@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::RelayType;
 use crate::nostr_manager::NostrManagerError;
+use crate::perf_span;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
@@ -270,6 +271,7 @@ impl Account {
         whitenoise: &Whitenoise,
         keys: Option<Keys>,
     ) -> Result<(Account, Keys)> {
+        let _span = perf_span!("accounts::new");
         let keys = keys.unwrap_or_else(Keys::generate);
 
         let (user, _created) =
@@ -293,6 +295,7 @@ impl Account {
         whitenoise: &Whitenoise,
         pubkey: PublicKey,
     ) -> Result<Account> {
+        let _span = perf_span!("accounts::new_external");
         let (user, _created) =
             User::find_or_create_by_pubkey(&pubkey, &whitenoise.database).await?;
 
@@ -339,6 +342,7 @@ impl Account {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::relays");
         let user = self.user(&whitenoise.database).await?;
         let relays = user.relays(relay_type, &whitenoise.database).await?;
         Ok(relays)
@@ -346,6 +350,7 @@ impl Account {
 
     /// Helper method to retrieve the NIP-65 relays for this account.
     pub(crate) async fn nip65_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::nip65_relays");
         let user = self.user(&whitenoise.database).await?;
         let relays = user.relays(RelayType::Nip65, &whitenoise.database).await?;
         Ok(relays)
@@ -353,6 +358,7 @@ impl Account {
 
     /// Helper method to retrieve the inbox relays for this account.
     pub(crate) async fn inbox_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::inbox_relays");
         let user = self.user(&whitenoise.database).await?;
         let relays = user.relays(RelayType::Inbox, &whitenoise.database).await?;
         Ok(relays)
@@ -368,6 +374,7 @@ impl Account {
         &self,
         whitenoise: &Whitenoise,
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::effective_inbox_relays");
         let inbox = self.inbox_relays(whitenoise).await?;
         if !inbox.is_empty() {
             return Ok(inbox);
@@ -382,6 +389,7 @@ impl Account {
 
     /// Helper method to retrieve the key package relays for this account.
     pub(crate) async fn key_package_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::key_package_relays");
         let user = self.user(&whitenoise.database).await?;
         let relays = user
             .relays(RelayType::KeyPackage, &whitenoise.database)
@@ -410,6 +418,7 @@ impl Account {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::add_relay");
         let user = self.user(&whitenoise.database).await?;
         user.add_relay(relay, relay_type, &whitenoise.database)
             .await?;
@@ -442,6 +451,7 @@ impl Account {
         relay_type: RelayType,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::remove_relay");
         let user = self.user(&whitenoise.database).await?;
         user.remove_relay(relay, relay_type, &whitenoise.database)
             .await?;
@@ -462,6 +472,7 @@ impl Account {
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the database
     pub async fn metadata(&self, whitenoise: &Whitenoise) -> Result<Metadata> {
+        let _span = perf_span!("accounts::metadata");
         let user = self.user(&whitenoise.database).await?;
         Ok(user.metadata.clone())
     }
@@ -481,6 +492,7 @@ impl Account {
         metadata: &Metadata,
         whitenoise: &Whitenoise,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::update_metadata");
         tracing::debug!(target: "whitenoise::accounts", "Updating metadata for account: {:?}", self.pubkey);
         let mut user = self.user(&whitenoise.database).await?;
         user.metadata = metadata.clone();
@@ -503,6 +515,7 @@ impl Account {
         server: Url,
         whitenoise: &Whitenoise,
     ) -> Result<String> {
+        let _span = perf_span!("accounts::upload_profile_picture");
         let client = BlossomClient::new(server);
         let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;

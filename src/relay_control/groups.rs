@@ -189,6 +189,7 @@ impl GroupPlane {
         &self,
         pubkey: &PublicKey,
     ) -> Option<Vec<GroupSubscriptionSpec>> {
+        let _span = perf_span!("relay::group_plane_account_state");
         self.accounts
             .read()
             .await
@@ -198,6 +199,7 @@ impl GroupPlane {
 
     #[allow(dead_code)]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
+        let _span = perf_span!("relay::group_plane_has_account");
         self.accounts.read().await.contains_key(pubkey)
     }
 
@@ -298,6 +300,7 @@ impl GroupPlane {
     }
 
     async fn unsubscribe_indices(&self, pubkey: &PublicKey, subscription_indices: &[usize]) {
+        let _span = perf_span!("relay::group_plane_unsubscribe_indices");
         for subscription_index in subscription_indices {
             self.session
                 .unsubscribe(&self.subscription_id(pubkey, *subscription_index))
@@ -366,6 +369,7 @@ impl GroupPlane {
 
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn reset(&self) {
+        let _span = perf_span!("relay::group_plane_reset");
         let pubkeys = self
             .accounts
             .read()

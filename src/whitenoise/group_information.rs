@@ -5,6 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
+use crate::perf_span;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +70,7 @@ impl GroupInformation {
         group_type: Option<GroupType>,
         group_name: &str,
     ) -> Result<GroupInformation, WhitenoiseError> {
+        let _span = perf_span!("group_info::create_for_group");
         let group_type =
             group_type.unwrap_or_else(|| Self::infer_group_type_from_group_name(group_name));
         let (group_info, _was_created) = Self::find_or_create_by_mls_group_id(
@@ -86,6 +88,7 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         whitenoise: &Whitenoise,
     ) -> Result<GroupInformation, WhitenoiseError> {
+        let _span = perf_span!("group_info::get_by_mls_group_id");
         let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
         let group = mdk
             .get_group(mls_group_id)?
@@ -106,6 +109,7 @@ impl GroupInformation {
         mls_group_ids: &[GroupId],
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
+        let _span = perf_span!("group_info::get_by_mls_group_ids");
         // First try to get existing records
         let existing =
             GroupInformation::find_by_mls_group_ids(mls_group_ids, &whitenoise.database).await?;
@@ -148,6 +152,7 @@ impl Whitenoise {
         account_pubkey: PublicKey,
         mls_group_id: &GroupId,
     ) -> Result<GroupInformation, WhitenoiseError> {
+        let _span = perf_span!("group_info::get_by_mls_group_id_full");
         GroupInformation::get_by_mls_group_id(account_pubkey, mls_group_id, self).await
     }
 
@@ -156,6 +161,7 @@ impl Whitenoise {
         account_pubkey: PublicKey,
         mls_group_ids: &[GroupId],
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
+        let _span = perf_span!("group_info::get_by_mls_group_ids_full");
         GroupInformation::get_by_mls_group_ids(account_pubkey, mls_group_ids, self).await
     }
 }

@@ -127,11 +127,15 @@ pub fn init_tracing_with_perf_layer(logs_dir: &std::path::Path, perf_layer: Perf
         // would pass, but suppress perf-only targets that should only reach
         // the dedicated PerfTracingLayer.
         let output_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off")
+            EnvFilter::new(
+                "info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off",
+            )
         });
 
         let file_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off")
+            EnvFilter::new(
+                "info,refinery_core=warn,refinery=warn,whitenoise::perf=off,sqlx::query=off",
+            )
         });
 
         // Add a dedicated INFO-level filter so the perf layer receives events

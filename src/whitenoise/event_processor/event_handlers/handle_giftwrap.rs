@@ -84,6 +84,7 @@ impl Whitenoise {
         event: Event,
         rumor: UnsignedEvent,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::process_welcome");
         // Extract key package event ID from the rumor tags early — required for pre-check
         // and key package lifecycle finalization.
         let key_package_event_id = match rumor
@@ -214,6 +215,7 @@ impl Whitenoise {
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
+        let _span = perf_span!("event_handlers::background_finalize_welcome");
         let Ok(whitenoise) = Whitenoise::get_instance() else {
             tracing::error!(
                 target: "whitenoise::event_processor::process_welcome::background",
@@ -256,6 +258,7 @@ impl Whitenoise {
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
+        let _span = perf_span!("event_handlers::finalize_welcome_with_instance");
         // Get signer early - needed for subscriptions
         let signer = match whitenoise.get_signer_for_account(account) {
             Ok(s) => s,
@@ -383,6 +386,7 @@ impl Whitenoise {
         group_id: &GroupId,
         group_name: &str,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::create_group_info");
         GroupInformation::create_for_group(whitenoise, group_id, None, group_name).await?;
         Ok(())
     }
@@ -393,6 +397,7 @@ impl Whitenoise {
         account: &Account,
         _signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::setup_group_subscriptions");
         let (group_ids, group_relays) =
             Self::get_group_subscription_info(whitenoise, &account.pubkey)?;
 
@@ -423,6 +428,7 @@ impl Whitenoise {
         account: &Account,
         key_package_event_id: EventId,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::rotate_key_package");
         // Mark the key package as consumed so the maintenance task knows
         // to clean up local key material after the quiet period.
         if let Err(e) = PublishedKeyPackage::mark_consumed(
@@ -483,6 +489,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::sync_group_image");
         whitenoise
             .sync_group_image_cache_if_needed(account, group_id)
             .await
@@ -492,6 +499,7 @@ impl Whitenoise {
         whitenoise: &Whitenoise,
         welcomer_pubkey: PublicKey,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::ensure_welcomer_user_exists");
         whitenoise
             .find_or_create_user_by_pubkey(&welcomer_pubkey, crate::UserSyncMode::Background)
             .await?;
@@ -515,6 +523,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
+        let _span = perf_span!("event_handlers::perform_self_update");
         let relay_urls = {
             let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
             Self::ensure_group_relays(&mdk, group_id)?

@@ -199,6 +199,7 @@ impl Whitenoise {
         &self,
         subscription_id: &str,
     ) -> Result<PublicKey> {
+        let _span = perf_span!("event_processor::extract_pubkey_from_subscription_id");
         let underscore_pos = subscription_id.find('_');
         if underscore_pos.is_none() {
             return Err(WhitenoiseError::InvalidEvent(format!(
@@ -225,6 +226,7 @@ impl Whitenoise {
     }
 
     async fn account_from_event_source(&self, source: &EventSource) -> Result<Account> {
+        let _span = perf_span!("event_processor::account_from_event_source");
         let target_pubkey = match source {
             EventSource::LegacySubscriptionId(Some(subscription_id)) => self
                 .extract_pubkey_from_subscription_id(subscription_id)
@@ -263,6 +265,7 @@ impl Whitenoise {
         event: &Event,
         account: &Account,
     ) -> Result<Option<&'static str>> {
+        let _span = perf_span!("event_processor::should_skip_account_event");
         let already_processed = match self
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
@@ -349,6 +352,7 @@ impl Whitenoise {
         event: &Event,
         account: &Account,
     ) -> Result<Option<Timestamp>> {
+        let _span = perf_span!("event_processor::extract_rumor_timestamp");
         let signer = self.get_signer_for_account(account)?;
 
         match extract_rumor(&signer, event).await {

@@ -28,6 +28,7 @@ impl Whitenoise {
     }
 
     async fn create_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
+        let _span = perf_span!("accounts::create_identity_with_keys");
         let mut account = self.create_base_account_with_private_key(keys).await?;
         tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
 

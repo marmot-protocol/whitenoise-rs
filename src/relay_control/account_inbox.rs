@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     nostr_manager::{Result, utils::adjust_since_for_giftwrap},
+    perf_span,
     relay_control::SubscriptionStream,
     types::{AccountInboxPlaneStateSnapshot, ProcessableEvent},
 };
@@ -67,6 +68,7 @@ impl AccountInboxPlane {
         since: Option<Timestamp>,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
+        let _span = perf_span!("relay::account_inbox_activate");
         self.session.set_signer(signer).await;
 
         self.session.ensure_relays_connected(inbox_relays).await?;
@@ -76,6 +78,7 @@ impl AccountInboxPlane {
     }
 
     pub(crate) async fn deactivate(&self) {
+        let _span = perf_span!("relay::account_inbox_deactivate");
         self.session
             .unsubscribe(&SubscriptionId::new(format!(
                 "{}_giftwrap",
@@ -103,6 +106,7 @@ impl AccountInboxPlane {
         inbox_relays: &[RelayUrl],
         since: Option<Timestamp>,
     ) -> Result<()> {
+        let _span = perf_span!("relay::account_inbox_subscribe_giftwrap");
         let mut filter = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(self.config.account_pubkey);

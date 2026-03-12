@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::{Event, Filter, Kind, Metadata, PublicKey, RelayUrl, TagKind};
 
+use crate::perf_span;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
@@ -40,6 +41,7 @@ pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
     searcher_pubkey: &PublicKey,
 ) -> HashSet<PublicKey> {
+    let _span = perf_span!("user_search::get_group_co_member_pubkeys");
     let account = match Account::find_by_pubkey(searcher_pubkey, &whitenoise.database).await {
         Ok(a) => a,
         Err(e) => {
@@ -98,6 +100,7 @@ pub(super) async fn get_group_co_member_pubkeys(
 
 /// Collect discovery relay URLs to use for user-search queries.
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
+    let _span = perf_span!("user_search::connected_relays");
     whitenoise.relay_control.discovery().relays().to_vec()
 }
 
@@ -113,6 +116,7 @@ pub(super) async fn check_user_table_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
+    let _span = perf_span!("user_search::check_user_table_metadata");
     let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
 
     let users = User::find_by_pubkeys(pubkeys, &whitenoise.database)
@@ -141,6 +145,7 @@ pub(super) async fn check_cache_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
+    let _span = perf_span!("user_search::check_cache_metadata");
     let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
     // Track pubkeys with any cached entry (even empty metadata) so we don't
     // re-forward confirmed-absent users to the network tiers.
@@ -184,6 +189,7 @@ pub(super) async fn try_fetch_network_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> Result<(HashMap<PublicKey, Metadata>, Vec<PublicKey>), ()> {
+    let _span = perf_span!("user_search::try_fetch_network_metadata");
     let all_relays = connected_relays(whitenoise).await;
     let filter = Filter::new()
         .authors(pubkeys.to_vec())
@@ -244,6 +250,7 @@ pub(super) async fn try_fetch_relay_lists(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> Result<HashMap<PublicKey, Vec<RelayUrl>>, ()> {
+    let _span = perf_span!("user_search::try_fetch_relay_lists");
     let all_relays = connected_relays(whitenoise).await;
     let filter = Filter::new()
         .authors(pubkeys.to_vec())
@@ -307,6 +314,7 @@ pub(super) async fn try_fetch_user_relay_metadata(
     pubkey: &PublicKey,
     relays: &[RelayUrl],
 ) -> UserRelayResult {
+    let _span = perf_span!("user_search::try_fetch_user_relay_metadata");
     let filter = Filter::new().authors([*pubkey]).kinds([Kind::Metadata]);
 
     match whitenoise
@@ -381,6 +389,7 @@ pub(super) async fn check_cached_follows_batch(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> (HashMap<PublicKey, Vec<PublicKey>>, Vec<PublicKey>) {
+    let _span = perf_span!("user_search::check_cached_follows_batch");
     let mut results: HashMap<PublicKey, Vec<PublicKey>> = HashMap::new();
     let mut remaining: HashSet<PublicKey> = pubkeys.iter().copied().collect();
 
@@ -424,6 +433,7 @@ pub(super) async fn fetch_network_follows(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
 ) -> HashMap<PublicKey, Vec<PublicKey>> {
+    let _span = perf_span!("user_search::fetch_network_follows");
     if pubkeys.is_empty() {
         return HashMap::new();
     }
@@ -527,6 +537,7 @@ async fn fetch_events_with_retries(
     kind: Kind,
     relays: &[RelayUrl],
 ) -> (HashMap<PublicKey, Vec<Event>>, HashSet<PublicKey>) {
+    let _span = perf_span!("user_search::fetch_events_with_retries");
     let mut events_by_author: HashMap<PublicKey, Vec<Event>> = HashMap::new();
 
     // Build initial chunks

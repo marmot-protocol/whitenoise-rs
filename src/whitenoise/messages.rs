@@ -399,6 +399,7 @@ impl Whitenoise {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
+        let _span = perf_span!("messages::cascade_delivery_failure");
         match kind {
             7 => {
                 // Reaction failed: remove from parent message's reaction summary
@@ -768,6 +769,7 @@ impl Whitenoise {
     }
 
     async fn cache_needs_sync(&self, group_id: &GroupId, mdk_messages: &[Message]) -> Result<bool> {
+        let _span = perf_span!("messages::cache_needs_sync");
         if mdk_messages.is_empty() {
             return Ok(false);
         }

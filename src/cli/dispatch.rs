@@ -5,6 +5,7 @@ use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
+use crate::perf_span;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::relays::{Relay, RelayType};
@@ -14,6 +15,7 @@ use super::protocol::{Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
 pub async fn dispatch(req: Request) -> Response {
+    let _span = perf_span!("dispatch::dispatch");
     let wn = match Whitenoise::get_instance() {
         Ok(wn) => wn,
         Err(e) => return Response::err(format!("whitenoise not initialized: {e}")),
@@ -483,6 +485,7 @@ async fn write_response<W>(writer: &mut W, response: &Response) -> bool
 where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::write_response");
     let mut buf = match serde_json::to_vec(response) {
         Ok(buf) => buf,
         Err(e) => {
@@ -499,6 +502,7 @@ async fn write_stream_end<W>(writer: &mut W)
 where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::write_stream_end");
     let end = Response {
         result: None,
         error: None,
@@ -515,6 +519,7 @@ pub async fn dispatch_streaming<W>(req: Request, mut writer: W)
 where
     W: AsyncWriteExt + Unpin + Send,
 {
+    let _span = perf_span!("dispatch::dispatch_streaming");
     let wn = match Whitenoise::get_instance() {
         Ok(wn) => wn,
         Err(e) => {
@@ -564,6 +569,7 @@ async fn messages_subscribe<W>(
 ) where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::messages_subscribe");
     // Validate account and group_id
     let _account = match find_account(wn, account_str).await {
         Ok(a) => a,
@@ -650,6 +656,7 @@ async fn chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_str: &str)
 where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::chats_subscribe");
     let account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
@@ -713,6 +720,7 @@ async fn notifications_subscribe<W>(wn: &Whitenoise, writer: &mut W)
 where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::notifications_subscribe");
     let subscription = wn.subscribe_to_notifications();
 
     let mut updates = subscription.updates;
@@ -758,6 +766,7 @@ async fn users_search<W>(
 ) where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::users_search");
     let account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
@@ -815,6 +824,7 @@ async fn clean_chat_list_item(
     wn: &Whitenoise,
     item: &crate::whitenoise::chat_list::ChatListItem,
 ) -> serde_json::Value {
+    let _span = perf_span!("dispatch::clean_chat_list_item");
     let mut value = serde_json::to_value(item).unwrap_or_default();
     if let Some(last_msg) = value.get_mut("last_message")
         && let Some(obj) = last_msg.as_object_mut()
@@ -844,6 +854,7 @@ async fn find_account(
     wn: &Whitenoise,
     pubkey_str: &str,
 ) -> Result<crate::whitenoise::accounts::Account, Response> {
+    let _span = perf_span!("dispatch::find_account");
     let pk = parse_pubkey(pubkey_str)?;
     let accounts = wn
         .all_accounts()
@@ -856,6 +867,7 @@ async fn find_account(
 }
 
 async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
+    let _span = perf_span!("dispatch::resolve_display_name");
     let user = wn
         .find_or_create_user_by_pubkey(pubkey, UserSyncMode::Blocking)
         .await
@@ -882,6 +894,7 @@ async fn create_group(
     description: Option<String>,
     member_strs: Vec<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::create_group");
     let account = find_account(wn, account_str).await?;
 
     let member_pubkeys: Vec<PublicKey> = member_strs
@@ -913,6 +926,7 @@ async fn add_members(
     group_id_hex: &str,
     member_strs: Vec<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::add_members");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let members: Vec<PublicKey> = member_strs
@@ -932,6 +946,7 @@ async fn get_group(
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::get_group");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let group = wn
@@ -947,6 +962,7 @@ async fn group_pubkey_list(
     group_id_hex: &str,
     admins_only: bool,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::group_pubkey_list");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let pubkeys = if admins_only {
@@ -972,6 +988,7 @@ async fn group_relay_list(
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::group_relay_list");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let relays = wn
@@ -989,6 +1006,7 @@ async fn remove_members(
     group_id_hex: &str,
     member_strs: Vec<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::remove_members");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let members: Vec<PublicKey> = member_strs
@@ -1008,6 +1026,7 @@ async fn leave_group(
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::leave_group");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     wn.leave_group(&account, &group_id)
@@ -1022,6 +1041,7 @@ async fn rename_group(
     group_id_hex: &str,
     name: String,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::rename_group");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let update = NostrGroupDataUpdate::new().name(name);
@@ -1032,6 +1052,7 @@ async fn rename_group(
 }
 
 async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::group_invites");
     let account = find_account(wn, account_str).await?;
     let groups = wn
         .visible_groups(&account)
@@ -1049,6 +1070,7 @@ async fn respond_to_invite(
     group_id_hex: &str,
     accept: bool,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::respond_to_invite");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1068,6 +1090,7 @@ async fn respond_to_invite(
 }
 
 async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::profile_show");
     let account = find_account(wn, account_str).await?;
     let metadata = account
         .metadata(wn)
@@ -1087,6 +1110,7 @@ async fn profile_update(
     nip05: Option<String>,
     lud16: Option<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::profile_update");
     let account = find_account(wn, account_str).await?;
 
     // Read-modify-write: start from current metadata, apply provided fields
@@ -1126,6 +1150,7 @@ async fn profile_update(
 }
 
 async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::follows_list");
     let account = find_account(wn, account_str).await?;
     let users = wn
         .follows(&account)
@@ -1154,6 +1179,7 @@ async fn follows_mutate(
     pubkey_str: &str,
     action: FollowAction,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::follows_mutate");
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
     match action {
@@ -1169,6 +1195,7 @@ async fn follows_check(
     account_str: &str,
     pubkey_str: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::follows_check");
     let account = find_account(wn, account_str).await?;
     let pubkey = parse_pubkey(pubkey_str)?;
     let following = wn
@@ -1179,6 +1206,7 @@ async fn follows_check(
 }
 
 async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::chats_list");
     let account = find_account(wn, account_str).await?;
     let items = wn
         .get_chat_list(&account)
@@ -1197,6 +1225,7 @@ async fn archive_chat(
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::archive_chat");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     wn.archive_chat(&account, &group_id)
@@ -1210,6 +1239,7 @@ async fn unarchive_chat(
     account_str: &str,
     group_id_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::unarchive_chat");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     wn.unarchive_chat(&account, &group_id)
@@ -1219,6 +1249,7 @@ async fn unarchive_chat(
 }
 
 async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::archived_chats_list");
     let account = find_account(wn, account_str).await?;
     let items = wn
         .get_archived_chat_list(&account)
@@ -1236,6 +1267,7 @@ async fn archived_chats_subscribe<W>(wn: &Whitenoise, writer: &mut W, account_st
 where
     W: AsyncWriteExt + Unpin,
 {
+    let _span = perf_span!("dispatch::archived_chats_subscribe");
     let account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
@@ -1296,6 +1328,7 @@ where
 }
 
 async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::settings_theme");
     let theme: ThemeMode = theme_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_theme_mode(theme)
         .await
@@ -1304,6 +1337,7 @@ async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Re
 }
 
 async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::settings_language");
     let language: Language = lang_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_language(language)
         .await
@@ -1325,6 +1359,7 @@ async fn relays_list(
     account_str: &str,
     type_filter: Option<&str>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::relays_list");
     let account = find_account(wn, account_str).await?;
 
     let types_to_query = match type_filter {
@@ -1380,6 +1415,7 @@ async fn relays_add(
     url_str: &str,
     type_str: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::relays_add");
     let account = find_account(wn, account_str).await?;
     let relay_type = parse_relay_type(type_str)?;
     let relay_url = parse_relay_url(url_str)?;
@@ -1405,6 +1441,7 @@ async fn relays_remove(
     url_str: &str,
     type_str: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::relays_remove");
     let account = find_account(wn, account_str).await?;
     let relay_type = parse_relay_type(type_str)?;
     let relay_url = parse_relay_url(url_str)?;
@@ -1428,6 +1465,7 @@ async fn relays_remove(
 }
 
 async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::users_show");
     let pk = parse_pubkey(pubkey_str)?;
     let user = wn
         .find_or_create_user_by_pubkey(&pk, UserSyncMode::Blocking)
@@ -1442,6 +1480,7 @@ async fn resolve_chat_display_names(
     wn: &Whitenoise,
     messages: &[crate::whitenoise::message_aggregator::ChatMessage],
 ) -> HashMap<PublicKey, String> {
+    let _span = perf_span!("dispatch::resolve_chat_display_names");
     let unique_pubkeys: Vec<PublicKey> = {
         let mut seen = std::collections::HashSet::new();
         for m in messages {
@@ -1543,6 +1582,7 @@ async fn list_messages(
     before_message_id: Option<&str>,
     limit: Option<u32>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::list_messages");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let before_ts = before.map(Timestamp::from);
@@ -1574,6 +1614,7 @@ async fn send_message(
     message: String,
     reply_to: Option<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::send_message");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1600,6 +1641,7 @@ async fn delete_message(
     group_id_hex: &str,
     message_id: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::delete_message");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1620,6 +1662,7 @@ async fn retry_message(
     group_id_hex: &str,
     event_id_str: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::retry_message");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let event_id = nostr_sdk::EventId::from_hex(event_id_str)
@@ -1639,6 +1682,7 @@ async fn react_to_message(
     message_id: &str,
     emoji: String,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::react_to_message");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1659,6 +1703,7 @@ async fn unreact_to_message(
     group_id_hex: &str,
     message_id: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::unreact_to_message");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1702,6 +1747,7 @@ async fn upload_media(
     send: bool,
     message: Option<String>,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::upload_media");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1781,6 +1827,7 @@ async fn download_media(
     group_id_hex: &str,
     file_hash_hex: &str,
 ) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::download_media");
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -1800,6 +1847,7 @@ async fn download_media(
 }
 
 async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
+    let _span = perf_span!("dispatch::list_media");
     let group_id = parse_group_id(group_id_hex)?;
 
     let files = wn

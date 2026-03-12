@@ -763,6 +763,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<bool> {
+        let _span = perf_span!("db::aggregated_msg_has_delivery_status");
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM message_delivery_status
              WHERE message_id = ? AND mls_group_id = ?)",
@@ -783,6 +784,7 @@ impl AggregatedMessage {
 
     /// Delete ALL cached events for a group
     pub async fn delete_by_group(group_id: &GroupId, database: &Database) -> Result<()> {
+        let _span = perf_span!("db::aggregated_msg_delete_by_group");
         sqlx::query("DELETE FROM aggregated_messages WHERE mls_group_id = ?")
             .bind(group_id.as_slice())
             .execute(&database.pool)
@@ -796,6 +798,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<ChatMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_by_id");
         let row: Option<AggregatedMessageRow> = sqlx::query_as(
             "SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
@@ -817,6 +820,7 @@ impl AggregatedMessage {
         message_id: &EventId,
         database: &Database,
     ) -> Result<Option<AggregatedMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_by_message_id");
         let row: Option<AggregatedMessageRow> =
             sqlx::query_as("SELECT * FROM aggregated_messages WHERE message_id = ? AND kind = 9")
                 .bind(message_id.to_hex())
@@ -963,6 +967,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<AggregatedMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_reaction_by_id");
         let row: Option<AggregatedMessageRow> = sqlx::query_as(
             "SELECT * FROM aggregated_messages
              WHERE message_id = ? AND mls_group_id = ? AND kind = 7
@@ -985,6 +990,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<AggregatedMessage>> {
+        let _span = perf_span!("db::aggregated_msg_find_orphaned_reactions");
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "SELECT am.* FROM aggregated_messages am
              WHERE am.kind = 7
@@ -1016,6 +1022,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<EventId>> {
+        let _span = perf_span!("db::aggregated_msg_find_orphaned_deletions");
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT am.message_id FROM aggregated_messages am
              WHERE am.kind = 5

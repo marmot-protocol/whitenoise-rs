@@ -31,6 +31,7 @@ impl Whitenoise {
         fallback_account: &Account,
         context: &'static str,
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("groups::resolve_member_delivery_relays");
         let inbox_relays = member.relays(RelayType::Inbox, &self.database).await?;
         if !inbox_relays.is_empty() {
             return Ok(inbox_relays);
@@ -272,6 +273,7 @@ impl Whitenoise {
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
+        let _span = perf_span!("groups::groups");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups: Vec<group_types::Group> = mdk
             .get_groups()
@@ -387,6 +389,7 @@ impl Whitenoise {
     /// * `Err(WhitenoiseError::GroupNotFound)` - If the group doesn't exist
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
+        let _span = perf_span!("groups::group");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let group = mdk
             .get_group(group_id)
@@ -401,6 +404,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
+        let _span = perf_span!("groups::group_members");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_members(group_id)
@@ -414,6 +418,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<BTreeSet<RelayUrl>> {
+        let _span = perf_span!("groups::group_relays");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         mdk.get_relays(group_id).map_err(WhitenoiseError::from)
     }
@@ -423,6 +428,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
+        let _span = perf_span!("groups::group_admins");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_group(group_id)
@@ -438,6 +444,7 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
+        let _span = perf_span!("groups::ensure_account_is_group_admin");
         let admins = self.group_admins(account, group_id).await?;
         if !admins.contains(&account.pubkey) {
             return Err(WhitenoiseError::AccountNotAuthorized);

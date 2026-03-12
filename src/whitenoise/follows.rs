@@ -65,6 +65,7 @@ impl Whitenoise {
     /// * `account` - The account to check (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to check if followed
     pub async fn is_following_user(&self, account: &Account, pubkey: &PublicKey) -> Result<bool> {
+        let _span = perf_span!("follows::is_following_user_check");
         let user = self.find_user_by_pubkey(pubkey).await;
         if user.is_err() {
             return Ok(false);
@@ -84,6 +85,7 @@ impl Whitenoise {
     ///
     /// * `account` - The account whose follows to retrieve (must exist in database with valid ID)
     pub async fn follows(&self, account: &Account) -> Result<Vec<User>> {
+        let _span = perf_span!("follows::get_follows");
         account.follows(&self.database).await
     }
 }

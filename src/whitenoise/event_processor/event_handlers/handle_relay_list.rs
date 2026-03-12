@@ -62,6 +62,7 @@ impl Whitenoise {
     }
 
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
+        let _span = perf_span!("event_handlers::handle_subscriptions_refresh");
         let user_pubkey = user.pubkey;
         let event_pubkey = event.pubkey;
 

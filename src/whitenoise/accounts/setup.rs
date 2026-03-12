@@ -20,6 +20,7 @@ impl Whitenoise {
         &self,
         keys: &Keys,
     ) -> Result<Account> {
+        let _span = perf_span!("accounts::create_base_account_with_private_key");
         let (account, _keys) = Account::new(self, Some(keys.clone())).await?;
 
         self.secrets_store.store_private_key(keys).map_err(|e| {
@@ -73,6 +74,7 @@ impl Whitenoise {
         user: &User,
         inbox_relays: &[Relay],
     ) -> Result<()> {
+        let _span = perf_span!("accounts::activate_account_without_publishing");
         let (cancel_tx, _) = tokio::sync::watch::channel(false);
         self.background_task_cancellation
             .insert(account.pubkey, cancel_tx);
@@ -98,6 +100,7 @@ impl Whitenoise {
     }
 
     pub(super) async fn persist_account(&self, account: &Account) -> Result<Account> {
+        let _span = perf_span!("accounts::persist_account");
         let saved_account = account.save(&self.database).await.map_err(|e| {
             tracing::error!(target: "whitenoise::accounts", "Failed to save account: {}", e);
             // Try to clean up stored private key
@@ -167,6 +170,7 @@ impl Whitenoise {
     /// Checks whether a key package event was published by this Whitenoise instance
     /// and still has live local key material.
     async fn is_own_key_package(&self, pubkey: &PublicKey, event_id: &EventId) -> bool {
+        let _span = perf_span!("accounts::is_own_key_package");
         match PublishedKeyPackage::find_by_event_id(pubkey, &event_id.to_hex(), &self.database)
             .await
         {
@@ -185,6 +189,7 @@ impl Whitenoise {
     }
 
     pub(super) async fn load_default_relays(&self) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::load_default_relays");
         let mut default_relays = Vec::new();
         for Relay { url, .. } in Relay::defaults() {
             let relay = self.find_or_create_relay_by_url(&url).await?;
@@ -207,6 +212,7 @@ impl Whitenoise {
         account: &mut Account,
         user: &User,
     ) -> Result<Vec<Relay>> {
+        let _span = perf_span!("accounts::setup_relays_for_new_account");
         let default_relays = self.load_default_relays().await?;
 
         user.add_relays(&default_relays, RelayType::Nip65, &self.database)
@@ -242,6 +248,7 @@ impl Whitenoise {
         &self,
         account: &mut Account,
     ) -> Result<(Vec<Relay>, Vec<Relay>, Vec<Relay>)> {
+        let _span = perf_span!("accounts::setup_relays_for_existing_account");
         let default_relays = self.load_default_relays().await?;
         let signer = self.get_signer_for_account(account)?;
 
@@ -334,6 +341,7 @@ impl Whitenoise {
         &self,
         account: &mut Account,
     ) -> Result<ExternalSignerRelaySetup> {
+        let _span = perf_span!("accounts::setup_relays_for_external_signer_account");
         let default_relays = self.load_default_relays().await?;
 
         // NIP-65 must be fetched first because Inbox and KeyPackage use the
@@ -387,6 +395,7 @@ impl Whitenoise {
         source_relays: &[Relay],
         default_relays: &[Relay],
     ) -> Result<(Vec<Relay>, bool)> {
+        let _span = perf_span!("accounts::setup_external_account_relay_type");
         // Try to fetch existing relay lists first
         let fetched_relays = self
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
@@ -415,6 +424,7 @@ impl Whitenoise {
         source_relays: &[Relay],
         default_relays: &[Relay],
     ) -> Result<(Vec<Relay>, bool)> {
+        let _span = perf_span!("accounts::setup_existing_account_relay_type");
         // Existing accounts: try to fetch existing relay lists first
         let fetched_relays = self
             .fetch_existing_relays(account.pubkey, relay_type, source_relays)
@@ -442,6 +452,7 @@ impl Whitenoise {
         relay_type: RelayType,
         source_relays: &[Relay],
     ) -> Result<Option<Vec<Relay>>> {
+        let _span = perf_span!("accounts::fetch_existing_relays");
         let source_relay_urls = Relay::urls(source_relays);
         if source_relay_urls.is_empty() {
             return Ok(None);
@@ -474,6 +485,7 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::add_relays_to_account");
         if relays.is_empty() {
             return Ok(());
         }
@@ -500,6 +512,7 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::sync_account_relays");
         let user = account.user(&self.database).await?;
         let relay_urls = Relay::urls(relays).into_iter().collect::<HashSet<_>>();
         user.sync_relay_urls(self, relay_type, &relay_urls, None)
@@ -517,6 +530,7 @@ impl Whitenoise {
     where
         S: NostrSigner + 'static,
     {
+        let _span = perf_span!("accounts::publish_relay_list");
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
         self.relay_control
@@ -534,6 +548,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::background_publish_account_metadata");
         let account_clone = account.clone();
         let ephemeral = self.relay_control.ephemeral();
         let signer = self.get_signer_for_account(account)?;
@@ -568,6 +583,7 @@ impl Whitenoise {
         relay_type: RelayType,
         relays: Option<&[Relay]>,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::background_publish_account_relay_list");
         let account_clone = account.clone();
         let ephemeral = self.relay_control.ephemeral();
         let relays = if let Some(relays) = relays {
@@ -607,6 +623,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::background_publish_account_follow_list");
         let account_clone = account.clone();
         let ephemeral = self.relay_control.ephemeral();
         let relays = account.nip65_relays(self).await?;
@@ -633,6 +650,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<GroupSubscriptionSpec>> {
+        let _span = perf_span!("accounts::extract_group_subscription_specs");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
         let mut group_specs = Vec::with_capacity(groups.len());
@@ -656,6 +674,7 @@ impl Whitenoise {
         account: &Account,
         cancel_rx: Option<&watch::Receiver<bool>>,
     ) -> Result<()> {
+        let _span = perf_span!("accounts::refresh_account_group_subscriptions_with_cancel");
         if Self::is_background_task_cancelled(cancel_rx) {
             tracing::debug!(
                 target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
@@ -821,6 +840,7 @@ impl Whitenoise {
     ///
     /// * `account` - The account to refresh subscriptions for
     pub(crate) async fn refresh_account_subscriptions(&self, account: &Account) -> Result<()> {
+        let _span = perf_span!("accounts::refresh_account_subscriptions");
         tracing::debug!(
             target: "whitenoise::accounts",
             "Refreshing account subscriptions for account: {:?}",
@@ -861,6 +881,7 @@ impl Whitenoise {
     }
 
     async fn warm_ephemeral_account_relays(&self, account: &Account) -> Result<()> {
+        let _span = perf_span!("accounts::warm_ephemeral_account_relays");
         let warm_relays = match self.account_ephemeral_warm_relay_urls(account).await {
             Ok(warm_relays) => warm_relays,
             Err(error) => {
@@ -907,6 +928,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<RelayUrl>> {
+        let _span = perf_span!("accounts::account_ephemeral_warm_relay_urls");
         let mut warm_relays: HashSet<RelayUrl> = HashSet::new();
         warm_relays.extend(Relay::urls(&account.nip65_relays(self).await?));
         warm_relays.extend(Relay::urls(&account.key_package_relays(self).await?));

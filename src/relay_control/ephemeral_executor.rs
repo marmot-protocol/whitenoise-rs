@@ -126,6 +126,7 @@ impl EphemeralExecutor {
 
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn remove_all_account_scopes(&self) {
+        let _span = perf_span!("relay::ephemeral_remove_all_account_scopes");
         let account_keys = self
             .sessions
             .read()

@@ -9,6 +9,7 @@ use super::{
         serialize_optional_public_key,
     },
 };
+use crate::perf_span;
 use crate::relay_control::{
     RelayPlane,
     observability::{RelayFailureCategory, RelayTelemetry, RelayTelemetryKind},
@@ -113,6 +114,7 @@ impl RelayStatusRecord {
         account_pubkey: Option<PublicKey>,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
+        let _span = perf_span!("db::relay_status_find");
         let record = match account_pubkey {
             Some(account_pubkey) => {
                 sqlx::query_as::<_, Self>(
@@ -182,6 +184,7 @@ impl RelayStatusRecord {
         lookup_keys: &[RelayStatusLookupKey],
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
+        let _span = perf_span!("db::relay_status_find_many");
         if lookup_keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -246,6 +249,7 @@ impl RelayStatusRecord {
         telemetry: &RelayTelemetry,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::relay_status_upsert_from_telemetry");
         // Compute per-event deltas rather than read-modify-write, so two concurrent
         // persistors cannot race and both write `success_count = 1` from a read of 0.
         let (success_delta, failure_delta) = match telemetry.kind {

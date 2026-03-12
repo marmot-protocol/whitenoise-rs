@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
+    perf_span,
     types::{DiscoveryPlaneStateSnapshot, ProcessableEvent},
 };
 
@@ -93,6 +94,7 @@ impl DiscoveryPlane {
     }
 
     pub(crate) async fn start(&self) -> Result<()> {
+        let _span = perf_span!("relay::discovery_start");
         self.session
             .ensure_relays_connected(&self.config.relays)
             .await
@@ -104,6 +106,7 @@ impl DiscoveryPlane {
         follow_list_accounts: &[(PublicKey, Option<Timestamp>)],
         public_since: Option<Timestamp>,
     ) -> Result<()> {
+        let _span = perf_span!("relay::discovery_sync");
         // Short-circuit: no relays configured — retire any existing subscriptions.
         if self.config.relays.is_empty() {
             let stale = {
@@ -271,6 +274,7 @@ impl DiscoveryPlane {
         filter: Filter,
         timeout: std::time::Duration,
     ) -> Result<Events> {
+        let _span = perf_span!("relay::discovery_fetch_events");
         if !self
             .session
             .has_any_relay_connected(&self.config.relays)

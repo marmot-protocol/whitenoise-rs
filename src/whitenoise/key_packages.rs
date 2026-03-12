@@ -226,6 +226,7 @@ impl Whitenoise {
     /// package is created only once to avoid orphaning unused key material in
     /// local MLS storage.
     pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
+        let _span = perf_span!("key_packages::publish_for_account");
         let relays = account.key_package_relays(self).await?;
 
         if relays.is_empty() {
@@ -295,6 +296,7 @@ impl Whitenoise {
         account: &Account,
         signer: impl NostrSigner + 'static,
     ) -> Result<()> {
+        let _span = perf_span!("key_packages::publish_for_account_with_signer");
         let relays = account.key_package_relays(self).await?;
 
         if relays.is_empty() {
@@ -380,6 +382,7 @@ impl Whitenoise {
         hash_ref: &[u8],
         event_id: &EventId,
     ) {
+        let _span = perf_span!("key_packages::track_published");
         if let Err(e) = PublishedKeyPackage::create(
             &account.pubkey,
             hash_ref,
@@ -409,6 +412,7 @@ impl Whitenoise {
         event_id: &EventId,
         delete_mls_stored_keys: bool,
     ) -> Result<bool> {
+        let _span = perf_span!("key_packages::delete_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_key_package_for_account_internal(
             account,
@@ -433,6 +437,7 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<bool> {
+        let _span = perf_span!("key_packages::delete_for_account_with_signer");
         self.delete_key_package_for_account_internal(
             account,
             event_id,
@@ -449,6 +454,7 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
+        let _span = perf_span!("key_packages::delete_for_account_internal");
         // Delete local MLS key material using the hash_ref stored at publish time.
         // This avoids a relay round-trip to fetch and parse the key package event.
         if delete_mls_stored_keys {
@@ -537,6 +543,7 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<Vec<Event>> {
+        let _span = perf_span!("key_packages::fetch_all_for_account");
         let key_package_relays = account.key_package_relays(self).await?;
         let relay_urls: Vec<RelayUrl> = Relay::urls(&key_package_relays);
 
@@ -614,6 +621,7 @@ impl Whitenoise {
         account: &Account,
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
+        let _span = perf_span!("key_packages::delete_all_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
             .await
@@ -640,6 +648,7 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
+        let _span = perf_span!("key_packages::delete_all_with_signer");
         self.delete_all_key_packages_loop(
             account,
             delete_mls_stored_keys,
@@ -658,6 +667,7 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
+        let _span = perf_span!("key_packages::delete_all_loop");
         let mut total_deleted = 0;
 
         for round in 0..MAX_DELETE_ROUNDS {
@@ -740,6 +750,7 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         max_retries: u32,
     ) -> Result<usize> {
+        let _span = perf_span!("key_packages::delete_batch_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_key_packages_for_account_internal(
             account,
@@ -759,6 +770,7 @@ impl Whitenoise {
         max_retries: u32,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
+        let _span = perf_span!("key_packages::delete_batch_internal");
         if key_package_events.is_empty() {
             tracing::debug!(
                 target: "whitenoise::key_packages",
@@ -847,6 +859,7 @@ impl Whitenoise {
     }
 
     async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
+        let _span = perf_span!("key_packages::prepare_relay_urls");
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
@@ -906,6 +919,7 @@ impl Whitenoise {
         signer: std::sync::Arc<dyn NostrSigner>,
         context: &str,
     ) -> Result<()> {
+        let _span = perf_span!("key_packages::publish_deletion_with_signer");
         match self
             .relay_control
             .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)

@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::EventId;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
+use crate::perf_span;
 
 /// Row structure for published_events table
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -45,6 +46,7 @@ impl PublishedEvent {
         account_id: i64,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::published_event_create");
         sqlx::query("INSERT OR IGNORE INTO published_events (event_id, account_id) VALUES (?, ?)")
             .bind(event_id.to_hex())
             .bind(account_id)
@@ -68,6 +70,7 @@ impl PublishedEvent {
         account_id: Option<i64>,
         database: &Database,
     ) -> Result<bool, DatabaseError> {
+        let _span = perf_span!("db::published_event_exists");
         let result = if let Some(account_id) = account_id {
             sqlx::query_as::<_, (i64,)>(
                 "SELECT EXISTS(SELECT 1 FROM published_events WHERE event_id = ? AND account_id = ?)",

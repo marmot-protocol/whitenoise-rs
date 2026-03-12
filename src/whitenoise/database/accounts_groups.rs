@@ -6,6 +6,7 @@ use super::{
     Database,
     utils::{parse_optional_timestamp, parse_timestamp},
 };
+use crate::perf_span;
 use crate::whitenoise::accounts_groups::AccountGroup;
 
 /// Internal database row representation for accounts_groups table
@@ -143,6 +144,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_by_account_and_group");
         let row = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -168,6 +170,7 @@ impl AccountGroup {
         dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<(Self, bool), sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_or_create");
         // Try to create first - this handles the race condition properly
         match Self::create(account_pubkey, mls_group_id, None, dm_peer_pubkey, database).await {
             Ok(created) => Ok((created, true)),
@@ -191,6 +194,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_visible_for_account");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -209,6 +213,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_pending_for_account");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -226,6 +231,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_by_group");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -244,6 +250,7 @@ impl AccountGroup {
         user_confirmation: bool,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_update_user_confirmation");
         let id = self.id.expect("AccountGroup must be persisted");
 
         let now_ms = Utc::now().timestamp_millis();
@@ -269,6 +276,7 @@ impl AccountGroup {
     /// - If the record doesn't exist, inserts it
     /// - If it exists, updates all mutable fields to match the provided values
     pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_save");
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
@@ -310,6 +318,7 @@ impl AccountGroup {
         pin_order: Option<i64>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_update_pin_order");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -334,6 +343,7 @@ impl AccountGroup {
         archived_at: Option<DateTime<Utc>>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_update_archived_at");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -365,6 +375,7 @@ impl AccountGroup {
         message_created_at_ms: i64,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_update_last_read_if_newer");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -406,6 +417,7 @@ impl AccountGroup {
         peer_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Option<GroupId>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_dm_group_id_by_peer");
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT ag.mls_group_id
              FROM accounts_groups ag
@@ -431,6 +443,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<(GroupId, PublicKey)>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_dm_peers_for_account");
         let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
             "SELECT ag.mls_group_id, ag.dm_peer_pubkey
              FROM accounts_groups ag
@@ -468,6 +481,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<GroupId>, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_find_dm_groups_missing_peer");
         let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
             "SELECT ag.mls_group_id
              FROM accounts_groups ag
@@ -496,6 +510,7 @@ impl AccountGroup {
         dm_peer_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<(), sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_update_dm_peer_pubkey");
         sqlx::query(
             "UPDATE accounts_groups
              SET dm_peer_pubkey = ?, updated_at = ?
@@ -519,6 +534,7 @@ impl AccountGroup {
         dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::accounts_groups_create");
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(

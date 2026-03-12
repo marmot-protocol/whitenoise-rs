@@ -202,6 +202,7 @@ impl<'a> MediaFiles<'a> {
         file_path: &Path,
         upload: MediaFileUpload<'_>,
     ) -> Result<MediaFile> {
+        let _span = perf_span!("media_files::record_in_database");
         let media_file = MediaFile::save(
             self.database,
             group_id,
@@ -234,6 +235,7 @@ impl<'a> MediaFiles<'a> {
     /// # Returns
     /// The path to the first matching file, if any
     pub(crate) async fn find_file_with_prefix(&self, prefix: &str) -> Option<PathBuf> {
+        let _span = perf_span!("media_files::find_file_with_prefix");
         self.storage.media_files.find_file_with_prefix(prefix).await
     }
 

@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
+    WhitenoiseError, perf_span,
     whitenoise::{
         accounts::{Account, AccountType},
         database::users::UserRow,
@@ -108,6 +108,7 @@ impl Account {
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
     pub(crate) async fn all(database: &Database) -> Result<Vec<Account>, WhitenoiseError> {
+        let _span = perf_span!("db::account_all");
         let account_rows = sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts")
             .fetch_all(&database.pool)
             .await
@@ -164,6 +165,7 @@ impl Account {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Account, WhitenoiseError> {
+        let _span = perf_span!("db::account_find_by_pubkey");
         let account_row =
             sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE pubkey = ?")
                 .bind(pubkey.to_hex().as_str())
@@ -196,6 +198,7 @@ impl Account {
     ///
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the associated user is not found.
     pub(crate) async fn user(&self, database: &Database) -> Result<User, WhitenoiseError> {
+        let _span = perf_span!("db::account_user");
         let user_row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = ?")
             .bind(self.user_id)
             .fetch_one(&database.pool)
@@ -218,6 +221,7 @@ impl Account {
     ///
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the database query fails.
     pub(crate) async fn follows(&self, database: &Database) -> Result<Vec<User>, WhitenoiseError> {
+        let _span = perf_span!("db::account_follows");
         let user_rows = sqlx::query_as::<_, UserRow>(
             "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.updated_at
              FROM account_follows af
@@ -262,6 +266,7 @@ impl Account {
         user: &User,
         database: &Database,
     ) -> Result<bool, WhitenoiseError> {
+        let _span = perf_span!("db::account_is_following_user");
         let result = sqlx::query(
             "SELECT COUNT(*) FROM account_follows WHERE account_id = ? AND user_id = ?",
         )
@@ -292,6 +297,7 @@ impl Account {
         user: &User,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::account_follow_user");
         sqlx::query("INSERT INTO account_follows (account_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(account_id, user_id) DO UPDATE SET updated_at = ?")
             .bind(self.id)
             .bind(user.id)
@@ -323,6 +329,7 @@ impl Account {
         user: &User,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::account_unfollow_user");
         sqlx::query("DELETE FROM account_follows WHERE account_id = ? AND user_id = ?")
             .bind(self.id)
             .bind(user.id)

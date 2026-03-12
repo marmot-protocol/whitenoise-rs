@@ -5,7 +5,7 @@ use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
+    WhitenoiseError, perf_span,
     whitenoise::{
         relays::{Relay, RelayType},
         users::User,
@@ -136,6 +136,7 @@ impl User {
     pub(crate) async fn all_pubkeys(
         database: &Database,
     ) -> Result<Vec<PublicKey>, WhitenoiseError> {
+        let _span = perf_span!("db::user_all_pubkeys");
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT pubkey
              FROM users
@@ -170,6 +171,7 @@ impl User {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<(User, bool), WhitenoiseError> {
+        let _span = perf_span!("db::user_find_or_create_by_pubkey");
         match User::find_by_pubkey(pubkey, database).await {
             Ok(user) => Ok((user, false)),
             Err(WhitenoiseError::UserNotFound) => {
@@ -309,7 +311,10 @@ impl User {
     /// Use this to record "we checked this user's metadata" even when no new
     /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
     /// for empty-profile users.
-    pub(crate) async fn touch_updated_at(&self, database: &Database) -> Result<(), WhitenoiseError> {
+    pub(crate) async fn touch_updated_at(
+        &self,
+        database: &Database,
+    ) -> Result<(), WhitenoiseError> {
         let current_time = Utc::now().timestamp_millis();
         sqlx::query("UPDATE users SET updated_at = ? WHERE pubkey = ?")
             .bind(current_time)

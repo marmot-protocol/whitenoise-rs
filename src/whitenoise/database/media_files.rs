@@ -6,6 +6,7 @@ use sqlx::types::Json;
 use std::path::{Path, PathBuf};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
+use crate::perf_span;
 use crate::whitenoise::error::WhitenoiseError;
 
 /// Optional metadata for media files stored as JSONB
@@ -214,6 +215,7 @@ impl MediaFile {
         database: &Database,
         encrypted_file_hash: &[u8; 32],
     ) -> Result<Option<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::media_file_find_by_hash");
         let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
 
         let row_opt = sqlx::query_as::<_, MediaFileRow>(
@@ -255,6 +257,7 @@ impl MediaFile {
         account_pubkey: &PublicKey,
         params: MediaFileParams<'_>,
     ) -> Result<Self, WhitenoiseError> {
+        let _span = perf_span!("db::media_file_save");
         let now_ms = chrono::Utc::now().timestamp_millis();
         let encrypted_file_hash_hex = hex::encode(params.encrypted_file_hash);
         let original_file_hash_hex = params.original_file_hash.map(hex::encode);
@@ -337,6 +340,7 @@ impl MediaFile {
         database: &Database,
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::media_file_find_by_group");
         let rows = sqlx::query_as::<_, MediaFileRow>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
@@ -390,6 +394,7 @@ impl MediaFile {
         group_id: &GroupId,
         account_pubkey: &PublicKey,
     ) -> Result<Option<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::media_file_find_by_original_hash_and_group");
         let hash_hex = hex::encode(original_file_hash);
         let account_hex = account_pubkey.to_hex();
 
@@ -438,6 +443,7 @@ impl MediaFile {
         id: i64,
         new_path: &Path,
     ) -> Result<Self, WhitenoiseError> {
+        let _span = perf_span!("db::media_file_update_file_path");
         let path_str = new_path
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;

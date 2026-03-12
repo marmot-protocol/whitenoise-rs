@@ -1,6 +1,7 @@
 use nostr_sdk::PublicKey;
 
 use super::{Database, DatabaseError};
+use crate::perf_span;
 
 /// Represents a published key package tracked for lifecycle management.
 ///
@@ -86,6 +87,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::published_key_package_create");
         sqlx::query(
             "INSERT OR IGNORE INTO published_key_packages (account_pubkey, key_package_hash_ref, event_id)
              VALUES (?, ?, ?)",
@@ -114,6 +116,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
+        let _span = perf_span!("db::published_key_package_find_by_event_id");
         let row = sqlx::query_as::<_, PublishedKeyPackageRow>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
@@ -139,6 +142,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<bool, DatabaseError> {
+        let _span = perf_span!("db::published_key_package_mark_consumed");
         let result = sqlx::query(
             "UPDATE published_key_packages
              SET consumed_at = unixepoch()
@@ -164,6 +168,7 @@ impl PublishedKeyPackage {
         quiet_period_secs: i64,
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
+        let _span = perf_span!("db::published_key_package_find_eligible_for_cleanup");
         let rows = sqlx::query_as::<_, PublishedKeyPackageRow>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
@@ -195,6 +200,7 @@ impl PublishedKeyPackage {
         id: i64,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::published_key_package_mark_key_material_deleted");
         sqlx::query("UPDATE published_key_packages SET key_material_deleted = 1 WHERE id = ?")
             .bind(id)
             .execute(&database.pool)
