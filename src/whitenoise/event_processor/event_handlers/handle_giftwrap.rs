@@ -131,12 +131,12 @@ impl Whitenoise {
             }
             Ok(Some(_)) => {} // Good — KP exists, key material available
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     target: "whitenoise::event_processor::process_welcome",
-                    "Failed to look up key package: {}, proceeding anyway",
+                    "Failed to look up key package: {}, rejecting Welcome",
                     e
                 );
-                // Don't block on DB lookup failure — fall through to MLS
+                return Err(e.into());
             }
         }
 
