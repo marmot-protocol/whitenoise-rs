@@ -148,9 +148,10 @@ impl WhitenoiseEventTracker {
             return Ok(*id);
         }
         let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = account.id.ok_or_else(|| {
+            Box::new(crate::WhitenoiseError::ResolveAccountId)
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
         self.account_id_cache.insert(*pubkey, account_id);
         Ok(account_id)
     }
@@ -502,6 +503,29 @@ mod tests {
                 .track_processed_account_event(&event, &event.pubkey)
                 .await;
             assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn resolve_account_id_uses_cache_on_second_call() {
+            let (database, _temp_dir) = create_test_database().await;
+            let keys = Keys::generate();
+            create_test_account(&database, &keys.public_key()).await;
+
+            let tracker = WhitenoiseEventTracker::new(database.clone());
+
+            // First call populates the cache
+            let id1 = tracker.resolve_account_id(&keys.public_key()).await.unwrap();
+
+            // Remove the account from the DB so only the cache can serve it
+            sqlx::query("DELETE FROM accounts WHERE pubkey = ?")
+                .bind(keys.public_key().to_hex())
+                .execute(&database.pool)
+                .await
+                .unwrap();
+
+            // Second call should succeed via cache
+            let id2 = tracker.resolve_account_id(&keys.public_key()).await.unwrap();
+            assert_eq!(id1, id2);
         }
 
         #[tokio::test]

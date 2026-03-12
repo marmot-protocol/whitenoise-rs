@@ -4,14 +4,19 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::EnvFilter, fmt::Layer, prelude::*, registry::Registry};
 
 #[cfg(feature = "benchmark-tests")]
+use tracing_subscriber::filter::LevelFilter;
+
+#[cfg(feature = "benchmark-tests")]
 use crate::integration_tests::benchmarks::PerfTracingLayer;
 
 mod nostr_manager;
 pub mod perf;
 pub(crate) mod relay_control;
 
-// Re-export proc macro for ergonomic `#[perf_instrument("prefix")]` usage
-pub use whitenoise_macros::perf_instrument;
+// Re-export proc macro for ergonomic `#[perf_instrument("prefix")]` usage.
+// Crate-private because the macro expands to `crate::perf_span!(...)` which
+// only resolves inside this crate.
+pub(crate) use whitenoise_macros::perf_instrument;
 mod types;
 pub mod whitenoise;
 
@@ -99,8 +104,6 @@ fn init_tracing(logs_dir: &std::path::Path) {
 /// Only available when the `benchmark-tests` feature is enabled.
 #[cfg(feature = "benchmark-tests")]
 pub fn init_tracing_with_perf_layer(logs_dir: &std::path::Path, perf_layer: PerfTracingLayer) {
-    use tracing_subscriber::filter::LevelFilter;
-
     TRACING_INIT.get_or_init(|| {
         let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
             .rotation(tracing_appender::rolling::Rotation::DAILY)

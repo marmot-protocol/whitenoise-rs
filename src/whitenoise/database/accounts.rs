@@ -207,7 +207,7 @@ impl Account {
             .fetch_one(&database.pool)
             .await
             .map_err(|e| match e {
-                sqlx::Error::RowNotFound => WhitenoiseError::AccountNotFound,
+                sqlx::Error::RowNotFound => WhitenoiseError::MissingUserReference,
                 other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
             })?;
         Ok(user_row.into())

@@ -26,7 +26,7 @@ impl Whitenoise {
     /// Emit a notification for a new message.
     /// Filters out messages from any of the user's own accounts and
     /// suppresses notifications for groups the user has not yet accepted.
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     pub(crate) async fn emit_new_message_notification(
         &self,
         account: &Account,
@@ -75,7 +75,7 @@ impl Whitenoise {
         self.notification_stream_manager.emit(update);
     }
 
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     pub(crate) async fn emit_group_invite_notification(
         &self,
         account: &Account,
@@ -113,7 +113,7 @@ impl Whitenoise {
     /// Emits a new-message notification only if notifications are enabled for the account.
     ///
     /// Fail-open: if the settings lookup fails, defaults to enabled and logs a warning.
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     pub(crate) async fn emit_new_message_notification_if_enabled(
         &self,
         account: &Account,
@@ -131,7 +131,7 @@ impl Whitenoise {
     /// Emits a group-invite notification only if notifications are enabled for the account.
     ///
     /// Fail-open: if the settings lookup fails, defaults to enabled and logs a warning.
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     pub(crate) async fn emit_group_invite_notification_if_enabled(
         &self,
         account: &Account,
@@ -177,7 +177,7 @@ impl Whitenoise {
     }
 
     /// Returns whether notifications are enabled for `account`. Fail-open on error.
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     async fn are_notifications_enabled(&self, account: &Account) -> bool {
         AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
             .await
@@ -192,7 +192,7 @@ impl Whitenoise {
             })
     }
 
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     async fn build_notification_user(&self, pubkey: &PublicKey) -> NotificationUser {
         let user = User::find_by_pubkey(pubkey, &self.database).await.ok();
 
@@ -217,7 +217,7 @@ impl Whitenoise {
 
     /// Returns whether the group has been accepted by the account.
     /// Fail-closed: returns `false` on lookup error to avoid notifying for unknown groups.
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     async fn is_group_accepted(&self, account_pubkey: &PublicKey, group_id: &GroupId) -> bool {
         match AccountGroup::find_by_account_and_group(account_pubkey, group_id, &self.database)
             .await
@@ -236,7 +236,7 @@ impl Whitenoise {
         }
     }
 
-    #[perf_instrument("notifications")]
+    #[perf_instrument("notification_streaming")]
     async fn is_own_account(&self, pubkey: &PublicKey) -> bool {
         Account::find_by_pubkey(pubkey, &self.database)
             .await

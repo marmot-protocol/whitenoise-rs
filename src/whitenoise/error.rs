@@ -51,6 +51,12 @@ pub enum WhitenoiseError {
     #[error("User not found")]
     UserNotFound,
 
+    #[error("Missing user reference: account exists but linked user row is absent (broken FK)")]
+    MissingUserReference,
+
+    #[error("Failed to resolve account ID for pubkey")]
+    ResolveAccountId,
+
     #[error("User not persisted - save the user before performing this operation")]
     UserNotPersisted,
 

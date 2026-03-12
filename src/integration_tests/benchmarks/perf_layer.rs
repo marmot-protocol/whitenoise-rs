@@ -42,6 +42,8 @@ pub struct PerfBreakdown {
     pub marker: String,
     /// Number of observations.
     pub call_count: u64,
+    /// Exact total duration (sum of all samples).
+    pub total_duration: Duration,
     /// Mean duration.
     pub mean: Duration,
     /// Median duration.
@@ -59,6 +61,7 @@ pub struct PerfBreakdown {
 impl PerfBreakdown {
     fn from_samples(marker: String, mut samples: Vec<Duration>) -> Self {
         let call_count = samples.len() as u64;
+        let total_duration: Duration = samples.iter().sum();
         let mean = stats::calculate_mean(&samples);
         let median = stats::calculate_median(&mut samples);
         let p95 = stats::calculate_percentile(&mut samples.clone(), 0.95);
@@ -69,6 +72,7 @@ impl PerfBreakdown {
         Self {
             marker,
             call_count,
+            total_duration,
             mean,
             median,
             p95,
@@ -153,11 +157,7 @@ impl PerfTracingLayer {
             .collect();
 
         // Hottest markers (most total time) first
-        breakdowns.sort_by(|a, b| {
-            let a_total = a.mean * a.call_count as u32;
-            let b_total = b.mean * b.call_count as u32;
-            b_total.cmp(&a_total)
-        });
+        breakdowns.sort_by(|a, b| b.total_duration.cmp(&a.total_duration));
         breakdowns
     }
 
@@ -177,6 +177,10 @@ where
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let target = event.metadata().target();
+
+        if target != PERF_TARGET && target != SQLX_TARGET {
+            return;
+        }
 
         let mut visitor = PerfEventVisitor {
             name: None,

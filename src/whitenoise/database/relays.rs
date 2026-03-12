@@ -104,11 +104,12 @@ impl Relay {
     ) -> Result<Relay, WhitenoiseError> {
         match Relay::find_by_url(url, database).await {
             Ok(relay) => Ok(relay),
-            Err(_) => {
+            Err(WhitenoiseError::RelayNotFound) => {
                 let relay = Relay::new(url);
                 let new_relay = relay.save(database).await?;
                 Ok(new_relay)
             }
+            Err(e) => Err(e),
         }
     }
 
