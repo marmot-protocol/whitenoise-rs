@@ -9,7 +9,7 @@ use nostr_sdk::prelude::*;
 
 pub use crate::whitenoise::database::media_files::MediaFile;
 use crate::{
-    perf_span,
+    perf_instrument,
     whitenoise::{
         database::{
             Database,
@@ -163,6 +163,7 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The MediaFile record from the database
+    #[perf_instrument("media_files")]
     pub(crate) async fn store_and_record(
         &self,
         account_pubkey: &PublicKey,
@@ -170,7 +171,6 @@ impl<'a> MediaFiles<'a> {
         filename: &str,
         upload: MediaFileUpload<'_>,
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media_files::store_and_record");
         // Store file to filesystem (deduplicated by content)
         let file_path = self
             .storage
@@ -195,6 +195,7 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The MediaFile record from the database
+    #[perf_instrument("media_files")]
     pub(crate) async fn record_in_database(
         &self,
         account_pubkey: &PublicKey,
@@ -202,7 +203,6 @@ impl<'a> MediaFiles<'a> {
         file_path: &Path,
         upload: MediaFileUpload<'_>,
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media_files::record_in_database");
         let media_file = MediaFile::save(
             self.database,
             group_id,
@@ -234,8 +234,8 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The path to the first matching file, if any
+    #[perf_instrument("media_files")]
     pub(crate) async fn find_file_with_prefix(&self, prefix: &str) -> Option<PathBuf> {
-        let _span = perf_span!("media_files::find_file_with_prefix");
         self.storage.media_files.find_file_with_prefix(prefix).await
     }
 
@@ -344,13 +344,13 @@ impl<'a> MediaFiles<'a> {
     /// # Returns
     /// * `Ok(())` - All references stored successfully
     /// * `Err(WhitenoiseError)` - Database error
+    #[perf_instrument("media_files")]
     pub(crate) async fn store_parsed_media_references(
         &self,
         group_id: &GroupId,
         account_pubkey: &PublicKey,
         parsed_references: Vec<ParsedMediaReference>,
     ) -> Result<()> {
-        let _span = perf_span!("media_files::store_parsed_references");
         for parsed in parsed_references {
             let reference = parsed.reference;
             let encrypted_hash = parsed.encrypted_hash;

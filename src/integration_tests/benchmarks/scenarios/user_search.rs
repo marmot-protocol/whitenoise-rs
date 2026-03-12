@@ -93,9 +93,9 @@ impl BenchmarkScenario for UserSearchBenchmark {
 
         // Clear perf samples accumulated during setup/follow so only
         // actual search timings appear in the breakdown.
-        crate::integration_tests::benchmarks::PERF_LAYER
-            .get()
-            .map(|layer| layer.clear());
+        if let Some(layer) = crate::integration_tests::benchmarks::PERF_LAYER.get() {
+            layer.clear();
+        }
 
         let mut all_timings: Vec<Duration> = Vec::new();
 

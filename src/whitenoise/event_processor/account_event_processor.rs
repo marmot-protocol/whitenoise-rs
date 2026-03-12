@@ -2,7 +2,7 @@ use nostr_sdk::prelude::*;
 
 use crate::{
     nostr_manager::utils::cap_timestamp_to_now,
-    perf_span,
+    perf_instrument,
     relay_control::hash_pubkey_for_subscription_id,
     types::{EventSource, RetryInfo},
     whitenoise::{
@@ -13,13 +13,13 @@ use crate::{
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_processor")]
     pub(super) async fn process_account_event(
         &self,
         event: Event,
         source: EventSource,
         retry_info: RetryInfo,
     ) {
-        let _span = perf_span!("event_processor::process_account_event");
         // Get the account from the subscription ID, skip if we can't find it
         let account = match self.account_from_event_source(&source).await {
             Ok(account) => account,
@@ -195,11 +195,11 @@ impl Whitenoise {
     /// Extract the account pubkey from a subscription_id
     /// Subscription IDs follow the format: {hashed_pubkey}_{subscription_type}
     /// where hashed_pubkey = SHA256(session salt || accouny_pubkey)[..12]
+    #[perf_instrument("event_processor")]
     async fn extract_pubkey_from_subscription_id(
         &self,
         subscription_id: &str,
     ) -> Result<PublicKey> {
-        let _span = perf_span!("event_processor::extract_pubkey_from_subscription_id");
         let underscore_pos = subscription_id.find('_');
         if underscore_pos.is_none() {
             return Err(WhitenoiseError::InvalidEvent(format!(
@@ -225,8 +225,8 @@ impl Whitenoise {
         )))
     }
 
+    #[perf_instrument("event_processor")]
     async fn account_from_event_source(&self, source: &EventSource) -> Result<Account> {
-        let _span = perf_span!("event_processor::account_from_event_source");
         let target_pubkey = match source {
             EventSource::LegacySubscriptionId(Some(subscription_id)) => self
                 .extract_pubkey_from_subscription_id(subscription_id)
@@ -260,12 +260,12 @@ impl Whitenoise {
 
     /// Check if an account event should be skipped (not processed)
     /// Returns Some(reason) if should skip, None if should process
+    #[perf_instrument("event_processor")]
     async fn should_skip_account_event_processing(
         &self,
         event: &Event,
         account: &Account,
     ) -> Result<Option<&'static str>> {
-        let _span = perf_span!("event_processor::should_skip_account_event");
         let already_processed = match self
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
@@ -318,12 +318,12 @@ impl Whitenoise {
     }
 
     /// Route an event to the appropriate handler based on its kind
+    #[perf_instrument("event_processor")]
     async fn route_account_event_for_processing(
         &self,
         event: &Event,
         account: &Account,
     ) -> Result<()> {
-        let _span = perf_span!("event_processor::route_account_event");
         match event.kind {
             Kind::GiftWrap => match validate_giftwrap_target(account, event) {
                 Ok(()) => self.handle_giftwrap(account, event.clone()).await,
@@ -347,12 +347,12 @@ impl Whitenoise {
     }
 
     /// Extract rumor timestamp from giftwrap event for sync advancement
+    #[perf_instrument("event_processor")]
     async fn extract_rumor_timestamp_for_advancement(
         &self,
         event: &Event,
         account: &Account,
     ) -> Result<Option<Timestamp>> {
-        let _span = perf_span!("event_processor::extract_rumor_timestamp");
         let signer = self.get_signer_for_account(account)?;
 
         match extract_rumor(&signer, event).await {

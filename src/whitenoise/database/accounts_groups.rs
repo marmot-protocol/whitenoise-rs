@@ -6,7 +6,7 @@ use super::{
     Database,
     utils::{parse_optional_timestamp, parse_timestamp},
 };
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 
 /// Internal database row representation for accounts_groups table
@@ -139,12 +139,12 @@ impl From<AccountGroupRow> for AccountGroup {
 
 impl AccountGroup {
     /// Finds an AccountGroup by account pubkey and MLS group ID.
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_account_and_group(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_by_account_and_group");
         let row = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -164,13 +164,13 @@ impl AccountGroup {
     /// This uses an insert-first approach to avoid TOCTOU race conditions:
     /// - Attempts to insert first
     /// - On unique constraint violation, fetches the existing record
+    #[perf_instrument("db")]
     pub(crate) async fn find_or_create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<(Self, bool), sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_or_create");
         // Try to create first - this handles the race condition properly
         match Self::create(account_pubkey, mls_group_id, None, dm_peer_pubkey, database).await {
             Ok(created) => Ok((created, true)),
@@ -190,11 +190,11 @@ impl AccountGroup {
     /// Finds all visible AccountGroups for a given account.
     /// Visible means: user_confirmation is NULL (pending) or true (accepted).
     /// Declined groups (user_confirmation = false) are hidden.
+    #[perf_instrument("db")]
     pub(crate) async fn find_visible_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_visible_for_account");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -209,11 +209,11 @@ impl AccountGroup {
 
     /// Finds all pending AccountGroups for a given account.
     /// Pending means: user_confirmation is NULL.
+    #[perf_instrument("db")]
     pub(crate) async fn find_pending_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_pending_for_account");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -227,11 +227,11 @@ impl AccountGroup {
     }
 
     /// Finds all AccountGroups for a specific MLS group.
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_group(
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_by_group");
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
@@ -245,12 +245,12 @@ impl AccountGroup {
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
+    #[perf_instrument("db")]
     pub(crate) async fn update_user_confirmation(
         &self,
         user_confirmation: bool,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_update_user_confirmation");
         let id = self.id.expect("AccountGroup must be persisted");
 
         let now_ms = Utc::now().timestamp_millis();
@@ -275,8 +275,8 @@ impl AccountGroup {
     ///
     /// - If the record doesn't exist, inserts it
     /// - If it exists, updates all mutable fields to match the provided values
+    #[perf_instrument("db")]
     pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_save");
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
@@ -313,12 +313,12 @@ impl AccountGroup {
     }
 
     /// Updates the pin_order for this AccountGroup.
+    #[perf_instrument("db")]
     pub(crate) async fn update_pin_order(
         &self,
         pin_order: Option<i64>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_update_pin_order");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -338,12 +338,12 @@ impl AccountGroup {
     }
 
     /// Updates the archived_at timestamp for this AccountGroup.
+    #[perf_instrument("db")]
     pub(crate) async fn update_archived_at(
         &self,
         archived_at: Option<DateTime<Utc>>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_update_archived_at");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -369,13 +369,13 @@ impl AccountGroup {
     ///
     /// This is atomic: the timestamp comparison and update happen in a single
     /// SQL statement, preventing race conditions between concurrent calls.
+    #[perf_instrument("db")]
     pub(crate) async fn update_last_read_if_newer(
         &self,
         message_id: &EventId,
         message_created_at_ms: i64,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_update_last_read_if_newer");
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
@@ -412,12 +412,12 @@ impl AccountGroup {
     /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup
     /// without requiring MLS/MDK calls. Returns `None` if no DM group exists
     /// between these users, or if the group has been declined.
+    #[perf_instrument("db")]
     pub(crate) async fn find_dm_group_id_by_peer(
         account_pubkey: &PublicKey,
         peer_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Option<GroupId>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_dm_group_id_by_peer");
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT ag.mls_group_id
              FROM accounts_groups ag
@@ -439,11 +439,11 @@ impl AccountGroup {
     ///
     /// Returns `(mls_group_id, dm_peer_pubkey)` pairs for groups where
     /// `dm_peer_pubkey` is populated and the group is visible (not declined).
+    #[perf_instrument("db")]
     pub(crate) async fn find_dm_peers_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<(GroupId, PublicKey)>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_dm_peers_for_account");
         let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
             "SELECT ag.mls_group_id, ag.dm_peer_pubkey
              FROM accounts_groups ag
@@ -477,11 +477,11 @@ impl AccountGroup {
     /// Used by the startup backfill to identify records that need population.
     /// Pushes all filtering to SQL (joins with `group_information`) so the caller
     /// only receives rows that actually need MDK membership resolution.
+    #[perf_instrument("db")]
     pub(crate) async fn find_dm_groups_missing_peer(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<GroupId>, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_find_dm_groups_missing_peer");
         let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
             "SELECT ag.mls_group_id
              FROM accounts_groups ag
@@ -504,13 +504,13 @@ impl AccountGroup {
     /// Updates the dm_peer_pubkey for a specific account-group record.
     ///
     /// Used by the startup backfill to populate the column for existing DM groups.
+    #[perf_instrument("db")]
     pub(crate) async fn update_dm_peer_pubkey(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         dm_peer_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<(), sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_update_dm_peer_pubkey");
         sqlx::query(
             "UPDATE accounts_groups
              SET dm_peer_pubkey = ?, updated_at = ?
@@ -527,6 +527,7 @@ impl AccountGroup {
     }
 
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
+    #[perf_instrument("db")]
     async fn create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
@@ -534,7 +535,6 @@ impl AccountGroup {
         dm_peer_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::accounts_groups_create");
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, AccountGroupRow>(

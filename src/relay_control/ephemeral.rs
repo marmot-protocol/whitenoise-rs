@@ -13,7 +13,7 @@ use crate::{
     RelayType,
     nostr_manager::utils::{is_event_timestamp_valid, is_relay_list_tag_for_event_kind},
     nostr_manager::{NostrManagerError, Result},
-    perf_span,
+    perf_instrument,
     types::{EphemeralPlaneStateSnapshot, ProcessableEvent},
     whitenoise::{
         accounts::Account,
@@ -84,40 +84,40 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_warm_relays");
         self.executor.warm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_relays_for_account(
         &self,
         account_pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_warm_relays_for_account");
         self.executor
             .warm_relays_for_account(account_pubkey, relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unwarm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_unwarm_relays");
         self.executor.unwarm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {
-        let _span = perf_span!("relay::ephemeral_remove_account_scope");
         self.executor.remove_account_scope(account_pubkey).await;
     }
 
     #[cfg(feature = "integration-tests")]
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_all_account_scopes(&self) {
-        let _span = perf_span!("relay::ephemeral_remove_all_account_scopes");
         self.executor.remove_all_account_scopes().await;
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn snapshot(&self) -> EphemeralPlaneStateSnapshot {
-        let _span = perf_span!("relay::ephemeral_snapshot");
         let (anonymous, accounts) = self.executor.snapshot_scopes().await;
 
         EphemeralPlaneStateSnapshot {
@@ -148,40 +148,41 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
         pubkey: PublicKey,
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_metadata_from");
         self.anonymous_scope()
             .fetch_metadata_from(relays, pubkey)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
         relay_type: RelayType,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_user_relays");
         self.anonymous_scope()
             .fetch_user_relays(pubkey, relay_type, relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_user_key_package");
         self.anonymous_scope()
             .fetch_user_key_package(pubkey, relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_gift_wrap_to(
         &self,
         receiver: &PublicKey,
@@ -191,7 +192,6 @@ impl EphemeralPlane {
         relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_gift_wrap_to");
         let wrapped_event =
             EventBuilder::gift_wrap(&signer, receiver, rumor, extra_tags.to_vec()).await?;
 
@@ -199,17 +199,18 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
         metadata: &Metadata,
         relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_metadata_with_signer");
         self.publish_event_builder_with_signer(EventBuilder::metadata(metadata), relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_relay_list_with_signer(
         &self,
         relay_list: &[RelayUrl],
@@ -217,7 +218,6 @@ impl EphemeralPlane {
         target_relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_publish_relay_list_with_signer");
         let tags: Vec<Tag> = match relay_type {
             RelayType::Nip65 => relay_list
                 .iter()
@@ -236,13 +236,13 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
         follow_list: &[PublicKey],
         target_relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_publish_follow_list_with_signer");
         let tags: Vec<Tag> = follow_list
             .iter()
             .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
@@ -255,6 +255,7 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
         encoded_key_package: &str,
@@ -262,7 +263,6 @@ impl EphemeralPlane {
         tags: &[Tag],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_key_package_with_signer");
         let event_builder =
             EventBuilder::new(Kind::MlsKeyPackage, encoded_key_package).tags(tags.to_vec());
 
@@ -270,26 +270,26 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_deletion_with_signer(
         &self,
         event_id: &EventId,
         relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_event_deletion_with_signer");
         let event_builder = EventBuilder::delete(EventDeletionRequest::new().id(*event_id));
 
         self.publish_event_builder_with_signer(event_builder, relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_batch_event_deletion_with_signer(
         &self,
         event_ids: &[EventId],
         relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_batch_event_deletion_with_signer");
         if event_ids.is_empty() {
             return Err(NostrManagerError::WhitenoiseInstance(
                 "Cannot publish batch deletion with empty event_ids list".to_string(),
@@ -303,17 +303,18 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: Event,
         account_pubkey: &PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_event_to");
         self.publish_event_to_scope(event, account_pubkey, relays, Some(*account_pubkey))
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn publish_event_to_scope(
         &self,
         event: Event,
@@ -321,7 +322,6 @@ impl EphemeralPlane {
         relays: &[RelayUrl],
         scope_account_pubkey: Option<PublicKey>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_event_to_scope");
         let mut last_error: Option<NostrManagerError> = None;
 
         for attempt in 0..self.config.max_publish_attempts {
@@ -386,6 +386,7 @@ impl EphemeralPlane {
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_message_event(
         &self,
         event: Event,
@@ -396,7 +397,6 @@ impl EphemeralPlane {
         database: &Database,
         stream_manager: &Arc<MessageStreamManager>,
     ) -> bool {
-        let _span = perf_span!("relay::ephemeral_publish_message_event");
         match self.publish_event_to(event, account_pubkey, relays).await {
             Ok(output) if !output.success.is_empty() => {
                 let status = DeliveryStatus::Sent(output.success.len());
@@ -446,34 +446,34 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relays: &[RelayUrl],
         filter: Filter,
     ) -> Result<Events> {
-        let _span = perf_span!("relay::ephemeral_fetch_events_from");
         self.fetch_events_from_scope(None, relays, filter).await
     }
 
+    #[perf_instrument("relay")]
     async fn fetch_events_from_scope(
         &self,
         scope_account_pubkey: Option<PublicKey>,
         relays: &[RelayUrl],
         filter: Filter,
     ) -> Result<Events> {
-        let _span = perf_span!("relay::ephemeral_fetch_events_from_scope");
         self.executor
             .fetch_events_from_scope(scope_account_pubkey, relays, filter)
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn publish_event_builder_with_signer(
         &self,
         event_builder: EventBuilder,
         relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_event_builder_with_signer");
         let account_pubkey = signer.get_public_key().await?;
         let event = event_builder.sign(&signer).await?;
 
@@ -482,12 +482,12 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn track_published_event(
         &self,
         event_id: &EventId,
         account_pubkey: &PublicKey,
     ) -> Result<()> {
-        let _span = perf_span!("relay::ephemeral_track_published_event");
         let account = Account::find_by_pubkey(account_pubkey, &self.database)
             .await
             .map_err(|error| NostrManagerError::FailedToTrackPublishedEvent(error.to_string()))?;
@@ -504,6 +504,7 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     async fn update_and_emit_delivery_status(
         event_id: &str,
         group_id: &GroupId,
@@ -511,7 +512,6 @@ impl EphemeralPlane {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
-        let _span = perf_span!("relay::ephemeral_update_and_emit_delivery_status");
         match AggregatedMessage::update_delivery_status_with_retry(
             event_id, group_id, status, database,
         )
@@ -604,23 +604,23 @@ impl EphemeralPlane {
 }
 
 impl EphemeralScope {
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relays: &[RelayUrl],
         filter: Filter,
     ) -> Result<Events> {
-        let _span = perf_span!("relay::ephemeral_fetch_events_from");
         self.plane
             .fetch_events_from_scope(self.scope_account_pubkey, relays, filter)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
         pubkey: PublicKey,
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_metadata_from");
         let filter = Filter::new().author(pubkey).kind(Kind::Metadata);
         let events = self.fetch_events_from(relays, filter).await?;
 
@@ -629,13 +629,13 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
         relay_type: RelayType,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_user_relays");
         let filter = Filter::new().author(pubkey).kind(relay_type.into());
         let events = self.fetch_events_from(relays, filter).await?;
 
@@ -644,12 +644,12 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let _span = perf_span!("relay::ephemeral_fetch_user_key_package");
         let filter = Filter::new().kind(Kind::MlsKeyPackage).author(pubkey);
         let events = self.fetch_events_from(relays, filter).await?;
 
@@ -658,12 +658,12 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: Event,
         relays: &[RelayUrl],
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::ephemeral_publish_event_to");
         let account_pubkey = self.scope_account_pubkey.ok_or_else(|| {
             NostrManagerError::WhitenoiseInstance(
                 "Cannot publish from an anonymous ephemeral scope".to_string(),

@@ -16,7 +16,7 @@ pub mod matcher;
 mod metrics;
 mod types;
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::cached_graph_user::CachedGraphUser;
 use crate::whitenoise::error::Result;
@@ -115,6 +115,7 @@ impl Whitenoise {
     /// This method does NOT create User records for search results.
     /// Only when the app explicitly interacts with a result (follow, message, etc.)
     /// should a User record be created via `find_or_create_user_by_pubkey`.
+    #[perf_instrument("user_search")]
     pub async fn search_users(&self, params: UserSearchParams) -> Result<UserSearchSubscription> {
         if params.radius_start > params.radius_end {
             return Err(crate::whitenoise::error::WhitenoiseError::InvalidInput(
@@ -135,8 +136,6 @@ impl Whitenoise {
         let radius_end = params.radius_end;
 
         tokio::spawn(async move {
-            let _span = perf_span!("user_search::search_users");
-
             // Get singleton instance inside spawned task (follows existing pattern in groups.rs)
             let whitenoise = match Self::get_instance() {
                 Ok(wn) => wn,
@@ -253,6 +252,7 @@ struct UserRelayFetchResult {
 /// Tiers 3, 4, and 5 use queue-based retries: failed chunks go to the end of a
 /// `VecDeque` (up to `MAX_QUEUE_RETRIES` times), allowing other work to proceed
 /// while a relay recovers.
+#[perf_instrument("user_search")]
 async fn search_task(
     whitenoise: &Whitenoise,
     tx: broadcast::Sender<UserSearchUpdate>,
@@ -261,7 +261,6 @@ async fn search_task(
     radius_start: u8,
     radius_end: u8,
 ) {
-    let _span = perf_span!("user_search::search_task");
     let total_results = AtomicUsize::new(0);
     let metrics = metrics::PipelineMetrics::new();
 
@@ -332,13 +331,13 @@ async fn search_task(
 }
 
 /// Push candidate batches to the channel, chunked by PUBKEY_BATCH_SIZE.
+#[perf_instrument("user_search")]
 async fn push_candidates(
     tx: &mpsc::Sender<CandidateBatch>,
     pubkeys: &HashSet<PublicKey>,
     radius: u8,
     metrics: &metrics::PipelineMetrics,
 ) -> std::result::Result<(), mpsc::error::SendError<CandidateBatch>> {
-    let _span = perf_span!("user_search::push_candidates");
     metrics
         .producer_pubkeys
         .fetch_add(pubkeys.len(), Ordering::Relaxed);
@@ -354,12 +353,12 @@ async fn push_candidates(
 }
 
 /// Push a RadiusComplete sentinel to the channel.
+#[perf_instrument("user_search")]
 async fn push_radius_complete(
     tx: &mpsc::Sender<CandidateBatch>,
     radius: u8,
     total_pubkeys: usize,
 ) -> std::result::Result<(), mpsc::error::SendError<CandidateBatch>> {
-    let _span = perf_span!("user_search::push_radius_complete");
     tx.send(CandidateBatch {
         radius,
         kind: CandidateBatchKind::RadiusComplete { total_pubkeys },
@@ -372,6 +371,7 @@ async fn push_radius_complete(
 /// Uses two-phase follows fetching per radius:
 /// 1. Cached follows (instant) → push partial candidates immediately
 /// 2. Network follows (slow) → push additional candidates while consumers are busy
+#[perf_instrument("user_search")]
 async fn follows_producer_task(
     whitenoise: &Whitenoise,
     tx: broadcast::Sender<UserSearchUpdate>,
@@ -381,7 +381,6 @@ async fn follows_producer_task(
     radius_end: u8,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::follows_producer_task");
     let mut seen_pubkeys: HashSet<PublicKey> = HashSet::new();
     let mut previous_layer_pubkeys: HashSet<PublicKey> = HashSet::new();
     let mut fallback_used = false;
@@ -620,6 +619,7 @@ fn match_and_emit(
 /// Tier 1 consumer: checks User table for metadata.
 ///
 /// Emits matches immediately, forwards cache misses + sentinels to tier 2.
+#[perf_instrument("user_search")]
 async fn tier1_user_table_consumer(
     whitenoise: &Whitenoise,
     tx: &broadcast::Sender<UserSearchUpdate>,
@@ -629,7 +629,6 @@ async fn tier1_user_table_consumer(
     total_results: &AtomicUsize,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::tier1_user_table_consumer");
     while let Some(batch) = rx.recv().await {
         if tx.receiver_count() == 0 {
             tracing::debug!(
@@ -679,6 +678,7 @@ async fn tier1_user_table_consumer(
 /// Tier 2 consumer: checks CachedGraphUser table for metadata.
 ///
 /// Emits matches immediately, forwards cache misses + sentinels to tier 3.
+#[perf_instrument("user_search")]
 async fn tier2_cache_consumer(
     whitenoise: &Whitenoise,
     tx: &broadcast::Sender<UserSearchUpdate>,
@@ -688,7 +688,6 @@ async fn tier2_cache_consumer(
     total_results: &AtomicUsize,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::tier2_cache_consumer");
     while let Some(batch) = rx.recv().await {
         if tx.receiver_count() == 0 {
             tracing::debug!(
@@ -745,6 +744,7 @@ async fn tier2_cache_consumer(
 /// - Success + EOSE: forward remaining as `Candidates` (not confirmed absent yet)
 /// - Error + retries left: requeue at back of pending
 /// - Error + retries exhausted: forward as `FailedCandidates` (affects tier 4 caching)
+#[perf_instrument("user_search")]
 async fn tier3_network_consumer(
     whitenoise: &Whitenoise,
     tx: &broadcast::Sender<UserSearchUpdate>,
@@ -754,7 +754,6 @@ async fn tier3_network_consumer(
     total_results: &AtomicUsize,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::tier3_network_consumer");
     // (chunk, radius, attempt)
     let mut pending: VecDeque<(Vec<PublicKey>, u8, u8)> = VecDeque::new();
     let mut in_flight = FuturesUnordered::new();
@@ -928,6 +927,7 @@ async fn tier3_network_consumer(
 ///    - No relay list + tier 3 failed → don't cache (uncertain)
 ///    - Error + retries left → requeue at back of pending
 ///    - Error + retries exhausted → drop (no relay list to try)
+#[perf_instrument("user_search")]
 async fn tier4_relay_list_consumer(
     whitenoise: &Whitenoise,
     tx: &broadcast::Sender<UserSearchUpdate>,
@@ -937,7 +937,6 @@ async fn tier4_relay_list_consumer(
     total_results: &AtomicUsize,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::tier4_relay_list_consumer");
     // (pubkeys, radius, attempt, tier3_failed)
     let mut pending: VecDeque<(Vec<PublicKey>, u8, u8, bool)> = VecDeque::new();
     let mut in_flight = FuturesUnordered::new();
@@ -1066,6 +1065,7 @@ async fn tier4_relay_list_consumer(
 /// Process a completed tier 4 relay list fetch result.
 ///
 /// Routes pubkeys based on relay list presence and tier 3 failure status.
+#[perf_instrument("user_search")]
 async fn process_tier4_result(
     whitenoise: &Whitenoise,
     result: RelayListFetchResult,
@@ -1076,7 +1076,6 @@ async fn process_tier4_result(
     pending: &mut VecDeque<(Vec<PublicKey>, u8, u8, bool)>,
     metrics: &metrics::PipelineMetrics,
 ) -> std::result::Result<(), ()> {
-    let _span = perf_span!("user_search::process_tier4_result");
     metrics.record_fetch(
         &metrics.t4_fetches,
         &metrics.t4_fetch_us,
@@ -1172,6 +1171,7 @@ async fn process_tier4_result(
 /// - Error + retries exhausted → don't cache (uncertain)
 ///
 /// Emits `RadiusCompleted` and `SearchCompleted` as the final pipeline tier.
+#[perf_instrument("user_search")]
 async fn tier5_user_relay_consumer(
     whitenoise: &Whitenoise,
     tx: &broadcast::Sender<UserSearchUpdate>,
@@ -1181,7 +1181,6 @@ async fn tier5_user_relay_consumer(
     radius_end: u8,
     metrics: &metrics::PipelineMetrics,
 ) {
-    let _span = perf_span!("user_search::tier5_user_relay_consumer");
     // (pubkey, relays, radius, attempt)
     let mut pending: VecDeque<(PublicKey, Vec<RelayUrl>, u8, u8)> = VecDeque::new();
     let mut in_flight = FuturesUnordered::new();
@@ -1364,13 +1363,13 @@ fn process_tier5_result(
 ///
 /// Named function (not closure) so all futures share the same concrete type
 /// in FuturesUnordered — no boxing required.
+#[perf_instrument("user_search")]
 async fn fetch_chunk_metadata(
     whitenoise: &Whitenoise,
     pubkeys: Vec<PublicKey>,
     radius: u8,
     attempt: u8,
 ) -> ChunkFetchResult {
-    let _span = perf_span!("user_search::fetch_chunk_metadata");
     let start = Instant::now();
     match graph::try_fetch_network_metadata(whitenoise, &pubkeys).await {
         Ok((found, remaining)) => ChunkFetchResult {
@@ -1395,6 +1394,7 @@ async fn fetch_chunk_metadata(
 }
 
 /// Tier 4: fetch NIP-65 relay lists for a chunk of pubkeys.
+#[perf_instrument("user_search")]
 async fn fetch_chunk_relay_lists(
     whitenoise: &Whitenoise,
     pubkeys: Vec<PublicKey>,
@@ -1402,7 +1402,6 @@ async fn fetch_chunk_relay_lists(
     attempt: u8,
     tier3_failed: bool,
 ) -> RelayListFetchResult {
-    let _span = perf_span!("user_search::fetch_chunk_relay_lists");
     let start = Instant::now();
     match graph::try_fetch_relay_lists(whitenoise, &pubkeys).await {
         Ok(relay_map) => RelayListFetchResult {
@@ -1427,6 +1426,7 @@ async fn fetch_chunk_relay_lists(
 }
 
 /// Tier 5: fetch metadata for a single pubkey from their preferred relays.
+#[perf_instrument("user_search")]
 async fn fetch_user_relay_chunk(
     whitenoise: &Whitenoise,
     pubkey: PublicKey,
@@ -1434,7 +1434,6 @@ async fn fetch_user_relay_chunk(
     radius: u8,
     attempt: u8,
 ) -> UserRelayFetchResult {
-    let _span = perf_span!("user_search::fetch_user_relay_chunk");
     let start = Instant::now();
     let result = graph::try_fetch_user_relay_metadata(whitenoise, &pubkey, &relays).await;
     UserRelayFetchResult {
@@ -1465,12 +1464,12 @@ fn collect_layer_from_follows(
 /// Phase 1: Build partial layer from cached follows (Account + CachedGraphUser).
 ///
 /// Returns (partial layer, pubkeys needing network fetch for follows).
+#[perf_instrument("user_search")]
 async fn build_cached_layer_from_follows(
     whitenoise: &Whitenoise,
     previous_layer: &HashSet<PublicKey>,
     seen: &HashSet<PublicKey>,
 ) -> (HashSet<PublicKey>, Vec<PublicKey>) {
-    let _span = perf_span!("user_search::build_cached_layer_from_follows");
     let pubkeys: Vec<PublicKey> = previous_layer.iter().copied().collect();
 
     let (cached_follows, need_fetch) =
@@ -1485,13 +1484,13 @@ async fn build_cached_layer_from_follows(
 /// Phase 2: Fetch remaining follows from network and extend the layer.
 ///
 /// Returns the additional pubkeys discovered (not in partial_layer or seen).
+#[perf_instrument("user_search")]
 async fn build_network_layer_from_follows(
     whitenoise: &Whitenoise,
     need_fetch: &[PublicKey],
     seen: &HashSet<PublicKey>,
     partial_layer: &HashSet<PublicKey>,
 ) -> HashSet<PublicKey> {
-    let _span = perf_span!("user_search::build_network_layer_from_follows");
     if need_fetch.is_empty() {
         return HashSet::new();
     }

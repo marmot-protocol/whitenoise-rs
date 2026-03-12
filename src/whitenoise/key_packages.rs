@@ -4,7 +4,7 @@ use std::time::Duration;
 use base64ct::{Base64, Encoding};
 use nostr_sdk::prelude::*;
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
@@ -203,12 +203,12 @@ impl Whitenoise {
     ///
     /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
     /// is the serialized hash_ref of the key package for lifecycle tracking.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn encoded_key_package(
         &self,
         account: &Account,
         key_package_relays: &[Relay],
     ) -> Result<(String, Vec<Tag>, Vec<u8>)> {
-        let _span = perf_span!("key_packages::encode");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
@@ -225,8 +225,8 @@ impl Whitenoise {
     /// 3 times with exponential backoff (2s, 4s) if publishing fails. The key
     /// package is created only once to avoid orphaning unused key material in
     /// local MLS storage.
+    #[perf_instrument("key_packages")]
     pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
-        let _span = perf_span!("key_packages::publish_for_account");
         let relays = account.key_package_relays(self).await?;
 
         if relays.is_empty() {
@@ -291,12 +291,12 @@ impl Whitenoise {
     /// This is used for external signer accounts (like Amber/NIP-55) where the
     /// private key is not available locally. The signer is used to sign the
     /// key package event before publishing.
+    #[perf_instrument("key_packages")]
     pub async fn publish_key_package_for_account_with_signer(
         &self,
         account: &Account,
         signer: impl NostrSigner + 'static,
     ) -> Result<()> {
-        let _span = perf_span!("key_packages::publish_for_account_with_signer");
         let relays = account.key_package_relays(self).await?;
 
         if relays.is_empty() {
@@ -324,12 +324,12 @@ impl Whitenoise {
     /// This is a convenience wrapper that calls [`Self::encoded_key_package`] followed by
     /// [`Self::publish_key_package_to_relays`]. If you need retry semantics, prefer calling
     /// those two methods separately so the key package is only created once.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn create_and_publish_key_package(
         &self,
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let _span = perf_span!("key_packages::create_and_publish");
         let (encoded_key_package, tags, hash_ref) =
             self.encoded_key_package(account, relays).await?;
         let relay_urls = Relay::urls(relays);
@@ -347,6 +347,7 @@ impl Whitenoise {
     /// Returns an error if no relay accepted the event. This method is
     /// intentionally separated from key package creation so callers can retry
     /// the relay publish without generating additional MLS key material.
+    #[perf_instrument("key_packages")]
     async fn publish_key_package_to_relays(
         &self,
         encoded_key_package: &str,
@@ -354,7 +355,6 @@ impl Whitenoise {
         tags: &[Tag],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
-        let _span = perf_span!("key_packages::publish_to_relays");
         let result = self
             .relay_control
             .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
@@ -376,13 +376,13 @@ impl Whitenoise {
     }
 
     /// Records a successfully published key package in the lifecycle tracking table.
+    #[perf_instrument("key_packages")]
     async fn track_published_key_package(
         &self,
         account: &Account,
         hash_ref: &[u8],
         event_id: &EventId,
     ) {
-        let _span = perf_span!("key_packages::track_published");
         if let Err(e) = PublishedKeyPackage::create(
             &account.pubkey,
             hash_ref,
@@ -406,13 +406,13 @@ impl Whitenoise {
     /// - For local accounts: uses keys from the secrets store
     ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    #[perf_instrument("key_packages")]
     pub async fn delete_key_package_for_account(
         &self,
         account: &Account,
         event_id: &EventId,
         delete_mls_stored_keys: bool,
     ) -> Result<bool> {
-        let _span = perf_span!("key_packages::delete_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_key_package_for_account_internal(
             account,
@@ -430,6 +430,7 @@ impl Whitenoise {
     /// deletion event before publishing.
     ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    #[perf_instrument("key_packages")]
     pub async fn delete_key_package_for_account_with_signer(
         &self,
         account: &Account,
@@ -437,7 +438,6 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<bool> {
-        let _span = perf_span!("key_packages::delete_for_account_with_signer");
         self.delete_key_package_for_account_internal(
             account,
             event_id,
@@ -447,6 +447,7 @@ impl Whitenoise {
         .await
     }
 
+    #[perf_instrument("key_packages")]
     async fn delete_key_package_for_account_internal(
         &self,
         account: &Account,
@@ -454,7 +455,6 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
-        let _span = perf_span!("key_packages::delete_for_account_internal");
         // Delete local MLS key material using the hash_ref stored at publish time.
         // This avoids a relay round-trip to fetch and parse the key package event.
         if delete_mls_stored_keys {
@@ -539,11 +539,11 @@ impl Whitenoise {
     /// - Failed to retrieve account's key package relays
     /// - Network error while fetching events from relays
     /// - NostrSDK error during event streaming
+    #[perf_instrument("key_packages")]
     pub async fn fetch_all_key_packages_for_account(
         &self,
         account: &Account,
     ) -> Result<Vec<Event>> {
-        let _span = perf_span!("key_packages::fetch_all_for_account");
         let key_package_relays = account.key_package_relays(self).await?;
         let relay_urls: Vec<RelayUrl> = Relay::urls(&key_package_relays);
 
@@ -616,12 +616,12 @@ impl Whitenoise {
     /// - Failed to get signing keys for the account
     /// - Network error while fetching or publishing events
     /// - Batch deletion event publishing failed
+    #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account(
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
     ) -> Result<usize> {
-        let _span = perf_span!("key_packages::delete_all_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
             .await
@@ -642,13 +642,13 @@ impl Whitenoise {
     /// # Returns
     ///
     /// Returns the number of key packages that were successfully deleted.
+    #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account_with_signer(
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
-        let _span = perf_span!("key_packages::delete_all_with_signer");
         self.delete_all_key_packages_loop(
             account,
             delete_mls_stored_keys,
@@ -661,13 +661,13 @@ impl Whitenoise {
     /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
     /// only a subset of key packages per query, so a single fetch-delete pass
     /// can leave packages behind.
+    #[perf_instrument("key_packages")]
     async fn delete_all_key_packages_loop(
         &self,
         account: &Account,
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
-        let _span = perf_span!("key_packages::delete_all_loop");
         let mut total_deleted = 0;
 
         for round in 0..MAX_DELETE_ROUNDS {
@@ -743,6 +743,7 @@ impl Whitenoise {
     /// # Returns
     ///
     /// Returns the number of key packages that were successfully deleted.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn delete_key_packages_for_account(
         &self,
         account: &Account,
@@ -750,7 +751,6 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         max_retries: u32,
     ) -> Result<usize> {
-        let _span = perf_span!("key_packages::delete_batch_for_account");
         let signer = self.get_signer_for_account(account)?;
         self.delete_key_packages_for_account_internal(
             account,
@@ -762,6 +762,7 @@ impl Whitenoise {
         .await
     }
 
+    #[perf_instrument("key_packages")]
     async fn delete_key_packages_for_account_internal(
         &self,
         account: &Account,
@@ -770,7 +771,6 @@ impl Whitenoise {
         max_retries: u32,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
-        let _span = perf_span!("key_packages::delete_batch_internal");
         if key_package_events.is_empty() {
             tracing::debug!(
                 target: "whitenoise::key_packages",
@@ -858,8 +858,8 @@ impl Whitenoise {
         Ok(deleted_count)
     }
 
+    #[perf_instrument("key_packages")]
     async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
-        let _span = perf_span!("key_packages::prepare_relay_urls");
         let key_package_relays = account.key_package_relays(self).await?;
 
         if key_package_relays.is_empty() {
@@ -912,6 +912,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("key_packages")]
     async fn publish_key_package_deletion_with_signer(
         &self,
         event_ids: &[EventId],
@@ -919,7 +920,6 @@ impl Whitenoise {
         signer: std::sync::Arc<dyn NostrSigner>,
         context: &str,
     ) -> Result<()> {
-        let _span = perf_span!("key_packages::publish_deletion_with_signer");
         match self
             .relay_control
             .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)

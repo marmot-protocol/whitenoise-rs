@@ -28,7 +28,7 @@ pub(crate) mod observability;
 pub(crate) mod router;
 pub(crate) mod sessions;
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::database::{Database, DatabaseError};
 use crate::{
     RelayType,
@@ -95,8 +95,8 @@ impl RelayControlPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn start_telemetry_persistors(&self) {
-        let _span = perf_span!("relay::start_telemetry_persistors");
         if self
             .telemetry_persistors_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -129,11 +129,11 @@ impl RelayControlPlane {
 
     /// Persist structured relay telemetry for later observability and retry work.
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn record_relay_telemetry(
         &self,
         telemetry: &observability::RelayTelemetry,
     ) -> std::result::Result<(), DatabaseError> {
-        let _span = perf_span!("relay::record_relay_telemetry");
         if !Self::should_persist_telemetry(telemetry) {
             tracing::debug!(
                 target: "whitenoise::relay_control::observability",
@@ -208,8 +208,8 @@ impl RelayControlPlane {
         !(telemetry.plane == RelayPlane::AccountInbox && telemetry.account_pubkey.is_none())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
-        let _span = perf_span!("relay::start_discovery_plane");
         self.discovery.start().await?;
         if let Err(error) = self.ephemeral.warm_relays(self.discovery.relays()).await {
             tracing::warn!(
@@ -220,13 +220,13 @@ impl RelayControlPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn sync_discovery_subscriptions(
         &self,
         watched_users: &[PublicKey],
         follow_list_accounts: &[(PublicKey, Option<nostr_sdk::Timestamp>)],
         public_since: Option<nostr_sdk::Timestamp>,
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::sync_discovery_subscriptions");
         self.discovery
             .sync(watched_users, follow_list_accounts, public_since)
             .await
@@ -239,6 +239,7 @@ impl RelayControlPlane {
     /// fails, group subscriptions may already be active. Refreshing an already
     /// active account attempts to restore the previous group state on inbox
     /// activation failure.
+    #[perf_instrument("relay")]
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -247,7 +248,6 @@ impl RelayControlPlane {
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::activate_account_subscriptions");
         let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
 
         self.group_plane
@@ -301,20 +301,20 @@ impl RelayControlPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn sync_account_group_subscriptions(
         &self,
         account_pubkey: PublicKey,
         group_specs: &[groups::GroupSubscriptionSpec],
         since: Option<nostr_sdk::Timestamp>,
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::sync_account_group_subscriptions");
         self.group_plane
             .update_account(account_pubkey, group_specs, since)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn deactivate_account_subscriptions(&self, account_pubkey: &PublicKey) {
-        let _span = perf_span!("relay::deactivate_account_subscriptions");
         if let Some(plane) = self
             .account_inbox_planes
             .write()
@@ -329,8 +329,8 @@ impl RelayControlPlane {
     }
 
     /// Deactivates all account subscriptions. Called during full data teardown.
+    #[perf_instrument("relay")]
     pub(crate) async fn shutdown_all(&self) {
-        let _span = perf_span!("relay::shutdown_all");
         let pubkeys: Vec<_> = self
             .account_inbox_planes
             .read()
@@ -343,8 +343,8 @@ impl RelayControlPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
-        let _span = perf_span!("relay::has_account_subscriptions");
         // Both planes must confirm the account is active. The group plane
         // keeps an entry even for accounts with zero groups (empty state), so
         // a missing entry unambiguously means setup never completed or failed.
@@ -368,8 +368,8 @@ impl RelayControlPlane {
                 .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {
-        let _span = perf_span!("relay::has_discovery_subscriptions");
         self.discovery.has_subscriptions().await && self.discovery.has_connected_relay().await
     }
 
@@ -382,57 +382,58 @@ impl RelayControlPlane {
         self.ephemeral.clone()
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
-        let _span = perf_span!("relay::warm_ephemeral_relays");
         self.ephemeral.warm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_ephemeral_relays_for_account(
         &self,
         account_pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::warm_ephemeral_relays_for_account");
         self.ephemeral
             .warm_relays_for_account(account_pubkey, relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unwarm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
-        let _span = perf_span!("relay::unwarm_ephemeral_relays");
         self.ephemeral.unwarm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
         pubkey: PublicKey,
     ) -> NostrResult<Option<nostr_sdk::Event>> {
-        let _span = perf_span!("relay::fetch_metadata_from");
         self.ephemeral.fetch_metadata_from(relays, pubkey).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
         relay_type: RelayType,
         relays: &[RelayUrl],
     ) -> NostrResult<Option<nostr_sdk::Event>> {
-        let _span = perf_span!("relay::fetch_user_relays");
         self.ephemeral
             .fetch_user_relays(pubkey, relay_type, relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> NostrResult<Option<nostr_sdk::Event>> {
-        let _span = perf_span!("relay::fetch_user_key_package");
         self.ephemeral.fetch_user_key_package(pubkey, relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_welcome(
         &self,
         receiver: &PublicKey,
@@ -442,37 +443,37 @@ impl RelayControlPlane {
         relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_welcome");
         self.ephemeral
             .publish_gift_wrap_to(receiver, rumor, extra_tags, account_pubkey, relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: nostr_sdk::Event,
         account_pubkey: &PublicKey,
         relays: &[RelayUrl],
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_event_to");
         self.ephemeral
             .publish_event_to(event, account_pubkey, relays)
             .await
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
         metadata: &nostr_sdk::Metadata,
         relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_metadata_with_signer");
         self.ephemeral
             .publish_metadata_with_signer(metadata, relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_relay_list_with_signer(
         &self,
         relay_list: &[RelayUrl],
@@ -480,25 +481,25 @@ impl RelayControlPlane {
         target_relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::publish_relay_list_with_signer");
         self.ephemeral
             .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
             .await
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
         follow_list: &[PublicKey],
         target_relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
-        let _span = perf_span!("relay::publish_follow_list_with_signer");
         self.ephemeral
             .publish_follow_list_with_signer(follow_list, target_relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
         encoded_key_package: &str,
@@ -506,38 +507,37 @@ impl RelayControlPlane {
         tags: &[nostr_sdk::Tag],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_key_package_with_signer");
         self.ephemeral
             .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_deletion_with_signer(
         &self,
         event_id: &nostr_sdk::EventId,
         relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_event_deletion_with_signer");
         self.ephemeral
             .publish_event_deletion_with_signer(event_id, relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_batch_event_deletion_with_signer(
         &self,
         event_ids: &[nostr_sdk::EventId],
         relays: &[RelayUrl],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
-        let _span = perf_span!("relay::publish_batch_event_deletion_with_signer");
         self.ephemeral
             .publish_batch_event_deletion_with_signer(event_ids, relays, signer)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
-        let _span = perf_span!("relay::snapshot");
         let discovery = self.discovery.snapshot().await;
         let ephemeral = self.ephemeral.snapshot().await;
 

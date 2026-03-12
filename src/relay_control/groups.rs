@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
-    perf_span,
+    perf_instrument,
     types::{GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ProcessableEvent},
 };
 
@@ -79,13 +79,13 @@ impl GroupPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn update_account(
         &self,
         pubkey: PublicKey,
         group_specs: &[GroupSubscriptionSpec],
         since: Option<Timestamp>,
     ) -> Result<()> {
-        let _span = perf_span!("relay::group_plane_update_account");
         let _update_guard = self.update_lock.lock().await;
 
         if let Some(previous_state) = self.accounts.read().await.get(&pubkey).cloned() {
@@ -171,8 +171,8 @@ impl GroupPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
-        let _span = perf_span!("relay::group_plane_remove_account");
         let _update_guard = self.update_lock.lock().await;
         if let Some(state) = self.accounts.write().await.remove(pubkey) {
             let subscription_indices = state
@@ -185,11 +185,11 @@ impl GroupPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn account_state(
         &self,
         pubkey: &PublicKey,
     ) -> Option<Vec<GroupSubscriptionSpec>> {
-        let _span = perf_span!("relay::group_plane_account_state");
         self.accounts
             .read()
             .await
@@ -198,8 +198,8 @@ impl GroupPlane {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
-        let _span = perf_span!("relay::group_plane_has_account");
         self.accounts.read().await.contains_key(pubkey)
     }
 
@@ -208,8 +208,8 @@ impl GroupPlane {
     /// - Accounts with no groups: entry present in the map is sufficient (empty
     ///   `relays` is the canonical "activated, nothing to subscribe to" state).
     /// - Accounts with groups: at least one group relay must be connected.
+    #[perf_instrument("relay")]
     pub(crate) async fn has_active_subscription(&self, pubkey: &PublicKey) -> bool {
-        let _span = perf_span!("relay::group_plane_has_active_subscription");
         let state = self.accounts.read().await;
         match state.get(pubkey) {
             None => false,
@@ -299,8 +299,8 @@ impl GroupPlane {
             .collect()
     }
 
+    #[perf_instrument("relay")]
     async fn unsubscribe_indices(&self, pubkey: &PublicKey, subscription_indices: &[usize]) {
-        let _span = perf_span!("relay::group_plane_unsubscribe_indices");
         for subscription_index in subscription_indices {
             self.session
                 .unsubscribe(&self.subscription_id(pubkey, *subscription_index))
@@ -368,8 +368,8 @@ impl GroupPlane {
     }
 
     #[cfg(feature = "integration-tests")]
+    #[perf_instrument("relay")]
     pub(crate) async fn reset(&self) {
-        let _span = perf_span!("relay::group_plane_reset");
         let pubkeys = self
             .accounts
             .read()

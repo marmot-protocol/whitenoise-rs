@@ -5,7 +5,7 @@ use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError, perf_span,
+    WhitenoiseError, perf_instrument,
     whitenoise::{
         relays::{Relay, RelayType},
         users::User,
@@ -133,10 +133,10 @@ impl User {
     }
 
     /// Fetches the distinct pubkeys for every user stored in the local database.
+    #[perf_instrument("db")]
     pub(crate) async fn all_pubkeys(
         database: &Database,
     ) -> Result<Vec<PublicKey>, WhitenoiseError> {
-        let _span = perf_span!("db::user_all_pubkeys");
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT pubkey
              FROM users
@@ -167,11 +167,11 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operations fail.
+    #[perf_instrument("db")]
     pub(crate) async fn find_or_create_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<(User, bool), WhitenoiseError> {
-        let _span = perf_span!("db::user_find_or_create_by_pubkey");
         match User::find_by_pubkey(pubkey, database).await {
             Ok(user) => Ok((user, false)),
             Err(WhitenoiseError::UserNotFound) => {

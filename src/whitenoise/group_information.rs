@@ -5,7 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,13 +64,13 @@ impl GroupInformation {
     /// * `group_type` - Optional explicit group type. If None, will be inferred from group name
     /// * `group_name` - The name of the group
     /// * `whitenoise` - Reference to the Whitenoise instance for database operations
+    #[perf_instrument("group_info")]
     pub async fn create_for_group(
         whitenoise: &Whitenoise,
         mls_group_id: &GroupId,
         group_type: Option<GroupType>,
         group_name: &str,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let _span = perf_span!("group_info::create_for_group");
         let group_type =
             group_type.unwrap_or_else(|| Self::infer_group_type_from_group_name(group_name));
         let (group_info, _was_created) = Self::find_or_create_by_mls_group_id(
@@ -83,12 +83,12 @@ impl GroupInformation {
     }
 
     /// Get group information by MLS group ID, creating it with a type inferred from the group name if it doesn't exist
+    #[perf_instrument("group_info")]
     pub async fn get_by_mls_group_id(
         account_pubkey: PublicKey,
         mls_group_id: &GroupId,
         whitenoise: &Whitenoise,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let _span = perf_span!("group_info::get_by_mls_group_id");
         let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
         let group = mdk
             .get_group(mls_group_id)?
@@ -104,12 +104,12 @@ impl GroupInformation {
 
     /// Get group information for multiple MLS group IDs
     /// Missing groups will be created with a type inferred from the group name
+    #[perf_instrument("group_info")]
     pub async fn get_by_mls_group_ids(
         account_pubkey: PublicKey,
         mls_group_ids: &[GroupId],
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
-        let _span = perf_span!("group_info::get_by_mls_group_ids");
         // First try to get existing records
         let existing =
             GroupInformation::find_by_mls_group_ids(mls_group_ids, &whitenoise.database).await?;
@@ -147,21 +147,21 @@ impl GroupInformation {
 }
 
 impl Whitenoise {
+    #[perf_instrument("group_info")]
     pub async fn get_group_information_by_mls_group_id(
         &self,
         account_pubkey: PublicKey,
         mls_group_id: &GroupId,
     ) -> Result<GroupInformation, WhitenoiseError> {
-        let _span = perf_span!("group_info::get_by_mls_group_id_full");
         GroupInformation::get_by_mls_group_id(account_pubkey, mls_group_id, self).await
     }
 
+    #[perf_instrument("group_info")]
     pub async fn get_group_information_by_mls_group_ids(
         &self,
         account_pubkey: PublicKey,
         mls_group_ids: &[GroupId],
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
-        let _span = perf_span!("group_info::get_by_mls_group_ids_full");
         GroupInformation::get_by_mls_group_ids(account_pubkey, mls_group_ids, self).await
     }
 }

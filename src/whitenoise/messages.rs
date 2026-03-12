@@ -1,5 +1,5 @@
 use crate::{
-    perf_span,
+    perf_instrument, perf_span,
     types::MessageWithTokens,
     whitenoise::{
         Whitenoise,
@@ -34,6 +34,7 @@ impl Whitenoise {
     ///   (e.g., text note, reaction, etc.).
     /// * `tags` - Optional vector of Nostr tags to include with the message. If None, an empty
     ///   tag list will be used.
+    #[perf_instrument("messages")]
     pub async fn send_message_to_group(
         &self,
         account: &Account,
@@ -42,8 +43,6 @@ impl Whitenoise {
         kind: u16,
         tags: Option<Vec<Tag>>,
     ) -> Result<MessageWithTokens> {
-        let _span = perf_span!("messages::send_message_to_group");
-
         let _build_span = perf_span!("messages::build_unsigned_event");
         let (inner_event, event_id) =
             self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
@@ -145,12 +144,12 @@ impl Whitenoise {
     /// Aggregates the raw MDK message into a `ChatMessage`, sets its delivery
     /// status to `Sending`, persists it in the cache, and emits a `NewMessage`
     /// update so the UI shows it immediately.
+    #[perf_instrument("messages")]
     async fn process_and_emit_outgoing_message(
         &self,
         mdk_message: &Message,
         group_id: &GroupId,
     ) -> Result<()> {
-        let _span = perf_span!("messages::process_and_emit_outgoing");
         let chat_message = self
             .message_aggregator
             .process_single_message(
@@ -190,12 +189,12 @@ impl Whitenoise {
     /// Inserts the reaction event into `aggregated_messages`, sets delivery status
     /// to `Sending`, applies the reaction to the target kind-9 message, and emits
     /// a `ReactionAdded` update so the UI reflects the change immediately.
+    #[perf_instrument("messages")]
     async fn cache_and_apply_outgoing_reaction(
         &self,
         mdk_message: &Message,
         group_id: &GroupId,
     ) -> Result<()> {
-        let _span = perf_span!("messages::cache_and_apply_outgoing_reaction");
         // Insert the reaction event row
         AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database)
             .await
@@ -264,12 +263,12 @@ impl Whitenoise {
     /// Inserts the deletion event into `aggregated_messages`, sets delivery status
     /// to `Sending`, marks the target message(s) as deleted, and emits appropriate
     /// updates so the UI reflects the change immediately.
+    #[perf_instrument("messages")]
     async fn cache_and_apply_outgoing_deletion(
         &self,
         mdk_message: &Message,
         group_id: &GroupId,
     ) -> Result<()> {
-        let _span = perf_span!("messages::cache_and_apply_outgoing_deletion");
         // Insert the deletion event row
         AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database)
             .await
@@ -389,6 +388,7 @@ impl Whitenoise {
     /// - **Kind 7 (reaction)**: Remove the reaction from the parent message's summary.
     /// - **Kind 5 (deletion)**: Clear `deletion_event_id` on targets so they reappear.
     /// - **Kind 9 / other**: No cascade needed — the message already shows Failed status.
+    #[perf_instrument("messages")]
     async fn cascade_delivery_failure(
         kind: u16,
         event_id: &str,
@@ -399,7 +399,6 @@ impl Whitenoise {
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
-        let _span = perf_span!("messages::cascade_delivery_failure");
         match kind {
             7 => {
                 // Reaction failed: remove from parent message's reaction summary
@@ -506,13 +505,13 @@ impl Whitenoise {
     ///
     /// Also emits `DeliveryStatusChanged` for the original message when it moves
     /// to `Retried`, so subscribers can update immediately without a reload.
+    #[perf_instrument("messages")]
     pub async fn retry_message_publish(
         &self,
         account: &Account,
         group_id: &GroupId,
         event_id: &EventId,
     ) -> Result<()> {
-        let _span = perf_span!("messages::retry_message_publish");
         // Guard: only retry messages that are in Failed state to prevent duplicate publishes
         let event_id_str = event_id.to_string();
         let original =
@@ -598,12 +597,12 @@ impl Whitenoise {
     /// * `pubkey` - The public key of the user requesting the messages. This is used to
     ///   fetch the appropriate account and verify access permissions.
     /// * `group_id` - The unique identifier of the group whose messages should be retrieved.
+    #[perf_instrument("messages")]
     pub async fn fetch_messages_for_group(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<MessageWithTokens>> {
-        let _span = perf_span!("messages::fetch_messages_for_group");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let messages = mdk.get_messages(group_id, None)?;
         let messages_with_tokens = messages
@@ -636,6 +635,7 @@ impl Whitenoise {
     ///   Must be `Some` whenever `before` is `Some`; `None` is only valid when `before` is also
     ///   `None` (initial load). Passing `before` without `before_message_id` returns an error.
     /// * `limit`             - Maximum number of messages to return. Defaults to 50, capped at 200.
+    #[perf_instrument("messages")]
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
@@ -644,7 +644,6 @@ impl Whitenoise {
         before_message_id: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
-        let _span = perf_span!("messages::fetch_aggregated_messages");
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
         AggregatedMessage::find_messages_by_group_paginated(
@@ -673,13 +672,13 @@ impl Whitenoise {
     /// * `pubkey`   - The public key of the requesting user (security check)
     /// * `group_id` - The group the message belongs to
     /// * `message_id` - Hex-encoded event ID of the message
+    #[perf_instrument("messages")]
     pub async fn fetch_message_by_id(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         message_id: &str,
     ) -> Result<Option<ChatMessage>> {
-        let _span = perf_span!("messages::fetch_message_by_id");
         Account::find_by_pubkey(pubkey, &self.database).await?;
 
         AggregatedMessage::find_by_id(message_id, group_id, &self.database)
@@ -713,8 +712,8 @@ impl Whitenoise {
     ///
     /// MUST be called BEFORE event processor starts to avoid race conditions.
     /// Uses simple count comparison to detect sync needs, then incrementally syncs missing events.
+    #[perf_instrument("messages")]
     pub(crate) async fn sync_message_cache_on_startup(&self) -> Result<()> {
-        let _span = perf_span!("messages::sync_cache_on_startup");
         tracing::info!(
             target: "whitenoise::cache",
             "Starting message cache synchronization..."
@@ -768,8 +767,8 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("messages")]
     async fn cache_needs_sync(&self, group_id: &GroupId, mdk_messages: &[Message]) -> Result<bool> {
-        let _span = perf_span!("messages::cache_needs_sync");
         if mdk_messages.is_empty() {
             return Ok(false);
         }
@@ -797,13 +796,13 @@ impl Whitenoise {
     /// Synchronize cache for a specific group
     ///
     /// Filters out events already in cache, then processes and saves only new events.
+    #[perf_instrument("messages")]
     async fn sync_cache_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         mdk_messages: Vec<Message>,
     ) -> Result<()> {
-        let _span = perf_span!("messages::sync_cache_for_group");
         if mdk_messages.is_empty() {
             return Ok(());
         }

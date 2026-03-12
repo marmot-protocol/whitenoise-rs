@@ -3,7 +3,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    perf_span,
+    perf_instrument,
     whitenoise::{
         Whitenoise,
         database::processed_events::ProcessedEvent,
@@ -96,8 +96,8 @@ impl User {
     /// # Arguments
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
+    #[perf_instrument("users")]
     pub async fn sync_metadata(&mut self, whitenoise: &Whitenoise) -> Result<()> {
-        let _span = perf_span!("users::sync_metadata");
         let relays_urls: Vec<_> = Relay::urls(&self.get_query_relays(whitenoise).await?);
         let metadata_event = whitenoise
             .relay_control
@@ -327,12 +327,12 @@ impl Whitenoise {
     /// - There's a database connection or query error
     /// - The public key format is invalid (though this is typically caught at the type level)
     /// - Network errors occur during blocking synchronization
+    #[perf_instrument("users")]
     pub async fn find_or_create_user_by_pubkey(
         &self,
         pubkey: &PublicKey,
         sync_mode: UserSyncMode,
     ) -> Result<User> {
-        let _span = perf_span!("users::find_or_create");
         let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
         if sync_mode == UserSyncMode::Blocking {
@@ -344,9 +344,8 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("users")]
     async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
-        let _span = perf_span!("users::sync_user_blocking");
-
         // For existing users with fresh metadata, skip the expensive network sync.
         // This matches the TTL check that Background mode already performs.
         if !is_new && !user.needs_metadata_refresh() {

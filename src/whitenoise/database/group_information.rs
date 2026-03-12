@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 
 use super::{Database, utils::parse_timestamp};
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{
     error::WhitenoiseError,
     group_information::{GroupInformation, GroupType},
@@ -81,11 +81,11 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if no group information with the given MLS group ID exists.
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_mls_group_id(
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("db::group_info_find_by_mls_group_id");
         let group_information_row = sqlx::query_as::<_, GroupInformationRow>(
             "SELECT id, mls_group_id, group_type, created_at, updated_at FROM group_information WHERE mls_group_id = ?",
         )
@@ -111,12 +111,12 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operations fail.
+    #[perf_instrument("db")]
     pub(crate) async fn find_or_create_by_mls_group_id(
         mls_group_id: &GroupId,
         group_type: Option<GroupType>,
         database: &Database,
     ) -> Result<(Self, bool), WhitenoiseError> {
-        let _span = perf_span!("db::group_info_find_or_create");
         match Self::find_by_mls_group_id(mls_group_id, database).await {
             Ok(group_info) => Ok((group_info, false)),
             Err(WhitenoiseError::SqlxError(sqlx::Error::RowNotFound)) => {
@@ -144,11 +144,11 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_mls_group_ids(
         mls_group_ids: &[GroupId],
         database: &Database,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let _span = perf_span!("db::group_info_find_by_mls_group_ids");
         if mls_group_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -175,12 +175,12 @@ impl GroupInformation {
     }
 
     // Private helper method for creating and persisting new records
+    #[perf_instrument("db")]
     async fn insert_new(
         mls_group_id: &GroupId,
         group_type: GroupType,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("db::group_info_insert_new");
         let now_ms = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, GroupInformationRow>(

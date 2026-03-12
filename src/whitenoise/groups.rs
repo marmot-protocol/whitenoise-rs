@@ -5,7 +5,7 @@ use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use crate::{
-    RelayType, perf_span,
+    RelayType, perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
         accounts::Account,
@@ -25,13 +25,13 @@ mod publish;
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 
 impl Whitenoise {
+    #[perf_instrument("groups")]
     async fn resolve_member_delivery_relays(
         &self,
         member: &User,
         fallback_account: &Account,
         context: &'static str,
     ) -> Result<Vec<Relay>> {
-        let _span = perf_span!("groups::resolve_member_delivery_relays");
         let inbox_relays = member.relays(RelayType::Inbox, &self.database).await?;
         if !inbox_relays.is_empty() {
             return Ok(inbox_relays);
@@ -93,6 +93,7 @@ impl Whitenoise {
     /// * `member_pubkeys` - List of public keys for group members
     /// * `config` - Group configuration data
     /// * `group_type` - Optional explicit group type. If None, will be inferred from participant count
+    #[perf_instrument("groups")]
     pub async fn create_group(
         &self,
         creator_account: &Account,
@@ -100,7 +101,6 @@ impl Whitenoise {
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        let _span = perf_span!("groups::create_group");
         let signer = self.get_signer_for_account(creator_account)?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
@@ -268,12 +268,12 @@ impl Whitenoise {
         Ok(group)
     }
 
+    #[perf_instrument("groups")]
     pub async fn groups(
         &self,
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
-        let _span = perf_span!("groups::groups");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups: Vec<group_types::Group> = mdk
             .get_groups()
@@ -297,8 +297,8 @@ impl Whitenoise {
     /// # Returns
     /// * `Ok(Vec<GroupWithMembership>)` - List of visible groups with their membership data
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
+    #[perf_instrument("groups")]
     pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
-        let _span = perf_span!("groups::visible_groups");
         let all_active_groups = self.groups(account, true).await?;
 
         // Get visible AccountGroup records (pending + accepted)
@@ -340,11 +340,11 @@ impl Whitenoise {
     /// # Returns
     /// * `Ok(Vec<GroupWithInfoAndMembership>)` - Visible groups with info and membership data
     /// * `Err(WhitenoiseError)` - If there is an error accessing storage
+    #[perf_instrument("groups")]
     pub async fn visible_groups_with_info(
         &self,
         account: &Account,
     ) -> Result<Vec<GroupWithInfoAndMembership>> {
-        let _span = perf_span!("groups::visible_groups_with_info");
         let visible = self.visible_groups(account).await?;
 
         if visible.is_empty() {
@@ -388,8 +388,8 @@ impl Whitenoise {
     /// * `Ok(Group)` - The group if found
     /// * `Err(WhitenoiseError::GroupNotFound)` - If the group doesn't exist
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
+    #[perf_instrument("groups")]
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
-        let _span = perf_span!("groups::group");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let group = mdk
             .get_group(group_id)
@@ -399,12 +399,12 @@ impl Whitenoise {
         Ok(group)
     }
 
+    #[perf_instrument("groups")]
     pub async fn group_members(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let _span = perf_span!("groups::group_members");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_members(group_id)
@@ -413,22 +413,22 @@ impl Whitenoise {
             .collect::<Vec<PublicKey>>())
     }
 
+    #[perf_instrument("groups")]
     pub async fn group_relays(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<BTreeSet<RelayUrl>> {
-        let _span = perf_span!("groups::group_relays");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         mdk.get_relays(group_id).map_err(WhitenoiseError::from)
     }
 
+    #[perf_instrument("groups")]
     pub async fn group_admins(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let _span = perf_span!("groups::group_admins");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         Ok(mdk
             .get_group(group_id)
@@ -439,12 +439,12 @@ impl Whitenoise {
             .collect::<Vec<PublicKey>>())
     }
 
+    #[perf_instrument("groups")]
     async fn ensure_account_is_group_admin(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        let _span = perf_span!("groups::ensure_account_is_group_admin");
         let admins = self.group_admins(account, group_id).await?;
         if !admins.contains(&account.pubkey) {
             return Err(WhitenoiseError::AccountNotAuthorized);
@@ -470,13 +470,13 @@ impl Whitenoise {
     /// * `account` - The account performing the member addition (must be group admin)
     /// * `group_id` - The ID of the group to add members to
     /// * `members` - Vector of public keys for the new members to add
+    #[perf_instrument("groups")]
     pub async fn add_members_to_group(
         &self,
         account: &Account,
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
-        let _span = perf_span!("groups::add_members_to_group");
         self.ensure_account_is_group_admin(account, group_id)
             .await?;
 
@@ -609,13 +609,13 @@ impl Whitenoise {
     /// * `account` - The account performing the member removal (must be group admin)
     /// * `group_id` - The ID of the group to remove members from
     /// * `members` - Vector of public keys for the members to remove
+    #[perf_instrument("groups")]
     pub async fn remove_members_from_group(
         &self,
         account: &Account,
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
-        let _span = perf_span!("groups::remove_members_from_group");
         self.ensure_account_is_group_admin(account, group_id)
             .await?;
 
@@ -647,13 +647,13 @@ impl Whitenoise {
     /// * `account` - The account performing the group data update (must be group admin)
     /// * `group_id` - The ID of the group to update
     /// * `group_data` - The new group data to update
+    #[perf_instrument("groups")]
     pub async fn update_group_data(
         &self,
         account: &Account,
         group_id: &GroupId,
         group_data: NostrGroupDataUpdate,
     ) -> Result<()> {
-        let _span = perf_span!("groups::update_group_data");
         self.ensure_account_is_group_admin(account, group_id)
             .await?;
 
@@ -681,8 +681,8 @@ impl Whitenoise {
     /// # Arguments
     /// * `account` - The account that wants to leave the group
     /// * `group_id` - The ID of the group to leave
+    #[perf_instrument("groups")]
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        let _span = perf_span!("groups::leave_group");
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;

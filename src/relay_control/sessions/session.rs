@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
 use crate::{
     nostr_manager::{NostrManagerError, Result},
-    perf_span,
+    perf_instrument,
     relay_control::{
         SubscriptionContext, SubscriptionStream,
         observability::{RelayTelemetry, RelayTelemetryKind},
@@ -117,14 +117,14 @@ impl RelaySession {
         false
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn ensure_relays_connected(&self, relay_urls: &[RelayUrl]) -> Result<()> {
-        let _span = perf_span!("relay::session_ensure_relays_connected");
         self.prepare_relay_urls(relay_urls).await?;
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     async fn prepare_relay_urls(&self, relay_urls: &[RelayUrl]) -> Result<PreparedRelayUrls> {
-        let _span = perf_span!("relay::session_prepare_relay_urls");
         if relay_urls.is_empty() {
             return Ok(PreparedRelayUrls {
                 usable_relay_urls: Vec::new(),
@@ -243,13 +243,14 @@ impl RelaySession {
         })
     }
 
+    #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relay_urls: &[RelayUrl],
         filter: Filter,
         timeout: std::time::Duration,
     ) -> Result<Events> {
-        let _span = perf_span!("relay::session_fetch_events_from");
         for relay_url in relay_urls {
             self.emit_telemetry(Self::apply_telemetry_scope(
                 self.config.telemetry_account_pubkey,
@@ -328,12 +329,12 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         relay_urls: &[RelayUrl],
         event: &Event,
     ) -> Result<Output<EventId>> {
-        let _span = perf_span!("relay::session_publish_event_to");
         let _publish_guard = self.state.publish_lock.lock().await;
 
         for relay_url in relay_urls {
@@ -432,12 +433,13 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_relay(&self, relay_url: &RelayUrl) -> Result<()> {
-        let _span = perf_span!("relay::session_remove_relay");
         self.client.force_remove_relay(relay_url.clone()).await?;
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn subscribe_with_id_to(
         &self,
         relay_urls: &[RelayUrl],
@@ -447,7 +449,6 @@ impl RelaySession {
         account_pubkey: Option<PublicKey>,
         group_ids: &[String],
     ) -> Result<()> {
-        let _span = perf_span!("relay::session_subscribe_with_id_to");
         for relay_url in relay_urls {
             let mut telemetry = RelayTelemetry::new(
                 RelayTelemetryKind::SubscriptionAttempt,
@@ -584,8 +585,8 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unsubscribe(&self, subscription_id: &SubscriptionId) {
-        let _span = perf_span!("relay::session_unsubscribe");
         if let Some(relay_urls) = self
             .state
             .subscription_relays
@@ -602,8 +603,8 @@ impl RelaySession {
         self.client.unsubscribe(subscription_id).await;
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn shutdown(&self) {
-        let _span = perf_span!("relay::session_shutdown");
         self.state.subscription_relays.write().await.clear();
         self.router.clear().await;
         self.client.reset().await;
@@ -611,8 +612,8 @@ impl RelaySession {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn unsubscribe_all(&self) {
-        let _span = perf_span!("relay::session_unsubscribe_all");
         let subscription_ids: Vec<SubscriptionId> = self
             .state
             .subscription_relays
@@ -870,6 +871,7 @@ impl RelaySession {
         });
     }
 
+    #[perf_instrument("relay")]
     async fn process_notification(
         notification: RelayNotification,
         plane: crate::relay_control::RelayPlane,
@@ -877,7 +879,6 @@ impl RelaySession {
         sender: &Sender<ProcessableEvent>,
         telemetry_sender: &broadcast::Sender<RelayTelemetry>,
     ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
-        let _span = perf_span!("relay::session_process_notification");
         match notification {
             RelayNotification::Notice {
                 relay_url,
@@ -995,8 +996,8 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
-        let _span = perf_span!("relay::session_ensure_relay_in_client");
         match self.client.relay(relay_url).await {
             Ok(_) => Ok(false),
             Err(_) => match self.config.relay_policy {

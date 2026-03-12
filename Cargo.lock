@@ -5456,7 +5456,17 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "whitenoise-macros",
  "windows-native-keyring-store",
+]
+
+[[package]]
+name = "whitenoise-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

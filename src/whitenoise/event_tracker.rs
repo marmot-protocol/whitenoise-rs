@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{
     accounts::Account,
     database::{Database, processed_events::ProcessedEvent, published_events::PublishedEvent},
@@ -139,11 +139,11 @@ impl WhitenoiseEventTracker {
     }
 
     /// Resolve account_id from pubkey, using the cache to avoid repeated DB lookups.
+    #[perf_instrument("event_tracker")]
     async fn resolve_account_id(
         &self,
         pubkey: &PublicKey,
     ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::resolve_account_id");
         if let Some(id) = self.account_id_cache.get(pubkey) {
             return Ok(*id);
         }
@@ -158,12 +158,12 @@ impl WhitenoiseEventTracker {
 
 #[async_trait]
 impl EventTracker for WhitenoiseEventTracker {
+    #[perf_instrument("event_tracker")]
     async fn track_published_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::track_published_event");
         let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::create(event_id, account_id, &self.database)
             .await
@@ -171,34 +171,34 @@ impl EventTracker for WhitenoiseEventTracker {
         Ok(())
     }
 
+    #[perf_instrument("event_tracker")]
     async fn account_published_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::account_published_event");
         let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn global_published_event(
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::global_published_event");
         PublishedEvent::exists(event_id, None, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn track_processed_account_event(
         &self,
         event: &Event,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::track_processed_account_event");
         let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::create(
             &event.id,
@@ -212,23 +212,23 @@ impl EventTracker for WhitenoiseEventTracker {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn already_processed_account_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::already_processed_account_event");
         let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn track_processed_global_event(
         &self,
         event: &Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::track_processed_global_event");
         ProcessedEvent::create(
             &event.id,
             None,
@@ -241,11 +241,11 @@ impl EventTracker for WhitenoiseEventTracker {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn already_processed_global_event(
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let _span = perf_span!("event_tracker::already_processed_global_event");
         ProcessedEvent::exists(event_id, None, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)

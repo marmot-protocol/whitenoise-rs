@@ -6,7 +6,7 @@ use sqlx::types::Json;
 use std::path::{Path, PathBuf};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::error::WhitenoiseError;
 
 /// Optional metadata for media files stored as JSONB
@@ -211,11 +211,11 @@ impl MediaFile {
     ///
     /// # Returns
     /// The MediaFile if found, None otherwise
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_hash(
         database: &Database,
         encrypted_file_hash: &[u8; 32],
     ) -> Result<Option<Self>, WhitenoiseError> {
-        let _span = perf_span!("db::media_file_find_by_hash");
         let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
 
         let row_opt = sqlx::query_as::<_, MediaFileRow>(
@@ -251,13 +251,13 @@ impl MediaFile {
     ///
     /// # Errors
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db")]
     pub(crate) async fn save(
         database: &Database,
         mls_group_id: &GroupId,
         account_pubkey: &PublicKey,
         params: MediaFileParams<'_>,
     ) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("db::media_file_save");
         let now_ms = chrono::Utc::now().timestamp_millis();
         let encrypted_file_hash_hex = hex::encode(params.encrypted_file_hash);
         let original_file_hash_hex = params.original_file_hash.map(hex::encode);
@@ -336,11 +336,11 @@ impl MediaFile {
     /// # Arguments
     /// * `database` - Database connection
     /// * `group_id` - The MLS group ID to fetch media files for
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_group(
         database: &Database,
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let _span = perf_span!("db::media_file_find_by_group");
         let rows = sqlx::query_as::<_, MediaFileRow>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
@@ -388,13 +388,13 @@ impl MediaFile {
     ///     // Download and decrypt the file
     /// }
     /// ```
+    #[perf_instrument("db")]
     pub(crate) async fn find_by_original_hash_and_group(
         database: &Database,
         original_file_hash: &[u8; 32],
         group_id: &GroupId,
         account_pubkey: &PublicKey,
     ) -> Result<Option<Self>, WhitenoiseError> {
-        let _span = perf_span!("db::media_file_find_by_original_hash_and_group");
         let hash_hex = hex::encode(original_file_hash);
         let account_hex = account_pubkey.to_hex();
 
@@ -438,12 +438,12 @@ impl MediaFile {
     /// let cached_path = PathBuf::from("/cache/media/abc123.jpg");
     /// let updated = MediaFile::update_file_path(&db, media_file.id.unwrap(), &cached_path).await?;
     /// ```
+    #[perf_instrument("db")]
     pub(crate) async fn update_file_path(
         database: &Database,
         id: i64,
         new_path: &Path,
     ) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("db::media_file_update_file_path");
         let path_str = new_path
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;

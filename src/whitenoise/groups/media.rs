@@ -10,7 +10,7 @@ use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::types::ImageType;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
@@ -49,12 +49,12 @@ impl Whitenoise {
     /// # Arguments
     /// * `account` - The account viewing the group
     /// * `group_id` - The MLS group ID
+    #[perf_instrument("media")]
     pub(crate) async fn sync_group_image_cache_if_needed(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        let _span = perf_span!("media::sync_group_image_cache_if_needed");
         let group: group_types::Group;
         {
             // Get group data to check if it has an image
@@ -146,6 +146,7 @@ impl Whitenoise {
     ///
     /// The returned metadata (hash, key, nonce) should be passed to `update_group_data`
     /// to update the group's image settings.
+    #[perf_instrument("media")]
     pub async fn upload_group_image(
         &self,
         account: &Account,
@@ -154,7 +155,6 @@ impl Whitenoise {
         blossom_server_url: Option<Url>,
         options: Option<MediaProcessingOptions>,
     ) -> Result<([u8; 32], [u8; 32], [u8; 12])> {
-        let _span = perf_span!("media::upload_group_image");
         let admins = self.group_admins(account, group_id).await?;
         if !admins.contains(&account.pubkey) {
             return Err(WhitenoiseError::AccountNotAuthorized);
@@ -234,6 +234,7 @@ impl Whitenoise {
         ))
     }
 
+    #[perf_instrument("media")]
     pub async fn upload_chat_media(
         &self,
         account: &Account,
@@ -242,7 +243,6 @@ impl Whitenoise {
         blossom_server_url: Option<Url>,
         options: Option<MediaProcessingOptions>,
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::upload_chat_media");
         let file_data = tokio::fs::read(file_path).await?;
         let media_detection = crate::types::detect_media_type(&file_data)?;
 
@@ -318,13 +318,13 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     pub async fn download_chat_media(
         &self,
         account: &Account,
         group_id: &GroupId,
         original_file_hash: &[u8; 32],
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::download_chat_media");
         let media_file = MediaFile::find_by_original_hash_and_group(
             &self.database,
             original_file_hash,
@@ -378,17 +378,17 @@ impl Whitenoise {
         MediaFile::update_file_path(&self.database, media_file_id, &cache_path).await
     }
 
+    #[perf_instrument("media")]
     pub async fn get_media_files_for_group(&self, group_id: &GroupId) -> Result<Vec<MediaFile>> {
-        let _span = perf_span!("media::get_media_files_for_group");
         MediaFile::find_by_group(&self.database, group_id).await
     }
 
+    #[perf_instrument("media")]
     pub async fn get_group_image_path(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<PathBuf>> {
-        let _span = perf_span!("media::get_group_image_path");
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let group = mdk
             .get_group(group_id)
@@ -398,12 +398,12 @@ impl Whitenoise {
         self.resolve_group_image_path(account, &group).await
     }
 
+    #[perf_instrument("media")]
     pub(crate) async fn resolve_group_image_path(
         &self,
         account: &Account,
         group: &group_types::Group,
     ) -> Result<Option<PathBuf>> {
-        let _span = perf_span!("media::resolve_group_image_path");
         let (image_hash, image_key, image_nonce) =
             match (&group.image_hash, &group.image_key, &group.image_nonce) {
                 (Some(hash), Some(key), Some(nonce)) => (hash, key, nonce),
@@ -439,6 +439,7 @@ impl Whitenoise {
     }
 
     /// Downloads, decrypts, and caches a group image if not already cached
+    #[perf_instrument("media")]
     async fn download_and_cache_group_image(
         &self,
         blossom_url: Option<Url>,
@@ -448,7 +449,6 @@ impl Whitenoise {
         image_key: &[u8; 32],
         image_nonce: &[u8; 12],
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::download_and_cache_group_image");
         let hash_hex = hex::encode(image_hash);
 
         if let Some(cached_path) = self.check_cached_image(&hash_hex).await? {
@@ -516,8 +516,8 @@ impl Whitenoise {
         Ok(media_file)
     }
 
+    #[perf_instrument("media")]
     async fn check_cached_image(&self, hash_hex: &str) -> Result<Option<PathBuf>> {
-        let _span = perf_span!("media::check_cached_image");
         let media_files = self.media_files();
         if let Some(cached_path) = media_files.find_file_with_prefix(hash_hex).await {
             tracing::debug!(
@@ -531,6 +531,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_to_group(
         &self,
         account_pubkey: &PublicKey,
@@ -539,7 +540,6 @@ impl Whitenoise {
         image_hash: &[u8; 32],
         image_key: &[u8; 32],
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::link_cached_image_to_group");
         let existing_record_opt = MediaFile::find_by_hash(&self.database, image_hash).await?;
 
         if let Some(existing_record) = existing_record_opt {
@@ -563,6 +563,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_from_existing_record(
         &self,
         account_pubkey: &PublicKey,
@@ -571,7 +572,6 @@ impl Whitenoise {
         image_hash: &[u8; 32],
         existing_record: crate::whitenoise::database::media_files::MediaFile,
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::link_cached_image_from_existing_record");
         let metadata_ref = existing_record.file_metadata.as_ref();
         let original_hash_ref = existing_record
             .original_file_hash
@@ -595,6 +595,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_with_detection(
         &self,
         account_pubkey: &PublicKey,
@@ -603,7 +604,6 @@ impl Whitenoise {
         image_hash: &[u8; 32],
         image_key: &[u8; 32],
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::link_cached_image_with_detection");
         tracing::debug!(
             target: "whitenoise::groups::link_cached_image_with_detection",
             "No existing database record for hash {}, detecting MIME type from cached file",
@@ -649,11 +649,11 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn download_blob_from_blossom(
         blossom_url: &Url,
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        let _span = perf_span!("media::download_blob_from_blossom");
         use nostr::hashes::{Hash, sha256::Hash as Sha256Hash};
 
         let client = BlossomClient::new(blossom_url.clone());
@@ -690,6 +690,7 @@ impl Whitenoise {
             })
     }
 
+    #[perf_instrument("media")]
     async fn download_and_decrypt_chat_media_blob(
         account_pubkey: &PublicKey,
         data_dir: &Path,
@@ -698,7 +699,6 @@ impl Whitenoise {
         media_file: &MediaFile,
         original_file_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        let _span = perf_span!("media::download_and_decrypt_chat_media_blob");
         let filename = media_file
             .file_metadata
             .as_ref()
@@ -769,6 +769,7 @@ impl Whitenoise {
             })
     }
 
+    #[perf_instrument("media")]
     async fn store_and_record_group_image(
         &self,
         account_pubkey: &PublicKey,
@@ -779,7 +780,6 @@ impl Whitenoise {
         image_type: &ImageType,
         blossom_server: &Url,
     ) -> Result<MediaFile> {
-        let _span = perf_span!("media::store_and_record_group_image");
         let hash_hex = hex::encode(image_hash);
         let filename = format!("{}.{}", hash_hex, image_type.extension());
         let blossom_url = blossom_server.join(&hash_hex).map_err(|e| {
@@ -813,13 +813,13 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn upload_encrypted_blob_to_blossom(
         blossom_server_url: &Url,
         encrypted_data: Vec<u8>,
         mime_type: &str,
         upload_keypair: &Keys,
     ) -> Result<nostr_blossom::bud02::BlobDescriptor> {
-        let _span = perf_span!("media::upload_encrypted_blob_to_blossom");
         let client = BlossomClient::new(blossom_server_url.clone());
         let upload_future = client.upload_blob(
             encrypted_data,

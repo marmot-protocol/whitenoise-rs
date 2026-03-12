@@ -1,6 +1,6 @@
 use nostr_sdk::PublicKey;
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -19,8 +19,8 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will follow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be followed
+    #[perf_instrument("follows")]
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
-        let _span = perf_span!("follows::follow_user");
         let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
         if newly_created {
@@ -42,8 +42,8 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will unfollow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be unfollowed
+    #[perf_instrument("follows")]
     pub async fn unfollow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
-        let _span = perf_span!("follows::unfollow_user");
         let user = match self.find_user_by_pubkey(pubkey).await {
             Ok(user) => user,
             Err(WhitenoiseError::UserNotFound) => return Ok(()),
@@ -64,8 +64,8 @@ impl Whitenoise {
     ///
     /// * `account` - The account to check (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to check if followed
+    #[perf_instrument("follows")]
     pub async fn is_following_user(&self, account: &Account, pubkey: &PublicKey) -> Result<bool> {
-        let _span = perf_span!("follows::is_following_user_check");
         let user = self.find_user_by_pubkey(pubkey).await;
         if user.is_err() {
             return Ok(false);
@@ -84,8 +84,8 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account whose follows to retrieve (must exist in database with valid ID)
+    #[perf_instrument("follows")]
     pub async fn follows(&self, account: &Account) -> Result<Vec<User>> {
-        let _span = perf_span!("follows::get_follows");
         account.follows(&self.database).await
     }
 }

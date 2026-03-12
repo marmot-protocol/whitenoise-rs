@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::{EventId, Kind, PublicKey};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{error::WhitenoiseError, relays::RelayType};
 
 /// Row structure for processed_events table
@@ -74,6 +74,7 @@ where
 
 impl ProcessedEvent {
     /// Records that we processed a specific event to ensure idempotency
+    #[perf_instrument("db")]
     pub(crate) async fn create(
         event_id: &EventId,
         account_id: Option<i64>,
@@ -82,7 +83,6 @@ impl ProcessedEvent {
         author: Option<&PublicKey>,
         database: &Database,
     ) -> Result<(), DatabaseError> {
-        let _span = perf_span!("db::processed_event_create");
         // Convert event_created_at to milliseconds if present
         let event_timestamp_ms = event_created_at.map(|dt| dt.timestamp_millis());
         let event_kind_i64 = event_kind.map(|k| k.as_u16() as i64);
@@ -103,12 +103,12 @@ impl ProcessedEvent {
 
     /// Checks if we already processed a specific event
     /// - account_id: Some(id) for account-specific processing, None for global processing
+    #[perf_instrument("db")]
     pub(crate) async fn exists(
         event_id: &EventId,
         account_id: Option<i64>,
         database: &Database,
     ) -> Result<bool, DatabaseError> {
-        let _span = perf_span!("db::processed_event_exists");
         let (query, bind_account_id) = match account_id {
             Some(id) => (
                 "SELECT EXISTS(SELECT 1 FROM processed_events WHERE event_id = ? AND account_id = ?)",
@@ -133,13 +133,13 @@ impl ProcessedEvent {
 
     /// Gets the newest event timestamp for specific event kind and account
     /// Optionally filters by author for global events (when account_id is None)
+    #[perf_instrument("db")]
     pub(crate) async fn newest_event_timestamp_for_kind(
         account_id: Option<i64>,
         event_kind: u16,
         author_pubkey: Option<&PublicKey>,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, DatabaseError> {
-        let _span = perf_span!("db::processed_event_newest_timestamp_for_kind");
         // Build query based on parameters
         let query = match (account_id.is_some(), author_pubkey.is_some()) {
             (true, _) => {
@@ -175,12 +175,12 @@ impl ProcessedEvent {
     }
 
     /// Gets the newest relay event timestamp for a user
+    #[perf_instrument("db")]
     pub(crate) async fn newest_relay_event_timestamp(
         user_pubkey: &PublicKey,
         relay_type: RelayType,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, WhitenoiseError> {
-        let _span = perf_span!("db::processed_event_newest_relay_event_timestamp");
         // Map relay types to their corresponding event kinds
         let kind = match relay_type {
             RelayType::Nip65 => 10002,
@@ -196,11 +196,11 @@ impl ProcessedEvent {
     }
 
     /// Gets the newest contact list event timestamp for an account
+    #[perf_instrument("db")]
     pub(crate) async fn newest_contact_list_timestamp(
         account_id: i64,
         database: &Database,
     ) -> Result<Option<DateTime<Utc>>, WhitenoiseError> {
-        let _span = perf_span!("db::processed_event_newest_contact_list_timestamp");
         // Query processed_events for kind 3 events with specific account_id
         Self::newest_event_timestamp_for_kind(Some(account_id), 3, None, database)
             .await

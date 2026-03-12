@@ -9,6 +9,9 @@ use crate::integration_tests::benchmarks::PerfTracingLayer;
 mod nostr_manager;
 pub mod perf;
 pub(crate) mod relay_control;
+
+// Re-export proc macro for ergonomic `#[perf_instrument("prefix")]` usage
+pub use whitenoise_macros::perf_instrument;
 mod types;
 pub mod whitenoise;
 

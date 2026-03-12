@@ -1,7 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::{
-    perf_span,
+    perf_instrument,
     whitenoise::{
         Whitenoise,
         accounts::Account,
@@ -13,8 +13,8 @@ use crate::{
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_relay_list(&self, event: Event) -> Result<()> {
-        let _span = perf_span!("event_handlers::handle_relay_list");
         // Check if we've already processed this specific event from this author
         let already_processed = ProcessedEvent::exists(
             &event.id,
@@ -61,8 +61,8 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("event_handlers")]
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
-        let _span = perf_span!("event_handlers::handle_subscriptions_refresh");
         let user_pubkey = user.pubkey;
         let event_pubkey = event.pubkey;
 

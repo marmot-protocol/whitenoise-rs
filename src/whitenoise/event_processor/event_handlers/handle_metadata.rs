@@ -1,7 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::{
-    perf_span,
+    perf_instrument,
     whitenoise::{
         Whitenoise,
         error::{Result, WhitenoiseError},
@@ -10,8 +10,8 @@ use crate::{
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_metadata(&self, event: Event) -> Result<()> {
-        let _span = perf_span!("event_handlers::handle_metadata");
         let (mut user, newly_created) =
             User::find_or_create_by_pubkey(&event.pubkey, &self.database).await?;
         match Metadata::from_json(&event.content) {

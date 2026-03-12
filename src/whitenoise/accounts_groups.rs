@@ -3,7 +3,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
     chat_list_streaming::ChatListUpdateTrigger, error::WhitenoiseError,
@@ -75,13 +75,13 @@ impl AccountGroup {
     ///
     /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
     /// so it can be persisted for efficient lookups.
+    #[perf_instrument("account_groups")]
     pub async fn get_or_create(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(Self, bool), WhitenoiseError> {
-        let _span = perf_span!("account_groups::get_or_create");
         let (account_group, was_created) = Self::find_or_create(
             account_pubkey,
             mls_group_id,
@@ -93,12 +93,12 @@ impl AccountGroup {
     }
 
     /// Gets an AccountGroup for the given account and group, if it exists.
+    #[perf_instrument("account_groups")]
     pub async fn get(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
     ) -> Result<Option<Self>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::get");
         let account_group =
             Self::find_by_account_and_group(account_pubkey, mls_group_id, &whitenoise.database)
                 .await?;
@@ -107,28 +107,28 @@ impl AccountGroup {
 
     /// Gets all visible AccountGroups for the given account.
     /// Visible means: pending or accepted (not declined).
+    #[perf_instrument("account_groups")]
     pub async fn visible_for_account(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::visible_for_account");
         let groups = Self::find_visible_for_account(account_pubkey, &whitenoise.database).await?;
         Ok(groups)
     }
 
     /// Gets all pending AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn pending_for_account(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::pending_for_account");
         let groups = Self::find_pending_for_account(account_pubkey, &whitenoise.database).await?;
         Ok(groups)
     }
 
     /// Accepts this group invite by setting user_confirmation to true.
+    #[perf_instrument("account_groups")]
     pub async fn accept(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("account_groups::accept");
         let updated = self
             .update_user_confirmation(true, &whitenoise.database)
             .await?;
@@ -140,12 +140,12 @@ impl AccountGroup {
     /// Uses the persisted `dm_peer_pubkey` column for an efficient single-query
     /// lookup without requiring MLS/MDK calls. Returns the group ID of the most
     /// recently created visible DM group with this peer, or `None` if none exists.
+    #[perf_instrument("account_groups")]
     pub async fn find_latest_dm_group_with_peer(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
         peer_pubkey: &PublicKey,
     ) -> Result<Option<GroupId>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::find_latest_dm_group_with_peer");
         let group_id =
             Self::find_dm_group_id_by_peer(account_pubkey, peer_pubkey, &whitenoise.database)
                 .await?;
@@ -154,8 +154,8 @@ impl AccountGroup {
 
     /// Declines this group invite by setting user_confirmation to false.
     /// The group will be hidden from the UI but remains in MLS.
+    #[perf_instrument("account_groups")]
     pub async fn decline(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("account_groups::decline");
         let updated = self
             .update_user_confirmation(false, &whitenoise.database)
             .await?;
@@ -163,8 +163,8 @@ impl AccountGroup {
     }
 
     /// Archives this chat by setting archived_at to the current time.
+    #[perf_instrument("account_groups")]
     pub async fn archive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("account_groups::archive");
         let updated = self
             .update_archived_at(Some(Utc::now()), &whitenoise.database)
             .await?;
@@ -172,8 +172,8 @@ impl AccountGroup {
     }
 
     /// Unarchives this chat by clearing archived_at.
+    #[perf_instrument("account_groups")]
     pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
-        let _span = perf_span!("account_groups::unarchive");
         let updated = self.update_archived_at(None, &whitenoise.database).await?;
         Ok(updated)
     }
@@ -184,41 +184,41 @@ impl Whitenoise {
     ///
     /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
     /// so it can be persisted for efficient lookups.
+    #[perf_instrument("account_groups")]
     pub async fn get_or_create_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(AccountGroup, bool), WhitenoiseError> {
-        let _span = perf_span!("account_groups::wn_get_or_create");
         AccountGroup::get_or_create(self, &account.pubkey, mls_group_id, dm_peer_pubkey).await
     }
 
     /// Gets all visible AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn get_visible_account_groups(
         &self,
         account: &Account,
     ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::wn_get_visible");
         AccountGroup::visible_for_account(self, &account.pubkey).await
     }
 
     /// Gets all pending AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn get_pending_account_groups(
         &self,
         account: &Account,
     ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::wn_get_pending");
         AccountGroup::pending_for_account(self, &account.pubkey).await
     }
 
     /// Accepts a group invite for the given account and MLS group.
+    #[perf_instrument("account_groups")]
     pub async fn accept_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::wn_accept");
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -226,12 +226,12 @@ impl Whitenoise {
     }
 
     /// Declines a group invite for the given account and MLS group.
+    #[perf_instrument("account_groups")]
     pub async fn decline_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::wn_decline");
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -244,12 +244,12 @@ impl Whitenoise {
     /// last_read_message_id only if the new message is newer than the current
     /// read marker. This prevents regression when messages arrive out of order
     /// or when the UI marks an older message as read after a newer one.
+    #[perf_instrument("account_groups")]
     pub async fn mark_message_read(
         &self,
         account: &Account,
         message_id: &EventId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::mark_message_read");
         let message = AggregatedMessage::find_by_message_id(message_id, &self.database)
             .await?
             .ok_or(WhitenoiseError::MessageNotFound)?;
@@ -272,12 +272,12 @@ impl Whitenoise {
     }
 
     /// Gets the last read message ID for an account in a group.
+    #[perf_instrument("account_groups")]
     pub async fn get_last_read_message_id(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<EventId>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::get_last_read_message_id");
         let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
         Ok(account_group.and_then(|ag| ag.last_read_message_id))
     }
@@ -286,13 +286,13 @@ impl Whitenoise {
     ///
     /// - `None` = unpin the chat
     /// - `Some(n)` = pin the chat with order n (lower values appear first)
+    #[perf_instrument("account_groups")]
     pub async fn set_chat_pin_order(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
         pin_order: Option<i64>,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::set_chat_pin_order");
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -307,12 +307,12 @@ impl Whitenoise {
     /// Archives a chat for the given account.
     ///
     /// Idempotent: if already archived, returns the existing state unchanged.
+    #[perf_instrument("account_groups")]
     pub async fn archive_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::archive_chat");
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -334,12 +334,12 @@ impl Whitenoise {
     /// Unarchives a chat for the given account.
     ///
     /// Idempotent: if not archived, returns the existing state unchanged.
+    #[perf_instrument("account_groups")]
     pub async fn unarchive_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let _span = perf_span!("account_groups::unarchive_chat");
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -360,12 +360,12 @@ impl Whitenoise {
 
     /// Returns the group ID of the latest DM group between the account and the
     /// given peer, or `None` if no DM group exists between them.
+    #[perf_instrument("account_groups")]
     pub async fn get_dm_group_with_peer(
         &self,
         account: &Account,
         peer_pubkey: &PublicKey,
     ) -> Result<Option<GroupId>, WhitenoiseError> {
-        let _span = perf_span!("account_groups::get_dm_group_with_peer");
         AccountGroup::find_latest_dm_group_with_peer(self, &account.pubkey, peer_pubkey).await
     }
 

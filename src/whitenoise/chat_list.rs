@@ -8,7 +8,7 @@ use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -225,8 +225,8 @@ impl Whitenoise {
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Declined and archived groups are filtered out.
+    #[perf_instrument("chat_list")]
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        let _span = perf_span!("chat_list::get_chat_list");
         let visible = self.visible_groups(account).await?;
         let active: Vec<_> = visible
             .into_iter()
@@ -238,8 +238,8 @@ impl Whitenoise {
     /// Retrieves the archived chat list for an account.
     ///
     /// Returns only archived chats, sorted by last activity.
+    #[perf_instrument("chat_list")]
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        let _span = perf_span!("chat_list::get_archived_chat_list");
         let visible = self.visible_groups(account).await?;
         let archived: Vec<_> = visible
             .into_iter()
@@ -252,12 +252,12 @@ impl Whitenoise {
     ///
     /// Handles the expensive batch pipeline: group info, messages, users, images,
     /// unread counts, assembly, and sorting.
+    #[perf_instrument("chat_list")]
     async fn build_chat_list_for(
         &self,
         account: &Account,
         groups_with_membership: Vec<GroupWithMembership>,
     ) -> Result<Vec<ChatListItem>> {
-        let _span = perf_span!("chat_list::build_chat_list_for");
         if groups_with_membership.is_empty() {
             return Ok(Vec::new());
         }
@@ -315,12 +315,12 @@ impl Whitenoise {
     /// - Group doesn't exist in MDK
     /// - GroupInformation doesn't exist (group not fully initialized)
     /// - AccountGroup is declined
+    #[perf_instrument("chat_list")]
     pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
-        let _span = perf_span!("chat_list::build_chat_list_item");
         // 1. Get group from MDK
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let Some(group) = mdk.get_group(group_id)? else {
@@ -431,13 +431,13 @@ impl Whitenoise {
     ///
     /// Checks for subscribers on both active and archived channels first to avoid
     /// expensive `build_chat_list_item` calls. Errors are logged but don't affect the caller.
+    #[perf_instrument("chat_list")]
     pub(crate) async fn emit_chat_list_update(
         &self,
         account: &Account,
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let _span = perf_span!("chat_list::emit_chat_list_update");
         let has_active = self
             .chat_list_stream_manager
             .has_subscribers(&account.pubkey);
@@ -463,12 +463,12 @@ impl Whitenoise {
     /// and the first handler modifies shared state. Only the first handler can
     /// correctly detect certain conditions (e.g., "was the deleted message the
     /// last message?"), so it must emit for all subscribers.
+    #[perf_instrument("chat_list")]
     pub(crate) async fn emit_chat_list_update_for_group(
         &self,
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let _span = perf_span!("chat_list::emit_chat_list_update_for_group");
         let account_groups = match AccountGroup::find_by_group(group_id, &self.database).await {
             Ok(groups) => groups,
             Err(e) => {
@@ -502,13 +502,13 @@ impl Whitenoise {
     /// Routes updates to the correct channel(s):
     /// - `ChatArchiveChanged`: both channels (item is moving between lists)
     /// - Other triggers: the one channel matching the item's archive status
+    #[perf_instrument("chat_list")]
     async fn emit_chat_list_update_for_account(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let _span = perf_span!("chat_list::emit_chat_list_update_for_account");
         let account = match Account::find_by_pubkey(pubkey, &self.database).await {
             Ok(acc) => acc,
             Err(e) => {
@@ -572,12 +572,12 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_group_info_map(
         &self,
         account_pubkey: PublicKey,
         group_ids: &[GroupId],
     ) -> Result<HashMap<GroupId, GroupInformation>> {
-        let _span = perf_span!("chat_list::build_group_info_map");
         let group_infos =
             GroupInformation::get_by_mls_group_ids(account_pubkey, group_ids, self).await?;
         Ok(group_infos
@@ -588,21 +588,21 @@ impl Whitenoise {
 
     /// Identifies the "other user" in each DM group using the persisted
     /// `dm_peer_pubkey` column, avoiding per-group MDK membership lookups.
+    #[perf_instrument("chat_list")]
     async fn identify_dm_participants(
         &self,
         account: &Account,
     ) -> Result<HashMap<GroupId, PublicKey>> {
-        let _span = perf_span!("chat_list::identify_dm_participants");
         let pairs =
             AccountGroup::find_dm_peers_for_account(&account.pubkey, &self.database).await?;
         Ok(pairs.into_iter().collect())
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_last_message_map(
         &self,
         group_ids: &[GroupId],
     ) -> Result<HashMap<GroupId, ChatMessageSummary>> {
-        let _span = perf_span!("chat_list::build_last_message_map");
         let summaries =
             AggregatedMessage::find_last_by_group_ids(group_ids, &self.database).await?;
         Ok(summaries
@@ -611,23 +611,23 @@ impl Whitenoise {
             .collect())
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_users_by_pubkey(
         &self,
         pubkeys: &[PublicKey],
     ) -> Result<HashMap<PublicKey, User>> {
-        let _span = perf_span!("chat_list::build_users_by_pubkey");
         let users = User::find_by_pubkeys(pubkeys, &self.database).await?;
         Ok(users.into_iter().map(|u| (u.pubkey, u)).collect())
     }
 
     /// Resolves image paths for Group-type chats only (DMs use profile picture URLs).
+    #[perf_instrument("chat_list")]
     async fn resolve_group_images(
         &self,
         account: &Account,
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> HashMap<GroupId, PathBuf> {
-        let _span = perf_span!("chat_list::resolve_group_images");
         let group_type_groups: Vec<_> = groups
             .iter()
             .filter(|g| {
@@ -650,12 +650,12 @@ impl Whitenoise {
     ///
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
+    #[perf_instrument("chat_list")]
     async fn resolve_group_image_paths(
         &self,
         account: &Account,
         groups: &[group_types::Group],
     ) -> HashMap<GroupId, PathBuf> {
-        let _span = perf_span!("chat_list::resolve_group_image_paths");
         let futures = groups.iter().map(|group| {
             let group_id = group.mls_group_id.clone();
             async move {

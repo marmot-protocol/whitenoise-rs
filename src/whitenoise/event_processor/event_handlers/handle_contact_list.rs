@@ -11,7 +11,7 @@ use crate::whitenoise::{
     utils::timestamp_to_datetime,
 };
 use crate::{
-    perf_span,
+    perf_instrument,
     relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
     types::ProcessableEvent,
 };
@@ -23,8 +23,8 @@ const CONTACT_LIST_CATCH_UP_BATCH_SIZE: usize = 500;
 const CONTACT_LIST_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
-        let _span = perf_span!("event_handlers::handle_contact_list");
         let _permit = self.acquire_contact_list_guard(account).await?;
         let account_id = account.id.ok_or(WhitenoiseError::AccountNotFound)?;
 
@@ -54,8 +54,8 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("event_handlers")]
     async fn acquire_contact_list_guard(&self, account: &Account) -> Result<OwnedSemaphorePermit> {
-        let _span = perf_span!("event_handlers::acquire_contact_list_guard");
         let semaphore = self
             .contact_list_guards
             .entry(account.pubkey)
@@ -69,8 +69,8 @@ impl Whitenoise {
         })
     }
 
+    #[perf_instrument("event_handlers")]
     async fn should_skip_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
-        let _span = perf_span!("event_handlers::should_skip_contact_list");
         if ProcessedEvent::exists(&event.id, Some(account_id), &self.database).await? {
             tracing::debug!(
                 target: "whitenoise::handle_contact_list",
@@ -87,8 +87,8 @@ impl Whitenoise {
         Ok(false)
     }
 
+    #[perf_instrument("event_handlers")]
     async fn is_stale_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
-        let _span = perf_span!("event_handlers::is_stale_contact_list");
         let event_time = timestamp_to_datetime(event.created_at)?;
         let newest_time =
             ProcessedEvent::newest_contact_list_timestamp(account_id, &self.database).await?;
@@ -167,12 +167,12 @@ impl Whitenoise {
 
     /// Fetches relay lists and metadata for a batch of users via the discovery
     /// plane. Returns the number of users whose catch-up work was queued.
+    #[perf_instrument("event_handlers")]
     async fn fetch_users_batch(
         whitenoise: &Whitenoise,
         pubkeys: &[PublicKey],
         cancel_rx: Option<watch::Receiver<bool>>,
     ) -> usize {
-        let _span = perf_span!("event_handlers::fetch_users_batch");
         let mut unique_pubkeys = pubkeys.to_vec();
         unique_pubkeys.sort_unstable_by_key(|pubkey| pubkey.to_hex());
         unique_pubkeys.dedup();
@@ -244,12 +244,12 @@ impl Whitenoise {
         queued_user_count
     }
 
+    #[perf_instrument("event_handlers")]
     async fn queue_discovery_catch_up_events(
         whitenoise: &Whitenoise,
         events: &Events,
         relay_url: &RelayUrl,
     ) -> Result<()> {
-        let _span = perf_span!("event_handlers::queue_discovery_catch_up_events");
         let source = SubscriptionContext {
             plane: RelayPlane::Discovery,
             account_pubkey: None,
