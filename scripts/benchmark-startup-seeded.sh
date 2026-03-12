@@ -38,7 +38,7 @@ echo "Generated keypair: $PUB"
 echo ""
 
 echo "=== Publishing contact list to discovery relays ==="
-cat "$FIXTURE" | nak event --sec "$SEC" $RELAYS 2>&1 || true
+cat "$FIXTURE" | nak event --sec "$SEC" $RELAYS 2>&1
 echo ""
 
 # ---------------------------------------------------------------------------
