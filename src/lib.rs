@@ -79,6 +79,9 @@ pub use whitenoise::user_search::{
     UserSearchSubscription, UserSearchUpdate,
 };
 
+// Zapstore version check
+pub use whitenoise::zapstore::fetch_latest_zapstore_version;
+
 static TRACING_GUARDS: OnceLock<Mutex<Option<(WorkerGuard, WorkerGuard)>>> = OnceLock::new();
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 

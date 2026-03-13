@@ -46,6 +46,7 @@ pub mod storage;
 pub mod user_search;
 pub mod users;
 pub mod utils;
+pub mod zapstore;
 
 use mdk_core::prelude::MDK;
 use mdk_sqlite_storage::MdkSqliteStorage;
