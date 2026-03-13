@@ -5456,6 +5456,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "whitenoise-macros",
  "windows-native-keyring-store",
 ]

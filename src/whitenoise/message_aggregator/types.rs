@@ -69,6 +69,24 @@ pub struct ChatMessage {
     pub delivery_status: Option<DeliveryStatus>,
 }
 
+/// A search result wrapping a matched message with token highlight spans.
+///
+/// Each entry in `highlight_spans` is a `[start, end]` pair of **char indices**
+/// (not byte offsets) into `message.content`. The spans appear in the order the
+/// query tokens were matched, left-to-right through the content.
+///
+/// Example: searching `"big plans"` in `"We have big plans"` yields
+/// `highlight_spans = [[8, 11], [12, 17]]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SearchResult {
+    /// The matched message, identical to what regular list queries return.
+    pub message: ChatMessage,
+
+    /// Char-index spans `[start, end]` (half-open) for each matched query token,
+    /// in the order they appear in `message.content`.
+    pub highlight_spans: Vec<[usize; 2]>,
+}
+
 /// Lightweight message summary for previews (chat list).
 ///
 /// This is a subset of `ChatMessage` optimized for display contexts where full
