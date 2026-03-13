@@ -273,10 +273,16 @@ impl Whitenoise {
 
             #[cfg(not(any(test, feature = "integration-tests")))]
             {
-                #[cfg(target_os = "macos")]
+                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
                 {
                     let store = apple_native_keyring_store::keychain::Store::new()
                         .expect("Failed to create macOS Keychain credential store");
+                    keyring_core::set_default_store(store);
+                }
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    let store = apple_native_keyring_store::protected::Store::new()
+                        .expect("Failed to create macOS protected-data credential store");
                     keyring_core::set_default_store(store);
                 }
                 #[cfg(target_os = "ios")]
