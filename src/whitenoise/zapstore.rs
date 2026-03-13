@@ -73,12 +73,7 @@ fn extract_version_from_app_event(event: &Event) -> Option<String> {
     }
 
     // Guard: the `d` tag must match our app identifier.
-    let d_tag_matches = event.tags.iter().any(|tag| {
-        let vec = tag.as_slice();
-        vec.first().map(|s| s.as_str()) == Some("d")
-            && vec.get(1).map(|s| s.as_str()) == Some(ZAPSTORE_APP_IDENTIFIER)
-    });
-    if !d_tag_matches {
+    if !has_matching_d_tag(&event.tags) {
         return None;
     }
 
@@ -88,6 +83,15 @@ fn extract_version_from_app_event(event: &Event) -> Option<String> {
         .tags
         .iter()
         .find_map(|tag| extract_version_from_a_tag(tag, &expected_prefix))
+}
+
+/// Returns `true` if `tags` contains a `d` tag whose value equals `ZAPSTORE_APP_IDENTIFIER`.
+fn has_matching_d_tag(tags: &Tags) -> bool {
+    tags.iter().any(|tag| {
+        let vec = tag.as_slice();
+        vec.first().map(|s| s.as_str()) == Some("d")
+            && vec.get(1).map(|s| s.as_str()) == Some(ZAPSTORE_APP_IDENTIFIER)
+    })
 }
 
 /// Extracts the version string from a single `a` tag value given an expected prefix.
@@ -235,12 +239,14 @@ mod tests {
     }
 
     #[test]
-    fn test_random_key_event_returns_none() {
-        // An event signed by a random key is rejected by the pubkey guard in
-        // extract_version_from_app_event before the d-tag guard is reached.
-        // The d-tag guard cannot be exercised independently in unit tests
-        // because signing with the real ZAPSTORE_APP_PUBKEY key is not possible.
-        let event = make_event_with_tags(vec![]);
-        assert_eq!(extract_version_from_app_event(&event), None);
+    fn test_has_matching_d_tag() {
+        let correct = make_tag(&["d", ZAPSTORE_APP_IDENTIFIER]);
+        let wrong = make_tag(&["d", "org.someone.else"]);
+        let unrelated = make_tag(&["e", ZAPSTORE_APP_IDENTIFIER]);
+
+        assert!(has_matching_d_tag(&Tags::from_list(vec![correct])));
+        assert!(!has_matching_d_tag(&Tags::from_list(vec![wrong])));
+        assert!(!has_matching_d_tag(&Tags::from_list(vec![unrelated])));
+        assert!(!has_matching_d_tag(&Tags::from_list(vec![])));
     }
 }
