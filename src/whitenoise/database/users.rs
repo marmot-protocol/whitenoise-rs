@@ -203,6 +203,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::UserNotFound`] if no user with the given public key exists.
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
@@ -230,6 +231,7 @@ impl User {
     ///
     /// Returns a `Vec<User>` containing all users found.
     /// Users that don't exist in the database are simply not included in the result.
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_by_pubkeys(
         pubkeys: &[PublicKey],
         database: &Database,
@@ -272,6 +274,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db::users")]
     pub(crate) async fn relays(
         &self,
         relay_type: RelayType,
@@ -311,6 +314,7 @@ impl User {
     /// Use this to record "we checked this user's metadata" even when no new
     /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
     /// for empty-profile users.
+    #[perf_instrument("db::users")]
     pub(crate) async fn touch_updated_at(
         &mut self,
         database: &Database,
@@ -341,6 +345,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db::users")]
     pub(crate) async fn save(&self, database: &Database) -> Result<User, WhitenoiseError> {
         let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
 

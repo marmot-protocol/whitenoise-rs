@@ -232,8 +232,7 @@ impl Account {
             "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.updated_at
              FROM account_follows af
              JOIN users u ON af.user_id = u.id
-             WHERE af.account_id = ?
-             ORDER BY u.created_at ASC, u.id ASC",
+             WHERE af.account_id = ?",
         )
         .bind(self.id)
         .fetch_all(&database.pool)

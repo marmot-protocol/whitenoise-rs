@@ -103,39 +103,28 @@ impl User {
             .relay_control
             .fetch_metadata_from(&relays_urls, self.pubkey)
             .await?;
-        let mut saved = false;
+
         if let Some(event) = metadata_event {
-            let metadata = Metadata::from_json(&event.content)?;
-            let should_update = self
-                .should_update_metadata(&event, false, &whitenoise.database)
-                .await?;
+            // Overwrite local metadata with whatever the relay returned.
+            // We don't guard on timestamps or "already processed" here because
+            // this is a deliberate, targeted fetch — not reactive event processing.
+            // The caller (sync_user_blocking / background_fetch_user_data) already
+            // gates on TTL, so we won't over-fetch.
+            self.metadata = Metadata::from_json(&event.content)?;
+            self.save(&whitenoise.database).await?;
 
-            if should_update {
-                self.metadata = metadata;
-
-                // Save the updated user metadata (also bumps updated_at)
-                self.save(&whitenoise.database).await?;
-                saved = true;
-
-                whitenoise
-                    .event_tracker
-                    .track_processed_global_event(&event)
-                    .await?;
-
-                tracing::debug!(
-                    target: "whitenoise::users::sync_metadata",
-                    "Updated metadata for user {} with event timestamp {} via background sync",
-                    self.pubkey,
-                    event.created_at
-                );
-            }
-        }
-        // Always record that we checked, even if no metadata was found or
-        // the event didn't need updating.  This lets needs_metadata_refresh()
-        // respect the TTL for empty-profile users.
-        if !saved {
+            tracing::debug!(
+                target: "whitenoise::users::sync_metadata",
+                "Updated metadata for user {} with event timestamp {} via background sync",
+                self.pubkey,
+                event.created_at
+            );
+        } else {
+            // No metadata found — record that we checked so TTL is respected
+            // for empty-profile users, preventing repeated fruitless fetches.
             self.touch_updated_at(&whitenoise.database).await?;
         }
+
         Ok(())
     }
 
