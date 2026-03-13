@@ -235,8 +235,11 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_d_tag_returns_none() {
-        // A kind-32267 event from a random key with no d tag — pubkey guard fires first.
+    fn test_random_key_event_returns_none() {
+        // An event signed by a random key is rejected by the pubkey guard in
+        // extract_version_from_app_event before the d-tag guard is reached.
+        // The d-tag guard cannot be exercised independently in unit tests
+        // because signing with the real ZAPSTORE_APP_PUBKEY key is not possible.
         let event = make_event_with_tags(vec![]);
         assert_eq!(extract_version_from_app_event(&event), None);
     }
