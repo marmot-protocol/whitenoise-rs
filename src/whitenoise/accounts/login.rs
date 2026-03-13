@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
 use super::{
@@ -36,7 +36,7 @@ impl Whitenoise {
         // global subscriptions to use `since=None` (unbounded re-fetch).
         let now_ms = Utc::now().timestamp_millis();
         Account::update_last_synced_max(&account.pubkey, now_ms, &self.database).await?;
-        account.last_synced_at = Some(Utc::now());
+        account.last_synced_at = DateTime::from_timestamp_millis(now_ms);
 
         let user = account.user(&self.database).await?;
 
