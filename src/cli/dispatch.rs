@@ -1599,7 +1599,8 @@ async fn search_messages(
         .iter()
         .filter_map(|r| {
             let mut msg = format_chat_message(&r.message, &display_names)?;
-            msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans).unwrap_or_default();
+            msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans)
+                .unwrap_or(serde_json::Value::Array(vec![]));
             Some(msg)
         })
         .collect();

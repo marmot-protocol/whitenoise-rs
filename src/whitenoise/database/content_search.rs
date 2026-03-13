@@ -138,8 +138,8 @@ pub fn query_tokens(query: &str) -> Vec<String> {
 /// Returns a `Vec` of `[start, end]` pairs (char indices, half-open: `content[start..end]`
 /// is the matched substring) in the order the tokens were found.
 ///
-/// If any token is not found (content does not match the query), returns an
-/// empty `Vec` rather than a partial result.
+/// If any token is not found, or if the normalization mapping cannot be built
+/// reliably (e.g. `to_lowercase` expands a codepoint), returns an empty `Vec`.
 pub fn find_highlight_spans(content: &str, query: &str) -> Vec<[usize; 2]> {
     let tokens = query_tokens(query);
     if tokens.is_empty() {
@@ -148,20 +148,59 @@ pub fn find_highlight_spans(content: &str, query: &str) -> Vec<[usize; 2]> {
 
     let normalized_content = normalize_for_search(content);
 
-    // Build a mapping from byte offset in normalized_content → char index in content.
-    // Both strings have the same number of Unicode scalar values because
-    // normalize_for_search is NFC (preserves codepoints) + to_lowercase (may change byte
-    // width but not codepoint count for any script we support). We walk both char
-    // iterators in parallel to pair char indices.
-    let content_chars: Vec<(usize, char)> = content.char_indices().collect();
-    let norm_chars: Vec<(usize, char)> = normalized_content.char_indices().collect();
+    // Build a mapping: norm_char_index → orig_char_index.
+    //
+    // `to_lowercase` can expand one codepoint into multiple (e.g. Turkish `İ`
+    // → `i` + combining dot above). When that happens the normalized string has
+    // more chars than the original, and a 1-to-1 assumption would produce wrong
+    // highlight offsets. We therefore walk the original string one char at a
+    // time, lowercase each char individually, count how many normalized chars it
+    // produces, and record the original char index for every resulting normalized
+    // char. If a single original char maps to N normalized chars, all N entries
+    // point back to that original char index.
+    //
+    // Additionally, we record the byte offset of each normalized char so we can
+    // translate byte-level match positions (from `str::find`) to char indices in
+    // the original string.
+    //
+    // Entry layout: `(norm_byte_offset, orig_char_index)`.
+    // A sentinel entry at the end holds the total byte length of normalized_content
+    // paired with `content.chars().count()`, allowing open-ended end-of-string
+    // lookups to succeed.
+    let mut norm_byte_to_orig_char: Vec<(usize, usize)> =
+        Vec::with_capacity(normalized_content.len());
+
+    let mut norm_byte = 0usize;
+    for (orig_idx, orig_char) in content.chars().enumerate() {
+        // Lowercase this single char. In almost all cases this is one char; for
+        // the handful of codepoints that expand (Turkish dotted-I, German ß in
+        // some locales, etc.) it may be two or more.
+        let lowered: String = orig_char.to_lowercase().collect();
+        for lc in lowered.chars() {
+            norm_byte_to_orig_char.push((norm_byte, orig_idx));
+            norm_byte += lc.len_utf8();
+        }
+    }
+    // Sentinel: end-of-string position.
+    norm_byte_to_orig_char.push((norm_byte, content.chars().count()));
+
+    // Helper closure: binary-search for the orig_char_index that corresponds to
+    // a given byte offset in normalized_content. Returns `None` if the offset
+    // does not land on a char boundary in the mapping (should not happen for
+    // well-formed UTF-8, but we return empty spans rather than wrong spans).
+    let lookup = |target_byte: usize| -> Option<usize> {
+        norm_byte_to_orig_char
+            .iter()
+            .find(|(b, _)| *b == target_byte)
+            .map(|(_, orig_idx)| *orig_idx)
+    };
 
     let mut spans = Vec::with_capacity(tokens.len());
     let mut search_byte_start = 0usize; // byte offset into normalized_content
 
     for token in &tokens {
-        // Find the token (already normalized) in normalized_content starting from
-        // the current forward position.
+        // Find the token (already normalized) in normalized_content starting
+        // from the current forward position.
         let Some(match_byte_start) = normalized_content[search_byte_start..].find(token.as_str())
         else {
             // Token not found — content doesn't actually match this query.
@@ -171,17 +210,12 @@ pub fn find_highlight_spans(content: &str, query: &str) -> Vec<[usize; 2]> {
         let abs_byte_start = search_byte_start + match_byte_start;
         let abs_byte_end = abs_byte_start + token.len();
 
-        // Convert byte offsets in normalized_content to char indices in content.
-        // Because we walk both char arrays simultaneously, the i-th char in
-        // normalized_content corresponds to the i-th char in content.
-        let char_start = norm_chars
-            .iter()
-            .position(|(b, _)| *b == abs_byte_start)
-            .unwrap_or(0);
-        let char_end = norm_chars
-            .iter()
-            .position(|(b, _)| *b == abs_byte_end)
-            .unwrap_or(content_chars.len());
+        // Map byte offsets back to original char indices. If either lookup fails
+        // we return empty spans rather than incorrect highlight ranges.
+        let (Some(char_start), Some(char_end)) = (lookup(abs_byte_start), lookup(abs_byte_end))
+        else {
+            return Vec::new();
+        };
 
         spans.push([char_start, char_end]);
 

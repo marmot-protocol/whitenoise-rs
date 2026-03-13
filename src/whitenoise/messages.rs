@@ -688,9 +688,10 @@ impl Whitenoise {
         Account::find_by_pubkey(pubkey, &self.database).await?;
 
         let limit_val = limit.unwrap_or(50);
-        AggregatedMessage::search_messages_in_group(group_id, query, limit_val, &self.database)
-            .await
-            .map_err(|e| WhitenoiseError::from(anyhow::anyhow!("Failed to search messages: {}", e)))
+        Ok(
+            AggregatedMessage::search_messages_in_group(group_id, query, limit_val, &self.database)
+                .await?,
+        )
     }
 
     /// Creates an unsigned nostr event with the given parameters
