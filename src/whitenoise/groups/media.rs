@@ -747,11 +747,27 @@ impl Whitenoise {
             nonce,
         };
 
-        media_manager
+        let decrypted = media_manager
             .decrypt_from_download(&encrypted_data, &reference)
             .map_err(|e| {
                 WhitenoiseError::Other(anyhow::anyhow!("Failed to decrypt chat media: {}", e))
-            })
+            })?;
+
+        // MIP-04 requires an explicit SHA-256 check on the plaintext after decryption.
+        // ChaCha20-Poly1305 authenticates the ciphertext, but does not guarantee the
+        // decrypted output matches the original file — a different plaintext encrypted
+        // under a valid derived key would pass AEAD authentication. Verify here.
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &decrypted);
+        let actual_hash: [u8; 32] = hasher.finalize().into();
+        if actual_hash != *original_file_hash {
+            return Err(WhitenoiseError::HashMismatch {
+                expected: hex::encode(original_file_hash),
+                actual: hex::encode(actual_hash),
+            });
+        }
+
+        Ok(decrypted)
     }
 
     async fn store_and_record_group_image(
