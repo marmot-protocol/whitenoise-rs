@@ -7,6 +7,7 @@ use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::{GroupId, group_types};
 use mdk_storage_traits::Secret;
 use nostr_blossom::client::BlossomClient;
+use nostr_sdk::prelude::hashes::{Hash, sha256::Hash as Sha256Hash};
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -649,12 +650,22 @@ impl Whitenoise {
             .await
     }
 
+    /// Rejects non-HTTPS Blossom URLs to prevent cleartext metadata leakage.
+    /// Debug builds also allow `http://localhost` for local testing.
+    pub(crate) fn require_https(url: &Url) -> Result<()> {
+        match url.scheme() {
+            "https" => Ok(()),
+            "http" if cfg!(debug_assertions) && url.host_str() == Some("localhost") => Ok(()),
+            _ => Err(WhitenoiseError::BlossomInsecureUrl(url.to_string())),
+        }
+    }
+
     #[perf_instrument("media")]
     async fn download_blob_from_blossom(
         blossom_url: &Url,
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        use nostr::hashes::{Hash, sha256::Hash as Sha256Hash};
+        Self::require_https(blossom_url)?;
 
         let client = BlossomClient::new(blossom_url.clone());
         let sha256 = Sha256Hash::from_slice(image_hash)
@@ -853,5 +864,46 @@ impl Whitenoise {
                 ))
             })?
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_https_accepts_https() {
+        let url = Url::parse("https://blossom.primal.net/abc123").unwrap();
+        assert!(Whitenoise::require_https(&url).is_ok());
+    }
+
+    #[test]
+    fn require_https_rejects_http() {
+        let url = Url::parse("http://evil.example.com/abc123").unwrap();
+        let err = Whitenoise::require_https(&url).unwrap_err();
+        assert!(
+            matches!(err, WhitenoiseError::BlossomInsecureUrl(_)),
+            "Expected BlossomInsecureUrl, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn require_https_rejects_ftp() {
+        let url = Url::parse("ftp://files.example.com/blob").unwrap();
+        assert!(Whitenoise::require_https(&url).is_err());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn require_https_allows_localhost_http_in_debug() {
+        let url = Url::parse("http://localhost:3000/abc123").unwrap();
+        assert!(Whitenoise::require_https(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn require_https_rejects_non_localhost_http_in_debug() {
+        let url = Url::parse("http://192.168.1.1:3000/abc123").unwrap();
+        assert!(Whitenoise::require_https(&url).is_err());
     }
 }

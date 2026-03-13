@@ -177,6 +177,9 @@ pub enum WhitenoiseError {
     #[error("Failed to download from Blossom server: {0}")]
     BlossomDownload(String),
 
+    #[error("Blossom URL must use HTTPS: {0}")]
+    BlossomInsecureUrl(String),
+
     #[error("Key package publish failed: {0}")]
     KeyPackagePublishFailed(String),
 
@@ -352,6 +355,10 @@ mod tests {
         assert_eq!(
             WhitenoiseError::BlossomDownload("timeout".to_string()).to_string(),
             "Failed to download from Blossom server: timeout"
+        );
+        assert_eq!(
+            WhitenoiseError::BlossomInsecureUrl("http://evil.com".to_string()).to_string(),
+            "Blossom URL must use HTTPS: http://evil.com"
         );
         assert_eq!(
             WhitenoiseError::KeyPackagePublishFailed("no relays accepted".to_string()).to_string(),
