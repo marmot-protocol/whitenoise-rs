@@ -97,6 +97,7 @@ impl RelayEventRecord {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn list_recent_for_scope(
         relay_url: &RelayUrl,
         plane: RelayPlane,

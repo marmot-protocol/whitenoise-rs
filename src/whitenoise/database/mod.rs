@@ -17,6 +17,7 @@ pub mod accounts_groups;
 pub mod aggregated_messages;
 pub mod app_settings;
 pub mod cached_graph_users;
+pub mod content_search;
 pub mod drafts;
 pub mod group_information;
 pub mod media_files;

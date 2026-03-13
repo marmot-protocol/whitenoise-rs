@@ -214,6 +214,15 @@ pub enum Request {
         message_id: String,
     },
 
+    #[serde(rename = "search_messages")]
+    SearchMessages {
+        account: String,
+        group_id: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+
     // Media
     #[serde(rename = "upload_media")]
     UploadMedia {
@@ -249,6 +258,40 @@ pub enum Request {
     // Debug
     #[serde(rename = "debug_relay_control_state")]
     DebugRelayControlState,
+    #[serde(rename = "debug_health")]
+    DebugHealth { account: String },
+    #[serde(rename = "debug_ratchet_tree")]
+    DebugRatchetTree { account: String, group_id: String },
+
+    // Reset
+    #[serde(rename = "delete_all_data")]
+    DeleteAllData,
+
+    // Groups — admin management
+    #[serde(rename = "group_promote")]
+    GroupPromote {
+        account: String,
+        group_id: String,
+        pubkey: String,
+    },
+    #[serde(rename = "group_demote")]
+    GroupDemote {
+        account: String,
+        group_id: String,
+        pubkey: String,
+    },
+
+    // Key packages
+    #[serde(rename = "keys_list")]
+    KeysList { account: String },
+    #[serde(rename = "keys_publish")]
+    KeysPublish { account: String },
+    #[serde(rename = "keys_delete")]
+    KeysDelete { account: String, event_id: String },
+    #[serde(rename = "keys_delete_all")]
+    KeysDeleteAll { account: String },
+    #[serde(rename = "keys_check")]
+    KeysCheck { pubkey: String },
 }
 
 fn default_radius_start() -> u8 {
@@ -1281,5 +1324,174 @@ mod tests {
         let wire = r#"{"method":"login_start","params":{"nsec":"nsec1test"}}"#;
         let parsed: Request = serde_json::from_str(wire).unwrap();
         assert!(matches!(parsed, Request::LoginStart { nsec } if nsec == "nsec1test"));
+    }
+
+    #[test]
+    fn search_messages_roundtrip_with_limit() {
+        let req = Request::SearchMessages {
+            account: "npub1abc".to_string(),
+            group_id: "group123".to_string(),
+            query: "hello world".to_string(),
+            limit: Some(25),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""method":"search_messages""#));
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchMessages { account, group_id, query, limit }
+            if account == "npub1abc"
+                && group_id == "group123"
+                && query == "hello world"
+                && limit == Some(25)
+        ));
+    }
+
+    #[test]
+    fn search_messages_roundtrip_limit_omitted() {
+        let req = Request::SearchMessages {
+            account: "npub1abc".to_string(),
+            group_id: "group123".to_string(),
+            query: "marmot".to_string(),
+            limit: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // limit: None should serialize as null (serde default)
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchMessages { limit, .. }
+            if limit.is_none()
+        ));
+
+        // Also verify that omitting the field entirely in incoming JSON gives None
+        let wire = r#"{"method":"search_messages","params":{"account":"npub1abc","group_id":"group123","query":"marmot"}}"#;
+        let parsed_wire: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed_wire,
+            Request::SearchMessages { limit, .. }
+            if limit.is_none()
+        ));
+    }
+
+    #[test]
+    fn debug_health_roundtrip() {
+        let req = Request::DebugHealth {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::DebugHealth { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn debug_ratchet_tree_roundtrip() {
+        let req = Request::DebugRatchetTree {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::DebugRatchetTree { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn delete_all_data_roundtrip() {
+        let req = Request::DeleteAllData;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"method":"delete_all_data"}"#);
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::DeleteAllData));
+    }
+
+    #[test]
+    fn group_promote_roundtrip() {
+        let req = Request::GroupPromote {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            pubkey: "npub1xyz".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupPromote { account, group_id, pubkey }
+            if account == "npub1abc" && group_id == "abcd1234" && pubkey == "npub1xyz"
+        ));
+    }
+
+    #[test]
+    fn group_demote_roundtrip() {
+        let req = Request::GroupDemote {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            pubkey: "npub1xyz".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::GroupDemote { account, group_id, pubkey }
+            if account == "npub1abc" && group_id == "abcd1234" && pubkey == "npub1xyz"
+        ));
+    }
+
+    #[test]
+    fn keys_list_roundtrip() {
+        let req = Request::KeysList {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::KeysList { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn keys_publish_roundtrip() {
+        let req = Request::KeysPublish {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::KeysPublish { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn keys_delete_roundtrip() {
+        let req = Request::KeysDelete {
+            account: "npub1abc".to_string(),
+            event_id: "eventid123".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::KeysDelete { account, event_id }
+            if account == "npub1abc" && event_id == "eventid123"
+        ));
+    }
+
+    #[test]
+    fn keys_delete_all_roundtrip() {
+        let req = Request::KeysDeleteAll {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::KeysDeleteAll { account } if account == "npub1abc"));
+    }
+
+    #[test]
+    fn keys_check_roundtrip() {
+        let req = Request::KeysCheck {
+            pubkey: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::KeysCheck { pubkey } if pubkey == "npub1abc"));
     }
 }

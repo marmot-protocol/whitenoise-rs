@@ -7,6 +7,7 @@ use std::{
 };
 
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 
@@ -85,12 +86,10 @@ impl RelaySession {
         &self.config
     }
 
-    #[allow(dead_code)]
     pub(crate) fn telemetry(&self) -> broadcast::Receiver<RelayTelemetry> {
         self.telemetry_sender.subscribe()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn notification_handler_registered(&self) -> bool {
         self.state
             .notification_handler_registered
@@ -196,12 +195,42 @@ impl RelaySession {
 
         if added_new_relay || !relays_to_wait.is_empty() {
             let connect_timeout = self.config.connect_timeout;
-            join_all(
-                relays_to_wait
-                    .into_iter()
-                    .map(|relay| async move { relay.wait_for_connection(connect_timeout).await }),
-            )
-            .await;
+            let already_connected = usable_relay_urls.len() - relays_to_wait.len();
+
+            match self.config.min_connected_relays {
+                Some(target) if already_connected < target => {
+                    let needed = target.min(usable_relay_urls.len()) - already_connected;
+                    let mut futs: FuturesUnordered<_> = relays_to_wait
+                        .into_iter()
+                        .map(|relay| async move {
+                            relay.wait_for_connection(connect_timeout).await;
+                            relay
+                        })
+                        .collect();
+
+                    let mut newly_connected = 0;
+                    while let Some(relay) = futs.next().await {
+                        if matches!(relay.status(), RelayStatus::Connected) {
+                            newly_connected += 1;
+                        }
+                        if newly_connected >= needed {
+                            break;
+                        }
+                    }
+                    // Remaining futures are dropped. The underlying connections
+                    // continue in background and nostr-sdk auto-resubscribes
+                    // when they come online.
+                }
+                Some(_) => {
+                    // Already have enough connected relays, skip waiting.
+                }
+                None => {
+                    join_all(relays_to_wait.into_iter().map(|relay| async move {
+                        relay.wait_for_connection(connect_timeout).await;
+                    }))
+                    .await;
+                }
+            }
         }
 
         let mut connected_relays = 0usize;
@@ -242,7 +271,6 @@ impl RelaySession {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn fetch_events_from(
         &self,
         relay_urls: &[RelayUrl],

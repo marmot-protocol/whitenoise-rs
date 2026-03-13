@@ -10,7 +10,6 @@ use crate::whitenoise::database::{
 };
 
 /// High-level relay failure classification to be persisted in later phases.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayFailureCategory {
     Transport,
@@ -134,7 +133,6 @@ impl FromStr for RelayFailureCategory {
 }
 
 /// Structured relay telemetry kind.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RelayTelemetryKind {
     Connected,
@@ -199,7 +197,6 @@ impl FromStr for RelayTelemetryKind {
 }
 
 /// Normalized relay telemetry payload shape.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayTelemetry {
     pub(crate) kind: RelayTelemetryKind,
@@ -212,7 +209,6 @@ pub(crate) struct RelayTelemetry {
     pub(crate) message: Option<String>,
 }
 
-#[allow(dead_code)]
 impl RelayTelemetry {
     pub(crate) fn new(kind: RelayTelemetryKind, plane: RelayPlane, relay_url: RelayUrl) -> Self {
         Self {
@@ -232,6 +228,7 @@ impl RelayTelemetry {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_occurred_at(mut self, occurred_at: DateTime<Utc>) -> Self {
         self.occurred_at = occurred_at;
         self
@@ -278,7 +275,6 @@ impl RelayTelemetry {
 }
 
 /// Static observability configuration owned by the control plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayObservabilityConfig {
     pub(crate) recent_event_limit: usize,
@@ -295,18 +291,17 @@ impl Default for RelayObservabilityConfig {
 }
 
 /// Relay-observability host for persistence and later aggregation logic.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelayObservability {
     config: RelayObservabilityConfig,
 }
 
-#[allow(dead_code)]
 impl RelayObservability {
     pub(crate) fn new(config: RelayObservabilityConfig) -> Self {
         Self { config }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> &RelayObservabilityConfig {
         &self.config
     }
@@ -362,6 +357,7 @@ impl RelayObservability {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn status(
         &self,
         database: &Database,
@@ -372,6 +368,7 @@ impl RelayObservability {
         RelayStatusRecord::find(relay_url, plane, account_pubkey, database).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn recent_events(
         &self,
         database: &Database,

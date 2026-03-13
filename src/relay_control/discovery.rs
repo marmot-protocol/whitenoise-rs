@@ -17,7 +17,6 @@ use crate::{
 const MAX_USERS_PER_PUBLIC_DISCOVERY_SUBSCRIPTION: usize = 500;
 
 /// Configuration for the long-lived discovery plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiscoveryPlaneConfig {
     pub(crate) relays: Vec<RelayUrl>,
@@ -33,7 +32,6 @@ impl Default for DiscoveryPlaneConfig {
     }
 }
 
-#[allow(dead_code)]
 impl DiscoveryPlaneConfig {
     pub(crate) fn new(relays: Vec<RelayUrl>) -> Self {
         Self {
@@ -86,6 +84,7 @@ impl DiscoveryPlane {
         let mut session_config = RelaySessionConfig::new(RelayPlane::Discovery);
         session_config.auth_policy = RelaySessionAuthPolicy::Disabled;
         session_config.reconnect_policy = config.reconnect_policy;
+        session_config.min_connected_relays = Some(2);
 
         Self {
             config,

@@ -16,8 +16,8 @@ use crate::{
 };
 
 /// Configuration for the long-lived group-message plane.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct GroupPlaneConfig {
     pub(crate) relays: Vec<RelayUrl>,
     pub(crate) group_ids: Vec<String>,
@@ -69,6 +69,7 @@ impl GroupPlane {
         let mut config = RelaySessionConfig::new(RelayPlane::Group);
         config.auth_policy = RelaySessionAuthPolicy::Disabled;
         config.reconnect_policy = RelaySessionReconnectPolicy::FreshnessBiased;
+        config.min_connected_relays = Some(2);
 
         Self {
             session: RelaySession::new(config, event_sender),

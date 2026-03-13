@@ -9,7 +9,9 @@ use crate::nostr_manager::parser::SerializableToken;
 use crate::whitenoise::{
     aggregated_message::AggregatedMessage,
     media_files::MediaFile,
-    message_aggregator::{ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary},
+    message_aggregator::{
+        ChatMessage, ChatMessageSummary, DeliveryStatus, ReactionSummary, SearchResult,
+    },
     utils::timestamp_to_datetime,
 };
 
@@ -340,6 +342,56 @@ impl AggregatedMessage {
         Ok(messages)
     }
 
+    /// Search messages within a group by content using forward-order substring matching.
+    ///
+    /// Matches against `content_normalized`, a NFC-lowercased copy of the content
+    /// stored at insert time — so that case folding is correct for all Unicode scripts,
+    /// including those where SQLite's built-in `LOWER()` is a no-op.
+    ///
+    /// Each returned [`SearchResult`] includes the matched [`ChatMessage`] and
+    /// `highlight_spans`: char-index `[start, end]` pairs for each query token in the
+    /// order they appear in the message content, ready for frontend highlighting.
+    pub async fn search_messages_in_group(
+        group_id: &GroupId,
+        query: &str,
+        limit: u32,
+        database: &Database,
+    ) -> Result<Vec<SearchResult>> {
+        let limit_val = i64::from(limit.min(200));
+        let like_pattern = super::content_search::query_to_like_pattern(query);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9
+               AND am.mls_group_id = ?
+               AND am.deletion_event_id IS NULL
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+               AND am.content_normalized LIKE ?
+             ORDER BY am.created_at DESC
+             LIMIT ?",
+        )
+        .bind(group_id.as_slice())
+        .bind(&like_pattern)
+        .bind(limit_val)
+        .fetch_all(&database.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let message = Self::row_to_chat_message(row)?;
+                let highlight_spans =
+                    super::content_search::find_highlight_spans(&message.content, query);
+                Ok(SearchResult {
+                    message,
+                    highlight_spans,
+                })
+            })
+            .collect()
+    }
+
     /// Save all events (kind 9, 7, 5) from sync in ONE transaction with single batch INSERT
     ///
     /// All events inserted in one batch - kind 9 gets full data, kind 7/5 get empty defaults
@@ -384,15 +436,19 @@ impl AggregatedMessage {
 
                     sqlx::query(
                         "INSERT OR IGNORE INTO aggregated_messages
-                         (message_id, mls_group_id, author, created_at, kind, content, tags,
-                          reply_to_id, content_tokens, reactions, media_attachments)
-                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)",
+                         (message_id, mls_group_id, author, created_at, kind, content,
+                          content_normalized, tags, reply_to_id, content_tokens, reactions,
+                          media_attachments)
+                         VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .bind(message.id.to_string())
                     .bind(group_id.as_slice())
                     .bind(message.pubkey.to_hex())
                     .bind(created_at.timestamp_millis())
                     .bind(&message.content)
+                    .bind(super::content_search::normalize_for_search(
+                        &message.content,
+                    ))
                     .bind(serde_json::to_string(&message.tags)?)
                     .bind(chat_msg.reply_to_id.as_ref())
                     .bind(serde_json::to_string(&chat_msg.content_tokens)?)
@@ -446,11 +502,12 @@ impl AggregatedMessage {
 
         sqlx::query(
             "INSERT INTO aggregated_messages
-             (message_id, mls_group_id, author, created_at, kind, content, tags,
-              reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?)
+             (message_id, mls_group_id, author, created_at, kind, content, content_normalized,
+              tags, reply_to_id, content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
+               content_normalized = excluded.content_normalized,
                tags = excluded.tags,
                reply_to_id = excluded.reply_to_id,
                content_tokens = excluded.content_tokens,
@@ -462,6 +519,9 @@ impl AggregatedMessage {
         .bind(message.author.to_hex())
         .bind(created_at.timestamp_millis())
         .bind(&message.content)
+        .bind(super::content_search::normalize_for_search(
+            &message.content,
+        ))
         .bind(serde_json::to_string(&message.tags)?)
         .bind(&message.reply_to_id)
         .bind(serde_json::to_string(&message.content_tokens)?)
@@ -2881,5 +2941,162 @@ mod tests {
             matches!(err, DatabaseError::InvalidCursor { .. }),
             "expected InvalidCursor for short hex id, got: {err}"
         );
+    }
+
+    fn create_test_chat_message_with_content(
+        seed: u8,
+        author: PublicKey,
+        content: &str,
+    ) -> ChatMessage {
+        let id = format!("{:0>64}", format!("{:x}", seed));
+        ChatMessage {
+            id,
+            author,
+            content: content.to_string(),
+            created_at: Timestamp::from(1_700_000_000u64 + seed as u64),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_messages_in_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[42; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        let messages = vec![
+            create_test_chat_message_with_content(1, author, "hello world"),
+            create_test_chat_message_with_content(2, author, "marmot protocol is the future"),
+            create_test_chat_message_with_content(
+                3,
+                author,
+                "our big plans are bigger than you imagine",
+            ),
+            create_test_chat_message_with_content(4, author, "日本語のメッセージ"),
+            create_test_chat_message_with_content(5, author, "привет мир from the colony"),
+            create_test_chat_message_with_content(6, author, "नमस्ते दुनिया"),
+        ];
+
+        for msg in &messages {
+            AggregatedMessage::insert_message(msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Basic single-word search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "hello",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message.content, "hello world");
+
+        // Forward-order multi-word search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "big plans",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].message.content,
+            "our big plans are bigger than you imagine"
+        );
+
+        // Substring matching ("big" matches "bigger")
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "big", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Case insensitive
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "MARMOT",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message.content, "marmot protocol is the future");
+
+        // CJK search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "日本語",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message.content, "日本語のメッセージ");
+
+        // Cyrillic search
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "привет",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Devanagari search (with combining marks)
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "नमस्ते",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message.content, "नमस्ते दुनिया");
+
+        // No match
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "nonexistent",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(results.is_empty());
+
+        // Empty query matches all
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 6);
+
+        // Limit is respected
+        let results =
+            AggregatedMessage::search_messages_in_group(&group_id, "", 2, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

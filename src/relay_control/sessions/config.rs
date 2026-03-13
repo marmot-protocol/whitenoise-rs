@@ -5,17 +5,16 @@ use nostr_sdk::PublicKey;
 use crate::relay_control::RelayPlane;
 
 /// Session-level auth policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionAuthPolicy {
     #[default]
     Disabled,
     Allowed,
+    #[allow(dead_code)]
     Required,
 }
 
 /// Session-level reconnect policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionReconnectPolicy {
     Conservative,
@@ -25,16 +24,15 @@ pub(crate) enum RelaySessionReconnectPolicy {
 }
 
 /// Session-level relay membership policy.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum RelaySessionRelayPolicy {
     #[default]
     Dynamic,
+    #[allow(dead_code)]
     ExplicitOnly,
 }
 
 /// Shared session configuration reused by all future relay planes.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelaySessionConfig {
     pub(crate) plane: RelayPlane,
@@ -43,6 +41,12 @@ pub(crate) struct RelaySessionConfig {
     pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
     pub(crate) relay_policy: RelaySessionRelayPolicy,
     pub(crate) connect_timeout: Duration,
+    /// Minimum number of relays that must be connected before proceeding.
+    /// When set, `prepare_relay_urls` returns as soon as this threshold is
+    /// reached instead of waiting for every relay. Remaining connections
+    /// continue in the background and nostr-sdk auto-resubscribes them.
+    /// When `None`, waits for all relays (the default).
+    pub(crate) min_connected_relays: Option<usize>,
 }
 
 impl RelaySessionConfig {
@@ -54,6 +58,7 @@ impl RelaySessionConfig {
             reconnect_policy: RelaySessionReconnectPolicy::Disabled,
             relay_policy: RelaySessionRelayPolicy::Dynamic,
             connect_timeout: Duration::from_secs(5),
+            min_connected_relays: None,
         }
     }
 }

@@ -5470,6 +5470,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "windows-native-keyring-store",
 ]
 
