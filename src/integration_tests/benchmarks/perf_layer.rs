@@ -63,9 +63,10 @@ impl PerfBreakdown {
         let call_count = samples.len() as u64;
         let total_duration: Duration = samples.iter().sum();
         let mean = stats::calculate_mean(&samples);
+        // calculate_median sorts samples in place; p95/p99 reuse the sorted slice.
         let median = stats::calculate_median(&mut samples);
-        let p95 = stats::calculate_percentile(&mut samples.clone(), 0.95);
-        let p99 = stats::calculate_percentile(&mut samples.clone(), 0.99);
+        let p95 = stats::calculate_percentile(&mut samples, 0.95);
+        let p99 = stats::calculate_percentile(&mut samples, 0.99);
         let min = *samples.iter().min().unwrap_or(&Duration::ZERO);
         let max = *samples.iter().max().unwrap_or(&Duration::ZERO);
 

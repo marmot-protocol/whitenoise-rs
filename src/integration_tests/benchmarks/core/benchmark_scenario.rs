@@ -35,7 +35,12 @@ pub trait BenchmarkScenario {
     ) -> Result<Duration, WhitenoiseError>;
 
     /// Run the benchmark with standard warmup, timing, and statistics collection.
-    /// Override this method only if you need custom orchestration (Level 3).
+    ///
+    /// Override this method only if you need custom orchestration (e.g. multi-phase
+    /// timing or a custom iteration loop). If you do override it, you are responsible
+    /// for calling `PERF_LAYER.get().map(|l| l.clear())` before the timed phase and
+    /// `PERF_LAYER.get().map(|l| l.drain())` at the end to collect perf breakdowns —
+    /// the default implementation does both; overrides do not inherit that logic.
     async fn run_benchmark(
         &mut self,
         whitenoise: &'static Whitenoise,
