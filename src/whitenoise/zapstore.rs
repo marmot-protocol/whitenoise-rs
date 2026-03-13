@@ -9,6 +9,13 @@ const ZAPSTORE_APP_PUBKEY: &str =
     "75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7";
 const ZAPSTORE_APP_IDENTIFIER: &str = "org.parres.whitenoise";
 const FETCH_TIMEOUT_SECS: u64 = 10;
+const ZAPSTORE_A_TAG_PREFIX: &str = concat!(
+    "30063:",
+    "75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7",
+    ":",
+    "org.parres.whitenoise",
+    "@",
+);
 
 /// Fetches the latest version string published on Zapstore for White Noise.
 ///
@@ -20,6 +27,12 @@ const FETCH_TIMEOUT_SECS: u64 = 10;
 ///
 /// Returns `None` when the app event is absent or carries no valid `a` tag.
 pub async fn fetch_latest_zapstore_version() -> Result<Option<String>> {
+    tracing::debug!(
+        target: "whitenoise::zapstore",
+        relay = ZAPSTORE_RELAY,
+        "fetching latest zapstore version"
+    );
+
     let pubkey = PublicKey::from_hex(ZAPSTORE_APP_PUBKEY).map_err(WhitenoiseError::from)?;
 
     // Fetch the single addressable kind-32267 Software Application event.
@@ -42,11 +55,25 @@ pub async fn fetch_latest_zapstore_version() -> Result<Option<String>> {
 
     client.disconnect().await;
 
-    let events = fetch_result.map_err(WhitenoiseError::from)?;
+    let events = fetch_result.map_err(|e| {
+        tracing::warn!(
+            target: "whitenoise::zapstore",
+            error = %e,
+            "failed to fetch app event from relay"
+        );
+        WhitenoiseError::from(e)
+    })?;
 
     let event = match events.first() {
         Some(e) => e,
-        None => return Ok(None),
+        None => {
+            tracing::warn!(
+                target: "whitenoise::zapstore",
+                relay = ZAPSTORE_RELAY,
+                "no app event found on relay"
+            );
+            return Ok(None);
+        }
     };
 
     Ok(extract_version_from_app_event(event))
@@ -77,12 +104,10 @@ fn extract_version_from_app_event(event: &Event) -> Option<String> {
         return None;
     }
 
-    let expected_prefix = format!("30063:{}:{}@", ZAPSTORE_APP_PUBKEY, ZAPSTORE_APP_IDENTIFIER);
-
     event
         .tags
         .iter()
-        .find_map(|tag| extract_version_from_a_tag(tag, &expected_prefix))
+        .find_map(|tag| extract_version_from_a_tag(tag, ZAPSTORE_A_TAG_PREFIX))
 }
 
 /// Returns `true` if `tags` contains a `d` tag whose value equals `ZAPSTORE_APP_IDENTIFIER`.
@@ -115,7 +140,7 @@ mod tests {
     use super::*;
 
     fn make_tag(values: &[&str]) -> Tag {
-        Tag::parse(values.iter().map(|s| s.to_string()).collect::<Vec<_>>()).expect("valid tag")
+        Tag::parse(values.iter().copied()).expect("valid tag")
     }
 
     /// Builds a kind-32267 event signed by a random key.
@@ -131,8 +156,8 @@ mod tests {
             .expect("signing succeeds")
     }
 
-    fn valid_prefix() -> String {
-        format!("30063:{}:{}@", ZAPSTORE_APP_PUBKEY, ZAPSTORE_APP_IDENTIFIER)
+    fn valid_prefix() -> &'static str {
+        ZAPSTORE_A_TAG_PREFIX
     }
 
     // --- extract_version_from_a_tag: tag-parsing unit tests ---
@@ -145,7 +170,7 @@ mod tests {
             "30063:75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7:org.parres.whitenoise@2026.3.5",
         ]);
         assert_eq!(
-            extract_version_from_a_tag(&tag, &prefix),
+            extract_version_from_a_tag(&tag, prefix),
             Some("2026.3.5".to_string())
         );
     }
@@ -154,7 +179,7 @@ mod tests {
     fn test_non_a_tag_returns_none() {
         let prefix = valid_prefix();
         let tag = make_tag(&["d", "org.parres.whitenoise"]);
-        assert_eq!(extract_version_from_a_tag(&tag, &prefix), None);
+        assert_eq!(extract_version_from_a_tag(&tag, prefix), None);
     }
 
     #[test]
@@ -165,7 +190,7 @@ mod tests {
             "a",
             "32267:75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7:org.parres.whitenoise",
         ]);
-        assert_eq!(extract_version_from_a_tag(&tag, &prefix), None);
+        assert_eq!(extract_version_from_a_tag(&tag, prefix), None);
     }
 
     #[test]
@@ -175,7 +200,7 @@ mod tests {
             "a",
             "30063:0000000000000000000000000000000000000000000000000000000000000001:org.parres.whitenoise@2026.3.5",
         ]);
-        assert_eq!(extract_version_from_a_tag(&tag, &prefix), None);
+        assert_eq!(extract_version_from_a_tag(&tag, prefix), None);
     }
 
     #[test]
@@ -185,7 +210,7 @@ mod tests {
             "a",
             "30063:75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7:org.someone.else@2026.3.5",
         ]);
-        assert_eq!(extract_version_from_a_tag(&tag, &prefix), None);
+        assert_eq!(extract_version_from_a_tag(&tag, prefix), None);
     }
 
     #[test]
@@ -196,7 +221,7 @@ mod tests {
             "a",
             "30063:75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7:org.parres.whitenoise@",
         ]);
-        assert_eq!(extract_version_from_a_tag(&tag, &prefix), None);
+        assert_eq!(extract_version_from_a_tag(&tag, prefix), None);
     }
 
     #[test]
@@ -215,7 +240,7 @@ mod tests {
         let tags = vec![tag1, tag2];
         let result = tags
             .iter()
-            .find_map(|t| extract_version_from_a_tag(t, &prefix));
+            .find_map(|t| extract_version_from_a_tag(t, prefix));
         assert_eq!(result, Some("2026.3.5".to_string()));
     }
 
