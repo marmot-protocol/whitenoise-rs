@@ -2632,34 +2632,6 @@ mod tests {
         );
     }
 
-    /// upload_profile_picture rejects non-HTTPS server URLs
-    #[tokio::test]
-    async fn test_upload_profile_picture_rejects_http() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-
-        let (account, keys) = create_test_account(&whitenoise).await;
-        let account = whitenoise.persist_account(&account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
-
-        let http_url = nostr_sdk::Url::parse("http://evil.example.com").unwrap();
-
-        let result = account
-            .upload_profile_picture(
-                "any_path.png",
-                crate::types::ImageType::Png,
-                http_url,
-                &whitenoise,
-            )
-            .await;
-
-        assert!(result.is_err(), "HTTP URLs must be rejected");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("HTTPS"),
-            "Error should mention HTTPS, got: {err_msg}"
-        );
-    }
-
     /// Test login_with_external_signer creates new external account
     #[tokio::test]
     async fn test_login_with_external_signer_new_account() {

@@ -607,4 +607,31 @@ mod tests {
             "member account should process the same wire event under its own account context"
         );
     }
+
+    #[tokio::test]
+    async fn test_validate_giftwrap_target_missing_p_tag() {
+        let keys = Keys::generate();
+        let account = Account {
+            id: None,
+            pubkey: keys.public_key(),
+            user_id: 0,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let event = EventBuilder::new(Kind::TextNote, "no p tag")
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = super::validate_giftwrap_target(&account, &event);
+        assert!(result.is_err(), "Missing p tag must be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No valid target pubkey"),
+            "Error should describe missing p tag, got: {err_msg}"
+        );
+    }
 }

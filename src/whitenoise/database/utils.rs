@@ -646,4 +646,62 @@ mod tests {
         assert_eq!(parsed_time.timestamp_millis(), test_timestamp);
         assert!(parsed_time.year() > 2020); // Should be recent timestamp, not 2020
     }
+
+    #[test]
+    fn test_parse_relay_url_valid() {
+        let result = parse_relay_url("wss://relay.example.com".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_relay_url_invalid() {
+        let result = parse_relay_url("not a url".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_optional_public_key_none() {
+        let result = parse_optional_public_key(None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_optional_public_key_valid() {
+        let keys = nostr_sdk::Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let result = parse_optional_public_key(Some(hex));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), keys.public_key());
+    }
+
+    #[test]
+    fn test_parse_optional_public_key_invalid() {
+        let result = parse_optional_public_key(Some("not_a_valid_hex_key".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_serialize_optional_public_key_some() {
+        let keys = nostr_sdk::Keys::generate();
+        let result = serialize_optional_public_key(Some(keys.public_key()));
+        assert_eq!(result, Some(keys.public_key().to_hex()));
+    }
+
+    #[test]
+    fn test_serialize_optional_public_key_none() {
+        let result = serialize_optional_public_key(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_create_column_decode_error() {
+        let err = create_column_decode_error("test_col", "bad value");
+        match err {
+            sqlx::Error::ColumnDecode { index, .. } => {
+                assert_eq!(index, "test_col");
+            }
+            _ => panic!("Expected ColumnDecode error"),
+        }
+    }
 }
