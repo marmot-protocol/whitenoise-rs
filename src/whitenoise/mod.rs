@@ -279,6 +279,17 @@ impl Whitenoise {
                         .expect("Failed to create macOS Keychain credential store");
                     keyring_core::set_default_store(store);
                 }
+                // Apple Silicon (aarch64) macOS: use the Protected Data store, which
+                // synchronises credentials across devices via iCloud.
+                //
+                // RUNTIME REQUIREMENT: the binary must be code-signed with a
+                // provisioning profile that includes the
+                // com.apple.security.application-groups (or equivalent
+                // keychain-access-groups) entitlement.  The Flutter app build
+                // pipeline satisfies this automatically.  An unsigned `cargo run`
+                // on a developer Mac will panic here with an entitlement error;
+                // in that case build for x86_64 or use the integration-test
+                // feature flag (which substitutes the mock store).
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     let store = apple_native_keyring_store::protected::Store::new()
