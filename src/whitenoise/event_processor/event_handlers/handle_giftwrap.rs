@@ -131,12 +131,12 @@ impl Whitenoise {
             }
             Ok(Some(_)) => {} // Good — KP exists, key material available
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     target: "whitenoise::event_processor::process_welcome",
-                    "Failed to look up key package: {}, proceeding anyway",
+                    "Failed to look up key package: {}, rejecting Welcome",
                     e
                 );
-                // Don't block on DB lookup failure — fall through to MLS
+                return Err(e.into());
             }
         }
 
@@ -1023,5 +1023,36 @@ mod tests {
             .await
             .unwrap();
         assert!(ag.is_some(), "AccountGroup must survive an early return");
+    }
+
+    /// When the DB lookup for the key package fails (e.g. table missing),
+    /// `handle_giftwrap` must return an error so the upstream retry logic kicks in.
+    /// This covers the `Err(e) => return Err(e.into())` path in `process_welcome`.
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_db_error_rejects() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        // Build a real MLS Welcome giftwrap addressed to the member
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+
+        // Corrupt the database by dropping the published_key_packages table
+        sqlx::query("DROP TABLE published_key_packages")
+            .execute(&whitenoise.database.pool)
+            .await
+            .unwrap();
+
+        // Processing should fail because the DB lookup errors out
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(
+            result.is_err(),
+            "Welcome with broken DB should return an error, got Ok"
+        );
     }
 }
