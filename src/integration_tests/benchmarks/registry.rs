@@ -144,7 +144,7 @@ impl BenchmarkRegistry {
                 && !breakdown.is_empty()
             {
                 tracing::info!("");
-                tracing::info!("  Perf Breakdown (sorted by call count):");
+                tracing::info!("  Perf Breakdown (sorted by total duration):");
                 tracing::info!(
                     "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
                     "Marker",

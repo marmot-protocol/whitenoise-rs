@@ -491,7 +491,6 @@ pub async fn dispatch(req: Request) -> Response {
 }
 
 /// Write a single response line to the writer. Returns false if the client disconnected.
-#[perf_instrument("dispatch")]
 async fn write_response<W>(writer: &mut W, response: &Response) -> bool
 where
     W: AsyncWriteExt + Unpin,
@@ -508,7 +507,6 @@ where
 }
 
 /// Write the `stream_end: true` sentinel that signals the end of a streaming response.
-#[perf_instrument("dispatch")]
 async fn write_stream_end<W>(writer: &mut W)
 where
     W: AsyncWriteExt + Unpin,

@@ -69,15 +69,11 @@ pub trait BenchmarkScenario {
 
             // Reset counter for actual benchmark
             context.tests_count = 0;
-
-            // Clear perf samples accumulated during warmup so they don't skew benchmark stats
-            if let Some(layer) = PERF_LAYER.get() {
-                layer.clear();
-            }
         }
 
-        // Clear perf samples before the timed phase (catches setup spans
-        // when warmup_iterations == 0, since the warmup branch handles its own clear)
+        // Clear perf samples before the timed phase.
+        // This covers both cases: warmup ran (clears warmup spans) and
+        // warmup was skipped (clears setup spans).
         if let Some(layer) = PERF_LAYER.get() {
             layer.clear();
         }

@@ -1,4 +1,5 @@
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
 use syn::{ItemFn, LitStr, parse_macro_input};
 
@@ -29,65 +30,18 @@ use syn::{ItemFn, LitStr, parse_macro_input};
 /// ```
 #[proc_macro_attribute]
 pub fn perf_instrument(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut func = parse_macro_input!(item as ItemFn);
+    let func = parse_macro_input!(item as ItemFn);
 
     // Parse attribute: either just a prefix string, or prefix + name override
     // Supported forms:
     //   #[perf_instrument("prefix")]
     //   #[perf_instrument("prefix", name = "explicit::span::name")]
-    let span_name = {
-        let attr2: proc_macro2::TokenStream = attr.into();
-        let mut tokens = attr2.into_iter();
-
-        // First token group: the prefix literal
-        let prefix_tt = tokens
-            .next()
-            .expect("perf_instrument: expected a prefix string argument");
-        let prefix: LitStr = syn::parse2(prefix_tt.into())
-            .expect("perf_instrument: prefix must be a string literal");
-
-        // Check for optional `, name = "..."` override
-        let mut explicit_name: Option<String> = None;
-
-        // Skip comma if present
-        if let Some(comma) = tokens.next() {
-            let comma_str = comma.to_string();
-            if comma_str == "," {
-                // Expect `name = "..."`
-                let ident = tokens
-                    .next()
-                    .expect("perf_instrument: expected `name` after comma");
-                assert!(
-                    ident.to_string() == "name",
-                    "perf_instrument: expected `name` parameter, got `{}`",
-                    ident
-                );
-                let eq = tokens
-                    .next()
-                    .expect("perf_instrument: expected `=` after `name`");
-                assert!(
-                    eq.to_string() == "=",
-                    "perf_instrument: expected `=`, got `{}`",
-                    eq
-                );
-                let value_tt = tokens
-                    .next()
-                    .expect("perf_instrument: expected string value after `name =`");
-                let value: LitStr = syn::parse2(value_tt.into())
-                    .expect("perf_instrument: `name` value must be a string literal");
-                explicit_name = Some(value.value());
-            }
-        }
-
-        match explicit_name {
-            Some(name) => name,
-            None => {
-                let fn_name = func.sig.ident.to_string();
-                format!("{}::{}", prefix.value(), fn_name)
-            }
-        }
+    let span_name = match parse_span_name(attr.into(), &func) {
+        Ok(name) => name,
+        Err(e) => return e.to_compile_error().into(),
     };
 
+    let mut func = func;
     let body = &func.block;
 
     let new_body = quote! {
@@ -97,7 +51,92 @@ pub fn perf_instrument(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    func.block = syn::parse2(new_body).expect("perf_instrument: failed to parse generated block");
+    func.block = match syn::parse2(new_body) {
+        Ok(block) => block,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     quote! { #func }.into()
+}
+
+fn parse_span_name(attr: proc_macro2::TokenStream, func: &ItemFn) -> Result<String, syn::Error> {
+    let mut tokens = attr.into_iter();
+
+    // First token: the prefix literal
+    let prefix_tt = tokens.next().ok_or_else(|| {
+        syn::Error::new(
+            Span::call_site(),
+            "perf_instrument requires a prefix string argument, e.g. #[perf_instrument(\"my_module\")]",
+        )
+    })?;
+
+    let prefix: LitStr = syn::parse2(prefix_tt.into()).map_err(|_| {
+        syn::Error::new(
+            Span::call_site(),
+            "perf_instrument: the first argument must be a string literal, e.g. \"my_module\"",
+        )
+    })?;
+
+    // Check for optional `, name = "..."` override
+    let mut explicit_name: Option<String> = None;
+
+    if let Some(comma) = tokens.next() {
+        if comma.to_string() != "," {
+            return Err(syn::Error::new(
+                comma.span(),
+                "perf_instrument: expected `,` after prefix, or end of attribute",
+            ));
+        }
+
+        // Expect `name`
+        let ident = tokens.next().ok_or_else(|| {
+            syn::Error::new(
+                Span::call_site(),
+                "perf_instrument: expected `name` keyword after `,`",
+            )
+        })?;
+        if ident.to_string() != "name" {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!("perf_instrument: unknown parameter `{ident}`; only `name` is supported"),
+            ));
+        }
+
+        // Expect `=`
+        let eq = tokens.next().ok_or_else(|| {
+            syn::Error::new(
+                Span::call_site(),
+                "perf_instrument: expected `=` after `name`",
+            )
+        })?;
+        if eq.to_string() != "=" {
+            return Err(syn::Error::new(
+                eq.span(),
+                format!("perf_instrument: expected `=`, got `{eq}`"),
+            ));
+        }
+
+        // Expect the string value
+        let value_tt = tokens.next().ok_or_else(|| {
+            syn::Error::new(
+                Span::call_site(),
+                "perf_instrument: expected a string literal after `name =`",
+            )
+        })?;
+        let value: LitStr = syn::parse2(value_tt.into()).map_err(|_| {
+            syn::Error::new(
+                Span::call_site(),
+                "perf_instrument: `name` value must be a string literal, e.g. name = \"my_module::MyType::my_fn\"",
+            )
+        })?;
+        explicit_name = Some(value.value());
+    }
+
+    Ok(match explicit_name {
+        Some(name) => name,
+        None => {
+            let fn_name = func.sig.ident.to_string();
+            format!("{}::{}", prefix.value(), fn_name)
+        }
+    })
 }
