@@ -1178,6 +1178,15 @@ impl Whitenoise {
         // Delete the account from the database
         account.delete(&self.database).await?;
 
+        // Sync discovery subscriptions with remaining accounts (tears down on last logout)
+        if let Err(e) = self.sync_discovery_subscriptions().await {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %pubkey,
+                "Failed to refresh discovery subscriptions after logout: {e}"
+            );
+        }
+
         // Remove the private key from the secret store
         // For local accounts this is required; for external accounts this is best-effort cleanup
         let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
@@ -1869,6 +1878,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "Logout should succeed for external account without stored key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_syncs_discovery_subscriptions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // After login, global discovery subscriptions should be active
+        assert!(
+            whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be operational after login"
+        );
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // After logging out the last account, discovery subscriptions should be torn down
+        assert!(
+            !whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be torn down after last account logout"
         );
     }
 

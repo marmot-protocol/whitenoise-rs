@@ -579,14 +579,20 @@ impl Whitenoise {
         whitenoise_ref.sync_discovery_subscriptions().await
     }
 
+    /// Buffer (in seconds) subtracted from `last_synced_at` timestamps when
+    /// computing subscription `since` values, to account for clock drift and
+    /// relay propagation delay.
+    const SUBSCRIPTION_BUFFER_SECS: u64 = 10;
+
     // Compute a shared since timestamp for global user subscriptions.
     // - Accepts the already-loaded account list to avoid TOCTOU races
     // - If any account is unsynced (last_synced_at = None), return None
-    // - Otherwise, use min(last_synced_at) minus a 10s buffer, floored at 0
+    // - Otherwise, use min(last_synced_at) minus a buffer, floored at 0
+    #[perf_instrument("whitenoise")]
     fn compute_global_since_timestamp(accounts: &[Account]) -> Option<nostr_sdk::Timestamp> {
         if accounts.is_empty() {
             tracing::debug!(
-                target: "whitenoise::setup_global_users_subscriptions",
+                target: "whitenoise::compute_global_since_timestamp",
                 "No accounts; defaulting to since=None"
             );
             return None;
@@ -598,34 +604,24 @@ impl Whitenoise {
                 .filter(|a| a.last_synced_at.is_none())
                 .count();
             tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
+                target: "whitenoise::compute_global_since_timestamp",
                 "Global subscriptions using since=None due to {} unsynced accounts",
                 unsynced
             );
             return None;
         }
 
-        const BUFFER_SECS: u64 = 10;
         let since = accounts
             .iter()
-            .filter_map(|a| a.since_timestamp(BUFFER_SECS))
+            .filter_map(|a| a.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS))
             .min_by_key(|t| t.as_secs());
 
-        match since {
-            Some(ts) => {
-                tracing::info!(
-                    target: "whitenoise::setup_global_users_subscriptions",
-                    "Global subscriptions using since={} ({}s buffer)",
-                    ts.as_secs(), BUFFER_SECS
-                );
-            }
-            None => {
-                tracing::debug!(
-                    target: "whitenoise::setup_global_users_subscriptions",
-                    "All accounts synced but since_timestamp returned None for all; \
-                     defaulting to since=None"
-                );
-            }
+        if let Some(ts) = since {
+            tracing::info!(
+                target: "whitenoise::compute_global_since_timestamp",
+                "Global subscriptions using since={} ({}s buffer)",
+                ts.as_secs(), Self::SUBSCRIPTION_BUFFER_SECS
+            );
         }
         since
     }
@@ -1307,7 +1303,12 @@ impl Whitenoise {
         let watched_users = User::all_pubkeys(&self.database).await?;
         let follow_list_accounts = accounts
             .iter()
-            .map(|account| (account.pubkey, account.since_timestamp(10)))
+            .map(|account| {
+                (
+                    account.pubkey,
+                    account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS),
+                )
+            })
             .collect::<Vec<_>>();
         let public_since = Self::compute_global_since_timestamp(&accounts);
 
@@ -2711,10 +2712,22 @@ mod tests {
     }
 
     mod subscription_tests {
-        use chrono::{TimeDelta, Utc};
+        use chrono::{DateTime, TimeDelta, Utc};
         use nostr_sdk::Keys;
 
         use super::*;
+
+        fn make_account(user_id: i64, last_synced_at: Option<DateTime<Utc>>) -> Account {
+            Account {
+                id: None,
+                pubkey: Keys::generate().public_key(),
+                user_id,
+                account_type: AccountType::Local,
+                last_synced_at,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        }
 
         #[tokio::test]
         async fn test_refresh_all_global_subscriptions_no_account_returns_ok() {
@@ -2735,15 +2748,7 @@ mod tests {
 
         #[test]
         fn test_compute_global_since_unsynced_account_returns_none() {
-            let accounts = vec![Account {
-                id: None,
-                pubkey: Keys::generate().public_key(),
-                user_id: 1,
-                account_type: AccountType::Local,
-                last_synced_at: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            }];
+            let accounts = vec![make_account(1, None)];
             assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
         }
 
@@ -2753,30 +2758,11 @@ mod tests {
             let older = now - TimeDelta::seconds(200);
             let newer = now - TimeDelta::seconds(100);
 
-            let accounts = vec![
-                Account {
-                    id: None,
-                    pubkey: Keys::generate().public_key(),
-                    user_id: 1,
-                    account_type: AccountType::Local,
-                    last_synced_at: Some(older),
-                    created_at: now,
-                    updated_at: now,
-                },
-                Account {
-                    id: None,
-                    pubkey: Keys::generate().public_key(),
-                    user_id: 2,
-                    account_type: AccountType::Local,
-                    last_synced_at: Some(newer),
-                    created_at: now,
-                    updated_at: now,
-                },
-            ];
+            let accounts = vec![make_account(1, Some(older)), make_account(2, Some(newer))];
 
             let ts = Whitenoise::compute_global_since_timestamp(&accounts).unwrap();
-            // Should use the older timestamp minus the 10s buffer
-            let expected = (older.timestamp().max(0) as u64).saturating_sub(10);
+            let expected = (older.timestamp().max(0) as u64)
+                .saturating_sub(Whitenoise::SUBSCRIPTION_BUFFER_SECS);
             assert_eq!(ts.as_secs(), expected);
         }
 
@@ -2784,26 +2770,9 @@ mod tests {
         fn test_compute_global_since_mixed_synced_unsynced_returns_none() {
             let now = Utc::now();
             let accounts = vec![
-                Account {
-                    id: None,
-                    pubkey: Keys::generate().public_key(),
-                    user_id: 1,
-                    account_type: AccountType::Local,
-                    last_synced_at: Some(now - TimeDelta::seconds(100)),
-                    created_at: now,
-                    updated_at: now,
-                },
-                Account {
-                    id: None,
-                    pubkey: Keys::generate().public_key(),
-                    user_id: 2,
-                    account_type: AccountType::Local,
-                    last_synced_at: None,
-                    created_at: now,
-                    updated_at: now,
-                },
+                make_account(1, Some(now - TimeDelta::seconds(100))),
+                make_account(2, None),
             ];
-            // One unsynced account forces since=None
             assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
         }
     }
