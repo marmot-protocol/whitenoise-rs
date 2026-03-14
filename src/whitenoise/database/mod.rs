@@ -248,24 +248,24 @@ impl Database {
 
 /// Retry an async database operation on transient SQLite lock errors.
 ///
-/// Uses linear backoff (100ms × attempt) for up to 3 attempts.
+/// Uses linear backoff (100 ms × attempt) for up to 3 attempts.
 /// Returns on first success or first non-lock error.
-pub async fn retry_on_lock<F, Fut, T>(mut op: F) -> std::result::Result<T, DatabaseError>
+pub(crate) async fn retry_on_lock<F, Fut, T>(mut op: F) -> std::result::Result<T, DatabaseError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
 {
-    const MAX_RETRIES: u32 = 3;
+    const MAX_ATTEMPTS: u32 = 3;
     let mut attempt: u32 = 0;
 
     loop {
         attempt += 1;
         match op().await {
             Ok(val) => return Ok(val),
-            Err(e) if e.is_sqlite_lock_error() && attempt < MAX_RETRIES => {
+            Err(e) if e.is_sqlite_lock_error() && attempt < MAX_ATTEMPTS => {
                 tracing::warn!(
                     target: "whitenoise::database",
-                    "SQLite lock on attempt {attempt}/{MAX_RETRIES}, \
+                    "SQLite lock on attempt {attempt}/{MAX_ATTEMPTS}, \
                      retrying...",
                 );
                 tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
