@@ -652,7 +652,7 @@ impl Whitenoise {
 
     /// Rejects non-HTTPS Blossom URLs to prevent cleartext metadata leakage.
     /// Debug builds also allow `http://localhost` for local testing.
-    fn require_https(url: &Url) -> Result<()> {
+    pub(crate) fn require_https(url: &Url) -> Result<()> {
         match url.scheme() {
             "https" => Ok(()),
             "http" if cfg!(debug_assertions) && url.host_str() == Some("localhost") => Ok(()),
@@ -859,7 +859,7 @@ impl Whitenoise {
             Some(upload_keypair),
         );
 
-        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
+        let descriptor = tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
             .await
             .map_err(|_| {
                 WhitenoiseError::Other(anyhow::anyhow!(
@@ -867,7 +867,11 @@ impl Whitenoise {
                     Self::BLOSSOM_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))
+            .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
+
+        Self::require_https(&descriptor.url)?;
+
+        Ok(descriptor)
     }
 }
 

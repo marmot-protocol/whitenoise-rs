@@ -535,6 +535,8 @@ impl Account {
             })?
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
 
+        Whitenoise::require_https(&descriptor.url)?;
+
         Ok(descriptor.url.to_string())
     }
 
