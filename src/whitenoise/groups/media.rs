@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures::StreamExt;
 use mdk_core::encrypted_media::types::MediaReference;
 use mdk_core::extension::group_image;
 use mdk_core::media_processing::MediaProcessingOptions;
@@ -21,6 +22,14 @@ impl Whitenoise {
     /// Default timeout for Blossom HTTP operations (download and upload)
     /// Set to 300 seconds to accommodate large image files over slow connections
     const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Maximum number of bytes accepted for a single blob download (100 MiB).
+    ///
+    /// This cap applies both to the `Content-Length` header check (early rejection)
+    /// and to the streaming byte counter (guards against servers that lie about or
+    /// omit the header).  A 100 MiB limit is generous for encrypted media files
+    /// while still bounding worst-case memory pressure.
+    const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
     /// Returns the default Blossom server URL based on build configuration
     ///
@@ -640,13 +649,73 @@ impl Whitenoise {
         blossom_url: &Url,
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        use nostr::hashes::{Hash, sha256::Hash as Sha256Hash};
+        // Build the Blossom download URL: <base>/<hex-hash>
+        // nostr-blossom's get_blob does this the same way, but we need the raw
+        // reqwest Response so we can stream it with a byte cap instead of
+        // buffering the whole body unconditionally.
+        let hash_hex = hex::encode(image_hash);
+        let download_url = blossom_url.join(&hash_hex).map_err(|e| {
+            WhitenoiseError::BlossomDownload(format!("Failed to build download URL: {}", e))
+        })?;
 
-        let client = BlossomClient::new(blossom_url.clone());
-        let sha256 = Sha256Hash::from_slice(image_hash)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Invalid SHA256 hash: {}", e)))?;
+        let download_future = async {
+            // Ensure the ring TLS provider is installed before building the client.
+            // reqwest 0.13 with rustls-no-provider requires an explicit provider.
+            // The `let _ =` ignores the error when it is already installed.
+            let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let download_future = client.get_blob(sha256, None, None, None::<&Keys>);
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .map_err(|e| {
+                    WhitenoiseError::BlossomDownload(format!("Failed to build HTTP client: {}", e))
+                })?;
+
+            let response = client.get(download_url).send().await.map_err(|e| {
+                WhitenoiseError::BlossomDownload(format!("HTTP request failed: {}", e))
+            })?;
+
+            if !response.status().is_success() {
+                return Err(WhitenoiseError::BlossomDownload(format!(
+                    "Server returned status {}",
+                    response.status()
+                )));
+            }
+
+            // Early rejection: refuse downloads that advertise an oversized body.
+            // Content-Length can be omitted or spoofed, so this is a fast-path
+            // check only — the streaming counter below is the authoritative guard.
+            let hint_capacity = if let Some(content_length) = response.content_length() {
+                let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
+                if content_length > Self::MAX_BLOB_BYTES {
+                    return Err(WhitenoiseError::DownloadSizeLimitExceeded {
+                        limit: Self::MAX_BLOB_BYTES,
+                    });
+                }
+                content_length
+            } else {
+                0
+            };
+
+            // Stream the body chunk-by-chunk, counting bytes as they arrive.
+            // This is the authoritative size guard: it fires even when the server
+            // omits or lies about Content-Length.
+            let mut body: Vec<u8> = Vec::with_capacity(hint_capacity);
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    WhitenoiseError::BlossomDownload(format!("Error reading response body: {}", e))
+                })?;
+                if body.len() + chunk.len() > Self::MAX_BLOB_BYTES {
+                    return Err(WhitenoiseError::DownloadSizeLimitExceeded {
+                        limit: Self::MAX_BLOB_BYTES,
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+
+            Ok(body)
+        };
 
         tokio::time::timeout(Self::BLOSSOM_TIMEOUT, download_future)
             .await
@@ -656,9 +725,6 @@ impl Whitenoise {
                     Self::BLOSSOM_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|e| {
-                WhitenoiseError::BlossomDownload(format!("Failed to download blob: {}", e))
-            })
     }
 
     fn decrypt_group_image(

@@ -61,6 +61,7 @@ rand = "0.9"
 reqwest = { version = "0.13.1", features = [
     "multipart",
     "json",
+    "stream",
     "rustls-no-provider",
 ], default-features = false }
 # Explicit TLS provider: reqwest 0.13 defaults to aws-lc-rs, but we use ring for
