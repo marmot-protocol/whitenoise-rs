@@ -1,3 +1,5 @@
+use nostr_connect::error::Error as NostrConnectError;
+use nostr_connect::prelude::nip46;
 use nostr_sdk::prelude::PublicKey;
 use thiserror::Error;
 
@@ -193,10 +195,13 @@ pub enum WhitenoiseError {
     UnsupportedMediaFormat(String),
 
     #[error("NIP-46 invalid bunker URI: {0}")]
-    Nip46InvalidUri(String),
+    Nip46InvalidUri(#[from] nip46::Error),
 
     #[error("NIP-46 connection error: {0}")]
-    Nip46Connection(String),
+    Nip46Connection(#[from] NostrConnectError),
+
+    #[error("NIP-46 pubkey mismatch during reconnect: expected {expected}, got {got}")]
+    Nip46PubkeyMismatch { expected: PublicKey, got: PublicKey },
 
     #[error(
         "Cannot deliver MLS welcome for {member_pubkey}: no inbox/NIP-65 relays configured and account {account_pubkey} has no fallback relays"
@@ -210,6 +215,12 @@ pub enum WhitenoiseError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         WhitenoiseError::Other(anyhow::anyhow!(err.to_string()))
+    }
+}
+
+impl From<nostr_connect::prelude::SignerError> for WhitenoiseError {
+    fn from(err: nostr_connect::prelude::SignerError) -> Self {
+        WhitenoiseError::Nip46Connection(NostrConnectError::Response(err.to_string()))
     }
 }
 
@@ -322,11 +333,12 @@ mod tests {
     #[test]
     fn test_nip46_error_display_messages() {
         assert_eq!(
-            WhitenoiseError::Nip46InvalidUri("bad uri".to_string()).to_string(),
-            "NIP-46 invalid bunker URI: bad uri"
+            WhitenoiseError::Nip46InvalidUri(nip46::Error::InvalidURI).to_string(),
+            "NIP-46 invalid bunker URI: Invalid uri"
         );
         assert_eq!(
-            WhitenoiseError::Nip46Connection("timeout".to_string()).to_string(),
+            WhitenoiseError::Nip46Connection(NostrConnectError::Response("timeout".to_string()))
+                .to_string(),
             "NIP-46 connection error: timeout"
         );
     }
