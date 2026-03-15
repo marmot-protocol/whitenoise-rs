@@ -1,6 +1,7 @@
 use nostr_sdk::PublicKey;
 
 use super::{Database, DatabaseError};
+use crate::perf_instrument;
 
 /// Represents a published key package tracked for lifecycle management.
 ///
@@ -80,6 +81,7 @@ impl PublishedKeyPackage {
     /// Called at publish time with the hash_ref computed atomically during
     /// key package creation. Fire-and-forget: if this fails, the KP is still
     /// functional on relays, we just lose cleanup tracking for this one.
+    #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn create(
         account_pubkey: &PublicKey,
         hash_ref: &[u8],
@@ -109,6 +111,7 @@ impl PublishedKeyPackage {
     ///
     /// Used as a pre-check before processing a Welcome to determine whether
     /// we have this key package and whether its key material is still available.
+    #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_by_event_id(
         account_pubkey: &PublicKey,
         event_id: &str,
@@ -134,6 +137,7 @@ impl PublishedKeyPackage {
     /// restarting the quiet period before cleanup.
     ///
     /// Returns `false` if no matching row exists or key material is already deleted.
+    #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn mark_consumed(
         account_pubkey: &PublicKey,
         event_id: &str,
@@ -159,6 +163,7 @@ impl PublishedKeyPackage {
     /// - `key_material_deleted` is 0 (key material hasn't been cleaned up yet)
     /// - ALL consumed packages for this account have `consumed_at` older than
     ///   `quiet_period_secs` (no recent welcomes — the burst is over)
+    #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn find_eligible_for_cleanup(
         account_pubkey: &PublicKey,
         quiet_period_secs: i64,
@@ -191,6 +196,7 @@ impl PublishedKeyPackage {
     ///
     /// Called after the maintenance task successfully deletes the local MLS
     /// key material. Rows are never deleted — the table serves as an audit trail.
+    #[perf_instrument("db::published_key_packages")]
     pub(crate) async fn mark_key_material_deleted(
         id: i64,
         database: &Database,

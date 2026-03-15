@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use super::benchmark_config::BenchmarkConfig;
+use crate::integration_tests::benchmarks::perf_layer::PerfBreakdown;
 use crate::integration_tests::benchmarks::stats;
 
 /// Results from running a benchmark scenario
@@ -17,6 +18,9 @@ pub struct BenchmarkResult {
     pub p95: Duration,
     pub p99: Duration,
     pub throughput: f64, // operations per second
+    /// Per-marker performance breakdown captured via `perf_span!`.
+    /// `None` when no `PerfTracingLayer` was active during the benchmark.
+    pub perf_breakdown: Option<Vec<PerfBreakdown>>,
 }
 
 impl BenchmarkResult {
@@ -31,11 +35,13 @@ impl BenchmarkResult {
     /// * `config` - Benchmark configuration (for iterations count)
     /// * `timings` - Vector of timing measurements from benchmark iterations
     /// * `total_duration` - Total elapsed time including cooldown between iterations
+    /// * `perf_breakdown` - Optional per-marker breakdown from `PerfTracingLayer::drain()`
     pub fn from_timings(
         name: String,
         config: &BenchmarkConfig,
         timings: Vec<Duration>,
         total_duration: Duration,
+        perf_breakdown: Option<Vec<PerfBreakdown>>,
     ) -> Self {
         let mean = stats::calculate_mean(&timings);
         let mut timings_for_median = timings.clone();
@@ -61,6 +67,7 @@ impl BenchmarkResult {
             p95,
             p99,
             throughput,
+            perf_breakdown,
         }
     }
 }

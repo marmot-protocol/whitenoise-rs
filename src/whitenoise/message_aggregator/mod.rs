@@ -23,6 +23,7 @@ use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 
 use crate::nostr_manager::parser::Parser;
+use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
 
 /// Main message aggregator - designed to be a singleton per Whitenoise instance
@@ -70,6 +71,7 @@ impl MessageAggregator {
         parser: &dyn Parser,
         media_files: Vec<MediaFile>,
     ) -> Result<Vec<ChatMessage>, ProcessingError> {
+        let _span = perf_span!("aggregator::aggregate_messages_for_group");
         if self.config.enable_debug_logging {
             tracing::debug!(
                 "Aggregating {} messages for group {} (user: {})",
@@ -96,6 +98,7 @@ impl MessageAggregator {
         parser: &dyn Parser,
         media_files: Vec<MediaFile>,
     ) -> Result<ChatMessage, ProcessingError> {
+        let _span = perf_span!("aggregator::process_single_message");
         // Build media files lookup map
         let media_files_map: std::collections::HashMap<String, MediaFile> = media_files
             .into_iter()

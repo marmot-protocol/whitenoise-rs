@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use super::benchmark_config::BenchmarkConfig;
 use super::benchmark_result::BenchmarkResult;
+use crate::integration_tests::benchmarks::PERF_LAYER;
 use crate::integration_tests::core::ScenarioContext;
 use crate::{Whitenoise, WhitenoiseError};
 
@@ -34,7 +35,12 @@ pub trait BenchmarkScenario {
     ) -> Result<Duration, WhitenoiseError>;
 
     /// Run the benchmark with standard warmup, timing, and statistics collection.
-    /// Override this method only if you need custom orchestration (Level 3).
+    ///
+    /// Override this method only if you need custom orchestration (e.g. multi-phase
+    /// timing or a custom iteration loop). If you do override it, you are responsible
+    /// for calling `PERF_LAYER.get().map(|l| l.clear())` before the timed phase and
+    /// `PERF_LAYER.get().map(|l| l.drain())` at the end to collect perf breakdowns —
+    /// the default implementation does both; overrides do not inherit that logic.
     async fn run_benchmark(
         &mut self,
         whitenoise: &'static Whitenoise,
@@ -70,6 +76,13 @@ pub trait BenchmarkScenario {
             context.tests_count = 0;
         }
 
+        // Clear perf samples before the timed phase.
+        // This covers both cases: warmup ran (clears warmup spans) and
+        // warmup was skipped (clears setup spans).
+        if let Some(layer) = PERF_LAYER.get() {
+            layer.clear();
+        }
+
         // Benchmark phase
         tracing::info!("Running {} benchmark iterations...", config.iterations);
         let mut timings = Vec::with_capacity(config.iterations as usize);
@@ -94,12 +107,16 @@ pub trait BenchmarkScenario {
         pb.finish_with_message("Benchmark complete");
         let total_duration = overall_start.elapsed();
 
+        // Drain perf layer if available
+        let perf_breakdown = PERF_LAYER.get().map(|layer| layer.drain());
+
         // Calculate and return results
         Ok(BenchmarkResult::from_timings(
             self.name().to_string(),
             &config,
             timings,
             total_duration,
+            perf_breakdown,
         ))
     }
 }

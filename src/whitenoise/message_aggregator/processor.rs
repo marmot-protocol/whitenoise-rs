@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::reaction_handler;
 use super::types::{AggregatorConfig, ChatMessage, ProcessingError};
 use crate::nostr_manager::parser::Parser;
+use crate::perf_span;
 use crate::whitenoise::media_files::MediaFile;
 use mdk_core::prelude::message_types::Message;
 
@@ -19,6 +20,7 @@ pub async fn process_messages(
     config: &AggregatorConfig,
     media_files: Vec<MediaFile>,
 ) -> Result<Vec<ChatMessage>, ProcessingError> {
+    let _span = perf_span!("aggregator::process_messages");
     if messages.is_empty() {
         return Ok(Vec::new());
     }
@@ -128,6 +130,7 @@ pub(crate) async fn process_regular_message(
     parser: &dyn Parser,
     media_files_map: &HashMap<String, MediaFile>,
 ) -> Result<ChatMessage, ProcessingError> {
+    let _span = perf_span!("aggregator::process_regular_message");
     // Check if this is a reply (NIP-C7 q-tag, or legacy e-tag)
     let reply_to_id = extract_reply_info(&message.tags);
     let is_reply = reply_to_id.is_some();

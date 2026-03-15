@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::EventId;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
+use crate::perf_instrument;
 
 /// Row structure for published_events table
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -40,6 +41,7 @@ where
 
 impl PublishedEvent {
     /// Records that we published a specific event to prevent processing our own events
+    #[perf_instrument("db::published_events")]
     pub(crate) async fn create(
         event_id: &EventId,
         account_id: i64,
@@ -63,6 +65,7 @@ impl PublishedEvent {
 
     /// Checks if we published a specific event
     /// - account_id: Some(id) for account-specific processing, None for global processing
+    #[perf_instrument("db::published_events")]
     pub(crate) async fn exists(
         event_id: &EventId,
         account_id: Option<i64>,

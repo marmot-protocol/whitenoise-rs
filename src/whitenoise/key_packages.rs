@@ -4,6 +4,7 @@ use std::time::Duration;
 use base64ct::{Base64, Encoding};
 use nostr_sdk::prelude::*;
 
+use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
@@ -202,6 +203,7 @@ impl Whitenoise {
     ///
     /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
     /// is the serialized hash_ref of the key package for lifecycle tracking.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn encoded_key_package(
         &self,
         account: &Account,
@@ -223,6 +225,7 @@ impl Whitenoise {
     /// 3 times with exponential backoff (2s, 4s) if publishing fails. The key
     /// package is created only once to avoid orphaning unused key material in
     /// local MLS storage.
+    #[perf_instrument("key_packages")]
     pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
         let relays = account.key_package_relays(self).await?;
 
@@ -288,6 +291,7 @@ impl Whitenoise {
     /// This is used for external signer accounts (like Amber/NIP-55) where the
     /// private key is not available locally. The signer is used to sign the
     /// key package event before publishing.
+    #[perf_instrument("key_packages")]
     pub async fn publish_key_package_for_account_with_signer(
         &self,
         account: &Account,
@@ -320,6 +324,7 @@ impl Whitenoise {
     /// This is a convenience wrapper that calls [`Self::encoded_key_package`] followed by
     /// [`Self::publish_key_package_to_relays`]. If you need retry semantics, prefer calling
     /// those two methods separately so the key package is only created once.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn create_and_publish_key_package(
         &self,
         account: &Account,
@@ -342,6 +347,7 @@ impl Whitenoise {
     /// Returns an error if no relay accepted the event. This method is
     /// intentionally separated from key package creation so callers can retry
     /// the relay publish without generating additional MLS key material.
+    #[perf_instrument("key_packages")]
     async fn publish_key_package_to_relays(
         &self,
         encoded_key_package: &str,
@@ -370,6 +376,7 @@ impl Whitenoise {
     }
 
     /// Records a successfully published key package in the lifecycle tracking table.
+    #[perf_instrument("key_packages")]
     async fn track_published_key_package(
         &self,
         account: &Account,
@@ -399,6 +406,7 @@ impl Whitenoise {
     /// - For local accounts: uses keys from the secrets store
     ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    #[perf_instrument("key_packages")]
     pub async fn delete_key_package_for_account(
         &self,
         account: &Account,
@@ -422,6 +430,7 @@ impl Whitenoise {
     /// deletion event before publishing.
     ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    #[perf_instrument("key_packages")]
     pub async fn delete_key_package_for_account_with_signer(
         &self,
         account: &Account,
@@ -438,6 +447,7 @@ impl Whitenoise {
         .await
     }
 
+    #[perf_instrument("key_packages")]
     async fn delete_key_package_for_account_internal(
         &self,
         account: &Account,
@@ -529,6 +539,7 @@ impl Whitenoise {
     /// - Failed to retrieve account's key package relays
     /// - Network error while fetching events from relays
     /// - NostrSDK error during event streaming
+    #[perf_instrument("key_packages")]
     pub async fn fetch_all_key_packages_for_account(
         &self,
         account: &Account,
@@ -605,6 +616,7 @@ impl Whitenoise {
     /// - Failed to get signing keys for the account
     /// - Network error while fetching or publishing events
     /// - Batch deletion event publishing failed
+    #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account(
         &self,
         account: &Account,
@@ -630,6 +642,7 @@ impl Whitenoise {
     /// # Returns
     ///
     /// Returns the number of key packages that were successfully deleted.
+    #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account_with_signer(
         &self,
         account: &Account,
@@ -648,6 +661,7 @@ impl Whitenoise {
     /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
     /// only a subset of key packages per query, so a single fetch-delete pass
     /// can leave packages behind.
+    #[perf_instrument("key_packages")]
     async fn delete_all_key_packages_loop(
         &self,
         account: &Account,
@@ -729,6 +743,7 @@ impl Whitenoise {
     /// # Returns
     ///
     /// Returns the number of key packages that were successfully deleted.
+    #[perf_instrument("key_packages")]
     pub(crate) async fn delete_key_packages_for_account(
         &self,
         account: &Account,
@@ -747,6 +762,7 @@ impl Whitenoise {
         .await
     }
 
+    #[perf_instrument("key_packages")]
     async fn delete_key_packages_for_account_internal(
         &self,
         account: &Account,
@@ -842,6 +858,7 @@ impl Whitenoise {
         Ok(deleted_count)
     }
 
+    #[perf_instrument("key_packages")]
     async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
         let key_package_relays = account.key_package_relays(self).await?;
 
@@ -895,6 +912,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("key_packages")]
     async fn publish_key_package_deletion_with_signer(
         &self,
         event_ids: &[EventId],

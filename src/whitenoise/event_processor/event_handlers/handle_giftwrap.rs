@@ -5,18 +5,22 @@ use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    accounts_groups::AccountGroup,
-    chat_list_streaming::ChatListUpdateTrigger,
-    database::published_key_packages::PublishedKeyPackage,
-    error::{Result, WhitenoiseError},
-    group_information::{GroupInformation, GroupType},
-    relays::Relay,
+use crate::{
+    perf_instrument, perf_span,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        accounts_groups::AccountGroup,
+        chat_list_streaming::ChatListUpdateTrigger,
+        database::published_key_packages::PublishedKeyPackage,
+        error::{Result, WhitenoiseError},
+        group_information::{GroupInformation, GroupType},
+        relays::Relay,
+    },
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_giftwrap(&self, account: &Account, event: Event) -> Result<()> {
         tracing::debug!(
             target: "whitenoise::event_handlers::handle_giftwrap",
@@ -26,6 +30,7 @@ impl Whitenoise {
 
         // For external signer accounts, use the registered signer.
         // For local accounts, use the keys from the secrets store.
+        let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
         let unwrapped = if account.uses_external_signer() {
             let signer = self.get_external_signer(&account.pubkey).ok_or_else(|| {
                 WhitenoiseError::Configuration(format!(
@@ -53,6 +58,8 @@ impl Whitenoise {
             })?
         };
 
+        drop(_decrypt_span);
+
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
                 self.process_welcome(account, event, unwrapped.rumor)
@@ -70,6 +77,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("event_handlers")]
     async fn process_welcome(
         &self,
         account: &Account,
@@ -186,19 +194,25 @@ impl Whitenoise {
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
-        tokio::spawn(Self::background_finalize_welcome(
-            account.clone(),
-            group_id,
-            group_name,
-            key_package_event_id,
-            welcomer_pubkey,
-        ));
+        let tid = crate::perf::current_trace_id();
+        let account_owned = account.clone();
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
+            Self::background_finalize_welcome(
+                account_owned,
+                group_id,
+                group_name,
+                key_package_event_id,
+                welcomer_pubkey,
+            )
+            .await;
+        }));
 
         Ok(())
     }
 
     /// Background task wrapper that gets Whitenoise instance and delegates to core logic.
     /// This thin wrapper exists because tokio::spawn requires 'static lifetime.
+    #[perf_instrument("event_handlers")]
     async fn background_finalize_welcome(
         account: Account,
         group_id: GroupId,
@@ -240,6 +254,7 @@ impl Whitenoise {
     ///    failed, the self-update is skipped and the reason is logged so the
     ///    caller can diagnose the problem.  Any missed self-update will be
     ///    retried by the scheduled key-package maintenance task.
+    #[perf_instrument("event_handlers")]
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -370,6 +385,7 @@ impl Whitenoise {
         );
     }
 
+    #[perf_instrument("event_handlers")]
     async fn create_group_info(
         whitenoise: &Whitenoise,
         group_id: &GroupId,
@@ -380,6 +396,7 @@ impl Whitenoise {
     }
 
     /// Set up Nostr subscriptions for group messages
+    #[perf_instrument("event_handlers")]
     async fn setup_group_subscriptions(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -410,6 +427,7 @@ impl Whitenoise {
     ///
     /// Marks the consumed key package in the published_key_packages table,
     /// then deletes it from relays and publishes a fresh replacement.
+    #[perf_instrument("event_handlers")]
     async fn rotate_key_package(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -470,6 +488,7 @@ impl Whitenoise {
     }
 
     /// Sync group image cache if needed
+    #[perf_instrument("event_handlers")]
     async fn sync_group_image(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -480,6 +499,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("event_handlers")]
     async fn ensure_welcomer_user_exists(
         whitenoise: &Whitenoise,
         welcomer_pubkey: PublicKey,
@@ -502,6 +522,7 @@ impl Whitenoise {
     /// If all publish attempts fail, the pending commit is never merged and
     /// the group state remains unchanged.
     #[allow(dead_code)]
+    #[perf_instrument("event_handlers")]
     async fn perform_self_update(
         whitenoise: &Whitenoise,
         account: &Account,

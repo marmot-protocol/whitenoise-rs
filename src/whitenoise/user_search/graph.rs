@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::{Event, Filter, Kind, Metadata, PublicKey, RelayUrl, TagKind};
 
+use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
@@ -36,6 +37,7 @@ const NETWORK_FETCH_RETRIES: usize = 3;
 /// deduplicated set of member pubkeys (excluding the searcher).
 ///
 /// This is purely local data (MLS/MDK) — no network fetch required.
+#[perf_instrument("user_search")]
 pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
     searcher_pubkey: &PublicKey,
@@ -97,6 +99,7 @@ pub(super) async fn get_group_co_member_pubkeys(
 }
 
 /// Collect discovery relay URLs to use for user-search queries.
+#[perf_instrument("user_search")]
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
     whitenoise.relay_control.discovery().relays().to_vec()
 }
@@ -109,6 +112,7 @@ async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
 ///
 /// Returns (found metadata map, remaining pubkeys not found or with empty metadata).
 /// Pubkeys with empty metadata (background sync not yet completed) are included in remaining.
+#[perf_instrument("user_search")]
 pub(super) async fn check_user_table_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -137,6 +141,7 @@ pub(super) async fn check_user_table_metadata(
 /// Tier 2: Batch check CachedGraphUser table for metadata.
 ///
 /// Returns (found metadata map, remaining pubkeys not found or with None/empty metadata).
+#[perf_instrument("user_search")]
 pub(super) async fn check_cache_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -180,6 +185,7 @@ pub(super) async fn check_cache_metadata(
 ///
 /// Returns `Ok((found, remaining))` on success (relay responded),
 /// or `Err(())` on network error (caller should requeue or forward).
+#[perf_instrument("user_search")]
 pub(super) async fn try_fetch_network_metadata(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -240,6 +246,7 @@ pub(super) async fn try_fetch_network_metadata(
 /// Returns `Ok(map)` where the map contains pubkey → write relay URLs.
 /// Pubkeys without relay list events are absent from the map.
 /// Returns `Err(())` on network error (caller should requeue).
+#[perf_instrument("user_search")]
 pub(super) async fn try_fetch_relay_lists(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -302,6 +309,7 @@ pub(super) enum UserRelayResult {
 ///
 /// Queries the given relays for Kind 0 metadata for a single pubkey.
 /// Caches found metadata. Does NOT cache EOSE or error — the consumer decides.
+#[perf_instrument("user_search")]
 pub(super) async fn try_fetch_user_relay_metadata(
     whitenoise: &Whitenoise,
     pubkey: &PublicKey,
@@ -377,6 +385,7 @@ pub(super) async fn get_metadata_batch(
 /// Tiers 1+2: Batch check local accounts and cache for follows.
 ///
 /// Returns (found follows map, remaining pubkeys needing network fetch).
+#[perf_instrument("user_search")]
 pub(super) async fn check_cached_follows_batch(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -420,6 +429,7 @@ pub(super) async fn check_cached_follows_batch(
 /// Caches ALL pubkeys including empty defaults ("follows nobody") since
 /// the contact list is authoritative — absence on relays means no follows.
 /// Uses immediate retries (not queue-based) since the follows producer has no queue.
+#[perf_instrument("user_search")]
 pub(super) async fn fetch_network_follows(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],
@@ -521,6 +531,7 @@ fn parse_write_relays_from_event(event: &Event) -> Vec<String> {
 ///
 /// Only used by the follows producer, which has no queue for deferred retries.
 /// Metadata tiers use single-attempt functions with queue-based retries in their consumers.
+#[perf_instrument("user_search")]
 async fn fetch_events_with_retries(
     whitenoise: &Whitenoise,
     pubkeys: &[PublicKey],

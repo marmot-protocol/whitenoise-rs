@@ -3,6 +3,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::{
     nostr_manager::utils::is_event_timestamp_valid,
+    perf,
     relay_control::SubscriptionStream,
     types::{EventSource, ProcessableEvent, RetryInfo},
     whitenoise::{
@@ -56,60 +57,67 @@ impl Whitenoise {
                         "Received event for processing"
                     );
 
-                    // Process the event
-                    match event {
-                        ProcessableEvent::NostrEvent { event, source, retry_info } => {
-                            // Validate timestamp before processing
-                            if !is_event_timestamp_valid(&event) {
-                                tracing::debug!(
-                                    target: "whitenoise::event_processor::process_events",
-                                    "Skipping event {} with invalid future timestamp: {}",
-                                    event.id.to_hex(),
-                                    event.created_at
-                                );
-                                continue;
-                            }
-
-                            match &source {
-                                EventSource::LegacySubscriptionId(subscription_id) => {
-                                    let Some(sub_id) = subscription_id.clone() else {
-                                        tracing::warn!(
-                                            target: "whitenoise::event_processor::process_events",
-                                            "Event received without subscription ID, skipping"
-                                        );
-                                        continue;
-                                    };
-
-                                    if whitenoise.is_event_global(&sub_id) {
-                                        whitenoise
-                                            .process_global_event(event, source, retry_info)
-                                            .await;
-                                    } else {
-                                        whitenoise
-                                            .process_account_event(event, source, retry_info)
-                                            .await;
-                                    }
+                    // Assign a fresh trace ID for every event so that all
+                    // perf_span! calls within the dispatch future share one
+                    // Chrome Trace tid, giving accurate flamegraph nesting.
+                    // Task-local storage survives Tokio worker-thread
+                    // rescheduling across .await points, unlike thread-local.
+                    perf::with_trace_id(perf::next_trace_id(), async {
+                        // Process the event
+                        match event {
+                            ProcessableEvent::NostrEvent { event, source, retry_info } => {
+                                // Validate timestamp before processing
+                                if !is_event_timestamp_valid(&event) {
+                                    tracing::debug!(
+                                        target: "whitenoise::event_processor::process_events",
+                                        "Skipping event {} with invalid future timestamp: {}",
+                                        event.id.to_hex(),
+                                        event.created_at
+                                    );
+                                    return;
                                 }
-                                EventSource::RelaySubscription(context) => match context.stream {
-                                    SubscriptionStream::DiscoveryUserData => {
-                                        whitenoise
-                                            .process_global_event(event, source, retry_info)
-                                            .await;
+
+                                match &source {
+                                    EventSource::LegacySubscriptionId(subscription_id) => {
+                                        let Some(sub_id) = subscription_id.clone() else {
+                                            tracing::warn!(
+                                                target: "whitenoise::event_processor::process_events",
+                                                "Event received without subscription ID, skipping"
+                                            );
+                                            return;
+                                        };
+
+                                        if whitenoise.is_event_global(&sub_id) {
+                                            whitenoise
+                                                .process_global_event(event, source, retry_info)
+                                                .await;
+                                        } else {
+                                            whitenoise
+                                                .process_account_event(event, source, retry_info)
+                                                .await;
+                                        }
                                     }
-                                    SubscriptionStream::DiscoveryFollowLists
-                                    | SubscriptionStream::GroupMessages
-                                    | SubscriptionStream::AccountInboxGiftwraps => {
-                                        whitenoise
-                                            .process_account_event(event, source, retry_info)
-                                            .await;
-                                    }
-                                },
+                                    EventSource::RelaySubscription(context) => match context.stream {
+                                        SubscriptionStream::DiscoveryUserData => {
+                                            whitenoise
+                                                .process_global_event(event, source, retry_info)
+                                                .await;
+                                        }
+                                        SubscriptionStream::DiscoveryFollowLists
+                                        | SubscriptionStream::GroupMessages
+                                        | SubscriptionStream::AccountInboxGiftwraps => {
+                                            whitenoise
+                                                .process_account_event(event, source, retry_info)
+                                                .await;
+                                        }
+                                    },
+                                }
+                            }
+                            ProcessableEvent::RelayMessage(relay_url, message) => {
+                                whitenoise.process_relay_message(relay_url, message).await;
                             }
                         }
-                        ProcessableEvent::RelayMessage(relay_url, message) => {
-                            whitenoise.process_relay_message(relay_url, message).await;
-                        }
-                    }
+                    }).await;
                 }
                 Some(_) = shutdown.recv(), if !shutting_down => {
                     tracing::info!(

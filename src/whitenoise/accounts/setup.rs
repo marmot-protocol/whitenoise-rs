@@ -5,6 +5,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::watch;
 
 use crate::RelayType;
+use crate::perf_instrument;
 use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
@@ -15,6 +16,7 @@ use crate::whitenoise::{Whitenoise, WhitenoiseError};
 use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
+    #[perf_instrument("accounts")]
     pub(super) async fn create_base_account_with_private_key(
         &self,
         keys: &Keys,
@@ -31,6 +33,7 @@ impl Whitenoise {
         Ok(account)
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn activate_account(
         &self,
         account: &Account,
@@ -65,6 +68,7 @@ impl Whitenoise {
 
     /// Activates an account without publishing anything (for external signer accounts).
     /// This sets up relay connections and subscriptions but skips key package publishing.
+    #[perf_instrument("accounts")]
     pub(super) async fn activate_account_without_publishing(
         &self,
         account: &Account,
@@ -95,6 +99,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn persist_account(&self, account: &Account) -> Result<Account> {
         let saved_account = account.save(&self.database).await.map_err(|e| {
             tracing::error!(target: "whitenoise::accounts", "Failed to save account: {}", e);
@@ -108,6 +113,7 @@ impl Whitenoise {
         Ok(saved_account)
     }
 
+    #[perf_instrument("accounts")]
     async fn setup_key_package(
         &self,
         account: &Account,
@@ -163,6 +169,7 @@ impl Whitenoise {
 
     /// Checks whether a key package event was published by this Whitenoise instance
     /// and still has live local key material.
+    #[perf_instrument("accounts")]
     async fn is_own_key_package(&self, pubkey: &PublicKey, event_id: &EventId) -> bool {
         match PublishedKeyPackage::find_by_event_id(pubkey, &event_id.to_hex(), &self.database)
             .await
@@ -181,6 +188,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn load_default_relays(&self) -> Result<Vec<Relay>> {
         let mut default_relays = Vec::new();
         for Relay { url, .. } in Relay::defaults() {
@@ -199,6 +207,7 @@ impl Whitenoise {
     ///
     /// # Returns
     /// Returns the default relays for the account.
+    #[perf_instrument("accounts")]
     pub(super) async fn setup_relays_for_new_account(
         &self,
         account: &mut Account,
@@ -235,6 +244,7 @@ impl Whitenoise {
         Ok(default_relays)
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn setup_relays_for_existing_account(
         &self,
         account: &mut Account,
@@ -327,6 +337,7 @@ impl Whitenoise {
     ///
     /// Returns the relays for each type and booleans indicating which relay lists
     /// should be published (true when defaults were used).
+    #[perf_instrument("accounts")]
     pub(super) async fn setup_relays_for_external_signer_account(
         &self,
         account: &mut Account,
@@ -377,6 +388,7 @@ impl Whitenoise {
     ///
     /// Returns the relays and a boolean indicating whether they should be published
     /// (true if defaults were used because no existing relay list was found on the network).
+    #[perf_instrument("accounts")]
     async fn setup_external_account_relay_type(
         &self,
         account: &Account,
@@ -405,6 +417,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("accounts")]
     async fn setup_existing_account_relay_type(
         &self,
         account: &Account,
@@ -433,6 +446,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn fetch_existing_relays(
         &self,
         pubkey: PublicKey,
@@ -465,6 +479,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn add_relays_to_account(
         &self,
         account: &Account,
@@ -491,6 +506,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn sync_account_relays(
         &self,
         account: &Account,
@@ -504,6 +520,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn publish_relay_list<S>(
         &self,
         relays: &[Relay],
@@ -527,6 +544,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(crate) async fn background_publish_account_metadata(
         &self,
         account: &Account,
@@ -559,6 +577,7 @@ impl Whitenoise {
     /// * `account` - The account to publish the relay list for
     /// * `relay_type` - The type of relay list to publish
     /// * `relays` - The relays to publish the relay list to, if None, the relays will be fetched from the account
+    #[perf_instrument("accounts")]
     pub(crate) async fn background_publish_account_relay_list(
         &self,
         account: &Account,
@@ -600,6 +619,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(crate) async fn background_publish_account_follow_list(
         &self,
         account: &Account,
@@ -626,6 +646,7 @@ impl Whitenoise {
     }
 
     /// Extract per-group relay specs for subscription setup.
+    #[perf_instrument("accounts")]
     pub(crate) async fn extract_group_subscription_specs(
         &self,
         account: &Account,
@@ -648,6 +669,7 @@ impl Whitenoise {
         Ok(group_specs)
     }
 
+    #[perf_instrument("accounts")]
     async fn refresh_account_group_subscriptions_with_cancel(
         &self,
         account: &Account,
@@ -743,6 +765,7 @@ impl Whitenoise {
         });
     }
 
+    #[perf_instrument("accounts")]
     pub(crate) async fn setup_subscriptions(
         &self,
         account: &Account,
@@ -821,6 +844,7 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account to refresh subscriptions for
+    #[perf_instrument("accounts")]
     pub(crate) async fn refresh_account_subscriptions(&self, account: &Account) -> Result<()> {
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -860,6 +884,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     async fn warm_ephemeral_account_relays(&self, account: &Account) -> Result<()> {
         let warm_relays = match self.account_ephemeral_warm_relay_urls(account).await {
             Ok(warm_relays) => warm_relays,
@@ -876,7 +901,15 @@ impl Whitenoise {
             return Ok(());
         }
 
-        if let Err(error) = self.relay_control.warm_ephemeral_relays(&warm_relays).await {
+        // Warm both scopes concurrently — they use separate relay sessions
+        // so there's no contention, and this halves the worst-case timeout.
+        let (anon_result, account_result) = tokio::join!(
+            self.relay_control.warm_ephemeral_relays(&warm_relays),
+            self.relay_control
+                .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays),
+        );
+
+        if let Err(error) = anon_result {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 account_pubkey = %account.pubkey,
@@ -884,11 +917,7 @@ impl Whitenoise {
             );
         }
 
-        if let Err(error) = self
-            .relay_control
-            .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
-            .await
-        {
+        if let Err(error) = account_result {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 account_pubkey = %account.pubkey,
@@ -899,6 +928,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("accounts")]
     pub(super) async fn account_ephemeral_warm_relay_urls(
         &self,
         account: &Account,

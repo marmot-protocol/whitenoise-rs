@@ -9,6 +9,7 @@ use super::{
 };
 use crate::{
     nostr_manager::{Result, utils::adjust_since_for_giftwrap},
+    perf_instrument,
     relay_control::SubscriptionStream,
     types::{AccountInboxPlaneStateSnapshot, ProcessableEvent},
 };
@@ -62,6 +63,7 @@ impl AccountInboxPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn activate(
         &self,
         inbox_relays: &[RelayUrl],
@@ -76,6 +78,7 @@ impl AccountInboxPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn deactivate(&self) {
         self.session
             .unsubscribe(&SubscriptionId::new(format!(
@@ -99,6 +102,7 @@ impl AccountInboxPlane {
         self.session.telemetry()
     }
 
+    #[perf_instrument("relay")]
     async fn subscribe_giftwrap(
         &self,
         inbox_relays: &[RelayUrl],

@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
+use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
@@ -38,6 +39,7 @@ impl Task for ConsumedKeyPackageCleanup {
         Duration::from_secs(60 * 10) // 10 minutes
     }
 
+    #[perf_instrument("scheduled::consumed_kp_cleanup")]
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::consumed_key_package_cleanup",
@@ -111,6 +113,7 @@ fn summarize_cleanup_results(results: Vec<(String, Result<usize, WhitenoiseError
 /// Checks if the account has consumed key packages where the quiet period has elapsed
 /// (no new welcomes in the last 30 seconds), then deletes local key material using
 /// the hash_ref stored at publish time and marks the row as cleaned.
+#[perf_instrument("scheduled::consumed_kp_cleanup")]
 async fn cleanup_consumed_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,

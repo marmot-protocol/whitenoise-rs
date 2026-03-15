@@ -8,13 +8,16 @@ use mdk_core::{
 use nostr_sdk::prelude::*;
 
 pub use crate::whitenoise::database::media_files::MediaFile;
-use crate::whitenoise::{
-    database::{
-        Database,
-        media_files::{FileMetadata, MediaFileParams},
+use crate::{
+    perf_instrument,
+    whitenoise::{
+        database::{
+            Database,
+            media_files::{FileMetadata, MediaFileParams},
+        },
+        error::{Result, WhitenoiseError},
+        storage::Storage,
     },
-    error::{Result, WhitenoiseError},
-    storage::Storage,
 };
 
 /// Parsed media reference with additional fields not in MDK's MediaReference
@@ -160,6 +163,7 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The MediaFile record from the database
+    #[perf_instrument("media_files")]
     pub(crate) async fn store_and_record(
         &self,
         account_pubkey: &PublicKey,
@@ -191,6 +195,7 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The MediaFile record from the database
+    #[perf_instrument("media_files")]
     pub(crate) async fn record_in_database(
         &self,
         account_pubkey: &PublicKey,
@@ -229,6 +234,7 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Returns
     /// The path to the first matching file, if any
+    #[perf_instrument("media_files")]
     pub(crate) async fn find_file_with_prefix(&self, prefix: &str) -> Option<PathBuf> {
         self.storage.media_files.find_file_with_prefix(prefix).await
     }
@@ -338,6 +344,7 @@ impl<'a> MediaFiles<'a> {
     /// # Returns
     /// * `Ok(())` - All references stored successfully
     /// * `Err(WhitenoiseError)` - Database error
+    #[perf_instrument("media_files")]
     pub(crate) async fn store_parsed_media_references(
         &self,
         group_id: &GroupId,

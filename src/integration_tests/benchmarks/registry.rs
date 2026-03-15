@@ -139,6 +139,39 @@ impl BenchmarkRegistry {
             tracing::info!("    P99:       {:?}", result.p99);
             tracing::info!("");
             tracing::info!("  Throughput:  {:.2} ops/sec", result.throughput);
+
+            if let Some(breakdown) = &result.perf_breakdown
+                && !breakdown.is_empty()
+            {
+                tracing::info!("");
+                tracing::info!("  Perf Breakdown (sorted by total duration):");
+                tracing::info!(
+                    "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+                    "Marker",
+                    "Calls",
+                    "Mean",
+                    "Median",
+                    "P95",
+                    "P99",
+                    "Min",
+                    "Max"
+                );
+                tracing::info!("  {}", "-".repeat(127));
+                for b in breakdown {
+                    tracing::info!(
+                        "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+                        b.marker,
+                        b.call_count,
+                        format!("{:.2?}", b.mean),
+                        format!("{:.2?}", b.median),
+                        format!("{:.2?}", b.p95),
+                        format!("{:.2?}", b.p99),
+                        format!("{:.2?}", b.min),
+                        format!("{:.2?}", b.max),
+                    );
+                }
+            }
+
             tracing::info!("");
             tracing::info!("---");
         }

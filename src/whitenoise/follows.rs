@@ -1,5 +1,6 @@
 use nostr_sdk::PublicKey;
 
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -18,6 +19,7 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will follow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be followed
+    #[perf_instrument("follows")]
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
         let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
@@ -40,6 +42,7 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will unfollow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be unfollowed
+    #[perf_instrument("follows")]
     pub async fn unfollow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
         let user = match self.find_user_by_pubkey(pubkey).await {
             Ok(user) => user,
@@ -61,14 +64,14 @@ impl Whitenoise {
     ///
     /// * `account` - The account to check (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to check if followed
+    #[perf_instrument("follows")]
     pub async fn is_following_user(&self, account: &Account, pubkey: &PublicKey) -> Result<bool> {
-        let user = self.find_user_by_pubkey(pubkey).await;
-        if user.is_err() {
-            return Ok(false);
-        }
-        account
-            .is_following_user(&user.unwrap(), &self.database)
-            .await
+        let user = match self.find_user_by_pubkey(pubkey).await {
+            Ok(user) => user,
+            Err(WhitenoiseError::UserNotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        account.is_following_user(&user, &self.database).await
     }
 
     /// Retrieves all users that an account follows.
@@ -80,6 +83,7 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account whose follows to retrieve (must exist in database with valid ID)
+    #[perf_instrument("follows")]
     pub async fn follows(&self, account: &Account) -> Result<Vec<User>> {
         account.follows(&self.database).await
     }

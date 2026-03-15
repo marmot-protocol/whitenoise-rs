@@ -5,7 +5,7 @@ use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
+    WhitenoiseError, perf_instrument,
     whitenoise::cached_graph_user::{CachedGraphUser, DEFAULT_CACHE_TTL_HOURS},
 };
 
@@ -131,6 +131,7 @@ impl CachedGraphUser {
     ///
     /// Returns only entries where metadata was fetched within the default TTL.
     /// Missing entries or entries with stale/unfetched metadata are excluded.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn find_fresh_metadata_batch(
         pubkeys: &[PublicKey],
         database: &Database,
@@ -148,6 +149,7 @@ impl CachedGraphUser {
     ///
     /// Returns only entries where follows were fetched within the default TTL.
     /// Missing entries or entries with stale/unfetched follows are excluded.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn find_fresh_follows_batch(
         pubkeys: &[PublicKey],
         database: &Database,
@@ -164,6 +166,7 @@ impl CachedGraphUser {
     /// Find cached users with a fresh field by pubkeys with custom TTL.
     ///
     /// The `timestamp_column` must be one of `metadata_updated_at` or `follows_updated_at`.
+    #[perf_instrument("db::cached_graph_users")]
     async fn find_fresh_batch_by_field(
         pubkeys: &[PublicKey],
         timestamp_column: &str,
@@ -269,6 +272,7 @@ impl CachedGraphUser {
     ///
     /// On fresh insert: follows = NULL (not fetched), follows_updated_at = NULL.
     /// On conflict: only metadata, metadata_updated_at, and updated_at change.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn upsert_metadata_only(
         pubkey: &PublicKey,
         metadata: &Metadata,
@@ -304,6 +308,7 @@ impl CachedGraphUser {
     ///
     /// On fresh insert: metadata = NULL (not fetched), metadata_updated_at = NULL.
     /// On conflict: only follows, follows_updated_at, and updated_at change.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn upsert_follows_only(
         pubkey: &PublicKey,
         follows: &[PublicKey],
@@ -339,6 +344,7 @@ impl CachedGraphUser {
     /// Remove stale cache entries using default TTL (24 hours).
     ///
     /// Returns the number of deleted rows.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn cleanup_stale(database: &Database) -> Result<u64, WhitenoiseError> {
         Self::cleanup_stale_with_ttl(DEFAULT_CACHE_TTL_HOURS, database).await
     }
@@ -346,6 +352,7 @@ impl CachedGraphUser {
     /// Remove stale cache entries using custom TTL.
     ///
     /// Returns the number of deleted rows.
+    #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn cleanup_stale_with_ttl(
         max_age_hours: i64,
         database: &Database,

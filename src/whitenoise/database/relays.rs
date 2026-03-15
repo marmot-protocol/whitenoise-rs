@@ -5,7 +5,7 @@ use super::{
     Database, DatabaseError,
     utils::{normalize_relay_url, parse_timestamp},
 };
-use crate::{WhitenoiseError, whitenoise::relays::Relay};
+use crate::{WhitenoiseError, perf_instrument, whitenoise::relays::Relay};
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub(crate) struct RelayRow {
@@ -74,6 +74,7 @@ impl Relay {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::RelayNotFound`] if no relay with the given URL exists.
+    #[perf_instrument("db::relays")]
     pub(crate) async fn find_by_url(
         url: &RelayUrl,
         database: &Database,
@@ -96,17 +97,19 @@ impl Relay {
         })
     }
 
+    #[perf_instrument("db::relays")]
     pub(crate) async fn find_or_create_by_url(
         url: &RelayUrl,
         database: &Database,
     ) -> Result<Relay, WhitenoiseError> {
         match Relay::find_by_url(url, database).await {
             Ok(relay) => Ok(relay),
-            Err(_) => {
+            Err(WhitenoiseError::RelayNotFound) => {
                 let relay = Relay::new(url);
                 let new_relay = relay.save(database).await?;
                 Ok(new_relay)
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -123,6 +126,7 @@ impl Relay {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db::relays")]
     pub(crate) async fn save(&self, database: &Database) -> Result<Relay, WhitenoiseError> {
         let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
         let normalized_url = normalize_relay_url(&self.url);

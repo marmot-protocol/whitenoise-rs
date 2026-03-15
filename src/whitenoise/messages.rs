@@ -1,4 +1,5 @@
 use crate::{
+    perf_instrument, perf_span,
     types::MessageWithTokens,
     whitenoise::{
         Whitenoise,
@@ -35,6 +36,7 @@ impl Whitenoise {
     ///   (e.g., text note, reaction, etc.).
     /// * `tags` - Optional vector of Nostr tags to include with the message. If None, an empty
     ///   tag list will be used.
+    #[perf_instrument("messages")]
     pub async fn send_message_to_group(
         &self,
         account: &Account,
@@ -43,26 +45,34 @@ impl Whitenoise {
         kind: u16,
         tags: Option<Vec<Tag>>,
     ) -> Result<MessageWithTokens> {
+        let _build_span = perf_span!("messages::build_unsigned_event");
         let (inner_event, event_id) =
             self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
+        drop(_build_span);
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         // Guard: fail immediately if no relays configured (before creating MLS message
         // to avoid persisting a message in MDK storage that can never be delivered)
+        let _relay_check = perf_span!("messages::get_group_relays");
         let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
+        drop(_relay_check);
         if group_relays.is_empty() {
             return Err(WhitenoiseError::GroupMissingRelays);
         }
 
+        let _mls_span = perf_span!("messages::mls_create_message");
         let message_event = mdk.create_message(group_id, inner_event)?;
         let mdk_message =
             mdk.get_message(group_id, &event_id)?
                 .ok_or(WhitenoiseError::MdkCoreError(
                     mdk_core::error::Error::MessageNotFound,
                 ))?;
+        drop(_mls_span);
 
+        let _parse_span = perf_span!("messages::parse_content_tokens");
         let tokens = self.content_parser.parse(&mdk_message.content);
+        drop(_parse_span);
 
         // Proactive caching + delivery tracking for all outgoing event kinds.
         // Kind 9 (chat): full message processing + NewMessage emission
@@ -136,6 +146,7 @@ impl Whitenoise {
     /// Aggregates the raw MDK message into a `ChatMessage`, sets its delivery
     /// status to `Sending`, persists it in the cache, and emits a `NewMessage`
     /// update so the UI shows it immediately.
+    #[perf_instrument("messages")]
     async fn process_and_emit_outgoing_message(
         &self,
         mdk_message: &Message,
@@ -180,6 +191,7 @@ impl Whitenoise {
     /// Inserts the reaction event into `aggregated_messages`, sets delivery status
     /// to `Sending`, applies the reaction to the target kind-9 message, and emits
     /// a `ReactionAdded` update so the UI reflects the change immediately.
+    #[perf_instrument("messages")]
     async fn cache_and_apply_outgoing_reaction(
         &self,
         mdk_message: &Message,
@@ -253,6 +265,7 @@ impl Whitenoise {
     /// Inserts the deletion event into `aggregated_messages`, sets delivery status
     /// to `Sending`, marks the target message(s) as deleted, and emits appropriate
     /// updates so the UI reflects the change immediately.
+    #[perf_instrument("messages")]
     async fn cache_and_apply_outgoing_deletion(
         &self,
         mdk_message: &Message,
@@ -377,6 +390,7 @@ impl Whitenoise {
     /// - **Kind 7 (reaction)**: Remove the reaction from the parent message's summary.
     /// - **Kind 5 (deletion)**: Clear `deletion_event_id` on targets so they reappear.
     /// - **Kind 9 / other**: No cascade needed — the message already shows Failed status.
+    #[perf_instrument("messages")]
     async fn cascade_delivery_failure(
         kind: u16,
         event_id: &str,
@@ -493,6 +507,7 @@ impl Whitenoise {
     ///
     /// Also emits `DeliveryStatusChanged` for the original message when it moves
     /// to `Retried`, so subscribers can update immediately without a reload.
+    #[perf_instrument("messages")]
     pub async fn retry_message_publish(
         &self,
         account: &Account,
@@ -584,6 +599,7 @@ impl Whitenoise {
     /// * `pubkey` - The public key of the user requesting the messages. This is used to
     ///   fetch the appropriate account and verify access permissions.
     /// * `group_id` - The unique identifier of the group whose messages should be retrieved.
+    #[perf_instrument("messages")]
     pub async fn fetch_messages_for_group(
         &self,
         account: &Account,
@@ -621,6 +637,7 @@ impl Whitenoise {
     ///   Must be `Some` whenever `before` is `Some`; `None` is only valid when `before` is also
     ///   `None` (initial load). Passing `before` without `before_message_id` returns an error.
     /// * `limit`             - Maximum number of messages to return. Defaults to 50, capped at 200.
+    #[perf_instrument("messages")]
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
@@ -657,6 +674,7 @@ impl Whitenoise {
     /// * `pubkey`   - The public key of the requesting user (security check)
     /// * `group_id` - The group the message belongs to
     /// * `message_id` - Hex-encoded event ID of the message
+    #[perf_instrument("messages")]
     pub async fn fetch_message_by_id(
         &self,
         pubkey: &PublicKey,
@@ -718,6 +736,7 @@ impl Whitenoise {
     ///
     /// MUST be called BEFORE event processor starts to avoid race conditions.
     /// Uses simple count comparison to detect sync needs, then incrementally syncs missing events.
+    #[perf_instrument("messages")]
     pub(crate) async fn sync_message_cache_on_startup(&self) -> Result<()> {
         tracing::info!(
             target: "whitenoise::cache",
@@ -772,6 +791,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("messages")]
     async fn cache_needs_sync(&self, group_id: &GroupId, mdk_messages: &[Message]) -> Result<bool> {
         if mdk_messages.is_empty() {
             return Ok(false);
@@ -800,6 +820,7 @@ impl Whitenoise {
     /// Synchronize cache for a specific group
     ///
     /// Filters out events already in cache, then processes and saves only new events.
+    #[perf_instrument("messages")]
     async fn sync_cache_for_group(
         &self,
         pubkey: &PublicKey,

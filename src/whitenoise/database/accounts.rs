@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
+    WhitenoiseError, perf_instrument,
     whitenoise::{
         accounts::{Account, AccountType},
         database::users::UserRow,
@@ -107,6 +107,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn all(database: &Database) -> Result<Vec<Account>, WhitenoiseError> {
         let account_rows = sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts")
             .fetch_all(&database.pool)
@@ -160,6 +161,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::AccountNotFound`] if no account with the given public key exists.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn find_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
@@ -169,7 +171,10 @@ impl Account {
                 .bind(pubkey.to_hex().as_str())
                 .fetch_one(&database.pool)
                 .await
-                .map_err(|_| WhitenoiseError::AccountNotFound)?;
+                .map_err(|e| match e {
+                    sqlx::Error::RowNotFound => WhitenoiseError::AccountNotFound,
+                    other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
+                })?;
 
         Ok(Account {
             id: Some(account_row.id),
@@ -195,12 +200,16 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the associated user is not found.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn user(&self, database: &Database) -> Result<User, WhitenoiseError> {
         let user_row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = ?")
             .bind(self.user_id)
             .fetch_one(&database.pool)
             .await
-            .map_err(|_| WhitenoiseError::AccountNotFound)?;
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => WhitenoiseError::MissingUserReference,
+                other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
+            })?;
         Ok(user_row.into())
     }
 
@@ -217,6 +226,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the database query fails.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn follows(&self, database: &Database) -> Result<Vec<User>, WhitenoiseError> {
         let user_rows = sqlx::query_as::<_, UserRow>(
             "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.updated_at
@@ -257,6 +267,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn is_following_user(
         &self,
         user: &User,
@@ -287,17 +298,19 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn follow_user(
         &self,
         user: &User,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let now = Utc::now().timestamp_millis();
         sqlx::query("INSERT INTO account_follows (account_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(account_id, user_id) DO UPDATE SET updated_at = ?")
             .bind(self.id)
             .bind(user.id)
-            .bind(self.created_at.timestamp_millis())
-            .bind(self.updated_at.timestamp_millis())
-            .bind(Utc::now().timestamp_millis())
+            .bind(now)
+            .bind(now)
+            .bind(now)
             .execute(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
@@ -318,6 +331,7 @@ impl Account {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db::accounts")]
     pub(crate) async fn unfollow_user(
         &self,
         user: &User,

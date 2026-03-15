@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 
+use ::whitenoise::init_tracing_with_perf_layer;
+use ::whitenoise::integration_tests::benchmarks::init_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
 use ::whitenoise::*;
 
@@ -34,6 +36,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
+
+    // Initialise the perf layer BEFORE Whitenoise initialises tracing so that
+    // the layer is part of the subscriber stack from the very first span.
+    let perf_layer = init_perf_layer();
+    init_tracing_with_perf_layer(&args.logs_dir, perf_layer);
 
     tracing::info!("=== Starting Whitenoise Performance Benchmark Suite ===");
 

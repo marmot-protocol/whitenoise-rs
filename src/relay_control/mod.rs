@@ -28,6 +28,7 @@ pub(crate) mod observability;
 pub(crate) mod router;
 pub(crate) mod sessions;
 
+use crate::perf_instrument;
 use crate::whitenoise::database::{Database, DatabaseError};
 use crate::{
     RelayType,
@@ -94,6 +95,7 @@ impl RelayControlPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn start_telemetry_persistors(&self) {
         if self
             .telemetry_persistors_started
@@ -127,6 +129,7 @@ impl RelayControlPlane {
 
     /// Persist structured relay telemetry for later observability and retry work.
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn record_relay_telemetry(
         &self,
         telemetry: &observability::RelayTelemetry,
@@ -205,6 +208,7 @@ impl RelayControlPlane {
         !(telemetry.plane == RelayPlane::AccountInbox && telemetry.account_pubkey.is_none())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn start_discovery_plane(&self) -> NostrResult<()> {
         let relays = self.discovery.relays();
         let (discovery_result, warm_result) =
@@ -219,6 +223,7 @@ impl RelayControlPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn sync_discovery_subscriptions(
         &self,
         watched_users: &[PublicKey],
@@ -237,6 +242,7 @@ impl RelayControlPlane {
     /// fails, group subscriptions may already be active. Refreshing an already
     /// active account attempts to restore the previous group state on inbox
     /// activation failure.
+    #[perf_instrument("relay")]
     pub(crate) async fn activate_account_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -298,6 +304,7 @@ impl RelayControlPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn sync_account_group_subscriptions(
         &self,
         account_pubkey: PublicKey,
@@ -309,6 +316,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn deactivate_account_subscriptions(&self, account_pubkey: &PublicKey) {
         if let Some(plane) = self
             .account_inbox_planes
@@ -324,6 +332,7 @@ impl RelayControlPlane {
     }
 
     /// Deactivates all account subscriptions. Called during full data teardown.
+    #[perf_instrument("relay")]
     pub(crate) async fn shutdown_all(&self) {
         let pubkeys: Vec<_> = self
             .account_inbox_planes
@@ -337,6 +346,7 @@ impl RelayControlPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
         // Both planes must confirm the account is active. The group plane
         // keeps an entry even for accounts with zero groups (empty state), so
@@ -361,6 +371,7 @@ impl RelayControlPlane {
                 .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn has_discovery_subscriptions(&self) -> bool {
         self.discovery.has_subscriptions().await && self.discovery.has_connected_relay().await
     }
@@ -374,10 +385,12 @@ impl RelayControlPlane {
         self.ephemeral.clone()
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
         self.ephemeral.warm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_ephemeral_relays_for_account(
         &self,
         account_pubkey: PublicKey,
@@ -388,10 +401,12 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unwarm_ephemeral_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
         self.ephemeral.unwarm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
@@ -400,6 +415,7 @@ impl RelayControlPlane {
         self.ephemeral.fetch_metadata_from(relays, pubkey).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
@@ -411,6 +427,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
@@ -419,6 +436,7 @@ impl RelayControlPlane {
         self.ephemeral.fetch_user_key_package(pubkey, relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_welcome(
         &self,
         receiver: &PublicKey,
@@ -433,6 +451,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: nostr_sdk::Event,
@@ -445,6 +464,7 @@ impl RelayControlPlane {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
         metadata: &nostr_sdk::Metadata,
@@ -456,6 +476,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_relay_list_with_signer(
         &self,
         relay_list: &[RelayUrl],
@@ -469,6 +490,7 @@ impl RelayControlPlane {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
         follow_list: &[PublicKey],
@@ -480,6 +502,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
         encoded_key_package: &str,
@@ -492,6 +515,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_deletion_with_signer(
         &self,
         event_id: &nostr_sdk::EventId,
@@ -503,6 +527,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_batch_event_deletion_with_signer(
         &self,
         event_ids: &[nostr_sdk::EventId],
@@ -514,6 +539,7 @@ impl RelayControlPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
         let discovery = self.discovery.snapshot().await;
         let ephemeral = self.ephemeral.snapshot().await;

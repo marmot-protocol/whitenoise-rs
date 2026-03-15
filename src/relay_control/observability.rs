@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::RelayPlane;
+use crate::perf_instrument;
 use crate::whitenoise::database::{
     Database, DatabaseError, relay_events::RelayEventRecord, relay_status::RelayStatusRecord,
 };
@@ -306,6 +307,7 @@ impl RelayObservability {
         &self.config
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn record(
         &self,
         database: &Database,
@@ -358,6 +360,7 @@ impl RelayObservability {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn status(
         &self,
         database: &Database,
@@ -369,6 +372,7 @@ impl RelayObservability {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn recent_events(
         &self,
         database: &Database,

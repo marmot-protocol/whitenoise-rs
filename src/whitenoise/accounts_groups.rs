@@ -3,6 +3,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
     chat_list_streaming::ChatListUpdateTrigger, error::WhitenoiseError,
@@ -74,6 +75,7 @@ impl AccountGroup {
     ///
     /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
     /// so it can be persisted for efficient lookups.
+    #[perf_instrument("account_groups")]
     pub async fn get_or_create(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
@@ -91,6 +93,7 @@ impl AccountGroup {
     }
 
     /// Gets an AccountGroup for the given account and group, if it exists.
+    #[perf_instrument("account_groups")]
     pub async fn get(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
@@ -104,6 +107,7 @@ impl AccountGroup {
 
     /// Gets all visible AccountGroups for the given account.
     /// Visible means: pending or accepted (not declined).
+    #[perf_instrument("account_groups")]
     pub async fn visible_for_account(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
@@ -113,6 +117,7 @@ impl AccountGroup {
     }
 
     /// Gets all pending AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn pending_for_account(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
@@ -122,6 +127,7 @@ impl AccountGroup {
     }
 
     /// Accepts this group invite by setting user_confirmation to true.
+    #[perf_instrument("account_groups")]
     pub async fn accept(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self
             .update_user_confirmation(true, &whitenoise.database)
@@ -134,6 +140,7 @@ impl AccountGroup {
     /// Uses the persisted `dm_peer_pubkey` column for an efficient single-query
     /// lookup without requiring MLS/MDK calls. Returns the group ID of the most
     /// recently created visible DM group with this peer, or `None` if none exists.
+    #[perf_instrument("account_groups")]
     pub async fn find_latest_dm_group_with_peer(
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
@@ -147,6 +154,7 @@ impl AccountGroup {
 
     /// Declines this group invite by setting user_confirmation to false.
     /// The group will be hidden from the UI but remains in MLS.
+    #[perf_instrument("account_groups")]
     pub async fn decline(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self
             .update_user_confirmation(false, &whitenoise.database)
@@ -155,6 +163,7 @@ impl AccountGroup {
     }
 
     /// Archives this chat by setting archived_at to the current time.
+    #[perf_instrument("account_groups")]
     pub async fn archive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self
             .update_archived_at(Some(Utc::now()), &whitenoise.database)
@@ -163,6 +172,7 @@ impl AccountGroup {
     }
 
     /// Unarchives this chat by clearing archived_at.
+    #[perf_instrument("account_groups")]
     pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self.update_archived_at(None, &whitenoise.database).await?;
         Ok(updated)
@@ -174,6 +184,7 @@ impl Whitenoise {
     ///
     /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
     /// so it can be persisted for efficient lookups.
+    #[perf_instrument("account_groups")]
     pub async fn get_or_create_account_group(
         &self,
         account: &Account,
@@ -184,6 +195,7 @@ impl Whitenoise {
     }
 
     /// Gets all visible AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn get_visible_account_groups(
         &self,
         account: &Account,
@@ -192,6 +204,7 @@ impl Whitenoise {
     }
 
     /// Gets all pending AccountGroups for the given account.
+    #[perf_instrument("account_groups")]
     pub async fn get_pending_account_groups(
         &self,
         account: &Account,
@@ -200,6 +213,7 @@ impl Whitenoise {
     }
 
     /// Accepts a group invite for the given account and MLS group.
+    #[perf_instrument("account_groups")]
     pub async fn accept_account_group(
         &self,
         account: &Account,
@@ -212,6 +226,7 @@ impl Whitenoise {
     }
 
     /// Declines a group invite for the given account and MLS group.
+    #[perf_instrument("account_groups")]
     pub async fn decline_account_group(
         &self,
         account: &Account,
@@ -229,6 +244,7 @@ impl Whitenoise {
     /// last_read_message_id only if the new message is newer than the current
     /// read marker. This prevents regression when messages arrive out of order
     /// or when the UI marks an older message as read after a newer one.
+    #[perf_instrument("account_groups")]
     pub async fn mark_message_read(
         &self,
         account: &Account,
@@ -256,6 +272,7 @@ impl Whitenoise {
     }
 
     /// Gets the last read message ID for an account in a group.
+    #[perf_instrument("account_groups")]
     pub async fn get_last_read_message_id(
         &self,
         account: &Account,
@@ -269,6 +286,7 @@ impl Whitenoise {
     ///
     /// - `None` = unpin the chat
     /// - `Some(n)` = pin the chat with order n (lower values appear first)
+    #[perf_instrument("account_groups")]
     pub async fn set_chat_pin_order(
         &self,
         account: &Account,
@@ -289,6 +307,7 @@ impl Whitenoise {
     /// Archives a chat for the given account.
     ///
     /// Idempotent: if already archived, returns the existing state unchanged.
+    #[perf_instrument("account_groups")]
     pub async fn archive_chat(
         &self,
         account: &Account,
@@ -315,6 +334,7 @@ impl Whitenoise {
     /// Unarchives a chat for the given account.
     ///
     /// Idempotent: if not archived, returns the existing state unchanged.
+    #[perf_instrument("account_groups")]
     pub async fn unarchive_chat(
         &self,
         account: &Account,
@@ -340,6 +360,7 @@ impl Whitenoise {
 
     /// Returns the group ID of the latest DM group between the account and the
     /// given peer, or `None` if no DM group exists between them.
+    #[perf_instrument("account_groups")]
     pub async fn get_dm_group_with_peer(
         &self,
         account: &Account,

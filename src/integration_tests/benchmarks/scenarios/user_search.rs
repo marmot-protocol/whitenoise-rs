@@ -91,6 +91,12 @@ impl BenchmarkScenario for UserSearchBenchmark {
                 WhitenoiseError::Other(anyhow::anyhow!("Failed to follow target: {}", e))
             })?;
 
+        // Clear perf samples accumulated during setup/follow so only
+        // actual search timings appear in the breakdown.
+        if let Some(layer) = crate::integration_tests::benchmarks::PERF_LAYER.get() {
+            layer.clear();
+        }
+
         let mut all_timings: Vec<Duration> = Vec::new();
 
         for &(query, expected_npub) in SEARCH_TARGETS {
@@ -117,11 +123,16 @@ impl BenchmarkScenario for UserSearchBenchmark {
 
         let total_duration: Duration = all_timings.iter().sum();
 
+        let perf_breakdown = crate::integration_tests::benchmarks::PERF_LAYER
+            .get()
+            .map(|layer| layer.drain());
+
         Ok(BenchmarkResult::from_timings(
             self.name().to_string(),
             &self.config(),
             all_timings,
             total_duration,
+            perf_breakdown,
         ))
     }
 }

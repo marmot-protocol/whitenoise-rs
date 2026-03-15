@@ -5,6 +5,7 @@ use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
+use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::relays::{Relay, RelayType};
@@ -13,6 +14,7 @@ use crate::whitenoise::users::{KeyPackageStatus, UserSyncMode};
 use super::protocol::{Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
+#[perf_instrument("dispatch")]
 pub async fn dispatch(req: Request) -> Response {
     let wn = match Whitenoise::get_instance() {
         Ok(wn) => wn,
@@ -821,6 +823,7 @@ async fn users_search<W>(
 
 /// Clean a ChatListItem for output: strip redundant mls_group_id from last_message,
 /// and resolve missing author_display_name.
+#[perf_instrument("dispatch")]
 async fn clean_chat_list_item(
     wn: &Whitenoise,
     item: &crate::whitenoise::chat_list::ChatListItem,
@@ -850,6 +853,7 @@ fn parse_pubkey(s: &str) -> Result<PublicKey, Response> {
     PublicKey::parse(s).map_err(|e| Response::err(format!("invalid pubkey '{s}': {e}")))
 }
 
+#[perf_instrument("dispatch")]
 async fn find_account(
     wn: &Whitenoise,
     pubkey_str: &str,
@@ -865,6 +869,7 @@ async fn find_account(
         .ok_or_else(|| Response::err(format!("account not found: {pubkey_str}")))
 }
 
+#[perf_instrument("dispatch")]
 async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
     let user = wn
         .find_or_create_user_by_pubkey(pubkey, UserSyncMode::Blocking)
@@ -885,6 +890,7 @@ fn cli_group_relay_urls() -> Vec<RelayUrl> {
         .collect()
 }
 
+#[perf_instrument("dispatch")]
 async fn create_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -917,6 +923,7 @@ async fn create_group(
     Ok(to_response(&group))
 }
 
+#[perf_instrument("dispatch")]
 async fn add_members(
     wn: &Whitenoise,
     account_str: &str,
@@ -937,6 +944,7 @@ async fn add_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn get_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -951,6 +959,7 @@ async fn get_group(
     Ok(to_response(&group))
 }
 
+#[perf_instrument("dispatch")]
 async fn group_pubkey_list(
     wn: &Whitenoise,
     account_str: &str,
@@ -977,6 +986,7 @@ async fn group_pubkey_list(
     Ok(to_response(&members))
 }
 
+#[perf_instrument("dispatch")]
 async fn group_relay_list(
     wn: &Whitenoise,
     account_str: &str,
@@ -993,6 +1003,7 @@ async fn group_relay_list(
     Ok(to_response(&urls))
 }
 
+#[perf_instrument("dispatch")]
 async fn remove_members(
     wn: &Whitenoise,
     account_str: &str,
@@ -1013,6 +1024,7 @@ async fn remove_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn leave_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1026,6 +1038,7 @@ async fn leave_group(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn rename_group(
     wn: &Whitenoise,
     account_str: &str,
@@ -1041,6 +1054,7 @@ async fn rename_group(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let groups = wn
@@ -1053,6 +1067,7 @@ async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, R
     Ok(to_response(&pending))
 }
 
+#[perf_instrument("dispatch")]
 async fn respond_to_invite(
     wn: &Whitenoise,
     account_str: &str,
@@ -1077,6 +1092,7 @@ async fn respond_to_invite(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let metadata = account
@@ -1087,6 +1103,7 @@ async fn profile_show(wn: &Whitenoise, account_str: &str) -> Result<Response, Re
 }
 
 #[allow(clippy::too_many_arguments)]
+#[perf_instrument("dispatch")]
 async fn profile_update(
     wn: &Whitenoise,
     account_str: &str,
@@ -1135,6 +1152,7 @@ async fn profile_update(
     Ok(to_response(&metadata))
 }
 
+#[perf_instrument("dispatch")]
 async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let users = wn
@@ -1158,6 +1176,7 @@ enum FollowAction {
     Remove,
 }
 
+#[perf_instrument("dispatch")]
 async fn follows_mutate(
     wn: &Whitenoise,
     account_str: &str,
@@ -1174,6 +1193,7 @@ async fn follows_mutate(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn follows_check(
     wn: &Whitenoise,
     account_str: &str,
@@ -1188,6 +1208,7 @@ async fn follows_check(
     Ok(Response::ok(serde_json::json!({ "following": following })))
 }
 
+#[perf_instrument("dispatch")]
 async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let items = wn
@@ -1202,6 +1223,7 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
     Ok(to_response(&clean))
 }
 
+#[perf_instrument("dispatch")]
 async fn archive_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1215,6 +1237,7 @@ async fn archive_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn unarchive_chat(
     wn: &Whitenoise,
     account_str: &str,
@@ -1228,6 +1251,7 @@ async fn unarchive_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let items = wn
@@ -1305,6 +1329,7 @@ where
     write_stream_end(writer).await;
 }
 
+#[perf_instrument("dispatch")]
 async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Response> {
     let theme: ThemeMode = theme_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_theme_mode(theme)
@@ -1313,6 +1338,7 @@ async fn settings_theme(wn: &Whitenoise, theme_str: &str) -> Result<Response, Re
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn settings_language(wn: &Whitenoise, lang_str: &str) -> Result<Response, Response> {
     let language: Language = lang_str.parse().map_err(|e: String| Response::err(e))?;
     wn.update_language(language)
@@ -1330,6 +1356,7 @@ fn parse_relay_url(s: &str) -> Result<RelayUrl, Response> {
     RelayUrl::parse(s).map_err(|e| Response::err(format!("invalid relay URL: {e}")))
 }
 
+#[perf_instrument("dispatch")]
 async fn relays_list(
     wn: &Whitenoise,
     account_str: &str,
@@ -1384,6 +1411,7 @@ async fn relays_list(
     Ok(to_response(&relays))
 }
 
+#[perf_instrument("dispatch")]
 async fn relays_add(
     wn: &Whitenoise,
     account_str: &str,
@@ -1409,6 +1437,7 @@ async fn relays_add(
     })))
 }
 
+#[perf_instrument("dispatch")]
 async fn relays_remove(
     wn: &Whitenoise,
     account_str: &str,
@@ -1437,6 +1466,7 @@ async fn relays_remove(
     })))
 }
 
+#[perf_instrument("dispatch")]
 async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
     let pk = parse_pubkey(pubkey_str)?;
     let user = wn
@@ -1448,6 +1478,7 @@ async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
 
 /// Collect unique pubkeys from a slice of ChatMessages (authors + reaction users)
 /// and resolve their display names.
+#[perf_instrument("dispatch")]
 async fn resolve_chat_display_names(
     wn: &Whitenoise,
     messages: &[crate::whitenoise::message_aggregator::ChatMessage],
@@ -1545,6 +1576,7 @@ fn format_chat_message(
     Some(msg)
 }
 
+#[perf_instrument("dispatch")]
 async fn list_messages(
     wn: &Whitenoise,
     account_str: &str,
@@ -1577,6 +1609,7 @@ async fn list_messages(
     Ok(to_response(&clean))
 }
 
+#[perf_instrument("dispatch")]
 async fn search_messages(
     wn: &Whitenoise,
     account_str: &str,
@@ -1608,6 +1641,7 @@ async fn search_messages(
     Ok(to_response(&clean))
 }
 
+#[perf_instrument("dispatch")]
 async fn send_message(
     wn: &Whitenoise,
     account_str: &str,
@@ -1635,6 +1669,7 @@ async fn send_message(
     Ok(to_response(&result))
 }
 
+#[perf_instrument("dispatch")]
 async fn delete_message(
     wn: &Whitenoise,
     account_str: &str,
@@ -1655,6 +1690,7 @@ async fn delete_message(
     Ok(to_response(&result))
 }
 
+#[perf_instrument("dispatch")]
 async fn retry_message(
     wn: &Whitenoise,
     account_str: &str,
@@ -1673,6 +1709,7 @@ async fn retry_message(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[perf_instrument("dispatch")]
 async fn react_to_message(
     wn: &Whitenoise,
     account_str: &str,
@@ -1694,6 +1731,7 @@ async fn react_to_message(
     Ok(to_response(&result))
 }
 
+#[perf_instrument("dispatch")]
 async fn unreact_to_message(
     wn: &Whitenoise,
     account_str: &str,
@@ -1735,6 +1773,7 @@ async fn unreact_to_message(
     Ok(to_response(&result))
 }
 
+#[perf_instrument("dispatch")]
 async fn upload_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1816,6 +1855,7 @@ fn build_imeta_tag(
         .map_err(|e| Response::err(format!("failed to create imeta tag: {e}")))
 }
 
+#[perf_instrument("dispatch")]
 async fn download_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1840,6 +1880,7 @@ async fn download_media(
     Ok(to_response(&media_file))
 }
 
+#[perf_instrument("dispatch")]
 async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
     let group_id = parse_group_id(group_id_hex)?;
 

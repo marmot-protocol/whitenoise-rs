@@ -8,6 +8,7 @@ use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
@@ -224,6 +225,7 @@ impl Whitenoise {
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Declined and archived groups are filtered out.
+    #[perf_instrument("chat_list")]
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
         let visible = self.visible_groups(account).await?;
         let active: Vec<_> = visible
@@ -236,6 +238,7 @@ impl Whitenoise {
     /// Retrieves the archived chat list for an account.
     ///
     /// Returns only archived chats, sorted by last activity.
+    #[perf_instrument("chat_list")]
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
         let visible = self.visible_groups(account).await?;
         let archived: Vec<_> = visible
@@ -249,6 +252,7 @@ impl Whitenoise {
     ///
     /// Handles the expensive batch pipeline: group info, messages, users, images,
     /// unread counts, assembly, and sorting.
+    #[perf_instrument("chat_list")]
     async fn build_chat_list_for(
         &self,
         account: &Account,
@@ -311,6 +315,7 @@ impl Whitenoise {
     /// - Group doesn't exist in MDK
     /// - GroupInformation doesn't exist (group not fully initialized)
     /// - AccountGroup is declined
+    #[perf_instrument("chat_list")]
     pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
@@ -426,6 +431,7 @@ impl Whitenoise {
     ///
     /// Checks for subscribers on both active and archived channels first to avoid
     /// expensive `build_chat_list_item` calls. Errors are logged but don't affect the caller.
+    #[perf_instrument("chat_list")]
     pub(crate) async fn emit_chat_list_update(
         &self,
         account: &Account,
@@ -457,6 +463,7 @@ impl Whitenoise {
     /// and the first handler modifies shared state. Only the first handler can
     /// correctly detect certain conditions (e.g., "was the deleted message the
     /// last message?"), so it must emit for all subscribers.
+    #[perf_instrument("chat_list")]
     pub(crate) async fn emit_chat_list_update_for_group(
         &self,
         group_id: &GroupId,
@@ -495,6 +502,7 @@ impl Whitenoise {
     /// Routes updates to the correct channel(s):
     /// - `ChatArchiveChanged`: both channels (item is moving between lists)
     /// - Other triggers: the one channel matching the item's archive status
+    #[perf_instrument("chat_list")]
     async fn emit_chat_list_update_for_account(
         &self,
         pubkey: &PublicKey,
@@ -564,6 +572,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_group_info_map(
         &self,
         account_pubkey: PublicKey,
@@ -579,6 +588,7 @@ impl Whitenoise {
 
     /// Identifies the "other user" in each DM group using the persisted
     /// `dm_peer_pubkey` column, avoiding per-group MDK membership lookups.
+    #[perf_instrument("chat_list")]
     async fn identify_dm_participants(
         &self,
         account: &Account,
@@ -588,6 +598,7 @@ impl Whitenoise {
         Ok(pairs.into_iter().collect())
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_last_message_map(
         &self,
         group_ids: &[GroupId],
@@ -600,6 +611,7 @@ impl Whitenoise {
             .collect())
     }
 
+    #[perf_instrument("chat_list")]
     async fn build_users_by_pubkey(
         &self,
         pubkeys: &[PublicKey],
@@ -609,6 +621,7 @@ impl Whitenoise {
     }
 
     /// Resolves image paths for Group-type chats only (DMs use profile picture URLs).
+    #[perf_instrument("chat_list")]
     async fn resolve_group_images(
         &self,
         account: &Account,
@@ -637,6 +650,7 @@ impl Whitenoise {
     ///
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
+    #[perf_instrument("chat_list")]
     async fn resolve_group_image_paths(
         &self,
         account: &Account,

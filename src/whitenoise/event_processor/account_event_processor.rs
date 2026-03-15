@@ -2,6 +2,7 @@ use nostr_sdk::prelude::*;
 
 use crate::{
     nostr_manager::utils::cap_timestamp_to_now,
+    perf_instrument,
     relay_control::hash_pubkey_for_subscription_id,
     types::{EventSource, RetryInfo},
     whitenoise::{
@@ -12,6 +13,7 @@ use crate::{
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_processor")]
     pub(super) async fn process_account_event(
         &self,
         event: Event,
@@ -193,6 +195,7 @@ impl Whitenoise {
     /// Extract the account pubkey from a subscription_id
     /// Subscription IDs follow the format: {hashed_pubkey}_{subscription_type}
     /// where hashed_pubkey = SHA256(session salt || accouny_pubkey)[..12]
+    #[perf_instrument("event_processor")]
     async fn extract_pubkey_from_subscription_id(
         &self,
         subscription_id: &str,
@@ -222,6 +225,7 @@ impl Whitenoise {
         )))
     }
 
+    #[perf_instrument("event_processor")]
     async fn account_from_event_source(&self, source: &EventSource) -> Result<Account> {
         let target_pubkey = match source {
             EventSource::LegacySubscriptionId(Some(subscription_id)) => self
@@ -256,6 +260,7 @@ impl Whitenoise {
 
     /// Check if an account event should be skipped (not processed)
     /// Returns Some(reason) if should skip, None if should process
+    #[perf_instrument("event_processor")]
     async fn should_skip_account_event_processing(
         &self,
         event: &Event,
@@ -313,6 +318,7 @@ impl Whitenoise {
     }
 
     /// Route an event to the appropriate handler based on its kind
+    #[perf_instrument("event_processor")]
     async fn route_account_event_for_processing(
         &self,
         event: &Event,
@@ -341,6 +347,7 @@ impl Whitenoise {
     }
 
     /// Extract rumor timestamp from giftwrap event for sync advancement
+    #[perf_instrument("event_processor")]
     async fn extract_rumor_timestamp_for_advancement(
         &self,
         event: &Event,

@@ -16,6 +16,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
+    perf_span,
     types::{EphemeralPinnedRelayStateSnapshot, EphemeralScopeStateSnapshot, ProcessableEvent},
     whitenoise::database::Database,
 };
@@ -66,6 +67,7 @@ impl EphemeralExecutor {
     }
 
     pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
+        let _span = perf_span!("relay::ephemeral_warm_relays");
         self.pin_relays(None, relays).await
     }
 
@@ -74,10 +76,12 @@ impl EphemeralExecutor {
         account_pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<()> {
+        let _span = perf_span!("relay::ephemeral_warm_relays_for_account");
         self.pin_relays(Some(account_pubkey), relays).await
     }
 
     pub(crate) async fn unwarm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
+        let _span = perf_span!("relay::ephemeral_unwarm_relays");
         self.unpin_relays(None, relays).await
     }
 
@@ -87,6 +91,7 @@ impl EphemeralExecutor {
         relays: &[RelayUrl],
         filter: Filter,
     ) -> Result<Events> {
+        let _span = perf_span!("relay::ephemeral_fetch_events");
         let entry = self.session_entry(account_pubkey).await;
         entry
             .prepare_ad_hoc_relays(relays, self.config.ad_hoc_relay_ttl)
@@ -103,6 +108,7 @@ impl EphemeralExecutor {
         relays: &[RelayUrl],
         event: &Event,
     ) -> Result<Output<EventId>> {
+        let _span = perf_span!("relay::ephemeral_publish_event");
         let entry = self.session_entry(account_pubkey).await;
         entry
             .prepare_ad_hoc_relays(relays, self.config.ad_hoc_relay_ttl)
@@ -111,6 +117,7 @@ impl EphemeralExecutor {
     }
 
     pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {
+        let _span = perf_span!("relay::ephemeral_remove_account_scope");
         let entry = self.sessions.write().await.remove(&Some(*account_pubkey));
         if let Some(entry) = entry {
             entry.session.shutdown().await;
@@ -119,6 +126,7 @@ impl EphemeralExecutor {
 
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn remove_all_account_scopes(&self) {
+        let _span = perf_span!("relay::ephemeral_remove_all_account_scopes");
         let account_keys = self
             .sessions
             .read()
@@ -137,6 +145,7 @@ impl EphemeralExecutor {
         account_pubkey: Option<PublicKey>,
         relays: &[RelayUrl],
     ) -> Result<()> {
+        let _span = perf_span!("relay::ephemeral_pin_relays");
         let entry = self.session_entry(account_pubkey).await;
         entry.pin_relays(relays).await?;
         entry
@@ -150,6 +159,7 @@ impl EphemeralExecutor {
         account_pubkey: Option<PublicKey>,
         relays: &[RelayUrl],
     ) -> Result<()> {
+        let _span = perf_span!("relay::ephemeral_unpin_relays");
         let entry = self.sessions.read().await.get(&account_pubkey).cloned();
         match entry {
             Some(entry) => entry.unpin_relays(relays).await,
@@ -158,6 +168,7 @@ impl EphemeralExecutor {
     }
 
     async fn session_entry(&self, account_pubkey: Option<PublicKey>) -> Arc<EphemeralSessionEntry> {
+        let _span = perf_span!("relay::ephemeral_session_entry");
         if let Some(session) = self.sessions.read().await.get(&account_pubkey).cloned() {
             return session;
         }

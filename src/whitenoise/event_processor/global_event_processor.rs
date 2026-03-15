@@ -1,6 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::{
+    perf_instrument,
     types::{EventSource, RetryInfo},
     whitenoise::{
         Whitenoise,
@@ -9,6 +10,7 @@ use crate::{
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_processor")]
     pub(super) async fn process_global_event(
         &self,
         event: Event,
@@ -76,6 +78,7 @@ impl Whitenoise {
 
     /// Check if a global event should be skipped (not processed)
     /// Returns Some(reason) if should skip, None if should process
+    #[perf_instrument("event_processor")]
     async fn should_skip_global_event_processing(&self, event: &Event) -> Option<&'static str> {
         let already_processed = match self
             .event_tracker
@@ -117,6 +120,7 @@ impl Whitenoise {
         None
     }
 
+    #[perf_instrument("event_processor")]
     async fn route_global_event_for_processing(&self, event: &Event) -> Result<()> {
         match event.kind {
             Kind::Metadata => self.handle_metadata(event.clone()).await,

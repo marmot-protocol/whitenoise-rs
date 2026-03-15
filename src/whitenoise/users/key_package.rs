@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use nostr_sdk::prelude::*;
 
+use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise,
     error::Result,
@@ -33,6 +34,7 @@ impl User {
     /// # Arguments
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
+    #[perf_instrument("users")]
     pub async fn key_package_event(&self, whitenoise: &Whitenoise) -> Result<Option<Event>> {
         let key_package_relays = self
             .relays(RelayType::KeyPackage, &whitenoise.database)
@@ -71,6 +73,7 @@ impl User {
     ///
     /// Similar to [`key_package_event`](Self::key_package_event), but returns a
     /// [`KeyPackageStatus`] that distinguishes between valid, missing, and incompatible.
+    #[perf_instrument("users")]
     pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
         let event = self.key_package_event(whitenoise).await?;
         Ok(classify_key_package(event))

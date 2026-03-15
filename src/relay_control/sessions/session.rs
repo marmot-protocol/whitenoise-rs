@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
 use crate::{
     nostr_manager::{NostrManagerError, Result},
+    perf_instrument,
     relay_control::{
         SubscriptionContext, SubscriptionStream,
         observability::{RelayTelemetry, RelayTelemetryKind},
@@ -117,11 +118,13 @@ impl RelaySession {
         false
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn ensure_relays_connected(&self, relay_urls: &[RelayUrl]) -> Result<()> {
         self.prepare_relay_urls(relay_urls).await?;
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     async fn prepare_relay_urls(&self, relay_urls: &[RelayUrl]) -> Result<PreparedRelayUrls> {
         if relay_urls.is_empty() {
             return Ok(PreparedRelayUrls {
@@ -174,6 +177,13 @@ impl RelaySession {
             match relay.status() {
                 RelayStatus::Connected => {}
                 RelayStatus::Connecting => {
+                    relays_to_wait.push(relay);
+                }
+                RelayStatus::Pending => {
+                    // Pending relays have can_connect() == false, so relay.connect()
+                    // is a no-op. Terminate first to reset to a connectable state.
+                    relay.disconnect();
+                    relay.connect();
                     relays_to_wait.push(relay);
                 }
                 RelayStatus::Disconnected => {
@@ -271,6 +281,8 @@ impl RelaySession {
         })
     }
 
+    #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relay_urls: &[RelayUrl],
@@ -355,6 +367,7 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         relay_urls: &[RelayUrl],
@@ -458,11 +471,13 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_relay(&self, relay_url: &RelayUrl) -> Result<()> {
         self.client.force_remove_relay(relay_url.clone()).await?;
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn subscribe_with_id_to(
         &self,
         relay_urls: &[RelayUrl],
@@ -608,6 +623,7 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unsubscribe(&self, subscription_id: &SubscriptionId) {
         if let Some(relay_urls) = self
             .state
@@ -625,6 +641,7 @@ impl RelaySession {
         self.client.unsubscribe(subscription_id).await;
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn shutdown(&self) {
         self.state.subscription_relays.write().await.clear();
         self.router.clear().await;
@@ -633,6 +650,7 @@ impl RelaySession {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn unsubscribe_all(&self) {
         let subscription_ids: Vec<SubscriptionId> = self
             .state
@@ -891,6 +909,7 @@ impl RelaySession {
         });
     }
 
+    #[perf_instrument("relay")]
     async fn process_notification(
         notification: RelayNotification,
         plane: crate::relay_control::RelayPlane,
@@ -1015,6 +1034,7 @@ impl RelaySession {
         }
     }
 
+    #[perf_instrument("relay")]
     async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
         match self.client.relay(relay_url).await {
             Ok(_) => Ok(false),
@@ -1178,6 +1198,55 @@ mod tests {
         );
 
         assert_eq!(telemetry.account_pubkey, Some(account_pubkey));
+    }
+
+    /// Validates the disconnect-before-connect mechanism used in `prepare_relay_urls`
+    /// to recover relays stuck in `Pending` state.
+    ///
+    /// In nostr-sdk 0.44, `relay.connect()` is a no-op when status is `Pending`
+    /// because `can_connect()` returns false for that state. Without intervention,
+    /// a Pending relay stays stuck permanently. The fix calls `disconnect()` first
+    /// to transition to `Terminated` (where `can_connect()` is true), then `connect()`.
+    #[tokio::test]
+    async fn test_disconnect_recovers_relay_stuck_in_pending() {
+        let (sender, _) = mpsc::channel(8);
+        let session = RelaySession::new(RelaySessionConfig::new(RelayPlane::Ephemeral), sender);
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        session.client().add_relay(relay_url.clone()).await.unwrap();
+
+        let relay = session.client().relay(&relay_url).await.unwrap();
+        assert_eq!(relay.status(), RelayStatus::Initialized);
+
+        // Put relay into Pending state (simulates a connection attempt in progress)
+        relay.connect();
+        assert_eq!(relay.status(), RelayStatus::Pending);
+
+        // Demonstrate the bug: connect() is a no-op when already Pending
+        relay.connect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Pending,
+            "connect() should be a no-op for Pending relays"
+        );
+
+        // The fix: disconnect() synchronously sets status to Terminated.
+        // No .await between disconnect() and assertion — on current_thread
+        // runtime, spawned connection tasks can't interfere.
+        relay.disconnect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Terminated,
+            "disconnect() should transition Pending to Terminated"
+        );
+
+        // Now connect() works again — spawns a fresh connection task
+        relay.connect();
+        assert_eq!(
+            relay.status(),
+            RelayStatus::Pending,
+            "connect() from Terminated should start a fresh connection attempt"
+        );
     }
 
     #[tokio::test]

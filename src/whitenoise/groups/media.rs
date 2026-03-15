@@ -10,6 +10,7 @@ use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
+use crate::perf_instrument;
 use crate::types::ImageType;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
@@ -48,6 +49,7 @@ impl Whitenoise {
     /// # Arguments
     /// * `account` - The account viewing the group
     /// * `group_id` - The MLS group ID
+    #[perf_instrument("media")]
     pub(crate) async fn sync_group_image_cache_if_needed(
         &self,
         account: &Account,
@@ -144,6 +146,7 @@ impl Whitenoise {
     ///
     /// The returned metadata (hash, key, nonce) should be passed to `update_group_data`
     /// to update the group's image settings.
+    #[perf_instrument("media")]
     pub async fn upload_group_image(
         &self,
         account: &Account,
@@ -231,6 +234,7 @@ impl Whitenoise {
         ))
     }
 
+    #[perf_instrument("media")]
     pub async fn upload_chat_media(
         &self,
         account: &Account,
@@ -314,6 +318,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     pub async fn download_chat_media(
         &self,
         account: &Account,
@@ -373,10 +378,12 @@ impl Whitenoise {
         MediaFile::update_file_path(&self.database, media_file_id, &cache_path).await
     }
 
+    #[perf_instrument("media")]
     pub async fn get_media_files_for_group(&self, group_id: &GroupId) -> Result<Vec<MediaFile>> {
         MediaFile::find_by_group(&self.database, group_id).await
     }
 
+    #[perf_instrument("media")]
     pub async fn get_group_image_path(
         &self,
         account: &Account,
@@ -391,6 +398,7 @@ impl Whitenoise {
         self.resolve_group_image_path(account, &group).await
     }
 
+    #[perf_instrument("media")]
     pub(crate) async fn resolve_group_image_path(
         &self,
         account: &Account,
@@ -431,6 +439,7 @@ impl Whitenoise {
     }
 
     /// Downloads, decrypts, and caches a group image if not already cached
+    #[perf_instrument("media")]
     async fn download_and_cache_group_image(
         &self,
         blossom_url: Option<Url>,
@@ -507,6 +516,7 @@ impl Whitenoise {
         Ok(media_file)
     }
 
+    #[perf_instrument("media")]
     async fn check_cached_image(&self, hash_hex: &str) -> Result<Option<PathBuf>> {
         let media_files = self.media_files();
         if let Some(cached_path) = media_files.find_file_with_prefix(hash_hex).await {
@@ -521,6 +531,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_to_group(
         &self,
         account_pubkey: &PublicKey,
@@ -552,6 +563,7 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_from_existing_record(
         &self,
         account_pubkey: &PublicKey,
@@ -583,6 +595,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn link_cached_image_with_detection(
         &self,
         account_pubkey: &PublicKey,
@@ -636,6 +649,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn download_blob_from_blossom(
         blossom_url: &Url,
         image_hash: &[u8; 32],
@@ -676,6 +690,7 @@ impl Whitenoise {
             })
     }
 
+    #[perf_instrument("media")]
     async fn download_and_decrypt_chat_media_blob(
         account_pubkey: &PublicKey,
         data_dir: &Path,
@@ -770,6 +785,7 @@ impl Whitenoise {
         Ok(decrypted)
     }
 
+    #[perf_instrument("media")]
     async fn store_and_record_group_image(
         &self,
         account_pubkey: &PublicKey,
@@ -813,6 +829,7 @@ impl Whitenoise {
             .await
     }
 
+    #[perf_instrument("media")]
     async fn upload_encrypted_blob_to_blossom(
         blossom_server_url: &Url,
         encrypted_data: Vec<u8>,

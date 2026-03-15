@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
+    perf_instrument,
     types::{GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ProcessableEvent},
 };
 
@@ -79,6 +80,7 @@ impl GroupPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn update_account(
         &self,
         pubkey: PublicKey,
@@ -170,6 +172,7 @@ impl GroupPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_account(&self, pubkey: &PublicKey) {
         let _update_guard = self.update_lock.lock().await;
         if let Some(state) = self.accounts.write().await.remove(pubkey) {
@@ -183,6 +186,7 @@ impl GroupPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn account_state(
         &self,
         pubkey: &PublicKey,
@@ -195,6 +199,7 @@ impl GroupPlane {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("relay")]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
         self.accounts.read().await.contains_key(pubkey)
     }
@@ -204,6 +209,7 @@ impl GroupPlane {
     /// - Accounts with no groups: entry present in the map is sufficient (empty
     ///   `relays` is the canonical "activated, nothing to subscribe to" state).
     /// - Accounts with groups: at least one group relay must be connected.
+    #[perf_instrument("relay")]
     pub(crate) async fn has_active_subscription(&self, pubkey: &PublicKey) -> bool {
         let state = self.accounts.read().await;
         match state.get(pubkey) {
@@ -294,6 +300,7 @@ impl GroupPlane {
             .collect()
     }
 
+    #[perf_instrument("relay")]
     async fn unsubscribe_indices(&self, pubkey: &PublicKey, subscription_indices: &[usize]) {
         for subscription_index in subscription_indices {
             self.session
@@ -362,6 +369,7 @@ impl GroupPlane {
     }
 
     #[cfg(feature = "integration-tests")]
+    #[perf_instrument("relay")]
     pub(crate) async fn reset(&self) {
         let pubkeys = self
             .accounts

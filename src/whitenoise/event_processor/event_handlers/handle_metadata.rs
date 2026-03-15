@@ -1,12 +1,16 @@
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    error::{Result, WhitenoiseError},
-    users::User,
+use crate::{
+    perf_instrument,
+    whitenoise::{
+        Whitenoise,
+        error::{Result, WhitenoiseError},
+        users::User,
+    },
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_metadata(&self, event: Event) -> Result<()> {
         let (mut user, newly_created) =
             User::find_or_create_by_pubkey(&event.pubkey, &self.database).await?;

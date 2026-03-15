@@ -8,6 +8,7 @@ use super::{
         parse_relay_url, parse_telemetry_kind, parse_timestamp, serialize_optional_public_key,
     },
 };
+use crate::perf_span;
 use crate::relay_control::{
     RelayPlane,
     observability::{RelayFailureCategory, RelayTelemetry, RelayTelemetryKind},
@@ -67,6 +68,7 @@ impl RelayEventRecord {
         telemetry: &RelayTelemetry,
         database: &Database,
     ) -> Result<(), DatabaseError> {
+        let _span = perf_span!("db::relay_event_create");
         sqlx::query(
             "INSERT INTO relay_events (
                 relay_url,
@@ -105,6 +107,7 @@ impl RelayEventRecord {
         limit: usize,
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
+        let _span = perf_span!("db::relay_event_list_recent_for_scope");
         let limit = i64::try_from(limit).map_err(|_| {
             DatabaseError::Sqlx(sqlx::Error::Protocol("limit overflow".to_string()))
         })?;

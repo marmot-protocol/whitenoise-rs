@@ -13,6 +13,7 @@ use crate::{
     RelayType,
     nostr_manager::utils::{is_event_timestamp_valid, is_relay_list_tag_for_event_kind},
     nostr_manager::{NostrManagerError, Result},
+    perf_instrument,
     types::{EphemeralPlaneStateSnapshot, ProcessableEvent},
     whitenoise::{
         accounts::Account,
@@ -83,10 +84,12 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
         self.executor.warm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn warm_relays_for_account(
         &self,
         account_pubkey: PublicKey,
@@ -97,19 +100,23 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn unwarm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
         self.executor.unwarm_relays(relays).await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {
         self.executor.remove_account_scope(account_pubkey).await;
     }
 
     #[cfg(feature = "integration-tests")]
+    #[perf_instrument("relay")]
     pub(crate) async fn remove_all_account_scopes(&self) {
         self.executor.remove_all_account_scopes().await;
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn snapshot(&self) -> EphemeralPlaneStateSnapshot {
         let (anonymous, accounts) = self.executor.snapshot_scopes().await;
 
@@ -141,6 +148,7 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
@@ -151,6 +159,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
@@ -162,6 +171,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
@@ -172,6 +182,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_gift_wrap_to(
         &self,
         receiver: &PublicKey,
@@ -188,6 +199,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
         metadata: &Metadata,
@@ -198,6 +210,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_relay_list_with_signer(
         &self,
         relay_list: &[RelayUrl],
@@ -223,6 +236,7 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
         follow_list: &[PublicKey],
@@ -241,6 +255,7 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
         encoded_key_package: &str,
@@ -255,6 +270,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_deletion_with_signer(
         &self,
         event_id: &EventId,
@@ -267,6 +283,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_batch_event_deletion_with_signer(
         &self,
         event_ids: &[EventId],
@@ -286,6 +303,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: Event,
@@ -296,6 +314,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn publish_event_to_scope(
         &self,
         event: Event,
@@ -367,6 +386,7 @@ impl EphemeralPlane {
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_message_event(
         &self,
         event: Event,
@@ -426,6 +446,7 @@ impl EphemeralPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relays: &[RelayUrl],
@@ -434,6 +455,7 @@ impl EphemeralPlane {
         self.fetch_events_from_scope(None, relays, filter).await
     }
 
+    #[perf_instrument("relay")]
     async fn fetch_events_from_scope(
         &self,
         scope_account_pubkey: Option<PublicKey>,
@@ -445,6 +467,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn publish_event_builder_with_signer(
         &self,
         event_builder: EventBuilder,
@@ -459,6 +482,7 @@ impl EphemeralPlane {
             .await
     }
 
+    #[perf_instrument("relay")]
     async fn track_published_event(
         &self,
         event_id: &EventId,
@@ -480,6 +504,7 @@ impl EphemeralPlane {
         Ok(())
     }
 
+    #[perf_instrument("relay")]
     async fn update_and_emit_delivery_status(
         event_id: &str,
         group_id: &GroupId,
@@ -579,6 +604,7 @@ impl EphemeralPlane {
 }
 
 impl EphemeralScope {
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
         relays: &[RelayUrl],
@@ -589,6 +615,7 @@ impl EphemeralScope {
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_metadata_from(
         &self,
         relays: &[RelayUrl],
@@ -602,6 +629,7 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
@@ -616,6 +644,7 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
@@ -629,6 +658,7 @@ impl EphemeralScope {
         })
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_event_to(
         &self,
         event: Event,

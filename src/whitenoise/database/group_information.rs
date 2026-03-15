@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 
 use super::{Database, utils::parse_timestamp};
+use crate::perf_instrument;
 use crate::whitenoise::{
     error::WhitenoiseError,
     group_information::{GroupInformation, GroupType},
@@ -80,6 +81,7 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if no group information with the given MLS group ID exists.
+    #[perf_instrument("db::group_information")]
     pub(crate) async fn find_by_mls_group_id(
         mls_group_id: &GroupId,
         database: &Database,
@@ -109,6 +111,7 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operations fail.
+    #[perf_instrument("db::group_information")]
     pub(crate) async fn find_or_create_by_mls_group_id(
         mls_group_id: &GroupId,
         group_type: Option<GroupType>,
@@ -141,6 +144,7 @@ impl GroupInformation {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db::group_information")]
     pub(crate) async fn find_by_mls_group_ids(
         mls_group_ids: &[GroupId],
         database: &Database,
@@ -171,6 +175,7 @@ impl GroupInformation {
     }
 
     // Private helper method for creating and persisting new records
+    #[perf_instrument("db::group_information")]
     async fn insert_new(
         mls_group_id: &GroupId,
         group_type: GroupType,

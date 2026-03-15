@@ -9,6 +9,7 @@ use super::{
         serialize_optional_public_key,
     },
 };
+use crate::perf_instrument;
 use crate::relay_control::{
     RelayPlane,
     observability::{RelayFailureCategory, RelayTelemetry, RelayTelemetryKind},
@@ -107,6 +108,7 @@ impl RelayStatusRecord {
     }
 
     #[allow(dead_code)]
+    #[perf_instrument("db::relay_status")]
     pub(crate) async fn find(
         relay_url: &RelayUrl,
         plane: RelayPlane,
@@ -178,6 +180,7 @@ impl RelayStatusRecord {
         Ok(record)
     }
 
+    #[perf_instrument("db::relay_status")]
     pub(crate) async fn find_many(
         lookup_keys: &[RelayStatusLookupKey],
         database: &Database,
@@ -242,6 +245,7 @@ impl RelayStatusRecord {
         Ok(records)
     }
 
+    #[perf_instrument("db::relay_status")]
     pub(crate) async fn upsert_from_telemetry(
         telemetry: &RelayTelemetry,
         database: &Database,
