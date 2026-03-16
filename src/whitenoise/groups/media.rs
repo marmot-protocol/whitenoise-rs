@@ -31,8 +31,32 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     // The `let _ =` suppresses the error when it is already installed (e.g.
     // during tests where multiple call sites race to install the same provider).
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Custom redirect policy that mirrors `require_https()`:
+    // - Always allow HTTPS redirect targets.
+    // - In debug builds, also allow http://localhost (for local test servers).
+    // - Reject everything else to prevent HTTPS → HTTP downgrade attacks.
+    // - Cap the chain at 10 hops to guard against redirect loops.
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url();
+        let allowed = match url.scheme() {
+            "https" => true,
+            "http" if cfg!(debug_assertions) && url.host_str() == Some("localhost") => true,
+            _ => false,
+        };
+        if allowed {
+            attempt.follow()
+        } else {
+            let msg = format!("redirect to non-HTTPS URL is not allowed: {url}");
+            attempt.error(msg)
+        }
+    });
+
     reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(redirect_policy)
         .build()
         .expect("Failed to build shared Blossom HTTP client")
 });
