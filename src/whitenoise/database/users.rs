@@ -5,7 +5,7 @@ use nostr_sdk::{Metadata, PublicKey};
 
 use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
 use crate::{
-    WhitenoiseError,
+    WhitenoiseError, perf_instrument,
     whitenoise::{
         relays::{Relay, RelayType},
         users::User,
@@ -133,6 +133,7 @@ impl User {
     }
 
     /// Fetches the distinct pubkeys for every user stored in the local database.
+    #[perf_instrument("db::users")]
     pub(crate) async fn all_pubkeys(
         database: &Database,
     ) -> Result<Vec<PublicKey>, WhitenoiseError> {
@@ -166,6 +167,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operations fail.
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_or_create_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
@@ -201,6 +203,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError::UserNotFound`] if no user with the given public key exists.
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_by_pubkey(
         pubkey: &PublicKey,
         database: &Database,
@@ -228,6 +231,7 @@ impl User {
     ///
     /// Returns a `Vec<User>` containing all users found.
     /// Users that don't exist in the database are simply not included in the result.
+    #[perf_instrument("db::users")]
     pub(crate) async fn find_by_pubkeys(
         pubkeys: &[PublicKey],
         database: &Database,
@@ -270,6 +274,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database query fails.
+    #[perf_instrument("db::users")]
     pub(crate) async fn relays(
         &self,
         relay_type: RelayType,
@@ -304,6 +309,29 @@ impl User {
         Ok(relays)
     }
 
+    /// Bumps `updated_at` to now without changing any other fields.
+    ///
+    /// Use this to record "we checked this user's metadata" even when no new
+    /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
+    /// for empty-profile users.
+    #[perf_instrument("db::users")]
+    pub(crate) async fn touch_updated_at(
+        &mut self,
+        database: &Database,
+    ) -> Result<(), WhitenoiseError> {
+        let now = Utc::now();
+        let current_time = now.timestamp_millis();
+        sqlx::query("UPDATE users SET updated_at = ? WHERE pubkey = ?")
+            .bind(current_time)
+            .bind(self.pubkey.to_hex().as_str())
+            .execute(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)
+            .map_err(WhitenoiseError::Database)?;
+        self.updated_at = now;
+        Ok(())
+    }
+
     /// Saves this user to the database.
     ///
     /// # Arguments
@@ -317,6 +345,7 @@ impl User {
     /// # Errors
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
+    #[perf_instrument("db::users")]
     pub(crate) async fn save(&self, database: &Database) -> Result<User, WhitenoiseError> {
         let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
 

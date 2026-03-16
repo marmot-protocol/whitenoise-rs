@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
 use super::{
@@ -5,6 +6,7 @@ use super::{
     LoginStatus,
 };
 use crate::RelayType;
+use crate::perf_instrument;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
@@ -15,6 +17,7 @@ impl Whitenoise {
     ///
     /// This method generates a new keypair, sets up the account with default relay lists,
     /// and fully configures the account for use in Whitenoise.
+    #[perf_instrument("accounts")]
     pub async fn create_identity(&self) -> Result<Account> {
         let keys = Keys::generate();
         tracing::debug!(target: "whitenoise::accounts", "Generated new keypair: {}", keys.public_key().to_hex());
@@ -25,9 +28,18 @@ impl Whitenoise {
         Ok(account)
     }
 
+    #[perf_instrument("accounts")]
     async fn create_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
         let mut account = self.create_base_account_with_private_key(keys).await?;
         tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
+
+        // A brand new identity has no history to catch up on — mark as synced
+        // immediately. Without this, `last_synced_at = NULL` poisons
+        // `compute_global_since_timestamp()` for ALL accounts, forcing
+        // global subscriptions to use `since=None` (unbounded re-fetch).
+        let now_ms = Utc::now().timestamp_millis();
+        Account::update_last_synced_max(&account.pubkey, now_ms, &self.database).await?;
+        account.last_synced_at = DateTime::from_timestamp_millis(now_ms);
 
         let user = account.user(&self.database).await?;
 
@@ -57,6 +69,7 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `nsec_or_hex_privkey` - The user's private key as a nsec string or hex-encoded string.
+    #[perf_instrument("accounts")]
     pub async fn login(&self, nsec_or_hex_privkey: String) -> Result<Account> {
         let keys = Keys::parse(&nsec_or_hex_privkey)?;
         let pubkey = keys.public_key();
@@ -1165,6 +1178,15 @@ impl Whitenoise {
         // Delete the account from the database
         account.delete(&self.database).await?;
 
+        // Sync discovery subscriptions with remaining accounts (tears down on last logout)
+        if let Err(e) = self.sync_discovery_subscriptions().await {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %pubkey,
+                "Failed to refresh discovery subscriptions after logout: {e}"
+            );
+        }
+
         // Remove the private key from the secret store
         // For local accounts this is required; for external accounts this is best-effort cleanup
         let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
@@ -1422,6 +1444,20 @@ mod tests {
 
         // Create a new identity
         let account = whitenoise.create_identity().await.unwrap();
+
+        // New identities must be marked as synced immediately so they don't
+        // poison compute_global_since_timestamp() for other accounts.
+        assert!(
+            account.last_synced_at.is_some(),
+            "New identity should have last_synced_at set to prevent global subscription poisoning"
+        );
+        let db_account = Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            db_account.last_synced_at.is_some(),
+            "New identity last_synced_at should be persisted in database"
+        );
 
         // Give the events time to be published and processed
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1842,6 +1878,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "Logout should succeed for external account without stored key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_syncs_discovery_subscriptions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // After login, global discovery subscriptions should be active
+        assert!(
+            whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be operational after login"
+        );
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // After logging out the last account, discovery subscriptions should be torn down
+        assert!(
+            !whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be torn down after last account logout"
         );
     }
 

@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     nostr_manager::Result,
+    perf_instrument,
     types::{DiscoveryPlaneStateSnapshot, ProcessableEvent},
 };
 
@@ -84,6 +85,7 @@ impl DiscoveryPlane {
         let mut session_config = RelaySessionConfig::new(RelayPlane::Discovery);
         session_config.auth_policy = RelaySessionAuthPolicy::Disabled;
         session_config.reconnect_policy = config.reconnect_policy;
+        session_config.min_connected_relays = Some(2);
 
         Self {
             config,
@@ -92,12 +94,14 @@ impl DiscoveryPlane {
         }
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn start(&self) -> Result<()> {
         self.session
             .ensure_relays_connected(&self.config.relays)
             .await
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn sync(
         &self,
         watched_users: &[PublicKey],
@@ -266,6 +270,7 @@ impl DiscoveryPlane {
         self.session.telemetry()
     }
 
+    #[perf_instrument("relay")]
     pub(crate) async fn fetch_events(
         &self,
         filter: Filter,

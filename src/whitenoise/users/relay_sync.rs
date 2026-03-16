@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use nostr_sdk::prelude::*;
 
+use crate::perf_instrument;
 use crate::relay_control::ephemeral::EphemeralScope;
 use crate::whitenoise::{
     Whitenoise,
@@ -15,6 +16,7 @@ use crate::whitenoise::{
 
 impl User {
     /// Fetches the latest relay lists for this user from Nostr and updates the local database
+    #[perf_instrument("relay_sync")]
     pub(crate) async fn update_relay_lists(&self, whitenoise: &Whitenoise) -> Result<()> {
         let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
         self.update_relay_lists_with_scope(whitenoise, &scope)
@@ -22,6 +24,7 @@ impl User {
         Ok(())
     }
 
+    #[perf_instrument("relay_sync")]
     async fn update_relay_lists_with_scope(
         &self,
         whitenoise: &Whitenoise,
@@ -79,6 +82,7 @@ impl User {
             .await
     }
 
+    #[perf_instrument("relay_sync")]
     async fn update_nip65_relays_with_scope(
         &self,
         whitenoise: &Whitenoise,
@@ -130,6 +134,7 @@ impl User {
             .await
     }
 
+    #[perf_instrument("relay_sync")]
     async fn update_secondary_relay_types_with_scope(
         &self,
         whitenoise: &Whitenoise,
@@ -182,6 +187,7 @@ impl User {
     /// Synchronizes stored relays with a new set of relay URLs.
     ///
     /// Returns `true` if changes were made, `false` if no changes needed.
+    #[perf_instrument("relay_sync")]
     pub(crate) async fn sync_relay_urls(
         &self,
         whitenoise: &Whitenoise,
@@ -312,6 +318,7 @@ impl User {
             .await
     }
 
+    #[perf_instrument("relay_sync")]
     async fn sync_relays_for_type_with_scope(
         &self,
         whitenoise: &Whitenoise,
@@ -336,6 +343,7 @@ impl User {
             .await
     }
 
+    #[perf_instrument("relay_sync")]
     async fn apply_relay_event(
         &self,
         whitenoise: &Whitenoise,

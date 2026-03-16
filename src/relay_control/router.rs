@@ -4,6 +4,7 @@ use nostr_sdk::{RelayUrl, SubscriptionId};
 use tokio::sync::RwLock;
 
 use super::SubscriptionContext;
+use crate::perf_span;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RelaySubscriptionKey {
@@ -33,6 +34,7 @@ impl RelayRouter {
         subscription_id: SubscriptionId,
         context: SubscriptionContext,
     ) {
+        let _span = perf_span!("relay::router_record_context");
         self.subscription_contexts.write().await.insert(
             RelaySubscriptionKey::new(relay_url, subscription_id),
             context,
@@ -44,6 +46,7 @@ impl RelayRouter {
         relay_url: &RelayUrl,
         subscription_id: &SubscriptionId,
     ) -> Option<SubscriptionContext> {
+        let _span = perf_span!("relay::router_subscription_context");
         self.subscription_contexts
             .read()
             .await
@@ -59,6 +62,7 @@ impl RelayRouter {
         relay_url: &RelayUrl,
         subscription_id: &SubscriptionId,
     ) -> Option<SubscriptionContext> {
+        let _span = perf_span!("relay::router_remove_context");
         self.subscription_contexts
             .write()
             .await
@@ -73,6 +77,7 @@ impl RelayRouter {
         relay_url: &RelayUrl,
         group_id: &str,
     ) -> Vec<SubscriptionContext> {
+        let _span = perf_span!("relay::router_matching_group_contexts");
         // This is an O(n) scan over active subscription contexts under a read
         // lock. That is acceptable for the current migrated planes and account
         // counts; add a secondary index if group fanout becomes hot.

@@ -111,6 +111,32 @@ benchmark scenario="":
     fi
     rm -rf ./dev/data/benchmark_test/
 
+# Measure initialization timing (phase-by-phase breakdown, empty database)
+# Usage:
+#   just benchmark-startup       # Single run
+#   just benchmark-startup 5     # 5 runs
+benchmark-startup iterations="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for i in $(seq 1 {{iterations}}); do
+        [ {{iterations}} -gt 1 ] && echo "--- Run $i/{{iterations}} ---"
+        rm -rf ./dev/data/startup_bench/
+        RUST_LOG=warn,whitenoise::init_timing=info \
+        cargo run --bin benchmark_test --features benchmark-tests --release -- \
+        --data-dir ./dev/data/startup_bench/ --logs-dir ./dev/data/startup_bench/ \
+        --init-only
+    done
+    rm -rf ./dev/data/startup_bench/
+
+# Measure initialization timing with a real account and follow list.
+# Requires: nak (https://github.com/fiatjaf/nak)
+# Usage:
+#   just benchmark-startup-seeded                                         # 5 warm runs
+#   just benchmark-startup-seeded 10                                      # 10 warm runs
+#   just benchmark-startup-seeded 5 ./test_fixtures/nostr/other.json      # custom fixture
+benchmark-startup-seeded iterations="5" fixture="./test_fixtures/nostr/jeff_contacts.json":
+    @bash scripts/benchmark-startup-seeded.sh {{iterations}} {{fixture}}
+
 # Run benchmarks and save results with timestamp
 # Usage:
 #   just benchmark-save                      # Save all benchmarks

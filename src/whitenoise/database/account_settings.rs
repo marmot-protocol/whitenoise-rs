@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 
 use super::{Database, utils::parse_timestamp};
+use crate::perf_span;
 use crate::whitenoise::account_settings::AccountSettings;
 
 /// Internal database row representation for account_settings table.
@@ -68,6 +69,7 @@ impl AccountSettings {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::account_settings_find_or_create");
         let now = Utc::now().timestamp_millis();
 
         match sqlx::query_as::<_, AccountSettingsRow>(
@@ -101,6 +103,7 @@ impl AccountSettings {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<bool, sqlx::Error> {
+        let _span = perf_span!("db::account_settings_notifications_enabled");
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT notifications_enabled FROM account_settings WHERE account_pubkey = ?",
         )
@@ -118,6 +121,7 @@ impl AccountSettings {
         enabled: bool,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::account_settings_update_notifications");
         let now = Utc::now().timestamp_millis();
         let enabled_int: i64 = if enabled { 1 } else { 0 };
 

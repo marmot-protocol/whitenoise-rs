@@ -2,12 +2,15 @@ use chrono::{DateTime, Duration, Utc};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::{
-    Whitenoise,
-    database::processed_events::ProcessedEvent,
-    error::{Result, WhitenoiseError},
-    relays::{Relay, RelayType},
-    utils::timestamp_to_datetime,
+use crate::{
+    perf_instrument,
+    whitenoise::{
+        Whitenoise,
+        database::processed_events::ProcessedEvent,
+        error::{Result, WhitenoiseError},
+        relays::{Relay, RelayType},
+        utils::timestamp_to_datetime,
+    },
 };
 
 mod key_package;
@@ -72,12 +75,11 @@ impl User {
         let ttl_duration = Duration::hours(METADATA_TTL_HOURS);
         let stale_threshold = now - ttl_duration;
 
-        // Always refresh if metadata is default (empty)
-        if self.metadata == Metadata::new() {
-            return true;
-        }
-
-        // Refresh if updated_at is older than TTL
+        // Refresh if updated_at is older than TTL.
+        // We rely solely on updated_at rather than checking metadata content,
+        // because sync_metadata always bumps updated_at after checking — even
+        // when no kind-0 event is found.  This lets empty-profile users hit
+        // the fast path once we've confirmed there's nothing to fetch.
         self.updated_at < stale_threshold
     }
 
@@ -94,37 +96,35 @@ impl User {
     /// # Arguments
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
+    #[perf_instrument("users")]
     pub async fn sync_metadata(&mut self, whitenoise: &Whitenoise) -> Result<()> {
         let relays_urls: Vec<_> = Relay::urls(&self.get_query_relays(whitenoise).await?);
         let metadata_event = whitenoise
             .relay_control
             .fetch_metadata_from(&relays_urls, self.pubkey)
             .await?;
+
         if let Some(event) = metadata_event {
-            let metadata = Metadata::from_json(&event.content)?;
-            let should_update = self
-                .should_update_metadata(&event, false, &whitenoise.database)
-                .await?;
+            // Overwrite local metadata with whatever the relay returned.
+            // We don't guard on timestamps or "already processed" here because
+            // this is a deliberate, targeted fetch — not reactive event processing.
+            // The caller (sync_user_blocking / background_fetch_user_data) already
+            // gates on TTL, so we won't over-fetch.
+            self.metadata = Metadata::from_json(&event.content)?;
+            self.save(&whitenoise.database).await?;
 
-            if should_update {
-                self.metadata = metadata;
-
-                // Save the updated user metadata
-                self.save(&whitenoise.database).await?;
-
-                whitenoise
-                    .event_tracker
-                    .track_processed_global_event(&event)
-                    .await?;
-
-                tracing::debug!(
-                    target: "whitenoise::users::sync_metadata",
-                    "Updated metadata for user {} with event timestamp {} via background sync",
-                    self.pubkey,
-                    event.created_at
-                );
-            }
+            tracing::debug!(
+                target: "whitenoise::users::sync_metadata",
+                "Updated metadata for user {} with event timestamp {} via background sync",
+                self.pubkey,
+                event.created_at
+            );
+        } else {
+            // No metadata found — record that we checked so TTL is respected
+            // for empty-profile users, preventing repeated fruitless fetches.
+            self.touch_updated_at(&whitenoise.database).await?;
         }
+
         Ok(())
     }
 
@@ -316,6 +316,7 @@ impl Whitenoise {
     /// - There's a database connection or query error
     /// - The public key format is invalid (though this is typically caught at the type level)
     /// - Network errors occur during blocking synchronization
+    #[perf_instrument("users")]
     pub async fn find_or_create_user_by_pubkey(
         &self,
         pubkey: &PublicKey,
@@ -332,11 +333,26 @@ impl Whitenoise {
         }
     }
 
+    #[perf_instrument("users")]
     async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
+        // For existing users with fresh metadata, skip the expensive network sync.
+        // This matches the TTL check that Background mode already performs.
+        if !is_new && !user.needs_metadata_refresh() {
+            tracing::debug!(
+                target: "whitenoise::users::sync_user_blocking",
+                "User {} metadata is fresh (updated_at: {}), skipping blocking sync",
+                user.pubkey,
+                user.updated_at
+            );
+            return Ok(user.clone());
+        }
+
         tracing::debug!(
             target: "whitenoise::users::sync_user_blocking",
-            "Force sync requested for user {}, performing blocking metadata and relay sync",
-            user.pubkey
+            "Sync required for user {} (is_new={}, needs_refresh={}), performing blocking metadata and relay sync",
+            user.pubkey,
+            is_new,
+            user.needs_metadata_refresh()
         );
 
         let mut user_clone = user.clone();
@@ -362,7 +378,6 @@ impl Whitenoise {
             }
         }
 
-        // Always sync metadata when force_sync is true
         if let Err(e) = user_clone.sync_metadata(self).await {
             tracing::warn!(
                 target: "whitenoise::users::sync_user_blocking",
@@ -1308,17 +1323,34 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_needs_metadata_refresh_default_metadata() {
+        async fn test_needs_metadata_refresh_default_metadata_fresh_updated_at() {
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
             let user = User {
                 id: Some(1),
                 pubkey: test_pubkey,
                 metadata: Metadata::new(), // Default empty metadata
                 created_at: Utc::now(),
-                updated_at: Utc::now(), // Even if recently updated
+                updated_at: Utc::now(), // Recently checked
             };
 
-            // Should always refresh if metadata is default/empty
+            // Should NOT refresh: updated_at is recent, meaning we already
+            // checked and found no kind-0 event.  Empty metadata is fine.
+            assert!(!user.needs_metadata_refresh());
+        }
+
+        #[tokio::test]
+        async fn test_needs_metadata_refresh_default_metadata_stale_updated_at() {
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let stale_time = Utc::now() - Duration::hours(METADATA_TTL_HOURS + 1);
+            let user = User {
+                id: Some(1),
+                pubkey: test_pubkey,
+                metadata: Metadata::new(), // Default empty metadata
+                created_at: stale_time,
+                updated_at: stale_time, // Haven't checked in a while
+            };
+
+            // Should refresh: updated_at is past TTL, time to re-check
             assert!(user.needs_metadata_refresh());
         }
 

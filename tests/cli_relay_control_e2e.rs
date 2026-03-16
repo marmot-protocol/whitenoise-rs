@@ -25,12 +25,17 @@ use cli_support::{
 
 const LOCAL_DEV_RELAYS: &[&str] = &["ws://localhost:8080", "ws://localhost:7777"];
 
+/// Run a user search and collect all updates until SearchCompleted.
+///
+/// If `stop_pubkey` is provided, stop early as soon as that pubkey appears in
+/// results — this avoids waiting for the full pipeline to drain large graphs.
 async fn users_search(
     socket: &Path,
     account: &str,
     query: &str,
     radius_start: u8,
     radius_end: u8,
+    stop_pubkey: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let request = Request::UsersSearch {
         account: account.to_string(),
@@ -40,17 +45,32 @@ async fn users_search(
     };
 
     let mut updates = Vec::new();
-    client::stream(socket, &request, |response: &Response| {
+    let stream_fut = client::stream(socket, &request, |response: &Response| {
         if let Some(error) = &response.error {
             panic!("users search returned error: {}", error.message);
         }
         if let Some(result) = &response.result {
             updates.push(result.clone());
+
+            // Early termination: stop once the target pubkey appears in results
+            if let Some(target) = stop_pubkey
+                && result["new_results"]
+                    .as_array()
+                    .is_some_and(|arr| arr.iter().any(|r| r["pubkey"].as_str() == Some(target)))
+            {
+                return false; // disconnect, cancelling the search
+            }
         }
         true
-    })
-    .await
-    .expect("stream users search");
+    });
+
+    match tokio::time::timeout(Duration::from_secs(60), stream_fut).await {
+        Ok(res) => res.expect("stream users search"),
+        Err(_) => panic!(
+            "users_search timed out after 60s (query={query:?}, collected {} updates so far)",
+            updates.len()
+        ),
+    }
 
     updates
 }
@@ -90,13 +110,23 @@ async fn relay_control_snapshot_tracks_seeded_discovery_graph() {
         .unwrap()
         .to_string();
 
-    let jeff_updates = users_search(&alice.socket, &alice_pk, "Jeff", 0, 2).await;
+    let jeff_updates = users_search(
+        &alice.socket,
+        &alice_pk,
+        "Jeff",
+        0,
+        2,
+        Some(JEFF_PUBKEY_HEX),
+    )
+    .await;
     assert!(
         search_updates_include_pubkey(&jeff_updates, JEFF_PUBKEY_HEX),
         "searching Jeff should surface the fallback seed user"
     );
 
-    let max_updates = users_search(&alice.socket, &alice_pk, "Max", 0, 3).await;
+    // Max is one of Jeff's follows — found at radius 2 (searcher → fallback → Jeff → Max).
+    let max_updates =
+        users_search(&alice.socket, &alice_pk, "Max", 0, 3, Some(MAX_PUBKEY_HEX)).await;
     assert!(
         search_updates_include_pubkey(&max_updates, MAX_PUBKEY_HEX),
         "searching Max should traverse Jeff's seeded follow graph"
@@ -221,7 +251,7 @@ async fn relay_control_snapshot_tracks_live_planes() {
                             && group["group_id"].as_str() == Some(nostr_group_id.as_str())
                             && group["subscription_id"]
                                 .as_str()
-                                .is_some_and(|sub_id| sub_id.ends_with("_mls_messages"))
+                                .is_some_and(|sub_id| sub_id.contains("_mls_messages"))
                             && group["relay_count"]
                                 .as_u64()
                                 .is_some_and(|count| count >= 1)
@@ -271,7 +301,7 @@ async fn relay_control_snapshot_tracks_live_planes() {
                             && group["group_id"].as_str() == Some(nostr_group_id.as_str())
                             && group["subscription_id"]
                                 .as_str()
-                                .is_some_and(|sub_id| sub_id.ends_with("_mls_messages"))
+                                .is_some_and(|sub_id| sub_id.contains("_mls_messages"))
                             && group["relay_count"]
                                 .as_u64()
                                 .is_some_and(|count| count >= 1)

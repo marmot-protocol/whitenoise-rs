@@ -11,6 +11,7 @@ use crate::whitenoise::{
     utils::timestamp_to_datetime,
 };
 use crate::{
+    perf_instrument,
     relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
     types::ProcessableEvent,
 };
@@ -22,6 +23,7 @@ const CONTACT_LIST_CATCH_UP_BATCH_SIZE: usize = 500;
 const CONTACT_LIST_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
         let _permit = self.acquire_contact_list_guard(account).await?;
         let account_id = account.id.ok_or(WhitenoiseError::AccountNotFound)?;
@@ -52,6 +54,7 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("event_handlers")]
     async fn acquire_contact_list_guard(&self, account: &Account) -> Result<OwnedSemaphorePermit> {
         let semaphore = self
             .contact_list_guards
@@ -66,6 +69,7 @@ impl Whitenoise {
         })
     }
 
+    #[perf_instrument("event_handlers")]
     async fn should_skip_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
         if ProcessedEvent::exists(&event.id, Some(account_id), &self.database).await? {
             tracing::debug!(
@@ -83,6 +87,7 @@ impl Whitenoise {
         Ok(false)
     }
 
+    #[perf_instrument("event_handlers")]
     async fn is_stale_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
         let event_time = timestamp_to_datetime(event.created_at)?;
         let newest_time =
@@ -122,7 +127,8 @@ impl Whitenoise {
             .get(account_pubkey)
             .map(|entry| entry.value().subscribe());
 
-        tokio::spawn(async move {
+        let tid = crate::perf::current_trace_id();
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(wn) => wn,
                 Err(e) => {
@@ -157,11 +163,12 @@ impl Whitenoise {
                 fetched,
                 total
             );
-        });
+        }));
     }
 
     /// Fetches relay lists and metadata for a batch of users via the discovery
     /// plane. Returns the number of users whose catch-up work was queued.
+    #[perf_instrument("event_handlers")]
     async fn fetch_users_batch(
         whitenoise: &Whitenoise,
         pubkeys: &[PublicKey],
@@ -238,6 +245,7 @@ impl Whitenoise {
         queued_user_count
     }
 
+    #[perf_instrument("event_handlers")]
     async fn queue_discovery_catch_up_events(
         whitenoise: &Whitenoise,
         events: &Events,

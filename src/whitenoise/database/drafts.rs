@@ -5,6 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 
 use super::{Database, DatabaseError, utils::parse_timestamp};
+use crate::perf_span;
 use crate::whitenoise::drafts::Draft;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::media_files::MediaFile;
@@ -108,6 +109,7 @@ impl Draft {
         media_attachments: &[MediaFile],
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
+        let _span = perf_span!("db::draft_save");
         let now = Utc::now().timestamp_millis();
 
         let media_json =
@@ -148,6 +150,7 @@ impl Draft {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<Self>, WhitenoiseError> {
+        let _span = perf_span!("db::draft_find");
         let row = sqlx::query_as::<_, DraftRow>(
             "SELECT * FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?",
         )
@@ -166,6 +169,7 @@ impl Draft {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<(), WhitenoiseError> {
+        let _span = perf_span!("db::draft_delete");
         sqlx::query("DELETE FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?")
             .bind(account_pubkey.to_hex())
             .bind(mls_group_id.as_slice())

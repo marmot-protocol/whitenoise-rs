@@ -6,6 +6,7 @@ use super::{
     Database,
     utils::{parse_optional_timestamp, parse_timestamp},
 };
+use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 
 /// Internal database row representation for accounts_groups table
@@ -138,6 +139,7 @@ impl From<AccountGroupRow> for AccountGroup {
 
 impl AccountGroup {
     /// Finds an AccountGroup by account pubkey and MLS group ID.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_by_account_and_group(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
@@ -162,6 +164,7 @@ impl AccountGroup {
     /// This uses an insert-first approach to avoid TOCTOU race conditions:
     /// - Attempts to insert first
     /// - On unique constraint violation, fetches the existing record
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_or_create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
@@ -187,6 +190,7 @@ impl AccountGroup {
     /// Finds all visible AccountGroups for a given account.
     /// Visible means: user_confirmation is NULL (pending) or true (accepted).
     /// Declined groups (user_confirmation = false) are hidden.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_visible_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
@@ -205,6 +209,7 @@ impl AccountGroup {
 
     /// Finds all pending AccountGroups for a given account.
     /// Pending means: user_confirmation is NULL.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_pending_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
@@ -222,6 +227,7 @@ impl AccountGroup {
     }
 
     /// Finds all AccountGroups for a specific MLS group.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_by_group(
         mls_group_id: &GroupId,
         database: &Database,
@@ -239,6 +245,7 @@ impl AccountGroup {
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_user_confirmation(
         &self,
         user_confirmation: bool,
@@ -268,6 +275,7 @@ impl AccountGroup {
     ///
     /// - If the record doesn't exist, inserts it
     /// - If it exists, updates all mutable fields to match the provided values
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
@@ -305,6 +313,7 @@ impl AccountGroup {
     }
 
     /// Updates the pin_order for this AccountGroup.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_pin_order(
         &self,
         pin_order: Option<i64>,
@@ -329,6 +338,7 @@ impl AccountGroup {
     }
 
     /// Updates the archived_at timestamp for this AccountGroup.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_archived_at(
         &self,
         archived_at: Option<DateTime<Utc>>,
@@ -359,6 +369,7 @@ impl AccountGroup {
     ///
     /// This is atomic: the timestamp comparison and update happen in a single
     /// SQL statement, preventing race conditions between concurrent calls.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_last_read_if_newer(
         &self,
         message_id: &EventId,
@@ -401,6 +412,7 @@ impl AccountGroup {
     /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup
     /// without requiring MLS/MDK calls. Returns `None` if no DM group exists
     /// between these users, or if the group has been declined.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_group_id_by_peer(
         account_pubkey: &PublicKey,
         peer_pubkey: &PublicKey,
@@ -427,6 +439,7 @@ impl AccountGroup {
     ///
     /// Returns `(mls_group_id, dm_peer_pubkey)` pairs for groups where
     /// `dm_peer_pubkey` is populated and the group is visible (not declined).
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_peers_for_account(
         account_pubkey: &PublicKey,
         database: &Database,
@@ -464,6 +477,7 @@ impl AccountGroup {
     /// Used by the startup backfill to identify records that need population.
     /// Pushes all filtering to SQL (joins with `group_information`) so the caller
     /// only receives rows that actually need MDK membership resolution.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_groups_missing_peer(
         account_pubkey: &PublicKey,
         database: &Database,
@@ -490,6 +504,7 @@ impl AccountGroup {
     /// Updates the dm_peer_pubkey for a specific account-group record.
     ///
     /// Used by the startup backfill to populate the column for existing DM groups.
+    #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_dm_peer_pubkey(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
@@ -512,6 +527,7 @@ impl AccountGroup {
     }
 
     /// Creates a new AccountGroup with user_confirmation = NULL (pending).
+    #[perf_instrument("db::accounts_groups")]
     async fn create(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,

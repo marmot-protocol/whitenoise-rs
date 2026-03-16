@@ -300,3 +300,87 @@ async fn cross_daemon_group_messaging() {
     );
     wait_for_message(&alice.socket, &alice_pk, &gid, "Hello from Bob").await;
 }
+
+/// Adding a second identity to a daemon must not break the first account's
+/// messaging.
+///
+/// Regression test: creating a new identity used to leave `last_synced_at = NULL`,
+/// which poisoned `compute_global_since_timestamp()` for ALL accounts, forcing
+/// global subscriptions to use `since=None` (unbounded re-fetch).
+#[tokio::test]
+async fn second_identity_does_not_break_first_account_messaging() {
+    let alice = Daemon::start().await;
+    let bob = Daemon::start().await;
+
+    // Account 1 on Alice's daemon
+    let alice_pk1 = wn(&alice.socket, &["create-identity"])["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Establish a working chat with account 1
+    let group = wn(
+        &alice.socket,
+        &[
+            "--account",
+            &alice_pk1,
+            "groups",
+            "create",
+            "Multi-Account Test",
+            &bob_pk,
+        ],
+    );
+    let gid = group_id_hex(&group);
+    wait_for_group(&bob.socket, &bob_pk).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Verify messaging works before adding second account
+    wn(
+        &alice.socket,
+        &[
+            "--account",
+            &alice_pk1,
+            "messages",
+            "send",
+            &gid,
+            "before second identity",
+        ],
+    );
+    wait_for_message(&bob.socket, &bob_pk, &gid, "before second identity").await;
+
+    // Create a SECOND identity on Alice's daemon — this is the critical step
+    let alice_pk2 = wn(&alice.socket, &["create-identity"])["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(alice_pk1, alice_pk2);
+
+    // Verify Alice's daemon now has 2 accounts
+    let accounts = wn(&alice.socket, &["whoami"]);
+    assert_eq!(
+        accounts.as_array().unwrap().len(),
+        2,
+        "Alice should have 2 accounts"
+    );
+
+    // Allow subscriptions to re-settle after the new account was added
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Account 1 messaging must still work after account 2 was created
+    wn(
+        &bob.socket,
+        &[
+            "--account",
+            &bob_pk,
+            "messages",
+            "send",
+            &gid,
+            "after second identity",
+        ],
+    );
+    wait_for_message(&alice.socket, &alice_pk1, &gid, "after second identity").await;
+}

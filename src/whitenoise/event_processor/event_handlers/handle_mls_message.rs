@@ -2,20 +2,24 @@ use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingResult};
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    aggregated_message::AggregatedMessage,
-    chat_list_streaming::ChatListUpdateTrigger,
-    error::{Result, WhitenoiseError},
-    media_files::MediaFile,
-    message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
-    message_streaming::{MessageUpdate, UpdateTrigger},
+use crate::{
+    perf_instrument, perf_span,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        aggregated_message::AggregatedMessage,
+        chat_list_streaming::ChatListUpdateTrigger,
+        error::{Result, WhitenoiseError},
+        media_files::MediaFile,
+        message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
+        message_streaming::{MessageUpdate, UpdateTrigger},
+    },
 };
 #[cfg(test)]
 use crate::{relay_control::hash_pubkey_for_subscription_id, types::EventSource};
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
         tracing::debug!(
           target: "whitenoise::event_handlers::handle_mls_message",
@@ -26,6 +30,7 @@ impl Whitenoise {
         );
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let _mls_proc = perf_span!("event_handlers::mls_process_message");
         let result = match mdk.process_message(&event) {
             Ok(result) => {
                 tracing::debug!(
@@ -55,6 +60,7 @@ impl Whitenoise {
                 return Err(WhitenoiseError::MdkCoreError(e));
             }
         };
+        drop(_mls_proc);
 
         // Extract and store media references synchronously for application messages.
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&result) {
@@ -130,19 +136,23 @@ impl Whitenoise {
                 // self-removal): publish the resulting commit event so other group
                 // members learn about the change, then merge the pending commit into
                 // our local MLS state.
+                //
+                // Uses publish_and_merge_commit to ensure MIP-03 ordering:
+                // publish first, merge only on success, clear pending commit on
+                // failure. This prevents local state from advancing to an epoch
+                // that no other group member knows about.
                 let group_id = &update_result.mls_group_id;
                 let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
-                mdk.merge_pending_commit(group_id)?;
-                self.background_refresh_account_group_subscriptions(account);
+                self.publish_and_merge_commit(
+                    update_result.evolution_event.clone(),
+                    &account.pubkey,
+                    group_id,
+                    &relay_urls,
+                )
+                .await?;
 
-                self.relay_control
-                    .publish_event_to(
-                        update_result.evolution_event.clone(),
-                        &account.pubkey,
-                        &relay_urls,
-                    )
-                    .await?;
+                self.background_refresh_account_group_subscriptions(account);
 
                 if let Some(welcome_rumors) = &update_result.welcome_rumors
                     && !welcome_rumors.is_empty()
@@ -284,6 +294,7 @@ impl Whitenoise {
     ///
     /// Processes the message through the aggregator, inserts into database,
     /// and applies any orphaned reactions/deletions that arrived before this message.
+    #[perf_instrument("event_handlers")]
     async fn cache_chat_message(
         &self,
         group_id: &GroupId,
@@ -328,6 +339,7 @@ impl Whitenoise {
     /// Returns `Ok(None)` if the target message isn't cached yet (orphaned reaction),
     /// or if the reaction was already processed as an outgoing event (echo from relay).
     /// Propagates real errors (malformed tags, invalid emoji, DB failures).
+    #[perf_instrument("event_handlers")]
     async fn cache_reaction(
         &self,
         group_id: &GroupId,
@@ -415,6 +427,7 @@ impl Whitenoise {
     ///
     /// A single deletion can target multiple events (reactions and/or messages),
     /// so this returns a Vec of (trigger, message) pairs.
+    #[perf_instrument("event_handlers")]
     async fn cache_deletion(
         &self,
         group_id: &GroupId,

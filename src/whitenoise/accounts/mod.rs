@@ -1,20 +1,19 @@
 mod login;
 mod setup;
 
-use std::fmt;
-use std::path::Path;
-use std::str::FromStr;
-
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::*;
 use mdk_sqlite_storage::MdkSqliteStorage;
-use nostr_blossom::client::BlossomClient;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::Path;
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::RelayType;
 use crate::nostr_manager::NostrManagerError;
+use crate::perf_instrument;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
@@ -266,6 +265,7 @@ impl Account {
 }
 
 impl Account {
+    #[perf_instrument("accounts")]
     pub(crate) async fn new(
         whitenoise: &Whitenoise,
         keys: Option<Keys>,
@@ -289,6 +289,7 @@ impl Account {
     }
 
     /// Creates a new account for an external signer (pubkey only, no private key).
+    #[perf_instrument("accounts")]
     pub(crate) async fn new_external(
         whitenoise: &Whitenoise,
         pubkey: PublicKey,
@@ -334,6 +335,7 @@ impl Account {
     ///   - `RelayType::Inbox` - Specialized relays for receiving private messages (kind 10050)
     ///   - `RelayType::KeyPackage` - Relays that store MLS key packages (kind 10051)
     /// * `whitenoise` - The Whitenoise instance for database operations
+    #[perf_instrument("accounts")]
     pub async fn relays(
         &self,
         relay_type: RelayType,
@@ -345,6 +347,7 @@ impl Account {
     }
 
     /// Helper method to retrieve the NIP-65 relays for this account.
+    #[perf_instrument("accounts")]
     pub(crate) async fn nip65_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
         let user = self.user(&whitenoise.database).await?;
         let relays = user.relays(RelayType::Nip65, &whitenoise.database).await?;
@@ -352,6 +355,7 @@ impl Account {
     }
 
     /// Helper method to retrieve the inbox relays for this account.
+    #[perf_instrument("accounts")]
     pub(crate) async fn inbox_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
         let user = self.user(&whitenoise.database).await?;
         let relays = user.relays(RelayType::Inbox, &whitenoise.database).await?;
@@ -364,6 +368,7 @@ impl Account {
     /// Accounts created before PR #515 may lack a kind 10050 event. Without
     /// this fallback, giftwrap subscriptions would be set up with zero relays,
     /// silently preventing the account from receiving DMs.
+    #[perf_instrument("accounts")]
     pub(crate) async fn effective_inbox_relays(
         &self,
         whitenoise: &Whitenoise,
@@ -381,6 +386,7 @@ impl Account {
     }
 
     /// Helper method to retrieve the key package relays for this account.
+    #[perf_instrument("accounts")]
     pub(crate) async fn key_package_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
         let user = self.user(&whitenoise.database).await?;
         let relays = user
@@ -404,6 +410,7 @@ impl Account {
     ///   - `RelayType::Inbox` - Inbox relays for private messages (kind 10050)
     ///   - `RelayType::KeyPackage` - Key package relays for MLS (kind 10051)
     /// * `whitenoise` - The Whitenoise instance for database and network operations
+    #[perf_instrument("accounts")]
     pub async fn add_relay(
         &self,
         relay: &Relay,
@@ -436,6 +443,7 @@ impl Account {
     ///   - `RelayType::Inbox` - Inbox relays for private messages (kind 10050)
     ///   - `RelayType::KeyPackage` - Key package relays for MLS (kind 10051)
     /// * `whitenoise` - The Whitenoise instance for database and network operations
+    #[perf_instrument("accounts")]
     pub async fn remove_relay(
         &self,
         relay: &Relay,
@@ -461,6 +469,7 @@ impl Account {
     /// # Arguments
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the database
+    #[perf_instrument("accounts")]
     pub async fn metadata(&self, whitenoise: &Whitenoise) -> Result<Metadata> {
         let user = self.user(&whitenoise.database).await?;
         Ok(user.metadata.clone())
@@ -476,6 +485,7 @@ impl Account {
     ///
     /// * `metadata` - The new metadata to set for this account
     /// * `whitenoise` - The Whitenoise instance for database and network operations
+    #[perf_instrument("accounts")]
     pub async fn update_metadata(
         &self,
         metadata: &Metadata,
@@ -496,6 +506,7 @@ impl Account {
     /// * `image_type` - Image type (JPEG, PNG, etc.)
     /// * `server` - Blossom server URL
     /// * `whitenoise` - Whitenoise instance for accessing account keys
+    #[perf_instrument("accounts")]
     pub async fn upload_profile_picture(
         &self,
         file_path: &str,
@@ -503,19 +514,28 @@ impl Account {
         server: Url,
         whitenoise: &Whitenoise,
     ) -> Result<String> {
-        let client = BlossomClient::new(server);
+        let client = Whitenoise::blossom_client(&server)?;
         let signer = whitenoise.get_signer_for_account(self)?;
         let data = tokio::fs::read(file_path).await?;
 
-        let descriptor = client
-            .upload_blob(
-                data,
-                Some(image_type.mime_type().to_string()),
-                None,
-                Some(&signer),
-            )
+        let upload_future = client.upload_blob(
+            data,
+            Some(image_type.mime_type().to_string()),
+            None,
+            Some(&signer),
+        );
+
+        let descriptor = tokio::time::timeout(Whitenoise::BLOSSOM_TIMEOUT, upload_future)
             .await
+            .map_err(|_| {
+                WhitenoiseError::Other(anyhow::anyhow!(
+                    "Upload timed out after {} seconds",
+                    Whitenoise::BLOSSOM_TIMEOUT.as_secs()
+                ))
+            })?
             .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
+
+        Whitenoise::require_https(&descriptor.url)?;
 
         Ok(descriptor.url.to_string())
     }

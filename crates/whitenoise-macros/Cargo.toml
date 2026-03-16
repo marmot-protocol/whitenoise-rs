@@ -1,0 +1,15 @@
+[package]
+name = "whitenoise-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90.0"
+description = "Proc macros for whitenoise performance instrumentation"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

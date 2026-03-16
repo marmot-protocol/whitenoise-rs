@@ -5,6 +5,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
+use crate::perf_instrument;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +64,7 @@ impl GroupInformation {
     /// * `group_type` - Optional explicit group type. If None, will be inferred from group name
     /// * `group_name` - The name of the group
     /// * `whitenoise` - Reference to the Whitenoise instance for database operations
+    #[perf_instrument("group_info")]
     pub async fn create_for_group(
         whitenoise: &Whitenoise,
         mls_group_id: &GroupId,
@@ -81,6 +83,7 @@ impl GroupInformation {
     }
 
     /// Get group information by MLS group ID, creating it with a type inferred from the group name if it doesn't exist
+    #[perf_instrument("group_info")]
     pub async fn get_by_mls_group_id(
         account_pubkey: PublicKey,
         mls_group_id: &GroupId,
@@ -101,6 +104,7 @@ impl GroupInformation {
 
     /// Get group information for multiple MLS group IDs
     /// Missing groups will be created with a type inferred from the group name
+    #[perf_instrument("group_info")]
     pub async fn get_by_mls_group_ids(
         account_pubkey: PublicKey,
         mls_group_ids: &[GroupId],
@@ -143,6 +147,7 @@ impl GroupInformation {
 }
 
 impl Whitenoise {
+    #[perf_instrument("group_info")]
     pub async fn get_group_information_by_mls_group_id(
         &self,
         account_pubkey: PublicKey,
@@ -151,6 +156,7 @@ impl Whitenoise {
         GroupInformation::get_by_mls_group_id(account_pubkey, mls_group_id, self).await
     }
 
+    #[perf_instrument("group_info")]
     pub async fn get_group_information_by_mls_group_ids(
         &self,
         account_pubkey: PublicKey,

@@ -1,15 +1,19 @@
 use nostr_sdk::prelude::*;
 
-use crate::whitenoise::{
-    Whitenoise,
-    accounts::Account,
-    database::processed_events::ProcessedEvent,
-    error::{Result, WhitenoiseError},
-    users::User,
-    utils::timestamp_to_datetime,
+use crate::{
+    perf_instrument,
+    whitenoise::{
+        Whitenoise,
+        accounts::Account,
+        database::processed_events::ProcessedEvent,
+        error::{Result, WhitenoiseError},
+        users::User,
+        utils::timestamp_to_datetime,
+    },
 };
 
 impl Whitenoise {
+    #[perf_instrument("event_handlers")]
     pub async fn handle_relay_list(&self, event: Event) -> Result<()> {
         // Check if we've already processed this specific event from this author
         let already_processed = ProcessedEvent::exists(
@@ -57,11 +61,13 @@ impl Whitenoise {
         Ok(())
     }
 
+    #[perf_instrument("event_handlers")]
     async fn handle_subscriptions_refresh(&self, user: &User, event: &Event) {
         let user_pubkey = user.pubkey;
         let event_pubkey = event.pubkey;
+        let tid = crate::perf::current_trace_id();
 
-        tokio::spawn(async move {
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(instance) => instance,
                 Err(error) => {
@@ -108,6 +114,6 @@ impl Whitenoise {
                     error
                 );
             }
-        });
+        }));
     }
 }

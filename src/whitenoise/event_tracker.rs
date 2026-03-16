@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 
+use crate::perf_instrument;
 use crate::whitenoise::{
     accounts::Account,
     database::{Database, processed_events::ProcessedEvent, published_events::PublishedEvent},
@@ -118,48 +120,71 @@ impl EventTracker for NoEventTracker {
     }
 }
 
-/// Database-backed event tracker with dependency injection
+/// Database-backed event tracker with dependency injection.
+///
+/// Caches `PublicKey → account_id` mappings to avoid redundant
+/// `Account::find_by_pubkey()` queries on every event.  The cache is
+/// append-only — accounts are never deleted during a session.
 pub struct WhitenoiseEventTracker {
     database: Arc<Database>,
+    account_id_cache: DashMap<PublicKey, i64>,
 }
 
 impl WhitenoiseEventTracker {
     pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
+        Self {
+            database,
+            account_id_cache: DashMap::new(),
+        }
+    }
+
+    /// Resolve account_id from pubkey, using the cache to avoid repeated DB lookups.
+    #[perf_instrument("event_tracker")]
+    async fn resolve_account_id(
+        &self,
+        pubkey: &PublicKey,
+    ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(id) = self.account_id_cache.get(pubkey) {
+            return Ok(*id);
+        }
+        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
+        let account_id = account.id.ok_or_else(|| {
+            Box::new(crate::WhitenoiseError::ResolveAccountId)
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        self.account_id_cache.insert(*pubkey, account_id);
+        Ok(account_id)
     }
 }
 
 #[async_trait]
 impl EventTracker for WhitenoiseEventTracker {
+    #[perf_instrument("event_tracker")]
     async fn track_published_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::create(event_id, account_id, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
         Ok(())
     }
 
+    #[perf_instrument("event_tracker")]
     async fn account_published_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         PublishedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn global_published_event(
         &self,
         event_id: &EventId,
@@ -169,15 +194,13 @@ impl EventTracker for WhitenoiseEventTracker {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn track_processed_account_event(
         &self,
         event: &Event,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::create(
             &event.id,
             Some(account_id),
@@ -190,20 +213,19 @@ impl EventTracker for WhitenoiseEventTracker {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn already_processed_account_event(
         &self,
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account
-            .id
-            .ok_or_else(|| std::io::Error::other("Account missing id"))?;
+        let account_id = self.resolve_account_id(pubkey).await?;
         ProcessedEvent::exists(event_id, Some(account_id), &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn track_processed_global_event(
         &self,
         event: &Event,
@@ -220,6 +242,7 @@ impl EventTracker for WhitenoiseEventTracker {
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    #[perf_instrument("event_tracker")]
     async fn already_processed_global_event(
         &self,
         event_id: &EventId,
@@ -480,6 +503,35 @@ mod tests {
                 .track_processed_account_event(&event, &event.pubkey)
                 .await;
             assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn resolve_account_id_uses_cache_on_second_call() {
+            let (database, _temp_dir) = create_test_database().await;
+            let keys = Keys::generate();
+            create_test_account(&database, &keys.public_key()).await;
+
+            let tracker = WhitenoiseEventTracker::new(database.clone());
+
+            // First call populates the cache
+            let id1 = tracker
+                .resolve_account_id(&keys.public_key())
+                .await
+                .unwrap();
+
+            // Remove the account from the DB so only the cache can serve it
+            sqlx::query("DELETE FROM accounts WHERE pubkey = ?")
+                .bind(keys.public_key().to_hex())
+                .execute(&database.pool)
+                .await
+                .unwrap();
+
+            // Second call should succeed via cache
+            let id2 = tracker
+                .resolve_account_id(&keys.public_key())
+                .await
+                .unwrap();
+            assert_eq!(id1, id2);
         }
 
         #[tokio::test]

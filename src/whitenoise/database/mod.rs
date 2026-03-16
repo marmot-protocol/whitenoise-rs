@@ -5,9 +5,9 @@ use std::{
 };
 
 use sqlx::{
-    Sqlite, SqlitePool,
+    ConnectOptions, Sqlite, SqlitePool,
     migrate::{MigrateDatabase, Migrator},
-    sqlite::SqlitePoolOptions,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
 
@@ -51,6 +51,23 @@ pub enum DatabaseError {
     InvalidCursor { reason: &'static str },
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+}
+
+impl DatabaseError {
+    /// Returns `true` for transient SQLite lock errors.
+    ///
+    /// Handles both primary codes (5 = SQLITE_BUSY, 6 = SQLITE_LOCKED) and
+    /// extended codes (e.g. 517 = SQLITE_BUSY_SNAPSHOT) by masking with 0xFF
+    /// to extract the primary result code.
+    pub fn is_sqlite_lock_error(&self) -> bool {
+        let Self::Sqlx(sqlx::Error::Database(db_err)) = self else {
+            return false;
+        };
+        db_err
+            .code()
+            .and_then(|c| c.parse::<u32>().ok())
+            .is_some_and(|code| matches!(code & 0xFF, 5 | 6))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +127,20 @@ impl Database {
     /// Creates and configures a SQLite connection pool
     async fn create_connection_pool(db_url: &str) -> Result<SqlitePool, DatabaseError> {
         tracing::debug!("Creating connection pool...");
+
+        // Log every SQL statement only when explicitly opted in (e.g. benchmarks).
+        // Slow-query logging stays unconditional as a safety net.
+        let log_statements_level = if std::env::var("SQLX_LOG_STATEMENTS").is_ok() {
+            tracing::log::LevelFilter::Info
+        } else {
+            tracing::log::LevelFilter::Off
+        };
+
+        let connect_options = format!("{db_url}?mode=rwc")
+            .parse::<SqliteConnectOptions>()?
+            .log_statements(log_statements_level)
+            .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_millis(500));
+
         let pool = SqlitePoolOptions::new()
             .acquire_timeout(Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
             .max_connections(DB_MAX_CONNECTIONS)
@@ -136,7 +167,7 @@ impl Database {
                     Ok(())
                 })
             })
-            .connect(&format!("{db_url}?mode=rwc"))
+            .connect_with(connect_options)
             .await?;
         Ok(pool)
     }
@@ -164,41 +195,7 @@ impl Database {
     /// 2. Schema is preserved even if interrupted
     /// 3. No risk of migration failures leaving database in broken state
     pub async fn delete_all_data(&self) -> Result<(), DatabaseError> {
-        // Retry logic for database locking issues
-        let max_retries = 3;
-        let mut last_error = None;
-
-        for attempt in 1..=max_retries {
-            match self.delete_all_data_inner().await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    // Check if this is a database lock error
-                    let is_lock_error = matches!(&e, DatabaseError::Sqlx(sqlx::Error::Database(db_err))
-                        if db_err.code().map(|c| c == "5" || c == "6").unwrap_or(false));
-
-                    if is_lock_error && attempt < max_retries {
-                        tracing::warn!(
-                            "Database locked during cleanup (attempt {}/{}), retrying...",
-                            attempt,
-                            max_retries
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            100 * attempt as u64,
-                        ))
-                        .await;
-                        last_error = Some(e);
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            DatabaseError::Sqlx(sqlx::Error::Protocol(
-                "Unexpected retry failure".to_string(),
-            ))
-        }))
+        retry_on_lock(|| self.delete_all_data_inner()).await
     }
 
     /// Inner implementation of delete_all_data
@@ -246,6 +243,35 @@ impl Database {
         txn.commit().await?;
 
         Ok(())
+    }
+}
+
+/// Retry an async database operation on transient SQLite lock errors.
+///
+/// Uses linear backoff (100 ms × attempt) for up to 3 attempts.
+/// Returns on first success or first non-lock error.
+pub(crate) async fn retry_on_lock<F, Fut, T>(mut op: F) -> std::result::Result<T, DatabaseError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(e) if e.is_sqlite_lock_error() && attempt < MAX_ATTEMPTS => {
+                tracing::warn!(
+                    target: "whitenoise::database",
+                    "SQLite lock on attempt {attempt}/{MAX_ATTEMPTS}, \
+                     retrying...",
+                );
+                tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -560,5 +586,162 @@ mod tests {
 
         assert_eq!(result1.0, 1);
         assert_eq!(result2.0, 2);
+    }
+
+    /// Minimal mock implementing `sqlx::error::DatabaseError` for testing
+    /// `is_sqlite_lock_error()` with specific error codes.
+    #[derive(Debug)]
+    struct MockDbError {
+        code: Option<String>,
+    }
+
+    impl std::fmt::Display for MockDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mock db error")
+        }
+    }
+
+    impl std::error::Error for MockDbError {}
+
+    impl sqlx::error::DatabaseError for MockDbError {
+        fn message(&self) -> &str {
+            "mock db error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            self.code.as_deref().map(std::borrow::Cow::Borrowed)
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn make_lock_error(code: &str) -> DatabaseError {
+        DatabaseError::Sqlx(sqlx::Error::Database(Box::new(MockDbError {
+            code: Some(code.to_string()),
+        })))
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_busy() {
+        assert!(make_lock_error("5").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_locked() {
+        assert!(make_lock_error("6").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_extended_busy() {
+        // 517 = SQLITE_BUSY_SNAPSHOT (517 & 0xFF == 5)
+        assert!(make_lock_error("517").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_true_for_extended_locked() {
+        // 262 = SQLITE_LOCKED_SHAREDCACHE (262 & 0xFF == 6)
+        assert!(make_lock_error("262").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_row_not_found() {
+        let err = DatabaseError::Sqlx(sqlx::Error::RowNotFound);
+        assert!(!err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_other_db_code() {
+        assert!(!make_lock_error("19").is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_serialization() {
+        let json_err = serde_json::from_str::<String>("invalid").unwrap_err();
+        let err = DatabaseError::Serialization(json_err);
+        assert!(!err.is_sqlite_lock_error());
+    }
+
+    #[test]
+    fn test_is_sqlite_lock_error_false_for_non_numeric_code() {
+        assert!(!make_lock_error("abc").is_sqlite_lock_error());
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_succeeds_first_try() {
+        let result = retry_on_lock(|| async { Ok::<_, DatabaseError>(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_succeeds_after_transient_lock() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                let attempt = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(make_lock_error("5"))
+                } else {
+                    Ok(99)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_exhausts_on_persistent_lock() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(make_lock_error("5"))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_sqlite_lock_error());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_on_lock_no_retry_on_non_lock_error() {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter_clone = counter.clone();
+
+        let result = retry_on_lock(move || {
+            let c = counter_clone.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(DatabaseError::Sqlx(sqlx::Error::RowNotFound))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
