@@ -756,6 +756,9 @@ impl RelaySession {
             // disconnect does not permanently blind the session. The loop
             // exits on a graceful Shutdown notification (Ok return) or when
             // the event_sender channel closes (receiver dropped).
+            const MAX_BACKOFF_SECS: u64 = 30;
+            let mut backoff_secs: u64 = 1;
+
             loop {
                 // Clone per-iteration so the `move` closure owns fresh handles.
                 let sender_i = event_sender.clone();
@@ -763,6 +766,7 @@ impl RelaySession {
                 let router_i = router.clone();
                 let state_i = state.clone();
 
+                let started_at = tokio::time::Instant::now();
                 let result = client
                     .handle_notifications(move |notification| {
                         let sender = sender_i.clone();
@@ -892,11 +896,18 @@ impl RelaySession {
                         break;
                     }
                     Err(error) => {
+                        // Reset backoff if the handler ran long enough to
+                        // have processed events successfully before failing.
+                        if started_at.elapsed() >= std::time::Duration::from_secs(MAX_BACKOFF_SECS)
+                        {
+                            backoff_secs = 1;
+                        }
                         tracing::error!(
                             target: "whitenoise::relay_control::session",
-                            "Notification handler error: {error}. Restarting in 1s."
+                            "Notification handler error: {error}. Restarting in {backoff_secs}s."
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     }
                 }
             }
