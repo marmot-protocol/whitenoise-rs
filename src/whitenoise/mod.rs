@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use ::rand::RngCore;
 
 use anyhow::Context;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl, ToBech32};
 use tokio::sync::{
@@ -170,6 +170,17 @@ pub struct Whitenoise {
     /// The value holds whichever relay lists were already discovered on the
     /// network so that step 2a can publish defaults only for the missing ones.
     pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
+    /// NIP-46 credentials (bunker URI + app keys) for logins that are still
+    /// in the multi-step flow. Credentials are stashed here during step 1 so
+    /// step 2 can persist them to the keychain only after the login fully
+    /// completes, preventing orphaned keychain entries on abandoned flows.
+    pending_nip46_credentials: DashMap<PublicKey, (String, nostr_sdk::Keys)>,
+    /// Accounts whose NIP-46 signer failed to reconnect at startup (e.g.
+    /// bunker offline, credentials stale). The UI layer can poll this set to
+    /// surface a "reconnection required" prompt for affected accounts.
+    /// Entries are removed when a manual login or register_external_signer
+    /// call succeeds for that pubkey.
+    pub nip46_reconnect_failed: DashSet<PublicKey>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -246,6 +257,8 @@ impl Whitenoise {
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
             pending_logins: DashMap::new(),
+            pending_nip46_credentials: DashMap::new(),
+            nip46_reconnect_failed: DashSet::new(),
         }
     }
 
@@ -543,10 +556,16 @@ impl Whitenoise {
 
         init_timing::record("background_tasks");
 
-        // Bring back NIP-46 signers for any external accounts that have saved
-        // credentials. Needs to happen before subscriptions go up — otherwise
-        // relays that require NIP-42 AUTH won't have a signer to talk to.
-        Self::reconnect_nip46_signers(whitenoise_ref).await;
+        // Bring NIP-46 signers back for external accounts in the background.
+        // Subscriptions for local accounts can proceed immediately; NIP-46
+        // accounts will catch up once the reconnect completes. A grace window
+        // of 2 seconds is given before subscriptions go up so that fast
+        // reconnects (e.g. already-online bunkers on a local relay) complete
+        // without a round-trip delay penalty on subscriptions.
+        tokio::spawn(async move {
+            Self::reconnect_nip46_signers(whitenoise_ref).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
@@ -685,6 +704,13 @@ impl Whitenoise {
     /// we log a warning and keep going; one broken reconnect shouldn't take
     /// down the whole startup.
     async fn reconnect_nip46_signers(whitenoise_ref: &Whitenoise) {
+        // 30 seconds matches the typical NIP-46 interactive-auth window (the
+        // signer app must approve the connection request before this expires).
+        // Lower values caused spurious failures on slow mobile networks during
+        // testing; higher values would make the background task outlive its
+        // usefulness. Caller-facing login methods accept a `timeout_secs`
+        // parameter; this constant is only for the background reconnect path
+        // where no caller is available to provide one.
         const NIP46_RECONNECT_TIMEOUT_SECS: u64 = 30;
 
         let accounts = match Account::all(&whitenoise_ref.database).await {
@@ -722,7 +748,10 @@ impl Whitenoise {
 
         for (pubkey, result) in results {
             match result {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Clear any prior failure flag — this account is now healthy.
+                    whitenoise_ref.nip46_reconnect_failed.remove(&pubkey);
+                }
                 Err(WhitenoiseError::SecretsStore(
                     crate::whitenoise::secrets_store::SecretsStoreError::KeyNotFound,
                 )) => {
@@ -742,9 +771,23 @@ impl Whitenoise {
                         pubkey.to_hex(),
                         e
                     );
+                    // Mark this account so the UI can prompt the user to
+                    // re-authenticate (e.g. the bunker was offline at startup).
+                    whitenoise_ref.nip46_reconnect_failed.insert(pubkey);
                 }
             }
         }
+    }
+
+    /// Returns the pubkeys of accounts whose NIP-46 signer failed to reconnect
+    /// at startup.
+    ///
+    /// The UI layer can poll this list to surface a "reconnection required"
+    /// prompt. An account is removed from this list as soon as a successful
+    /// [`register_external_signer`](Self::register_external_signer) or
+    /// [`login_nip46`](Self::login_nip46) call is made for it.
+    pub fn nip46_reconnect_failed_accounts(&self) -> Vec<PublicKey> {
+        self.nip46_reconnect_failed.iter().map(|r| *r).collect()
     }
 
     /// Returns a reference to the global Whitenoise singleton instance.
@@ -924,6 +967,10 @@ impl Whitenoise {
             return Err(WhitenoiseError::NotExternalSignerAccount);
         }
         self.insert_external_signer(pubkey, signer).await?;
+
+        // Clear any prior startup-reconnect failure so the UI knows this
+        // account is now healthy.
+        self.nip46_reconnect_failed.remove(&pubkey);
 
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.

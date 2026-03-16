@@ -201,10 +201,10 @@ pub enum WhitenoiseError {
     UnsupportedMediaFormat(String),
 
     #[error("NIP-46 invalid bunker URI: {0}")]
-    Nip46InvalidUri(#[from] nip46::Error),
+    Nip46InvalidUri(nip46::Error),
 
     #[error("NIP-46 connection error: {0}")]
-    Nip46Connection(#[from] NostrConnectError),
+    Nip46Connection(NostrConnectError),
 
     #[error("NIP-46 pubkey mismatch during reconnect: expected {expected}, got {got}")]
     Nip46PubkeyMismatch { expected: PublicKey, got: PublicKey },
@@ -221,12 +221,6 @@ pub enum WhitenoiseError {
 impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         WhitenoiseError::Other(anyhow::anyhow!(err.to_string()))
-    }
-}
-
-impl From<nostr_connect::prelude::SignerError> for WhitenoiseError {
-    fn from(err: nostr_connect::prelude::SignerError) -> Self {
-        WhitenoiseError::Nip46Connection(NostrConnectError::Response(err.to_string()))
     }
 }
 
