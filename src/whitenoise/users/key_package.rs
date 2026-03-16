@@ -73,10 +73,41 @@ impl User {
     ///
     /// Similar to [`key_package_event`](Self::key_package_event), but returns a
     /// [`KeyPackageStatus`] that distinguishes between valid, missing, and incompatible.
+    ///
+    /// If the initial lookup returns [`KeyPackageStatus::NotFound`] and the user has no
+    /// relay data yet (e.g. created by a background sync that hasn't finished), this
+    /// method will perform a blocking relay sync and retry once.
     #[perf_instrument("users")]
     pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
         let event = self.key_package_event(whitenoise).await?;
-        Ok(classify_key_package(event))
+        let status = classify_key_package(event);
+
+        match status {
+            KeyPackageStatus::NotFound
+                if self
+                    .relays(RelayType::KeyPackage, &whitenoise.database)
+                    .await?
+                    .is_empty() =>
+            {
+                tracing::debug!(
+                    target: "whitenoise::users::key_package",
+                    "Key package not found for user {} with empty relay list, syncing relays and retrying",
+                    self.pubkey
+                );
+                if let Err(e) = self.update_relay_lists(whitenoise).await {
+                    tracing::warn!(
+                        target: "whitenoise::users::key_package",
+                        "Failed to sync relay lists for user {}: {}",
+                        self.pubkey,
+                        e
+                    );
+                    return Ok(KeyPackageStatus::NotFound);
+                }
+                let event = self.key_package_event(whitenoise).await?;
+                Ok(classify_key_package(event))
+            }
+            other => Ok(other),
+        }
     }
 }
 

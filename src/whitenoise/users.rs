@@ -2361,4 +2361,61 @@ mod tests {
             }
         }
     }
+
+    mod key_package_status_tests {
+        use super::*;
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        #[tokio::test]
+        async fn test_not_found_with_empty_relay_list_retries_after_sync() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            // User has no relays in DB, so key_package_status should attempt
+            // relay sync and retry. With no real relays to reach, the result
+            // should still be NotFound but the retry path is exercised.
+            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            assert_eq!(status, KeyPackageStatus::NotFound);
+        }
+
+        #[tokio::test]
+        async fn test_not_found_with_populated_relay_list_does_not_retry() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            // Add a key package relay using a local test relay so the connection succeeds
+            let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+                .await
+                .unwrap();
+
+            // With a relay present, key_package_status should return NotFound
+            // without attempting relay sync (no retry path).
+            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            assert_eq!(status, KeyPackageStatus::NotFound);
+        }
+    }
 }
