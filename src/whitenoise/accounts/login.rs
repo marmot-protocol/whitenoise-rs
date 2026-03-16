@@ -774,23 +774,25 @@ impl Whitenoise {
     // downstream (signing, decryption, giftwrap) just works.
     // -----------------------------------------------------------------------
 
-    /// Stores NIP-46 credentials in the keychain after a successful login, and
-    /// rolls back the login if the store fails.
+    /// Stores NIP-46 credentials in the keychain after a successful login.
     ///
-    /// Called by the one-shot and client-initiated login paths to enforce the
-    /// invariant: a NIP-46 account must always have stored credentials, or
-    /// it can never reconnect after restart.
+    /// When `rollback_login` is `true` and the keychain write fails, the login
+    /// is rolled back via `logout` so the caller never gets an activated
+    /// account that can't reconnect after restart. Pass `false` when the
+    /// account already existed before this login call — rolling it back would
+    /// tear down a valid pre-existing session.
     async fn store_nip46_credentials_or_rollback(
         &self,
         pubkey: &PublicKey,
         app_keys: &Keys,
         bunker_uri: &str,
+        rollback_login: bool,
     ) -> Result<()> {
         if let Err(store_err) =
             self.secrets_store
                 .store_nip46_credentials(pubkey, app_keys.secret_key(), bunker_uri)
         {
-            if let Err(rollback_err) = self.logout(pubkey).await {
+            if rollback_login && let Err(rollback_err) = self.logout(pubkey).await {
                 tracing::warn!(
                     target: "whitenoise::accounts::login",
                     "Failed to roll back login after credential store failure for {}: {}",
@@ -886,13 +888,25 @@ impl Whitenoise {
             WhitenoiseError::Nip46Connection(nostr_connect::error::Error::Response(e.to_string()))
         })?;
 
+        // Check before login so we know whether to roll back on keychain failure.
+        // If the account already exists, rolling it back would tear down a valid
+        // pre-existing session.
+        let account_is_new = Account::find_by_pubkey(&user_pubkey, &self.database)
+            .await
+            .is_err();
+
         let account = self.login_with_external_signer(user_pubkey, signer).await?;
 
-        // Persist credentials only after login succeeds. Rolls back the login
-        // on keychain failure so the caller never gets an activated account
-        // that can't reconnect after restart.
-        self.store_nip46_credentials_or_rollback(&user_pubkey, &app_keys, bunker_uri)
-            .await?;
+        // Persist credentials only after login succeeds. Rolls back a newly
+        // created account on keychain failure; skips rollback for pre-existing
+        // accounts to avoid tearing down a valid session.
+        self.store_nip46_credentials_or_rollback(
+            &user_pubkey,
+            &app_keys,
+            bunker_uri,
+            account_is_new,
+        )
+        .await?;
 
         Ok(account)
     }
@@ -904,12 +918,20 @@ impl Whitenoise {
     /// start with [`login_nip46_start`](Self::login_nip46_start) instead.
     pub async fn login_nip46(&self, bunker_uri: &str, timeout_secs: u64) -> Result<Account> {
         let (pubkey, signer, app_keys) = self.create_nip46_signer(bunker_uri, timeout_secs).await?;
+
+        // Check before login so we know whether to roll back on keychain failure.
+        // If the account already exists, rolling it back would tear down a valid
+        // pre-existing session.
+        let account_is_new = Account::find_by_pubkey(&pubkey, &self.database)
+            .await
+            .is_err();
+
         let account = self.login_with_external_signer(pubkey, signer).await?;
 
-        // Persist credentials only after login succeeds. Rolls back the login
-        // on keychain failure so the caller never gets an activated account
-        // that can't reconnect after restart.
-        self.store_nip46_credentials_or_rollback(&pubkey, &app_keys, bunker_uri)
+        // Persist credentials only after login succeeds. Rolls back a newly
+        // created account on keychain failure; skips rollback for pre-existing
+        // accounts to avoid tearing down a valid session.
+        self.store_nip46_credentials_or_rollback(&pubkey, &app_keys, bunker_uri, account_is_new)
             .await?;
 
         Ok(account)
@@ -938,26 +960,25 @@ impl Whitenoise {
             .create_nip46_signer(bunker_uri, timeout_secs)
             .await
             .map_err(LoginError::from)?;
+
+        // Check before login so we know whether to roll back on keychain failure.
+        let account_is_new = Account::find_by_pubkey(&pubkey, &self.database)
+            .await
+            .is_err();
+
         let result = self.login_external_signer_start(pubkey, signer).await?;
 
         match result.status {
             LoginStatus::Complete => {
                 // Single-step success: persist credentials now.
-                if let Err(store_err) = self.secrets_store.store_nip46_credentials(
+                self.store_nip46_credentials_or_rollback(
                     &pubkey,
-                    app_keys.secret_key(),
+                    &app_keys,
                     bunker_uri,
-                ) {
-                    if let Err(rollback_err) = self.logout(&pubkey).await {
-                        tracing::warn!(
-                            target: "whitenoise::accounts::login",
-                            "Failed to roll back login after credential store failure for {}: {}",
-                            pubkey.to_hex(),
-                            rollback_err
-                        );
-                    }
-                    return Err(LoginError::Internal(store_err.to_string()));
-                }
+                    account_is_new,
+                )
+                .await
+                .map_err(|e| LoginError::Internal(e.to_string()))?;
             }
             LoginStatus::NeedsRelayLists => {
                 // Multi-step: stash credentials so step 2 can persist them
@@ -1023,7 +1044,9 @@ impl Whitenoise {
             return Ok(());
         };
 
-        self.store_nip46_credentials_or_rollback(pubkey, &app_keys, &bunker_uri)
+        // Step 2 always completes an account that was created in step 1 —
+        // it's safe to roll back on keychain failure.
+        self.store_nip46_credentials_or_rollback(pubkey, &app_keys, &bunker_uri, true)
             .await
             .map_err(|e| LoginError::Internal(e.to_string()))?;
 

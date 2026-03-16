@@ -176,11 +176,10 @@ pub struct Whitenoise {
     /// completes, preventing orphaned keychain entries on abandoned flows.
     pending_nip46_credentials: DashMap<PublicKey, (String, nostr_sdk::Keys)>,
     /// Accounts whose NIP-46 signer failed to reconnect at startup (e.g.
-    /// bunker offline, credentials stale). The UI layer can poll this set to
-    /// surface a "reconnection required" prompt for affected accounts.
-    /// Entries are removed when a manual login or register_external_signer
-    /// call succeeds for that pubkey.
-    pub nip46_reconnect_failed: DashSet<PublicKey>,
+    /// bunker offline, credentials stale). The UI layer can poll this via
+    /// `nip46_reconnect_failed_accounts()`. Mutated only through controlled
+    /// internal paths to preserve invariants.
+    nip46_reconnect_failed: DashSet<PublicKey>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -557,15 +556,24 @@ impl Whitenoise {
         init_timing::record("background_tasks");
 
         // Bring NIP-46 signers back for external accounts in the background.
-        // Subscriptions for local accounts can proceed immediately; NIP-46
-        // accounts will catch up once the reconnect completes. A grace window
-        // of 2 seconds is given before subscriptions go up so that fast
-        // reconnects (e.g. already-online bunkers on a local relay) complete
-        // without a round-trip delay penalty on subscriptions.
-        tokio::spawn(async move {
-            Self::reconnect_nip46_signers(whitenoise_ref).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Only spawn the reconnect task and apply the grace window when there
+        // are actually external accounts — users with only local accounts pay
+        // no startup delay.
+        let has_external_accounts = Account::all(&whitenoise_ref.database)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a.uses_external_signer());
+
+        if has_external_accounts {
+            tokio::spawn(async move {
+                Self::reconnect_nip46_signers(whitenoise_ref).await;
+            });
+            // Give fast reconnects (e.g. bunker already online on a local relay)
+            // a brief window to finish before subscriptions go up, so NIP-46
+            // accounts don't miss NIP-42 AUTH on the first relay connection.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
 
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
