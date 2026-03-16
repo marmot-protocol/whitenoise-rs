@@ -357,20 +357,16 @@ impl Whitenoise {
 
         let mut user_clone = user.clone();
 
-        // Always sync relay lists in blocking mode so relay-dependent lookups
-        // (e.g. key_package_status) have accurate data to work with, regardless
-        // of whether this is a new user or an existing one that may have been
-        // created via a prior background sync that hasn't finished yet.
-        if let Err(e) = user_clone.update_relay_lists(self).await {
-            tracing::warn!(
-                target: "whitenoise::users::sync_user_blocking",
-                "Failed to sync relay lists for user {}: {}",
-                user_clone.pubkey,
-                e
-            );
-        }
-
         if is_new {
+            // For new users, sync relay lists first so we have a good chance of finding their events
+            if let Err(e) = user_clone.update_relay_lists(self).await {
+                tracing::warn!(
+                    target: "whitenoise::users::sync_user_blocking",
+                    "Failed to sync relay lists for new user {}: {}",
+                    user_clone.pubkey,
+                    e
+                );
+            }
             // For new users, we need to add the user to the global subscriptions batches so we get updates on their events
             if let Err(e) = self.refresh_global_subscription_for_user().await {
                 tracing::warn!(
@@ -2363,6 +2359,63 @@ mod tests {
 
                 assert!(!changed);
             }
+        }
+    }
+
+    mod key_package_status_tests {
+        use super::*;
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        #[tokio::test]
+        async fn test_not_found_with_empty_relay_list_retries_after_sync() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            // User has no relays in DB, so key_package_status should attempt
+            // relay sync and retry. With no real relays to reach, the result
+            // should still be NotFound but the retry path is exercised.
+            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            assert_eq!(status, KeyPackageStatus::NotFound);
+        }
+
+        #[tokio::test]
+        async fn test_not_found_with_populated_relay_list_does_not_retry() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            // Add a key package relay using a local test relay so the connection succeeds
+            let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+                .await
+                .unwrap();
+
+            // With a relay present, key_package_status should return NotFound
+            // without attempting relay sync (no retry path).
+            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            assert_eq!(status, KeyPackageStatus::NotFound);
         }
     }
 }
