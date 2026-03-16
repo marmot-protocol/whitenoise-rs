@@ -36,11 +36,17 @@ impl RelayNotification {
         relay_url: RelayUrl,
         message: RelayMessage<'static>,
     ) -> Option<Self> {
-        // This normalization is telemetry-oriented. For message types such as
-        // `OK` and `EOSE` we intentionally collapse structured payloads into a
-        // coarse notification shape instead of preserving every field.
+        // This normalization is telemetry-oriented. Only actionable relay
+        // messages (Notice, Closed, Auth) produce notifications. High-volume
+        // happy-path messages (OK, EOSE, Count, NegMsg, NegErr) are filtered
+        // out to avoid polluting the relay_events table with non-actionable data.
         match message {
-            RelayMessage::Event { .. } => None,
+            RelayMessage::Event { .. }
+            | RelayMessage::Ok { .. }
+            | RelayMessage::EndOfStoredEvents(_)
+            | RelayMessage::Count { .. }
+            | RelayMessage::NegMsg { .. }
+            | RelayMessage::NegErr { .. } => None,
             RelayMessage::Notice(message) => Some(Self::Notice {
                 relay_url,
                 failure_category: Some(RelayFailureCategory::classify_notice(&message)),
@@ -58,31 +64,6 @@ impl RelayNotification {
                 relay_url,
                 failure_category: Some(RelayFailureCategory::classify_auth(&challenge)),
                 challenge: challenge.into_owned(),
-            }),
-            RelayMessage::Ok { .. } => Some(Self::Notice {
-                relay_url,
-                message: "ok".to_string(),
-                failure_category: None,
-            }),
-            RelayMessage::EndOfStoredEvents(_) => Some(Self::Notice {
-                relay_url,
-                message: "eose".to_string(),
-                failure_category: None,
-            }),
-            RelayMessage::Count { .. } => Some(Self::Notice {
-                relay_url,
-                message: "count".to_string(),
-                failure_category: None,
-            }),
-            RelayMessage::NegMsg { .. } => Some(Self::Notice {
-                relay_url,
-                message: "negmsg".to_string(),
-                failure_category: None,
-            }),
-            RelayMessage::NegErr { .. } => Some(Self::Notice {
-                relay_url,
-                message: "negerr".to_string(),
-                failure_category: None,
             }),
         }
     }
