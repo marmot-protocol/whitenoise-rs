@@ -1,6 +1,7 @@
 use crate::integration_tests::benchmarks::scenarios::{
-    IdentityCreationBenchmark, LoginPerformanceBenchmark, MessageAggregationBenchmark,
-    MessagingPerformanceBenchmark, UserDiscoveryBenchmark, UserSearchBenchmark,
+    GroupCreationBenchmark, IdentityCreationBenchmark, LoginPerformanceBenchmark,
+    MessageAggregationBenchmark, MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
+    UserSearchBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -56,6 +57,7 @@ macro_rules! benchmark_registry {
 // BENCHMARK REGISTRY - Add new benchmarks here (one line each)
 // ============================================================================
 benchmark_registry! {
+    "group-creation" => GroupCreationBenchmark::default(),
     "identity-creation" => IdentityCreationBenchmark::default(),
     "login-performance" => LoginPerformanceBenchmark::default(),
     "messaging-performance" => MessagingPerformanceBenchmark::default(),
@@ -198,6 +200,7 @@ mod tests {
     #[test]
     fn test_parse_valid_scenario_names() {
         // Test all valid scenario names can be parsed and instantiated
+        assert!(parse_and_instantiate("group-creation").is_ok());
         assert!(parse_and_instantiate("identity-creation").is_ok());
         assert!(parse_and_instantiate("login-performance").is_ok());
         assert!(parse_and_instantiate("messaging-performance").is_ok());
@@ -210,6 +213,7 @@ mod tests {
     #[test]
     fn test_parse_case_insensitive() {
         // Test case insensitivity
+        assert!(parse_and_instantiate("GROUP-CREATION").is_ok());
         assert!(parse_and_instantiate("IDENTITY-CREATION").is_ok());
         assert!(parse_and_instantiate("LOGIN-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
@@ -234,13 +238,15 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
+        assert!(names.contains(&"group-creation"));
         assert!(names.contains(&"identity-creation"));
         assert!(names.contains(&"login-performance"));
         assert!(names.contains(&"messaging-performance"));
         assert!(names.contains(&"message-aggregation"));
         assert!(names.contains(&"user-discovery-blocking"));
         assert!(names.contains(&"user-discovery-background"));
+        assert!(names.contains(&"user-search"));
     }
 
     #[test]

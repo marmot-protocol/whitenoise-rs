@@ -256,26 +256,20 @@ impl Whitenoise {
     /// **not** auto-detect a platform backend — callers must register one via
     /// `keyring_core::set_default_store()` before any `Entry` operations.
     ///
-    /// In test and integration-test builds the mock (in-memory) store is used so
-    /// that unit tests never touch the real platform keychain. The
-    /// `benchmark-tests` feature selects the real keyring only for the
-    /// benchmark binary (`cargo run --bin`), not for `cargo test` builds.
+    /// In test, integration-test, and benchmark-test builds the mock (in-memory)
+    /// store is used so that neither `cargo test` nor unsigned `cargo run`
+    /// binaries require real platform keychain entitlements.
     ///
     /// This function is safe to call multiple times; only the first call has
     /// an effect.
     fn initialize_keyring_store() {
         static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
         KEYRING_STORE_INIT.get_or_init(|| {
-            // Always use the mock store in `cargo test` builds so unit tests
-            // never interact with the real platform keychain. The
-            // `benchmark-tests` feature only overrides the mock for the
-            // *benchmark binary* (`cargo run --bin benchmark_test`), which is
-            // not a `cfg(test)` build. The `integration-tests` feature
-            // selects mock for `cargo run --bin integration_test` as well.
-            #[cfg(any(
-                test,
-                all(feature = "integration-tests", not(feature = "benchmark-tests"))
-            ))]
+            // Use the mock (in-memory) store in test, integration-test, and
+            // benchmark-test builds so that `cargo test` and unsigned `cargo run`
+            // binaries never require real platform keychain entitlements.
+            // The real store is reserved for production builds (no feature flags).
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             {
                 keyring_core::set_default_store(
                     keyring_core::mock::Store::new()
@@ -285,7 +279,8 @@ impl Whitenoise {
 
             #[cfg(all(
                 not(test),
-                any(not(feature = "integration-tests"), feature = "benchmark-tests")
+                not(feature = "integration-tests"),
+                not(feature = "benchmark-tests")
             ))]
             {
                 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -301,10 +296,7 @@ impl Whitenoise {
                 // provisioning profile that includes the
                 // com.apple.security.application-groups (or equivalent
                 // keychain-access-groups) entitlement.  The Flutter app build
-                // pipeline satisfies this automatically.  An unsigned `cargo run`
-                // on a developer Mac will panic here with an entitlement error;
-                // in that case build for x86_64 or use the integration-test
-                // feature flag (which substitutes the mock store).
+                // pipeline satisfies this automatically.
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 {
                     let store = apple_native_keyring_store::protected::Store::new()
