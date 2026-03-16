@@ -334,15 +334,12 @@ impl RelayControlPlane {
     /// Deactivates all account subscriptions. Called during full data teardown.
     #[perf_instrument("relay")]
     pub(crate) async fn shutdown_all(&self) {
-        let pubkeys: Vec<_> = self
-            .account_inbox_planes
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect();
-        for pubkey in pubkeys {
-            self.deactivate_account_subscriptions(&pubkey).await;
+        let planes: Vec<_> = self.account_inbox_planes.write().await.drain().collect();
+
+        for (pubkey, plane) in planes {
+            plane.deactivate().await;
+            self.group_plane.remove_account(&pubkey).await;
+            self.ephemeral.remove_account_scope(&pubkey).await;
         }
     }
 
