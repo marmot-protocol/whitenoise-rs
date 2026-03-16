@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -17,6 +18,23 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::media_files::{FileMetadata, MediaFile};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::media_files::MediaFileUpload;
+
+/// Shared HTTP client for Blossom blob downloads.
+///
+/// `reqwest::Client` holds a connection pool, a DNS resolver, and TLS state.
+/// Building it once here lets all downloads reuse keep-alive connections and
+/// avoids repeated TLS handshakes.  The ring TLS provider is installed here
+/// too, so the `install_default()` call happens exactly once.
+static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    // reqwest 0.13 with `rustls-no-provider` requires an explicit provider.
+    // The `let _ =` suppresses the error when it is already installed (e.g.
+    // during tests where multiple call sites race to install the same provider).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .expect("Failed to build shared Blossom HTTP client")
+});
 
 impl Whitenoise {
     /// Default timeout for Blossom HTTP operations (download and upload)
@@ -658,22 +676,14 @@ impl Whitenoise {
             WhitenoiseError::BlossomDownload(format!("Failed to build download URL: {}", e))
         })?;
 
-        let download_future = async {
-            // Ensure the ring TLS provider is installed before building the client.
-            // reqwest 0.13 with rustls-no-provider requires an explicit provider.
-            // The `let _ =` ignores the error when it is already installed.
-            let _ = rustls::crypto::ring::default_provider().install_default();
-
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::limited(10))
-                .build()
+        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, async {
+            let response = BLOSSOM_HTTP_CLIENT
+                .get(download_url)
+                .send()
+                .await
                 .map_err(|e| {
-                    WhitenoiseError::BlossomDownload(format!("Failed to build HTTP client: {}", e))
+                    WhitenoiseError::BlossomDownload(format!("HTTP request failed: {}", e))
                 })?;
-
-            let response = client.get(download_url).send().await.map_err(|e| {
-                WhitenoiseError::BlossomDownload(format!("HTTP request failed: {}", e))
-            })?;
 
             if !response.status().is_success() {
                 return Err(WhitenoiseError::BlossomDownload(format!(
@@ -700,13 +710,17 @@ impl Whitenoise {
             // Stream the body chunk-by-chunk, counting bytes as they arrive.
             // This is the authoritative size guard: it fires even when the server
             // omits or lies about Content-Length.
+            //
+            // The subtraction `MAX_BLOB_BYTES - body.len()` is always safe: the
+            // loop only continues while body.len() <= MAX_BLOB_BYTES, so the
+            // right-hand side never underflows.
             let mut body: Vec<u8> = Vec::with_capacity(hint_capacity);
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|e| {
                     WhitenoiseError::BlossomDownload(format!("Error reading response body: {}", e))
                 })?;
-                if body.len() + chunk.len() > Self::MAX_BLOB_BYTES {
+                if chunk.len() > Self::MAX_BLOB_BYTES - body.len() {
                     return Err(WhitenoiseError::DownloadSizeLimitExceeded {
                         limit: Self::MAX_BLOB_BYTES,
                     });
@@ -715,16 +729,14 @@ impl Whitenoise {
             }
 
             Ok(body)
-        };
-
-        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, download_future)
-            .await
-            .map_err(|_| {
-                WhitenoiseError::BlossomDownload(format!(
-                    "Download timed out after {} seconds",
-                    Self::BLOSSOM_TIMEOUT.as_secs()
-                ))
-            })?
+        })
+        .await
+        .map_err(|_| {
+            WhitenoiseError::BlossomDownload(format!(
+                "Download timed out after {} seconds",
+                Self::BLOSSOM_TIMEOUT.as_secs()
+            ))
+        })?
     }
 
     fn decrypt_group_image(
