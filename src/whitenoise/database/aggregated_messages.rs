@@ -326,6 +326,7 @@ impl AggregatedMessage {
                ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9 AND am.mls_group_id = ?
                AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
+               AND am.deletion_event_id IS NULL
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT ?",
@@ -2965,6 +2966,510 @@ mod tests {
         assert!(
             matches!(err, DatabaseError::InvalidCursor { .. }),
             "expected InvalidCursor for short hex id, got: {err}"
+        );
+    }
+
+    // ── Additional pagination tests ───────────────────────────────────────────
+
+    /// Messages in group A must not appear when paginating group B.
+    #[tokio::test]
+    async fn test_paginated_group_isolation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_a = GroupId::from_slice(&[210; 32]);
+        let group_b = GroupId::from_slice(&[211; 32]);
+        setup_group(&group_a, &whitenoise.database).await;
+        setup_group(&group_b, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_701_000_000;
+
+        // 3 messages in group A, 2 messages in group B
+        for i in 1u8..=3 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_a,
+                &whitenoise.database,
+            )
+            .await;
+        }
+        for i in 10u8..=11 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_b,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        let results_a = AggregatedMessage::find_messages_by_group_paginated(
+            &group_a,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let results_b = AggregatedMessage::find_messages_by_group_paginated(
+            &group_b,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results_a.len(), 3, "group A should have exactly 3 messages");
+        assert_eq!(results_b.len(), 2, "group B should have exactly 2 messages");
+
+        let ids_a: std::collections::HashSet<_> = results_a.iter().map(|m| &m.id).collect();
+        let ids_b: std::collections::HashSet<_> = results_b.iter().map(|m| &m.id).collect();
+        assert!(
+            ids_a.is_disjoint(&ids_b),
+            "no message should appear in both groups"
+        );
+    }
+
+    /// Deleted messages (those with a non-NULL deletion_event_id) must be excluded from
+    /// paginated results, matching the `deletion_event_id IS NULL` guard used by all other
+    /// message-fetching queries.
+    #[tokio::test]
+    async fn test_paginated_deleted_messages_are_excluded() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[212; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_702_000_000;
+
+        // Insert 3 messages: seeds 1, 2, 3
+        for i in 1u8..=3 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Delete seed-2 message
+        let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
+        let deletion_id = format!("{:0>64x}", 0xde1212u64);
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let returned_ids: Vec<_> = messages.iter().map(|m| &m.id).collect();
+        assert!(
+            !returned_ids.contains(&&msg2_id),
+            "deleted message must not appear in paginated results; got: {returned_ids:?}"
+        );
+        assert_eq!(
+            messages.len(),
+            2,
+            "only non-deleted messages should be returned"
+        );
+    }
+
+    /// Kind-7 reactions stored in the aggregated_messages table must not appear in
+    /// paginated results: the query is guarded by `WHERE kind = 9`.
+    #[tokio::test]
+    async fn test_paginated_non_kind9_messages_are_excluded() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[213; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_703_000_000;
+
+        // Insert one kind-9 message via the normal helper
+        insert_message_at(1, author, base_ts + 1, &group_id, &whitenoise.database).await;
+
+        // Insert a kind-7 reaction row directly with raw SQL (insert_message always writes kind=9)
+        let reaction_id = format!("{:0>64}", format!("{:x}", 200u8));
+        let tags_json = serde_json::to_string(&Vec::<Vec<String>>::new()).unwrap();
+        let empty_tokens = serde_json::to_string(&Vec::<SerializableToken>::new()).unwrap();
+        let empty_reactions = serde_json::to_string(&ReactionSummary::default()).unwrap();
+        let empty_media = serde_json::to_string(&Vec::<MediaFile>::new()).unwrap();
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 7, '+', ?, ?, ?, ?)",
+        )
+        .bind(&reaction_id)
+        .bind(group_id.as_slice())
+        .bind(author.to_hex())
+        .bind((base_ts + 2) as i64 * 1_000)
+        .bind(&tags_json)
+        .bind(&empty_tokens)
+        .bind(&empty_reactions)
+        .bind(&empty_media)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "only kind-9 messages should be returned; got {} messages",
+            messages.len()
+        );
+        assert_eq!(
+            messages[0].id,
+            format!("{:0>64}", format!("{:x}", 1u8)),
+            "only the kind-9 message should be present"
+        );
+    }
+
+    /// Uppercase hex in the cursor `before_message_id` must be accepted and canonicalized
+    /// to lowercase. The internal tie-break comparison is against lowercase-stored message_ids,
+    /// so without canonicalization an uppercase cursor would silently produce a wrong page.
+    #[tokio::test]
+    async fn test_paginated_uppercase_cursor_id_is_canonicalized() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[214; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_704_000_000;
+
+        // Insert 5 messages
+        for i in 1u8..=5 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Build cursor from seed 3 (ts+3) but pass the message ID in uppercase
+        let lowercase_id = format!("{:0>64}", format!("{:x}", 3u8));
+        let uppercase_id = lowercase_id.to_uppercase();
+
+        // Should not error — uppercase is valid hex and gets canonicalized internally
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(Timestamp::from(base_ts + 3)),
+            Some(uppercase_id.as_str()),
+            None,
+        )
+        .await
+        .expect("uppercase cursor ID should be accepted and canonicalized");
+
+        // Same result as if we passed a lowercase cursor at ts+3
+        assert_eq!(
+            messages.len(),
+            2,
+            "should return 2 messages before the cursor (ts+1 and ts+2)"
+        );
+        assert_eq!(messages[0].created_at, Timestamp::from(base_ts + 1));
+        assert_eq!(messages[1].created_at, Timestamp::from(base_ts + 2));
+    }
+
+    /// A group with exactly one message: the first (and only) page returns that message;
+    /// using it as the cursor for the next page yields empty.
+    #[tokio::test]
+    async fn test_paginated_single_message_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[215; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let ts: u64 = 1_705_000_000;
+
+        let msg = insert_message_at(1, author, ts, &group_id, &whitenoise.database).await;
+
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.len(),
+            1,
+            "single-message group should return 1 message"
+        );
+        assert_eq!(page1[0].id, msg.id);
+
+        // Cursor from the only message → next page is empty
+        let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(page1[0].created_at),
+            Some(page1[0].id.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page2.is_empty(),
+            "cursor past the only message should yield empty page"
+        );
+    }
+
+    /// With exactly 50 messages (the default limit), the first page returns all 50 and
+    /// the next page is empty — confirming the boundary is inclusive of the limit.
+    #[tokio::test]
+    async fn test_paginated_exactly_default_limit_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[216; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_706_000_000;
+
+        for i in 1u8..=50 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page1.len(),
+            50,
+            "exactly 50 messages should all be returned on the first page"
+        );
+
+        // Cursor from the oldest (page1[0]) → no older messages exist
+        let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(page1[0].created_at),
+            Some(page1[0].id.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            page2.is_empty(),
+            "second page should be empty when history is exactly one full page"
+        );
+    }
+
+    /// limit=1 is the smallest useful page size. Stepping through messages one-by-one
+    /// with limit=1 must visit every message exactly once with no skips or duplicates.
+    #[tokio::test]
+    async fn test_paginated_limit_one_traverses_all_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[217; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_707_000_000;
+        let total: u8 = 5;
+
+        for i in 1u8..=total {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        let mut all_seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(Timestamp, String)> = None;
+
+        loop {
+            let (before, before_id) = match &cursor {
+                None => (None, None),
+                Some((ts, id)) => (Some(*ts), Some(id.as_str())),
+            };
+
+            let page = AggregatedMessage::find_messages_by_group_paginated(
+                &group_id,
+                &whitenoise.database,
+                before,
+                before_id,
+                Some(1),
+            )
+            .await
+            .unwrap();
+
+            if page.is_empty() {
+                break;
+            }
+
+            assert_eq!(
+                page.len(),
+                1,
+                "limit=1 must return exactly one message per page"
+            );
+            let msg = &page[0];
+            assert!(
+                !all_seen.contains(&msg.id),
+                "message {} appeared twice (duplicate at limit=1)",
+                msg.id
+            );
+            all_seen.push(msg.id.clone());
+            cursor = Some((msg.created_at, msg.id.clone()));
+        }
+
+        assert_eq!(
+            all_seen.len(),
+            usize::from(total),
+            "limit=1 traversal should visit all {total} messages exactly once"
+        );
+    }
+
+    /// Cursor pointing at the absolute oldest message in the group (cursor = that message's
+    /// own position) should yield an empty next page, confirming the `<` boundary is strict.
+    #[tokio::test]
+    async fn test_paginated_cursor_at_oldest_message_yields_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[218; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_708_000_000;
+
+        // Insert 3 messages; seed 1 is the oldest
+        for i in 1u8..=3 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Full first page
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page1.len(), 3);
+
+        // Use the oldest message (page1[0]) as the cursor
+        let oldest = &page1[0];
+        let next_page = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            Some(oldest.created_at),
+            Some(oldest.id.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            next_page.is_empty(),
+            "cursor at the absolute oldest message must yield empty page"
+        );
+    }
+
+    /// Retried messages (delivery_status = \"Retried\") are excluded from paginated results
+    /// by the LEFT JOIN filter `mds.status != '\"Retried\"'`. This test verifies that
+    /// retried messages do not appear alongside normal messages.
+    #[tokio::test]
+    async fn test_paginated_retried_messages_are_excluded() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[219; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_709_000_000;
+
+        // Insert a normal message (seed 1) and a retried message (seed 2)
+        insert_message_at(1, author, base_ts + 1, &group_id, &whitenoise.database).await;
+
+        let retried_msg = ChatMessage {
+            id: format!("{:0>64}", format!("{:x}", 2u8)),
+            author,
+            content: "retried message".to_string(),
+            created_at: Timestamp::from(base_ts + 2),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: Some(DeliveryStatus::Retried),
+        };
+        AggregatedMessage::insert_message(&retried_msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "retried messages must not appear in paginated results"
+        );
+        assert_eq!(
+            messages[0].id,
+            format!("{:0>64}", format!("{:x}", 1u8)),
+            "only the non-retried message should be returned"
         );
     }
 

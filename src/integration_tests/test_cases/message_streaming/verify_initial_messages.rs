@@ -57,7 +57,7 @@ impl TestCase for VerifyInitialMessagesTestCase {
 
         let subscription = context
             .whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id)
+            .subscribe_to_group_messages(&group.mls_group_id, None)
             .await?;
 
         tracing::info!(

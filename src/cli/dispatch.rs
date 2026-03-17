@@ -541,8 +541,12 @@ where
     };
 
     match req {
-        Request::MessagesSubscribe { account, group_id } => {
-            messages_subscribe(wn, &mut writer, &account, &group_id).await;
+        Request::MessagesSubscribe {
+            account,
+            group_id,
+            limit,
+        } => {
+            messages_subscribe(wn, &mut writer, &account, &group_id, limit).await;
         }
         Request::ChatsSubscribe { account } => {
             chats_subscribe(wn, &mut writer, &account).await;
@@ -573,6 +577,7 @@ async fn messages_subscribe<W>(
     writer: &mut W,
     account_str: &str,
     group_id_hex: &str,
+    limit: Option<u32>,
 ) where
     W: AsyncWriteExt + Unpin,
 {
@@ -595,7 +600,7 @@ async fn messages_subscribe<W>(
     };
 
     // Subscribe — gets initial snapshot + broadcast receiver
-    let subscription = match wn.subscribe_to_group_messages(&group_id).await {
+    let subscription = match wn.subscribe_to_group_messages(&group_id, limit).await {
         Ok(sub) => sub,
         Err(e) => {
             let _ = write_response(writer, &Response::err(e.to_string())).await;
