@@ -368,7 +368,6 @@ impl GroupPlane {
         }
     }
 
-    #[cfg(feature = "integration-tests")]
     #[perf_instrument("relay")]
     pub(crate) async fn reset(&self) {
         let pubkeys = self
