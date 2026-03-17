@@ -247,7 +247,14 @@ pub enum Request {
 
     // Streaming
     #[serde(rename = "messages_subscribe")]
-    MessagesSubscribe { account: String, group_id: String },
+    MessagesSubscribe {
+        account: String,
+        group_id: String,
+        /// Maximum number of messages to include in the initial snapshot.
+        /// Defaults to 50 when absent, capped at 200.
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     #[serde(rename = "chats_subscribe")]
     ChatsSubscribe { account: String },
     #[serde(rename = "archived_chats_subscribe")]
@@ -1082,16 +1089,59 @@ mod tests {
 
     #[test]
     fn messages_subscribe_roundtrip() {
+        // Without limit — deserialises to None via #[serde(default)]
         let req = Request::MessagesSubscribe {
             account: "npub1abc".to_string(),
             group_id: "abcd1234".to_string(),
+            limit: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::MessagesSubscribe { account, group_id }
+            Request::MessagesSubscribe { account, group_id, limit: None }
             if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn messages_subscribe_with_limit_roundtrip() {
+        // With an explicit limit — round-trips correctly
+        let req = Request::MessagesSubscribe {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            limit: Some(25),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::MessagesSubscribe { account, group_id, limit: Some(25) }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    /// Older clients that do not send `limit` in the JSON payload must still deserialise
+    /// successfully, with `limit` defaulting to `None` via `#[serde(default)]`.
+    #[test]
+    fn messages_subscribe_missing_limit_field_deserialises_as_none() {
+        // Wire format without the `limit` key — simulates an old client
+        let wire = r#"{"method":"messages_subscribe","params":{"account":"npub1abc","group_id":"abcd1234"}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(
+            matches!(parsed, Request::MessagesSubscribe { limit: None, .. }),
+            "missing 'limit' key must deserialise as None for backward compatibility"
+        );
+    }
+
+    /// `limit: null` in the JSON payload must also deserialise as `None`.
+    #[test]
+    fn messages_subscribe_explicit_null_limit_deserialises_as_none() {
+        let wire = r#"{"method":"messages_subscribe","params":{"account":"npub1abc","group_id":"abcd1234","limit":null}}"#;
+        let parsed: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::MessagesSubscribe { limit: None, .. }
         ));
     }
 
