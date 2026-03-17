@@ -342,6 +342,80 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Like [`Self::create_and_publish_key_package`], but the relay publish
+    /// runs in a background task so the caller isn't blocked by network latency.
+    ///
+    /// The MLS key material is always created synchronously (local, fast).
+    /// Only the relay broadcast + DB tracking are deferred.  If the global
+    /// [`Whitenoise`] singleton isn't available (unit tests), the publish
+    /// runs inline as a fallback.
+    ///
+    /// Failures are non-fatal — the `KeyPackageMaintenance` scheduler
+    /// (10-min interval) retries any that didn't land.
+    pub(crate) async fn create_key_package_and_background_publish(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+    ) -> Result<()> {
+        let (encoded_key_package, tags, hash_ref) =
+            self.encoded_key_package(account, relays).await?;
+        let relay_urls = Relay::urls(relays);
+        let signer = self.get_signer_for_account(account)?;
+
+        if Whitenoise::get_instance().is_ok() {
+            let account = account.clone();
+            tokio::spawn(async move {
+                let wn = match Whitenoise::get_instance() {
+                    Ok(wn) => wn,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "whitenoise::key_packages",
+                            "Failed to get Whitenoise instance for background key package publish: {}",
+                            e
+                        );
+                        return;
+                    }
+                };
+                match wn
+                    .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                    .await
+                {
+                    Ok(event_id) => {
+                        wn.track_published_key_package(&account, &hash_ref, &event_id)
+                            .await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "whitenoise::key_packages",
+                            "Background key package publish failed, scheduler will retry: {}",
+                            e
+                        );
+                    }
+                }
+            });
+        } else {
+            // Synchronous fallback (unit tests or pre-initialization).
+            match self
+                .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                .await
+            {
+                Ok(event_id) => {
+                    self.track_published_key_package(account, &hash_ref, &event_id)
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Key package publish failed, scheduler will retry: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Publishes an already-encoded key package event to the given relays.
     ///
     /// Returns an error if no relay accepted the event. This method is
