@@ -106,11 +106,8 @@ indicatif = { version = "0.18.3", optional = true }
 #   compiled when this feature is enabled, so both features must be listed even
 #   though a given binary only calls one of them.
 # NOTE: apple_native_keyring_store::protected::Store requires the binary to be
-#   code-signed with a provisioning profile that grants the
-#   com.apple.security.application-groups or keychain-access-groups entitlement.
-#   Running an unsigned binary (e.g. `cargo run` on a developer Mac without a
-#   profile) will panic at start-up with an entitlement error.  Use an x86_64
-#   host or the `keychain` path for local development without a profile.
+#   code-signed with a provisioning profile. The `cli` feature automatically
+#   selects keychain::Store instead, so CLI builds work without signing.
 apple-native-keyring-store = { version = "0.2", features = ["keychain", "protected"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]

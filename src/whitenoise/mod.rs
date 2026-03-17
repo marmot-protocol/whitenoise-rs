@@ -283,21 +283,29 @@ impl Whitenoise {
                 not(feature = "benchmark-tests")
             ))]
             {
-                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+                // CLI builds use the regular Keychain store on all macOS architectures.
+                // The `cli` feature gates the `wn`/`wnd` binaries, which are unsigned
+                // and cannot use the Protected Data store (it requires a provisioning
+                // profile with application-groups entitlement).
+                #[cfg(all(target_os = "macos", feature = "cli"))]
                 {
                     let store = apple_native_keyring_store::keychain::Store::new()
                         .expect("Failed to create macOS Keychain credential store");
                     keyring_core::set_default_store(store);
                 }
-                // Apple Silicon (aarch64) macOS: use the Protected Data store, which
-                // synchronises credentials across devices via iCloud.
-                //
-                // RUNTIME REQUIREMENT: the binary must be code-signed with a
-                // provisioning profile that includes the
-                // com.apple.security.application-groups (or equivalent
-                // keychain-access-groups) entitlement.  The Flutter app build
-                // pipeline satisfies this automatically.
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                // Intel Macs (non-CLI): use the regular Keychain store.
+                // Protected Data store is not available on x86_64.
+                #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
+                {
+                    let store = apple_native_keyring_store::keychain::Store::new()
+                        .expect("Failed to create macOS Keychain credential store");
+                    keyring_core::set_default_store(store);
+                }
+                // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
+                // Requires code-signing with a provisioning profile that includes the
+                // com.apple.security.application-groups entitlement. The Flutter app
+                // build pipeline satisfies this.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
                 {
                     let store = apple_native_keyring_store::protected::Store::new()
                         .expect("Failed to create macOS protected-data credential store");
