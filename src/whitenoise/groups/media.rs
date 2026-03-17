@@ -2,13 +2,20 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use base64ct::{Base64, Encoding as _};
 use futures::StreamExt;
 use mdk_core::encrypted_media::types::MediaReference;
 use mdk_core::extension::group_image;
 use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::{GroupId, group_types};
 use mdk_storage_traits::Secret;
+use nostr_blossom::bud01::{
+    BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb,
+    BlossomBuilderExtension,
+};
 use nostr_blossom::client::BlossomClient;
+use nostr_sdk::prelude::hashes::Hash;
+use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -964,13 +971,64 @@ impl Whitenoise {
         mime_type: &str,
         upload_keypair: &Keys,
     ) -> Result<nostr_blossom::bud02::BlobDescriptor> {
-        let client = Self::blossom_client(blossom_server_url)?;
-        let upload_future = client.upload_blob(
-            encrypted_data,
-            Some(mime_type.to_string()),
-            None,
-            Some(upload_keypair),
+        // Enforce HTTPS before making any network contact.  Checked here rather
+        // than in `blossom_client` so we can use BLOSSOM_HTTP_CLIENT directly
+        // and inherit its custom redirect policy (which blocks HTTPS → HTTP
+        // downgrade attacks).  `BlossomClient::new` uses
+        // `Policy::limited(10)`, which does not restrict redirect targets.
+        Self::require_https(blossom_server_url)?;
+
+        // Build the Blossom auth event that authorises this upload.
+        let sha256 = Sha256Hash::hash(&encrypted_data);
+        let expiration = Timestamp::now() + Duration::from_secs(300);
+        let auth = BlossomAuthorization::new(
+            "Blossom upload authorization".to_string(),
+            expiration,
+            BlossomAuthorizationVerb::Upload,
+            BlossomAuthorizationScope::BlobSha256Hashes(vec![sha256]),
         );
+        let auth_event = EventBuilder::blossom_auth(auth)
+            .sign(upload_keypair)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::Other(anyhow::anyhow!("Failed to sign Blossom auth event: {}", e))
+            })?;
+        let auth_json = auth_event.as_json();
+        let auth_header_value = format!("Nostr {}", Base64::encode_string(auth_json.as_bytes()));
+
+        let upload_url = blossom_server_url.join("upload").map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("Failed to build upload URL: {}", e))
+        })?;
+
+        let upload_future = async {
+            let response = BLOSSOM_HTTP_CLIENT
+                .put(upload_url)
+                .header(reqwest::header::CONTENT_TYPE, mime_type)
+                .header(reqwest::header::AUTHORIZATION, &auth_header_value)
+                .body(encrypted_data)
+                .send()
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::Other(anyhow::anyhow!("Upload HTTP request failed: {}", e))
+                })?;
+
+            if !response.status().is_success() {
+                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    "Upload failed with status {}",
+                    response.status()
+                )));
+            }
+
+            response
+                .json::<nostr_blossom::bud02::BlobDescriptor>()
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::Other(anyhow::anyhow!(
+                        "Failed to parse upload response: {}",
+                        e
+                    ))
+                })
+        };
 
         let descriptor = tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
             .await
@@ -979,8 +1037,7 @@ impl Whitenoise {
                     "Upload timed out after {} seconds",
                     Self::BLOSSOM_TIMEOUT.as_secs()
                 ))
-            })?
-            .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
+            })??;
 
         Self::require_https(&descriptor.url)?;
 
@@ -1054,16 +1111,19 @@ mod tests {
     /// Authoritative guard: server streams > 100 MiB with no `Content-Length`.
     ///
     /// The streaming byte counter must catch this even when the header is absent.
+    /// `with_chunked_body` is used (not `with_body`) because mockito's `with_body`
+    /// automatically sets `Content-Length`, which would trigger the fast-path header
+    /// check instead of exercising the streaming byte counter.
     #[tokio::test]
     #[cfg(debug_assertions)]
     async fn download_rejects_oversized_streaming_body() {
         let mut server = mockito::Server::new_async().await;
-        // One byte over the limit, sent as a single chunk without Content-Length.
+        // One byte over the limit, sent as a chunked response without Content-Length.
         let oversized_body = vec![0u8; Whitenoise::MAX_BLOB_BYTES + 1];
         let _mock = server
             .mock("GET", test_path().as_str())
             .with_status(200)
-            .with_body(oversized_body)
+            .with_chunked_body(move |w| w.write_all(&oversized_body))
             .create_async()
             .await;
 
