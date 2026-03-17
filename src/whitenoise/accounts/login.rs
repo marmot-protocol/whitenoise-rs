@@ -7,6 +7,7 @@ use super::{
 };
 use crate::RelayType;
 use crate::perf_instrument;
+use crate::perf_span;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
@@ -199,6 +200,7 @@ impl Whitenoise {
     /// - [`Whitenoise::login_publish_default_relays`] -- publish default relay lists
     /// - [`Whitenoise::login_with_custom_relay`] -- search a user-provided relay
     /// - [`Whitenoise::login_cancel`] -- abort and clean up
+    #[perf_instrument("accounts")]
     pub async fn login_start(
         &self,
         nsec_or_hex_privkey: String,
@@ -272,6 +274,7 @@ impl Whitenoise {
     /// of the three relay list kinds (10002, 10050, 10051) were already found on the
     /// network.  Default relays are assigned and published **only for the missing
     /// ones**; existing lists are left untouched.
+    #[perf_instrument("accounts")]
     pub async fn login_publish_default_relays(
         &self,
         pubkey: &PublicKey,
@@ -382,6 +385,7 @@ impl Whitenoise {
     /// If the merged stash is now complete the account is activated and
     /// [`LoginStatus::Complete`] is returned. Otherwise
     /// [`LoginStatus::NeedsRelayLists`] is returned so the caller can re-prompt.
+    #[perf_instrument("accounts")]
     pub async fn login_with_custom_relay(
         &self,
         pubkey: &PublicKey,
@@ -516,6 +520,7 @@ impl Whitenoise {
     ///
     /// Behaves like [`Whitenoise::login_start`] but takes a public key and a
     /// [`NostrSigner`] instead of a private key string.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_start<S>(
         &self,
         pubkey: PublicKey,
@@ -591,6 +596,7 @@ impl Whitenoise {
     /// of the three relay list kinds (10002, 10050, 10051) were already found on the
     /// network.  Default relays are assigned and published **only for the missing
     /// ones**; existing lists are left untouched.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_publish_default_relays(
         &self,
         pubkey: &PublicKey,
@@ -690,6 +696,7 @@ impl Whitenoise {
     }
 
     /// Step 2b for external signer: search a custom relay for existing relay lists.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_with_custom_relay(
         &self,
         pubkey: &PublicKey,
@@ -771,16 +778,19 @@ impl Whitenoise {
     ///
     /// Callers should check [`DiscoveredRelayLists::is_complete`] to determine
     /// whether login can proceed or whether the user must provide relay lists.
+    #[perf_instrument("accounts")]
     async fn try_discover_relay_lists(
         &self,
         account: &mut Account,
         source_relays: &[Relay],
     ) -> core::result::Result<DiscoveredRelayLists, LoginError> {
         // Step 1: Fetch NIP-65 relay list (kind 10002) from the source relays.
+        let _fetch_nip65 = perf_span!("accounts::discover_relay_lists::fetch_nip65");
         let nip65_relays = self
             .fetch_existing_relays(account.pubkey, RelayType::Nip65, source_relays)
             .await
             .map_err(LoginError::from)?;
+        drop(_fetch_nip65);
 
         // Use the discovered NIP-65 relays as the source for 10050/10051 when
         // available; otherwise fall back to the original source relays so we
@@ -791,6 +801,7 @@ impl Whitenoise {
         };
 
         // Steps 2 & 3: Fetch Inbox (10050) and KeyPackage (10051) concurrently.
+        let _fetch_inbox_kp = perf_span!("accounts::discover_relay_lists::fetch_inbox_and_kp");
         let pubkey = account.pubkey;
         let (inbox_result, key_package_result) = tokio::join!(
             self.fetch_existing_relays(pubkey, RelayType::Inbox, &secondary_source),
@@ -798,9 +809,11 @@ impl Whitenoise {
         );
         let inbox_relays = inbox_result.map_err(LoginError::from)?;
         let key_package_relays = key_package_result.map_err(LoginError::from)?;
+        drop(_fetch_inbox_kp);
 
         // Persist the exact discovered network state, including empty results,
         // so stale relay rows are removed when a relay list no longer exists.
+        let _sync_span = perf_span!("accounts::discover_relay_lists::sync_to_db");
         self.sync_account_relays(
             account,
             nip65_relays.as_deref().unwrap_or(&[]),
@@ -822,6 +835,7 @@ impl Whitenoise {
         )
         .await
         .map_err(LoginError::from)?;
+        drop(_sync_span);
 
         Ok(DiscoveredRelayLists {
             nip65: nip65_relays,
@@ -878,6 +892,7 @@ impl Whitenoise {
     }
 
     /// Activate a local-key account after relay lists have been resolved.
+    #[perf_instrument("accounts")]
     async fn complete_login(
         &self,
         account: &Account,
@@ -894,6 +909,7 @@ impl Whitenoise {
     }
 
     /// Activate an external-signer account after relay lists have been resolved.
+    #[perf_instrument("accounts")]
     async fn complete_external_signer_login<S>(
         &self,
         account: &Account,
