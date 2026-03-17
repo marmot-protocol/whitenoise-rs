@@ -17,7 +17,8 @@ use std::{
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, broadcast, mpsc::Sender};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
+use tokio::task::JoinHandle;
 
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
@@ -55,6 +56,7 @@ pub(crate) struct RelayControlPlane {
     router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
+    telemetry_handles: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl RelayControlPlane {
@@ -92,6 +94,7 @@ impl RelayControlPlane {
             router: router::RelayRouter::default(),
             observability,
             telemetry_persistors_started: AtomicBool::new(false),
+            telemetry_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,8 +108,10 @@ impl RelayControlPlane {
             return;
         }
 
-        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry());
-        self.spawn_telemetry_persistor("group", self.group_plane.telemetry());
+        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry())
+            .await;
+        self.spawn_telemetry_persistor("group", self.group_plane.telemetry())
+            .await;
     }
 
     /// Access to the shared application database for later relay-control phases.
@@ -152,9 +157,9 @@ impl RelayControlPlane {
         &self.session_salt
     }
 
-    /// Spawn a fire-and-forget telemetry writer that exits when the telemetry
-    /// sender for the subscribed plane is dropped and the broadcast channel closes.
-    fn spawn_telemetry_persistor(
+    /// Spawn a telemetry writer, aborting any previous task registered under
+    /// the same name so that re-activation does not leak persistor tasks.
+    async fn spawn_telemetry_persistor(
         &self,
         task_name: &str,
         mut receiver: broadcast::Receiver<observability::RelayTelemetry>,
@@ -162,8 +167,9 @@ impl RelayControlPlane {
         let database = self.database.clone();
         let observability = self.observability.clone();
         let task_name = task_name.to_string();
+        let task_key = task_name.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 match receiver.recv().await {
                     Ok(telemetry) => {
@@ -202,6 +208,10 @@ impl RelayControlPlane {
                 }
             }
         });
+
+        if let Some(previous) = self.telemetry_handles.lock().await.insert(task_key, handle) {
+            previous.abort();
+        }
     }
 
     fn should_persist_telemetry(telemetry: &observability::RelayTelemetry) -> bool {
@@ -299,7 +309,8 @@ impl RelayControlPlane {
         self.spawn_telemetry_persistor(
             &format!("account_inbox:{}", account_pubkey.to_hex()),
             telemetry_receiver,
-        );
+        )
+        .await;
 
         Ok(())
     }
@@ -327,6 +338,11 @@ impl RelayControlPlane {
             plane.deactivate().await;
         }
 
+        let handle_key = format!("account_inbox:{}", account_pubkey.to_hex());
+        if let Some(handle) = self.telemetry_handles.lock().await.remove(&handle_key) {
+            handle.abort();
+        }
+
         self.group_plane.remove_account(account_pubkey).await;
         self.ephemeral.remove_account_scope(account_pubkey).await;
     }
@@ -344,6 +360,10 @@ impl RelayControlPlane {
 
         for plane in planes {
             plane.deactivate().await;
+        }
+
+        for (_, handle) in self.telemetry_handles.lock().await.drain() {
+            handle.abort();
         }
 
         // Reset group and ephemeral planes independently to ensure any
@@ -732,7 +752,9 @@ mod tests {
         let relay_control =
             RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
         let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
-        relay_control.spawn_telemetry_persistor("test", telemetry_receiver);
+        relay_control
+            .spawn_telemetry_persistor("test", telemetry_receiver)
+            .await;
 
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
         let telemetry = RelayTelemetry::new(
@@ -778,7 +800,9 @@ mod tests {
         .with_subscription_id("account-sub-1");
 
         let (account_sender, account_receiver) = broadcast::channel(8);
-        relay_control.spawn_telemetry_persistor("test-account", account_receiver);
+        relay_control
+            .spawn_telemetry_persistor("test-account", account_receiver)
+            .await;
         account_sender.send(account_telemetry).unwrap();
         account_sender
             .send(

@@ -6,6 +6,7 @@ use std::{
 
 use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
+use tokio::task::JoinHandle;
 
 use super::{
     RelayPlane,
@@ -42,6 +43,7 @@ pub(crate) struct EphemeralExecutor {
 struct EphemeralSessionEntry {
     session: RelaySession,
     tracking: Mutex<SessionRelayTracking>,
+    telemetry_handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +122,7 @@ impl EphemeralExecutor {
         let _span = perf_span!("relay::ephemeral_remove_account_scope");
         let entry = self.sessions.write().await.remove(&Some(*account_pubkey));
         if let Some(entry) = entry {
+            entry.telemetry_handle.abort();
             entry.session.shutdown().await;
         }
     }
@@ -181,11 +184,12 @@ impl EphemeralExecutor {
             self.session_config(account_pubkey),
             self.event_sender.clone(),
         );
-        self.spawn_telemetry_persistor(account_pubkey, session.telemetry());
+        let telemetry_handle = self.spawn_telemetry_persistor(account_pubkey, session.telemetry());
 
         let entry = Arc::new(EphemeralSessionEntry {
             session,
             tracking: Mutex::new(SessionRelayTracking::default()),
+            telemetry_handle,
         });
         sessions.insert(account_pubkey, entry.clone());
 
@@ -206,7 +210,7 @@ impl EphemeralExecutor {
         &self,
         account_pubkey: Option<PublicKey>,
         mut receiver: broadcast::Receiver<RelayTelemetry>,
-    ) {
+    ) -> JoinHandle<()> {
         let database = self.database.clone();
         let observability = self.observability.clone();
         let task_name = format!(
@@ -242,7 +246,7 @@ impl EphemeralExecutor {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
+        })
     }
 
     #[cfg(test)]
