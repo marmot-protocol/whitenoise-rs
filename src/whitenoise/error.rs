@@ -1,3 +1,5 @@
+use nostr_connect::error::Error as NostrConnectError;
+use nostr_connect::prelude::nip46;
 use nostr_sdk::prelude::PublicKey;
 use thiserror::Error;
 
@@ -201,6 +203,15 @@ pub enum WhitenoiseError {
     #[error("Unsupported media format: {0}")]
     UnsupportedMediaFormat(String),
 
+    #[error("NIP-46 invalid bunker URI: {0}")]
+    Nip46InvalidUri(nip46::Error),
+
+    #[error("NIP-46 connection error: {0}")]
+    Nip46Connection(NostrConnectError),
+
+    #[error("NIP-46 pubkey mismatch during reconnect: expected {expected}, got {got}")]
+    Nip46PubkeyMismatch { expected: PublicKey, got: PublicKey },
+
     #[error(
         "Cannot deliver MLS welcome for {member_pubkey}: no inbox/NIP-65 relays configured and account {account_pubkey} has no fallback relays"
     )]
@@ -319,6 +330,19 @@ mod tests {
         assert_eq!(
             WhitenoiseError::UserNotPersisted.to_string(),
             "User not persisted - save the user before performing this operation"
+        );
+    }
+
+    #[test]
+    fn test_nip46_error_display_messages() {
+        assert_eq!(
+            WhitenoiseError::Nip46InvalidUri(nip46::Error::InvalidURI).to_string(),
+            "NIP-46 invalid bunker URI: Invalid uri"
+        );
+        assert_eq!(
+            WhitenoiseError::Nip46Connection(NostrConnectError::Response("timeout".to_string()))
+                .to_string(),
+            "NIP-46 connection error: timeout"
         );
     }
 

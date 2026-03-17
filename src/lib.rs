@@ -69,6 +69,9 @@ pub use whitenoise::message_aggregator::{
     ChatMessage, DeliveryStatus, EmojiReaction, ReactionSummary, UserReaction,
 };
 
+// NIP-46 (Nostr Connect / Remote Signer)
+pub use nostr_connect::prelude::{NostrConnect, NostrConnectURI};
+
 // Nostr integration
 pub use nostr_manager::parser::SerializableToken;
 
