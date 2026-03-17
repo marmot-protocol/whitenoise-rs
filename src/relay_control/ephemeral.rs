@@ -110,7 +110,6 @@ impl EphemeralPlane {
         self.executor.remove_account_scope(account_pubkey).await;
     }
 
-    #[cfg(feature = "integration-tests")]
     #[perf_instrument("relay")]
     pub(crate) async fn remove_all_account_scopes(&self) {
         self.executor.remove_all_account_scopes().await;
