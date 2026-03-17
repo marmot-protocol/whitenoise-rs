@@ -735,10 +735,17 @@ impl Whitenoise {
             .sync_account_group_subscriptions(
                 account.pubkey,
                 &group_specs,
-                account.since_timestamp(10),
+                Self::group_resubscribe_since(account),
             )
             .await
             .map_err(WhitenoiseError::from)
+    }
+
+    /// Replay anchor for any group-subscription rebuild path.
+    ///
+    /// Uses the widened resubscribe buffer to cover teardown/rebuild gaps.
+    fn group_resubscribe_since(account: &Account) -> Option<Timestamp> {
+        account.since_timestamp(Self::RESUBSCRIBE_BUFFER_SECS)
     }
 
     #[perf_instrument("accounts")]
@@ -756,7 +763,29 @@ impl Whitenoise {
             return Ok(());
         }
 
-        self.sync_group_subscriptions(account).await
+        let group_specs = self.extract_group_subscription_specs(account).await?;
+
+        for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
+            Relay::find_or_create_by_url(relay_url, &self.database).await?;
+        }
+
+        if Self::is_background_task_cancelled(cancel_rx) {
+            tracing::debug!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                account_pubkey = %account.pubkey,
+                "Skipping group subscription sync because the account was cancelled",
+            );
+            return Ok(());
+        }
+
+        self.relay_control
+            .sync_account_group_subscriptions(
+                account.pubkey,
+                &group_specs,
+                Self::group_resubscribe_since(account),
+            )
+            .await
+            .map_err(WhitenoiseError::from)
     }
 
     fn is_background_task_cancelled(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
@@ -841,13 +870,14 @@ impl Whitenoise {
             Relay::find_or_create_by_url(relay_url, &self.database).await?;
         }
 
-        // Compute per-account since with a 10s lookback buffer when available
-        let since = account.since_timestamp(10);
+        // Standard buffer for initial activation (no prior teardown gap to cover).
+        let since = account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS);
         match since {
             Some(ts) => tracing::debug!(
                 target: "whitenoise::accounts",
-                "Computed per-account since={}s (10s buffer) for {}",
+                "Computed per-account since={}s ({}s buffer) for {}",
                 ts.as_secs(),
+                Self::SUBSCRIPTION_BUFFER_SECS,
                 account.pubkey.to_hex()
             ),
             None => tracing::debug!(
@@ -913,9 +943,11 @@ impl Whitenoise {
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
-        // 10s buffer to avoid missing events at the boundary of the last sync window.
+        // Use a larger buffer when resubscribing after teardown to cover the gap
+        // window between deactivate and the new subscriptions going live.
+        // Any duplicate events are deduplicated by the event tracker.
         // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
-        let since = account.since_timestamp(10);
+        let since = Self::group_resubscribe_since(account);
 
         let signer = self.get_signer_for_account(account)?;
 
@@ -1376,5 +1408,54 @@ mod tests {
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_none_returns_true() {
+        assert!(Whitenoise::is_background_task_cancelled(None));
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_false_receiver_returns_false() {
+        let (_, rx) = watch::channel(false);
+        assert!(!Whitenoise::is_background_task_cancelled(Some(&rx)));
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_true_receiver_returns_true() {
+        let (_, rx) = watch::channel(true);
+        assert!(Whitenoise::is_background_task_cancelled(Some(&rx)));
+    }
+
+    async fn make_stub_account(whitenoise: &Whitenoise) -> Account {
+        let keys = Keys::generate();
+        let (account, _) = Account::new(whitenoise, Some(keys)).await.unwrap();
+        account
+    }
+
+    #[tokio::test]
+    async fn test_refresh_account_group_subscriptions_with_cancel_skips_when_cancelled_at_start() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = make_stub_account(&whitenoise).await;
+
+        let (_, rx) = watch::channel(true);
+        let result = whitenoise
+            .refresh_account_group_subscriptions_with_cancel(&account, Some(&rx))
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_account_group_subscriptions_with_cancel_succeeds_with_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = make_stub_account(&whitenoise).await;
+
+        let (_, rx) = watch::channel(false);
+        let result = whitenoise
+            .refresh_account_group_subscriptions_with_cancel(&account, Some(&rx))
+            .await;
+
+        assert!(result.is_ok());
     }
 }

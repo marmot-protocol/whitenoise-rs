@@ -92,14 +92,14 @@ impl Whitenoise {
             {
                 Ok(()) => {
                     tracing::debug!(
-                        target: "whitenoise::initialize_whitenoise",
+                        target: "whitenoise::setup_accounts_subscriptions",
                         "Successfully set up subscriptions for account: {}",
                         account.pubkey.to_hex()
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
-                        target: "whitenoise::initialize_whitenoise",
+                        target: "whitenoise::setup_accounts_subscriptions",
                         "Failed to set up subscriptions for account {}: {}",
                         account.pubkey.to_hex(),
                         e
