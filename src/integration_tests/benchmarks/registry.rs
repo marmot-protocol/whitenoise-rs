@@ -1,7 +1,7 @@
 use crate::integration_tests::benchmarks::scenarios::{
-    GroupCreationBenchmark, IdentityCreationBenchmark, LoginPerformanceBenchmark,
-    MessageAggregationBenchmark, MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
-    UserSearchBenchmark,
+    GroupCreationBenchmark, IdentityCreationBenchmark, LoginMultistepPerformanceBenchmark,
+    LoginPerformanceBenchmark, LoginStartPerformanceBenchmark, MessageAggregationBenchmark,
+    MessagingPerformanceBenchmark, UserDiscoveryBenchmark, UserSearchBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -60,6 +60,8 @@ benchmark_registry! {
     "group-creation" => GroupCreationBenchmark::default(),
     "identity-creation" => IdentityCreationBenchmark::default(),
     "login-performance" => LoginPerformanceBenchmark::default(),
+    "login-start" => LoginStartPerformanceBenchmark::default(),
+    "login-multistep" => LoginMultistepPerformanceBenchmark::default(),
     "messaging-performance" => MessagingPerformanceBenchmark::default(),
     "message-aggregation" => MessageAggregationBenchmark::default(),
     "user-discovery-blocking" => UserDiscoveryBenchmark::with_blocking_mode(),
@@ -203,6 +205,8 @@ mod tests {
         assert!(parse_and_instantiate("group-creation").is_ok());
         assert!(parse_and_instantiate("identity-creation").is_ok());
         assert!(parse_and_instantiate("login-performance").is_ok());
+        assert!(parse_and_instantiate("login-start").is_ok());
+        assert!(parse_and_instantiate("login-multistep").is_ok());
         assert!(parse_and_instantiate("messaging-performance").is_ok());
         assert!(parse_and_instantiate("message-aggregation").is_ok());
         assert!(parse_and_instantiate("user-discovery-blocking").is_ok());
@@ -216,6 +220,8 @@ mod tests {
         assert!(parse_and_instantiate("GROUP-CREATION").is_ok());
         assert!(parse_and_instantiate("IDENTITY-CREATION").is_ok());
         assert!(parse_and_instantiate("LOGIN-PERFORMANCE").is_ok());
+        assert!(parse_and_instantiate("LOGIN-START").is_ok());
+        assert!(parse_and_instantiate("LOGIN-MULTISTEP").is_ok());
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("Message-Aggregation").is_ok());
         assert!(parse_and_instantiate("USER-DISCOVERY-BLOCKING").is_ok());
@@ -238,10 +244,12 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 10);
         assert!(names.contains(&"group-creation"));
         assert!(names.contains(&"identity-creation"));
         assert!(names.contains(&"login-performance"));
+        assert!(names.contains(&"login-start"));
+        assert!(names.contains(&"login-multistep"));
         assert!(names.contains(&"messaging-performance"));
         assert!(names.contains(&"message-aggregation"));
         assert!(names.contains(&"user-discovery-blocking"));
