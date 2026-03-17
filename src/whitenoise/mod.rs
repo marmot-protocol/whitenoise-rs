@@ -576,6 +576,13 @@ impl Whitenoise {
     /// relay propagation delay.
     const SUBSCRIPTION_BUFFER_SECS: u64 = 10;
 
+    /// Buffer (in seconds) used when resubscribing after a teardown/rebuild
+    /// cycle. Larger than `SUBSCRIPTION_BUFFER_SECS` to cover the gap window
+    /// created by tearing down old subscriptions before new ones are live.
+    /// Any events fetched that were already processed are deduplicated by the
+    /// event tracker.
+    const RESUBSCRIBE_BUFFER_SECS: u64 = 60;
+
     // Compute a shared since timestamp for global user subscriptions.
     // - Accepts the already-loaded account list to avoid TOCTOU races
     // - If any account is unsynced (last_synced_at = None), return None

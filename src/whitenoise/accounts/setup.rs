@@ -703,7 +703,7 @@ impl Whitenoise {
             .sync_account_group_subscriptions(
                 account.pubkey,
                 &group_specs,
-                account.since_timestamp(10),
+                account.since_timestamp(Self::RESUBSCRIBE_BUFFER_SECS),
             )
             .await
             .map_err(WhitenoiseError::from)
@@ -786,13 +786,14 @@ impl Whitenoise {
             Relay::find_or_create_by_url(relay_url, &self.database).await?;
         }
 
-        // Compute per-account since with a 10s lookback buffer when available
-        let since = account.since_timestamp(10);
+        // Standard buffer for initial activation (no prior teardown gap to cover).
+        let since = account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS);
         match since {
             Some(ts) => tracing::debug!(
                 target: "whitenoise::accounts",
-                "Computed per-account since={}s (10s buffer) for {}",
+                "Computed per-account since={}s ({}s buffer) for {}",
                 ts.as_secs(),
+                Self::SUBSCRIPTION_BUFFER_SECS,
                 account.pubkey.to_hex()
             ),
             None => tracing::debug!(
@@ -858,9 +859,11 @@ impl Whitenoise {
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
-        // 10s buffer to avoid missing events at the boundary of the last sync window.
+        // Use a larger buffer when resubscribing after teardown to cover the gap
+        // window between deactivate and the new subscriptions going live.
+        // Any duplicate events are deduplicated by the event tracker.
         // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
-        let since = account.since_timestamp(10);
+        let since = account.since_timestamp(Self::RESUBSCRIBE_BUFFER_SECS);
 
         let signer = self.get_signer_for_account(account)?;
 
