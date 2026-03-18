@@ -146,6 +146,7 @@ jobs:
                 const data = JSON.parse(raw);
                 hotspotTable = '\n\n| Rank | Span | Scenario | Mean | Contrib% | 7d Trend | Score |\n';
                 hotspotTable += '|------|------|----------|------|----------|----------|-------|\n';
+                const mdSafe = (s) => String(s).replace(/[\r\n]+/g, ' ').replace(/\|/g, '&#124;').replace(/`/g, "'");
                 for (const h of data.hotspots) {
                   const trend = h.trend_pct === null ? '—'
                     : h.trend_pct > 10 ? `📈 +${h.trend_pct.toFixed(0)}%`
@@ -154,7 +155,9 @@ jobs:
                   const mean = h.mean_ns >= 1e9 ? `${(h.mean_ns/1e9).toFixed(2)}s`
                     : h.mean_ns >= 1e6 ? `${(h.mean_ns/1e6).toFixed(1)}ms`
                     : `${(h.mean_ns/1e3).toFixed(1)}µs`;
-                  hotspotTable += `| ${h.rank} | \`${h.span_name}\` | ${h.scenario_name} | ${mean} | ${h.contribution_pct.toFixed(1)}% | ${trend} | ${h.hotspot_score.toFixed(2)} |\n`;
+                  const spanName = mdSafe(h.span_name);
+                  const scenarioName = mdSafe(h.scenario_name);
+                  hotspotTable += `| ${h.rank} | \`${spanName}\` | ${scenarioName} | ${mean} | ${h.contribution_pct.toFixed(1)}% | ${trend} | ${h.hotspot_score.toFixed(2)} |\n`;
                 }
               } catch (_) {
                 hotspotTable = '\n\n*(Error reading hotspot data)*';
