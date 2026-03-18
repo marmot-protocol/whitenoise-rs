@@ -1094,12 +1094,14 @@ mod tests {
     }
 
     /// When no candidate is Marmot-compatible, falls back to the latest
-    /// timestamp-valid event.
+    /// timestamp-valid event among the incompatible ones.
     #[test]
     fn test_latest_key_package_falls_back_when_none_compatible() {
         let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
 
-        let event = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let older_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1109,6 +1111,21 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
             ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x8888"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -1116,7 +1133,8 @@ mod tests {
             .kind(Kind::MlsKeyPackage)
             .author(keys.public_key());
         let mut events = Events::new(&filter);
-        events.insert(event.clone());
+        events.insert(older_incompatible);
+        events.insert(newer_incompatible.clone());
 
         let result = EphemeralPlane::latest_from_events_with_validation(
             events,
@@ -1127,8 +1145,8 @@ mod tests {
 
         assert_eq!(
             result.as_ref().map(|e| e.id),
-            Some(event.id),
-            "Should fall back to timestamp-valid event when none are Marmot-compatible"
+            Some(newer_incompatible.id),
+            "Should fall back to the newest timestamp-valid event when none are Marmot-compatible"
         );
     }
 }
