@@ -64,11 +64,17 @@ jobs:
         env:
           SCENARIO: ${{ github.event.inputs.scenario }}
         run: |
-          RESULT=$(ls -t ./benchmark_results/result_*.json | head -1)
-          if [ -z "$RESULT" ]; then
+          # Use a glob array rather than ls -t | head -1 so that an empty match
+          # does not cause errexit to fire before the explicit error check runs.
+          shopt -s nullglob
+          files=(./benchmark_results/result_*.json)
+          shopt -u nullglob
+          if [ ${#files[@]} -eq 0 ]; then
             echo "ERROR: No benchmark result file found"
             exit 1
           fi
+          # Pick the newest file by modification time.
+          RESULT=$(printf '%s\n' "${files[@]}" | xargs ls -t | head -1)
           BASELINE_NAME="baseline-${SCENARIO:-all}.json"
           cp "$RESULT" "perf-hotspot-data/$BASELINE_NAME"
           echo "Copied $RESULT → perf-hotspot-data/$BASELINE_NAME"
