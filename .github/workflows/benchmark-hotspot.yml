@@ -25,11 +25,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Checkout perf-hotspot branch
+        id: checkout_perf_hotspot
         uses: actions/checkout@v4
         with:
           ref: perf-hotspot
           fetch-depth: 1
           path: perf-hotspot-data
+        continue-on-error: true
+
+      - name: Bootstrap perf-hotspot workspace (branch missing)
+        if: steps.checkout_perf_hotspot.outcome != 'success'
+        run: |
+          mkdir -p perf-hotspot-data/hotspots
+          cd perf-hotspot-data
+          git init
+          git checkout -b perf-hotspot
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@master

@@ -131,6 +131,39 @@ benchmark-json scenario="":
         {{scenario}}
     rm -rf ./dev/data/benchmark_test
 
+# Run only stable-tier benchmark scenarios and merge results into a single JSON.
+# Used by the merge-gating CI job so relay-tier failures cannot block a merge.
+benchmark-json-stable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ./benchmark_results
+    rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    MERGED="./benchmark_results/result_${TIMESTAMP}_stable.json"
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    # Run each stable scenario individually so a single-scenario failure is isolated.
+    SCENARIO_FILES=()
+    for SCENARIO in messaging-performance message-aggregation identity-creation; do
+        RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+            cargo run --release --features benchmark-tests --bin benchmark_test -- \
+            --data-dir ./dev/data/benchmark_test \
+            --logs-dir ./dev/data/benchmark_test/logs \
+            --output-json "$TMPDIR/${SCENARIO}.json" \
+            "$SCENARIO"
+        SCENARIO_FILES+=("$TMPDIR/${SCENARIO}.json")
+    done
+    # Merge the single-scenario JSON files into one envelope.
+    # jq slurps all files, takes generated_at/git_sha from the last file,
+    # and concatenates all scenarios[] arrays.
+    jq -s '{
+        generated_at: .[-1].generated_at,
+        git_sha: .[-1].git_sha,
+        scenarios: [.[].scenarios[]]
+    }' "${SCENARIO_FILES[@]}" > "$MERGED"
+    rm -rf ./dev/data/benchmark_test
+    echo "Stable benchmark results: $MERGED"
+
 # Set current result as regression baseline
 # Usage:
 #   just benchmark-baseline                      # All scenarios

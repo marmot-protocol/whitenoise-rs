@@ -55,6 +55,15 @@ impl BenchmarkScenario for UserDiscoveryBenchmark {
         }
     }
 
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds {
+            warn_pct: 10,
+            regress_pct: 20,
+            break_pct: 35,
+            ci_tier: "relay",
+        }
+    }
+
     async fn setup(&mut self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let num_users = self.config().iterations as usize;
         tracing::info!("Creating {} test users with metadata...", num_users);

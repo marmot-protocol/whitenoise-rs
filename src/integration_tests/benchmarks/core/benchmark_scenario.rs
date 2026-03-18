@@ -5,6 +5,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use super::benchmark_config::BenchmarkConfig;
 use super::benchmark_result::BenchmarkResult;
+use super::json_output::ScenarioThresholds;
 use std::sync::atomic::Ordering;
 
 use crate::integration_tests::benchmarks::{DETAILED_MODE, PERF_LAYER};
@@ -23,6 +24,16 @@ pub trait BenchmarkScenario {
     /// Configuration for this benchmark
     fn config(&self) -> BenchmarkConfig {
         BenchmarkConfig::default()
+    }
+
+    /// Regression-detection thresholds for this scenario.
+    ///
+    /// Defaults to conservative relay-tier thresholds with `ci_tier: "unknown"`.
+    /// Override this to declare the correct CI tier and custom warn/regress/break
+    /// percentages so that `bench_compare` gates PRs correctly without requiring
+    /// a separate central registry.
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds::default()
     }
 
     /// Setup phase - create accounts, groups, and any test data needed.

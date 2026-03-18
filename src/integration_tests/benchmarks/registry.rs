@@ -1,3 +1,4 @@
+use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
 use crate::integration_tests::benchmarks::scenarios::{
     AddMembersPerformanceBenchmark, GroupCreationBenchmark, IdentityCreationBenchmark,
     LoginMultistepPerformanceBenchmark, LoginPerformanceBenchmark, LoginStartPerformanceBenchmark,
@@ -91,6 +92,20 @@ impl BenchmarkRegistry {
             }
         }
         None
+    }
+
+    /// Return the thresholds for a benchmark result by looking up the registered
+    /// scenario and calling `thresholds()` on it directly.
+    ///
+    /// This eliminates the need for a separate central `thresholds_for` match —
+    /// each scenario owns its thresholds and they are always in sync with the registry.
+    pub fn thresholds_for(result: &BenchmarkResult) -> ScenarioThresholds {
+        if let Some(name) = Self::cli_name_for(result) {
+            if let Ok(scenario) = parse_and_instantiate(name) {
+                return scenario.thresholds();
+            }
+        }
+        ScenarioThresholds::default()
     }
 
     /// Run a single benchmark scenario by name, returning the result.

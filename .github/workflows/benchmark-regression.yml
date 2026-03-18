@@ -97,7 +97,7 @@ jobs:
 
       - name: Run stable benchmarks
         if: steps.baseline-check.outputs.exists == 'true'
-        run: just benchmark-json
+        run: just benchmark-json-stable
 
       - name: Compare against baseline
         if: steps.baseline-check.outputs.exists == 'true'
