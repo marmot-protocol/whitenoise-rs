@@ -1065,6 +1065,106 @@ mod tests {
         assert_eq!(result.unwrap(), None);
     }
 
+    mod key_package_relay_urls_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_returns_key_package_relays_when_present() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let kp_url = RelayUrl::parse("wss://kp.example.com").unwrap();
+            let kp_relay = whitenoise
+                .find_or_create_relay_by_url(&kp_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&kp_relay, RelayType::KeyPackage, &whitenoise.database)
+                .await
+                .unwrap();
+
+            // Also add NIP-65 to prove KP takes priority
+            let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
+            let nip65_relay = whitenoise
+                .find_or_create_relay_by_url(&nip65_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let urls = saved_user
+                .key_package_relay_urls(&whitenoise)
+                .await
+                .unwrap();
+            assert_eq!(urls, vec![kp_url]);
+        }
+
+        #[tokio::test]
+        async fn test_falls_back_to_nip65_when_no_kp_relays() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let nip65_url = RelayUrl::parse("wss://nip65.example.com").unwrap();
+            let nip65_relay = whitenoise
+                .find_or_create_relay_by_url(&nip65_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&nip65_relay, RelayType::Nip65, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let urls = saved_user
+                .key_package_relay_urls(&whitenoise)
+                .await
+                .unwrap();
+            assert_eq!(urls, vec![nip65_url]);
+        }
+
+        #[tokio::test]
+        async fn test_falls_back_to_discovery_relays_when_no_user_relays() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let urls = saved_user
+                .key_package_relay_urls(&whitenoise)
+                .await
+                .unwrap();
+            let expected = whitenoise.fallback_relay_urls().await;
+            assert_eq!(urls, expected);
+            assert!(
+                !urls.is_empty(),
+                "Discovery relays should be available as final fallback"
+            );
+        }
+    }
+
     mod should_update_metadata_tests {
         use super::*;
         use crate::whitenoise::database::processed_events::ProcessedEvent;
