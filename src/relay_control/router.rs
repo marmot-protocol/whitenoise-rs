@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::{RelayUrl, SubscriptionId};
 use tokio::sync::RwLock;
 
-use super::SubscriptionContext;
+use super::{SubscriptionContext, SubscriptionStream};
 use crate::perf_span;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -21,10 +21,18 @@ impl RelaySubscriptionKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RelayGroupKey {
+    relay_url: RelayUrl,
+    group_id: String,
+}
+
 /// Local routing table from opaque relay subscription IDs to internal context.
 #[derive(Debug, Default)]
 pub(crate) struct RelayRouter {
     subscription_contexts: RwLock<HashMap<RelaySubscriptionKey, SubscriptionContext>>,
+    /// Secondary index for O(1) group-message fanout lookups.
+    group_index: RwLock<HashMap<RelayGroupKey, HashSet<RelaySubscriptionKey>>>,
 }
 
 impl RelayRouter {
@@ -35,10 +43,25 @@ impl RelayRouter {
         context: SubscriptionContext,
     ) {
         let _span = perf_span!("relay::router_record_context");
-        self.subscription_contexts.write().await.insert(
-            RelaySubscriptionKey::new(relay_url, subscription_id),
-            context,
-        );
+        let key = RelaySubscriptionKey::new(relay_url.clone(), subscription_id);
+
+        if context.stream == SubscriptionStream::GroupMessages {
+            let mut index = self.group_index.write().await;
+            for group_id in &context.group_ids {
+                index
+                    .entry(RelayGroupKey {
+                        relay_url: relay_url.clone(),
+                        group_id: group_id.clone(),
+                    })
+                    .or_default()
+                    .insert(key.clone());
+            }
+        }
+
+        self.subscription_contexts
+            .write()
+            .await
+            .insert(key, context);
     }
 
     pub(crate) async fn subscription_context(
@@ -63,13 +86,28 @@ impl RelayRouter {
         subscription_id: &SubscriptionId,
     ) -> Option<SubscriptionContext> {
         let _span = perf_span!("relay::router_remove_context");
-        self.subscription_contexts
-            .write()
-            .await
-            .remove(&RelaySubscriptionKey::new(
-                relay_url.clone(),
-                subscription_id.clone(),
-            ))
+        let key = RelaySubscriptionKey::new(relay_url.clone(), subscription_id.clone());
+        let removed = self.subscription_contexts.write().await.remove(&key);
+
+        if let Some(ref context) = removed
+            && context.stream == SubscriptionStream::GroupMessages
+        {
+            let mut index = self.group_index.write().await;
+            for group_id in &context.group_ids {
+                let group_key = RelayGroupKey {
+                    relay_url: relay_url.clone(),
+                    group_id: group_id.clone(),
+                };
+                if let Some(set) = index.get_mut(&group_key) {
+                    set.remove(&key);
+                    if set.is_empty() {
+                        index.remove(&group_key);
+                    }
+                }
+            }
+        }
+
+        removed
     }
 
     pub(crate) async fn matching_group_contexts(
@@ -78,22 +116,19 @@ impl RelayRouter {
         group_id: &str,
     ) -> Vec<SubscriptionContext> {
         let _span = perf_span!("relay::router_matching_group_contexts");
-        // This is an O(n) scan over active subscription contexts under a read
-        // lock. That is acceptable for the current migrated planes and account
-        // counts; add a secondary index if group fanout becomes hot.
-        self.subscription_contexts
-            .read()
-            .await
-            .iter()
-            .filter(|(key, context)| {
-                key.relay_url == *relay_url
-                    && context.stream == crate::relay_control::SubscriptionStream::GroupMessages
-                    && context
-                        .group_ids
-                        .iter()
-                        .any(|candidate| candidate == group_id)
-            })
-            .map(|(_, context)| context.clone())
+        let group_key = RelayGroupKey {
+            relay_url: relay_url.clone(),
+            group_id: group_id.to_string(),
+        };
+
+        let keys = match self.group_index.read().await.get(&group_key) {
+            Some(set) => set.iter().cloned().collect::<Vec<_>>(),
+            None => return vec![],
+        };
+
+        let contexts = self.subscription_contexts.read().await;
+        keys.iter()
+            .filter_map(|key| contexts.get(key).cloned())
             .collect()
     }
 
@@ -103,6 +138,7 @@ impl RelayRouter {
 
     pub(crate) async fn clear(&self) {
         self.subscription_contexts.write().await.clear();
+        self.group_index.write().await.clear();
     }
 }
 
