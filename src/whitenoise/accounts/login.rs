@@ -214,6 +214,35 @@ impl Whitenoise {
             pubkey.to_hex()
         );
 
+        // If this account is already fully logged in, return it as-is.
+        // Re-running create_base_account_with_private_key would reset
+        // last_synced_at to NULL (poisoning compute_global_since_timestamp
+        // for all accounts), and re-running activate_account would create
+        // duplicate subscriptions and needlessly kill in-progress background
+        // tasks.
+        //
+        // Three conditions must hold to short-circuit:
+        // 1. Account row exists in the database.
+        // 2. No pending multi-step login is in progress (pending_logins).
+        // 3. An active session exists (background_task_cancellation is set
+        //    by activate_account). Without this check, a concurrent second
+        //    call could see the DB row created by a first call that hasn't
+        //    finished activation yet and return Complete prematurely.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
+            && !self.pending_logins.contains_key(&pubkey)
+            && self.background_task_cancellation.contains_key(&pubkey)
+        {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(LoginResult {
+                account: existing,
+                status: LoginStatus::Complete,
+            });
+        }
+
         let mut account = self
             .create_base_account_with_private_key(&keys)
             .await
@@ -3269,6 +3298,149 @@ mod tests {
         let err = LoginError::NoRelayConnections;
         let debug = format!("{:?}", err);
         assert!(debug.contains("NoRelayConnections"));
+    }
+
+    #[tokio::test]
+    async fn test_login_start_already_logged_in_returns_existing() {
+        // If the account is already fully logged in (e.g. via create_identity),
+        // login_start must return the existing account as Complete without
+        // re-creating it or resetting last_synced_at.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a fully activated account.
+        let keys = create_test_keys();
+        let original = whitenoise
+            .create_test_identity_with_keys(&keys)
+            .await
+            .unwrap();
+        let original_synced_at = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+            .await
+            .unwrap()
+            .last_synced_at;
+        assert!(
+            original_synced_at.is_some(),
+            "create_identity must set last_synced_at"
+        );
+
+        // Now call login_start with the same nsec — should short-circuit.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            LoginStatus::Complete,
+            "Already-logged-in account should return Complete"
+        );
+        assert_eq!(
+            result.account.pubkey, original.pubkey,
+            "Should return the same account"
+        );
+        assert_eq!(
+            result.account.id, original.id,
+            "Should return the same account row, not a new one"
+        );
+
+        // Critical: last_synced_at must NOT have been reset to NULL.
+        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.last_synced_at, original_synced_at,
+            "login_start must not reset last_synced_at for an existing account"
+        );
+
+        // No pending login should have been stashed.
+        assert!(
+            !whitenoise.pending_logins.contains_key(&original.pubkey),
+            "Should not create a pending login for an already-active account"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_start_db_row_without_active_session_does_not_short_circuit() {
+        // If an account row exists in the DB but has no active session
+        // (e.g., a concurrent login_start created it but hasn't activated yet),
+        // login_start must NOT return Complete — it should proceed normally.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create the account row directly (simulating the race: first call
+        // created the DB row but hasn't activated yet).
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+
+        // Verify: account in DB, no pending login, no cancellation channel.
+        assert!(
+            Account::find_by_pubkey(&pubkey, &whitenoise.database)
+                .await
+                .is_ok()
+        );
+        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&pubkey)
+        );
+
+        // login_start should NOT short-circuit — no active session.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Must have taken the relay-discovery path, not the short-circuit.
+        // In the mock environment (no relay servers), discovery finds nothing
+        // and returns NeedsRelayLists with a stashed pending login.
+        assert_eq!(
+            result.status,
+            LoginStatus::NeedsRelayLists,
+            "DB row without active session must not short-circuit to Complete"
+        );
+        assert!(
+            whitenoise.pending_logins.contains_key(&pubkey),
+            "Relay discovery path must stash a pending login"
+        );
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_login_start_partial_login_does_not_short_circuit() {
+        // If a previous login_start returned NeedsRelayLists (account in DB but
+        // pending_logins stash exists), a second login_start must NOT short-circuit
+        // — it should retry relay discovery.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // First login_start — no relays published, so it returns NeedsRelayLists.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::NeedsRelayLists);
+        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+
+        // Second login_start — should NOT short-circuit because account is pending.
+        let result2 = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+        assert_eq!(
+            result2.status,
+            LoginStatus::NeedsRelayLists,
+            "Partial login must retry discovery, not return Complete"
+        );
+
+        // Cleanup
+        let _ = whitenoise.login_cancel(&pubkey).await;
     }
 
     #[tokio::test]
