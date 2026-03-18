@@ -103,14 +103,23 @@ jobs:
         if: steps.baseline-check.outputs.exists == 'true'
         id: compare
         run: |
-          CANDIDATE=$(ls -t ./benchmark_results/result_*.json | head -1)
+          # Disable errexit before the glob so a no-match does not abort silently;
+          # the explicit empty-check below handles that case with a clear message.
           set +e
+          shopt -s nullglob
+          files=(./benchmark_results/result_*.json)
+          shopt -u nullglob
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "ERROR: No benchmark result file found for comparison"
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          CANDIDATE=$(printf '%s\n' "${files[@]}" | xargs ls -t | head -1)
           cargo run --release --features benchmark-tests --bin bench_compare -- \
             perf-hotspot-data/baseline-all.json \
             "$CANDIDATE" \
             --output-json ./benchmark_results/comparison.json
           EXIT=$?
-          set -e
           echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
@@ -137,7 +146,10 @@ jobs:
           script: |
             const fs = require('fs');
             const baselineExists = process.env.BASELINE_EXISTS === 'true';
-            const compareExit = parseInt(process.env.COMPARE_EXIT || '0');
+            // Guard: treat a missing or empty COMPARE_EXIT as an internal error (exit 1)
+            // rather than silently mapping it to exit 0 (✅ No regression).
+            const rawExit = process.env.COMPARE_EXIT;
+            const compareExit = (rawExit !== undefined && rawExit !== '') ? parseInt(rawExit, 10) : 1;
 
             let statusLine;
             if (!baselineExists) {
