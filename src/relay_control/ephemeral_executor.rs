@@ -11,7 +11,8 @@ use super::{
     RelayPlane,
     observability::{RelayObservability, RelayTelemetry},
     sessions::{
-        RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
+        QuorumPublishResult, RelaySession, RelaySessionAuthPolicy, RelaySessionConfig,
+        RelaySessionReconnectPolicy,
     },
 };
 use crate::{
@@ -114,6 +115,24 @@ impl EphemeralExecutor {
             .prepare_ad_hoc_relays(relays, self.config.ad_hoc_relay_ttl)
             .await?;
         entry.session.publish_event_to(relays, event).await
+    }
+
+    pub(crate) async fn publish_event_to_scope_quorum(
+        &self,
+        account_pubkey: Option<PublicKey>,
+        relays: &[RelayUrl],
+        event: &Event,
+        early_return_threshold: usize,
+    ) -> Result<QuorumPublishResult> {
+        let _span = perf_span!("relay::ephemeral_publish_event_quorum");
+        let entry = self.session_entry(account_pubkey).await;
+        entry
+            .prepare_ad_hoc_relays(relays, self.config.ad_hoc_relay_ttl)
+            .await?;
+        entry
+            .session
+            .publish_event_to_quorum(relays, event, early_return_threshold)
+            .await
     }
 
     pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {

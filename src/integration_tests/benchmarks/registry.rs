@@ -1,7 +1,8 @@
 use crate::integration_tests::benchmarks::scenarios::{
-    GroupCreationBenchmark, IdentityCreationBenchmark, LoginMultistepPerformanceBenchmark,
-    LoginPerformanceBenchmark, LoginStartPerformanceBenchmark, MessageAggregationBenchmark,
-    MessagingPerformanceBenchmark, UserDiscoveryBenchmark, UserSearchBenchmark,
+    AddMembersPerformanceBenchmark, GroupCreationBenchmark, IdentityCreationBenchmark,
+    LoginMultistepPerformanceBenchmark, LoginPerformanceBenchmark, LoginStartPerformanceBenchmark,
+    MessageAggregationBenchmark, MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
+    UserSearchBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -57,6 +58,7 @@ macro_rules! benchmark_registry {
 // BENCHMARK REGISTRY - Add new benchmarks here (one line each)
 // ============================================================================
 benchmark_registry! {
+    "add-members" => AddMembersPerformanceBenchmark::default(),
     "group-creation" => GroupCreationBenchmark::default(),
     "identity-creation" => IdentityCreationBenchmark::default(),
     "login-performance" => LoginPerformanceBenchmark::default(),
@@ -202,6 +204,7 @@ mod tests {
     #[test]
     fn test_parse_valid_scenario_names() {
         // Test all valid scenario names can be parsed and instantiated
+        assert!(parse_and_instantiate("add-members").is_ok());
         assert!(parse_and_instantiate("group-creation").is_ok());
         assert!(parse_and_instantiate("identity-creation").is_ok());
         assert!(parse_and_instantiate("login-performance").is_ok());
@@ -217,6 +220,7 @@ mod tests {
     #[test]
     fn test_parse_case_insensitive() {
         // Test case insensitivity
+        assert!(parse_and_instantiate("ADD-MEMBERS").is_ok());
         assert!(parse_and_instantiate("GROUP-CREATION").is_ok());
         assert!(parse_and_instantiate("IDENTITY-CREATION").is_ok());
         assert!(parse_and_instantiate("LOGIN-PERFORMANCE").is_ok());
@@ -244,7 +248,8 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
+        assert!(names.contains(&"add-members"));
         assert!(names.contains(&"group-creation"));
         assert!(names.contains(&"identity-creation"));
         assert!(names.contains(&"login-performance"));
