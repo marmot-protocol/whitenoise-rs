@@ -180,7 +180,10 @@ impl User {
                     pubkey: *pubkey,
                     metadata: Metadata::new(),
                     created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    // Epoch signals "never synced".  Every sync path bumps
+                    // updated_at to Utc::now(), so needs_metadata_refresh()
+                    // will return true until a real sync runs.
+                    updated_at: DateTime::<Utc>::UNIX_EPOCH,
                 };
                 user = user.save(database).await?;
                 Ok((user, true))
@@ -489,7 +492,8 @@ impl User {
                     pubkey: *pubkey,
                     metadata: Metadata::new(),
                     created_at: Utc::now(),
-                    updated_at: Utc::now(),
+                    // Epoch signals "never synced" — see find_or_create_by_pubkey.
+                    updated_at: DateTime::<Utc>::UNIX_EPOCH,
                 };
                 user = user.save_tx(tx).await?;
                 Ok((user, true))
