@@ -1,15 +1,24 @@
+pub mod bench_utils;
+pub mod chrome_trace;
 pub mod core;
 pub mod perf_layer;
 pub mod registry;
 pub mod scenarios;
+pub mod serde_duration;
 pub mod stats;
 pub mod test_cases;
 
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 
 // Re-export commonly used items for convenience
 pub use core::{BenchmarkConfig, BenchmarkResult, BenchmarkScenario, BenchmarkTestCase};
-pub use perf_layer::{PerfBreakdown, PerfSample, PerfTracingLayer};
+pub use perf_layer::{IterationDetail, PerfBreakdown, PerfSample, PerfTracingLayer};
+
+/// Set to `true` before running benchmarks when `--detailed` is requested.
+/// The benchmark scenario loop reads this to decide whether to call
+/// `checkpoint()` and `drain_per_iteration()`.
+pub static DETAILED_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Global handle to the `PerfTracingLayer` registered at benchmark binary startup.
 ///

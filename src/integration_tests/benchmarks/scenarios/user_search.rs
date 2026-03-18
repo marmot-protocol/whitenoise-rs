@@ -133,6 +133,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             all_timings,
             total_duration,
             perf_breakdown,
+            None, // user_search uses a custom loop; per-iteration detail not supported
         ))
     }
 }

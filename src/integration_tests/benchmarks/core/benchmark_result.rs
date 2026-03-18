@@ -1,26 +1,66 @@
 use std::time::Duration;
 
+use serde::Serialize;
+
 use super::benchmark_config::BenchmarkConfig;
-use crate::integration_tests::benchmarks::perf_layer::PerfBreakdown;
+use crate::integration_tests::benchmarks::perf_layer::{IterationDetail, PerfBreakdown};
 use crate::integration_tests::benchmarks::stats;
 
 /// Results from running a benchmark scenario
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BenchmarkResult {
     pub name: String,
     pub iterations: u32,
+    #[serde(
+        rename = "total_duration_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub total_duration: Duration,
+    #[serde(
+        rename = "mean_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub mean: Duration,
+    #[serde(
+        rename = "median_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub median: Duration,
+    #[serde(
+        rename = "std_dev_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub std_dev: Duration,
+    #[serde(
+        rename = "min_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub min: Duration,
+    #[serde(
+        rename = "max_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub max: Duration,
+    #[serde(
+        rename = "p95_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub p95: Duration,
+    #[serde(
+        rename = "p99_ns",
+        serialize_with = "crate::integration_tests::benchmarks::serde_duration::as_nanos"
+    )]
     pub p99: Duration,
+    #[serde(rename = "throughput_ops_sec")]
     pub throughput: f64, // operations per second
     /// Per-marker performance breakdown captured via `perf_span!`.
     /// `None` when no `PerfTracingLayer` was active during the benchmark.
     pub perf_breakdown: Option<Vec<PerfBreakdown>>,
+    /// Per-iteration span detail. `Some` only when `--detailed` is active.
+    /// Each entry holds all spans captured within a single iteration along
+    /// with that iteration's wall-clock time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_iteration: Option<Vec<IterationDetail>>,
 }
 
 impl BenchmarkResult {
@@ -42,6 +82,7 @@ impl BenchmarkResult {
         timings: Vec<Duration>,
         total_duration: Duration,
         perf_breakdown: Option<Vec<PerfBreakdown>>,
+        per_iteration: Option<Vec<IterationDetail>>,
     ) -> Self {
         let mean = stats::calculate_mean(&timings);
         let mut timings_for_median = timings.clone();
@@ -68,6 +109,7 @@ impl BenchmarkResult {
             p99,
             throughput,
             perf_breakdown,
+            per_iteration,
         }
     }
 }

@@ -111,6 +111,71 @@ benchmark scenario="":
     fi
     rm -rf ./dev/data/benchmark_test/
 
+# Run benchmarks and emit JSON output
+# Usage:
+#   just benchmark-json                      # All scenarios
+#   just benchmark-json messaging-performance  # Specific scenario
+benchmark-json scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ./benchmark_results
+    rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    SUFFIX=""
+    [ -n "{{scenario}}" ] && SUFFIX="_{{scenario}}"
+    RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+        cargo run --release --features benchmark-tests --bin benchmark_test -- \
+        --data-dir ./dev/data/benchmark_test \
+        --logs-dir ./dev/data/benchmark_test/logs \
+        --output-json "./benchmark_results/result_${TIMESTAMP}${SUFFIX}.json" \
+        {{scenario}}
+    rm -rf ./dev/data/benchmark_test
+
+# Set current result as regression baseline
+# Usage:
+#   just benchmark-baseline                      # All scenarios
+#   just benchmark-baseline messaging-performance  # Specific scenario
+benchmark-baseline scenario="":
+    just benchmark-json {{scenario}}
+    cp $(ls -t ./benchmark_results/result_*.json | head -1) ./benchmark_results/baseline.json
+    @echo "Baseline updated: ./benchmark_results/baseline.json"
+
+# Run benchmarks and compare against baseline
+# Usage:
+#   just benchmark-check                      # All scenarios
+#   just benchmark-check messaging-performance  # Specific scenario
+benchmark-check scenario="":
+    just benchmark-json {{scenario}}
+    cargo run --release --features benchmark-tests --bin bench_compare -- \
+        ./benchmark_results/baseline.json \
+        $(ls -t ./benchmark_results/result_*.json | head -1) \
+        {{ if scenario != "" { "--scenario " + scenario } else { "" } }}
+
+# Run benchmarks with per-iteration detail and emit a Perfetto trace
+# Usage:
+#   just benchmark-trace                      # All scenarios
+#   just benchmark-trace messaging-performance  # Specific scenario
+benchmark-trace scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ./benchmark_results
+    TS=$(date +%Y%m%d_%H%M%S)
+    SUFFIX=""
+    [ -n "{{scenario}}" ] && SUFFIX="_{{scenario}}"
+    rm -rf ./dev/data/benchmark_test && mkdir -p ./dev/data/benchmark_test
+    RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+        cargo run --release --features benchmark-tests --bin benchmark_test -- \
+        --data-dir ./dev/data/benchmark_test \
+        --logs-dir ./dev/data/benchmark_test/logs \
+        --output-json "./benchmark_results/trace_${TS}${SUFFIX}.json" \
+        --chrome-trace "./benchmark_results/trace_${TS}${SUFFIX}.perfetto.json" \
+        --detailed \
+        {{scenario}}
+    rm -rf ./dev/data/benchmark_test
+    echo "Perfetto trace: ./benchmark_results/trace_${TS}${SUFFIX}.perfetto.json"
+    echo "Open at: https://ui.perfetto.dev"
+
+
 # Measure initialization timing (phase-by-phase breakdown, empty database)
 # Usage:
 #   just benchmark-startup       # Single run

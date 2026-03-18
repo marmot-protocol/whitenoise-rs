@@ -71,52 +71,68 @@ benchmark_registry! {
 pub struct BenchmarkRegistry;
 
 impl BenchmarkRegistry {
-    /// Run a single benchmark scenario by name
+    /// Return the kebab-case CLI name for a benchmark result.
+    ///
+    /// Scenarios store a human-readable display name (e.g. "Messaging Performance")
+    /// but the registry maps kebab-case CLI names to constructors. This method
+    /// finds the CLI name that produced the given result by matching against the
+    /// display name of each registered scenario.
+    pub fn cli_name_for(result: &BenchmarkResult) -> Option<&'static str> {
+        for name in get_all_benchmark_names() {
+            if let Ok(scenario) = parse_and_instantiate(name)
+                && scenario.name() == result.name
+            {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Run a single benchmark scenario by name, returning the result.
     pub async fn run_scenario(
         scenario_name: &str,
         whitenoise: &'static Whitenoise,
-    ) -> Result<(), WhitenoiseError> {
+    ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
 
-        // Parse and instantiate the scenario
         let mut scenario =
             parse_and_instantiate(scenario_name).map_err(WhitenoiseError::InvalidInput)?;
 
         tracing::info!("=== Running Benchmark: {} ===", scenario.name());
 
-        // Run the benchmark
         let result = scenario.run_benchmark(whitenoise).await?;
+        let results = vec![result];
 
-        // Print summary for this single benchmark
-        Self::print_summary(&[result], overall_start.elapsed()).await;
+        Self::print_summary(&results, overall_start.elapsed()).await;
 
         tracing::info!("=== Benchmark Completed Successfully ===");
 
-        Ok(())
+        Ok(results)
     }
 
+    /// Run all registered benchmarks, returning results for those that succeeded.
     pub async fn run_all_benchmarks(
         whitenoise: &'static Whitenoise,
-    ) -> Result<(), WhitenoiseError> {
+    ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
         let mut results = Vec::new();
         let mut first_error = None;
 
         tracing::info!("=== Running Performance Benchmarks ===");
 
-        // Run all registered benchmarks
         run_all_registered(whitenoise, &mut results, &mut first_error).await;
 
         Self::print_summary(&results, overall_start.elapsed()).await;
 
-        // Return the first error encountered, if any
+        // Return results even if some scenarios failed — partial results are valuable.
+        // Propagate the first error so the caller knows something went wrong.
         match first_error {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => Ok(results),
         }
     }
 
-    async fn print_summary(results: &[BenchmarkResult], overall_duration: Duration) {
+    pub async fn print_summary(results: &[BenchmarkResult], overall_duration: Duration) {
         tokio::time::sleep(Duration::from_millis(500)).await; // Wait for logs to flush
 
         if results.is_empty() {
