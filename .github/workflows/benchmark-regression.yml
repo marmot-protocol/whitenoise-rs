@@ -160,8 +160,10 @@ jobs:
               statusLine = '⚠️ **REGRESSION** — this PR degrades one or more stable scenarios.';
             } else if (compareExit === 1) {
               statusLine = '⚠️ **WARNING** — minor degradation detected.';
-            } else {
+            } else if (compareExit === 0) {
               statusLine = '✅ **No regression** — all stable scenarios within thresholds.';
+            } else {
+              statusLine = `❌ **Comparison error** — bench_compare exited with unexpected code ${compareExit}.`;
             }
 
             let comparisonText = '';
@@ -195,9 +197,9 @@ jobs:
             }
 
       - name: Fail on breaking regression
-        if: steps.compare.outputs.exit_code == '3'
+        if: steps.compare.outputs.exit_code != '' && steps.compare.outputs.exit_code != '0'
         run: |
-          echo "Breaking regression detected — blocking merge."
+          echo "Regression or comparison error (exit ${{ steps.compare.outputs.exit_code }}) — blocking merge."
           exit 1
 
   benchmark-relay:

@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use keyring_core::Entry;
+use nostr_sdk::Keys;
 
 use ::whitenoise::init_tracing_with_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::chrome_trace::write_perfetto_trace;
@@ -12,7 +14,11 @@ use ::whitenoise::integration_tests::benchmarks::core::json_output::{
 };
 use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
 use ::whitenoise::integration_tests::benchmarks::{DETAILED_MODE, init_perf_layer};
+use ::whitenoise::whitenoise::secrets_store::SecretsStore;
 use ::whitenoise::*;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 /// Filename written into the data directory by `--login` and read by `--seed-nsec`.
 ///
@@ -138,8 +144,6 @@ fn save_keyring_sidecar(
     data_dir: &std::path::Path,
     pubkey_hex: &str,
 ) -> Result<(), WhitenoiseError> {
-    use keyring_core::Entry;
-
     let db_key_id = format!("mdk.db.key.{pubkey_hex}");
     let entry = Entry::new(KEYRING_SERVICE, &db_key_id)
         .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("keyring entry error: {e}")))?;
@@ -160,7 +164,6 @@ fn save_keyring_sidecar(
     // Restrict to owner-read/write only — the file contains a raw encryption key.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
             WhitenoiseError::Other(anyhow::anyhow!(
                 "failed to set keyring sidecar permissions: {e}"
@@ -183,10 +186,6 @@ fn save_keyring_sidecar(
 /// DB encryption key is present when `MdkSqliteStorage::new` tries to open the
 /// existing database.
 fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(), WhitenoiseError> {
-    use ::whitenoise::whitenoise::secrets_store::SecretsStore;
-    use keyring_core::Entry;
-    use nostr_sdk::Keys;
-
     // Must initialise the mock store before any keyring_core::Entry calls.
     Whitenoise::initialize_mock_keyring_store();
 
@@ -316,10 +315,11 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     if let Some(ref trace_path) = args.chrome_trace {
         if !args.detailed {
-            tracing::error!("--chrome-trace requires --detailed; skipping trace output");
-        } else {
-            write_perfetto_trace(trace_path, &results)?;
+            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                "--chrome-trace requires --detailed; re-run with both flags"
+            )));
         }
+        write_perfetto_trace(trace_path, &results)?;
     }
 
     Ok(())
