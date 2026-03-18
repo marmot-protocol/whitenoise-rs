@@ -372,15 +372,6 @@ impl Whitenoise {
                     e
                 );
             }
-            // For new users, we need to add the user to the global subscriptions batches so we get updates on their events
-            if let Err(e) = self.refresh_global_subscription_for_user().await {
-                tracing::warn!(
-                    target: "whitenoise::users::sync_user_blocking",
-                    "Failed to refresh global subscription for new user {}: {}",
-                    user_clone.pubkey,
-                    e
-                );
-            }
         }
 
         if let Err(e) = user_clone.sync_metadata(self).await {
@@ -454,15 +445,6 @@ impl Whitenoise {
             }
             if let Err(e) = metadata_result {
                 tracing::warn!("Failed to fetch metadata for {}: {}", user_clone.pubkey, e);
-            }
-
-            if let Err(e) = whitenoise.refresh_global_subscription_for_user().await {
-                tracing::warn!(
-                    target: "whitenoise::users::background_fetch_user_data",
-                    "Failed to refresh global subscription for {}: {}",
-                    user_clone.pubkey,
-                    e
-                );
             }
 
             Ok::<(), WhitenoiseError>(())
