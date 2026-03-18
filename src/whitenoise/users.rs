@@ -2540,8 +2540,10 @@ mod tests {
             assert_eq!(status, KeyPackageStatus::NotFound);
         }
 
+        /// When the user has relays and fresh metadata, the retry guard should
+        /// not trigger — the first NotFound result is returned as-is.
         #[tokio::test]
-        async fn test_not_found_with_populated_relay_list_does_not_retry() {
+        async fn test_not_found_with_fresh_relay_data_does_not_retry() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = Keys::generate().public_key();
 
@@ -2554,7 +2556,6 @@ mod tests {
             };
             let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-            // Add a key package relay using a local test relay so the connection succeeds
             let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
             let relay = whitenoise
                 .find_or_create_relay_by_url(&relay_url)
@@ -2565,8 +2566,42 @@ mod tests {
                 .await
                 .unwrap();
 
-            // With a relay present, key_package_status should return NotFound
-            // without attempting relay sync (no retry path).
+            // Relays present + fresh updated_at → should_retry returns false,
+            // so no relay sync is attempted.
+            let status = saved_user.key_package_status(&whitenoise).await.unwrap();
+            assert_eq!(status, KeyPackageStatus::NotFound);
+        }
+
+        /// When the user has relays but stale metadata (updated_at past TTL),
+        /// the retry guard triggers a relay sync before the second lookup.
+        #[tokio::test]
+        async fn test_not_found_with_stale_relay_data_retries_after_sync() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                updated_at: DateTime::<Utc>::UNIX_EPOCH,
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let relay_url = RelayUrl::parse("ws://localhost:8080").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+            saved_user
+                .add_relay(&relay, RelayType::KeyPackage, &whitenoise.database)
+                .await
+                .unwrap();
+
+            // Relays present but updated_at = epoch → needs_metadata_refresh()
+            // returns true, so should_retry triggers relay sync + second lookup.
+            // With no real relays the result is still NotFound, but the retry
+            // path is exercised.
             let status = saved_user.key_package_status(&whitenoise).await.unwrap();
             assert_eq!(status, KeyPackageStatus::NotFound);
         }

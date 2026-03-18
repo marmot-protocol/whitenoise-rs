@@ -87,9 +87,9 @@ impl User {
     /// Similar to [`key_package_event`](Self::key_package_event), but returns a
     /// [`KeyPackageStatus`] that distinguishes between valid, missing, and incompatible.
     ///
-    /// If the initial lookup returns [`KeyPackageStatus::NotFound`] and the user has no
-    /// relay data yet (e.g. created by a background sync that hasn't finished), this
-    /// method will perform a blocking relay sync and retry once.
+    /// If the initial lookup returns [`KeyPackageStatus::NotFound`] and the user's
+    /// relay data is empty or stale, this method will perform a blocking relay sync
+    /// and retry once.
     #[perf_instrument("users")]
     pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
         let event = self.key_package_event(whitenoise).await?;
@@ -97,14 +97,11 @@ impl User {
 
         match status {
             KeyPackageStatus::NotFound
-                if self
-                    .relays(RelayType::KeyPackage, &whitenoise.database)
-                    .await?
-                    .is_empty() =>
+                if self.should_retry_key_package_lookup(whitenoise).await? =>
             {
                 tracing::debug!(
                     target: "whitenoise::users::key_package",
-                    "Key package not found for user {} with empty relay list, syncing relays and retrying",
+                    "Key package not found for user {} with empty or stale relay data, syncing relays and retrying",
                     self.pubkey
                 );
                 if let Err(e) = self.update_relay_lists(whitenoise).await {
@@ -121,6 +118,21 @@ impl User {
             }
             other => Ok(other),
         }
+    }
+
+    /// Determines whether a failed key-package lookup should trigger a relay
+    /// sync and retry.
+    ///
+    /// Returns `true` when the stored relay data is empty or stale, meaning a
+    /// fresh sync might discover relays that actually host the key package.
+    async fn should_retry_key_package_lookup(&self, whitenoise: &Whitenoise) -> Result<bool> {
+        let kp_relays = self
+            .relays(RelayType::KeyPackage, &whitenoise.database)
+            .await?;
+        if kp_relays.is_empty() {
+            return Ok(true);
+        }
+        Ok(self.needs_metadata_refresh())
     }
 }
 
