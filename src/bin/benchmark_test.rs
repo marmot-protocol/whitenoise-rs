@@ -10,7 +10,7 @@ use nostr_sdk::Keys;
 use ::whitenoise::init_tracing_with_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::chrome_trace::write_perfetto_trace;
 use ::whitenoise::integration_tests::benchmarks::core::json_output::{
-    BenchmarkOutput, ScenarioResult, thresholds_for,
+    BenchmarkOutput, ScenarioResult,
 };
 use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
 use ::whitenoise::integration_tests::benchmarks::{DETAILED_MODE, init_perf_layer};
@@ -112,12 +112,9 @@ fn write_json_output(
 ) -> Result<(), WhitenoiseError> {
     let scenarios: Vec<ScenarioResult> = results
         .iter()
-        .map(|r| {
-            let cli_name = BenchmarkRegistry::cli_name_for(r).unwrap_or("unknown");
-            ScenarioResult {
-                result: r.clone(),
-                thresholds: thresholds_for(cli_name),
-            }
+        .map(|r| ScenarioResult {
+            result: r.clone(),
+            thresholds: BenchmarkRegistry::thresholds_for(r),
         })
         .collect();
 

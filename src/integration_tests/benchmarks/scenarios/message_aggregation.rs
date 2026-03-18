@@ -3,6 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::WhitenoiseError;
+use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
 use crate::integration_tests::benchmarks::test_cases::FetchAggregatedMessagesBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::{ScenarioContext, TestCase};
@@ -93,6 +94,15 @@ impl BenchmarkScenario for MessageAggregationBenchmark {
             iterations: 100,
             warmup_iterations: 10,
             cooldown_between_iterations: Duration::from_millis(10),
+        }
+    }
+
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds {
+            warn_pct: 5,
+            regress_pct: 10,
+            break_pct: 20,
+            ci_tier: "stable",
         }
     }
 
