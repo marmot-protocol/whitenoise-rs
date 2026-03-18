@@ -63,8 +63,13 @@ pub struct User {
 impl User {
     /// Checks if the user's metadata is stale and needs refreshing based on TTL.
     ///
-    /// Returns `true` if the metadata was last updated more than `METADATA_TTL_HOURS` ago,
-    /// or if this is a newly created user with default metadata.
+    /// Returns `true` if:
+    /// - The user has never been synced (created with epoch `updated_at`), or
+    /// - The metadata was last updated more than `METADATA_TTL_HOURS` ago.
+    ///
+    /// Newly created users have `updated_at` set to the Unix epoch so that a
+    /// blocking lookup after a background-created empty record always triggers
+    /// a real sync rather than treating the fresh `created_at` as a cache hit.
     ///
     /// # Returns
     ///
@@ -76,10 +81,10 @@ impl User {
         let stale_threshold = now - ttl_duration;
 
         // Refresh if updated_at is older than TTL.
-        // We rely solely on updated_at rather than checking metadata content,
-        // because sync_metadata always bumps updated_at after checking — even
-        // when no kind-0 event is found.  This lets empty-profile users hit
-        // the fast path once we've confirmed there's nothing to fetch.
+        // Newly created users start with updated_at = epoch, which is always
+        // older than the threshold.  Once any sync path runs (sync_metadata,
+        // touch_updated_at, save), updated_at is bumped to Utc::now() and
+        // the normal TTL logic takes over.
         self.updated_at < stale_threshold
     }
 
@@ -1474,6 +1479,54 @@ mod tests {
 
             assert_eq!(user.pubkey, test_pubkey);
             assert!(user.id.is_some());
+        }
+
+        #[tokio::test]
+        async fn test_new_user_needs_metadata_refresh() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+
+            let (user, created) =
+                User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.database)
+                    .await
+                    .unwrap();
+
+            assert!(created);
+            // A freshly created user must need refresh so that a subsequent
+            // Blocking lookup does not skip the sync.
+            assert!(
+                user.needs_metadata_refresh(),
+                "Newly created user should need metadata refresh"
+            );
+        }
+
+        /// A blocking lookup after a background-created empty user must
+        /// not skip the network sync.
+        #[tokio::test]
+        async fn test_blocking_sync_not_skipped_after_background_create() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = nostr_sdk::Keys::generate().public_key();
+
+            // Step 1: Background lookup creates an empty user record.
+            let bg_user = whitenoise
+                .find_or_create_user_by_pubkey(&test_pubkey, UserSyncMode::Background)
+                .await
+                .unwrap();
+            assert!(bg_user.id.is_some());
+
+            // Step 2: Re-fetch from DB (simulates a later call path).
+            let (user_from_db, is_new) =
+                User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.database)
+                    .await
+                    .unwrap();
+            assert!(!is_new, "User already exists — is_new must be false");
+
+            // Step 3: The user must still need refresh so sync_user_blocking
+            // does not short-circuit.
+            assert!(
+                user_from_db.needs_metadata_refresh(),
+                "Background-created user must need refresh until a real sync runs"
+            );
         }
     }
 
