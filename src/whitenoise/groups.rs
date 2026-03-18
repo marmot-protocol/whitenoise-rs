@@ -95,15 +95,13 @@ impl Whitenoise {
     /// preflight status checks and actual group creation use the same fallback chain.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
-        if created {
-            if let Err(e) = user.update_relay_lists(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Failed to update relay lists for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
+        if created && let Err(e) = user.update_relay_lists(self).await {
+            tracing::warn!(
+                target: "whitenoise::accounts::groups::create_group",
+                "Failed to update relay lists for new user {}: {}",
+                user.pubkey,
+                e
+            );
         }
 
         let _kp_fetch = perf_span!("groups::fetch_key_package");
