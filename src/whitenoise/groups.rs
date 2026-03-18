@@ -89,12 +89,11 @@ impl Whitenoise {
     }
 
     /// Resolves a single member for group creation: finds or creates the user record,
-    /// syncs relay lists and metadata for new users, fetches and validates the key package.
-    async fn resolve_member_key_package(
-        &self,
-        pk: &PublicKey,
-        fallback_account: &Account,
-    ) -> Result<(User, Event)> {
+    /// syncs relay lists for new users, fetches and validates the key package.
+    ///
+    /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
+    /// preflight status checks and actual group creation use the same fallback chain.
+    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
         if created {
             if let Err(e) = user.update_relay_lists(self).await {
@@ -107,31 +106,8 @@ impl Whitenoise {
             }
         }
 
-        let mut kp_relays = user.relays(RelayType::KeyPackage, &self.database).await?;
-        if kp_relays.is_empty() {
-            tracing::warn!(
-                target: "whitenoise::accounts::groups::create_group",
-                "User {} has no key package relays configured, falling back to account {} relays",
-                user.pubkey,
-                fallback_account.pubkey
-            );
-            kp_relays = fallback_account.nip65_relays(self).await?;
-            if kp_relays.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Account {} has no fallback relays configured, using defaults",
-                    fallback_account.pubkey
-                );
-                kp_relays = Relay::defaults();
-            }
-        }
-
-        let kp_relays_urls = Relay::urls(&kp_relays);
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let some_event = self
-            .relay_control
-            .fetch_user_key_package(*pk, &kp_relays_urls)
-            .await?;
+        let some_event = user.key_package_event(self).await?;
         drop(_kp_fetch);
 
         let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
@@ -328,7 +304,7 @@ impl Whitenoise {
         // Resolve members and fetch key packages concurrently
         let member_futures = member_pubkeys
             .iter()
-            .map(|pk| self.resolve_member_key_package(pk, creator_account));
+            .map(|pk| self.resolve_member_key_package(pk));
         let resolved_members = try_join_all(member_futures).await?;
         let (members, key_package_events): (Vec<User>, Vec<Event>) =
             resolved_members.into_iter().unzip();
