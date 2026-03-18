@@ -89,29 +89,19 @@ impl Whitenoise {
     }
 
     /// Resolves a single member for group creation: finds or creates the user record,
-    /// syncs relay lists and metadata for new users, fetches and validates the key package.
+    /// syncs relay lists for new users, fetches and validates the key package.
     ///
     /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
     /// preflight status checks and actual group creation use the same fallback chain.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
-        let (mut user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
-        if created {
-            if let Err(e) = user.update_relay_lists(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Failed to update relay lists for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
-            if let Err(e) = user.sync_metadata(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Failed to sync metadata for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
+        let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
+        if created && let Err(e) = user.update_relay_lists(self).await {
+            tracing::warn!(
+                target: "whitenoise::accounts::groups::create_group",
+                "Failed to update relay lists for new user {}: {}",
+                user.pubkey,
+                e
+            );
         }
 
         let _kp_fetch = perf_span!("groups::fetch_key_package");
@@ -574,7 +564,17 @@ impl Whitenoise {
             let (user, newly_created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
 
             if newly_created {
-                self.background_fetch_user_data(&user).await?;
+                // Sync relay lists synchronously so that the key package relay lookup below
+                // has a chance to find the user's relays before falling back to account defaults.
+                // Metadata is not needed to add a member to a group; skip it on the critical path.
+                if let Err(e) = user.update_relay_lists(self).await {
+                    tracing::warn!(
+                        target: "whitenoise::accounts::groups::add_members_to_group",
+                        "Failed to update relay lists for new user {}: {}",
+                        user.pubkey,
+                        e
+                    );
+                }
             }
             // Try and get user's key package relays, if they don't have any, use account's default relays
             let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
