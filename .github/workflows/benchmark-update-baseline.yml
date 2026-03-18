@@ -61,24 +61,28 @@ jobs:
         run: docker compose down -v
 
       - name: Copy result to baseline
+        env:
+          SCENARIO: ${{ github.event.inputs.scenario }}
         run: |
           RESULT=$(ls -t ./benchmark_results/result_*.json | head -1)
           if [ -z "$RESULT" ]; then
             echo "ERROR: No benchmark result file found"
             exit 1
           fi
-          cp "$RESULT" perf-hotspot-data/baseline.json
-          echo "Copied $RESULT → perf-hotspot-data/baseline.json"
+          BASELINE_NAME="baseline-${SCENARIO:-all}.json"
+          cp "$RESULT" "perf-hotspot-data/$BASELINE_NAME"
+          echo "Copied $RESULT → perf-hotspot-data/$BASELINE_NAME"
+          echo "baseline_name=$BASELINE_NAME" >> "$GITHUB_ENV"
 
       - name: Commit baseline to perf-hotspot branch
         run: |
           cd perf-hotspot-data
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add baseline.json
+          git add "$baseline_name"
           if git diff --cached --quiet; then
             echo "No changes to baseline"
           else
-            git commit -m "baseline from $(git -C .. rev-parse --short HEAD) on $(date -u +%Y-%m-%d)"
+            git commit -m "baseline ($baseline_name) from $(git -C .. rev-parse --short HEAD) on $(date -u +%Y-%m-%d)"
             git push
           fi

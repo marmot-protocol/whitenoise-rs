@@ -425,13 +425,19 @@ fn main() {
     print_comparison(&output);
 
     if let Some(ref out_path) = args.output_json {
-        match serde_json::to_string_pretty(&output) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(out_path, json) {
-                    eprintln!("ERROR: failed to write output JSON: {e}");
-                }
+        let json = match serde_json::to_string_pretty(&output) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("ERROR: failed to serialize comparison output: {e}");
+                std::process::exit(4);
             }
-            Err(e) => eprintln!("ERROR: failed to serialize comparison output: {e}"),
+        };
+        if let Err(e) = std::fs::write(out_path, json) {
+            eprintln!(
+                "ERROR: failed to write output JSON to {}: {e}",
+                out_path.display()
+            );
+            std::process::exit(4);
         }
     }
 
