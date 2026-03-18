@@ -1,0 +1,238 @@
+name: Performance Regression Check
+
+# Triggered when the 'benchmark' label is applied to a PR.
+# Re-run: remove label -> re-add label -> jobs fire again with fresh results.
+# Create the label once: gh label create benchmark --color 0075ca
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Guard: skip all downstream jobs if the triggering label is not 'benchmark'.
+  check-label:
+    name: Check label
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          LABEL_NAME: ${{ github.event.label.name }}
+        run: |
+          if [ "$LABEL_NAME" = "benchmark" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  benchmark-stable:
+    name: Stable scenarios (merge-gating)
+    needs: check-label
+    if: needs.check-label.outputs.run == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout perf-hotspot branch
+        uses: actions/checkout@v4
+        with:
+          ref: perf-hotspot
+          fetch-depth: 1
+          path: perf-hotspot-data
+
+      - name: Check baseline exists
+        id: baseline-check
+        run: |
+          if [ -f perf-hotspot-data/baseline.json ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "WARNING: No baseline.json found. Run benchmark-update-baseline first."
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          sleep 5
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Post "running" comment
+        id: post-running
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.slice(0, 7);
+            const body = `## Performance Benchmark Results\n\n⏳ Benchmarks are running... (~10–12 min)\n\nTriggered by label \`benchmark\` on commit \`${sha}\``;
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+            core.setOutput('comment_id', comment.id);
+
+      - name: Run stable benchmarks
+        if: steps.baseline-check.outputs.exists == 'true'
+        run: just benchmark-json
+
+      - name: Compare against baseline
+        if: steps.baseline-check.outputs.exists == 'true'
+        id: compare
+        run: |
+          CANDIDATE=$(ls -t ./benchmark_results/result_*.json | head -1)
+          set +e
+          cargo run --release --features benchmark-tests --bin bench_compare -- \
+            perf-hotspot-data/baseline.json \
+            "$CANDIDATE" \
+            --output-json ./benchmark_results/comparison.json
+          EXIT=$?
+          set -e
+          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
+
+      - name: Upload comparison artifact
+        if: steps.baseline-check.outputs.exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comparison
+          path: ./benchmark_results/comparison.json
+          if-no-files-found: ignore
+
+      - name: Update PR comment with results
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          COMPARE_EXIT: ${{ steps.compare.outputs.exit_code }}
+          BASELINE_EXISTS: ${{ steps.baseline-check.outputs.exists }}
+          COMMENT_ID: ${{ steps.post-running.outputs.comment_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const baselineExists = process.env.BASELINE_EXISTS === 'true';
+            const compareExit = parseInt(process.env.COMPARE_EXIT || '0');
+
+            let statusLine;
+            if (!baselineExists) {
+              statusLine = '⚠️ No baseline found. Run the **Update Performance Baseline** workflow first.';
+            } else if (compareExit === 3) {
+              statusLine = '❌ **BREAKING REGRESSION** — this PR degrades stable scenarios beyond the break threshold.';
+            } else if (compareExit === 2) {
+              statusLine = '⚠️ **REGRESSION** — this PR degrades one or more stable scenarios.';
+            } else if (compareExit === 1) {
+              statusLine = '⚠️ **WARNING** — minor degradation detected.';
+            } else {
+              statusLine = '✅ **No regression** — all stable scenarios within thresholds.';
+            }
+
+            let comparisonText = '';
+            try {
+              const raw = fs.readFileSync('./benchmark_results/comparison.json', 'utf8');
+              const cmp = JSON.parse(raw);
+              comparisonText = '\n\n<details><summary>Full comparison details</summary>\n\n```\n';
+              for (const sc of cmp.scenarios) {
+                comparisonText += `\nscenario: ${sc.name} [${sc.ci_tier}]\n`;
+                for (const m of sc.metrics) {
+                  const sign = m.delta_pct >= 0 ? '+' : '';
+                  comparisonText += `  ${m.metric.padEnd(20)} ${sign}${m.delta_pct.toFixed(1)}%  ${m.status}\n`;
+                }
+              }
+              comparisonText += '```\n\n</details>';
+            } catch (_) {
+              comparisonText = '';
+            }
+
+            const sha = context.sha.slice(0, 7);
+            const body = `## Performance Benchmark Results\n\n${statusLine}${comparisonText}\n\n*Candidate: \`${sha}\`*`;
+
+            const commentId = process.env.COMMENT_ID;
+            if (commentId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: parseInt(commentId),
+                body,
+              });
+            }
+
+      - name: Fail on breaking regression
+        if: steps.compare.outputs.exit_code == '3'
+        run: |
+          echo "Breaking regression detected — blocking merge."
+          exit 1
+
+  benchmark-relay:
+    name: Relay scenarios (informational)
+    needs: check-label
+    if: needs.check-label.outputs.run == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Relay-tier scenarios never fail CI — informational only.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          sleep 5
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Run relay-tier scenarios
+        run: |
+          just benchmark-json group-creation || true
+          just benchmark-json login-performance || true
+          just benchmark-json user-discovery-blocking || true
+          just benchmark-json user-discovery-background || true
+          just benchmark-json user-search || true
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
+
+      - name: Upload relay results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-relay-results
+          path: ./benchmark_results/result_*.json
+          if-no-files-found: ignore

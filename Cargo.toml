@@ -153,6 +153,16 @@ name = "benchmark_test"
 path = "src/bin/benchmark_test.rs"
 required-features = ["benchmark-tests"]
 
+[[bin]]
+name = "bench_compare"
+path = "src/bin/bench_compare.rs"
+required-features = ["benchmark-tests"]
+
+[[bin]]
+name = "bench_hotspot"
+path = "src/bin/bench_hotspot.rs"
+required-features = ["benchmark-tests"]
+
 [profile.release]
 debug = false
 opt-level = "z"
