@@ -1,4 +1,8 @@
-//! Serde helpers for serializing `Duration` as nanosecond `u64` values.
+//! Serde helpers for serializing `Duration` as nanosecond `u128` values.
+//!
+//! [`as_nanos`] calls [`Duration::as_nanos`] and forwards the result to
+//! [`Serializer::serialize_u128`], producing a JSON number that covers the full
+//! nanosecond range without truncation.
 //!
 //! Used by `#[serde(serialize_with = "...")]` on `PerfBreakdown`,
 //! `PerfSample`, and `BenchmarkResult` fields.

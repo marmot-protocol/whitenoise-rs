@@ -53,11 +53,11 @@ jobs:
       - name: Check baseline exists
         id: baseline-check
         run: |
-          if [ -f perf-hotspot-data/baseline.json ]; then
+          if [ -f perf-hotspot-data/baseline-all.json ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "WARNING: No baseline.json found. Run benchmark-update-baseline first."
+            echo "WARNING: No baseline-all.json found. Run benchmark-update-baseline (with no scenario input) first."
           fi
 
       - name: Set up Rust
@@ -106,7 +106,7 @@ jobs:
           CANDIDATE=$(ls -t ./benchmark_results/result_*.json | head -1)
           set +e
           cargo run --release --features benchmark-tests --bin bench_compare -- \
-            perf-hotspot-data/baseline.json \
+            perf-hotspot-data/baseline-all.json \
             "$CANDIDATE" \
             --output-json ./benchmark_results/comparison.json
           EXIT=$?

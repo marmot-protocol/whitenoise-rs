@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDateTime;
+
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
@@ -101,9 +103,24 @@ fn hotspot_score(mean_ns: f64, scenario_mean_ns: f64, call_count: u64) -> f64 {
 
 // ─── Trend lookup ─────────────────────────────────────────────────────────────
 
+/// Parse a `run_id` string of the form `YYYY-MM-DDTHHMMSSZ` (produced by
+/// `date -u +%Y-%m-%dT%H%M%SZ`) into seconds since the Unix epoch.
+/// Returns `None` if the string doesn't match the expected format.
+fn run_id_to_secs(s: &str) -> Option<u64> {
+    let dt = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H%M%SZ").ok()?;
+    let ts = dt.and_utc().timestamp();
+    if ts < 0 { None } else { Some(ts as u64) }
+}
+
 /// Load the hotspot JSON file from exactly 7 days ago (approximate — finds the
-/// newest file older than 7 × 24 hours) and build a lookup map:
-/// `scenario_name → span_name → mean_ns`.
+/// newest file whose logical run timestamp is older than 7 × 24 hours) and
+/// build a lookup map: `scenario_name → span_name → mean_ns`.
+///
+/// The logical timestamp is read from the `run_id` field inside each JSON
+/// file. If that field is absent or unparseable the filename stem is tried
+/// as a fallback (both use the same `YYYY-MM-DDTHHMMSSZ` format). File
+/// modification time is intentionally not used: `git checkout` in CI resets
+/// mtimes to the checkout instant, making them useless for ordering.
 fn load_week_ago_means(history_dir: &Path) -> HashMap<String, HashMap<String, f64>> {
     let threshold = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -119,14 +136,23 @@ fn load_week_ago_means(history_dir: &Path) -> HashMap<String, HashMap<String, f6
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && let Ok(age) = modified.duration_since(std::time::UNIX_EPOCH)
+
+            // Derive logical timestamp: try run_id field in the report first,
+            // then fall back to parsing the filename stem.
+            let ts = load_json(&path)
+                .ok()
+                .and_then(|j| run_id_to_secs(&get_str(&j, "run_id")))
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(run_id_to_secs)
+                });
+
+            if let Some(ts) = ts
+                && ts <= threshold
+                && best.as_ref().is_none_or(|(t, _)| ts > *t)
             {
-                let mtime = age.as_secs();
-                if mtime <= threshold && best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-                    best = Some((mtime, path));
-                }
+                best = Some((ts, path));
             }
         }
     }
