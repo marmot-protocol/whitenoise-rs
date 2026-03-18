@@ -165,7 +165,7 @@ jobs:
             }
 
             if (issueNumber) {
-              await github.rest.issues.createComment({
+              await github.rest.issues.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: issueNumber,
