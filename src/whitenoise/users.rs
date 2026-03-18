@@ -372,6 +372,16 @@ impl Whitenoise {
                     e
                 );
             }
+            // Add the new user to the discovery subscription batch so future subscription-driven
+            // updates (metadata changes, relay list changes) are delivered automatically.
+            if let Err(e) = self.refresh_global_subscription_for_user().await {
+                tracing::warn!(
+                    target: "whitenoise::users::sync_user_blocking",
+                    "Failed to refresh global subscription for new user {}: {}",
+                    user_clone.pubkey,
+                    e
+                );
+            }
         }
 
         if let Err(e) = user_clone.sync_metadata(self).await {
@@ -388,7 +398,7 @@ impl Whitenoise {
 
     async fn sync_user_background(&self, user: &User, is_new: bool) -> Result<()> {
         if is_new {
-            if let Err(e) = self.background_fetch_user_data(user).await {
+            if let Err(e) = self.background_fetch_user_data(user, true).await {
                 tracing::warn!(
                     target: "whitenoise::users::sync_user_background",
                     "Failed to start background fetch for new user {}: {}",
@@ -404,7 +414,7 @@ impl Whitenoise {
                 user.pubkey,
                 user.updated_at
             );
-            if let Err(e) = self.background_fetch_user_data(user).await {
+            if let Err(e) = self.background_fetch_user_data(user, false).await {
                 tracing::warn!(
                     target: "whitenoise::users::sync_user_background",
                     "Failed to start background fetch for stale user {}: {}",
@@ -424,7 +434,7 @@ impl Whitenoise {
         Ok(())
     }
 
-    pub(crate) async fn background_fetch_user_data(&self, user: &User) -> Result<()> {
+    pub(crate) async fn background_fetch_user_data(&self, user: &User, is_new: bool) -> Result<()> {
         let user_clone = user.clone();
         let mut mut_user_clone = user.clone();
 
@@ -445,6 +455,18 @@ impl Whitenoise {
             }
             if let Err(e) = metadata_result {
                 tracing::warn!("Failed to fetch metadata for {}: {}", user_clone.pubkey, e);
+            }
+
+            // For newly seen users, add them to the discovery subscription batch so that
+            // future subscription-driven updates (metadata, relay list changes) are delivered.
+            // Existing stale users are already subscribed; skip the expensive rebuild.
+            if is_new && let Err(e) = whitenoise.refresh_global_subscription_for_user().await {
+                tracing::warn!(
+                    target: "whitenoise::users::background_fetch_user_data",
+                    "Failed to refresh global subscription for new user {}: {}",
+                    user_clone.pubkey,
+                    e
+                );
             }
 
             Ok::<(), WhitenoiseError>(())
