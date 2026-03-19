@@ -26,7 +26,7 @@ impl User {
     /// 1. User's KeyPackage relays (kind 10051)
     /// 2. User's NIP-65 relays (kind 10002)
     /// 3. Whitenoise discovery/fallback relays
-    /// 4. Default account relays used for bootstrap in local/dev setups
+    /// 4. Default bootstrap relays from `Relay::defaults()`
     #[perf_instrument("users")]
     pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
         let kp_relays = self
