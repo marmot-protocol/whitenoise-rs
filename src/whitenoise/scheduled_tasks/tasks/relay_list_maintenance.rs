@@ -349,7 +349,7 @@ mod tests {
         // Create account — this publishes relay lists to the local test relays
         let account = whitenoise.create_identity().await.unwrap();
 
-        // Verify the account has local relay config
+        // Verify local relay config exists
         let inbox_relays = account.inbox_relays(whitenoise).await.unwrap();
         assert!(!inbox_relays.is_empty(), "Account should have inbox relays");
 
@@ -359,12 +359,60 @@ mod tests {
             "Account should have key package relays"
         );
 
-        // Run maintenance — relay lists should already be on the network
-        // (published during create_identity), so this should be a no-op
+        // Verify relay lists are discoverable on the network before maintenance
+        let nip65_urls = Relay::urls(&account.nip65_relays(whitenoise).await.unwrap());
+
+        let inbox_before = whitenoise
+            .relay_control
+            .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_urls)
+            .await
+            .unwrap();
+        assert!(
+            inbox_before.is_some(),
+            "Inbox relay list should be on network before maintenance"
+        );
+
+        let kp_before = whitenoise
+            .relay_control
+            .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_urls)
+            .await
+            .unwrap();
+        assert!(
+            kp_before.is_some(),
+            "Key package relay list should be on network before maintenance"
+        );
+
+        // Run maintenance — should be a no-op since both lists are already present
         let task = RelayListMaintenance;
         let result = task.execute(whitenoise).await;
         assert!(result.is_ok());
+
+        // Verify relay lists are still discoverable after maintenance (unchanged)
+        let inbox_after = whitenoise
+            .relay_control
+            .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_urls)
+            .await
+            .unwrap();
+        assert!(
+            inbox_after.is_some(),
+            "Inbox relay list should still be on network after maintenance"
+        );
+
+        let kp_after = whitenoise
+            .relay_control
+            .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_urls)
+            .await
+            .unwrap();
+        assert!(
+            kp_after.is_some(),
+            "Key package relay list should still be on network after maintenance"
+        );
     }
+
+    // NOTE: Relay-dependent tests (re-publish when missing from network) live
+    // in the integration test suite and are exercised via `just int-test scheduler`.
+    // The local test relays don't honour NIP-09 event deletions for replaceable
+    // events, so we cannot simulate a missing relay list in unit tests.
 
     #[tokio::test]
     async fn test_maintain_relay_lists_skips_when_no_local_relays() {
