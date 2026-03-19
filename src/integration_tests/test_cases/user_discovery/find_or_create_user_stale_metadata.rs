@@ -3,6 +3,9 @@ use crate::integration_tests::core::*;
 use async_trait::async_trait;
 use nostr_sdk::{Keys, Metadata};
 
+const LOG_TARGET: &str =
+    "integration_tests::test_cases::user_discovery::find_or_create_user_stale_metadata";
+
 /// Tests that unknown metadata stays unknown when targeted discovery finds nothing.
 ///
 /// This covers the legacy empty-row behavior we want after the migration:
@@ -33,6 +36,7 @@ impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
+            target: LOG_TARGET,
             "Testing unknown-metadata no-result behavior for pubkey: {}",
             test_pubkey
         );
@@ -59,7 +63,10 @@ impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
             "Stored user must remain unknown when discovery returns no metadata"
         );
 
-        tracing::info!("✓ Unknown metadata remained unknown after no-result discovery");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ Unknown metadata remained unknown after no-result discovery"
+        );
 
         Ok(())
     }

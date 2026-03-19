@@ -41,7 +41,7 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
     // Custom redirect policy that mirrors `require_https()`:
     // - Always allow HTTPS redirect targets.
-    // - In debug builds, also allow http://localhost (for local test servers).
+    // - In debug builds, also allow HTTP loopback hosts (for local test servers).
     // - Reject everything else to prevent HTTPS → HTTP downgrade attacks.
     // - Cap the chain at 10 hops to guard against redirect loops.
     let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
@@ -51,7 +51,7 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         let url = attempt.url();
         let allowed = match url.scheme() {
             "https" => true,
-            "http" if cfg!(debug_assertions) && url.host_str() == Some("localhost") => true,
+            "http" if Whitenoise::is_debug_local_blossom_url(url) => true,
             _ => false,
         };
         if allowed {
@@ -707,12 +707,26 @@ impl Whitenoise {
             .await
     }
 
+    fn is_debug_local_blossom_url(url: &Url) -> bool {
+        if !cfg!(debug_assertions) {
+            return false;
+        }
+
+        match url.host_str() {
+            Some("localhost") => true,
+            Some(host) => host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+            None => false,
+        }
+    }
+
     /// Rejects non-HTTPS Blossom URLs to prevent cleartext metadata leakage.
-    /// Debug builds also allow `http://localhost` for local testing.
+    /// Debug builds also allow loopback `http://` URLs for local testing.
     pub(crate) fn require_https(url: &Url) -> Result<()> {
         match url.scheme() {
             "https" => Ok(()),
-            "http" if cfg!(debug_assertions) && url.host_str() == Some("localhost") => Ok(()),
+            "http" if Self::is_debug_local_blossom_url(url) => Ok(()),
             _ => Err(WhitenoiseError::BlossomInsecureUrl(url.to_string())),
         }
     }
@@ -1053,7 +1067,7 @@ mod tests {
     //
     // These tests spin up a local mockito server and call the real streaming
     // path.  They run only in debug builds because `require_https` allows
-    // `http://localhost` in debug mode only.
+    // loopback `http://` URLs in debug mode only.
 
     /// Returns a fixed 32-byte hash for use as a fake blob hash in tests.
     fn test_hash() -> [u8; 32] {
@@ -1068,10 +1082,8 @@ mod tests {
 
     /// Returns a `localhost`-based URL for the mockito server.
     ///
-    /// `mockito::Server` binds to `127.0.0.1`, but `require_https` only permits
-    /// `http://localhost` in debug builds (not `http://127.0.0.1`).  This helper
-    /// rewrites the server URL to use the `localhost` hostname so the HTTPS check
-    /// passes while the TCP connection still reaches the local mock server.
+    /// `mockito::Server` binds to a loopback address; using `localhost` keeps the
+    /// test URL readable while still reaching the local mock server.
     fn localhost_url(server: &mockito::Server) -> Url {
         let port = server.socket_address().port();
         Url::parse(&format!("http://localhost:{port}")).unwrap()
@@ -1192,6 +1204,13 @@ mod tests {
     #[cfg(debug_assertions)]
     fn blossom_client_allows_localhost_http_in_debug() {
         let url = Url::parse("http://localhost:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_allows_loopback_http_in_debug() {
+        let url = Url::parse("http://127.0.0.1:3000").unwrap();
         assert!(Whitenoise::blossom_client(&url).is_ok());
     }
 

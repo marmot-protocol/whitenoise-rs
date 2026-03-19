@@ -1,10 +1,12 @@
 -- Track whether user metadata has been resolved yet.
 -- `NULL` = unknown / not yet resolved.
--- non-NULL = metadata resolution completed at this time, including valid blank `{}` metadata.
+-- non-NULL = legacy metadata resolution completed and backfilled from `updated_at`,
+-- excluding empty JSON `{}` objects.
 --
 -- `nostr_sdk::Metadata::new()` serializes to `{}` in the current dependency set,
--- so legacy rows with exactly that empty object stay unknown. Any row with a
--- non-empty JSON object is backfilled as known using its existing `updated_at`.
+-- and `json_each(users.metadata)` returns no rows for that shape, so legacy rows
+-- with exactly that empty object stay unknown. Any row with a non-empty JSON
+-- object is backfilled as known using its existing `updated_at`.
 
 ALTER TABLE users
 ADD COLUMN metadata_known_at INTEGER NULL;

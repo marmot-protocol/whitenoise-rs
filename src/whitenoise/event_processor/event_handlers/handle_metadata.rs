@@ -35,6 +35,15 @@ impl Whitenoise {
                         event.pubkey,
                         event.created_at
                     );
+                } else if user.metadata_is_unknown() {
+                    user.mark_metadata_known_now();
+                    user.save(&self.database).await?;
+
+                    tracing::debug!(
+                        target: "whitenoise::event_processor::handle_metadata",
+                        "Marked metadata as known for user {} without changing stored metadata",
+                        event.pubkey
+                    );
                 }
                 Ok(())
             }
@@ -56,7 +65,9 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::{
+        database::processed_events::ProcessedEvent, test_utils::create_mock_whitenoise,
+    };
 
     async fn metadata_event(keys: &Keys, metadata: &Metadata, timestamp: Timestamp) -> Event {
         EventBuilder::metadata(metadata)
@@ -138,5 +149,43 @@ mod tests {
             .unwrap();
         assert_eq!(user.metadata.name, Some("newer".to_string()));
         assert_eq!(user.metadata_known_at, first_known_at);
+    }
+
+    #[tokio::test]
+    async fn already_current_metadata_marks_unknown_user_as_known() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let metadata = Metadata::new().name("known");
+        let event = metadata_event(&keys, &metadata, Timestamp::now()).await;
+
+        let user = User {
+            id: None,
+            pubkey: keys.public_key(),
+            metadata: metadata.clone(),
+            created_at: Utc::now(),
+            metadata_known_at: None,
+            updated_at: Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        ProcessedEvent::create(
+            &event.id,
+            None,
+            Some(Utc::now()),
+            Some(Kind::Metadata),
+            Some(&keys.public_key()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        whitenoise.handle_metadata(event).await.unwrap();
+
+        let stored_user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        assert_eq!(stored_user.metadata, metadata);
+        assert!(stored_user.metadata_known_at.is_some());
     }
 }

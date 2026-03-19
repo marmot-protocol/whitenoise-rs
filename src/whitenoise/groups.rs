@@ -799,8 +799,8 @@ mod tests {
     use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
 
     fn mock_blossom_url(server: &mockito::Server) -> Url {
-        let port = server.socket_address().port();
-        Url::parse(&format!("http://localhost:{port}")).unwrap()
+        let socket_address = server.socket_address();
+        Url::parse(&format!("http://{socket_address}")).unwrap()
     }
 
     fn mock_blob_descriptor(server_url: &Url, blob: &[u8], mime_type: &str) -> BlobDescriptor {

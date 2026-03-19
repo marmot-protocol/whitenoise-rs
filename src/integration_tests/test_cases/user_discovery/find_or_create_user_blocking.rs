@@ -8,11 +8,12 @@ use nostr_sdk::{Keys, Metadata, RelayUrl};
 ///
 /// This test verifies:
 /// - User creation when user doesn't exist
-/// - Synchronous metadata fetching (blocking until complete)
-/// - Synchronous relay list fetching (blocking until complete)
+/// - `UserSyncMode::Blocking` lookup behavior when metadata catch-up may still complete async
+/// - Retry-based verification that metadata and relay-list catch-up eventually settles
 /// - Idempotency (calling twice returns the same user)
 ///
-/// For background behavior, see `FindOrCreateUserBackgroundModeTestCase`.
+/// For background-specific behavior expectations, see
+/// `FindOrCreateUserBackgroundModeTestCase`.
 pub struct FindOrCreateUserTestCase {
     test_keys: Keys,
     should_have_metadata: bool,

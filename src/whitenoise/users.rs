@@ -1205,7 +1205,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_falls_back_to_default_relays_when_no_user_relays() {
+        async fn test_falls_back_to_configured_discovery_relays_when_no_user_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
             let user = User {
@@ -1222,11 +1222,11 @@ mod tests {
                 .key_package_relay_urls(&whitenoise)
                 .await
                 .unwrap();
-            let expected = Relay::urls(&Relay::defaults());
+            let expected = whitenoise.fallback_relay_urls().await;
             assert_eq!(urls, expected);
             assert!(
                 !urls.is_empty(),
-                "Default relays should be available as the bootstrap fallback"
+                "Configured discovery relays should be available as the fallback"
             );
         }
     }
