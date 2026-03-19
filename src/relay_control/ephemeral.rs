@@ -19,7 +19,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         database::{Database, published_events::PublishedEvent},
-        key_packages::has_encoding_tag,
+        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
         message_aggregator::DeliveryStatus,
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
@@ -598,7 +598,7 @@ impl EphemeralPlane {
     }
 
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
-        has_encoding_tag(event) && !event.content.trim().is_empty()
+        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
     }
 }
 
@@ -976,5 +976,177 @@ mod tests {
             .count();
 
         assert_eq!(publish_failures, 2);
+    }
+
+    /// Newer incompatible key package must not shadow an older valid one.
+    #[test]
+    fn test_latest_key_package_prefers_marmot_compatible_over_newer_incompatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        // Older event: fully Marmot-compatible
+        let older_valid = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Newer event: has encoding tag + non-empty content but wrong ciphersuite
+        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x9999"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(newer_incompatible.created_at > older_valid.created_at);
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_valid.clone());
+        events.insert(newer_incompatible);
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(older_valid.id),
+            "Should prefer the older Marmot-compatible event over the newer incompatible one"
+        );
+    }
+
+    /// When all candidates are Marmot-compatible, the newest wins.
+    #[test]
+    fn test_latest_key_package_picks_newest_when_all_compatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        let older = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let newer = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older);
+        events.insert(newer.clone());
+
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(newer.id),
+            "Should pick the newest event when all are Marmot-compatible"
+        );
+    }
+
+    /// When no candidate is Marmot-compatible, falls back to the latest
+    /// timestamp-valid event among the incompatible ones.
+    #[test]
+    fn test_latest_key_package_falls_back_when_none_compatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        let older_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x9999"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x8888"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_incompatible);
+        events.insert(newer_incompatible.clone());
+
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(newer_incompatible.id),
+            "Should fall back to the newest timestamp-valid event when none are Marmot-compatible"
+        );
     }
 }
