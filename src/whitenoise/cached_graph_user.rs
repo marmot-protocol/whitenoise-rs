@@ -7,7 +7,7 @@
 //!
 //! Key differences from `User`:
 //! - Does NOT trigger subscriptions or background syncing
-//! - Has a 24-hour TTL for freshness
+//! - Has a per-entry TTL for freshness (varies by confidence)
 //! - Stores follow list alongside metadata
 //! - Is NOT exposed to Flutter/FRB
 
@@ -15,7 +15,16 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::{Metadata, PublicKey};
 
 /// Default TTL for cached graph user data (24 hours).
+/// Used by follows freshness and cleanup. See also `CONFIDENT_CACHE_TTL_MS`.
 pub const DEFAULT_CACHE_TTL_HOURS: i64 = 24;
+
+/// Cache TTL for confident results: clean EOSE or found metadata (24 hours in ms).
+/// Same duration as `DEFAULT_CACHE_TTL_HOURS` but independent — metadata expiration
+/// and follows/cleanup TTL are separate concerns that may diverge.
+pub const CONFIDENT_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Cache TTL for uncertain results: relay errors after retry exhaustion (30 minutes in ms).
+pub const UNCERTAIN_CACHE_TTL_MS: i64 = 30 * 60 * 1000;
 
 /// Cached user data for users discovered via social graph traversal (web of trust).
 ///
@@ -37,6 +46,8 @@ pub struct CachedGraphUser {
     pub updated_at: DateTime<Utc>,
     /// When metadata was last fetched. `None` = metadata never written.
     pub metadata_updated_at: Option<DateTime<Utc>>,
+    /// When this metadata cache entry expires. `None` = expired / never set.
+    pub metadata_expires_at: Option<DateTime<Utc>>,
     /// When follows were last fetched. `None` = follows never written.
     pub follows_updated_at: Option<DateTime<Utc>>,
 }
@@ -50,10 +61,14 @@ impl CachedGraphUser {
         follows: Option<Vec<PublicKey>>,
     ) -> Self {
         let now = Utc::now();
+        let metadata_expires_at = metadata
+            .as_ref()
+            .map(|_| now + chrono::Duration::milliseconds(CONFIDENT_CACHE_TTL_MS));
         Self {
             id: None,
             pubkey,
             metadata_updated_at: metadata.as_ref().map(|_| now),
+            metadata_expires_at,
             follows_updated_at: follows.as_ref().map(|_| now),
             metadata,
             follows,

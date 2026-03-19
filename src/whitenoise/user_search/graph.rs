@@ -17,7 +17,7 @@ use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
-use crate::whitenoise::cached_graph_user::CachedGraphUser;
+use crate::whitenoise::cached_graph_user::{CONFIDENT_CACHE_TTL_MS, CachedGraphUser};
 use crate::whitenoise::users::User;
 
 /// Maximum authors to include in a single relay filter query.
@@ -226,8 +226,13 @@ pub(super) async fn try_fetch_network_metadata(
             .ok()
             .filter(|m| *m != Metadata::new())
         {
-            let _ =
-                CachedGraphUser::upsert_metadata_only(&pk, &metadata, &whitenoise.database).await;
+            let _ = CachedGraphUser::upsert_metadata_only(
+                &pk,
+                &metadata,
+                CONFIDENT_CACHE_TTL_MS,
+                &whitenoise.database,
+            )
+            .await;
             found.insert(pk, metadata);
         }
     }
@@ -330,9 +335,13 @@ pub(super) async fn try_fetch_user_relay_metadata(
                 .and_then(|e| serde_json::from_str::<Metadata>(&e.content).ok())
                 .filter(|m| *m != Metadata::new())
             {
-                let _ =
-                    CachedGraphUser::upsert_metadata_only(pubkey, &metadata, &whitenoise.database)
-                        .await;
+                let _ = CachedGraphUser::upsert_metadata_only(
+                    pubkey,
+                    &metadata,
+                    CONFIDENT_CACHE_TTL_MS,
+                    &whitenoise.database,
+                )
+                .await;
                 UserRelayResult::Found(Box::new(metadata))
             } else {
                 UserRelayResult::Eose

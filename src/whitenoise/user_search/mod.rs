@@ -18,7 +18,9 @@ mod types;
 
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
-use crate::whitenoise::cached_graph_user::CachedGraphUser;
+use crate::whitenoise::cached_graph_user::{
+    CONFIDENT_CACHE_TTL_MS, CachedGraphUser, UNCERTAIN_CACHE_TTL_MS,
+};
 use crate::whitenoise::error::Result;
 
 /// Timeout for fetching data at each radius level (seconds).
@@ -1109,9 +1111,13 @@ async fn process_tier4_result(
         } else if !result.tier3_failed {
             // No relay list + tier 3 EOSE → confirmed absent, cache empty
             metrics.t4_no_relays_cached.fetch_add(1, Ordering::Relaxed);
-            let _ =
-                CachedGraphUser::upsert_metadata_only(pk, &Metadata::new(), &whitenoise.database)
-                    .await;
+            let _ = CachedGraphUser::upsert_metadata_only(
+                pk,
+                &Metadata::new(),
+                CONFIDENT_CACHE_TTL_MS,
+                &whitenoise.database,
+            )
+            .await;
         } else {
             // No relay list + tier 3 failed → don't cache (uncertain), just drop
             metrics.t4_no_relays_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1329,7 +1335,13 @@ fn process_tier5_result(
             let pk = result.pubkey;
             let db = whitenoise.database.clone();
             tokio::spawn(async move {
-                let _ = CachedGraphUser::upsert_metadata_only(&pk, &Metadata::new(), &db).await;
+                let _ = CachedGraphUser::upsert_metadata_only(
+                    &pk,
+                    &Metadata::new(),
+                    CONFIDENT_CACHE_TTL_MS,
+                    &db,
+                )
+                .await;
             });
         }
         graph::UserRelayResult::Error => {
@@ -1343,17 +1355,21 @@ fn process_tier5_result(
                 ));
             } else {
                 metrics.t5_error_exhausted.fetch_add(1, Ordering::Relaxed);
-                // Cache as empty despite uncertainty. We've tried default relays
+                // Cache as empty with a short TTL. We've tried default relays
                 // (T3), discovered this user's preferred relays (T4), and retried
                 // fetching from those relays (T5) — all without finding metadata.
-                // It's possible the user does have metadata on a relay that was
-                // temporarily unreachable, but caching empty here prevents these
-                // pubkeys from causing repeated timeouts on subsequent searches.
-                // The cache entry will expire naturally, allowing a fresh lookup later.
+                // Unlike confident misses (EOSE), relay errors are transient, so
+                // we use a shorter TTL to allow re-discovery soon.
                 let pk = result.pubkey;
                 let db = whitenoise.database.clone();
                 tokio::spawn(async move {
-                    let _ = CachedGraphUser::upsert_metadata_only(&pk, &Metadata::new(), &db).await;
+                    let _ = CachedGraphUser::upsert_metadata_only(
+                        &pk,
+                        &Metadata::new(),
+                        UNCERTAIN_CACHE_TTL_MS,
+                        &db,
+                    )
+                    .await;
                 });
             }
         }
