@@ -1038,6 +1038,13 @@ impl RelaySession {
                                             ) {
                                                 Ok(()) => {}
                                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                    tracing::warn!(
+                                                        target: "whitenoise::relay_control::sessions",
+                                                        relay_url = %relay_url,
+                                                        subscription_id = %subscription_id,
+                                                        event_id = %event.id,
+                                                        "Event channel closed, dropping routed event"
+                                                    );
                                                     return Ok(true);
                                                 }
                                                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1147,6 +1154,11 @@ impl RelaySession {
                 )) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Notice"
+                        );
                         return Ok(true);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1177,6 +1189,11 @@ impl RelaySession {
                 )) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Closed"
+                        );
                         return Ok(true);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1207,6 +1224,11 @@ impl RelaySession {
                 )) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Auth"
+                        );
                         return Ok(true);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1562,5 +1584,65 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_process_notification_exits_when_channel_closed() {
+        let (sender, receiver) = mpsc::channel(8);
+        drop(receiver);
+        let (telemetry_sender, _) = broadcast::channel(8);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        let result = RelaySession::process_notification(
+            RelayNotification::Notice {
+                relay_url,
+                message: "test".to_string(),
+                failure_category: None,
+            },
+            RelayPlane::Discovery,
+            None,
+            &sender,
+            &telemetry_sender,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result,
+            "expected Ok(true) to signal handler exit on closed channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_notification_warns_and_continues_when_channel_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        // Fill the channel so the next send returns Full.
+        sender
+            .try_send(ProcessableEvent::RelayMessage(
+                RelayUrl::parse("wss://relay.example.com").unwrap(),
+                "filler".to_string(),
+            ))
+            .unwrap();
+        let (telemetry_sender, _) = broadcast::channel(8);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        let result = RelaySession::process_notification(
+            RelayNotification::Notice {
+                relay_url,
+                message: "test".to_string(),
+                failure_category: None,
+            },
+            RelayPlane::Discovery,
+            None,
+            &sender,
+            &telemetry_sender,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result,
+            "expected Ok(false) to continue when channel is full"
+        );
     }
 }
