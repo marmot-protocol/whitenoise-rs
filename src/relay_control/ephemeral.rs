@@ -228,8 +228,10 @@ impl EphemeralPlane {
                 .collect(),
         };
         let event_builder = EventBuilder::new(relay_type.into(), "").tags(tags);
+        let account_pubkey = signer.get_public_key().await?;
+        let event = event_builder.sign(&signer).await?;
 
-        self.publish_event_builder_with_signer(event_builder, target_relays, signer)
+        self.publish_event_with_quorum(event, &account_pubkey, target_relays, 2)
             .await?;
 
         Ok(())
@@ -383,6 +385,123 @@ impl EphemeralPlane {
         }
 
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
+    }
+
+    #[perf_instrument("relay")]
+    pub(crate) async fn publish_event_with_quorum(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        early_return_threshold: usize,
+    ) -> Result<Output<EventId>> {
+        let result = self
+            .executor
+            .publish_event_to_scope_quorum(
+                Some(*account_pubkey),
+                relays,
+                &event,
+                early_return_threshold,
+            )
+            .await?;
+
+        if result.output.success.is_empty() {
+            return Err(NostrManagerError::NoRelayAccepted);
+        }
+
+        if let Err(error) = self
+            .track_published_event(result.output.id(), account_pubkey)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::relay_control::ephemeral",
+                account_pubkey = %account_pubkey,
+                event_id = %result.output.id(),
+                "Quorum publish succeeded but event tracking failed: {error}"
+            );
+        }
+
+        let retry_relays: Vec<RelayUrl> = result
+            .pending
+            .into_iter()
+            .chain(result.output.failed.keys().cloned())
+            .collect();
+
+        if !retry_relays.is_empty() {
+            let executor = self.executor.clone();
+            let account_pubkey = *account_pubkey;
+
+            tokio::spawn(async move {
+                Self::retry_failed_relays(executor, event, account_pubkey, retry_relays).await;
+            });
+        }
+
+        Ok(result.output)
+    }
+
+    async fn retry_failed_relays(
+        executor: EphemeralExecutor,
+        event: Event,
+        account_pubkey: PublicKey,
+        mut remaining_relays: Vec<RelayUrl>,
+    ) {
+        const MAX_RETRIES: u32 = 4;
+
+        for attempt in 0..MAX_RETRIES {
+            let delay = Duration::from_secs(2u64.pow(attempt + 1)); // 2s, 4s, 8s, 16s
+            tokio::time::sleep(delay).await;
+
+            match executor
+                .publish_event_to_scope(Some(account_pubkey), &remaining_relays, &event)
+                .await
+            {
+                Ok(output) => {
+                    remaining_relays.retain(|u| !output.success.contains(u));
+
+                    if remaining_relays.is_empty() {
+                        tracing::debug!(
+                            target: "whitenoise::relay_control::ephemeral",
+                            account_pubkey = %account_pubkey,
+                            event_id = %event.id,
+                            attempt = attempt + 1,
+                            "Background retry: all relays succeeded"
+                        );
+                        return;
+                    }
+
+                    tracing::debug!(
+                        target: "whitenoise::relay_control::ephemeral",
+                        account_pubkey = %account_pubkey,
+                        event_id = %event.id,
+                        attempt = attempt + 1,
+                        succeeded = output.success.len(),
+                        remaining = remaining_relays.len(),
+                        "Background retry: partial progress"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::relay_control::ephemeral",
+                        account_pubkey = %account_pubkey,
+                        event_id = %event.id,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        "Background relay retry failed: {e}"
+                    );
+                }
+            }
+        }
+
+        if !remaining_relays.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::relay_control::ephemeral",
+                account_pubkey = %account_pubkey,
+                event_id = %event.id,
+                relays = ?remaining_relays,
+                "Background retry exhausted: {} relays never accepted the event",
+                remaining_relays.len()
+            );
+        }
     }
 
     #[perf_instrument("relay")]
