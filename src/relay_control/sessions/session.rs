@@ -1030,21 +1030,25 @@ impl RelaySession {
                                         for target_context in
                                             Self::dedupe_contexts(target_contexts)
                                         {
-                                            if sender
-                                                .send(ProcessableEvent::new_routed_nostr_event(
+                                            match sender.try_send(
+                                                ProcessableEvent::new_routed_nostr_event(
                                                     event.as_ref().clone(),
                                                     target_context,
-                                                ))
-                                                .await
-                                                .is_err()
-                                            {
-                                                tracing::warn!(
-                                                    target: "whitenoise::relay_control::sessions",
-                                                    relay_url = %relay_url,
-                                                    subscription_id = %subscription_id,
-                                                    event_id = %event.id,
-                                                    "Event channel closed, dropping routed event"
-                                                );
+                                                ),
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                    return Ok(true);
+                                                }
+                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                    tracing::warn!(
+                                                        target: "whitenoise::relay_control::sessions",
+                                                        relay_url = %relay_url,
+                                                        subscription_id = %subscription_id,
+                                                        event_id = %event.id,
+                                                        "Event channel full, dropping routed event"
+                                                    );
+                                                }
                                             }
                                         }
                                     } else {
@@ -1137,19 +1141,21 @@ impl RelaySession {
                 message,
                 failure_category,
             } => {
-                if sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Notice".to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        target: "whitenoise::relay_control::sessions",
-                        %relay_url,
-                        "Event channel closed, dropping Notice"
-                    );
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Notice".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Notice"
+                        );
+                    }
                 }
                 let mut telemetry = RelayTelemetry::notice(plane, relay_url, &message);
                 if let Some(failure_category) = failure_category {
@@ -1165,19 +1171,21 @@ impl RelaySession {
                 message,
                 failure_category,
             } => {
-                if sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Closed".to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        target: "whitenoise::relay_control::sessions",
-                        %relay_url,
-                        "Event channel closed, dropping Closed"
-                    );
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Closed".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Closed"
+                        );
+                    }
                 }
                 let mut telemetry = RelayTelemetry::closed(plane, relay_url, &message);
                 if let Some(failure_category) = failure_category {
@@ -1193,19 +1201,21 @@ impl RelaySession {
                 challenge,
                 failure_category,
             } => {
-                if sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Auth".to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        target: "whitenoise::relay_control::sessions",
-                        %relay_url,
-                        "Event channel closed, dropping Auth"
-                    );
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Auth".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Auth"
+                        );
+                    }
                 }
                 let mut telemetry = RelayTelemetry::auth_challenge(plane, relay_url, &challenge);
                 if let Some(failure_category) = failure_category {
