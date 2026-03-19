@@ -122,23 +122,22 @@ impl EphemeralExecutor {
         let _span = perf_span!("relay::ephemeral_remove_account_scope");
         let entry = self.sessions.write().await.remove(&Some(*account_pubkey));
         if let Some(entry) = entry {
-            entry.telemetry_handle.abort();
-            entry.session.shutdown().await;
+            entry.shutdown().await;
         }
     }
 
-    pub(crate) async fn remove_all_account_scopes(&self) {
-        let _span = perf_span!("relay::ephemeral_remove_all_account_scopes");
-        let account_keys = self
+    pub(crate) async fn remove_all_scopes(&self) {
+        let _span = perf_span!("relay::ephemeral_remove_all_scopes");
+        let entries = self
             .sessions
-            .read()
+            .write()
             .await
-            .keys()
-            .filter_map(|key| *key)
+            .drain()
+            .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
 
-        for account_pubkey in account_keys {
-            self.remove_account_scope(&account_pubkey).await;
+        for entry in entries {
+            entry.shutdown().await;
         }
     }
 
@@ -291,6 +290,11 @@ impl EphemeralExecutor {
 }
 
 impl EphemeralSessionEntry {
+    async fn shutdown(&self) {
+        self.telemetry_handle.abort();
+        self.session.shutdown().await;
+    }
+
     async fn pin_relays(&self, relays: &[RelayUrl]) -> Result<()> {
         let unique_relays: HashSet<RelayUrl> = relays.iter().cloned().collect();
 

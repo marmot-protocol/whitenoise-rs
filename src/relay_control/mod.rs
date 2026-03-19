@@ -370,7 +370,7 @@ impl RelayControlPlane {
         // orphaned entries (e.g. from partial activation failures) are
         // cleaned up, not just accounts that had inbox planes.
         self.group_plane.reset().await;
-        self.ephemeral.remove_all_account_scopes().await;
+        self.ephemeral.remove_all_scopes().await;
     }
 
     #[perf_instrument("relay")]
@@ -615,7 +615,7 @@ impl RelayControlPlane {
         }
 
         self.group_plane.reset().await;
-        self.ephemeral.remove_all_account_scopes().await;
+        self.ephemeral.remove_all_scopes().await;
         Ok(())
     }
 }
@@ -877,5 +877,32 @@ mod tests {
         assert_eq!(snapshot.ephemeral.account_scope_count, 0);
         assert!(snapshot.ephemeral.anonymous.is_none());
         assert!(snapshot.ephemeral.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_all_clears_all_ephemeral_scopes() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+        let anonymous_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+        let account_relay = RelayUrl::parse("ws://127.0.0.1:2").unwrap();
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+
+        let _ = relay_control
+            .warm_ephemeral_relays(std::slice::from_ref(&anonymous_relay))
+            .await;
+        let _ = relay_control
+            .warm_ephemeral_relays_for_account(account_pubkey, std::slice::from_ref(&account_relay))
+            .await;
+
+        let before = relay_control.snapshot().await;
+        assert!(before.ephemeral.anonymous.is_some());
+        assert_eq!(before.ephemeral.account_scope_count, 1);
+
+        relay_control.shutdown_all().await;
+
+        let after = relay_control.snapshot().await;
+        assert!(after.ephemeral.anonymous.is_none());
+        assert_eq!(after.ephemeral.account_scope_count, 0);
     }
 }

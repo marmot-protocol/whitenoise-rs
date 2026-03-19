@@ -111,8 +111,8 @@ impl EphemeralPlane {
     }
 
     #[perf_instrument("relay")]
-    pub(crate) async fn remove_all_account_scopes(&self) {
-        self.executor.remove_all_account_scopes().await;
+    pub(crate) async fn remove_all_scopes(&self) {
+        self.executor.remove_all_scopes().await;
     }
 
     #[perf_instrument("relay")]
