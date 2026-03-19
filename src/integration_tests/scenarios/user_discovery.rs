@@ -45,18 +45,18 @@ impl Scenario for UserDiscoveryScenario {
             .execute(&mut self.context)
             .await?;
 
-        tracing::info!("Testing: Background mode (force_sync=false) for new user");
+        tracing::info!("Testing: Background mode for new user");
         FindOrCreateUserBackgroundModeTestCase::new()
             .execute(&mut self.context)
             .await?;
 
-        tracing::info!("Testing: Force sync on existing user with updated metadata");
-        FindOrCreateUserForceSyncOnExistingTestCase::new()
+        tracing::info!("Testing: Older relay metadata cannot overwrite newer processed metadata");
+        FindOrCreateUserPreservesNewerProcessedMetadataTestCase::new()
             .execute(&mut self.context)
             .await?;
 
-        tracing::info!("Testing: Stale metadata refresh (force_sync=false)");
-        FindOrCreateUserStaleMetadataRefreshTestCase::new()
+        tracing::info!("Testing: Unknown metadata remains unknown when discovery finds nothing");
+        FindOrCreateUserUnknownMetadataNoResultTestCase::new()
             .execute(&mut self.context)
             .await?;
 

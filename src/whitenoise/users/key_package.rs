@@ -25,7 +25,8 @@ impl User {
     /// Fallback order:
     /// 1. User's KeyPackage relays (kind 10051)
     /// 2. User's NIP-65 relays (kind 10002)
-    /// 3. Whitenoise discovery/fallback relays
+    /// 3. Default account relays used for bootstrap in local/dev setups
+    /// 4. Whitenoise discovery/fallback relays
     #[perf_instrument("users")]
     pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
         let kp_relays = self
@@ -48,7 +49,18 @@ impl User {
 
         tracing::warn!(
             target: "whitenoise::users::key_package",
-            "User {} has no NIP-65 relays either, using fallback relays",
+            "User {} has no NIP-65 relays either, trying default relays",
+            self.pubkey
+        );
+
+        let default_relays = Relay::urls(&Relay::defaults());
+        if !default_relays.is_empty() {
+            return Ok(default_relays);
+        }
+
+        tracing::warn!(
+            target: "whitenoise::users::key_package",
+            "User {} has no default relays available either, using fallback relays",
             self.pubkey
         );
 

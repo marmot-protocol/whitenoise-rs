@@ -4,7 +4,7 @@ use crate::integration_tests::core::*;
 use async_trait::async_trait;
 use nostr_sdk::{Keys, Metadata, RelayUrl};
 
-/// Tests find_or_create_user with force_sync=true (synchronous/blocking mode)
+/// Tests find_or_create_user with `UserSyncMode::Blocking`.
 ///
 /// This test verifies:
 /// - User creation when user doesn't exist
@@ -12,8 +12,7 @@ use nostr_sdk::{Keys, Metadata, RelayUrl};
 /// - Synchronous relay list fetching (blocking until complete)
 /// - Idempotency (calling twice returns the same user)
 ///
-/// LIMITATION: This test only covers force_sync=true. For force_sync=false
-/// (background mode), see FindOrCreateUserBackgroundModeTestCase.
+/// For background behavior, see `FindOrCreateUserBackgroundModeTestCase`.
 pub struct FindOrCreateUserTestCase {
     test_keys: Keys,
     should_have_metadata: bool,
@@ -120,7 +119,7 @@ impl TestCase for FindOrCreateUserTestCase {
             .find_or_create_user_by_pubkey(
                 &test_pubkey,
                 crate::whitenoise::users::UserSyncMode::Blocking,
-            ) // force synchronous metadata sync
+            )
             .await?;
 
         assert_eq!(user.pubkey, test_pubkey, "User pubkey should match");

@@ -494,6 +494,7 @@ impl Account {
         tracing::debug!(target: "whitenoise::accounts", "Updating metadata for account: {:?}", self.pubkey);
         let mut user = self.user(&whitenoise.database).await?;
         user.metadata = metadata.clone();
+        user.mark_metadata_known_now();
         user.save(&whitenoise.database).await?;
         whitenoise.background_publish_account_metadata(self).await?;
         Ok(())

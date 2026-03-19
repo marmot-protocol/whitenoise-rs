@@ -1429,6 +1429,54 @@ pub mod test_utils {
         (whitenoise, data_temp, logs_temp)
     }
 
+    pub(crate) async fn create_mock_whitenoise_with_event_receiver() -> (
+        Whitenoise,
+        mpsc::Receiver<ProcessableEvent>,
+        TempDir,
+        TempDir,
+    ) {
+        Whitenoise::initialize_mock_keyring_store();
+
+        wait_for_test_relays().await;
+
+        let (config, data_temp, logs_temp) = create_test_config();
+
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        std::fs::create_dir_all(&config.logs_dir).unwrap();
+
+        init_tracing(&config.logs_dir);
+
+        let database = Arc::new(
+            Database::new(config.data_dir.join("test.sqlite"))
+                .await
+                .unwrap(),
+        );
+        let secrets_store = SecretsStore::new(&config.keyring_service_id);
+        let (event_sender, event_receiver) = mpsc::channel(10);
+        let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
+        let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
+        let test_event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
+            Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone()));
+        let storage = storage::Storage::new(data_temp.path()).await.unwrap();
+        let message_aggregator = message_aggregator::MessageAggregator::new();
+        let whitenoise = Whitenoise::from_components(
+            config,
+            database,
+            WhitenoiseComponents {
+                event_tracker: test_event_tracker,
+                secrets_store,
+                storage,
+                message_aggregator,
+                event_sender,
+                shutdown_sender,
+                scheduler_shutdown,
+            },
+        );
+        whitenoise.relay_control.start_telemetry_persistors().await;
+
+        (whitenoise, event_receiver, data_temp, logs_temp)
+    }
+
     /// Wait for local test relays to be ready
     async fn wait_for_test_relays() {
         use std::time::Duration;

@@ -1152,7 +1152,7 @@ mod tests {
         let _mock = server
             .mock("GET", test_path().as_str())
             .with_status(200)
-            .with_body(body.as_ref())
+            .with_body(&body[..])
             .create_async()
             .await;
 

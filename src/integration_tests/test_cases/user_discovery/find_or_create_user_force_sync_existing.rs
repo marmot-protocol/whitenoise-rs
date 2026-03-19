@@ -2,122 +2,62 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::create_test_client;
 use crate::integration_tests::core::*;
 use async_trait::async_trait;
-use nostr_sdk::{Keys, Metadata};
+use nostr_sdk::{EventBuilder, Keys, Metadata, Timestamp};
 
-/// Tests find_or_create_user with force_sync=true on an EXISTING user
+/// Tests that targeted discovery cannot overwrite newer already-processed metadata.
 ///
-/// This test verifies:
-/// - force_sync=true ALWAYS syncs metadata, even if just fetched
-/// - Ignores the TTL logic (24h freshness check)
-/// - Can fetch updated metadata that was published after user creation
-///
-/// This demonstrates that force_sync=true overrides the TTL optimization
-/// and is useful when you know metadata has changed and want it immediately.
-///
-/// TESTS CODE PATH: Lines 651-688 in users.rs (force_sync=true, existing user)
-pub struct FindOrCreateUserForceSyncOnExistingTestCase {
+/// This simulates a legacy row whose `metadata_known_at` is still `NULL` even
+/// though a newer metadata event has already been processed. A subsequent
+/// blocking lookup must not let an older relay result clobber the stored
+/// metadata.
+pub struct FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
     test_keys: Keys,
-    initial_metadata: Metadata,
-    updated_metadata: Metadata,
+    newer_metadata: Metadata,
+    older_metadata: Metadata,
 }
 
-impl FindOrCreateUserForceSyncOnExistingTestCase {
+impl FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for FindOrCreateUserForceSyncOnExistingTestCase {
+impl Default for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
     fn default() -> Self {
-        let keys = Keys::generate();
         Self {
-            test_keys: keys,
-            initial_metadata: Metadata::new()
-                .name("Initial Name")
-                .display_name("Initial Display"),
-            updated_metadata: Metadata::new()
-                .name("Updated Name")
-                .display_name("Updated Display"),
+            test_keys: Keys::generate(),
+            newer_metadata: Metadata::new()
+                .name("Newer Name")
+                .display_name("Newer Display"),
+            older_metadata: Metadata::new()
+                .name("Older Name")
+                .display_name("Older Display"),
         }
     }
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserForceSyncOnExistingTestCase {
+impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
-            "Testing force_sync=true on existing user with fresh metadata for pubkey: {}",
+            "Testing targeted discovery ordering for legacy unknown metadata on pubkey: {}",
             test_pubkey
         );
 
-        // Create identity so we can subscribe
-        context.whitenoise.create_identity().await?;
+        let newer_timestamp = Timestamp::now();
+        let older_timestamp = Timestamp::from(newer_timestamp.as_secs().saturating_sub(3600));
 
-        // Publish initial metadata
-        let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
-
-        tracing::info!("Publishing initial metadata");
-        test_client
-            .send_event_builder(nostr_sdk::EventBuilder::metadata(&self.initial_metadata))
-            .await?;
-
-        // Wait for event to propagate to relay
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        test_client.disconnect().await;
-
-        // Create user with Blocking mode (call once to avoid refreshing timestamp)
-        context
-            .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
+        let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+        client
+            .send_event_builder(
+                EventBuilder::metadata(&self.newer_metadata).custom_created_at(newer_timestamp),
             )
             .await?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-        // Wait for metadata to be fetched and processed
         let initial_user = retry_default(
-            || async {
-                let user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
-                if user.metadata.name == self.initial_metadata.name {
-                    Ok(user)
-                } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Initial metadata not yet fetched: got {:?}, expecting {:?}",
-                        user.metadata.name,
-                        self.initial_metadata.name
-                    )))
-                }
-            },
-            &format!(
-                "wait for initial metadata fetch for user {}",
-                &test_pubkey.to_hex()[..8]
-            ),
-        )
-        .await?;
-
-        tracing::info!("✓ User created with initial metadata");
-
-        // Small delay to ensure the first metadata event is fully processed
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        // Publish updated metadata
-        let test_client2 = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
-
-        tracing::info!("Publishing updated metadata");
-        test_client2
-            .send_event_builder(nostr_sdk::EventBuilder::metadata(&self.updated_metadata))
-            .await?;
-
-        // Wait for the event to be published and propagate to relay
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        test_client2.disconnect().await;
-
-        // Call find_or_create with Blocking mode on existing user
-        // This should force a sync even though metadata was just fetched
-        // NOTE: We use retry here because the relay might take a moment to make the event available
-        let updated_user = retry_default(
             || async {
                 let user = context
                     .whitenoise
@@ -127,33 +67,64 @@ impl TestCase for FindOrCreateUserForceSyncOnExistingTestCase {
                     )
                     .await?;
 
-                if user.metadata.name == self.updated_metadata.name {
+                if user.metadata.name == self.newer_metadata.name {
                     Ok(user)
                 } else {
                     Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Updated metadata not yet fetched: still has {:?}, expecting {:?}",
-                        user.metadata.name,
-                        self.updated_metadata.name
+                        "Expected newer metadata to be processed first, got {:?}",
+                        user.metadata.name
                     )))
                 }
             },
             &format!(
-                "wait for blocking sync to fetch updated metadata for user {}",
+                "wait for blocking discovery to process newer metadata for user {}",
                 &test_pubkey.to_hex()[..8]
             ),
         )
         .await?;
 
-        assert_eq!(
-            updated_user.id, initial_user.id,
-            "Should return same user ID"
-        );
-        assert_eq!(
-            updated_user.metadata.name, self.updated_metadata.name,
-            "Should have updated metadata after force sync"
+        assert!(
+            initial_user.metadata_known_at.is_some(),
+            "Initial blocking lookup should mark metadata as known"
         );
 
-        tracing::info!("✓ Force sync on existing user successfully fetched updated metadata");
+        context
+            .whitenoise
+            .set_user_metadata_known_at_for_testing(&test_pubkey, None)
+            .await?;
+
+        let legacy_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
+        assert!(
+            legacy_user.metadata_known_at.is_none(),
+            "Legacy repair simulation should clear metadata_known_at"
+        );
+        assert_eq!(legacy_user.metadata.name, self.newer_metadata.name);
+
+        client
+            .send_event_builder(
+                EventBuilder::metadata(&self.older_metadata).custom_created_at(older_timestamp),
+            )
+            .await?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        client.disconnect().await;
+
+        let user_after = context
+            .whitenoise
+            .find_or_create_user_by_pubkey(
+                &test_pubkey,
+                crate::whitenoise::users::UserSyncMode::Blocking,
+            )
+            .await?;
+
+        assert_eq!(
+            user_after.metadata.name, self.newer_metadata.name,
+            "Older relay metadata must not overwrite newer processed metadata"
+        );
+
+        let stored_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
+        assert_eq!(stored_user.metadata.name, self.newer_metadata.name);
+
+        tracing::info!("✓ Older targeted discovery result did not overwrite newer metadata");
 
         Ok(())
     }
