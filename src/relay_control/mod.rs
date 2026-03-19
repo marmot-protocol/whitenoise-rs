@@ -347,13 +347,17 @@ impl RelayControlPlane {
             telemetry_receiver,
         );
 
-        if let Some(previous_entry) = self.account_inbox_planes.write().await.insert(
-            account_pubkey,
-            AccountInboxEntry {
-                plane,
-                telemetry_handle,
-            },
-        ) {
+        let previous_entry = {
+            let mut map = self.account_inbox_planes.write().await;
+            map.insert(
+                account_pubkey,
+                AccountInboxEntry {
+                    plane,
+                    telemetry_handle,
+                },
+            )
+        };
+        if let Some(previous_entry) = previous_entry {
             previous_entry.deactivate().await;
         }
 
@@ -377,12 +381,11 @@ impl RelayControlPlane {
         let account_lock = self.account_inbox_activation_lock(*account_pubkey).await;
         let _account_guard = account_lock.lock().await;
 
-        if let Some(entry) = self
-            .account_inbox_planes
-            .write()
-            .await
-            .remove(account_pubkey)
-        {
+        let entry = {
+            let mut map = self.account_inbox_planes.write().await;
+            map.remove(account_pubkey)
+        };
+        if let Some(entry) = entry {
             entry.deactivate().await;
         }
 
@@ -412,6 +415,7 @@ impl RelayControlPlane {
         // cleaned up, not just accounts that had inbox planes.
         self.group_plane.reset().await;
         self.ephemeral.remove_all_scopes().await;
+        self.account_inbox_activation_locks.lock().await.clear();
     }
 
     #[perf_instrument("relay")]
@@ -658,6 +662,7 @@ impl RelayControlPlane {
         self.abort_control_plane_telemetry_persistors().await;
         self.group_plane.reset().await;
         self.ephemeral.remove_all_scopes().await;
+        self.account_inbox_activation_locks.lock().await.clear();
         Ok(())
     }
 }
