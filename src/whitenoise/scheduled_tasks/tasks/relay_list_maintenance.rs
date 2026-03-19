@@ -366,6 +366,36 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn test_maintain_relay_lists_skips_when_no_local_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
+
+        // Create a bare account with no relay config — simulates an account
+        // where relay list publishing failed and no local relays were saved.
+        let keys = nostr_sdk::Keys::generate();
+        let account = Account::new_external(whitenoise, keys.public_key())
+            .await
+            .unwrap();
+        let account = account.save(&whitenoise.database).await.unwrap();
+
+        // Verify no local relays exist
+        let inbox = account.inbox_relays(whitenoise).await.unwrap();
+        let kp = account.key_package_relays(whitenoise).await.unwrap();
+        assert!(inbox.is_empty(), "Should have no inbox relays");
+        assert!(kp.is_empty(), "Should have no key package relays");
+
+        // Run maintain_relay_lists directly — both types should be Skipped
+        let results = maintain_relay_lists(whitenoise, &account).await;
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, MaintenanceResult::Skipped)),
+            "Both relay types should be skipped when no local relays exist"
+        );
+    }
+
     #[test]
     fn test_constants() {
         assert_eq!(MAX_CONCURRENT_ACCOUNTS, 5);
