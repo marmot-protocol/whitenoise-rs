@@ -117,7 +117,7 @@ jobs:
             echo "No changes to hotspot digest"
           else
             git commit -m "hotspot digest ${{ steps.hotspot.outputs.ts }} from $(git -C .. rev-parse --short HEAD)"
-            git push
+            git push --set-upstream origin perf-hotspot
           fi
 
       - name: Update GitHub hotspot issue
@@ -170,6 +170,9 @@ jobs:
                   const scenarioName = mdSafe(h.scenario_name);
                   hotspotTable += `| ${h.rank} | \`${spanName}\` | ${scenarioName} | ${mean} | ${h.contribution_pct.toFixed(1)}% | ${trend} | ${h.hotspot_score.toFixed(2)} |\n`;
                 }
+                if (!benchmarkOk) {
+                  hotspotTable = '\n\n⚠️ Partial benchmark run — some scenarios may be missing.' + hotspotTable;
+                }
               } catch (_) {
                 hotspotTable = '\n\n*(Error reading hotspot data)*';
               }
@@ -186,11 +189,19 @@ jobs:
                 body,
               });
             } else {
-              await github.rest.issues.create({
+              const newIssue = await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title: 'Performance Hotspot Digest',
                 body,
                 labels: ['perf-hotspot'],
+              });
+              await github.graphql(`
+                mutation($issueId:ID!) {
+                  pinIssue(input: {issueId: $issueId}) {
+                    issue { id }
+                  }
+                }`, {
+                issueId: newIssue.data.node_id
               });
             }

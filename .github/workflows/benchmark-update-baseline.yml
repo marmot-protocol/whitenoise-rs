@@ -2,11 +2,6 @@ name: Update Performance Baseline
 
 on:
   workflow_dispatch:
-    inputs:
-      scenario:
-        description: "Scenario name to baseline (leave empty for all scenarios)"
-        required: false
-        default: ""
 
 permissions:
   contents: write
@@ -52,17 +47,13 @@ jobs:
           ./scripts/wait_for_relays.sh
 
       - name: Run benchmarks
-        env:
-          SCENARIO: ${{ github.event.inputs.scenario }}
-        run: just benchmark-json "$SCENARIO"
+        run: just benchmark-json
 
       - name: Stop Docker Compose services
         if: always()
         run: docker compose down -v
 
       - name: Copy result to baseline
-        env:
-          SCENARIO: ${{ github.event.inputs.scenario }}
         run: |
           # Use a glob array rather than ls -t | head -1 so that an empty match
           # does not cause errexit to fire before the explicit error check runs.
@@ -75,7 +66,7 @@ jobs:
           fi
           # Pick the newest file by modification time.
           RESULT=$(printf '%s\n' "${files[@]}" | xargs ls -t | head -1)
-          BASELINE_NAME="baseline-${SCENARIO:-all}.json"
+          BASELINE_NAME="baseline-all.json"
           cp "$RESULT" "perf-hotspot-data/$BASELINE_NAME"
           echo "Copied $RESULT → perf-hotspot-data/$BASELINE_NAME"
           echo "baseline_name=$BASELINE_NAME" >> "$GITHUB_ENV"
