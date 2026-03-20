@@ -1047,7 +1047,7 @@ impl Whitenoise {
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
                     tracing::warn!(
-                        target: "whitenoise::mod",
+                        target: "whitenoise",
                         "subscription drain lagged by {n} user updates"
                     );
                     continue;
