@@ -1316,16 +1316,43 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Checks if account subscriptions are operational
+    /// Checks if account subscriptions are operational.
     ///
-    /// Returns true if the account inbox plane exists and at least one of its
-    /// relays is connected or connecting.
+    /// Returns true when:
+    /// 1. The inbox plane and group plane both have connected relays, AND
+    /// 2. The number of groups in the group plane matches MDK's active groups.
+    ///
+    /// The group count parity check catches groups that were added to MDK
+    /// (e.g. via `accept_welcome`) but never made it into the group plane
+    /// (e.g. because the background subscription setup failed on mobile).
     #[perf_instrument("whitenoise")]
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
-        Ok(self
+        let relay_healthy = self
             .relay_control
             .has_account_subscriptions(&account.pubkey)
-            .await)
+            .await;
+
+        if !relay_healthy {
+            return Ok(false);
+        }
+
+        let mdk_count = self.active_group_count(account)?;
+        let plane_count = self
+            .relay_control
+            .group_plane_account_group_count(&account.pubkey)
+            .await;
+
+        if mdk_count != plane_count {
+            tracing::info!(
+                target: "whitenoise::is_account_subscriptions_operational",
+                account = %account.pubkey.to_hex(),
+                mdk_groups = mdk_count,
+                plane_groups = plane_count,
+                "Group count mismatch between MDK and group plane",
+            );
+        }
+
+        Ok(mdk_count == plane_count)
     }
 
     /// Checks if global subscriptions are operational without refreshing.
@@ -2189,6 +2216,87 @@ mod tests {
             assert!(
                 is_operational,
                 "Account should be operational after create_identity"
+            );
+        }
+
+        /// When MDK has more active groups than the group plane, the parity
+        /// check should detect the mismatch and report non-operational.
+        #[tokio::test]
+        async fn test_is_account_operational_detects_group_count_mismatch() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let creator_account = whitenoise.create_identity().await.unwrap();
+            let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+            let member_pubkey = members[0].0.pubkey;
+            wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
+
+            // Starts operational (0 groups in MDK, 0 in plane)
+            assert!(
+                whitenoise
+                    .is_account_subscriptions_operational(&creator_account)
+                    .await
+                    .unwrap(),
+                "Should be operational with zero groups"
+            );
+
+            // Create a group — this adds it to MDK and (via background task)
+            // to the group plane
+            let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+            whitenoise
+                .create_group(&creator_account, vec![member_pubkey], config, None)
+                .await
+                .unwrap();
+
+            // Tear down subscriptions to simulate the welcome-processing
+            // cascade failure (group exists in MDK but not in group plane)
+            whitenoise
+                .relay_control
+                .deactivate_account_subscriptions(&creator_account.pubkey)
+                .await;
+
+            // Re-activate inbox only (without groups) to isolate the test
+            // to the group count parity check — inbox is healthy, groups are not
+            let signer = whitenoise.get_signer_for_account(&creator_account).unwrap();
+            let inbox_relays = crate::whitenoise::relays::Relay::urls(
+                &creator_account
+                    .effective_inbox_relays(&whitenoise)
+                    .await
+                    .unwrap(),
+            );
+            whitenoise
+                .relay_control
+                .activate_account_subscriptions(
+                    creator_account.pubkey,
+                    &inbox_relays,
+                    &[], // empty group specs — simulates the missing group
+                    creator_account.since_timestamp(10),
+                    signer,
+                )
+                .await
+                .unwrap();
+
+            let is_operational = whitenoise
+                .is_account_subscriptions_operational(&creator_account)
+                .await
+                .unwrap();
+            assert!(
+                !is_operational,
+                "Should detect mismatch: MDK has 1 group, plane has 0"
+            );
+
+            // Recovery via ensure should fix it
+            whitenoise
+                .ensure_account_subscriptions(&creator_account)
+                .await
+                .unwrap();
+
+            let is_operational = whitenoise
+                .is_account_subscriptions_operational(&creator_account)
+                .await
+                .unwrap();
+            assert!(
+                is_operational,
+                "Should be operational after ensure recovery"
             );
         }
 
