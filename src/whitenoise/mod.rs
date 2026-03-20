@@ -986,23 +986,32 @@ impl Whitenoise {
         // 4. Drain any updates that landed between subscribe() and the DB fetch.
         //    These are messages that were persisted and broadcast while the query was in
         //    flight. Without this drain they would be missing from the snapshot even though
-        //    they are already in the database. Always insert: either the message is already
-        //    in the map (update replaces stale DB row) or it arrived just after the query
-        //    cut-off (new message that belongs in the snapshot). The live `updates` receiver
-        //    returned to the caller covers all future messages; this loop only closes the
-        //    narrow race window on the initial snapshot.
+        //    they are already in the database. For NewMessage triggers, always insert: either
+        //    the message is already in the map (update replaces stale DB row) or it arrived
+        //    just after the query cut-off (new message that belongs in the snapshot). For
+        //    other triggers, only apply the update if the message id already exists in the map
+        //    to avoid pulling in old messages. The live `updates` receiver returned to the
+        //    caller covers all future messages; this loop only closes the narrow race window
+        //    on the initial snapshot.
         loop {
             match updates.try_recv() {
                 Ok(update) => {
-                    messages_map.insert(update.message.id.clone(), update.message);
+                    if update.trigger == message_streaming::UpdateTrigger::NewMessage
+                        || messages_map.contains_key(&update.message.id)
+                    {
+                        messages_map.insert(update.message.id.clone(), update.message);
+                    }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!(
+                    tracing::error!(
                         target: "whitenoise::mod",
-                        "subscription drain lagged by {n} messages"
+                        "subscription drain lagged by {n} messages, snapshot may be incomplete"
                     );
-                    continue;
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Message stream lagged by {} messages during subscription initialization, retry needed",
+                        n
+                    )));
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     // Channel closed unexpectedly — unreachable while we hold a receiver.
