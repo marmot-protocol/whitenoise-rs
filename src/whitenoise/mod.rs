@@ -1017,7 +1017,11 @@ impl Whitenoise {
         //    arbitrary, so an explicit sort is always needed.
         let mut initial_messages: Vec<message_aggregator::ChatMessage> =
             messages_map.into_values().collect();
-        initial_messages.sort_by_key(|m| m.created_at);
+        initial_messages.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(message_streaming::GroupMessageSubscription {
             initial_messages,
