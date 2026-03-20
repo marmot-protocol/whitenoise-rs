@@ -111,7 +111,7 @@ impl GroupPlane {
         let normalized_groups = Self::normalize_group_specs(group_specs);
         let subscriptions = Self::build_relay_set_subscriptions(&normalized_groups);
 
-        // On any failure below, remove the accounts entry so that
+        // On any failure below, remove the account entry so that
         // has_active_subscription() returns false and recovery is triggered.
         // (The unsubscribe above already tore down the previous subscription,
         // so leaving stale relay info in the map would make the health check
@@ -120,15 +120,6 @@ impl GroupPlane {
         for subscription in &subscriptions {
             if subscription.relays.is_empty() || subscription.group_ids.is_empty() {
                 continue;
-            }
-
-            let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
-                SingleLetterTag::lowercase(Alphabet::H),
-                subscription.group_ids.iter(),
-            );
-
-            if let Some(since) = since {
-                filter = filter.since(since);
             }
 
             if let Err(e) = self
@@ -146,7 +137,7 @@ impl GroupPlane {
                 .subscribe_with_id_to(
                     &subscription.relays,
                     self.subscription_id(&pubkey, subscription.subscription_index),
-                    filter,
+                    Self::build_filter(subscription, since),
                     SubscriptionStream::GroupMessages,
                     Some(pubkey),
                     &subscription.group_ids,
@@ -239,6 +230,19 @@ impl GroupPlane {
             self.pubkey_hash(pubkey),
             subscription_index
         ))
+    }
+
+    fn build_filter(subscription: &GroupRelaySetSubscription, since: Option<Timestamp>) -> Filter {
+        let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+            SingleLetterTag::lowercase(Alphabet::H),
+            subscription.group_ids.iter(),
+        );
+
+        if let Some(since) = since {
+            filter = filter.since(since);
+        }
+
+        filter
     }
 
     fn normalize_group_specs(group_specs: &[GroupSubscriptionSpec]) -> Vec<GroupSubscriptionSpec> {
@@ -390,6 +394,7 @@ mod tests {
 
     use super::*;
     use futures::future::join_all;
+    use nostr_sdk::Timestamp;
     use tokio::sync::mpsc;
 
     #[test]
@@ -492,5 +497,300 @@ mod tests {
             .find(|group| group.group_id == "group-b")
             .unwrap();
         assert_eq!(group_b.relay_urls, vec![relay_c.to_string()]);
+    }
+
+    #[test]
+    fn test_build_filter_without_since() {
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let subscription = GroupRelaySetSubscription {
+            subscription_index: 0,
+            relays: vec![relay],
+            group_ids: vec!["group-1".to_string()],
+        };
+
+        let filter = GroupPlane::build_filter(&subscription, None);
+        // Filter should contain the MlsGroupMessage kind (445).
+        let serialized = serde_json::to_string(&filter).unwrap();
+        assert!(serialized.contains("445"));
+    }
+
+    #[test]
+    fn test_build_filter_with_since() {
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let subscription = GroupRelaySetSubscription {
+            subscription_index: 0,
+            relays: vec![relay],
+            group_ids: vec!["group-1".to_string()],
+        };
+        let ts = Timestamp::from(1_700_000_000u64);
+
+        let filter = GroupPlane::build_filter(&subscription, Some(ts));
+        let serialized = serde_json::to_string(&filter).unwrap();
+        assert!(serialized.contains("since"));
+        assert!(serialized.contains("1700000000"));
+    }
+
+    #[tokio::test]
+    async fn test_update_account_empty_groups_clears_existing_state() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [3; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        // Seed state with a subscription that has no relays so unsubscribe is a no-op.
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "group-x".to_string(),
+            relays: vec![],
+        }];
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&groups);
+        plane.accounts.write().await.insert(
+            pubkey,
+            GroupAccountState {
+                groups,
+                subscriptions,
+            },
+        );
+
+        plane.update_account(pubkey, &[], None).await.unwrap();
+
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        assert!(state.groups.is_empty());
+        assert!(state.subscriptions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_account_skips_subscriptions_with_empty_relays() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [4; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        // A spec with no relays should be silently skipped (no relay connection
+        // is attempted, so the call succeeds without live infrastructure).
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "group-no-relay".to_string(),
+            relays: vec![],
+        }];
+
+        plane.update_account(pubkey, &groups, None).await.unwrap();
+
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        // Normalized groups are stored but the empty-relay subscription is
+        // filtered out by build_relay_set_subscriptions.
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].group_id, "group-no-relay");
+    }
+
+    #[tokio::test]
+    async fn test_update_account_stale_subscriptions_removed_on_replace() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [5; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        // Seed two groups with no relays so update_account can succeed without
+        // live relay connections.
+        let old_groups = vec![
+            GroupSubscriptionSpec {
+                group_id: "old-group-1".to_string(),
+                relays: vec![],
+            },
+            GroupSubscriptionSpec {
+                group_id: "old-group-2".to_string(),
+                relays: vec![],
+            },
+        ];
+        plane
+            .update_account(pubkey, &old_groups, None)
+            .await
+            .unwrap();
+
+        let new_groups = vec![GroupSubscriptionSpec {
+            group_id: "new-group".to_string(),
+            relays: vec![],
+        }];
+        plane
+            .update_account(pubkey, &new_groups, None)
+            .await
+            .unwrap();
+
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].group_id, "new-group");
+    }
+
+    #[tokio::test]
+    async fn test_update_account_idempotent_with_same_groups() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [6; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "stable-group".to_string(),
+            relays: vec![],
+        }];
+
+        plane.update_account(pubkey, &groups, None).await.unwrap();
+        plane.update_account(pubkey, &groups, None).await.unwrap();
+
+        let accounts = plane.accounts.read().await;
+        let state = accounts.get(&pubkey).unwrap();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].group_id, "stable-group");
+    }
+
+    #[tokio::test]
+    async fn test_has_active_subscription_false_for_unknown_account() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [8; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        assert!(!plane.has_active_subscription(&pubkey).await);
+    }
+
+    #[tokio::test]
+    async fn test_has_active_subscription_true_after_empty_update() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [10; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        plane.update_account(pubkey, &[], None).await.unwrap();
+
+        assert!(plane.has_active_subscription(&pubkey).await);
+    }
+
+    #[tokio::test]
+    async fn test_account_state_returns_none_for_unknown_account() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [11; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        assert!(plane.account_state(&pubkey).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_account_state_returns_groups_after_update() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [12; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        let groups = vec![GroupSubscriptionSpec {
+            group_id: "my-group".to_string(),
+            relays: vec![],
+        }];
+
+        plane.update_account(pubkey, &groups, None).await.unwrap();
+
+        let state = plane.account_state(&pubkey).await.unwrap();
+        assert_eq!(state.len(), 1);
+        assert_eq!(state[0].group_id, "my-group");
+    }
+
+    #[tokio::test]
+    async fn test_remove_account_clears_entry() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [13; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        plane.update_account(pubkey, &[], None).await.unwrap();
+        assert!(plane.has_account(&pubkey).await);
+
+        plane.remove_account(&pubkey).await;
+        assert!(!plane.has_account(&pubkey).await);
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_account_is_noop() {
+        let (sender, _) = mpsc::channel(8);
+        let plane = GroupPlane::new(sender, [14; 16]);
+        let pubkey = Keys::generate().public_key();
+
+        // Should not panic.
+        plane.remove_account(&pubkey).await;
+        assert!(!plane.has_account(&pubkey).await);
+    }
+
+    #[test]
+    fn test_normalize_group_specs_deduplicates_relays() {
+        let relay_a = RelayUrl::parse("wss://relay-a.example.com").unwrap();
+        let relay_b = RelayUrl::parse("wss://relay-b.example.com").unwrap();
+
+        let specs = vec![
+            GroupSubscriptionSpec {
+                group_id: "group-1".to_string(),
+                relays: vec![relay_a.clone()],
+            },
+            GroupSubscriptionSpec {
+                group_id: "group-1".to_string(),
+                relays: vec![relay_b.clone()],
+            },
+        ];
+
+        let normalized = GroupPlane::normalize_group_specs(&specs);
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].group_id, "group-1");
+        assert_eq!(normalized[0].relays.len(), 2);
+    }
+
+    #[test]
+    fn test_normalize_group_specs_sorts_by_group_id() {
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        let specs = vec![
+            GroupSubscriptionSpec {
+                group_id: "zzz".to_string(),
+                relays: vec![relay.clone()],
+            },
+            GroupSubscriptionSpec {
+                group_id: "aaa".to_string(),
+                relays: vec![relay.clone()],
+            },
+        ];
+
+        let normalized = GroupPlane::normalize_group_specs(&specs);
+        assert_eq!(normalized[0].group_id, "aaa");
+        assert_eq!(normalized[1].group_id, "zzz");
+    }
+
+    #[test]
+    fn test_build_relay_set_subscriptions_groups_by_relay_set() {
+        let relay_a = RelayUrl::parse("wss://relay-a.example.com").unwrap();
+        let relay_b = RelayUrl::parse("wss://relay-b.example.com").unwrap();
+
+        let groups = vec![
+            GroupSubscriptionSpec {
+                group_id: "group-1".to_string(),
+                relays: vec![relay_a.clone()],
+            },
+            GroupSubscriptionSpec {
+                group_id: "group-2".to_string(),
+                relays: vec![relay_a.clone()],
+            },
+            GroupSubscriptionSpec {
+                group_id: "group-3".to_string(),
+                relays: vec![relay_b.clone()],
+            },
+        ];
+
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&groups);
+        assert_eq!(subscriptions.len(), 2);
+
+        let relay_a_sub = subscriptions
+            .iter()
+            .find(|s| s.relays == vec![relay_a.clone()])
+            .unwrap();
+        assert_eq!(relay_a_sub.group_ids.len(), 2);
+
+        let relay_b_sub = subscriptions
+            .iter()
+            .find(|s| s.relays == vec![relay_b.clone()])
+            .unwrap();
+        assert_eq!(relay_b_sub.group_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_build_relay_set_subscriptions_empty_input() {
+        let subscriptions = GroupPlane::build_relay_set_subscriptions(&[]);
+        assert!(subscriptions.is_empty());
     }
 }
