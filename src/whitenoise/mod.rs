@@ -15,9 +15,6 @@ use tokio::sync::{
 };
 use tokio::task::JoinHandle;
 
-#[cfg(test)]
-use tokio::sync::Notify;
-
 pub mod account_settings;
 pub mod accounts;
 pub mod accounts_groups;
@@ -157,8 +154,6 @@ pub struct Whitenoise {
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
-    #[cfg(test)]
-    subscribe_to_user_fetch_gate: Mutex<Option<Arc<Notify>>>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
     contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
     /// Shutdown signal for scheduled tasks
@@ -193,8 +188,7 @@ struct WhitenoiseComponents {
 
 impl std::fmt::Debug for Whitenoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut debug = f.debug_struct("Whitenoise");
-        debug
+        f.debug_struct("Whitenoise")
             .field("config", &self.config)
             .field("database", &"<REDACTED>")
             .field("event_tracker", &"<REDACTED>")
@@ -209,10 +203,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("archived_chat_list_stream_manager", &"<REDACTED>")
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
-            .field("shutdown_sender", &"<REDACTED>");
-        #[cfg(test)]
-        debug.field("subscribe_to_user_fetch_gate", &"<REDACTED>");
-        debug
+            .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
@@ -253,8 +244,6 @@ impl Whitenoise {
             ),
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
-            #[cfg(test)]
-            subscribe_to_user_fetch_gate: Mutex::new(None),
             contact_list_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
@@ -1035,16 +1024,21 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> Result<user_streaming::UserSubscription> {
         let mut updates = self.user_stream_manager.subscribe(pubkey);
-
-        #[cfg(test)]
-        if let Some(fetch_gate) = self.take_subscribe_to_user_fetch_gate_for_testing().await {
-            fetch_gate.notified().await;
-        }
-
-        let mut initial_user = self
+        let initial_user = self
             .find_or_create_user_by_pubkey(pubkey, users::UserSyncMode::Background)
             .await?;
+        let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
 
+        Ok(user_streaming::UserSubscription {
+            initial_user,
+            updates,
+        })
+    }
+
+    fn drain_user_updates(
+        mut initial_user: User,
+        updates: &mut broadcast::Receiver<user_streaming::UserUpdate>,
+    ) -> Result<User> {
         loop {
             match updates.try_recv() {
                 Ok(update) => {
@@ -1066,20 +1060,7 @@ impl Whitenoise {
             }
         }
 
-        Ok(user_streaming::UserSubscription {
-            initial_user,
-            updates,
-        })
-    }
-
-    #[cfg(test)]
-    async fn take_subscribe_to_user_fetch_gate_for_testing(&self) -> Option<Arc<Notify>> {
-        self.subscribe_to_user_fetch_gate.lock().await.take()
-    }
-
-    #[cfg(test)]
-    async fn set_subscribe_to_user_fetch_gate_for_testing(&self, fetch_gate: Arc<Notify>) {
-        *self.subscribe_to_user_fetch_gate.lock().await = Some(fetch_gate);
+        Ok(initial_user)
     }
 
     /// Subscribe to chat list updates for a specific account.
@@ -2113,13 +2094,9 @@ mod tests {
     }
 
     mod user_subscription_tests {
-        use std::sync::Arc;
-        use std::time::Duration;
-
         use chrono::Utc;
         use nostr_sdk::{Keys, Metadata};
-        use tokio::sync::Notify;
-        use tokio::time::timeout;
+        use tokio::sync::broadcast;
 
         use super::*;
 
@@ -2161,14 +2138,10 @@ mod tests {
             assert_eq!(saved_user, subscription.initial_user);
         }
 
-        #[tokio::test]
-        async fn test_subscribe_to_user_race_free_initial_snapshot_uses_newest_update() {
-            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let whitenoise = Arc::new(whitenoise);
+        #[test]
+        fn test_drain_user_updates_uses_newest_queued_update() {
             let pubkey = Keys::generate().public_key();
-            let fetch_gate = Arc::new(Notify::new());
-
-            let mut existing_user = User {
+            let mut initial_user = User {
                 id: None,
                 pubkey,
                 metadata: Metadata::new().name("Old Name"),
@@ -2176,52 +2149,23 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: Utc::now(),
             };
-            existing_user.mark_metadata_known_now();
-            existing_user = existing_user.save(&whitenoise.database).await.unwrap();
+            initial_user.mark_metadata_known_now();
 
-            whitenoise
-                .set_subscribe_to_user_fetch_gate_for_testing(Arc::clone(&fetch_gate))
-                .await;
-
-            let whitenoise_for_task = Arc::clone(&whitenoise);
-            let subscribe_task = tokio::spawn(async move {
-                whitenoise_for_task
-                    .subscribe_to_user(&pubkey)
-                    .await
-                    .unwrap()
-            });
-
-            timeout(Duration::from_secs(1), async {
-                loop {
-                    if whitenoise.user_stream_manager.has_subscribers(&pubkey) {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("user stream should be subscribed before the fetch starts");
-
-            let mut newest_user = existing_user.clone();
+            let mut newest_user = initial_user.clone();
             newest_user.metadata = Metadata::new().name("Newest Name");
             newest_user.updated_at = Utc::now();
 
-            whitenoise.user_stream_manager.emit(
-                &pubkey,
-                user_streaming::UserUpdate {
+            let (sender, mut updates) = broadcast::channel(10);
+            sender
+                .send(user_streaming::UserUpdate {
                     trigger: user_streaming::UserUpdateTrigger::MetadataChanged,
                     user: newest_user.clone(),
-                },
-            );
+                })
+                .expect("should queue update");
 
-            fetch_gate.notify_one();
+            let drained_user = Whitenoise::drain_user_updates(initial_user, &mut updates).unwrap();
 
-            let subscription = timeout(Duration::from_secs(1), subscribe_task)
-                .await
-                .expect("subscription task should complete")
-                .unwrap();
-
-            assert_eq!(subscription.initial_user, newest_user);
+            assert_eq!(drained_user, newest_user);
         }
     }
 
