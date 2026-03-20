@@ -1,8 +1,47 @@
+use std::time::Duration;
+
+use async_trait::async_trait;
+use nostr_sdk::{Client, EventBuilder, EventId, Filter, Keys, Kind, Metadata, Timestamp};
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::create_test_client;
 use crate::integration_tests::core::*;
-use async_trait::async_trait;
-use nostr_sdk::{EventBuilder, Keys, Metadata, Timestamp};
+
+const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::find_or_create_user_preserves_newer_processed_metadata";
+
+async fn wait_for_latest_metadata_event(
+    client: &Client,
+    pubkey: nostr_sdk::PublicKey,
+    expected_event_id: EventId,
+    description: &str,
+) -> Result<(), WhitenoiseError> {
+    // Kind-0 is replaceable, so older events are not guaranteed to remain
+    // queryable by exact ID once the relay has reconciled them. Poll the same
+    // author+kind lookup shape used by targeted discovery instead.
+    retry(
+        30,
+        Duration::from_millis(100),
+        || async {
+            let events = client
+                .fetch_events(
+                    Filter::new().author(pubkey).kind(Kind::Metadata),
+                    Duration::from_secs(1),
+                )
+                .await?;
+
+            if events.iter().any(|event| event.id == expected_event_id) {
+                Ok(())
+            } else {
+                Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    "Latest metadata query does not yet return expected event {}",
+                    expected_event_id.to_hex()
+                )))
+            }
+        },
+        description,
+    )
+    .await
+}
 
 /// Tests that targeted discovery cannot overwrite newer already-processed metadata.
 ///
@@ -42,6 +81,7 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
+            target: LOG_TARGET,
             "Testing targeted discovery ordering for legacy unknown metadata on pubkey: {}",
             test_pubkey
         );
@@ -50,12 +90,22 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
         let older_timestamp = Timestamp::from(newer_timestamp.as_secs().saturating_sub(3600));
 
         let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
-        client
+        let newer_event_id = *client
             .send_event_builder(
                 EventBuilder::metadata(&self.newer_metadata).custom_created_at(newer_timestamp),
             )
-            .await?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            .await?
+            .id();
+        wait_for_latest_metadata_event(
+            &client,
+            test_pubkey,
+            newer_event_id,
+            &format!(
+                "wait for metadata lookup to return newer event {}",
+                newer_event_id.to_hex()
+            ),
+        )
+        .await?;
 
         let initial_user = retry_default(
             || async {
@@ -100,12 +150,22 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
         );
         assert_eq!(legacy_user.metadata.name, self.newer_metadata.name);
 
-        client
+        let _older_event_id = *client
             .send_event_builder(
                 EventBuilder::metadata(&self.older_metadata).custom_created_at(older_timestamp),
             )
-            .await?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            .await?
+            .id();
+        wait_for_latest_metadata_event(
+            &client,
+            test_pubkey,
+            newer_event_id,
+            &format!(
+                "wait for metadata lookup to keep returning newer event {} after older publish",
+                newer_event_id.to_hex()
+            ),
+        )
+        .await?;
         client.disconnect().await;
 
         let user_after = context
@@ -124,7 +184,10 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
         let stored_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
         assert_eq!(stored_user.metadata.name, self.newer_metadata.name);
 
-        tracing::info!("✓ Older targeted discovery result did not overwrite newer metadata");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ Older targeted discovery result did not overwrite newer metadata"
+        );
 
         Ok(())
     }

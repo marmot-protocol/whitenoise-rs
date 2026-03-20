@@ -454,9 +454,7 @@ impl Whitenoise {
             );
         }
 
-        User::find_by_pubkey(&user.pubkey, &self.database)
-            .await
-            .or_else(|_| Ok(user.clone()))
+        User::find_by_pubkey(&user.pubkey, &self.database).await
     }
 
     async fn sync_user_background(&self, user: &User, is_new: bool) -> Result<()> {
@@ -525,13 +523,24 @@ impl Whitenoise {
 
     pub(crate) async fn background_fetch_user_data(&self, user: &User) -> Result<()> {
         let user_clone = user.clone();
+        let user_pubkey = user.pubkey;
         tokio::spawn(async move {
-            let whitenoise = Whitenoise::get_instance()?;
-            whitenoise
-                .background_fetch_user_data_inner(user_clone)
-                .await?;
+            let result = async {
+                let whitenoise = Self::get_instance()?;
+                whitenoise
+                    .background_fetch_user_data_inner(user_clone)
+                    .await
+            }
+            .await;
 
-            Ok::<(), WhitenoiseError>(())
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::users::background_fetch_user_data",
+                    "Background discovery catch-up task failed for user {}: {}",
+                    user_pubkey,
+                    error
+                );
+            }
         });
 
         Ok(())

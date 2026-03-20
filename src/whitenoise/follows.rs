@@ -25,7 +25,14 @@ impl Whitenoise {
 
         if newly_created {
             self.background_fetch_user_data(&user).await?;
-            self.refresh_global_subscription_for_user().await?;
+            if let Err(error) = self.refresh_global_subscription_for_user().await {
+                tracing::warn!(
+                    target: "whitenoise::follows::follow_user",
+                    "Failed to refresh global subscription after creating followed user {}: {}",
+                    user.pubkey,
+                    error
+                );
+            }
         }
 
         account.follow_user(&user, &self.database).await?;
