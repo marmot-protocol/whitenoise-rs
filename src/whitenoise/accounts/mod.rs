@@ -18,6 +18,7 @@ use crate::types::ImageType;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::secrets_store::SecretsStoreError;
+use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
@@ -495,7 +496,15 @@ impl Account {
         let mut user = self.user(&whitenoise.database).await?;
         user.metadata = metadata.clone();
         user.mark_metadata_known_now();
-        user.save(&whitenoise.database).await?;
+        let saved_user = user.save(&whitenoise.database).await?;
+        let user_pubkey = saved_user.pubkey;
+        whitenoise.user_stream_manager.emit(
+            &user_pubkey,
+            UserUpdate {
+                trigger: UserUpdateTrigger::LocalMetadataChanged,
+                user: saved_user,
+            },
+        );
         whitenoise.background_publish_account_metadata(self).await?;
         Ok(())
     }
@@ -575,7 +584,8 @@ pub mod test_utils {
 mod tests {
     use crate::whitenoise::relays::{Relay, RelayType};
     use crate::whitenoise::test_utils::*;
-    use nostr_sdk::RelayUrl;
+    use crate::whitenoise::user_streaming::UserUpdateTrigger;
+    use nostr_sdk::{Metadata, RelayUrl};
 
     #[tokio::test]
     async fn test_effective_inbox_relays_returns_inbox_when_present() {
@@ -636,5 +646,38 @@ mod tests {
         let result = account.effective_inbox_relays(&whitenoise).await.unwrap();
 
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_metadata_emits_local_metadata_changed_update() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = account.save(&whitenoise.database).await.unwrap();
+
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Nip65)
+            .await
+            .unwrap();
+
+        let mut subscription = whitenoise.subscribe_to_user(&account.pubkey).await.unwrap();
+        let new_metadata = Metadata::new().name("Local Update");
+
+        account
+            .update_metadata(&new_metadata, &whitenoise)
+            .await
+            .unwrap();
+
+        let update = subscription
+            .updates
+            .try_recv()
+            .expect("should receive update");
+
+        assert_eq!(update.trigger, UserUpdateTrigger::LocalMetadataChanged);
+        assert_eq!(update.user.pubkey, account.pubkey);
+        assert_eq!(update.user.metadata.name, Some("Local Update".to_string()));
+        assert!(update.user.metadata_known_at.is_some());
     }
 }

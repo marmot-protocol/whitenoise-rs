@@ -5,6 +5,7 @@ use crate::{
     whitenoise::{
         Whitenoise,
         error::{Result, WhitenoiseError},
+        user_streaming::{UserUpdate, UserUpdateTrigger},
         users::User,
     },
 };
@@ -23,7 +24,16 @@ impl Whitenoise {
                 if should_update {
                     user.metadata = metadata;
                     user.mark_metadata_known_now();
-                    user.save(&self.database).await?;
+                    let saved_user = user.save(&self.database).await?;
+                    let user_pubkey = saved_user.pubkey;
+
+                    self.user_stream_manager.emit(
+                        &user_pubkey,
+                        UserUpdate {
+                            trigger: UserUpdateTrigger::MetadataChanged,
+                            user: saved_user,
+                        },
+                    );
 
                     self.event_tracker
                         .track_processed_global_event(&event)
@@ -37,7 +47,16 @@ impl Whitenoise {
                     );
                 } else if user.metadata_is_unknown() {
                     user.mark_metadata_known_now();
-                    user.save(&self.database).await?;
+                    let saved_user = user.save(&self.database).await?;
+                    let user_pubkey = saved_user.pubkey;
+
+                    self.user_stream_manager.emit(
+                        &user_pubkey,
+                        UserUpdate {
+                            trigger: UserUpdateTrigger::MetadataChanged,
+                            user: saved_user,
+                        },
+                    );
 
                     tracing::debug!(
                         target: "whitenoise::event_processor::handle_metadata",
@@ -67,6 +86,7 @@ mod tests {
     use super::*;
     use crate::whitenoise::{
         database::processed_events::ProcessedEvent, test_utils::create_mock_whitenoise,
+        user_streaming::UserUpdateTrigger,
     };
 
     async fn metadata_event(keys: &Keys, metadata: &Metadata, timestamp: Timestamp) -> Event {
@@ -187,5 +207,29 @@ mod tests {
             .unwrap();
         assert_eq!(stored_user.metadata, metadata);
         assert!(stored_user.metadata_known_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn subscribed_receivers_get_metadata_changed_update_after_valid_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let mut subscription = whitenoise
+            .subscribe_to_user(&keys.public_key())
+            .await
+            .unwrap();
+        let metadata = Metadata::new().name("updated");
+        let event = metadata_event(&keys, &metadata, Timestamp::now()).await;
+
+        whitenoise.handle_metadata(event).await.unwrap();
+
+        let update = subscription
+            .updates
+            .try_recv()
+            .expect("should receive update");
+
+        assert_eq!(update.trigger, UserUpdateTrigger::MetadataChanged);
+        assert_eq!(update.user.pubkey, keys.public_key());
+        assert_eq!(update.user.metadata.name, Some("updated".to_string()));
+        assert!(update.user.metadata_known_at.is_some());
     }
 }
