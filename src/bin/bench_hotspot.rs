@@ -98,7 +98,7 @@ fn hotspot_score(mean_ns: f64, scenario_mean_ns: f64, call_count: u64) -> f64 {
     if scenario_mean_ns == 0.0 {
         return 0.0;
     }
-    (mean_ns / scenario_mean_ns) * (call_count as f64 + 1.0).ln()
+    (mean_ns / scenario_mean_ns) * (call_count as f64).ln_1p()
 }
 
 // ─── Trend lookup ─────────────────────────────────────────────────────────────
@@ -220,16 +220,16 @@ fn print_digest(output: &HotspotOutput) {
     println!();
 }
 
-fn truncate(s: &str, max: usize) -> &str {
+fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        return s;
+        return s.to_string();
     }
     // Walk back from `max` until we land on a UTF-8 character boundary.
-    let mut end = max;
+    let mut end = max.saturating_sub(1); // room for ellipsis
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    format!("{}…", &s[..end])
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────

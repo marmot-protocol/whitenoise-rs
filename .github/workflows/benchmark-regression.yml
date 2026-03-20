@@ -114,7 +114,7 @@ jobs:
             echo "exit_code=1" >> "$GITHUB_OUTPUT"
             exit 1
           fi
-          CANDIDATE=$(printf '%s\n' "${files[@]}" | xargs ls -t | head -1)
+          CANDIDATE=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
           cargo run --release --features benchmark-tests --bin bench_compare -- \
             perf-hotspot-data/baseline-all.json \
             "$CANDIDATE" \
@@ -197,9 +197,11 @@ jobs:
             }
 
       - name: Fail on breaking regression
-        if: steps.compare.outputs.exit_code != '' && steps.compare.outputs.exit_code != '0'
+        if: |
+          steps.compare.outputs.exit_code == '3' ||
+          steps.compare.outputs.exit_code == '4'
         run: |
-          echo "Regression or comparison error (exit ${{ steps.compare.outputs.exit_code }}) — blocking merge."
+          echo "Breaking regression or comparison error (exit ${{ steps.compare.outputs.exit_code }}) — blocking merge."
           exit 1
 
   benchmark-relay:

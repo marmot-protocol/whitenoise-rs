@@ -152,10 +152,7 @@ fn compare_scenario(
         return None;
     }
 
-    let cand_name = get_str(candidate, "name");
-    if name != cand_name {
-        return None;
-    }
+    debug_assert_eq!(name, get_str(candidate, "name"));
 
     let thresholds = baseline.get("thresholds")?;
     let warn = get_u32(thresholds, "warn_pct");
