@@ -658,6 +658,19 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Returns the number of active groups in MDK for an account.
+    ///
+    /// Cheaper than `extract_group_subscription_specs` — counts without
+    /// fetching per-group relay lists.
+    pub(crate) fn active_group_count(&self, account: &Account) -> Result<usize> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let groups = mdk.get_groups()?;
+        Ok(groups
+            .iter()
+            .filter(|g| g.state == GroupState::Active)
+            .count())
+    }
+
     /// Extract per-group relay specs for subscription setup.
     #[perf_instrument("accounts")]
     pub(crate) async fn extract_group_subscription_specs(
@@ -682,6 +695,36 @@ impl Whitenoise {
         Ok(group_specs)
     }
 
+    /// Syncs group plane subscriptions for an account without touching the inbox.
+    ///
+    /// Reads active groups from MDK, ensures relay records exist, and updates
+    /// the group plane. Unlike `refresh_account_subscriptions`, this does not
+    /// tear down or rebuild inbox subscriptions.
+    #[perf_instrument("accounts")]
+    pub(crate) async fn sync_group_subscriptions(&self, account: &Account) -> Result<()> {
+        let group_specs = self.extract_group_subscription_specs(account).await?;
+
+        for relay_url in group_specs.iter().flat_map(|spec| spec.relays.iter()) {
+            if let Err(e) = Relay::find_or_create_by_url(relay_url, &self.database).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    relay = %relay_url,
+                    error = %e,
+                    "Failed to create relay record",
+                );
+            }
+        }
+
+        self.relay_control
+            .sync_account_group_subscriptions(
+                account.pubkey,
+                &group_specs,
+                account.since_timestamp(10),
+            )
+            .await
+            .map_err(WhitenoiseError::from)
+    }
+
     #[perf_instrument("accounts")]
     async fn refresh_account_group_subscriptions_with_cancel(
         &self,
@@ -697,29 +740,7 @@ impl Whitenoise {
             return Ok(());
         }
 
-        let group_specs = self.extract_group_subscription_specs(account).await?;
-
-        for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
-            Relay::find_or_create_by_url(relay_url, &self.database).await?;
-        }
-
-        if Self::is_background_task_cancelled(cancel_rx) {
-            tracing::debug!(
-                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
-                account_pubkey = %account.pubkey,
-                "Skipping group subscription sync because the account was cancelled",
-            );
-            return Ok(());
-        }
-
-        self.relay_control
-            .sync_account_group_subscriptions(
-                account.pubkey,
-                &group_specs,
-                account.since_timestamp(10),
-            )
-            .await
-            .map_err(WhitenoiseError::from)
+        self.sync_group_subscriptions(account).await
     }
 
     fn is_background_task_cancelled(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
@@ -960,6 +981,38 @@ mod tests {
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
+
+    #[tokio::test]
+    async fn test_active_group_count_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        assert_eq!(
+            whitenoise.active_group_count(&account).unwrap(),
+            0,
+            "New account should have 0 active groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_group_count_with_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            whitenoise.active_group_count(&creator_account).unwrap(),
+            1,
+            "Creator should have 1 active group"
+        );
+    }
 
     #[tokio::test]
     async fn test_extract_group_subscription_specs_no_groups() {

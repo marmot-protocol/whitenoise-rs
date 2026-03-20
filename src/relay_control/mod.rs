@@ -364,6 +364,11 @@ impl RelayControlPlane {
         Ok(())
     }
 
+    /// Returns the number of groups in the group plane for an account.
+    pub(crate) async fn group_plane_account_group_count(&self, pubkey: &PublicKey) -> usize {
+        self.group_plane.account_group_count(pubkey).await
+    }
+
     #[perf_instrument("relay")]
     pub(crate) async fn sync_account_group_subscriptions(
         &self,
