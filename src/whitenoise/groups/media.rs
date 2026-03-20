@@ -39,6 +39,17 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     // during tests where multiple call sites race to install the same provider).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Use embedded Mozilla root certificates instead of rustls-platform-verifier.
+    // The platform verifier requires Android-specific JNI initialization that is
+    // not performed in the Flutter app, causing a panic on first HTTPS request.
+    // Embedded roots work on all platforms and match nostr-blossom's approach.
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
     // Custom redirect policy that mirrors `require_https()`:
     // - Always allow HTTPS redirect targets.
     // - In debug builds, also allow HTTP loopback hosts (for local test servers).
@@ -64,6 +75,7 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
     reqwest::Client::builder()
         .redirect(redirect_policy)
+        .use_preconfigured_tls(tls_config)
         .build()
         .expect("Failed to build shared Blossom HTTP client")
 });
