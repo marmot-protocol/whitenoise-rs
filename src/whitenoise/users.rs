@@ -13,6 +13,7 @@ use crate::{
         database::processed_events::ProcessedEvent,
         error::{Result, WhitenoiseError},
         relays::{Relay, RelayType},
+        user_streaming::{UserUpdate, UserUpdateTrigger},
         utils::timestamp_to_datetime,
     },
 };
@@ -394,6 +395,16 @@ impl Whitenoise {
         sync_mode: UserSyncMode,
     ) -> Result<User> {
         let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
+
+        if created {
+            self.user_stream_manager.emit(
+                &user.pubkey,
+                UserUpdate {
+                    trigger: UserUpdateTrigger::UserCreated,
+                    user: user.clone(),
+                },
+            );
+        }
 
         if sync_mode == UserSyncMode::Blocking {
             let updated_user = self.sync_user_blocking(&user, created).await?;
