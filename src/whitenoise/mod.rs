@@ -44,6 +44,7 @@ pub mod scheduled_tasks;
 pub mod secrets_store;
 pub mod storage;
 pub mod user_search;
+pub mod user_streaming;
 pub mod users;
 pub mod utils;
 pub mod zapstore;
@@ -147,6 +148,7 @@ pub struct Whitenoise {
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: Arc<message_streaming::MessageStreamManager>,
+    user_stream_manager: user_streaming::UserStreamManager,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     notification_stream_manager: notification_streaming::NotificationStreamManager,
@@ -196,6 +198,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("storage", &"<REDACTED>")
             .field("message_aggregator", &"<REDACTED>")
             .field("message_stream_manager", &"<REDACTED>")
+            .field("user_stream_manager", &"<REDACTED>")
             .field("chat_list_stream_manager", &"<REDACTED>")
             .field("archived_chat_list_stream_manager", &"<REDACTED>")
             .field("notification_stream_manager", &"<REDACTED>")
@@ -233,6 +236,7 @@ impl Whitenoise {
             storage: components.storage,
             message_aggregator: components.message_aggregator,
             message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
+            user_stream_manager: user_streaming::UserStreamManager::default(),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
             ),
@@ -283,21 +287,29 @@ impl Whitenoise {
                 not(feature = "benchmark-tests")
             ))]
             {
-                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+                // CLI builds use the regular Keychain store on all macOS architectures.
+                // The `cli` feature gates the `wn`/`wnd` binaries, which are unsigned
+                // and cannot use the Protected Data store (it requires a provisioning
+                // profile with application-groups entitlement).
+                #[cfg(all(target_os = "macos", feature = "cli"))]
                 {
                     let store = apple_native_keyring_store::keychain::Store::new()
                         .expect("Failed to create macOS Keychain credential store");
                     keyring_core::set_default_store(store);
                 }
-                // Apple Silicon (aarch64) macOS: use the Protected Data store, which
-                // synchronises credentials across devices via iCloud.
-                //
-                // RUNTIME REQUIREMENT: the binary must be code-signed with a
-                // provisioning profile that includes the
-                // com.apple.security.application-groups (or equivalent
-                // keychain-access-groups) entitlement.  The Flutter app build
-                // pipeline satisfies this automatically.
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                // Intel Macs (non-CLI): use the regular Keychain store.
+                // Protected Data store is not available on x86_64.
+                #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
+                {
+                    let store = apple_native_keyring_store::keychain::Store::new()
+                        .expect("Failed to create macOS Keychain credential store");
+                    keyring_core::set_default_store(store);
+                }
+                // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
+                // Requires code-signing with a provisioning profile that includes the
+                // com.apple.security.application-groups entitlement. The Flutter app
+                // build pipeline satisfies this.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
                 {
                     let store = apple_native_keyring_store::protected::Store::new()
                         .expect("Failed to create macOS protected-data credential store");
@@ -1038,6 +1050,58 @@ impl Whitenoise {
         })
     }
 
+    /// Subscribe to updates for a single user.
+    ///
+    /// Returns both an initial snapshot AND a receiver for real-time updates.
+    /// The design eliminates race conditions:
+    /// - Subscription is established BEFORE fetching to capture concurrent updates
+    /// - Any updates that arrived during fetch are merged into `initial_user`
+    /// - The receiver only yields updates AFTER the initial snapshot
+    #[perf_instrument("whitenoise")]
+    pub async fn subscribe_to_user(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Result<user_streaming::UserSubscription> {
+        let mut updates = self.user_stream_manager.subscribe(pubkey);
+        let initial_user = self
+            .find_or_create_user_by_pubkey(pubkey, users::UserSyncMode::Background)
+            .await?;
+        let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
+
+        Ok(user_streaming::UserSubscription {
+            initial_user,
+            updates,
+        })
+    }
+
+    fn drain_user_updates(
+        mut initial_user: User,
+        updates: &mut broadcast::Receiver<user_streaming::UserUpdate>,
+    ) -> Result<User> {
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    initial_user = update.user;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} user updates"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "User stream closed unexpectedly during subscription"
+                    )));
+                }
+            }
+        }
+
+        Ok(initial_user)
+    }
+
     /// Subscribe to chat list updates for a specific account.
     ///
     /// Returns both an initial snapshot AND a receiver for real-time updates.
@@ -1402,11 +1466,17 @@ pub mod test_utils {
     /// # Returns
     ///
     /// A tuple containing:
-    /// - `(Whitenoise, TempDir, TempDir)`
+    /// - `(Whitenoise, mpsc::Receiver<ProcessableEvent>, TempDir, TempDir)`
     ///   - `Whitenoise`: The mock Whitenoise instance
+    ///   - `mpsc::Receiver<ProcessableEvent>`: The event receiver paired with the instance sender
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
-    pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+    async fn create_mock_whitenoise_internal() -> (
+        Whitenoise,
+        mpsc::Receiver<ProcessableEvent>,
+        TempDir,
+        TempDir,
+    ) {
         Whitenoise::initialize_mock_keyring_store();
 
         // Wait for local relays to be ready in test environment
@@ -1429,7 +1499,7 @@ pub mod test_utils {
         let secrets_store = SecretsStore::new(&config.keyring_service_id);
 
         // Create channels but don't start processing loop to avoid network calls
-        let (event_sender, _event_receiver) = mpsc::channel(10);
+        let (event_sender, event_receiver) = mpsc::channel(10);
         let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
         let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
 
@@ -1457,7 +1527,22 @@ pub mod test_utils {
         );
         whitenoise.relay_control.start_telemetry_persistors().await;
 
+        (whitenoise, event_receiver, data_temp, logs_temp)
+    }
+
+    pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+        let (whitenoise, _event_receiver, data_temp, logs_temp) =
+            create_mock_whitenoise_internal().await;
         (whitenoise, data_temp, logs_temp)
+    }
+
+    pub(crate) async fn create_mock_whitenoise_with_event_receiver() -> (
+        Whitenoise,
+        mpsc::Receiver<ProcessableEvent>,
+        TempDir,
+        TempDir,
+    ) {
+        create_mock_whitenoise_internal().await
     }
 
     /// Wait for local test relays to be ready
@@ -3014,6 +3099,82 @@ mod tests {
                 6,
                 "snapshot + older page must cover 6 distinct messages"
             );
+        }
+    }
+
+    mod user_subscription_tests {
+        use chrono::Utc;
+        use nostr_sdk::{Keys, Metadata};
+        use tokio::sync::broadcast;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn test_subscribe_to_user_returns_initial_snapshot_for_existing_known_user() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = Keys::generate().public_key();
+
+            let mut user = User {
+                id: None,
+                pubkey,
+                metadata: Metadata::new().name("Known User"),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            user.mark_metadata_known_now();
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let subscription = whitenoise.subscribe_to_user(&pubkey).await.unwrap();
+
+            assert_eq!(subscription.initial_user, saved_user);
+        }
+
+        #[tokio::test]
+        async fn test_subscribe_to_user_creates_initial_snapshot_for_unknown_pubkey() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = Keys::generate().public_key();
+
+            let subscription = whitenoise.subscribe_to_user(&pubkey).await.unwrap();
+
+            assert_eq!(subscription.initial_user.pubkey, pubkey);
+            assert!(subscription.initial_user.id.is_some());
+            assert!(subscription.initial_user.metadata_is_unknown());
+
+            let saved_user = User::find_by_pubkey(&pubkey, &whitenoise.database)
+                .await
+                .unwrap();
+            assert_eq!(saved_user, subscription.initial_user);
+        }
+
+        #[test]
+        fn test_drain_user_updates_uses_newest_queued_update() {
+            let pubkey = Keys::generate().public_key();
+            let mut initial_user = User {
+                id: None,
+                pubkey,
+                metadata: Metadata::new().name("Old Name"),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            initial_user.mark_metadata_known_now();
+
+            let mut newest_user = initial_user.clone();
+            newest_user.metadata = Metadata::new().name("Newest Name");
+            newest_user.updated_at = Utc::now();
+
+            let (sender, mut updates) = broadcast::channel(10);
+            sender
+                .send(user_streaming::UserUpdate {
+                    trigger: user_streaming::UserUpdateTrigger::MetadataChanged,
+                    user: newest_user.clone(),
+                })
+                .expect("should queue update");
+
+            let drained_user = Whitenoise::drain_user_updates(initial_user, &mut updates).unwrap();
+
+            assert_eq!(drained_user, newest_user);
         }
     }
 

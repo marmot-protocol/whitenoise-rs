@@ -19,7 +19,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         database::{Database, published_events::PublishedEvent},
-        key_packages::has_encoding_tag,
+        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
         message_aggregator::DeliveryStatus,
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
@@ -110,10 +110,9 @@ impl EphemeralPlane {
         self.executor.remove_account_scope(account_pubkey).await;
     }
 
-    #[cfg(feature = "integration-tests")]
     #[perf_instrument("relay")]
-    pub(crate) async fn remove_all_account_scopes(&self) {
-        self.executor.remove_all_account_scopes().await;
+    pub(crate) async fn remove_all_scopes(&self) {
+        self.executor.remove_all_scopes().await;
     }
 
     #[perf_instrument("relay")]
@@ -229,8 +228,10 @@ impl EphemeralPlane {
                 .collect(),
         };
         let event_builder = EventBuilder::new(relay_type.into(), "").tags(tags);
+        let account_pubkey = signer.get_public_key().await?;
+        let event = event_builder.sign(&signer).await?;
 
-        self.publish_event_builder_with_signer(event_builder, target_relays, signer)
+        self.publish_event_with_quorum(event, &account_pubkey, target_relays, 2)
             .await?;
 
         Ok(())
@@ -384,6 +385,123 @@ impl EphemeralPlane {
         }
 
         Err(last_error.unwrap_or(NostrManagerError::NoRelayConnections))
+    }
+
+    #[perf_instrument("relay")]
+    pub(crate) async fn publish_event_with_quorum(
+        &self,
+        event: Event,
+        account_pubkey: &PublicKey,
+        relays: &[RelayUrl],
+        early_return_threshold: usize,
+    ) -> Result<Output<EventId>> {
+        let result = self
+            .executor
+            .publish_event_to_scope_quorum(
+                Some(*account_pubkey),
+                relays,
+                &event,
+                early_return_threshold,
+            )
+            .await?;
+
+        if result.output.success.is_empty() {
+            return Err(NostrManagerError::NoRelayAccepted);
+        }
+
+        if let Err(error) = self
+            .track_published_event(result.output.id(), account_pubkey)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::relay_control::ephemeral",
+                account_pubkey = %account_pubkey,
+                event_id = %result.output.id(),
+                "Quorum publish succeeded but event tracking failed: {error}"
+            );
+        }
+
+        let retry_relays: Vec<RelayUrl> = result
+            .pending
+            .into_iter()
+            .chain(result.output.failed.keys().cloned())
+            .collect();
+
+        if !retry_relays.is_empty() {
+            let executor = self.executor.clone();
+            let account_pubkey = *account_pubkey;
+
+            tokio::spawn(async move {
+                Self::retry_failed_relays(executor, event, account_pubkey, retry_relays).await;
+            });
+        }
+
+        Ok(result.output)
+    }
+
+    async fn retry_failed_relays(
+        executor: EphemeralExecutor,
+        event: Event,
+        account_pubkey: PublicKey,
+        mut remaining_relays: Vec<RelayUrl>,
+    ) {
+        const MAX_RETRIES: u32 = 4;
+
+        for attempt in 0..MAX_RETRIES {
+            let delay = Duration::from_secs(2u64.pow(attempt + 1)); // 2s, 4s, 8s, 16s
+            tokio::time::sleep(delay).await;
+
+            match executor
+                .publish_event_to_scope(Some(account_pubkey), &remaining_relays, &event)
+                .await
+            {
+                Ok(output) => {
+                    remaining_relays.retain(|u| !output.success.contains(u));
+
+                    if remaining_relays.is_empty() {
+                        tracing::debug!(
+                            target: "whitenoise::relay_control::ephemeral",
+                            account_pubkey = %account_pubkey,
+                            event_id = %event.id,
+                            attempt = attempt + 1,
+                            "Background retry: all relays succeeded"
+                        );
+                        return;
+                    }
+
+                    tracing::debug!(
+                        target: "whitenoise::relay_control::ephemeral",
+                        account_pubkey = %account_pubkey,
+                        event_id = %event.id,
+                        attempt = attempt + 1,
+                        succeeded = output.success.len(),
+                        remaining = remaining_relays.len(),
+                        "Background retry: partial progress"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::relay_control::ephemeral",
+                        account_pubkey = %account_pubkey,
+                        event_id = %event.id,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        "Background relay retry failed: {e}"
+                    );
+                }
+            }
+        }
+
+        if !remaining_relays.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::relay_control::ephemeral",
+                account_pubkey = %account_pubkey,
+                event_id = %event.id,
+                relays = ?remaining_relays,
+                "Background retry exhausted: {} relays never accepted the event",
+                remaining_relays.len()
+            );
+        }
     }
 
     #[perf_instrument("relay")]
@@ -573,6 +691,15 @@ impl EphemeralPlane {
         Ok(latest_semantically_valid.or(latest_timestamp_valid))
     }
 
+    fn latest_valid_metadata_from_events(events: Events) -> Option<Event> {
+        events
+            .into_iter()
+            .filter(|event| event.kind == Kind::Metadata)
+            .filter(is_event_timestamp_valid)
+            .filter(Self::is_metadata_event_semantically_valid)
+            .max_by_key(|event| (event.created_at, event.id))
+    }
+
     fn is_metadata_event_semantically_valid(event: &Event) -> bool {
         Metadata::from_json(&event.content).is_ok()
     }
@@ -599,7 +726,7 @@ impl EphemeralPlane {
     }
 
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
-        has_encoding_tag(event) && !event.content.trim().is_empty()
+        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
     }
 }
 
@@ -624,9 +751,7 @@ impl EphemeralScope {
         let filter = Filter::new().author(pubkey).kind(Kind::Metadata);
         let events = self.fetch_events_from(relays, filter).await?;
 
-        EphemeralPlane::latest_from_events_with_validation(events, Kind::Metadata, |event| {
-            EphemeralPlane::is_metadata_event_semantically_valid(event)
-        })
+        Ok(EphemeralPlane::latest_valid_metadata_from_events(events))
     }
 
     #[perf_instrument("relay")]
@@ -977,5 +1102,258 @@ mod tests {
             .count();
 
         assert_eq!(publish_failures, 2);
+    }
+
+    /// Newer incompatible key package must not shadow an older valid one.
+    #[test]
+    fn test_latest_key_package_prefers_marmot_compatible_over_newer_incompatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        // Older event: fully Marmot-compatible
+        let older_valid = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        // Newer event: has encoding tag + non-empty content but wrong ciphersuite
+        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x9999"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(newer_incompatible.created_at > older_valid.created_at);
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_valid.clone());
+        events.insert(newer_incompatible);
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(older_valid.id),
+            "Should prefer the older Marmot-compatible event over the newer incompatible one"
+        );
+    }
+
+    /// When all candidates are Marmot-compatible, the newest wins.
+    #[test]
+    fn test_latest_key_package_picks_newest_when_all_compatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        let older = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let newer = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older);
+        events.insert(newer.clone());
+
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(newer.id),
+            "Should pick the newest event when all are Marmot-compatible"
+        );
+    }
+
+    /// When no candidate is Marmot-compatible, falls back to the latest
+    /// timestamp-valid event among the incompatible ones.
+    #[test]
+    fn test_latest_key_package_falls_back_when_none_compatible() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let earlier = Timestamp::from(now.as_secs() - 60);
+
+        let older_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x9999"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                ["0x8888"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xF2EE"],
+            ))
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_incompatible);
+        events.insert(newer_incompatible.clone());
+
+        let result = EphemeralPlane::latest_from_events_with_validation(
+            events,
+            Kind::MlsKeyPackage,
+            EphemeralPlane::is_key_package_event_semantically_valid,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.as_ref().map(|e| e.id),
+            Some(newer_incompatible.id),
+            "Should fall back to the newest timestamp-valid event when none are Marmot-compatible"
+        );
+    }
+
+    #[test]
+    fn test_metadata_fetch_prefers_newest_semantically_valid_kind0() {
+        let keys = Keys::generate();
+        let oldest = Timestamp::from(1_700_000_000u64);
+        let newer = Timestamp::from(oldest.as_secs() + 60);
+        let newest_invalid = Timestamp::from(newer.as_secs() + 60);
+
+        let older_valid = EventBuilder::metadata(&Metadata::new().name("older"))
+            .custom_created_at(oldest)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let newer_valid = EventBuilder::metadata(&Metadata::new().name("newer"))
+            .custom_created_at(newer)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_latest = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(newest_invalid)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_valid);
+        events.insert(newer_valid.clone());
+        events.insert(invalid_latest);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert_eq!(result.as_ref().map(|event| event.id), Some(newer_valid.id));
+    }
+
+    #[test]
+    fn test_metadata_fetch_returns_none_when_only_invalid_kind0_events_exist() {
+        let keys = Keys::generate();
+        let now = Timestamp::from(1_700_000_000u64);
+        let later = Timestamp::from(now.as_secs() + 60);
+
+        let invalid_a = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_b = EventBuilder::new(Kind::Metadata, "not json")
+            .custom_created_at(later)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(invalid_a);
+        events.insert(invalid_b);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_metadata_fetch_does_not_fall_back_to_invalid_latest_event() {
+        let keys = Keys::generate();
+        let earlier = Timestamp::from(1_700_000_000u64);
+        let later = Timestamp::from(earlier.as_secs() + 60);
+
+        let valid_older = EventBuilder::metadata(&Metadata::new().name("valid"))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_latest = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(later)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(valid_older.clone());
+        events.insert(invalid_latest);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert_eq!(result.as_ref().map(|event| event.id), Some(valid_older.id));
     }
 }

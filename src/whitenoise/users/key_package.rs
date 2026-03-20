@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
@@ -22,51 +20,79 @@ pub enum KeyPackageStatus {
 }
 
 impl User {
-    /// Fetches the user's MLS key package event from their configured key package relays.
+    /// Returns the relay URLs to query for this user's key package.
     ///
-    /// This method retrieves the user's published MLS (Message Layer Security) key package
-    /// from the Nostr network. Key packages are cryptographic objects that contain the user's
-    /// public keys and credentials needed to add them to MLS group conversations.
+    /// Fallback order:
+    /// 1. User's KeyPackage relays (kind 10051)
+    /// 2. User's NIP-65 relays (kind 10002)
+    /// 3. Whitenoise discovery/fallback relays
+    /// 4. Default bootstrap relays from `Relay::defaults()`
+    #[perf_instrument("users")]
+    pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
+        let kp_relays = self
+            .relays(RelayType::KeyPackage, &whitenoise.database)
+            .await?;
+        if !kp_relays.is_empty() {
+            return Ok(Relay::urls(&kp_relays));
+        }
+
+        tracing::warn!(
+            target: "whitenoise::users::key_package",
+            "User {} has no key package relays, trying NIP-65 relays",
+            self.pubkey
+        );
+
+        let nip65_relays = self.relays(RelayType::Nip65, &whitenoise.database).await?;
+        if !nip65_relays.is_empty() {
+            return Ok(Relay::urls(&nip65_relays));
+        }
+
+        tracing::warn!(
+            target: "whitenoise::users::key_package",
+            "User {} has no NIP-65 relays either, trying configured discovery relays",
+            self.pubkey
+        );
+
+        let fallback_relays = whitenoise.fallback_relay_urls().await;
+        if !fallback_relays.is_empty() {
+            return Ok(fallback_relays);
+        }
+
+        tracing::warn!(
+            target: "whitenoise::users::key_package",
+            "User {} has no configured discovery relays available either, trying default relays",
+            self.pubkey
+        );
+
+        Ok(Relay::urls(&Relay::defaults()))
+    }
+
+    /// Fetches the user's MLS key package event from relays.
     ///
-    /// The method first retrieves the user's key package relay list (NIP-65 kind 10051 events),
-    /// then fetches the most recent MLS key package event (kind 443) from those relays.
+    /// Relay resolution follows [`key_package_relay_urls`](Self::key_package_relay_urls):
+    /// the user's KeyPackage relays, then NIP-65, then configured discovery
+    /// relays, then default bootstrap relays.
     ///
     /// # Arguments
     ///
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
     #[perf_instrument("users")]
     pub async fn key_package_event(&self, whitenoise: &Whitenoise) -> Result<Option<Event>> {
-        let key_package_relays = self
-            .relays(RelayType::KeyPackage, &whitenoise.database)
-            .await?;
-        let mut key_package_relays_urls_set: HashSet<RelayUrl> =
-            Relay::urls(&key_package_relays).into_iter().collect();
-        if key_package_relays.is_empty() {
+        let relay_urls = self.key_package_relay_urls(whitenoise).await?;
+        if relay_urls.is_empty() {
             tracing::warn!(
-                target: "whitenoise::users::key_package_event",
-                "User {} has no key package relays, using nip65 relays",
-                self.pubkey
-            );
-            key_package_relays_urls_set.extend(Relay::urls(
-                &self.relays(RelayType::Nip65, &whitenoise.database).await?,
-            ));
-        }
-        if key_package_relays_urls_set.is_empty() {
-            tracing::warn!(
-                target: "whitenoise::users::key_package_event",
-                "User {} has neither key package nor NIP-65 relays; returning None",
+                target: "whitenoise::users::key_package",
+                "No relays available for user {}; returning None",
                 self.pubkey
             );
             return Ok(None);
         }
 
-        let key_package_relays_urls: Vec<RelayUrl> =
-            key_package_relays_urls_set.into_iter().collect();
-        let key_package_event = whitenoise
+        let event = whitenoise
             .relay_control
-            .fetch_user_key_package(self.pubkey, &key_package_relays_urls)
+            .fetch_user_key_package(self.pubkey, &relay_urls)
             .await?;
-        Ok(key_package_event)
+        Ok(event)
     }
 
     /// Checks the status of a user's key package on relays.

@@ -3,7 +3,11 @@ use chrono::{DateTime, Utc};
 use nostr_sdk::RelayUrl;
 use nostr_sdk::{Metadata, PublicKey};
 
-use super::{Database, DatabaseError, relays::RelayRow, utils::parse_timestamp};
+use super::{
+    Database, DatabaseError,
+    relays::RelayRow,
+    utils::{parse_optional_timestamp, parse_timestamp},
+};
 use crate::{
     WhitenoiseError, perf_instrument,
     whitenoise::{
@@ -22,6 +26,8 @@ pub(crate) struct UserRow {
     pub metadata: Metadata,
     // created_at is the timestamp of the user creation
     pub created_at: DateTime<Utc>,
+    // metadata_known_at records when metadata resolution completed, including valid blank metadata
+    pub metadata_known_at: Option<DateTime<Utc>>,
     // updated_at is the timestamp of the last update
     pub updated_at: DateTime<Utc>,
 }
@@ -52,6 +58,7 @@ where
             })?;
 
         let created_at = parse_timestamp(row, "created_at")?;
+        let metadata_known_at = parse_optional_timestamp(row, "metadata_known_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
         Ok(UserRow {
@@ -59,6 +66,7 @@ where
             pubkey,
             metadata,
             created_at,
+            metadata_known_at,
             updated_at,
         })
     }
@@ -71,6 +79,7 @@ impl From<UserRow> for User {
             pubkey: val.pubkey,
             metadata: val.metadata,
             created_at: val.created_at,
+            metadata_known_at: val.metadata_known_at,
             updated_at: val.updated_at,
         }
     }
@@ -180,6 +189,7 @@ impl User {
                     pubkey: *pubkey,
                     metadata: Metadata::new(),
                     created_at: Utc::now(),
+                    metadata_known_at: None,
                     updated_at: Utc::now(),
                 };
                 user = user.save(database).await?;
@@ -243,7 +253,9 @@ impl User {
         let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_hex()).collect();
 
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            "SELECT id, pubkey, metadata, created_at, updated_at FROM users WHERE pubkey IN (",
+            "SELECT id, pubkey, metadata, created_at, metadata_known_at, updated_at
+             FROM users
+             WHERE pubkey IN (",
         );
         let mut sep = qb.separated(", ");
         for hex in &pubkey_hexes {
@@ -309,29 +321,6 @@ impl User {
         Ok(relays)
     }
 
-    /// Bumps `updated_at` to now without changing any other fields.
-    ///
-    /// Use this to record "we checked this user's metadata" even when no new
-    /// metadata was found, so that `needs_metadata_refresh()` respects the TTL
-    /// for empty-profile users.
-    #[perf_instrument("db::users")]
-    pub(crate) async fn touch_updated_at(
-        &mut self,
-        database: &Database,
-    ) -> Result<(), WhitenoiseError> {
-        let now = Utc::now();
-        let current_time = now.timestamp_millis();
-        sqlx::query("UPDATE users SET updated_at = ? WHERE pubkey = ?")
-            .bind(current_time)
-            .bind(self.pubkey.to_hex().as_str())
-            .execute(&database.pool)
-            .await
-            .map_err(DatabaseError::Sqlx)
-            .map_err(WhitenoiseError::Database)?;
-        self.updated_at = now;
-        Ok(())
-    }
-
     /// Saves this user to the database.
     ///
     /// # Arguments
@@ -352,15 +341,20 @@ impl User {
         // Use INSERT ON CONFLICT to handle both insert and update cases
         let current_time = Utc::now().timestamp_millis();
         sqlx::query(
-            "INSERT INTO users (pubkey, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO users (pubkey, metadata, created_at, metadata_known_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
                metadata = excluded.metadata,
+               metadata_known_at = excluded.metadata_known_at,
                updated_at = ?",
         )
         .bind(self.pubkey.to_hex().as_str())
         .bind(serde_json::to_string(&self.metadata).map_err(DatabaseError::Serialization)?)
         .bind(self.created_at.timestamp_millis())
+        .bind(
+            self.metadata_known_at
+                .map(|timestamp| timestamp.timestamp_millis()),
+        )
         .bind(self.updated_at.timestamp_millis())
         .bind(current_time)
         .execute(&mut *tx)
@@ -434,15 +428,20 @@ impl User {
         // Use INSERT ON CONFLICT to handle both insert and update cases
         let current_time = Utc::now().timestamp_millis();
         sqlx::query(
-            "INSERT INTO users (pubkey, metadata, created_at, updated_at)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO users (pubkey, metadata, created_at, metadata_known_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
                metadata = excluded.metadata,
+               metadata_known_at = excluded.metadata_known_at,
                updated_at = ?",
         )
         .bind(self.pubkey.to_hex().as_str())
         .bind(serde_json::to_string(&self.metadata).map_err(DatabaseError::Serialization)?)
         .bind(self.created_at.timestamp_millis())
+        .bind(
+            self.metadata_known_at
+                .map(|timestamp| timestamp.timestamp_millis()),
+        )
         .bind(self.updated_at.timestamp_millis())
         .bind(current_time)
         .execute(&mut **tx)
@@ -489,6 +488,7 @@ impl User {
                     pubkey: *pubkey,
                     metadata: Metadata::new(),
                     created_at: Utc::now(),
+                    metadata_known_at: None,
                     updated_at: Utc::now(),
                 };
                 user = user.save_tx(tx).await?;
@@ -678,6 +678,7 @@ mod tests {
                 pubkey TEXT NOT NULL,
                 metadata JSONB,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                metadata_known_at DATETIME,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
@@ -950,6 +951,7 @@ mod tests {
             pubkey: test_pubkey1,
             metadata: Metadata::new().name("User One"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         let user2 = User {
@@ -957,6 +959,7 @@ mod tests {
             pubkey: test_pubkey2,
             metadata: Metadata::new().name("User Two"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
 
@@ -992,6 +995,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_created_at,
+            metadata_known_at: None,
             updated_at: test_updated_at,
         };
         let result = user.save(&whitenoise.database).await;
@@ -1032,6 +1036,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_created_at,
+            metadata_known_at: None,
             updated_at: test_updated_at,
         };
 
@@ -1052,6 +1057,55 @@ mod tests {
             loaded.updated_at.timestamp_millis(),
             test_updated_at.timestamp_millis()
         );
+    }
+
+    #[tokio::test]
+    async fn test_save_persisted_metadata_known_at_for_populated_metadata() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let mut user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new().name("Known User"),
+            created_at: chrono::Utc::now(),
+            metadata_known_at: None,
+            updated_at: chrono::Utc::now(),
+        };
+        user.mark_metadata_known_now();
+
+        user.save(&whitenoise.database).await.unwrap();
+
+        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(loaded.metadata_known_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_save_persisted_metadata_known_at_for_valid_blank_metadata() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+        let mut user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new(),
+            created_at: chrono::Utc::now(),
+            metadata_known_at: None,
+            updated_at: chrono::Utc::now(),
+        };
+        user.mark_metadata_known_now();
+
+        user.save(&whitenoise.database).await.unwrap();
+
+        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(loaded.metadata, Metadata::new());
+        assert!(loaded.metadata_known_at.is_some());
     }
 
     #[tokio::test]
@@ -1085,6 +1139,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_or_create_new_user_starts_with_metadata_known_at_none() {
+        use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = nostr_sdk::Keys::generate().public_key();
+
+        let (user, created) = User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(created);
+        assert_eq!(user.metadata, Metadata::new());
+        assert!(user.metadata_known_at.is_none());
+    }
+
+    #[tokio::test]
     async fn test_find_by_pubkeys_single_existing() {
         use crate::whitenoise::test_utils::create_mock_whitenoise;
 
@@ -1096,6 +1166,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: Metadata::new().name("Test User"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -1125,6 +1196,7 @@ mod tests {
                 pubkey: *pubkey,
                 metadata: Metadata::new().name(format!("User {}", i + 1)),
                 created_at: chrono::Utc::now(),
+                metadata_known_at: None,
                 updated_at: chrono::Utc::now(),
             };
             user.save(&whitenoise.database).await.unwrap();
@@ -1156,6 +1228,7 @@ mod tests {
             pubkey: existing_pubkey,
             metadata: Metadata::new().name("Existing User"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -1204,6 +1277,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -1245,6 +1319,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_created_at,
+            metadata_known_at: None,
             updated_at: test_updated_at,
         };
 
@@ -1323,6 +1398,7 @@ mod tests {
                 pubkey: test_pubkey,
                 metadata: metadata.clone(),
                 created_at: test_timestamp,
+                metadata_known_at: None,
                 updated_at: test_timestamp,
             };
 
@@ -1389,6 +1465,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1513,6 +1590,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1547,6 +1625,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1608,6 +1687,7 @@ mod tests {
             pubkey: user1_pubkey,
             metadata: Metadata::new().name("User 1"),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1616,6 +1696,7 @@ mod tests {
             pubkey: user2_pubkey,
             metadata: Metadata::new().name("User 2"),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1707,6 +1788,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata,
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1753,6 +1835,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata,
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1809,6 +1892,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata,
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1865,6 +1949,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata,
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1905,6 +1990,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata,
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1947,6 +2033,7 @@ mod tests {
             pubkey: test_pubkey,
             metadata: test_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 

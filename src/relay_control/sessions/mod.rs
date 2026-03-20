@@ -6,4 +6,4 @@ pub(crate) use config::{
     RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
     RelaySessionRelayPolicy,
 };
-pub(crate) use session::RelaySession;
+pub(crate) use session::{QuorumPublishResult, RelaySession};

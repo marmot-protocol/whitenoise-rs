@@ -80,6 +80,9 @@ pub use whitenoise::chat_list_streaming::{
     ChatListSubscription, ChatListUpdate, ChatListUpdateTrigger,
 };
 
+// User streaming
+pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTrigger};
+
 // Notification streaming
 pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,

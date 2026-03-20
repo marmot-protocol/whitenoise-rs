@@ -201,6 +201,9 @@ pub enum WhitenoiseError {
     #[error("Unsupported media format: {0}")]
     UnsupportedMediaFormat(String),
 
+    #[error("Download rejected: response body exceeds the {limit} byte size limit")]
+    DownloadSizeLimitExceeded { limit: usize },
+
     #[error(
         "Cannot deliver MLS welcome for {member_pubkey}: no inbox/NIP-65 relays configured and account {account_pubkey} has no fallback relays"
     )]

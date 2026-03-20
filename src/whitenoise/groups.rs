@@ -89,57 +89,23 @@ impl Whitenoise {
     }
 
     /// Resolves a single member for group creation: finds or creates the user record,
-    /// syncs relay lists and metadata for new users, fetches and validates the key package.
-    async fn resolve_member_key_package(
-        &self,
-        pk: &PublicKey,
-        fallback_account: &Account,
-    ) -> Result<(User, Event)> {
-        let (mut user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
-        if created {
-            if let Err(e) = user.update_relay_lists(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Failed to update relay lists for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
-            if let Err(e) = user.sync_metadata(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Failed to sync metadata for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
-        }
-
-        let mut kp_relays = user.relays(RelayType::KeyPackage, &self.database).await?;
-        if kp_relays.is_empty() {
+    /// syncs relay lists for new users, fetches and validates the key package.
+    ///
+    /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
+    /// preflight status checks and actual group creation use the same fallback chain.
+    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+        let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
+        if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
                 target: "whitenoise::accounts::groups::create_group",
-                "User {} has no key package relays configured, falling back to account {} relays",
+                "Failed to update relay lists for new user {}: {}",
                 user.pubkey,
-                fallback_account.pubkey
+                e
             );
-            kp_relays = fallback_account.nip65_relays(self).await?;
-            if kp_relays.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::create_group",
-                    "Account {} has no fallback relays configured, using defaults",
-                    fallback_account.pubkey
-                );
-                kp_relays = Relay::defaults();
-            }
         }
 
-        let kp_relays_urls = Relay::urls(&kp_relays);
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let some_event = self
-            .relay_control
-            .fetch_user_key_package(*pk, &kp_relays_urls)
-            .await?;
+        let some_event = user.key_package_event(self).await?;
         drop(_kp_fetch);
 
         let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
@@ -336,7 +302,7 @@ impl Whitenoise {
         // Resolve members and fetch key packages concurrently
         let member_futures = member_pubkeys
             .iter()
-            .map(|pk| self.resolve_member_key_package(pk, creator_account));
+            .map(|pk| self.resolve_member_key_package(pk));
         let resolved_members = try_join_all(member_futures).await?;
         let (members, key_package_events): (Vec<User>, Vec<Event>) =
             resolved_members.into_iter().unzip();
@@ -598,7 +564,17 @@ impl Whitenoise {
             let (user, newly_created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
 
             if newly_created {
-                self.background_fetch_user_data(&user).await?;
+                // Sync relay lists synchronously so that the key package relay lookup below
+                // has a chance to find the user's relays before falling back to account defaults.
+                // Metadata is not needed to add a member to a group; skip it on the critical path.
+                if let Err(e) = user.update_relay_lists(self).await {
+                    tracing::warn!(
+                        target: "whitenoise::accounts::groups::add_members_to_group",
+                        "Failed to update relay lists for new user {}: {}",
+                        user.pubkey,
+                        e
+                    );
+                }
             }
             // Try and get user's key package relays, if they don't have any, use account's default relays
             let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
@@ -817,7 +793,28 @@ mod tests {
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
+    use nostr_blossom::bud02::BlobDescriptor;
     use nostr_sdk::RelayUrl;
+    use nostr_sdk::prelude::hashes::Hash as _;
+    use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
+
+    fn mock_blossom_url(server: &mockito::Server) -> Url {
+        let socket_address = server.socket_address();
+        Url::parse(&format!("http://{socket_address}")).unwrap()
+    }
+
+    fn mock_blob_descriptor(server_url: &Url, blob: &[u8], mime_type: &str) -> BlobDescriptor {
+        let sha256 = Sha256Hash::hash(blob);
+        let url = server_url.join(&sha256.to_string()).unwrap();
+
+        BlobDescriptor {
+            url,
+            sha256,
+            size: blob.len().try_into().unwrap(),
+            mime_type: Some(mime_type.to_string()),
+            uploaded: Timestamp::now(),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_group() {
@@ -1904,6 +1901,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/png",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -1929,8 +1943,6 @@ mod tests {
         // Read the original image data for later comparison
         let test_image_data = tokio::fs::read(temp_path).await.unwrap();
 
-        // Upload the group image to local Blossom server (port 3000 per docker-compose.yml)
-        let blossom_server = Url::parse("http://localhost:3000").unwrap();
         // Use test options to skip blurhash generation (which has issues with small test images)
         let test_options = MediaProcessingOptions {
             generate_blurhash: false,
@@ -1941,7 +1953,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(blossom_server),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await;
@@ -2039,6 +2051,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/jpeg",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member accounts
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -2066,8 +2095,6 @@ mod tests {
         // Read the original image data for later comparison
         let test_image_data = tokio::fs::read(temp_path).await.unwrap();
 
-        // Creator uploads the group image
-        let blossom_server = Url::parse("http://localhost:3000").unwrap();
         // Use test options to skip blurhash generation (which has issues with small test images)
         let test_options = MediaProcessingOptions {
             generate_blurhash: false,
@@ -2078,7 +2105,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(blossom_server),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await
@@ -2149,6 +2176,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/png",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -2184,7 +2228,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(Url::parse("http://localhost:3000").unwrap()),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await;

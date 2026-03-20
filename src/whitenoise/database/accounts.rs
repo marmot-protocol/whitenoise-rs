@@ -229,7 +229,7 @@ impl Account {
     #[perf_instrument("db::accounts")]
     pub(crate) async fn follows(&self, database: &Database) -> Result<Vec<User>, WhitenoiseError> {
         let user_rows = sqlx::query_as::<_, UserRow>(
-            "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.updated_at
+            "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.metadata_known_at, u.updated_at
              FROM account_follows af
              JOIN users u ON af.user_id = u.id
              WHERE af.account_id = ?",
@@ -246,6 +246,7 @@ impl Account {
                 pubkey: row.pubkey,
                 metadata: row.metadata,
                 created_at: row.created_at,
+                metadata_known_at: row.metadata_known_at,
                 updated_at: row.updated_at,
             })
             .collect();
@@ -558,6 +559,7 @@ mod tests {
                 pubkey TEXT NOT NULL UNIQUE,
                 metadata TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
+                metadata_known_at INTEGER,
                 updated_at INTEGER NOT NULL
             )",
         )
@@ -1025,6 +1027,7 @@ mod tests {
                 pubkey: user_pubkey,
                 metadata: metadata.clone(),
                 created_at: test_timestamp,
+                metadata_known_at: None,
                 updated_at: test_timestamp,
             };
 
@@ -1145,6 +1148,7 @@ mod tests {
             pubkey: user_pubkey,
             metadata: user_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1217,6 +1221,7 @@ mod tests {
             pubkey: user_pubkey,
             metadata: user_metadata.clone(),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
 
@@ -1311,6 +1316,7 @@ mod tests {
                 pubkey: user_pubkey,
                 metadata: user_metadata,
                 created_at: test_timestamp,
+                metadata_known_at: None,
                 updated_at: test_timestamp,
             };
 
@@ -1803,6 +1809,7 @@ mod tests {
                 .name("TestUser")
                 .display_name("Test User"),
             created_at: test_timestamp,
+            metadata_known_at: None,
             updated_at: test_timestamp,
         };
         user.save(&whitenoise.database).await.unwrap();

@@ -14,12 +14,23 @@
 
 #![cfg(all(feature = "cli", feature = "integration-tests"))]
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 #[path = "support/cli.rs"]
 mod cli_support;
 
-use cli_support::{Daemon, group_id_hex, wait_for_group, wait_for_message, wn};
+use cli_support::{Daemon, group_id_hex, poll_until, wait_for_group, wait_for_message, wn};
+
+async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
+    let msg = format!("did not see a valid key package for {pubkey} within 30s");
+    poll_until(Duration::from_secs(30), &msg, || {
+        wn(socket, &["keys", "check", pubkey])
+            .get("status")
+            .and_then(|status| status.as_str())
+            == Some("valid")
+    })
+    .await;
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -162,6 +173,7 @@ async fn group_metadata_and_membership() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_key_package(&bob.socket, &bob_pk).await;
 
     let group = wn(
         &alice.socket,
@@ -252,6 +264,7 @@ async fn cross_daemon_group_messaging() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_key_package(&bob.socket, &bob_pk).await;
 
     let group = wn(
         &alice.socket,
@@ -321,6 +334,7 @@ async fn second_identity_does_not_break_first_account_messaging() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_key_package(&bob.socket, &bob_pk).await;
 
     // Establish a working chat with account 1
     let group = wn(
