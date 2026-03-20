@@ -949,7 +949,7 @@ impl Whitenoise {
     /// * `group_id` - The group to subscribe to
     /// * `limit`    - Maximum number of messages to include in the initial snapshot
     ///   (default 50, capped at 200).  Older messages can be fetched on demand via
-    ///   [`fetch_aggregated_messages_for_group`].  Pass `None` to use the default.
+    ///   [`Self::fetch_aggregated_messages_for_group`].  Pass `None` to use the default.
     ///
     /// # Returns
     /// A [`message_streaming::GroupMessageSubscription`] containing initial messages and a broadcast receiver
