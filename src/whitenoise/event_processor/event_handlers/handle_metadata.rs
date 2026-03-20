@@ -22,6 +22,7 @@ impl Whitenoise {
 
                 if should_update {
                     user.metadata = metadata;
+                    user.mark_metadata_known_now();
                     user.save(&self.database).await?;
 
                     self.event_tracker
@@ -33,6 +34,15 @@ impl Whitenoise {
                         "Updated metadata for user {} with event timestamp {}",
                         event.pubkey,
                         event.created_at
+                    );
+                } else if user.metadata_is_unknown() {
+                    user.mark_metadata_known_now();
+                    user.save(&self.database).await?;
+
+                    tracing::debug!(
+                        target: "whitenoise::event_processor::handle_metadata",
+                        "Marked metadata as known for user {} without changing stored metadata",
+                        event.pubkey
                     );
                 }
                 Ok(())
@@ -47,5 +57,135 @@ impl Whitenoise {
                 Err(WhitenoiseError::EventProcessor(e.to_string()))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, Utc};
+
+    use super::*;
+    use crate::whitenoise::{
+        database::processed_events::ProcessedEvent, test_utils::create_mock_whitenoise,
+    };
+
+    async fn metadata_event(keys: &Keys, metadata: &Metadata, timestamp: Timestamp) -> Event {
+        EventBuilder::metadata(metadata)
+            .custom_created_at(timestamp)
+            .sign(keys)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_blank_kind0_marks_metadata_as_known() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let event = metadata_event(&keys, &Metadata::new(), Timestamp::now()).await;
+
+        whitenoise.handle_metadata(event).await.unwrap();
+
+        let user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        assert_eq!(user.metadata, Metadata::new());
+        assert!(user.metadata_known_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn newer_valid_kind0_updates_metadata_and_known_timestamp() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let older = metadata_event(&keys, &Metadata::new().name("older"), now).await;
+
+        whitenoise.handle_metadata(older).await.unwrap();
+        let first_user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        let first_known_at = first_user.metadata_known_at.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let newer_timestamp = Timestamp::from(now.as_secs() + 60);
+        let newer = metadata_event(&keys, &Metadata::new().name("newer"), newer_timestamp).await;
+        whitenoise.handle_metadata(newer).await.unwrap();
+
+        let updated_user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        let updated_known_at = updated_user.metadata_known_at.unwrap();
+
+        assert_eq!(updated_user.metadata.name, Some("newer".to_string()));
+        assert!(updated_known_at >= first_known_at);
+    }
+
+    #[tokio::test]
+    async fn older_valid_kind0_does_not_overwrite_newer_processed_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let now = Utc::now();
+        let newer_timestamp = Timestamp::from(now.timestamp() as u64);
+        let older_timestamp = Timestamp::from((now - Duration::minutes(5)).timestamp() as u64);
+
+        let newer = metadata_event(&keys, &Metadata::new().name("newer"), newer_timestamp).await;
+        whitenoise.handle_metadata(newer).await.unwrap();
+
+        let first_user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        let first_known_at = first_user.metadata_known_at;
+
+        let older = metadata_event(&keys, &Metadata::new().name("older"), older_timestamp).await;
+        whitenoise.handle_metadata(older).await.unwrap();
+
+        let user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        assert_eq!(user.metadata.name, Some("newer".to_string()));
+        assert_eq!(user.metadata_known_at, first_known_at);
+    }
+
+    #[tokio::test]
+    async fn already_processed_event_still_marks_unknown_user_as_known() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let metadata = Metadata::new().name("known");
+        let event = metadata_event(&keys, &metadata, Timestamp::now()).await;
+
+        let user = User {
+            id: None,
+            pubkey: keys.public_key(),
+            metadata: metadata.clone(),
+            created_at: Utc::now(),
+            metadata_known_at: None,
+            updated_at: Utc::now(),
+        };
+        user.save(&whitenoise.database).await.unwrap();
+
+        ProcessedEvent::create(
+            &event.id,
+            None,
+            Some(Utc::now()),
+            Some(Kind::Metadata),
+            Some(&keys.public_key()),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        whitenoise.handle_metadata(event).await.unwrap();
+
+        let stored_user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        assert_eq!(stored_user.metadata, metadata);
+        assert!(stored_user.metadata_known_at.is_some());
     }
 }

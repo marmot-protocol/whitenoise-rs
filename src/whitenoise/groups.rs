@@ -793,7 +793,28 @@ mod tests {
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
+    use nostr_blossom::bud02::BlobDescriptor;
     use nostr_sdk::RelayUrl;
+    use nostr_sdk::prelude::hashes::Hash as _;
+    use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
+
+    fn mock_blossom_url(server: &mockito::Server) -> Url {
+        let socket_address = server.socket_address();
+        Url::parse(&format!("http://{socket_address}")).unwrap()
+    }
+
+    fn mock_blob_descriptor(server_url: &Url, blob: &[u8], mime_type: &str) -> BlobDescriptor {
+        let sha256 = Sha256Hash::hash(blob);
+        let url = server_url.join(&sha256.to_string()).unwrap();
+
+        BlobDescriptor {
+            url,
+            sha256,
+            size: blob.len().try_into().unwrap(),
+            mime_type: Some(mime_type.to_string()),
+            uploaded: Timestamp::now(),
+        }
+    }
 
     #[tokio::test]
     async fn test_create_group() {
@@ -1880,6 +1901,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/png",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -1905,8 +1943,6 @@ mod tests {
         // Read the original image data for later comparison
         let test_image_data = tokio::fs::read(temp_path).await.unwrap();
 
-        // Upload the group image to local Blossom server (port 3000 per docker-compose.yml)
-        let blossom_server = Url::parse("http://localhost:3000").unwrap();
         // Use test options to skip blurhash generation (which has issues with small test images)
         let test_options = MediaProcessingOptions {
             generate_blurhash: false,
@@ -1917,7 +1953,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(blossom_server),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await;
@@ -2015,6 +2051,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/jpeg",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member accounts
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -2042,8 +2095,6 @@ mod tests {
         // Read the original image data for later comparison
         let test_image_data = tokio::fs::read(temp_path).await.unwrap();
 
-        // Creator uploads the group image
-        let blossom_server = Url::parse("http://localhost:3000").unwrap();
         // Use test options to skip blurhash generation (which has issues with small test images)
         let test_options = MediaProcessingOptions {
             generate_blurhash: false,
@@ -2054,7 +2105,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(blossom_server),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await
@@ -2125,6 +2176,23 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "image/png",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
 
         // Setup creator and member
         let creator_account = whitenoise.create_identity().await.unwrap();
@@ -2160,7 +2228,7 @@ mod tests {
                 &creator_account,
                 &group.mls_group_id,
                 temp_path,
-                Some(Url::parse("http://localhost:3000").unwrap()),
+                Some(blossom_url),
                 Some(test_options),
             )
             .await;

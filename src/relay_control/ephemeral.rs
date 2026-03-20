@@ -691,6 +691,15 @@ impl EphemeralPlane {
         Ok(latest_semantically_valid.or(latest_timestamp_valid))
     }
 
+    fn latest_valid_metadata_from_events(events: Events) -> Option<Event> {
+        events
+            .into_iter()
+            .filter(|event| event.kind == Kind::Metadata)
+            .filter(is_event_timestamp_valid)
+            .filter(Self::is_metadata_event_semantically_valid)
+            .max_by_key(|event| (event.created_at, event.id))
+    }
+
     fn is_metadata_event_semantically_valid(event: &Event) -> bool {
         Metadata::from_json(&event.content).is_ok()
     }
@@ -742,9 +751,7 @@ impl EphemeralScope {
         let filter = Filter::new().author(pubkey).kind(Kind::Metadata);
         let events = self.fetch_events_from(relays, filter).await?;
 
-        EphemeralPlane::latest_from_events_with_validation(events, Kind::Metadata, |event| {
-            EphemeralPlane::is_metadata_event_semantically_valid(event)
-        })
+        Ok(EphemeralPlane::latest_valid_metadata_from_events(events))
     }
 
     #[perf_instrument("relay")]
@@ -1267,5 +1274,86 @@ mod tests {
             Some(newer_incompatible.id),
             "Should fall back to the newest timestamp-valid event when none are Marmot-compatible"
         );
+    }
+
+    #[test]
+    fn test_metadata_fetch_prefers_newest_semantically_valid_kind0() {
+        let keys = Keys::generate();
+        let oldest = Timestamp::from(1_700_000_000u64);
+        let newer = Timestamp::from(oldest.as_secs() + 60);
+        let newest_invalid = Timestamp::from(newer.as_secs() + 60);
+
+        let older_valid = EventBuilder::metadata(&Metadata::new().name("older"))
+            .custom_created_at(oldest)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let newer_valid = EventBuilder::metadata(&Metadata::new().name("newer"))
+            .custom_created_at(newer)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_latest = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(newest_invalid)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(older_valid);
+        events.insert(newer_valid.clone());
+        events.insert(invalid_latest);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert_eq!(result.as_ref().map(|event| event.id), Some(newer_valid.id));
+    }
+
+    #[test]
+    fn test_metadata_fetch_returns_none_when_only_invalid_kind0_events_exist() {
+        let keys = Keys::generate();
+        let now = Timestamp::from(1_700_000_000u64);
+        let later = Timestamp::from(now.as_secs() + 60);
+
+        let invalid_a = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(now)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_b = EventBuilder::new(Kind::Metadata, "not json")
+            .custom_created_at(later)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(invalid_a);
+        events.insert(invalid_b);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_metadata_fetch_does_not_fall_back_to_invalid_latest_event() {
+        let keys = Keys::generate();
+        let earlier = Timestamp::from(1_700_000_000u64);
+        let later = Timestamp::from(earlier.as_secs() + 60);
+
+        let valid_older = EventBuilder::metadata(&Metadata::new().name("valid"))
+            .custom_created_at(earlier)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let invalid_latest = EventBuilder::new(Kind::Metadata, "{invalid")
+            .custom_created_at(later)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let filter = Filter::new().kind(Kind::Metadata).author(keys.public_key());
+        let mut events = Events::new(&filter);
+        events.insert(valid_older.clone());
+        events.insert(invalid_latest);
+
+        let result = EphemeralPlane::latest_valid_metadata_from_events(events);
+
+        assert_eq!(result.as_ref().map(|event| event.id), Some(valid_older.id));
     }
 }

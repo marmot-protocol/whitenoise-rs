@@ -26,6 +26,7 @@ impl User {
     /// 1. User's KeyPackage relays (kind 10051)
     /// 2. User's NIP-65 relays (kind 10002)
     /// 3. Whitenoise discovery/fallback relays
+    /// 4. Default bootstrap relays from `Relay::defaults()`
     #[perf_instrument("users")]
     pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
         let kp_relays = self
@@ -48,17 +49,29 @@ impl User {
 
         tracing::warn!(
             target: "whitenoise::users::key_package",
-            "User {} has no NIP-65 relays either, using fallback relays",
+            "User {} has no NIP-65 relays either, trying configured discovery relays",
             self.pubkey
         );
 
-        Ok(whitenoise.fallback_relay_urls().await)
+        let fallback_relays = whitenoise.fallback_relay_urls().await;
+        if !fallback_relays.is_empty() {
+            return Ok(fallback_relays);
+        }
+
+        tracing::warn!(
+            target: "whitenoise::users::key_package",
+            "User {} has no configured discovery relays available either, trying default relays",
+            self.pubkey
+        );
+
+        Ok(Relay::urls(&Relay::defaults()))
     }
 
     /// Fetches the user's MLS key package event from relays.
     ///
     /// Relay resolution follows [`key_package_relay_urls`](Self::key_package_relay_urls):
-    /// the user's KeyPackage relays, then NIP-65, then discovery fallbacks.
+    /// the user's KeyPackage relays, then NIP-65, then configured discovery
+    /// relays, then default bootstrap relays.
     ///
     /// # Arguments
     ///

@@ -739,6 +739,7 @@ mod tests {
             pubkey: keys.public_key(),
             metadata: Metadata::new().name("Alice").about("From user table"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -783,6 +784,7 @@ mod tests {
             pubkey: keys.public_key(),
             metadata: Metadata::new(),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -819,6 +821,7 @@ mod tests {
                 pubkey: keys.public_key(),
                 metadata: Metadata::new().name(name),
                 created_at: chrono::Utc::now(),
+                metadata_known_at: None,
                 updated_at: chrono::Utc::now(),
             };
             user.save(&whitenoise.database).await.unwrap();
@@ -876,6 +879,7 @@ mod tests {
             pubkey: user_keys.public_key(),
             metadata: Metadata::new().name("FromUser"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -983,6 +987,7 @@ mod tests {
             pubkey: pk,
             metadata: Metadata::new(), // empty
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -1003,6 +1008,7 @@ mod tests {
             pubkey: pk,
             metadata: Metadata::new().name("HasMeta"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();

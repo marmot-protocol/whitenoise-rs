@@ -1804,6 +1804,7 @@ mod tests {
             pubkey: followed_keys.public_key(),
             metadata: Metadata::new().name("FollowedUserGraph"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -2465,6 +2466,7 @@ mod tests {
             pubkey: known_pk,
             metadata: Metadata::new().name("KnownUser"),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
@@ -2590,6 +2592,7 @@ mod tests {
             pubkey: followed_keys.public_key(),
             metadata: Metadata::new(),
             created_at: chrono::Utc::now(),
+            metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
         user.save(&whitenoise.database).await.unwrap();
