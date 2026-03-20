@@ -132,26 +132,23 @@ impl TestCase for VerifyInitialMessagesTestCase {
             tracing::info!("✓ Message '{}' correctly has no reactions", key);
         }
 
-        // Verify deleted messages
+        // Verify deleted messages are NOT in the initial snapshot
         for key in &self.expected_deleted {
             let msg_id = context.get_message_id(key)?;
-            let msg = subscription
+            let found = subscription
                 .initial_messages
                 .iter()
-                .find(|m| &m.id == msg_id)
-                .ok_or_else(|| {
-                    WhitenoiseError::Other(anyhow::anyhow!(
-                        "Message '{}' not found for deletion check",
-                        key
-                    ))
-                })?;
+                .any(|m| &m.id == msg_id);
 
             assert!(
-                msg.is_deleted,
-                "Expected message '{}' to be deleted, but is_deleted is false",
+                !found,
+                "Expected message '{}' to be excluded from initial snapshot because it is deleted, but it was found",
                 key
             );
-            tracing::info!("✓ Message '{}' is correctly marked as deleted", key);
+            tracing::info!(
+                "✓ Message '{}' is correctly excluded from the initial snapshot",
+                key
+            );
         }
 
         tracing::info!(
