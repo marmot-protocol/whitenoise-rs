@@ -136,6 +136,7 @@ benchmark-json scenario="":
 benchmark-json-stable:
     #!/usr/bin/env bash
     set -euo pipefail
+    command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not installed"; exit 1; }
     mkdir -p ./benchmark_results
     rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)

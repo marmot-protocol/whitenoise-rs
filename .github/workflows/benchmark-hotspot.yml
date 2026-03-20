@@ -83,7 +83,7 @@ jobs:
           if [ ${#files[@]} -eq 0 ]; then
             echo "found=false" >> "$GITHUB_OUTPUT"
           else
-            FILE=$(printf '%s\n' "${files[@]}" | xargs ls -t -- | head -1)
+            FILE=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t -- | head -1)
             echo "path=$FILE" >> "$GITHUB_OUTPUT"
             echo "found=true" >> "$GITHUB_OUTPUT"
           fi

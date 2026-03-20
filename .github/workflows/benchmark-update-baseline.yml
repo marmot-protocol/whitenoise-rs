@@ -65,7 +65,7 @@ jobs:
             exit 1
           fi
           # Pick the newest file by modification time.
-          RESULT=$(printf '%s\n' "${files[@]}" | xargs ls -t | head -1)
+          RESULT=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
           BASELINE_NAME="baseline-all.json"
           cp "$RESULT" "perf-hotspot-data/$BASELINE_NAME"
           echo "Copied $RESULT → perf-hotspot-data/$BASELINE_NAME"
