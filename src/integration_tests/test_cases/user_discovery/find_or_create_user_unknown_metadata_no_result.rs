@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use nostr_sdk::{Keys, Metadata};
 
 const LOG_TARGET: &str =
-    "integration_tests::test_cases::user_discovery::find_or_create_user_stale_metadata";
+    "integration_tests::test_cases::user_discovery::find_or_create_user_unknown_metadata_no_result";
 
 /// Tests that unknown metadata stays unknown when targeted discovery finds nothing.
 ///

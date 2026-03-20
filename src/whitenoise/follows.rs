@@ -24,7 +24,8 @@ impl Whitenoise {
         let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
 
         if newly_created {
-            self.background_fetch_user_data(&user, true).await?;
+            self.background_fetch_user_data(&user).await?;
+            self.refresh_global_subscription_for_user().await?;
         }
 
         account.follow_user(&user, &self.database).await?;

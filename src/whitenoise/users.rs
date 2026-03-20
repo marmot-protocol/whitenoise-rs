@@ -76,7 +76,7 @@ impl User {
     }
 
     pub fn metadata_is_unknown(&self) -> bool {
-        self.metadata_known_at.is_none()
+        !self.metadata_is_known()
     }
 
     pub fn mark_metadata_known_now(&mut self) {
@@ -236,7 +236,7 @@ impl Whitenoise {
     }
 
     fn prepare_targeted_discovery_events(events: Events) -> Vec<Event> {
-        let mut filtered_events: Vec<Event> = events
+        events
             .into_iter()
             .filter_map(|event| match event.kind {
                 Kind::Metadata if Metadata::from_json(&event.content).is_err() => {
@@ -253,10 +253,7 @@ impl Whitenoise {
                 | Kind::MlsKeyPackageRelays => Some(event),
                 _ => None,
             })
-            .collect();
-
-        filtered_events.sort_unstable_by_key(|event| (event.created_at, event.id));
-        filtered_events
+            .collect()
     }
 
     async fn fetch_targeted_discovery_events(
@@ -410,6 +407,15 @@ impl Whitenoise {
     #[perf_instrument("users")]
     async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
         if user.metadata_is_known() {
+            if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
+                tracing::warn!(
+                    target: "whitenoise::users::sync_user_blocking",
+                    "Failed to refresh global subscription for new user {}: {}",
+                    user.pubkey,
+                    error
+                );
+            }
+
             tracing::debug!(
                 target: "whitenoise::users::sync_user_blocking",
                 "User {} metadata is already known, skipping blocking discovery",
@@ -460,7 +466,7 @@ impl Whitenoise {
                 "User {} metadata is unknown, starting background discovery catch-up",
                 user.pubkey,
             );
-            if let Err(error) = self.background_fetch_user_data(user, is_new).await {
+            if let Err(error) = self.background_fetch_user_data(user).await {
                 tracing::warn!(
                     target: "whitenoise::users::sync_user_background",
                     "Failed to start background discovery catch-up for user {}: {}",
@@ -476,10 +482,19 @@ impl Whitenoise {
             );
         }
 
+        if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
+            tracing::warn!(
+                target: "whitenoise::users::sync_user_background",
+                "Failed to refresh global subscription for new user {}: {}",
+                user.pubkey,
+                error
+            );
+        }
+
         Ok(())
     }
 
-    async fn background_fetch_user_data_inner(&self, user: User, is_new: bool) -> Result<()> {
+    async fn background_fetch_user_data_inner(&self, user: User) -> Result<()> {
         match self.fetch_targeted_discovery_events(user.pubkey).await {
             Ok(Some((events, relay_url))) => {
                 if let Err(error) = self
@@ -505,40 +520,21 @@ impl Whitenoise {
             }
         }
 
-        if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::users::background_fetch_user_data",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                error
-            );
-        }
-
         Ok(())
     }
 
-    pub(crate) async fn background_fetch_user_data(&self, user: &User, is_new: bool) -> Result<()> {
-        #[cfg(test)]
-        {
-            self.background_fetch_user_data_inner(user.clone(), is_new)
+    pub(crate) async fn background_fetch_user_data(&self, user: &User) -> Result<()> {
+        let user_clone = user.clone();
+        tokio::spawn(async move {
+            let whitenoise = Whitenoise::get_instance()?;
+            whitenoise
+                .background_fetch_user_data_inner(user_clone)
                 .await?;
-            Ok(())
-        }
 
-        #[cfg(not(test))]
-        {
-            let user_clone = user.clone();
-            tokio::spawn(async move {
-                let whitenoise = Whitenoise::get_instance()?;
-                whitenoise
-                    .background_fetch_user_data_inner(user_clone, is_new)
-                    .await?;
+            Ok::<(), WhitenoiseError>(())
+        });
 
-                Ok::<(), WhitenoiseError>(())
-            });
-
-            Ok(())
-        }
+        Ok(())
     }
 
     /// **TEST-ONLY**: Override `metadata_known_at` for a user.
@@ -598,6 +594,14 @@ mod tests {
 
     fn assert_no_queued_events(receiver: &mut mpsc::Receiver<ProcessableEvent>) {
         assert!(receiver.try_recv().is_err());
+    }
+
+    async fn watched_user_count(whitenoise: &Whitenoise) -> usize {
+        whitenoise
+            .get_relay_control_state()
+            .await
+            .discovery
+            .watched_user_count
     }
 
     #[test]
@@ -817,6 +821,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_user_background_new_known_metadata_refreshes_discovery_subscriptions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        whitenoise.create_identity().await.unwrap();
+
+        let before = watched_user_count(&whitenoise).await;
+
+        let test_pubkey = Keys::generate().public_key();
+        let mut user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new().name("Known New User"),
+            created_at: Utc::now(),
+            metadata_known_at: None,
+            updated_at: Utc::now(),
+        };
+        user.mark_metadata_known_now();
+        let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+        whitenoise
+            .sync_user_background(&saved_user, true)
+            .await
+            .unwrap();
+
+        let after = watched_user_count(&whitenoise).await;
+        assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_user_blocking_new_known_metadata_refreshes_discovery_subscriptions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        whitenoise.create_identity().await.unwrap();
+
+        let before = watched_user_count(&whitenoise).await;
+
+        let test_pubkey = Keys::generate().public_key();
+        let mut user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new().name("Known New User"),
+            created_at: Utc::now(),
+            metadata_known_at: None,
+            updated_at: Utc::now(),
+        };
+        user.mark_metadata_known_now();
+        let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+        let returned_user = whitenoise
+            .sync_user_blocking(&saved_user, true)
+            .await
+            .unwrap();
+
+        let after = watched_user_count(&whitenoise).await;
+        assert_eq!(after, before + 1);
+        assert_eq!(returned_user.pubkey, saved_user.pubkey);
+        assert!(returned_user.metadata_is_known());
+    }
+
+    #[tokio::test]
     async fn test_sync_user_background_unknown_metadata_triggers_discovery_catch_up() {
         let (whitenoise, mut receiver, _data_temp, _logs_temp) =
             create_mock_whitenoise_with_event_receiver().await;
@@ -831,7 +893,10 @@ mod tests {
             .0;
         assert!(user.metadata_is_unknown());
 
-        whitenoise.sync_user_background(&user, false).await.unwrap();
+        whitenoise
+            .background_fetch_user_data_inner(user.clone())
+            .await
+            .unwrap();
 
         let queued_event = receiver.try_recv().unwrap();
         match queued_event {
@@ -1609,7 +1674,10 @@ mod tests {
                 .unwrap()
                 .0;
 
-            whitenoise.sync_user_background(&user, false).await.unwrap();
+            whitenoise
+                .background_fetch_user_data_inner(user.clone())
+                .await
+                .unwrap();
 
             assert_no_queued_events(&mut receiver);
 

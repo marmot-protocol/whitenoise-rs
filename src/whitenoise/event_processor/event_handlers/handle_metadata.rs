@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_current_metadata_marks_unknown_user_as_known() {
+    async fn already_processed_event_still_marks_unknown_user_as_known() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
         let metadata = Metadata::new().name("known");
