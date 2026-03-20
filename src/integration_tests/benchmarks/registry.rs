@@ -100,10 +100,10 @@ impl BenchmarkRegistry {
     /// This eliminates the need for a separate central `thresholds_for` match —
     /// each scenario owns its thresholds and they are always in sync with the registry.
     pub fn thresholds_for(result: &BenchmarkResult) -> ScenarioThresholds {
-        if let Some(name) = Self::cli_name_for(result) {
-            if let Ok(scenario) = parse_and_instantiate(name) {
-                return scenario.thresholds();
-            }
+        if let Some(name) = Self::cli_name_for(result)
+            && let Ok(scenario) = parse_and_instantiate(name)
+        {
+            return scenario.thresholds();
         }
         ScenarioThresholds::default()
     }
