@@ -1,43 +1,14 @@
-use std::time::Duration;
-
 use async_trait::async_trait;
-use nostr_sdk::{Client, Filter, Keys, Kind, Metadata};
+use nostr_sdk::{Keys, Metadata};
 
 use crate::integration_tests::core::test_clients::{create_test_client, publish_relay_lists};
 use crate::integration_tests::core::*;
 use crate::{RelayType, WhitenoiseError};
 
+use super::helpers::wait_for_relay_list_indexed;
+
 const LOG_TARGET: &str =
-    "integration_tests::test_cases::user_discovery::find_or_create_user_unknown_metadata_no_result";
-
-async fn wait_for_relay_list_indexed(
-    client: &Client,
-    pubkey: nostr_sdk::PublicKey,
-) -> Result<(), WhitenoiseError> {
-    retry(
-        30,
-        Duration::from_millis(100),
-        || async {
-            let events = client
-                .fetch_events(
-                    Filter::new().author(pubkey).kind(Kind::RelayList),
-                    Duration::from_secs(1),
-                )
-                .await?;
-
-            if events.iter().next().is_some() {
-                Ok(())
-            } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
-                    "Relay-list event is not yet queryable for {}",
-                    pubkey
-                )))
-            }
-        },
-        "wait for relay-list event to be queryable",
-    )
-    .await
-}
+    "integration_tests::test_cases::user_discovery::resolve_user_unknown_metadata_no_result";
 
 /// Tests that unknown metadata stays unknown when targeted discovery finds nothing.
 ///
@@ -45,18 +16,18 @@ async fn wait_for_relay_list_indexed(
 /// an empty local user record is still "unknown" until a valid kind-0 event is
 /// processed. A no-result lookup must not silently convert it into known blank
 /// metadata.
-pub struct FindOrCreateUserUnknownMetadataNoResultTestCase {
+pub struct ResolveUserUnknownMetadataNoResultTestCase {
     test_keys: Keys,
 }
 
-impl FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl ResolveUserUnknownMetadataNoResultTestCase {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl Default for ResolveUserUnknownMetadataNoResultTestCase {
     fn default() -> Self {
         Self {
             test_keys: Keys::generate(),
@@ -65,7 +36,7 @@ impl Default for FindOrCreateUserUnknownMetadataNoResultTestCase {
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl TestCase for ResolveUserUnknownMetadataNoResultTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
@@ -86,10 +57,7 @@ impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
 
         let user = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
-            )
+            .resolve_user_blocking(&test_pubkey)
             .await?;
 
         assert_eq!(user.pubkey, test_pubkey);

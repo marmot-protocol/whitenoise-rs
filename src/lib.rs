@@ -46,7 +46,7 @@ pub use whitenoise::error::WhitenoiseError;
 
 // Account and user management
 pub use whitenoise::accounts::{Account, AccountType, LoginError, LoginResult, LoginStatus};
-pub use whitenoise::users::{KeyPackageStatus, User, UserSyncMode};
+pub use whitenoise::users::{KeyPackageStatus, User};
 
 // Settings and configuration
 pub use whitenoise::account_settings::AccountSettings;

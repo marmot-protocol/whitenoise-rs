@@ -66,8 +66,9 @@ benchmark_registry! {
     "login-multistep" => LoginMultistepPerformanceBenchmark::default(),
     "messaging-performance" => MessagingPerformanceBenchmark::default(),
     "message-aggregation" => MessageAggregationBenchmark::default(),
-    "user-discovery-blocking" => UserDiscoveryBenchmark::with_blocking_mode(),
-    "user-discovery-background" => UserDiscoveryBenchmark::with_background_mode(),
+    "user-resolution-local" => UserDiscoveryBenchmark::for_get_or_create_local(),
+    "resolve-user" => UserDiscoveryBenchmark::for_resolve_user(),
+    "resolve-user-blocking" => UserDiscoveryBenchmark::for_resolve_user_blocking(),
     "user-search" => UserSearchBenchmark,
 }
 // ============================================================================
@@ -212,8 +213,9 @@ mod tests {
         assert!(parse_and_instantiate("login-multistep").is_ok());
         assert!(parse_and_instantiate("messaging-performance").is_ok());
         assert!(parse_and_instantiate("message-aggregation").is_ok());
-        assert!(parse_and_instantiate("user-discovery-blocking").is_ok());
-        assert!(parse_and_instantiate("user-discovery-background").is_ok());
+        assert!(parse_and_instantiate("user-resolution-local").is_ok());
+        assert!(parse_and_instantiate("resolve-user").is_ok());
+        assert!(parse_and_instantiate("resolve-user-blocking").is_ok());
         assert!(parse_and_instantiate("user-search").is_ok());
     }
 
@@ -228,7 +230,9 @@ mod tests {
         assert!(parse_and_instantiate("LOGIN-MULTISTEP").is_ok());
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("Message-Aggregation").is_ok());
-        assert!(parse_and_instantiate("USER-DISCOVERY-BLOCKING").is_ok());
+        assert!(parse_and_instantiate("USER-RESOLUTION-LOCAL").is_ok());
+        assert!(parse_and_instantiate("RESOLVE-USER").is_ok());
+        assert!(parse_and_instantiate("RESOLVE-USER-BLOCKING").is_ok());
         assert!(parse_and_instantiate("USER-SEARCH").is_ok());
     }
 
@@ -248,7 +252,7 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"add-members"));
         assert!(names.contains(&"group-creation"));
         assert!(names.contains(&"identity-creation"));
@@ -257,8 +261,9 @@ mod tests {
         assert!(names.contains(&"login-multistep"));
         assert!(names.contains(&"messaging-performance"));
         assert!(names.contains(&"message-aggregation"));
-        assert!(names.contains(&"user-discovery-blocking"));
-        assert!(names.contains(&"user-discovery-background"));
+        assert!(names.contains(&"user-resolution-local"));
+        assert!(names.contains(&"resolve-user"));
+        assert!(names.contains(&"resolve-user-blocking"));
         assert!(names.contains(&"user-search"));
     }
 

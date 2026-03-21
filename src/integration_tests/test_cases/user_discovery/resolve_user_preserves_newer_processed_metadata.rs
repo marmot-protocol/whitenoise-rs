@@ -1,47 +1,13 @@
-use std::time::Duration;
-
 use async_trait::async_trait;
-use nostr_sdk::{Client, EventBuilder, EventId, Filter, Keys, Kind, Metadata, Timestamp};
+use nostr_sdk::{EventBuilder, Keys, Metadata, Timestamp};
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::create_test_client;
 use crate::integration_tests::core::*;
 
-const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::find_or_create_user_preserves_newer_processed_metadata";
+use super::helpers::wait_for_latest_metadata_event;
 
-async fn wait_for_latest_metadata_event(
-    client: &Client,
-    pubkey: nostr_sdk::PublicKey,
-    expected_event_id: EventId,
-    description: &str,
-) -> Result<(), WhitenoiseError> {
-    // Kind-0 is replaceable, so older events are not guaranteed to remain
-    // queryable by exact ID once the relay has reconciled them. Poll the same
-    // author+kind lookup shape used by targeted discovery instead.
-    retry(
-        30,
-        Duration::from_millis(100),
-        || async {
-            let events = client
-                .fetch_events(
-                    Filter::new().author(pubkey).kind(Kind::Metadata),
-                    Duration::from_secs(1),
-                )
-                .await?;
-
-            if events.iter().any(|event| event.id == expected_event_id) {
-                Ok(())
-            } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
-                    "Latest metadata query does not yet return expected event {}",
-                    expected_event_id.to_hex()
-                )))
-            }
-        },
-        description,
-    )
-    .await
-}
+const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::resolve_user_preserves_newer_processed_metadata";
 
 /// Tests that targeted discovery cannot overwrite newer already-processed metadata.
 ///
@@ -49,20 +15,20 @@ async fn wait_for_latest_metadata_event(
 /// though a newer metadata event has already been processed. A subsequent
 /// blocking lookup must not let an older relay result clobber the stored
 /// metadata.
-pub struct FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+pub struct ResolveUserPreservesNewerProcessedMetadataTestCase {
     test_keys: Keys,
     newer_metadata: Metadata,
     older_metadata: Metadata,
 }
 
-impl FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl ResolveUserPreservesNewerProcessedMetadataTestCase {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl Default for ResolveUserPreservesNewerProcessedMetadataTestCase {
     fn default() -> Self {
         Self {
             test_keys: Keys::generate(),
@@ -77,7 +43,7 @@ impl Default for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl TestCase for ResolveUserPreservesNewerProcessedMetadataTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
@@ -111,10 +77,7 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
             || async {
                 let user = context
                     .whitenoise
-                    .find_or_create_user_by_pubkey(
-                        &test_pubkey,
-                        crate::whitenoise::users::UserSyncMode::Blocking,
-                    )
+                    .resolve_user_blocking(&test_pubkey)
                     .await?;
 
                 if user.metadata.name == self.newer_metadata.name {
@@ -170,10 +133,7 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
 
         let user_after = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
-            )
+            .resolve_user_blocking(&test_pubkey)
             .await?;
 
         assert_eq!(

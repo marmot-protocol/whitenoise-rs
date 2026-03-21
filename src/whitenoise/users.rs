@@ -1,13 +1,16 @@
 use std::time::Duration as StdDuration;
 
+#[cfg(test)]
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     perf_instrument,
-    relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
-    types::ProcessableEvent,
     whitenoise::{
         Whitenoise,
         database::processed_events::ProcessedEvent,
@@ -33,32 +36,15 @@ use key_package::{classify_key_package, has_valid_encoding_tag};
 /// the discovery plane is willing to wait longer for other operations.
 const USER_DISCOVERY_CATCH_UP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
-/// Specifies how user metadata and relay lists should be synchronized when finding or creating a user.
-///
-/// This enum controls the synchronization behavior in `find_or_create_user_by_pubkey`, allowing
-/// callers to choose between immediate blocking synchronization or background asynchronous updates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum UserSyncMode {
-    /// Immediate blocking sync of metadata and relay lists.
-    ///
-    /// This mode performs synchronous network calls to fetch the latest user metadata
-    /// and relay lists before returning. Use this when you need up-to-date information
-    /// immediately (e.g., when displaying user profiles or adding users to groups).
-    ///
-    /// **Note:** This mode blocks the current async task until network operations complete.
-    Blocking,
-
-    /// Background catch-up for users whose metadata has not been resolved yet.
-    ///
-    /// This mode returns immediately with the local record and schedules a
-    /// best-effort discovery catch-up only when metadata is still unknown.
-    /// Users whose metadata is already known are returned without any automatic
-    /// refresh.
-    ///
-    /// **Note:** This is the recommended mode for most use cases as it provides better
-    /// performance and responsiveness.
-    Background,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserResolutionMode {
+    LocalOnly,
+    BackgroundIfUnknown,
+    BlockingIfUnknown,
 }
+
+#[cfg(test)]
+static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct User {
@@ -174,7 +160,7 @@ impl User {
                 if !is_newer_or_equal {
                     tracing::debug!(
                         target: "whitenoise::users::should_update_metadata",
-                        "Ignoring stale metadata event for user {} (event: {}, stored: {})",
+                        "Ignoring older metadata event for user {} (event: {}, stored: {})",
                         self.pubkey,
                         event_datetime,
                         stored_timestamp
@@ -257,21 +243,15 @@ impl Whitenoise {
             .collect()
     }
 
-    async fn fetch_targeted_discovery_events(
-        &self,
-        pubkey: PublicKey,
-    ) -> Result<Option<(Vec<Event>, RelayUrl)>> {
-        // `fetch_events` returns a merged event set without per-event relay provenance.
-        // We still need a discovery-plane routing context for the event processor, so use
-        // one deterministic configured relay URL as synthetic source metadata.
-        let Some(routing_relay) = self.relay_control.discovery().relays().first().cloned() else {
+    async fn fetch_targeted_discovery_events(&self, pubkey: PublicKey) -> Result<Vec<Event>> {
+        if self.relay_control.discovery().relays().is_empty() {
             tracing::warn!(
                 target: "whitenoise::users::targeted_discovery",
                 "Skipping targeted discovery catch-up for {} because no discovery relays are configured",
                 pubkey
             );
-            return Ok(None);
-        };
+            return Ok(Vec::new());
+        }
 
         let events = self
             .relay_control
@@ -282,10 +262,7 @@ impl Whitenoise {
             )
             .await?;
 
-        Ok(Some((
-            Self::prepare_targeted_discovery_events(events),
-            routing_relay,
-        )))
+        Ok(Self::prepare_targeted_discovery_events(events))
     }
 
     async fn process_targeted_discovery_events(&self, events: &[Event]) {
@@ -310,220 +287,143 @@ impl Whitenoise {
         }
     }
 
-    async fn queue_targeted_discovery_events(
-        &self,
-        events: &[Event],
-        relay_url: &RelayUrl,
-    ) -> Result<()> {
-        let source = SubscriptionContext {
-            plane: RelayPlane::Discovery,
-            account_pubkey: None,
-            relay_url: relay_url.clone(),
-            stream: SubscriptionStream::DiscoveryUserData,
-            group_ids: Vec::new(),
-        };
-
-        for event in events {
-            self.event_sender
-                .send(ProcessableEvent::new_routed_nostr_event(
-                    event.clone(),
-                    source.clone(),
-                ))
-                .await
-                .map_err(|error| {
-                    WhitenoiseError::EventProcessor(format!(
-                        "Failed to enqueue targeted discovery event: {error}"
-                    ))
-                })?;
+    fn emit_user_created_if_needed(&self, user: &User, created: bool) {
+        if !created {
+            return;
         }
 
-        Ok(())
+        self.user_stream_manager.emit(
+            &user.pubkey,
+            UserUpdate {
+                trigger: UserUpdateTrigger::UserCreated,
+                user: user.clone(),
+            },
+        );
     }
 
-    /// Finds a user by their public key or creates a new one if not found.
-    ///
-    /// This method is local-first:
-    /// - if the user does not exist locally, it creates an empty record with unknown metadata
-    /// - if metadata is already known, it returns immediately without refreshing
-    /// - if metadata is unknown, it performs a targeted discovery catch-up according to `sync_mode`
-    ///
-    /// # Arguments
-    ///
-    /// * `pubkey` - The Nostr public key of the user to find or create
-    /// * `sync_mode` - Controls how user data is synchronized:
-    ///   - `UserSyncMode::Blocking` - Performs immediate blocking sync before returning
-    ///   - `UserSyncMode::Background` - Returns immediately and syncs in the background
-    ///
-    /// # Returns
-    ///
-    /// Returns a `Result<User>` containing:
-    /// - `Ok(User)` - The found or created user
-    /// - `Err(WhitenoiseError)` - If there's a database error
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use nostr_sdk::PublicKey;
-    /// use whitenoise::{UserSyncMode, Whitenoise};
-    ///
-    /// # async fn example(whitenoise: &Whitenoise) -> Result<(), Box<dyn std::error::Error>> {
-    /// let pubkey = PublicKey::parse("npub1...")?;
-    ///
-    /// // Fast, non-blocking call with background sync
-    /// let user = whitenoise
-    ///     .find_or_create_user_by_pubkey(&pubkey, UserSyncMode::Background)
-    ///     .await?;
-    ///
-    /// // Slower, blocking call with immediate metadata
-    /// let user_with_metadata = whitenoise
-    ///     .find_or_create_user_by_pubkey(&pubkey, UserSyncMode::Blocking)
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// This method will return an error if:
-    /// - There's a database connection or query error
-    /// - The public key format is invalid (though this is typically caught at the type level)
-    /// - Network errors occur during blocking discovery
+    async fn refresh_discovery_for_new_user_if_needed(
+        &self,
+        user: &User,
+        created: bool,
+        mode: UserResolutionMode,
+    ) {
+        if !created || mode == UserResolutionMode::LocalOnly {
+            return;
+        }
+
+        if let Err(error) = self.refresh_global_subscription_for_user().await {
+            tracing::warn!(
+                target: "whitenoise::users::refresh_discovery_for_new_user_if_needed",
+                "Failed to refresh global subscription for new user {}: {}",
+                user.pubkey,
+                error
+            );
+        }
+    }
+
+    fn user_resolution_guard(&self, pubkey: PublicKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.user_resolution_guards
+            .entry(pubkey)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     #[perf_instrument("users")]
-    pub async fn find_or_create_user_by_pubkey(
+    async fn resolve_user_with_mode(
         &self,
         pubkey: &PublicKey,
-        sync_mode: UserSyncMode,
+        mode: UserResolutionMode,
     ) -> Result<User> {
         let (user, created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
+        self.emit_user_created_if_needed(&user, created);
 
-        if created {
-            self.user_stream_manager.emit(
-                &user.pubkey,
-                UserUpdate {
-                    trigger: UserUpdateTrigger::UserCreated,
-                    user: user.clone(),
-                },
-            );
+        if user.metadata_is_unknown() {
+            match mode {
+                UserResolutionMode::LocalOnly => {}
+                UserResolutionMode::BackgroundIfUnknown => {
+                    self.start_background_user_resolution_if_unknown(user.pubkey);
+                }
+                UserResolutionMode::BlockingIfUnknown => {
+                    self.resolve_unknown_user_blocking_if_needed(user.pubkey)
+                        .await?;
+                }
+            }
         }
 
-        if sync_mode == UserSyncMode::Blocking {
-            let updated_user = self.sync_user_blocking(&user, created).await?;
-            Ok(updated_user)
-        } else {
-            self.sync_user_background(&user, created).await?;
-            Ok(user)
-        }
+        self.refresh_discovery_for_new_user_if_needed(&user, created, mode)
+            .await;
+
+        User::find_by_pubkey(pubkey, &self.database).await
     }
 
+    /// Look up a local user row or create an empty unknown-metadata row.
+    ///
+    /// This method is strictly local-only: it never performs relay fetches or
+    /// other discovery work. When a new row is inserted, subscribers receive a
+    /// `UserCreated` update.
     #[perf_instrument("users")]
-    async fn sync_user_blocking(&self, user: &User, is_new: bool) -> Result<User> {
-        if user.metadata_is_known() {
-            if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
-                tracing::warn!(
-                    target: "whitenoise::users::sync_user_blocking",
-                    "Failed to refresh global subscription for new user {}: {}",
-                    user.pubkey,
-                    error
-                );
-            }
+    pub async fn get_or_create_user_local(&self, pubkey: &PublicKey) -> Result<User> {
+        self.resolve_user_with_mode(pubkey, UserResolutionMode::LocalOnly)
+            .await
+    }
 
+    /// Ensure a local user row exists and kick off discovery only when metadata is unknown.
+    ///
+    /// Returns the current local snapshot immediately. If the user is still
+    /// unknown, targeted discovery resolution is started or reused in the
+    /// background.
+    #[perf_instrument("users")]
+    pub async fn resolve_user(&self, pubkey: &PublicKey) -> Result<User> {
+        self.resolve_user_with_mode(pubkey, UserResolutionMode::BackgroundIfUnknown)
+            .await
+    }
+
+    /// Ensure a local user row exists and resolve unknown metadata before returning.
+    ///
+    /// Returns immediately for users whose metadata is already known. Unknown
+    /// users run one guarded targeted discovery resolution and then return the
+    /// freshest local snapshot.
+    #[perf_instrument("users")]
+    pub async fn resolve_user_blocking(&self, pubkey: &PublicKey) -> Result<User> {
+        self.resolve_user_with_mode(pubkey, UserResolutionMode::BlockingIfUnknown)
+            .await
+    }
+
+    async fn resolve_unknown_user_under_guard(&self, pubkey: PublicKey) -> Result<()> {
+        let user = User::find_by_pubkey(&pubkey, &self.database).await?;
+        if user.metadata_is_known() {
             tracing::debug!(
-                target: "whitenoise::users::sync_user_blocking",
-                "User {} metadata is already known, skipping blocking discovery",
-                user.pubkey,
+                target: "whitenoise::users::resolve_unknown_user_under_guard",
+                "User {} metadata is already known, skipping targeted discovery",
+                pubkey
             );
-            return Ok(user.clone());
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        {
+            let pubkey_hex = pubkey.to_hex();
+            USER_RESOLUTION_RUN_COUNTS
+                .entry(pubkey_hex)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
         }
 
         tracing::debug!(
-            target: "whitenoise::users::sync_user_blocking",
-            "User {} metadata is unknown, performing blocking targeted discovery catch-up",
-            user.pubkey,
+            target: "whitenoise::users::resolve_unknown_user_under_guard",
+            "User {} metadata is unknown, performing targeted discovery catch-up",
+            pubkey
         );
 
-        match self.fetch_targeted_discovery_events(user.pubkey).await {
-            Ok(Some((events, _relay_url))) => {
+        match self.fetch_targeted_discovery_events(pubkey).await {
+            Ok(events) => {
                 self.process_targeted_discovery_events(&events).await;
             }
-            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
-                    target: "whitenoise::users::sync_user_blocking",
+                    target: "whitenoise::users::resolve_unknown_user_under_guard",
                     "Failed to perform targeted discovery catch-up for user {}: {}",
-                    user.pubkey,
-                    error
-                );
-            }
-        }
-
-        if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::users::sync_user_blocking",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                error
-            );
-        }
-
-        User::find_by_pubkey(&user.pubkey, &self.database).await
-    }
-
-    async fn sync_user_background(&self, user: &User, is_new: bool) -> Result<()> {
-        if user.metadata_is_unknown() {
-            tracing::debug!(
-                target: "whitenoise::users::sync_user_background",
-                "User {} metadata is unknown, starting background discovery catch-up",
-                user.pubkey,
-            );
-            if let Err(error) = self.background_fetch_user_data(user).await {
-                tracing::warn!(
-                    target: "whitenoise::users::sync_user_background",
-                    "Failed to start background discovery catch-up for user {}: {}",
-                    user.pubkey,
-                    error
-                );
-            }
-        } else {
-            tracing::debug!(
-                target: "whitenoise::users::sync_user_background",
-                "User {} metadata is already known, skipping background discovery",
-                user.pubkey,
-            );
-        }
-
-        if is_new && let Err(error) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::users::sync_user_background",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                error
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn background_fetch_user_data_inner(&self, user: User) -> Result<()> {
-        match self.fetch_targeted_discovery_events(user.pubkey).await {
-            Ok(Some((events, relay_url))) => {
-                if let Err(error) = self
-                    .queue_targeted_discovery_events(&events, &relay_url)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::users::background_fetch_user_data",
-                        "Failed to queue targeted discovery catch-up for user {}: {}",
-                        user.pubkey,
-                        error
-                    );
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::users::background_fetch_user_data",
-                    "Failed to fetch targeted discovery catch-up for user {}: {}",
-                    user.pubkey,
+                    pubkey,
                     error
                 );
             }
@@ -532,29 +432,46 @@ impl Whitenoise {
         Ok(())
     }
 
-    pub(crate) async fn background_fetch_user_data(&self, user: &User) -> Result<()> {
-        let user_clone = user.clone();
-        let user_pubkey = user.pubkey;
+    async fn resolve_unknown_user_blocking_if_needed(&self, pubkey: PublicKey) -> Result<()> {
+        let resolution_guard = self.user_resolution_guard(pubkey);
+        let _resolution_guard = resolution_guard.lock().await;
+        self.resolve_unknown_user_under_guard(pubkey).await
+    }
+
+    pub(crate) fn start_background_user_resolution_if_unknown(&self, pubkey: PublicKey) {
+        let resolution_guard = self.user_resolution_guard(pubkey);
+        let Ok(resolution_guard) = resolution_guard.try_lock_owned() else {
+            tracing::debug!(
+                target: "whitenoise::users::start_background_user_resolution_if_unknown",
+                "User {} resolution already in progress, reusing existing background discovery",
+                pubkey
+            );
+            return;
+        };
+
+        tracing::debug!(
+            target: "whitenoise::users::start_background_user_resolution_if_unknown",
+            "Starting background discovery catch-up for user {}",
+            pubkey
+        );
+
         tokio::spawn(async move {
+            let _resolution_guard = resolution_guard;
             let result = async {
                 let whitenoise = Self::get_instance()?;
-                whitenoise
-                    .background_fetch_user_data_inner(user_clone)
-                    .await
+                whitenoise.resolve_unknown_user_under_guard(pubkey).await
             }
             .await;
 
             if let Err(error) = result {
                 tracing::warn!(
-                    target: "whitenoise::users::background_fetch_user_data",
+                    target: "whitenoise::users::start_background_user_resolution_if_unknown",
                     "Background discovery catch-up task failed for user {}: {}",
-                    user_pubkey,
+                    pubkey,
                     error
                 );
             }
         });
-
-        Ok(())
     }
 
     /// **TEST-ONLY**: Override `metadata_known_at` for a user.
@@ -588,12 +505,9 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::test_utils::{
-        create_mock_whitenoise, create_mock_whitenoise_with_event_receiver,
-    };
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, test_get_whitenoise};
     use chrono::{Duration, Utc};
     use std::collections::HashSet;
-    use tokio::sync::mpsc;
 
     async fn publish_metadata_to_discovery(keys: &Keys, metadata: &Metadata) {
         let client = Client::new(keys.clone());
@@ -612,8 +526,15 @@ mod tests {
         client.disconnect().await;
     }
 
-    fn assert_no_queued_events(receiver: &mut mpsc::Receiver<ProcessableEvent>) {
-        assert!(receiver.try_recv().is_err());
+    fn reset_user_resolution_run_count(pubkey: &PublicKey) {
+        USER_RESOLUTION_RUN_COUNTS.remove(&pubkey.to_hex());
+    }
+
+    fn user_resolution_run_count(pubkey: &PublicKey) -> usize {
+        USER_RESOLUTION_RUN_COUNTS
+            .get(&pubkey.to_hex())
+            .map(|count| *count)
+            .unwrap_or(0)
     }
 
     async fn watched_user_count(whitenoise: &Whitenoise) -> usize {
@@ -789,145 +710,189 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_user_background_known_metadata_returns_immediately() {
-        let (whitenoise, mut receiver, _data_temp, _logs_temp) =
-            create_mock_whitenoise_with_event_receiver().await;
-
-        let test_pubkey = Keys::generate().public_key();
-        let mut user = User {
-            id: None,
-            pubkey: test_pubkey,
-            metadata: Metadata::new().name("Known User"),
-            created_at: Utc::now(),
-            metadata_known_at: None,
-            updated_at: Utc::now(),
-        };
-        user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
-
-        whitenoise
-            .sync_user_background(&saved_user, false)
-            .await
-            .unwrap();
-
-        assert_no_queued_events(&mut receiver);
-    }
-
-    #[tokio::test]
-    async fn test_sync_user_blocking_known_metadata_returns_immediately() {
-        let (whitenoise, mut receiver, _data_temp, _logs_temp) =
-            create_mock_whitenoise_with_event_receiver().await;
-
-        let test_pubkey = Keys::generate().public_key();
-        let mut user = User {
-            id: None,
-            pubkey: test_pubkey,
-            metadata: Metadata::new().name("Known User"),
-            created_at: Utc::now(),
-            metadata_known_at: None,
-            updated_at: Utc::now(),
-        };
-        user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
-
-        let returned_user = whitenoise
-            .sync_user_blocking(&saved_user, false)
-            .await
-            .unwrap();
-
-        assert_eq!(returned_user.pubkey, saved_user.pubkey);
-        assert!(returned_user.metadata_is_known());
-        assert_no_queued_events(&mut receiver);
-    }
-
-    #[tokio::test]
-    async fn test_sync_user_background_new_known_metadata_refreshes_discovery_subscriptions() {
+    async fn test_get_or_create_user_local_creates_row_without_refreshing_discovery() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         whitenoise.create_identity().await.unwrap();
 
         let before = watched_user_count(&whitenoise).await;
-
         let test_pubkey = Keys::generate().public_key();
-        let mut user = User {
-            id: None,
-            pubkey: test_pubkey,
-            metadata: Metadata::new().name("Known New User"),
-            created_at: Utc::now(),
-            metadata_known_at: None,
-            updated_at: Utc::now(),
-        };
-        user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-        whitenoise
-            .sync_user_background(&saved_user, true)
+        let user = whitenoise
+            .get_or_create_user_local(&test_pubkey)
             .await
             .unwrap();
-
         let after = watched_user_count(&whitenoise).await;
-        assert_eq!(after, before + 1);
+
+        assert_eq!(after, before);
+        assert_eq!(user.pubkey, test_pubkey);
+        assert!(user.id.is_some());
+        assert!(user.metadata_is_unknown());
     }
 
     #[tokio::test]
-    async fn test_sync_user_blocking_new_known_metadata_refreshes_discovery_subscriptions() {
+    async fn test_get_or_create_user_local_emits_user_created_update() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = Keys::generate().public_key();
+        let mut updates = whitenoise.user_stream_manager.subscribe(&test_pubkey);
+
+        let user = whitenoise
+            .get_or_create_user_local(&test_pubkey)
+            .await
+            .unwrap();
+        let update = updates.try_recv().unwrap();
+
+        assert_eq!(update.trigger, UserUpdateTrigger::UserCreated);
+        assert_eq!(update.user, user);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_returns_unknown_local_snapshot_immediately() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = Keys::generate().public_key();
+
+        let user = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            whitenoise.resolve_user(&test_pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let stored_user = whitenoise.find_user_by_pubkey(&test_pubkey).await.unwrap();
+        assert_eq!(user, stored_user);
+        assert!(user.metadata_is_unknown());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_refreshes_discovery_only_for_new_users() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         whitenoise.create_identity().await.unwrap();
 
         let before = watched_user_count(&whitenoise).await;
-
         let test_pubkey = Keys::generate().public_key();
-        let mut user = User {
-            id: None,
-            pubkey: test_pubkey,
-            metadata: Metadata::new().name("Known New User"),
-            created_at: Utc::now(),
-            metadata_known_at: None,
-            updated_at: Utc::now(),
-        };
-        user.mark_metadata_known_now();
-        let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-        let returned_user = whitenoise
-            .sync_user_blocking(&saved_user, true)
-            .await
-            .unwrap();
+        whitenoise.resolve_user(&test_pubkey).await.unwrap();
+        let after_create = watched_user_count(&whitenoise).await;
+        whitenoise.resolve_user(&test_pubkey).await.unwrap();
+        let after_second_call = watched_user_count(&whitenoise).await;
 
-        let after = watched_user_count(&whitenoise).await;
-        assert_eq!(after, before + 1);
-        assert_eq!(returned_user.pubkey, saved_user.pubkey);
-        assert!(returned_user.metadata_is_known());
+        assert_eq!(after_create, before + 1);
+        assert_eq!(after_second_call, after_create);
     }
 
     #[tokio::test]
-    async fn test_sync_user_background_unknown_metadata_triggers_discovery_catch_up() {
-        let (whitenoise, mut receiver, _data_temp, _logs_temp) =
-            create_mock_whitenoise_with_event_receiver().await;
-
+    async fn test_resolve_user_dedupes_background_resolution_for_same_unknown_user() {
+        let whitenoise = test_get_whitenoise().await;
         let keys = Keys::generate();
-        let metadata = Metadata::new().name("Queued User");
+        let pubkey = keys.public_key();
+        let metadata = Metadata::new().name("Background Deduped User");
         publish_metadata_to_discovery(&keys, &metadata).await;
 
-        let user = User::find_or_create_by_pubkey(&keys.public_key(), &whitenoise.database)
-            .await
-            .unwrap()
-            .0;
-        assert!(user.metadata_is_unknown());
+        whitenoise.get_or_create_user_local(&pubkey).await.unwrap();
+
+        reset_user_resolution_run_count(&pubkey);
+
+        let (first, second) = tokio::join!(
+            whitenoise.resolve_user(&pubkey),
+            whitenoise.resolve_user(&pubkey),
+        );
+
+        first.unwrap();
+        second.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
+                if user.metadata_is_known() {
+                    break user;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(user_resolution_run_count(&pubkey), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_unknown_user_blocking_if_needed_dedupes_concurrent_calls() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let metadata = Metadata::new().name("Deduped User");
+        publish_metadata_to_discovery(&keys, &metadata).await;
 
         whitenoise
-            .background_fetch_user_data_inner(user.clone())
+            .get_or_create_user_local(&keys.public_key())
             .await
             .unwrap();
 
-        let queued_event = receiver.try_recv().unwrap();
-        match queued_event {
-            ProcessableEvent::NostrEvent { event, .. } => {
-                assert_eq!(event.kind, Kind::Metadata);
-                assert_eq!(event.pubkey, keys.public_key());
-            }
-            ProcessableEvent::RelayMessage(_, _) => {
-                panic!("expected queued metadata event, got relay message")
-            }
-        }
+        reset_user_resolution_run_count(&keys.public_key());
+
+        let (first, second) = tokio::join!(
+            whitenoise.resolve_unknown_user_blocking_if_needed(keys.public_key()),
+            whitenoise.resolve_unknown_user_blocking_if_needed(keys.public_key()),
+        );
+
+        first.unwrap();
+        second.unwrap();
+
+        let user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        assert_eq!(user.metadata.name, metadata.name);
+        assert_eq!(user_resolution_run_count(&keys.public_key()), 1);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_blocking_returns_immediately_for_known_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let test_pubkey = Keys::generate().public_key();
+        let mut user = User {
+            id: None,
+            pubkey: test_pubkey,
+            metadata: Metadata::new().name("Known User"),
+            created_at: Utc::now(),
+            metadata_known_at: None,
+            updated_at: Utc::now(),
+        };
+        user.mark_metadata_known_now();
+        let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+        reset_user_resolution_run_count(&test_pubkey);
+
+        let returned_user = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            whitenoise.resolve_user_blocking(&test_pubkey),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(returned_user, saved_user);
+        assert_eq!(user_resolution_run_count(&test_pubkey), 0);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_blocking_returns_fresh_snapshot_for_unknown_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        let metadata = Metadata::new().name("Blocking User");
+        publish_metadata_to_discovery(&keys, &metadata).await;
+
+        reset_user_resolution_run_count(&keys.public_key());
+
+        let user = whitenoise
+            .resolve_user_blocking(&keys.public_key())
+            .await
+            .unwrap();
+
+        assert_eq!(user.pubkey, keys.public_key());
+        assert_eq!(user.metadata.name, metadata.name);
+        assert!(user.metadata_is_known());
+        assert_eq!(user_resolution_run_count(&keys.public_key()), 1);
     }
 
     #[tokio::test]
@@ -1618,16 +1583,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_find_or_create_creates_new_user() {
+        async fn test_get_or_create_user_local_creates_new_user() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
 
             // Verify user doesn't exist
             assert!(whitenoise.find_user_by_pubkey(&test_pubkey).await.is_err());
 
-            // Create user with Background mode to avoid network calls
             let user = whitenoise
-                .find_or_create_user_by_pubkey(&test_pubkey, UserSyncMode::Background)
+                .get_or_create_user_local(&test_pubkey)
                 .await
                 .unwrap();
 
@@ -1639,7 +1603,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_find_or_create_returns_existing_user() {
+        async fn test_get_or_create_user_local_returns_existing_user() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
 
@@ -1655,9 +1619,8 @@ mod tests {
             original_user.mark_metadata_known_now();
             let saved_user = original_user.save(&whitenoise.database).await.unwrap();
 
-            // Call find_or_create
             let found_user = whitenoise
-                .find_or_create_user_by_pubkey(&test_pubkey, UserSyncMode::Background)
+                .get_or_create_user_local(&test_pubkey)
                 .await
                 .unwrap();
 
@@ -1669,37 +1632,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_find_or_create_returns_immediately_with_background_sync() {
+        async fn test_resolve_user_returns_local_snapshot_for_existing_user() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
-
-            // TESTS: Method returns immediately without blocking on network
             let user = whitenoise
-                .find_or_create_user_by_pubkey(&test_pubkey, UserSyncMode::Background)
+                .get_or_create_user_local(&test_pubkey)
                 .await
                 .unwrap();
 
-            assert_eq!(user.pubkey, test_pubkey);
-            assert!(user.id.is_some());
+            let resolved_user = whitenoise.resolve_user(&test_pubkey).await.unwrap();
+
+            assert_eq!(resolved_user, user);
         }
 
         #[tokio::test]
         async fn test_unknown_metadata_remains_unknown_when_discovery_finds_nothing() {
-            let (whitenoise, mut receiver, _data_temp, _logs_temp) =
-                create_mock_whitenoise_with_event_receiver().await;
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
 
-            let user = User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.database)
-                .await
-                .unwrap()
-                .0;
-
             whitenoise
-                .background_fetch_user_data_inner(user.clone())
+                .resolve_user_blocking(&test_pubkey)
                 .await
                 .unwrap();
-
-            assert_no_queued_events(&mut receiver);
 
             let user_from_db = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
                 .await

@@ -7,7 +7,6 @@ use crate::integration_tests::core::test_clients::{
 };
 use crate::integration_tests::core::*;
 use crate::whitenoise::user_search::{SearchUpdateTrigger, UserSearchParams};
-use crate::whitenoise::users::UserSyncMode;
 
 use super::helpers::collect_search_updates;
 
@@ -68,10 +67,9 @@ impl TestCase for SearchIncrementalRadiusTestCase {
             &target_pubkey.to_hex()[..8]
         );
 
-        // Create MiddleUser in our DB with blocking sync (populates metadata)
         context
             .whitenoise
-            .find_or_create_user_by_pubkey(&middle_pubkey, UserSyncMode::Blocking)
+            .resolve_user_blocking(&middle_pubkey)
             .await?;
 
         // Searcher follows MiddleUser

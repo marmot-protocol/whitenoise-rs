@@ -461,9 +461,7 @@ impl Whitenoise {
         whitenoise: &Whitenoise,
         welcomer_pubkey: PublicKey,
     ) -> Result<()> {
-        whitenoise
-            .find_or_create_user_by_pubkey(&welcomer_pubkey, crate::UserSyncMode::Background)
-            .await?;
+        whitenoise.resolve_user(&welcomer_pubkey).await?;
         Ok(())
     }
 
