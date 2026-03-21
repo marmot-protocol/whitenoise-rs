@@ -1,10 +1,13 @@
-use crate::WhitenoiseError;
-use crate::integration_tests::core::test_clients::{create_test_client, publish_relay_lists};
-use crate::integration_tests::core::*;
 use async_trait::async_trait;
-use nostr_sdk::{Keys, Metadata, RelayUrl};
+use nostr_sdk::{EventId, Keys, Metadata, RelayUrl};
 
-use super::helpers::wait_for_relay_list_indexed;
+use crate::WhitenoiseError;
+use crate::integration_tests::core::{
+    test_clients::{create_test_client, publish_relay_lists},
+    *,
+};
+
+use super::helpers::{wait_for_latest_metadata_event, wait_for_relay_list_indexed};
 
 const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::resolve_user_blocking";
 
@@ -64,18 +67,24 @@ impl ResolveUserBlockingTestCase {
         self
     }
 
-    async fn publish_metadata(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
+    async fn publish_metadata(
+        &self,
+        context: &ScenarioContext,
+    ) -> Result<EventId, WhitenoiseError> {
         let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
-        if let Some(metadata) = &self.test_metadata {
-            tracing::info!(target: LOG_TARGET, "Publishing test metadata for test pubkey");
-            test_client
-                .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))
-                .await?;
-        }
+        let metadata = self
+            .test_metadata
+            .as_ref()
+            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Missing test metadata")))?;
+        tracing::info!(target: LOG_TARGET, "Publishing test metadata for test pubkey");
+        let event_id = *test_client
+            .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))
+            .await?
+            .id();
 
         test_client.disconnect().await;
-        Ok(())
+        Ok(event_id)
     }
 
     async fn publish_relays_data(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
@@ -112,7 +121,17 @@ impl TestCase for ResolveUserBlockingTestCase {
         }
 
         if self.should_have_metadata {
-            self.publish_metadata(context).await?;
+            let metadata_event_id = self.publish_metadata(context).await?;
+            let metadata_client =
+                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+            wait_for_latest_metadata_event(
+                &metadata_client,
+                test_pubkey,
+                metadata_event_id,
+                "wait for metadata event to be queryable",
+            )
+            .await?;
+            metadata_client.disconnect().await;
         }
 
         if self.should_have_relays {
