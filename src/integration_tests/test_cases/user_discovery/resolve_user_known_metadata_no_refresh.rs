@@ -1,45 +1,14 @@
-use std::time::Duration;
-
 use async_trait::async_trait;
-use nostr_sdk::{Client, EventBuilder, EventId, Filter, Keys, Kind, Metadata, Timestamp};
+use nostr_sdk::{EventBuilder, Keys, Metadata, Timestamp};
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::create_test_client;
 use crate::integration_tests::core::*;
 
+use super::helpers::wait_for_latest_metadata_event;
+
 const LOG_TARGET: &str =
     "integration_tests::test_cases::user_discovery::resolve_user_known_metadata_no_refresh";
-
-async fn wait_for_latest_metadata_event(
-    client: &Client,
-    pubkey: nostr_sdk::PublicKey,
-    expected_event_id: EventId,
-    description: &str,
-) -> Result<(), WhitenoiseError> {
-    retry(
-        30,
-        Duration::from_millis(100),
-        || async {
-            let events = client
-                .fetch_events(
-                    Filter::new().author(pubkey).kind(Kind::Metadata),
-                    Duration::from_secs(1),
-                )
-                .await?;
-
-            if events.iter().any(|event| event.id == expected_event_id) {
-                Ok(())
-            } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
-                    "Latest metadata query does not yet return expected event {}",
-                    expected_event_id.to_hex()
-                )))
-            }
-        },
-        description,
-    )
-    .await
-}
 
 pub struct ResolveUserKnownMetadataNoRefreshTestCase {
     test_keys: Keys,

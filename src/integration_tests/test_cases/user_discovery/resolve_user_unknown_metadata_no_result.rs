@@ -1,43 +1,14 @@
-use std::time::Duration;
-
 use async_trait::async_trait;
-use nostr_sdk::{Client, Filter, Keys, Kind, Metadata};
+use nostr_sdk::{Keys, Metadata};
 
 use crate::integration_tests::core::test_clients::{create_test_client, publish_relay_lists};
 use crate::integration_tests::core::*;
 use crate::{RelayType, WhitenoiseError};
 
+use super::helpers::wait_for_relay_list_indexed;
+
 const LOG_TARGET: &str =
     "integration_tests::test_cases::user_discovery::resolve_user_unknown_metadata_no_result";
-
-async fn wait_for_relay_list_indexed(
-    client: &Client,
-    pubkey: nostr_sdk::PublicKey,
-) -> Result<(), WhitenoiseError> {
-    retry(
-        30,
-        Duration::from_millis(100),
-        || async {
-            let events = client
-                .fetch_events(
-                    Filter::new().author(pubkey).kind(Kind::RelayList),
-                    Duration::from_secs(1),
-                )
-                .await?;
-
-            if events.iter().next().is_some() {
-                Ok(())
-            } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
-                    "Relay-list event is not yet queryable for {}",
-                    pubkey
-                )))
-            }
-        },
-        "wait for relay-list event to be queryable",
-    )
-    .await
-}
 
 /// Tests that unknown metadata stays unknown when targeted discovery finds nothing.
 ///

@@ -1,3 +1,4 @@
+pub mod helpers;
 pub mod resolve_user;
 pub mod resolve_user_blocking;
 pub mod resolve_user_known_metadata_no_refresh;

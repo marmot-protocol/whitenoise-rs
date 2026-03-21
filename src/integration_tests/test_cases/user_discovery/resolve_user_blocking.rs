@@ -4,6 +4,10 @@ use crate::integration_tests::core::*;
 use async_trait::async_trait;
 use nostr_sdk::{Keys, Metadata, RelayUrl};
 
+use super::helpers::wait_for_relay_list_indexed;
+
+const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::resolve_user_blocking";
+
 /// Tests `resolve_user_blocking`.
 ///
 /// This test verifies:
@@ -64,7 +68,7 @@ impl ResolveUserBlockingTestCase {
         let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
         if let Some(metadata) = &self.test_metadata {
-            tracing::info!("Publishing test metadata for test pubkey");
+            tracing::info!(target: LOG_TARGET, "Publishing test metadata for test pubkey");
             test_client
                 .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))
                 .await?;
@@ -77,7 +81,7 @@ impl ResolveUserBlockingTestCase {
     async fn publish_relays_data(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
-        tracing::info!("Publishing test relay list for test pubkey");
+        tracing::info!(target: LOG_TARGET, "Publishing test relay list for test pubkey");
         let relay_urls: Vec<String> = self.test_relays.iter().map(|url| url.to_string()).collect();
         publish_relay_lists(&test_client, relay_urls).await?;
 
@@ -90,7 +94,11 @@ impl ResolveUserBlockingTestCase {
 impl TestCase for ResolveUserBlockingTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
-        tracing::info!("Testing resolve_user_blocking for pubkey: {}", test_pubkey);
+        tracing::info!(
+            target: LOG_TARGET,
+            "Testing resolve_user_blocking for pubkey: {}",
+            test_pubkey
+        );
         let user_exists = context
             .whitenoise
             .find_user_by_pubkey(&test_pubkey)
@@ -109,6 +117,11 @@ impl TestCase for ResolveUserBlockingTestCase {
 
         if self.should_have_relays {
             self.publish_relays_data(context).await?;
+
+            let relay_client =
+                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+            wait_for_relay_list_indexed(&relay_client, test_pubkey).await?;
+            relay_client.disconnect().await;
         }
 
         let user = context
@@ -120,6 +133,7 @@ impl TestCase for ResolveUserBlockingTestCase {
         assert!(user.id.is_some(), "User should have an ID after creation");
 
         tracing::info!(
+            target: LOG_TARGET,
             "✓ User created with ID: {} for pubkey: {}",
             user.id.unwrap(),
             test_pubkey
@@ -129,10 +143,16 @@ impl TestCase for ResolveUserBlockingTestCase {
         assert_eq!(found_user.pubkey, test_pubkey, "Found user should match");
         assert_eq!(found_user.id, user.id, "Found user ID should match");
 
-        tracing::info!("✓ User can be found by pubkey after creation");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ User can be found by pubkey after creation"
+        );
 
         if self.should_have_metadata {
-            tracing::info!("✓ resolve_user_blocking returned metadata before returning");
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ resolve_user_blocking returned metadata before returning"
+            );
         }
 
         if self.should_have_metadata {
@@ -151,6 +171,7 @@ impl TestCase for ResolveUserBlockingTestCase {
                 );
 
                 tracing::info!(
+                    target: LOG_TARGET,
                     "✓ User metadata matches published data: name={:?}, display_name={:?}",
                     user.metadata.name,
                     user.metadata.display_name
@@ -161,7 +182,10 @@ impl TestCase for ResolveUserBlockingTestCase {
                 user.metadata.name.is_none() || user.metadata.name == Some(String::new()),
                 "User should have empty/no name when no metadata published"
             );
-            tracing::info!("✓ User has empty metadata as expected (nothing published)");
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ User has empty metadata as expected (nothing published)"
+            );
         }
 
         if self.should_have_relays {
@@ -182,14 +206,21 @@ impl TestCase for ResolveUserBlockingTestCase {
             }
 
             tracing::info!(
+                target: LOG_TARGET,
                 "✓ User relay list matches published data: {} relays found",
                 user_relays.len()
             );
         } else {
-            tracing::info!("✓ No relay publication needed for this test case");
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ No relay publication needed for this test case"
+            );
         }
 
-        let user_again = context.whitenoise.resolve_user(&test_pubkey).await?;
+        let user_again = context
+            .whitenoise
+            .resolve_user_blocking(&test_pubkey)
+            .await?;
         assert_eq!(
             user_again.id, user.id,
             "Should return same user on second call"
@@ -203,7 +234,10 @@ impl TestCase for ResolveUserBlockingTestCase {
             "Should return same user metadata"
         );
 
-        tracing::info!("✓ resolve_user returns the existing local snapshot on second call");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ resolve_user returns the existing local snapshot on second call"
+        );
 
         Ok(())
     }
