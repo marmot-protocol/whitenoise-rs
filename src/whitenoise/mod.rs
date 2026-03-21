@@ -417,7 +417,7 @@ impl Whitenoise {
         }
 
         // Create event processing channels
-        let (event_sender, event_receiver) = mpsc::channel(500);
+        let (event_sender, event_receiver) = mpsc::channel(2000);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
 
         // Create scheduler shutdown channel
