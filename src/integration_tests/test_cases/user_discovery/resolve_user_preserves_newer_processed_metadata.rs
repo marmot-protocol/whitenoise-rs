@@ -7,7 +7,7 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::create_test_client;
 use crate::integration_tests::core::*;
 
-const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::find_or_create_user_preserves_newer_processed_metadata";
+const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::resolve_user_preserves_newer_processed_metadata";
 
 async fn wait_for_latest_metadata_event(
     client: &Client,
@@ -49,20 +49,20 @@ async fn wait_for_latest_metadata_event(
 /// though a newer metadata event has already been processed. A subsequent
 /// blocking lookup must not let an older relay result clobber the stored
 /// metadata.
-pub struct FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+pub struct ResolveUserPreservesNewerProcessedMetadataTestCase {
     test_keys: Keys,
     newer_metadata: Metadata,
     older_metadata: Metadata,
 }
 
-impl FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl ResolveUserPreservesNewerProcessedMetadataTestCase {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl Default for ResolveUserPreservesNewerProcessedMetadataTestCase {
     fn default() -> Self {
         Self {
             test_keys: Keys::generate(),
@@ -77,7 +77,7 @@ impl Default for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
+impl TestCase for ResolveUserPreservesNewerProcessedMetadataTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
@@ -111,10 +111,7 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
             || async {
                 let user = context
                     .whitenoise
-                    .find_or_create_user_by_pubkey(
-                        &test_pubkey,
-                        crate::whitenoise::users::UserSyncMode::Blocking,
-                    )
+                    .resolve_user_blocking(&test_pubkey)
                     .await?;
 
                 if user.metadata.name == self.newer_metadata.name {
@@ -170,10 +167,7 @@ impl TestCase for FindOrCreateUserPreservesNewerProcessedMetadataTestCase {
 
         let user_after = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
-            )
+            .resolve_user_blocking(&test_pubkey)
             .await?;
 
         assert_eq!(

@@ -8,7 +8,7 @@ use crate::integration_tests::core::*;
 use crate::{RelayType, WhitenoiseError};
 
 const LOG_TARGET: &str =
-    "integration_tests::test_cases::user_discovery::find_or_create_user_unknown_metadata_no_result";
+    "integration_tests::test_cases::user_discovery::resolve_user_unknown_metadata_no_result";
 
 async fn wait_for_relay_list_indexed(
     client: &Client,
@@ -45,18 +45,18 @@ async fn wait_for_relay_list_indexed(
 /// an empty local user record is still "unknown" until a valid kind-0 event is
 /// processed. A no-result lookup must not silently convert it into known blank
 /// metadata.
-pub struct FindOrCreateUserUnknownMetadataNoResultTestCase {
+pub struct ResolveUserUnknownMetadataNoResultTestCase {
     test_keys: Keys,
 }
 
-impl FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl ResolveUserUnknownMetadataNoResultTestCase {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Default for FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl Default for ResolveUserUnknownMetadataNoResultTestCase {
     fn default() -> Self {
         Self {
             test_keys: Keys::generate(),
@@ -65,7 +65,7 @@ impl Default for FindOrCreateUserUnknownMetadataNoResultTestCase {
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
+impl TestCase for ResolveUserUnknownMetadataNoResultTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
         tracing::info!(
@@ -86,10 +86,7 @@ impl TestCase for FindOrCreateUserUnknownMetadataNoResultTestCase {
 
         let user = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
-            )
+            .resolve_user_blocking(&test_pubkey)
             .await?;
 
         assert_eq!(user.pubkey, test_pubkey);
