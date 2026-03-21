@@ -5,7 +5,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use super::benchmark_config::BenchmarkConfig;
 use super::benchmark_result::BenchmarkResult;
-use crate::integration_tests::benchmarks::PERF_LAYER;
+use super::json_output::ScenarioThresholds;
+use std::sync::atomic::Ordering;
+
+use crate::integration_tests::benchmarks::{DETAILED_MODE, PERF_LAYER};
 use crate::integration_tests::core::ScenarioContext;
 use crate::{Whitenoise, WhitenoiseError};
 
@@ -21,6 +24,16 @@ pub trait BenchmarkScenario {
     /// Configuration for this benchmark
     fn config(&self) -> BenchmarkConfig {
         BenchmarkConfig::default()
+    }
+
+    /// Regression-detection thresholds for this scenario.
+    ///
+    /// Defaults to conservative relay-tier thresholds with `ci_tier: "unknown"`.
+    /// Override this to declare the correct CI tier and custom warn/regress/break
+    /// percentages so that `bench_compare` gates PRs correctly without requiring
+    /// a separate central registry.
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds::default()
     }
 
     /// Setup phase - create accounts, groups, and any test data needed.
@@ -97,9 +110,14 @@ pub trait BenchmarkScenario {
         );
         pb.set_message("Benchmarking");
 
-        for _ in 0..config.iterations {
+        let detailed = DETAILED_MODE.load(Ordering::Relaxed);
+
+        for i in 0..config.iterations {
             let duration = self.single_iteration(&mut context).await?;
             timings.push(duration);
+            if detailed && let Some(layer) = PERF_LAYER.get() {
+                layer.checkpoint(i as usize, duration.as_nanos() as u64);
+            }
             pb.inc(1);
             tokio::time::sleep(config.cooldown_between_iterations).await;
         }
@@ -107,8 +125,19 @@ pub trait BenchmarkScenario {
         pb.finish_with_message("Benchmark complete");
         let total_duration = overall_start.elapsed();
 
-        // Drain perf layer if available
-        let perf_breakdown = PERF_LAYER.get().map(|layer| layer.drain());
+        // In detailed mode, checkpoint() has already moved all samples into per-iteration
+        // buckets, so drain() would return an empty vec. Return None instead to clearly
+        // signal "aggregate breakdown not available in this mode."
+        let perf_breakdown = if detailed {
+            None
+        } else {
+            PERF_LAYER.get().map(|layer| layer.drain())
+        };
+        let per_iteration = if detailed {
+            PERF_LAYER.get().map(|layer| layer.drain_per_iteration())
+        } else {
+            None
+        };
 
         // Calculate and return results
         Ok(BenchmarkResult::from_timings(
@@ -117,6 +146,7 @@ pub trait BenchmarkScenario {
             timings,
             total_duration,
             perf_breakdown,
+            per_iteration,
         ))
     }
 }

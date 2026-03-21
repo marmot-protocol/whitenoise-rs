@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use nostr_sdk::{EventBuilder, Keys, Metadata};
 
 use crate::WhitenoiseError;
+use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
 use crate::integration_tests::benchmarks::test_cases::FindOrCreateUserBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::ScenarioContext;
@@ -46,6 +47,15 @@ impl BenchmarkScenario for UserDiscoveryBenchmark {
             iterations: 100,
             warmup_iterations: 0,
             cooldown_between_iterations: Duration::from_millis(50),
+        }
+    }
+
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds {
+            warn_pct: 10,
+            regress_pct: 20,
+            break_pct: 35,
+            ci_tier: "relay",
         }
     }
 

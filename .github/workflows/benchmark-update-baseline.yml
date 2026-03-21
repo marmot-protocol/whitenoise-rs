@@ -1,0 +1,85 @@
+name: Update Performance Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  update-baseline:
+    name: Run benchmarks and update perf-hotspot branch
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout perf-hotspot branch
+        uses: actions/checkout@v4
+        with:
+          ref: perf-hotspot
+          fetch-depth: 1
+          path: perf-hotspot-data
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          echo "Running Nostr health checks..."
+          sleep 5
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Run benchmarks
+        run: just benchmark-json
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
+
+      - name: Copy result to baseline
+        run: |
+          # Use a glob array rather than ls -t | head -1 so that an empty match
+          # does not cause errexit to fire before the explicit error check runs.
+          shopt -s nullglob
+          files=(./benchmark_results/result_*.json)
+          shopt -u nullglob
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "ERROR: No benchmark result file found"
+            exit 1
+          fi
+          # Pick the newest file by modification time.
+          RESULT=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
+          BASELINE_NAME="baseline-all.json"
+          cp "$RESULT" "perf-hotspot-data/$BASELINE_NAME"
+          echo "Copied $RESULT → perf-hotspot-data/$BASELINE_NAME"
+          echo "baseline_name=$BASELINE_NAME" >> "$GITHUB_ENV"
+
+      - name: Commit baseline to perf-hotspot branch
+        run: |
+          cd perf-hotspot-data
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$baseline_name"
+          if git diff --cached --quiet; then
+            echo "No changes to baseline"
+          else
+            git commit -m "baseline ($baseline_name) from $(git -C .. rev-parse --short HEAD) on $(date -u +%Y-%m-%d)"
+            git push
+          fi
