@@ -43,7 +43,7 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
             test_pubkey
         );
 
-        context.whitenoise.create_identity().await?;
+        let account = context.whitenoise.create_identity().await?;
 
         let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
@@ -80,6 +80,12 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
         )
         .await?;
         assert!(initial_user.metadata_is_known());
+
+        // Remove the temporary account before publishing the newer event so
+        // the long-lived discovery subscription cannot update local state via
+        // the normal event-processing path while we are testing the explicit
+        // blocking-resolution contract.
+        context.whitenoise.logout(&account.pubkey).await?;
 
         let newer_timestamp = Timestamp::from(Timestamp::now().as_secs() + 60);
         let newer_event_id = *client
