@@ -79,6 +79,11 @@ pub enum MessagesCmd {
     Subscribe {
         /// MLS group ID (hex)
         group_id: String,
+
+        /// Maximum number of messages in the initial snapshot (default: 50, max: 200).
+        /// Older messages can be fetched on demand with the `list` command.
+        #[arg(long)]
+        limit: Option<u32>,
     },
 
     /// React to a message
@@ -139,7 +144,9 @@ impl MessagesCmd {
                 query,
                 limit,
             } => search(socket, json, account_flag, group_id, query, limit).await,
-            Self::Subscribe { group_id } => subscribe(socket, json, account_flag, group_id).await,
+            Self::Subscribe { group_id, limit } => {
+                subscribe(socket, json, account_flag, group_id, limit).await
+            }
             Self::React {
                 group_id,
                 message_id,
@@ -211,11 +218,13 @@ async fn subscribe(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
+    limit: Option<u32>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let req = Request::MessagesSubscribe {
         account: pubkey,
         group_id,
+        limit,
     };
     let mut had_error = false;
     client::stream(socket, &req, |resp| {

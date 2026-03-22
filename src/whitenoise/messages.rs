@@ -1796,7 +1796,7 @@ mod tests {
 
         // Subscribe before retry so we can verify live delivery status transition.
         let mut updates = whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id)
+            .subscribe_to_group_messages(&group.mls_group_id, None)
             .await
             .unwrap()
             .updates;
