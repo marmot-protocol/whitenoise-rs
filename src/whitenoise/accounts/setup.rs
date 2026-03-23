@@ -1003,12 +1003,63 @@ mod tests {
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
 
+    #[cfg(feature = "integration-tests")]
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
         whitenoise.background_task_cancellation.clear();
         whitenoise.external_signers.clear();
         whitenoise.pending_logins.clear();
         whitenoise.reset_nostr_client().await.unwrap();
         whitenoise.wipe_database().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ensure_background_task_cancellation_channel_creates_missing_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account_pubkey = Keys::generate().public_key();
+
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&account_pubkey),
+            "test account should start without a cancellation channel"
+        );
+
+        whitenoise.ensure_background_task_cancellation_channel(account_pubkey);
+
+        let cancel_tx = whitenoise
+            .background_task_cancellation
+            .get(&account_pubkey)
+            .expect("missing cancellation channel after ensure");
+        let cancel_rx = cancel_tx.subscribe();
+
+        assert!(
+            !*cancel_rx.borrow(),
+            "new cancellation channel should start in the non-cancelled state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_background_task_cancellation_channel_preserves_existing_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account_pubkey = Keys::generate().public_key();
+        let (existing_cancel_tx, _) = watch::channel(true);
+
+        whitenoise
+            .background_task_cancellation
+            .insert(account_pubkey, existing_cancel_tx);
+
+        whitenoise.ensure_background_task_cancellation_channel(account_pubkey);
+
+        let cancel_tx = whitenoise
+            .background_task_cancellation
+            .get(&account_pubkey)
+            .expect("missing preserved cancellation channel");
+        let cancel_rx = cancel_tx.subscribe();
+
+        assert!(
+            *cancel_rx.borrow(),
+            "existing cancellation channel should not be replaced"
+        );
     }
 
     #[tokio::test]
@@ -1121,6 +1172,7 @@ mod tests {
     /// 1. runtime-only state is lost (as after app relaunch),
     /// 2. startup rebuilds subscriptions from persisted accounts,
     /// 3. creating a new group must still add that group to the creator's live group plane.
+    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn test_create_group_after_startup_restore_refreshes_creator_group_plane() {
         let whitenoise = test_get_whitenoise().await;
