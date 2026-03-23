@@ -42,15 +42,14 @@ impl DiscoverySyncWorker {
         Ok(())
     }
 
-    /// Runs the worker loop using `sync_discovery_subscriptions` from the
-    /// global Whitenoise instance. This is the production entry point.
-    pub(crate) async fn run(&self, shutdown_rx: watch::Receiver<bool>) {
-        self.run_with(shutdown_rx, || async {
-            crate::whitenoise::Whitenoise::get_instance()?
-                .sync_discovery_subscriptions()
-                .await
-        })
-        .await;
+    /// Runs the worker loop. This is the production entry point.
+    pub(crate) async fn run(
+        &self,
+        whitenoise: &'static crate::whitenoise::Whitenoise,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        self.run_with(shutdown_rx, || whitenoise.sync_discovery_subscriptions())
+            .await;
     }
 
     /// Runs the worker loop with a custom work function. Used by tests to
@@ -66,15 +65,20 @@ impl DiscoverySyncWorker {
                 _ = self.notify.notified() => {
                     loop {
                         self.do_rebuild(&work).await;
-                        match timeout(DEBOUNCE_WINDOW, self.notify.notified()).await {
-                            Ok(()) => {
-                                tracing::debug!(
-                                    target: "whitenoise::discovery_sync",
-                                    "Signal received during debounce window, rebuilding again"
-                                );
-                                continue;
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = timeout(DEBOUNCE_WINDOW, self.notify.notified()) => {
+                                match result {
+                                    Ok(()) => {
+                                        tracing::debug!(
+                                            target: "whitenoise::discovery_sync",
+                                            "Signal received during debounce window, rebuilding again"
+                                        );
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
                             }
-                            Err(_) => break,
                         }
                     }
                 }

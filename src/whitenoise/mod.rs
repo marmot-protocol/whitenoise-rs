@@ -564,7 +564,7 @@ impl Whitenoise {
             let handle = tokio::spawn(async move {
                 whitenoise_ref
                     .discovery_sync_worker
-                    .run(worker_shutdown_rx)
+                    .run(whitenoise_ref, worker_shutdown_rx)
                     .await;
             });
             whitenoise_ref.scheduler_handles.lock().await.push(handle);
