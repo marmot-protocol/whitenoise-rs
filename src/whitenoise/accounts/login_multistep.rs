@@ -561,5 +561,4 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)
     }
-
 }

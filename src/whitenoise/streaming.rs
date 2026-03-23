@@ -258,5 +258,4 @@ impl Whitenoise {
     pub(crate) fn media_files(&self) -> media_files::MediaFiles<'_> {
         media_files::MediaFiles::new(&self.storage, &self.database)
     }
-
 }
