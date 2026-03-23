@@ -2854,6 +2854,149 @@ mod tests {
         }
     }
 
+    mod nip46_reconnect_failed_tests {
+        use super::*;
+        use nostr_sdk::Keys;
+
+        #[tokio::test]
+        async fn test_nip46_reconnect_failed_initially_empty() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            assert!(
+                whitenoise.nip46_reconnect_failed_accounts().is_empty(),
+                "Should have no failed accounts initially"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_nip46_reconnect_failed_tracks_pubkeys() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let pk1 = Keys::generate().public_key();
+            let pk2 = Keys::generate().public_key();
+
+            whitenoise.nip46_reconnect_failed.insert(pk1);
+            whitenoise.nip46_reconnect_failed.insert(pk2);
+
+            let failed = whitenoise.nip46_reconnect_failed_accounts();
+            assert_eq!(failed.len(), 2);
+            assert!(failed.contains(&pk1));
+            assert!(failed.contains(&pk2));
+        }
+
+        #[tokio::test]
+        async fn test_nip46_reconnect_failed_remove_clears_pubkey() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let pk = Keys::generate().public_key();
+            whitenoise.nip46_reconnect_failed.insert(pk);
+            assert_eq!(whitenoise.nip46_reconnect_failed_accounts().len(), 1);
+
+            whitenoise.nip46_reconnect_failed.remove(&pk);
+            assert!(whitenoise.nip46_reconnect_failed_accounts().is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_nip46_reconnect_failed_insert_idempotent() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let pk = Keys::generate().public_key();
+            whitenoise.nip46_reconnect_failed.insert(pk);
+            whitenoise.nip46_reconnect_failed.insert(pk);
+
+            assert_eq!(
+                whitenoise.nip46_reconnect_failed_accounts().len(),
+                1,
+                "Duplicate insert should not create a second entry"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_register_external_signer_clears_reconnect_failed() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let pubkey = keys.public_key();
+
+            // Set up an external account and mark it as reconnect-failed
+            let _account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            whitenoise.nip46_reconnect_failed.insert(pubkey);
+            assert_eq!(whitenoise.nip46_reconnect_failed_accounts().len(), 1);
+
+            // Re-register the signer — should clear the failure flag
+            whitenoise
+                .register_external_signer::<nostr_sdk::Keys>(pubkey, keys)
+                .await
+                .unwrap();
+
+            assert!(
+                whitenoise.nip46_reconnect_failed_accounts().is_empty(),
+                "register_external_signer should clear the reconnect-failed flag"
+            );
+        }
+    }
+
+    mod get_signer_tests {
+        use super::*;
+        use nostr_sdk::Keys;
+
+        #[tokio::test]
+        async fn test_get_signer_rejects_external_account_without_registered_signer() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            // Remove the signer that login_with_external_signer_for_test registered
+            whitenoise.remove_external_signer(&account.pubkey);
+
+            let result = whitenoise.get_signer_for_account(&account);
+            assert!(
+                result.is_err(),
+                "Should reject external account with no registered signer"
+            );
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("not authorized") || err_msg.contains("AccountNotAuthorized"),
+                "Error should indicate account not authorized, got: {}",
+                err_msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_get_signer_returns_external_signer_when_registered() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let keys = Keys::generate();
+            let account = whitenoise
+                .login_with_external_signer_for_test(keys.clone())
+                .await
+                .unwrap();
+
+            // Signer was registered by the test helper — should succeed
+            let signer = whitenoise.get_signer_for_account(&account);
+            assert!(signer.is_ok(), "Should return signer for external account");
+        }
+
+        #[tokio::test]
+        async fn test_get_signer_returns_local_keys_for_local_account() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let (account, _keys) = setup_login_account(&whitenoise).await;
+            let signer = whitenoise.get_signer_for_account(&account);
+            assert!(
+                signer.is_ok(),
+                "Should return signer for local account with stored keys"
+            );
+        }
+    }
+
     mod subscription_tests {
         use super::*;
 

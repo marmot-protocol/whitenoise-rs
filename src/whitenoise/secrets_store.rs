@@ -505,4 +505,74 @@ mod tests {
         let retrieved_keys = secrets_store.get_nostr_keys_for_pubkey(&pubkey).unwrap();
         assert_eq!(retrieved_keys.public_key(), pubkey);
     }
+
+    #[test]
+    fn test_get_nip46_credentials_rejects_malformed_json() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Write garbage JSON directly to the keychain entry
+        let entry_key = format!("nip46:{}", pubkey.to_hex());
+        let entry = Entry::new(&secrets_store.service_name, &entry_key).unwrap();
+        entry.set_password("not-valid-json").unwrap();
+
+        let result = secrets_store.get_nip46_credentials(&pubkey);
+        assert!(
+            matches!(result, Err(SecretsStoreError::MalformedNip46Blob(_))),
+            "Should return MalformedNip46Blob for invalid JSON, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_get_nip46_credentials_rejects_invalid_secret_key() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Write valid JSON but with an invalid secret key hex
+        let entry_key = format!("nip46:{}", pubkey.to_hex());
+        let entry = Entry::new(&secrets_store.service_name, &entry_key).unwrap();
+        let payload = serde_json::json!({
+            "app_secret_key": "not-a-valid-hex-secret-key",
+            "bunker_uri": "bunker://deadbeef?relay=wss://relay.test"
+        });
+        entry.set_password(&payload.to_string()).unwrap();
+
+        let result = secrets_store.get_nip46_credentials(&pubkey);
+        assert!(
+            result.is_err(),
+            "Should reject credentials with invalid secret key hex"
+        );
+    }
+
+    #[test]
+    fn test_store_nip46_credentials_overwrites_existing() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let app_keys_1 = Keys::generate();
+        let bunker_uri_1 = "bunker://aaaa?relay=wss://relay1.test";
+        secrets_store
+            .store_nip46_credentials(&pubkey, app_keys_1.secret_key(), bunker_uri_1)
+            .unwrap();
+
+        // Overwrite with different credentials
+        let app_keys_2 = Keys::generate();
+        let bunker_uri_2 = "bunker://bbbb?relay=wss://relay2.test";
+        secrets_store
+            .store_nip46_credentials(&pubkey, app_keys_2.secret_key(), bunker_uri_2)
+            .unwrap();
+
+        let (retrieved_secret, retrieved_uri) =
+            secrets_store.get_nip46_credentials(&pubkey).unwrap();
+        assert_eq!(retrieved_uri, bunker_uri_2, "Should return updated URI");
+        assert_eq!(
+            retrieved_secret.to_secret_hex(),
+            app_keys_2.secret_key().to_secret_hex(),
+            "Should return updated secret key"
+        );
+    }
 }

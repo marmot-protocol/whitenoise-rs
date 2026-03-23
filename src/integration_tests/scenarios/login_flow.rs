@@ -75,6 +75,12 @@ impl Scenario for LoginFlowScenario {
             .execute(&mut self.context)
             .await?;
 
+        // 8. NIP-46 credential lifecycle: store, retrieve, reconnect-failed
+        // tracking, and cleanup on logout.
+        Nip46CredentialLifecycleTestCase
+            .execute(&mut self.context)
+            .await?;
+
         Ok(())
     }
 }
