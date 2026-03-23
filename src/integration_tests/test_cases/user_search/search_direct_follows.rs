@@ -5,7 +5,6 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::{create_test_client, publish_test_metadata};
 use crate::integration_tests::core::*;
 use crate::whitenoise::user_search::{MatchedField, SearchUpdateTrigger, UserSearchParams};
-use crate::whitenoise::users::UserSyncMode;
 
 use super::helpers::collect_search_updates;
 
@@ -46,10 +45,9 @@ impl TestCase for SearchDirectFollowsTestCase {
         publish_test_metadata(&client, followed_name, "A directly followed user").await?;
         client.disconnect().await;
 
-        // Create the user with blocking sync so metadata is populated in the DB
         context
             .whitenoise
-            .find_or_create_user_by_pubkey(&followed_pubkey, UserSyncMode::Blocking)
+            .resolve_user_blocking(&followed_pubkey)
             .await?;
 
         context
@@ -77,7 +75,7 @@ impl TestCase for SearchDirectFollowsTestCase {
 
         context
             .whitenoise
-            .find_or_create_user_by_pubkey(&unfollowed_pubkey, UserSyncMode::Blocking)
+            .resolve_user_blocking(&unfollowed_pubkey)
             .await?;
 
         // Search at radius 0-1

@@ -5,7 +5,6 @@ use crate::WhitenoiseError;
 use crate::integration_tests::core::test_clients::{create_test_client, publish_test_metadata};
 use crate::integration_tests::core::*;
 use crate::whitenoise::user_search::{SearchUpdateTrigger, UserSearchParams};
-use crate::whitenoise::users::UserSyncMode;
 
 use super::helpers::collect_search_updates;
 
@@ -19,7 +18,7 @@ use super::helpers::collect_search_updates;
 ///
 /// Sets up:
 /// - Target publishes metadata to relays
-/// - Target's User record is created via Background mode (empty metadata in DB)
+/// - Target's User record is created via resolve_user (empty metadata in DB)
 /// - Searcher follows Target
 ///
 /// Verifies:
@@ -55,15 +54,12 @@ impl TestCase for SearchEmptyMetadataTestCase {
             &target_pubkey.to_hex()[..8]
         );
 
-        // Step 2: Create a User record with empty metadata using Background mode.
-        // Background mode returns immediately with an empty-metadata User record
-        // and schedules an async fetch. We search before that fetch completes.
-        context
-            .whitenoise
-            .find_or_create_user_by_pubkey(&target_pubkey, UserSyncMode::Background)
-            .await?;
+        // Step 2: Create a User record with empty metadata using resolve_user.
+        // It returns immediately with an empty-metadata User record and
+        // starts async discovery only because metadata is still unknown.
+        context.whitenoise.resolve_user(&target_pubkey).await?;
         tracing::info!(
-            "Created User record via Background mode for {}",
+            "Created User record via resolve_user for {}",
             &target_pubkey.to_hex()[..8]
         );
 

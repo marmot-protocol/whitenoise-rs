@@ -156,6 +156,8 @@ pub struct Whitenoise {
     shutdown_sender: Sender<()>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
     contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
+    /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
+    user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
     scheduler_shutdown: watch::Sender<bool>,
     /// Handles for spawned scheduler tasks
@@ -205,6 +207,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
+            .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .finish()
@@ -245,6 +248,7 @@ impl Whitenoise {
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
             contact_list_guards: DashMap::new(),
+            user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
@@ -1025,9 +1029,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> Result<user_streaming::UserSubscription> {
         let mut updates = self.user_stream_manager.subscribe(pubkey);
-        let initial_user = self
-            .find_or_create_user_by_pubkey(pubkey, users::UserSyncMode::Background)
-            .await?;
+        let initial_user = self.resolve_user(pubkey).await?;
         let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
 
         Ok(user_streaming::UserSubscription {
@@ -1525,15 +1527,6 @@ pub mod test_utils {
         (whitenoise, data_temp, logs_temp)
     }
 
-    pub(crate) async fn create_mock_whitenoise_with_event_receiver() -> (
-        Whitenoise,
-        mpsc::Receiver<ProcessableEvent>,
-        TempDir,
-        TempDir,
-    ) {
-        create_mock_whitenoise_internal().await
-    }
-
     /// Wait for local test relays to be ready
     async fn wait_for_test_relays() {
         use std::time::Duration;
@@ -1614,8 +1607,20 @@ pub mod test_utils {
     }
 
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
-        // Initialize whitenoise for this specific test
-        let (config, _data_temp, _logs_temp) = create_test_config();
+        static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+
+        // Singleton-backed tests can spawn background tasks that outlive the
+        // helper call, so the temp dirs backing the singleton config must stay
+        // alive for the rest of the process.
+        let config = TEST_SINGLETON_CONFIG
+            .get_or_init(|| {
+                let (config, data_temp, logs_temp) = create_test_config();
+                std::mem::forget(data_temp);
+                std::mem::forget(logs_temp);
+                config
+            })
+            .clone();
+
         Whitenoise::initialize_whitenoise(config).await.unwrap();
         Whitenoise::get_instance().unwrap()
     }

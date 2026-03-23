@@ -116,7 +116,7 @@ impl Whitenoise {
     /// # Note
     /// This method does NOT create User records for search results.
     /// Only when the app explicitly interacts with a result (follow, message, etc.)
-    /// should a User record be created via `find_or_create_user_by_pubkey`.
+    /// should a User record be created via `resolve_user` or `get_or_create_user_local`.
     #[perf_instrument("user_search")]
     pub async fn search_users(&self, params: UserSearchParams) -> Result<UserSearchSubscription> {
         if params.radius_start > params.radius_end {
