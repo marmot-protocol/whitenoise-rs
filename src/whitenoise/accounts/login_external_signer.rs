@@ -275,11 +275,7 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
-        let user = account
-            .user(&self.database)
-            .await
-            .map_err(LoginError::from)?;
-        self.activate_account_without_publishing(account, &user, inbox_relays)
+        self.activate_account_without_publishing(account, inbox_relays)
             .await
             .map_err(LoginError::from)?;
 
@@ -509,8 +505,7 @@ impl Whitenoise {
         // In production, the real signer is registered before activation.
         self.insert_external_signer(pubkey, keys).await?;
 
-        let user = account.user(&self.database).await?;
-        self.activate_account_without_publishing(&account, &user, &relay_setup.inbox_relays)
+        self.activate_account_without_publishing(&account, &relay_setup.inbox_relays)
             .await?;
 
         Ok(account)

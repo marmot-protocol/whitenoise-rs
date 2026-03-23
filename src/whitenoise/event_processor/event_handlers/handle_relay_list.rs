@@ -95,14 +95,7 @@ impl Whitenoise {
                 }
             };
 
-            if let Err(error) = whitenoise.refresh_global_subscription_for_user().await {
-                tracing::warn!(
-                    target: "whitenoise::handle_relay_list",
-                    "Failed to refresh global subscriptions after relay list change for {}: {}",
-                    event_pubkey,
-                    error
-                );
-            }
+            whitenoise.discovery_sync_worker.request_rebuild();
 
             if let Some(account) = account
                 && let Err(error) = whitenoise.refresh_account_subscriptions(&account).await

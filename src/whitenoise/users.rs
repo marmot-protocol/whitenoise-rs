@@ -301,24 +301,12 @@ impl Whitenoise {
         );
     }
 
-    async fn refresh_discovery_for_new_user_if_needed(
-        &self,
-        user: &User,
-        created: bool,
-        mode: UserResolutionMode,
-    ) {
+    fn refresh_discovery_for_new_user_if_needed(&self, created: bool, mode: UserResolutionMode) {
         if !created || mode == UserResolutionMode::LocalOnly {
             return;
         }
 
-        if let Err(error) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::users::refresh_discovery_for_new_user_if_needed",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                error
-            );
-        }
+        self.discovery_sync_worker.request_rebuild();
     }
 
     fn user_resolution_guard(&self, pubkey: PublicKey) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -350,8 +338,7 @@ impl Whitenoise {
             }
         }
 
-        self.refresh_discovery_for_new_user_if_needed(&user, created, mode)
-            .await;
+        self.refresh_discovery_for_new_user_if_needed(created, mode);
 
         User::find_by_pubkey(pubkey, &self.database).await
     }
@@ -769,13 +756,19 @@ mod tests {
     async fn test_resolve_user_refreshes_discovery_only_for_new_users() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         whitenoise.create_identity().await.unwrap();
+        // Flush fire-and-forget rebuild (worker handles this in production)
+        whitenoise.sync_discovery_subscriptions().await.unwrap();
 
         let before = watched_user_count(&whitenoise).await;
         let test_pubkey = Keys::generate().public_key();
 
         whitenoise.resolve_user(&test_pubkey).await.unwrap();
+        // Flush fire-and-forget rebuild (worker handles this in production)
+        whitenoise.sync_discovery_subscriptions().await.unwrap();
         let after_create = watched_user_count(&whitenoise).await;
+
         whitenoise.resolve_user(&test_pubkey).await.unwrap();
+        // No rebuild needed — user already exists, request_rebuild not called
         let after_second_call = watched_user_count(&whitenoise).await;
 
         assert_eq!(after_create, before + 1);

@@ -553,11 +553,7 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> core::result::Result<(), LoginError> {
-        let user = account
-            .user(&self.database)
-            .await
-            .map_err(LoginError::from)?;
-        self.activate_account(account, &user, false, inbox_relays, key_package_relays)
+        self.activate_account(account, false, inbox_relays, key_package_relays)
             .await
             .map_err(LoginError::from)
     }

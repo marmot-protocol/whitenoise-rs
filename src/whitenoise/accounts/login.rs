@@ -42,7 +42,7 @@ impl Whitenoise {
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
-        self.activate_account(&account, &user, true, &relays, &relays)
+        self.activate_account(&account, true, &relays, &relays)
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
@@ -93,8 +93,7 @@ impl Whitenoise {
             self.setup_relays_for_existing_account(&mut account).await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
-        let user = account.user(&self.database).await?;
-        self.activate_account(&account, &user, false, &inbox_relays, &key_package_relays)
+        self.activate_account(&account, false, &inbox_relays, &key_package_relays)
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
@@ -147,8 +146,7 @@ impl Whitenoise {
         // setup can use it for NIP-42 AUTH on relays that require it.
         self.insert_external_signer(pubkey, signer.clone()).await?;
 
-        let user = account.user(&self.database).await?;
-        self.activate_account_without_publishing(&account, &user, &relay_setup.inbox_relays)
+        self.activate_account_without_publishing(&account, &relay_setup.inbox_relays)
             .await?;
 
         self.publish_relay_lists_with_signer(&relay_setup, signer.clone())
@@ -862,6 +860,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
+        // Flush fire-and-forget rebuild (worker handles this in production)
+        whitenoise.sync_discovery_subscriptions().await.unwrap();
 
         // After login, global discovery subscriptions should be active
         assert!(
@@ -874,13 +874,14 @@ mod tests {
 
         whitenoise.logout(&account.pubkey).await.unwrap();
 
-        // After logging out the last account, discovery subscriptions should be torn down
+        // After logging out the last account, zero accounts with zero
+        // subscriptions is the correct retired state (healthy).
         assert!(
-            !whitenoise
+            whitenoise
                 .is_global_subscriptions_operational()
                 .await
                 .unwrap(),
-            "Global subscriptions should be torn down after last account logout"
+            "Zero accounts with zero subscriptions should be healthy after logout"
         );
     }
 

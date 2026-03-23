@@ -151,25 +151,6 @@ impl DiscoveryPlane {
             .await
     }
 
-    /// Temporary adapter: delegates to the decoupled methods so existing
-    /// callers continue to compile. Removed in the next commit when callers
-    /// migrate to calling `sync_watched_users` / `sync_follow_lists` directly.
-    #[perf_instrument("relay")]
-    pub(crate) async fn sync(
-        &self,
-        watched_users: &[PublicKey],
-        follow_list_accounts: &[(PublicKey, Option<Timestamp>)],
-        public_since: Option<Timestamp>,
-    ) -> Result<()> {
-        if self.config.relays.is_empty() {
-            self.retire_all().await;
-            return Ok(());
-        }
-        self.sync_watched_users(watched_users, public_since).await?;
-        self.sync_follow_lists(follow_list_accounts).await?;
-        Ok(())
-    }
-
     // ── Watched-user subscriptions ───────────────────────────────────────
 
     /// Syncs discovery subscriptions for watched users (metadata, relay lists,

@@ -147,13 +147,7 @@ impl Whitenoise {
                 total,
             );
 
-            if let Err(error) = whitenoise.refresh_all_global_subscriptions().await {
-                tracing::warn!(
-                    target: "whitenoise::handle_contact_list",
-                    "Failed to refresh discovery subscriptions before catch-up: {}",
-                    error
-                );
-            }
+            whitenoise.discovery_sync_worker.request_rebuild();
 
             let fetched = Self::fetch_users_batch(whitenoise, &pubkeys, cancel_rx).await;
 

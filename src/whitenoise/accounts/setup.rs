@@ -53,7 +53,6 @@ impl Whitenoise {
     pub(super) async fn activate_account(
         &self,
         account: &Account,
-        user: &User,
         is_new_account: bool,
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
@@ -65,15 +64,7 @@ impl Whitenoise {
         self.background_task_cancellation
             .insert(account.pubkey, cancel_tx);
 
-        if let Err(e) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::accounts",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                e
-            );
-        }
-        tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed for account user");
+        self.discovery_sync_worker.request_rebuild();
 
         // Subscriptions and key package setup operate on disjoint relay
         // sessions (group/inbox plane vs ephemeral plane) with no shared
@@ -101,22 +92,13 @@ impl Whitenoise {
     pub(super) async fn activate_account_without_publishing(
         &self,
         account: &Account,
-        user: &User,
         inbox_relays: &[Relay],
     ) -> Result<()> {
         let (cancel_tx, _) = tokio::sync::watch::channel(false);
         self.background_task_cancellation
             .insert(account.pubkey, cancel_tx);
 
-        if let Err(e) = self.refresh_global_subscription_for_user().await {
-            tracing::warn!(
-                target: "whitenoise::accounts",
-                "Failed to refresh global subscription for new user {}: {}",
-                user.pubkey,
-                e
-            );
-        }
-        tracing::debug!(target: "whitenoise::accounts", "Global subscription refreshed");
+        self.discovery_sync_worker.request_rebuild();
 
         self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
