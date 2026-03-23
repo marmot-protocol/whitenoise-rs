@@ -110,3 +110,72 @@ impl Whitenoise {
         }));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::prelude::*;
+
+    use crate::whitenoise::{
+        database::processed_events::ProcessedEvent, relays::RelayType,
+        test_utils::create_mock_whitenoise,
+    };
+
+    async fn relay_list_event(keys: &Keys, relay_urls: &[&str]) -> Event {
+        let tags: Vec<Tag> = relay_urls.iter().map(|url| Tag::reference(*url)).collect();
+        EventBuilder::new(Kind::RelayList, "")
+            .tags(tags)
+            .sign(keys)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn relay_list_event_creates_user_with_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        let event = relay_list_event(
+            &keys,
+            &["wss://relay1.example.com", "wss://relay2.example.com"],
+        )
+        .await;
+        whitenoise.handle_relay_list(event).await.unwrap();
+
+        let user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        let relays = user
+            .relays(RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(relays.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_relay_list_event_is_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        let event = relay_list_event(&keys, &["wss://relay1.example.com"]).await;
+        whitenoise.handle_relay_list(event.clone()).await.unwrap();
+        whitenoise.handle_relay_list(event.clone()).await.unwrap();
+
+        // Event should be recorded exactly once
+        let processed = ProcessedEvent::exists(&event.id, None, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(processed);
+
+        // User should still have the correct relays
+        let user = whitenoise
+            .find_user_by_pubkey(&keys.public_key())
+            .await
+            .unwrap();
+        let relays = user
+            .relays(RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(relays.len(), 1);
+    }
+}
