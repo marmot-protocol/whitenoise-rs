@@ -19,6 +19,7 @@ struct CachedGraphUserRow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     metadata_updated_at: Option<DateTime<Utc>>,
+    metadata_expires_at: Option<DateTime<Utc>>,
     follows_updated_at: Option<DateTime<Utc>>,
 }
 
@@ -86,6 +87,18 @@ where
             })
             .transpose()?;
 
+        let metadata_expires_at_raw: Option<i64> = row.try_get("metadata_expires_at")?;
+        let metadata_expires_at = metadata_expires_at_raw
+            .map(|ms| {
+                DateTime::from_timestamp_millis(ms).ok_or_else(|| sqlx::Error::ColumnDecode {
+                    index: "metadata_expires_at".to_string(),
+                    source: Box::<dyn std::error::Error + Send + Sync>::from(
+                        "invalid timestamp millis",
+                    ),
+                })
+            })
+            .transpose()?;
+
         let follows_updated_at_raw: Option<i64> = row.try_get("follows_updated_at")?;
         let follows_updated_at = follows_updated_at_raw
             .map(|ms| {
@@ -106,6 +119,7 @@ where
             created_at,
             updated_at,
             metadata_updated_at,
+            metadata_expires_at,
             follows_updated_at,
         })
     }
@@ -121,28 +135,46 @@ impl From<CachedGraphUserRow> for CachedGraphUser {
             created_at: row.created_at,
             updated_at: row.updated_at,
             metadata_updated_at: row.metadata_updated_at,
+            metadata_expires_at: row.metadata_expires_at,
             follows_updated_at: row.follows_updated_at,
         }
     }
 }
 
 impl CachedGraphUser {
-    /// Find cached users with fresh metadata by pubkeys.
+    /// Find cached users with fresh (non-expired) metadata by pubkeys.
     ///
-    /// Returns only entries where metadata was fetched within the default TTL.
-    /// Missing entries or entries with stale/unfetched metadata are excluded.
+    /// Uses the per-entry `metadata_expires_at` column, which encodes confidence:
+    /// confident misses expire after 24h, uncertain misses after 30min.
+    /// Entries with NULL `metadata_expires_at` are treated as expired.
     #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn find_fresh_metadata_batch(
         pubkeys: &[PublicKey],
         database: &Database,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        Self::find_fresh_batch_by_field(
-            pubkeys,
-            "metadata_updated_at",
-            DEFAULT_CACHE_TTL_HOURS,
-            database,
-        )
-        .await
+        if pubkeys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let pubkey_hexes: Vec<String> = pubkeys.iter().map(|pk| pk.to_hex()).collect();
+
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+            sqlx::QueryBuilder::new("SELECT * FROM cached_graph_users WHERE pubkey IN (");
+        let mut sep = qb.separated(", ");
+        for hex in &pubkey_hexes {
+            sep.push_bind(hex);
+        }
+        sep.push_unseparated(") AND metadata_expires_at > ");
+        qb.push_bind(now);
+
+        let rows = qb
+            .build_query_as::<CachedGraphUserRow>()
+            .fetch_all(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+
+        Ok(rows.into_iter().map(Self::from).collect())
     }
 
     /// Find cached users with fresh follows by pubkeys.
@@ -241,16 +273,18 @@ impl CachedGraphUser {
         let now = Utc::now().timestamp_millis();
         let created_at = self.created_at.timestamp_millis();
         let metadata_updated_at = self.metadata.as_ref().map(|_| now);
+        let metadata_expires_at = self.metadata_expires_at.map(|dt| dt.timestamp_millis());
         let follows_updated_at = self.follows.as_ref().map(|_| now);
 
         let row = sqlx::query_as::<_, CachedGraphUserRow>(
-            "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, follows_updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, metadata_expires_at, follows_updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
                 metadata = excluded.metadata,
                 follows = excluded.follows,
                 updated_at = excluded.updated_at,
                 metadata_updated_at = excluded.metadata_updated_at,
+                metadata_expires_at = excluded.metadata_expires_at,
                 follows_updated_at = excluded.follows_updated_at
              RETURNING *",
         )
@@ -260,6 +294,7 @@ impl CachedGraphUser {
         .bind(created_at)
         .bind(now)
         .bind(metadata_updated_at)
+        .bind(metadata_expires_at)
         .bind(follows_updated_at)
         .fetch_one(&database.pool)
         .await
@@ -270,26 +305,33 @@ impl CachedGraphUser {
 
     /// Upsert only metadata, preserving existing follows.
     ///
+    /// `ttl_ms` controls how long the entry is considered fresh:
+    /// - `CONFIDENT_CACHE_TTL_MS` (24h) for clean EOSE or found metadata.
+    /// - `UNCERTAIN_CACHE_TTL_MS` (30min) for relay errors after retry exhaustion.
+    ///
     /// On fresh insert: follows = NULL (not fetched), follows_updated_at = NULL.
-    /// On conflict: only metadata, metadata_updated_at, and updated_at change.
+    /// On conflict: only metadata, metadata_updated_at, metadata_expires_at, and updated_at change.
     #[perf_instrument("db::cached_graph_users")]
     pub(crate) async fn upsert_metadata_only(
         pubkey: &PublicKey,
         metadata: &Metadata,
+        ttl_ms: i64,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
         let pubkey_hex = pubkey.to_hex();
         let metadata_json =
             serde_json::to_string(metadata).map_err(DatabaseError::Serialization)?;
         let now = Utc::now().timestamp_millis();
+        let expires_at = now + ttl_ms;
 
         let row = sqlx::query_as::<_, CachedGraphUserRow>(
-            "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, follows_updated_at)
-             VALUES (?, ?, NULL, ?, ?, ?, NULL)
+            "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, metadata_expires_at, follows_updated_at)
+             VALUES (?, ?, NULL, ?, ?, ?, ?, NULL)
              ON CONFLICT(pubkey) DO UPDATE SET
                 metadata = excluded.metadata,
                 updated_at = excluded.updated_at,
-                metadata_updated_at = excluded.metadata_updated_at
+                metadata_updated_at = excluded.metadata_updated_at,
+                metadata_expires_at = excluded.metadata_expires_at
              RETURNING *",
         )
         .bind(&pubkey_hex)
@@ -297,6 +339,7 @@ impl CachedGraphUser {
         .bind(now)
         .bind(now)
         .bind(now)
+        .bind(expires_at)
         .fetch_one(&database.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
@@ -372,6 +415,7 @@ impl CachedGraphUser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whitenoise::cached_graph_user::{CONFIDENT_CACHE_TTL_MS, UNCERTAIN_CACHE_TTL_MS};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::Keys;
 
@@ -710,6 +754,7 @@ mod tests {
         let updated = CachedGraphUser::upsert_metadata_only(
             &keys.public_key(),
             &Metadata::new().name("Updated"),
+            CONFIDENT_CACHE_TTL_MS,
             &whitenoise.database,
         )
         .await
@@ -765,6 +810,7 @@ mod tests {
         let saved = CachedGraphUser::upsert_metadata_only(
             &keys.public_key(),
             &Metadata::new().name("New"),
+            CONFIDENT_CACHE_TTL_MS,
             &whitenoise.database,
         )
         .await
@@ -799,5 +845,113 @@ mod tests {
         let follows = saved.follows.unwrap();
         assert_eq!(follows.len(), 1);
         assert!(follows.contains(&follow1));
+    }
+
+    #[tokio::test]
+    async fn uncertain_metadata_expires_before_confident() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let confident_pk = Keys::generate().public_key();
+        let uncertain_pk = Keys::generate().public_key();
+
+        let now = Utc::now().timestamp_millis();
+
+        // Confident miss: written 31 minutes ago, expires in ~23h29m (still fresh)
+        let written_31m_ago = now - 31 * 60 * 1000;
+        let confident_expires = written_31m_ago + CONFIDENT_CACHE_TTL_MS;
+        sqlx::query(
+            "INSERT INTO cached_graph_users (pubkey, metadata, created_at, updated_at, metadata_updated_at, metadata_expires_at)
+             VALUES (?, '{}', ?, ?, ?, ?)",
+        )
+        .bind(confident_pk.to_hex())
+        .bind(written_31m_ago)
+        .bind(written_31m_ago)
+        .bind(written_31m_ago)
+        .bind(confident_expires)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        // Uncertain miss: written 31 minutes ago, expired 1 minute ago
+        let uncertain_expires = written_31m_ago + UNCERTAIN_CACHE_TTL_MS;
+        sqlx::query(
+            "INSERT INTO cached_graph_users (pubkey, metadata, created_at, updated_at, metadata_updated_at, metadata_expires_at)
+             VALUES (?, '{}', ?, ?, ?, ?)",
+        )
+        .bind(uncertain_pk.to_hex())
+        .bind(written_31m_ago)
+        .bind(written_31m_ago)
+        .bind(written_31m_ago)
+        .bind(uncertain_expires)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let fresh = CachedGraphUser::find_fresh_metadata_batch(
+            &[confident_pk, uncertain_pk],
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fresh.len(), 1, "only the confident entry should be fresh");
+        assert_eq!(fresh[0].pubkey, confident_pk);
+    }
+
+    #[tokio::test]
+    async fn upsert_metadata_only_sets_expires_at_from_ttl() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        let before = Utc::now();
+        let saved = CachedGraphUser::upsert_metadata_only(
+            &keys.public_key(),
+            &Metadata::new().name("Test"),
+            UNCERTAIN_CACHE_TTL_MS,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let after = Utc::now();
+
+        let expires = saved.metadata_expires_at.expect("expires_at should be set");
+        let ttl = chrono::Duration::milliseconds(UNCERTAIN_CACHE_TTL_MS);
+        // Allow 1s tolerance for DB millisecond truncation and test execution time.
+        let tolerance = chrono::Duration::seconds(1);
+        let expected_min = before + ttl - tolerance;
+        let expected_max = after + ttl + tolerance;
+        assert!(
+            expires >= expected_min && expires <= expected_max,
+            "expires_at ({expires:?}) should be ~now + TTL ({expected_min:?}..{expected_max:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_metadata_expires_at_treated_as_expired() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        // Insert with NULL metadata_expires_at (simulates pre-migration row)
+        let now = Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO cached_graph_users (pubkey, metadata, created_at, updated_at, metadata_updated_at, metadata_expires_at)
+             VALUES (?, '{}', ?, ?, ?, NULL)",
+        )
+        .bind(keys.public_key().to_hex())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let fresh =
+            CachedGraphUser::find_fresh_metadata_batch(&[keys.public_key()], &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(
+            fresh.is_empty(),
+            "NULL expires_at should be treated as expired"
+        );
     }
 }

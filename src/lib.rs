@@ -46,7 +46,7 @@ pub use whitenoise::error::WhitenoiseError;
 
 // Account and user management
 pub use whitenoise::accounts::{Account, AccountType, LoginError, LoginResult, LoginStatus};
-pub use whitenoise::users::{KeyPackageStatus, User, UserSyncMode};
+pub use whitenoise::users::{KeyPackageStatus, User};
 
 // Settings and configuration
 pub use whitenoise::account_settings::AccountSettings;
@@ -82,6 +82,9 @@ pub use whitenoise::message_streaming::{GroupMessageSubscription, MessageUpdate,
 pub use whitenoise::chat_list_streaming::{
     ChatListSubscription, ChatListUpdate, ChatListUpdateTrigger,
 };
+
+// User streaming
+pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTrigger};
 
 // Notification streaming
 pub use whitenoise::notification_streaming::{

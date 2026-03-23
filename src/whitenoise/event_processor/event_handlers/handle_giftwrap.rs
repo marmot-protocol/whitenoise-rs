@@ -1,6 +1,3 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
 use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
@@ -15,7 +12,6 @@ use crate::{
         database::published_key_packages::PublishedKeyPackage,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        relays::Relay,
     },
 };
 
@@ -263,24 +259,13 @@ impl Whitenoise {
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
-        // Get signer early - needed for subscriptions
-        let signer = match whitenoise.get_signer_for_account(account) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    account = %account.pubkey.to_hex(),
-                    error = %e,
-                    "Failed to get signer; aborting welcome finalization"
-                );
-                return;
-            }
-        };
-
         // --- Step 1: subscription setup (must happen before catch-up and self-update) ---
-        let _subscription_ok = match Self::setup_group_subscriptions(whitenoise, account, signer)
-            .await
-        {
+        //
+        // Uses sync_group_subscriptions which only updates the group plane.
+        // Unlike refresh_account_subscriptions, this does NOT tear down the
+        // inbox or existing group subscriptions — avoiding a cascade failure
+        // when relay connections are flaky (e.g. mobile resuming from background).
+        let _subscription_ok = match whitenoise.sync_group_subscriptions(account).await {
             Ok(()) => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::process_welcome::background",
@@ -395,34 +380,6 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Set up Nostr subscriptions for group messages
-    #[perf_instrument("event_handlers")]
-    async fn setup_group_subscriptions(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        _signer: Arc<dyn NostrSigner>,
-    ) -> Result<()> {
-        let (group_ids, group_relays) =
-            Self::get_group_subscription_info(whitenoise, &account.pubkey)?;
-
-        // Create relay records (idempotent)
-        for relay in &group_relays {
-            if let Err(e) = Relay::find_or_create_by_url(relay, &whitenoise.database).await {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::process_welcome::background",
-                    "Failed to create relay record for {}: {}",
-                    relay,
-                    e
-                );
-            }
-        }
-
-        let _ = group_ids;
-        whitenoise.refresh_account_subscriptions(account).await?;
-
-        Ok(())
-    }
-
     /// Handle key package rotation after welcome.
     ///
     /// Marks the consumed key package in the published_key_packages table,
@@ -504,9 +461,7 @@ impl Whitenoise {
         whitenoise: &Whitenoise,
         welcomer_pubkey: PublicKey,
     ) -> Result<()> {
-        whitenoise
-            .find_or_create_user_by_pubkey(&welcomer_pubkey, crate::UserSyncMode::Background)
-            .await?;
+        whitenoise.resolve_user(&welcomer_pubkey).await?;
         Ok(())
     }
 
@@ -551,27 +506,6 @@ impl Whitenoise {
         );
 
         Ok(())
-    }
-
-    /// Helper to get group subscription info (group IDs and relay URLs) for an account.
-    fn get_group_subscription_info(
-        whitenoise: &Whitenoise,
-        pubkey: &PublicKey,
-    ) -> Result<(Vec<String>, Vec<RelayUrl>)> {
-        let mdk = whitenoise.create_mdk_for_account(*pubkey)?;
-        let groups = mdk.get_groups()?;
-        let mut group_relays_set = BTreeSet::new();
-        let group_ids = groups
-            .iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect::<Vec<_>>();
-
-        for group in &groups {
-            let relays = mdk.get_relays(&group.mls_group_id)?;
-            group_relays_set.extend(relays);
-        }
-
-        Ok((group_ids, group_relays_set.into_iter().collect()))
     }
 }
 
@@ -838,42 +772,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_group_subscription_info_no_groups() {
+    async fn test_sync_group_subscriptions_no_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
 
-        // New account has no groups
-        let result = Whitenoise::get_group_subscription_info(&whitenoise, &account.pubkey);
+        // New account has no groups — sync should succeed as a no-op
+        let result = whitenoise.sync_group_subscriptions(&account).await;
         assert!(result.is_ok());
-
-        let (group_ids, relays) = result.unwrap();
-        assert!(group_ids.is_empty());
-        assert!(relays.is_empty());
     }
 
     #[tokio::test]
-    async fn test_get_group_subscription_info_with_group() {
+    async fn test_sync_group_subscriptions_with_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create creator and member accounts
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
-        // Create a group
         let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
         whitenoise
             .create_group(&creator_account, vec![member_pubkey], config, None)
             .await
             .unwrap();
 
-        // Creator should now have one group with relays
-        let result = Whitenoise::get_group_subscription_info(&whitenoise, &creator_account.pubkey);
+        // Creator should have one group — sync should update the group plane
+        let result = whitenoise.sync_group_subscriptions(&creator_account).await;
         assert!(result.is_ok());
 
-        let (group_ids, relays) = result.unwrap();
-        assert_eq!(group_ids.len(), 1, "Creator should have one group");
-        assert!(!relays.is_empty(), "Group should have relays");
+        // Group plane should contain the group
+        let plane_count = whitenoise
+            .relay_control
+            .group_plane_account_group_count(&creator_account.pubkey)
+            .await;
+        assert_eq!(plane_count, 1, "Group plane should have one group");
     }
 
     #[tokio::test]
@@ -1007,11 +939,91 @@ mod tests {
         );
     }
 
-    /// When the account's signing key is not in the secrets store,
-    /// `finalize_welcome_with_instance` must return early without panicking.
-    /// This covers the signer-not-found early-return path (lines 238-245).
+    /// After welcome finalization, the new group must appear in the group
+    /// plane and the account's subscriptions must remain operational.
+    /// This is the core regression test for the background subscription bug:
+    /// the old code tore down all subscriptions (inbox + groups) and rebuilt
+    /// from scratch, which could cascade-fail on mobile. The fix uses an
+    /// incremental group plane update that leaves the inbox untouched.
     #[tokio::test]
-    async fn test_finalize_welcome_no_signer_returns_early() {
+    async fn test_finalize_welcome_adds_group_to_plane() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        // Member starts with subscriptions but no groups
+        assert!(
+            whitenoise
+                .is_account_subscriptions_operational(&member_account)
+                .await
+                .unwrap(),
+            "Member should be operational before welcome"
+        );
+        assert_eq!(
+            whitenoise
+                .relay_control
+                .group_plane_account_group_count(&member_account.pubkey)
+                .await,
+            0,
+            "Member should have 0 groups in plane before welcome"
+        );
+
+        // Build and process a real MLS Welcome
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+        whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        // Get the group ID from MDK (accept_welcome already ran)
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(!groups.is_empty(), "Member should have a group in MDK");
+        let group = &groups[0];
+
+        // Run finalize_welcome_with_instance
+        Whitenoise::finalize_welcome_with_instance(
+            &whitenoise,
+            &member_account,
+            &group.mls_group_id,
+            &group.name,
+            EventId::all_zeros(),
+            creator_account.pubkey,
+        )
+        .await;
+
+        // The new group must be in the group plane
+        let plane_count = whitenoise
+            .relay_control
+            .group_plane_account_group_count(&member_account.pubkey)
+            .await;
+        assert_eq!(
+            plane_count, 1,
+            "Group plane should have 1 group after welcome finalization"
+        );
+
+        // Subscriptions must still be operational (inbox survived)
+        assert!(
+            whitenoise
+                .is_account_subscriptions_operational(&member_account)
+                .await
+                .unwrap(),
+            "Subscriptions should remain operational after welcome finalization"
+        );
+    }
+
+    /// When the account's signing key is not in the secrets store,
+    /// `finalize_welcome_with_instance` must complete without panicking.
+    /// Operations that need a signer (e.g. key rotation) fail gracefully
+    /// while others (subscription sync, group info) proceed normally.
+    #[tokio::test]
+    async fn test_finalize_welcome_no_signer_completes_gracefully() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = mdk_core::GroupId::from_slice(&[99; 32]);
@@ -1022,7 +1034,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Remove the private key so get_signer_for_account returns an error
+        // Remove the private key so signer-dependent operations fail
         whitenoise
             .secrets_store
             .remove_private_key_for_pubkey(&account.pubkey)
@@ -1039,11 +1051,11 @@ mod tests {
         )
         .await;
 
-        // AccountGroup must still exist (early return does not destroy it)
+        // AccountGroup must still exist
         let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
             .await
             .unwrap();
-        assert!(ag.is_some(), "AccountGroup must survive an early return");
+        assert!(ag.is_some(), "AccountGroup must survive missing signer");
     }
 
     /// When the DB lookup for the key package fails (e.g. table missing),

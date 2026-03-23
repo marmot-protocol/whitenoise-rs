@@ -225,6 +225,16 @@ impl GroupPlane {
         }
     }
 
+    /// Returns the number of groups tracked in the group plane for an account.
+    pub(crate) async fn account_group_count(&self, pubkey: &PublicKey) -> usize {
+        self.accounts
+            .read()
+            .await
+            .get(pubkey)
+            .map(|state| state.groups.len())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn telemetry(&self) -> broadcast::Receiver<super::observability::RelayTelemetry> {
         self.session.telemetry()
     }
@@ -368,7 +378,6 @@ impl GroupPlane {
         }
     }
 
-    #[cfg(feature = "integration-tests")]
     #[perf_instrument("relay")]
     pub(crate) async fn reset(&self) {
         let pubkeys = self

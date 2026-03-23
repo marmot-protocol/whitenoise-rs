@@ -94,13 +94,7 @@ impl PublishSubscriptionUpdateTestCase {
     ) -> Result<(), WhitenoiseError> {
         if self.account_name.is_none() {
             let pubkey = keys.public_key();
-            let initial_user = context
-                .whitenoise
-                .find_or_create_user_by_pubkey(
-                    &pubkey,
-                    crate::whitenoise::users::UserSyncMode::Blocking,
-                )
-                .await?;
+            let initial_user = context.whitenoise.resolve_user_blocking(&pubkey).await?;
 
             // Verify initial state for metadata tests
             if self.metadata.is_some() {

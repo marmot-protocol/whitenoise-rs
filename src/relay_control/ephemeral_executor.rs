@@ -6,12 +6,14 @@ use std::{
 
 use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
+use tokio::task::JoinHandle;
 
 use super::{
     RelayPlane,
     observability::{RelayObservability, RelayTelemetry},
     sessions::{
-        RelaySession, RelaySessionAuthPolicy, RelaySessionConfig, RelaySessionReconnectPolicy,
+        QuorumPublishResult, RelaySession, RelaySessionAuthPolicy, RelaySessionConfig,
+        RelaySessionReconnectPolicy,
     },
 };
 use crate::{
@@ -42,6 +44,7 @@ pub(crate) struct EphemeralExecutor {
 struct EphemeralSessionEntry {
     session: RelaySession,
     tracking: Mutex<SessionRelayTracking>,
+    telemetry_handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Default)]
@@ -116,27 +119,44 @@ impl EphemeralExecutor {
         entry.session.publish_event_to(relays, event).await
     }
 
+    pub(crate) async fn publish_event_to_scope_quorum(
+        &self,
+        account_pubkey: Option<PublicKey>,
+        relays: &[RelayUrl],
+        event: &Event,
+        early_return_threshold: usize,
+    ) -> Result<QuorumPublishResult> {
+        let _span = perf_span!("relay::ephemeral_publish_event_quorum");
+        let entry = self.session_entry(account_pubkey).await;
+        entry
+            .prepare_ad_hoc_relays(relays, self.config.ad_hoc_relay_ttl)
+            .await?;
+        entry
+            .session
+            .publish_event_to_quorum(relays, event, early_return_threshold)
+            .await
+    }
+
     pub(crate) async fn remove_account_scope(&self, account_pubkey: &PublicKey) {
         let _span = perf_span!("relay::ephemeral_remove_account_scope");
         let entry = self.sessions.write().await.remove(&Some(*account_pubkey));
         if let Some(entry) = entry {
-            entry.session.shutdown().await;
+            entry.shutdown().await;
         }
     }
 
-    #[cfg(feature = "integration-tests")]
-    pub(crate) async fn remove_all_account_scopes(&self) {
-        let _span = perf_span!("relay::ephemeral_remove_all_account_scopes");
-        let account_keys = self
+    pub(crate) async fn remove_all_scopes(&self) {
+        let _span = perf_span!("relay::ephemeral_remove_all_scopes");
+        let entries = self
             .sessions
-            .read()
+            .write()
             .await
-            .keys()
-            .filter_map(|key| *key)
+            .drain()
+            .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
 
-        for account_pubkey in account_keys {
-            self.remove_account_scope(&account_pubkey).await;
+        for entry in entries {
+            entry.shutdown().await;
         }
     }
 
@@ -182,11 +202,12 @@ impl EphemeralExecutor {
             self.session_config(account_pubkey),
             self.event_sender.clone(),
         );
-        self.spawn_telemetry_persistor(account_pubkey, session.telemetry());
+        let telemetry_handle = self.spawn_telemetry_persistor(account_pubkey, session.telemetry());
 
         let entry = Arc::new(EphemeralSessionEntry {
             session,
             tracking: Mutex::new(SessionRelayTracking::default()),
+            telemetry_handle,
         });
         sessions.insert(account_pubkey, entry.clone());
 
@@ -207,7 +228,7 @@ impl EphemeralExecutor {
         &self,
         account_pubkey: Option<PublicKey>,
         mut receiver: broadcast::Receiver<RelayTelemetry>,
-    ) {
+    ) -> JoinHandle<()> {
         let database = self.database.clone();
         let observability = self.observability.clone();
         let task_name = format!(
@@ -243,7 +264,7 @@ impl EphemeralExecutor {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
+        })
     }
 
     #[cfg(test)]
@@ -288,6 +309,11 @@ impl EphemeralExecutor {
 }
 
 impl EphemeralSessionEntry {
+    async fn shutdown(&self) {
+        self.telemetry_handle.abort();
+        self.session.shutdown().await;
+    }
+
     async fn pin_relays(&self, relays: &[RelayUrl]) -> Result<()> {
         let unique_relays: HashSet<RelayUrl> = relays.iter().cloned().collect();
 

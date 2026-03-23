@@ -1,20 +1,23 @@
-use crate::WhitenoiseError;
-use crate::integration_tests::core::test_clients::{create_test_client, publish_relay_lists};
-use crate::integration_tests::core::*;
 use async_trait::async_trait;
-use nostr_sdk::{Keys, Metadata, RelayUrl};
+use nostr_sdk::{EventId, Keys, Metadata, RelayUrl};
 
-/// Tests find_or_create_user with force_sync=true (synchronous/blocking mode)
+use crate::WhitenoiseError;
+use crate::integration_tests::core::{
+    test_clients::{create_test_client, publish_relay_lists},
+    *,
+};
+
+use super::helpers::{wait_for_latest_metadata_event, wait_for_relay_list_indexed};
+
+const LOG_TARGET: &str = "integration_tests::test_cases::user_discovery::resolve_user_blocking";
+
+/// Tests `resolve_user_blocking`.
 ///
 /// This test verifies:
 /// - User creation when user doesn't exist
-/// - Synchronous metadata fetching (blocking until complete)
-/// - Synchronous relay list fetching (blocking until complete)
+/// - blocking lookup populates metadata and relay lists before returning when they are available
 /// - Idempotency (calling twice returns the same user)
-///
-/// LIMITATION: This test only covers force_sync=true. For force_sync=false
-/// (background mode), see FindOrCreateUserBackgroundModeTestCase.
-pub struct FindOrCreateUserTestCase {
+pub struct ResolveUserBlockingTestCase {
     test_keys: Keys,
     should_have_metadata: bool,
     should_have_relays: bool,
@@ -22,7 +25,7 @@ pub struct FindOrCreateUserTestCase {
     test_relays: Vec<RelayUrl>,
 }
 
-impl FindOrCreateUserTestCase {
+impl ResolveUserBlockingTestCase {
     pub fn basic() -> Self {
         let keys = Keys::generate();
         Self {
@@ -64,24 +67,30 @@ impl FindOrCreateUserTestCase {
         self
     }
 
-    async fn publish_metadata(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
+    async fn publish_metadata(
+        &self,
+        context: &ScenarioContext,
+    ) -> Result<EventId, WhitenoiseError> {
         let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
-        if let Some(metadata) = &self.test_metadata {
-            tracing::info!("Publishing test metadata for test pubkey");
-            test_client
-                .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))
-                .await?;
-        }
+        let metadata = self
+            .test_metadata
+            .as_ref()
+            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Missing test metadata")))?;
+        tracing::info!(target: LOG_TARGET, "Publishing test metadata for test pubkey");
+        let event_id = *test_client
+            .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))
+            .await?
+            .id();
 
         test_client.disconnect().await;
-        Ok(())
+        Ok(event_id)
     }
 
     async fn publish_relays_data(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
-        tracing::info!("Publishing test relay list for test pubkey");
+        tracing::info!(target: LOG_TARGET, "Publishing test relay list for test pubkey");
         let relay_urls: Vec<String> = self.test_relays.iter().map(|url| url.to_string()).collect();
         publish_relay_lists(&test_client, relay_urls).await?;
 
@@ -91,10 +100,14 @@ impl FindOrCreateUserTestCase {
 }
 
 #[async_trait]
-impl TestCase for FindOrCreateUserTestCase {
+impl TestCase for ResolveUserBlockingTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let test_pubkey = self.test_keys.public_key();
-        tracing::info!("Testing find_or_create_user for pubkey: {}", test_pubkey);
+        tracing::info!(
+            target: LOG_TARGET,
+            "Testing resolve_user_blocking for pubkey: {}",
+            test_pubkey
+        );
         let user_exists = context
             .whitenoise
             .find_user_by_pubkey(&test_pubkey)
@@ -108,25 +121,38 @@ impl TestCase for FindOrCreateUserTestCase {
         }
 
         if self.should_have_metadata {
-            self.publish_metadata(context).await?;
+            let metadata_event_id = self.publish_metadata(context).await?;
+            let metadata_client =
+                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+            wait_for_latest_metadata_event(
+                &metadata_client,
+                test_pubkey,
+                metadata_event_id,
+                "wait for metadata event to be queryable",
+            )
+            .await?;
+            metadata_client.disconnect().await;
         }
 
         if self.should_have_relays {
             self.publish_relays_data(context).await?;
+
+            let relay_client =
+                create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
+            wait_for_relay_list_indexed(&relay_client, test_pubkey).await?;
+            relay_client.disconnect().await;
         }
 
-        let mut user = context
+        let user = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Blocking,
-            ) // force synchronous metadata sync
+            .resolve_user_blocking(&test_pubkey)
             .await?;
 
         assert_eq!(user.pubkey, test_pubkey, "User pubkey should match");
         assert!(user.id.is_some(), "User should have an ID after creation");
 
         tracing::info!(
+            target: LOG_TARGET,
             "✓ User created with ID: {} for pubkey: {}",
             user.id.unwrap(),
             test_pubkey
@@ -136,28 +162,16 @@ impl TestCase for FindOrCreateUserTestCase {
         assert_eq!(found_user.pubkey, test_pubkey, "Found user should match");
         assert_eq!(found_user.id, user.id, "Found user ID should match");
 
-        tracing::info!("✓ User can be found by pubkey after creation");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ User can be found by pubkey after creation"
+        );
 
-        // If we expect metadata, wait until it arrives (background fetch is now asynchronous)
         if self.should_have_metadata {
-            tracing::info!("Waiting for background metadata fetch to complete...");
-            user = retry_default(
-                || async {
-                    let updated_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
-                    if updated_user.metadata != nostr_sdk::Metadata::default() {
-                        Ok(updated_user)
-                    } else {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "Background metadata fetch not yet complete"
-                        )))
-                    }
-                },
-                &format!(
-                    "wait for background metadata fetch for user {}",
-                    &test_pubkey.to_hex()[..8]
-                ),
-            )
-            .await?;
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ resolve_user_blocking returned metadata before returning"
+            );
         }
 
         if self.should_have_metadata {
@@ -176,6 +190,7 @@ impl TestCase for FindOrCreateUserTestCase {
                 );
 
                 tracing::info!(
+                    target: LOG_TARGET,
                     "✓ User metadata matches published data: name={:?}, display_name={:?}",
                     user.metadata.name,
                     user.metadata.display_name
@@ -186,37 +201,19 @@ impl TestCase for FindOrCreateUserTestCase {
                 user.metadata.name.is_none() || user.metadata.name == Some(String::new()),
                 "User should have empty/no name when no metadata published"
             );
-            tracing::info!("✓ User has empty metadata as expected (nothing published)");
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ User has empty metadata as expected (nothing published)"
+            );
         }
 
         if self.should_have_relays {
-            tracing::info!("Waiting for background relay fetch to complete...");
-
-            // Wait for background relay fetching to complete
-            let user_relays = retry_default(
-                || async {
-                    let updated_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
-                    let relays = updated_user
-                        .relays_by_type(
-                            crate::whitenoise::relays::RelayType::Nip65,
-                            context.whitenoise,
-                        )
-                        .await?;
-
-                    if relays.is_empty() {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "Background relay fetch not yet complete"
-                        )))
-                    } else {
-                        Ok(relays)
-                    }
-                },
-                &format!(
-                    "wait for background relay fetch for user {}",
-                    &test_pubkey.to_hex()[..8]
-                ),
-            )
-            .await?;
+            let user_relays = user
+                .relays_by_type(
+                    crate::whitenoise::relays::RelayType::Nip65,
+                    context.whitenoise,
+                )
+                .await?;
 
             let relay_urls: Vec<&RelayUrl> = user_relays.iter().map(|r| &r.url).collect();
             for expected_relay in &self.test_relays {
@@ -228,23 +225,20 @@ impl TestCase for FindOrCreateUserTestCase {
             }
 
             tracing::info!(
+                target: LOG_TARGET,
                 "✓ User relay list matches published data: {} relays found",
                 user_relays.len()
             );
         } else {
-            tracing::info!("✓ No relay publication needed for this test case");
+            tracing::info!(
+                target: LOG_TARGET,
+                "✓ No relay publication needed for this test case"
+            );
         }
 
-        // Second call with Background mode to test idempotency
-        // NOTE: Since the user was just created/synced, metadata is fresh (<24h),
-        // so this call will return immediately without any sync (lines 716-723 in users.rs)
-        // However, we CANNOT verify that sync was skipped - we can only verify the user is returned.
         let user_again = context
             .whitenoise
-            .find_or_create_user_by_pubkey(
-                &test_pubkey,
-                crate::whitenoise::users::UserSyncMode::Background,
-            )
+            .resolve_user_blocking(&test_pubkey)
             .await?;
         assert_eq!(
             user_again.id, user.id,
@@ -259,7 +253,10 @@ impl TestCase for FindOrCreateUserTestCase {
             "Should return same user metadata"
         );
 
-        tracing::info!("✓ find_or_create returns existing user on second call");
+        tracing::info!(
+            target: LOG_TARGET,
+            "✓ resolve_user returns the existing local snapshot on second call"
+        );
 
         Ok(())
     }

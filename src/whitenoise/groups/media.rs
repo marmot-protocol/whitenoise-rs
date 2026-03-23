@@ -1,12 +1,21 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use base64ct::{Base64, Encoding as _};
+use futures::StreamExt;
 use mdk_core::encrypted_media::types::MediaReference;
 use mdk_core::extension::group_image;
 use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::{GroupId, group_types};
 use mdk_storage_traits::Secret;
+use nostr_blossom::bud01::{
+    BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb,
+    BlossomBuilderExtension,
+};
 use nostr_blossom::client::BlossomClient;
+use nostr_sdk::prelude::hashes::Hash;
+use nostr_sdk::prelude::hashes::sha256::Hash as Sha256Hash;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -18,10 +27,71 @@ use crate::whitenoise::database::media_files::{FileMetadata, MediaFile};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::media_files::MediaFileUpload;
 
+/// Shared HTTP client for Blossom blob downloads.
+///
+/// `reqwest::Client` holds a connection pool, a DNS resolver, and TLS state.
+/// Building it once here lets all downloads reuse keep-alive connections and
+/// avoids repeated TLS handshakes.  The ring TLS provider is installed here
+/// too, so the `install_default()` call happens exactly once.
+static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    // reqwest 0.13 with `rustls-no-provider` requires an explicit provider.
+    // The `let _ =` suppresses the error when it is already installed (e.g.
+    // during tests where multiple call sites race to install the same provider).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Use embedded Mozilla root certificates instead of rustls-platform-verifier.
+    // The platform verifier requires Android-specific JNI initialization that is
+    // not performed in the Flutter app, causing a panic on first HTTPS request.
+    // Embedded roots work on all platforms and match nostr-blossom's approach.
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    // Custom redirect policy that mirrors `require_https()`:
+    // - Always allow HTTPS redirect targets.
+    // - In debug builds, also allow HTTP loopback hosts (for local test servers).
+    // - Reject everything else to prevent HTTPS → HTTP downgrade attacks.
+    // - Cap the chain at 10 hops to guard against redirect loops.
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url();
+        let allowed = match url.scheme() {
+            "https" => true,
+            "http" if Whitenoise::is_debug_local_blossom_url(url) => true,
+            _ => false,
+        };
+        if allowed {
+            attempt.follow()
+        } else {
+            let msg = format!("redirect to non-HTTPS URL is not allowed: {url}");
+            attempt.error(msg)
+        }
+    });
+
+    reqwest::Client::builder()
+        .redirect(redirect_policy)
+        .use_preconfigured_tls(tls_config)
+        .build()
+        .expect("Failed to build shared Blossom HTTP client")
+});
+
 impl Whitenoise {
     /// Default timeout for Blossom HTTP operations (download and upload)
     /// Set to 300 seconds to accommodate large image files over slow connections
-    const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
+    pub(crate) const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    /// Maximum number of bytes accepted for a single blob download (100 MiB).
+    ///
+    /// This cap applies both to the `Content-Length` header check (early rejection)
+    /// and to the streaming byte counter (guards against servers that lie about or
+    /// omit the header).  A 100 MiB limit is generous for encrypted media files
+    /// while still bounding worst-case memory pressure.
+    const MAX_BLOB_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 
     /// Returns the default Blossom server URL based on build configuration
     ///
@@ -649,30 +719,121 @@ impl Whitenoise {
             .await
     }
 
+    fn is_debug_local_blossom_url(url: &Url) -> bool {
+        if !cfg!(debug_assertions) {
+            return false;
+        }
+
+        match url.host_str() {
+            Some("localhost") => true,
+            Some(host) => host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+            None => false,
+        }
+    }
+
+    /// Rejects non-HTTPS Blossom URLs to prevent cleartext metadata leakage.
+    /// Debug builds also allow loopback `http://` URLs for local testing.
+    pub(crate) fn require_https(url: &Url) -> Result<()> {
+        match url.scheme() {
+            "https" => Ok(()),
+            "http" if Self::is_debug_local_blossom_url(url) => Ok(()),
+            _ => Err(WhitenoiseError::BlossomInsecureUrl(url.to_string())),
+        }
+    }
+
+    /// Blossom client that enforces HTTPS on the server URL.
+    pub(crate) fn blossom_client(url: &Url) -> Result<BlossomClient> {
+        Self::require_https(url)?;
+        Ok(BlossomClient::new(url.clone()))
+    }
+
+    /// Validates a `Content-Length` header value against `limit`.
+    ///
+    /// Returns the length as `usize` (suitable for `Vec::with_capacity`) on
+    /// success, or `DownloadSizeLimitExceeded` if the advertised length exceeds
+    /// the limit.  The `u64 → usize` conversion uses `try_from` with a
+    /// `usize::MAX` fallback to stay correct on any target width.
+    fn check_content_length(content_length: u64, limit: usize) -> Result<usize> {
+        let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
+        if content_length > limit {
+            return Err(WhitenoiseError::DownloadSizeLimitExceeded { limit });
+        }
+        Ok(content_length)
+    }
+
     #[perf_instrument("media")]
     async fn download_blob_from_blossom(
         blossom_url: &Url,
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        use nostr::hashes::{Hash, sha256::Hash as Sha256Hash};
+        // Enforce HTTPS before making any network contact.
+        Self::require_https(blossom_url)?;
 
-        let client = BlossomClient::new(blossom_url.clone());
-        let sha256 = Sha256Hash::from_slice(image_hash)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Invalid SHA256 hash: {}", e)))?;
+        // Build the Blossom download URL: <base>/<hex-hash>
+        // nostr-blossom's get_blob does this the same way, but we need the raw
+        // reqwest Response so we can stream it with a byte cap instead of
+        // buffering the whole body unconditionally.
+        let hash_hex = hex::encode(image_hash);
+        let download_url = blossom_url.join(&hash_hex).map_err(|e| {
+            WhitenoiseError::BlossomDownload(format!("Failed to build download URL: {}", e))
+        })?;
 
-        let download_future = client.get_blob(sha256, None, None, None::<&Keys>);
+        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, async {
+            let response = BLOSSOM_HTTP_CLIENT
+                .get(download_url)
+                .send()
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::BlossomDownload(format!("HTTP request failed: {}", e))
+                })?;
 
-        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, download_future)
-            .await
-            .map_err(|_| {
-                WhitenoiseError::BlossomDownload(format!(
-                    "Download timed out after {} seconds",
-                    Self::BLOSSOM_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|e| {
-                WhitenoiseError::BlossomDownload(format!("Failed to download blob: {}", e))
-            })
+            if !response.status().is_success() {
+                return Err(WhitenoiseError::BlossomDownload(format!(
+                    "Server returned status {}",
+                    response.status()
+                )));
+            }
+
+            // Early rejection: refuse downloads that advertise an oversized body.
+            // Content-Length can be omitted or spoofed, so this is a fast-path
+            // check only — the streaming counter below is the authoritative guard.
+            let hint_capacity = match response.content_length() {
+                Some(cl) => Self::check_content_length(cl, Self::MAX_BLOB_BYTES)?,
+                None => 0,
+            };
+
+            // Stream the body chunk-by-chunk, counting bytes as they arrive.
+            // This is the authoritative size guard: it fires even when the server
+            // omits or lies about Content-Length.
+            //
+            // The subtraction `MAX_BLOB_BYTES - body.len()` is always safe: the
+            // loop only continues while body.len() <= MAX_BLOB_BYTES, so the
+            // right-hand side never underflows.
+            let mut body: Vec<u8> = Vec::with_capacity(hint_capacity);
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    WhitenoiseError::BlossomDownload(format!("Error reading response body: {}", e))
+                })?;
+                if chunk.len() > Self::MAX_BLOB_BYTES - body.len() {
+                    return Err(WhitenoiseError::DownloadSizeLimitExceeded {
+                        limit: Self::MAX_BLOB_BYTES,
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+
+            Ok(body)
+        })
+        .await
+        .map_err(|_| {
+            WhitenoiseError::BlossomDownload(format!(
+                "Download timed out after {} seconds",
+                Self::BLOSSOM_TIMEOUT.as_secs()
+            ))
+        })?
     }
 
     fn decrypt_group_image(
@@ -836,22 +997,239 @@ impl Whitenoise {
         mime_type: &str,
         upload_keypair: &Keys,
     ) -> Result<nostr_blossom::bud02::BlobDescriptor> {
-        let client = BlossomClient::new(blossom_server_url.clone());
-        let upload_future = client.upload_blob(
-            encrypted_data,
-            Some(mime_type.to_string()),
-            None,
-            Some(upload_keypair),
-        );
+        // Enforce HTTPS before making any network contact.  Checked here rather
+        // than in `blossom_client` so we can use BLOSSOM_HTTP_CLIENT directly
+        // and inherit its custom redirect policy (which blocks HTTPS → HTTP
+        // downgrade attacks).  `BlossomClient::new` uses
+        // `Policy::limited(10)`, which does not restrict redirect targets.
+        Self::require_https(blossom_server_url)?;
 
-        tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
+        // Build the Blossom auth event that authorises this upload.
+        let sha256 = Sha256Hash::hash(&encrypted_data);
+        let expiration = Timestamp::now() + Duration::from_secs(300);
+        let auth = BlossomAuthorization::new(
+            "Blossom upload authorization".to_string(),
+            expiration,
+            BlossomAuthorizationVerb::Upload,
+            BlossomAuthorizationScope::BlobSha256Hashes(vec![sha256]),
+        );
+        let auth_event = EventBuilder::blossom_auth(auth)
+            .sign(upload_keypair)
+            .await
+            .map_err(|e| {
+                WhitenoiseError::Other(anyhow::anyhow!("Failed to sign Blossom auth event: {}", e))
+            })?;
+        let auth_json = auth_event.as_json();
+        let auth_header_value = format!("Nostr {}", Base64::encode_string(auth_json.as_bytes()));
+
+        let upload_url = blossom_server_url.join("upload").map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("Failed to build upload URL: {}", e))
+        })?;
+
+        let upload_future = async {
+            let response = BLOSSOM_HTTP_CLIENT
+                .put(upload_url)
+                .header(reqwest::header::CONTENT_TYPE, mime_type)
+                .header(reqwest::header::AUTHORIZATION, &auth_header_value)
+                .body(encrypted_data)
+                .send()
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::Other(anyhow::anyhow!("Upload HTTP request failed: {}", e))
+                })?;
+
+            if !response.status().is_success() {
+                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    "Upload failed with status {}",
+                    response.status()
+                )));
+            }
+
+            response
+                .json::<nostr_blossom::bud02::BlobDescriptor>()
+                .await
+                .map_err(|e| {
+                    WhitenoiseError::Other(anyhow::anyhow!(
+                        "Failed to parse upload response: {}",
+                        e
+                    ))
+                })
+        };
+
+        let descriptor = tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
             .await
             .map_err(|_| {
                 WhitenoiseError::Other(anyhow::anyhow!(
                     "Upload timed out after {} seconds",
                     Self::BLOSSOM_TIMEOUT.as_secs()
                 ))
-            })?
-            .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))
+            })??;
+
+        Self::require_https(&descriptor.url)?;
+
+        Ok(descriptor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── download_blob_from_blossom size-cap tests ─────────────────────────────
+    //
+    // These tests spin up a local mockito server and call the real streaming
+    // path.  They run only in debug builds because `require_https` allows
+    // loopback `http://` URLs in debug mode only.
+
+    /// Returns a fixed 32-byte hash for use as a fake blob hash in tests.
+    fn test_hash() -> [u8; 32] {
+        [0xab; 32]
+    }
+
+    /// Returns the URL path that `download_blob_from_blossom` will request for
+    /// `test_hash()`, i.e. `/<hex-encoded-hash>`.
+    fn test_path() -> String {
+        format!("/{}", hex::encode(test_hash()))
+    }
+
+    /// Returns a `localhost`-based URL for the mockito server.
+    ///
+    /// `mockito::Server` binds to a loopback address; using `localhost` keeps the
+    /// test URL readable while still reaching the local mock server.
+    fn localhost_url(server: &mockito::Server) -> Url {
+        let port = server.socket_address().port();
+        Url::parse(&format!("http://localhost:{port}")).unwrap()
+    }
+
+    /// Fast-path rejection: `Content-Length` header alone exceeds the limit.
+    ///
+    /// `check_content_length` is the pure function behind the fast-path guard.
+    /// Testing it directly avoids the need for a mock HTTP server and verifies
+    /// the logic independently of the network layer.
+    #[test]
+    fn content_length_guard_rejects_oversized_header() {
+        let limit = Whitenoise::MAX_BLOB_BYTES;
+        let oversized = (limit + 1) as u64;
+        let err = Whitenoise::check_content_length(oversized, limit).unwrap_err();
+        assert!(
+            matches!(err, WhitenoiseError::DownloadSizeLimitExceeded { limit: l } if l == Whitenoise::MAX_BLOB_BYTES),
+            "Expected DownloadSizeLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Fast-path accepts a `Content-Length` exactly at the limit.
+    #[test]
+    fn content_length_guard_accepts_exact_limit() {
+        let limit = Whitenoise::MAX_BLOB_BYTES;
+        let result = Whitenoise::check_content_length(limit as u64, limit).unwrap();
+        assert_eq!(result, limit);
+    }
+
+    /// Fast-path accepts a `Content-Length` below the limit.
+    #[test]
+    fn content_length_guard_accepts_small_value() {
+        let result = Whitenoise::check_content_length(1024, Whitenoise::MAX_BLOB_BYTES).unwrap();
+        assert_eq!(result, 1024);
+    }
+
+    /// Authoritative guard: server streams > 100 MiB with no `Content-Length`.
+    ///
+    /// The streaming byte counter must catch this even when the header is absent.
+    /// `with_chunked_body` is used (not `with_body`) because mockito's `with_body`
+    /// automatically sets `Content-Length`, which would trigger the fast-path header
+    /// check instead of exercising the streaming byte counter.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    async fn download_rejects_oversized_streaming_body() {
+        let mut server = mockito::Server::new_async().await;
+        // One byte over the limit, sent as a chunked response without Content-Length.
+        let oversized_body = vec![0u8; Whitenoise::MAX_BLOB_BYTES + 1];
+        let _mock = server
+            .mock("GET", test_path().as_str())
+            .with_status(200)
+            .with_chunked_body(move |w| w.write_all(&oversized_body))
+            .create_async()
+            .await;
+
+        let url = localhost_url(&server);
+        let err = Whitenoise::download_blob_from_blossom(&url, &test_hash())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                WhitenoiseError::DownloadSizeLimitExceeded {
+                    limit: Whitenoise::MAX_BLOB_BYTES
+                }
+            ),
+            "Expected DownloadSizeLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Happy path: a small response within the limit is returned successfully.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    async fn download_accepts_small_body() {
+        let mut server = mockito::Server::new_async().await;
+        let body = b"hello blossom";
+        let _mock = server
+            .mock("GET", test_path().as_str())
+            .with_status(200)
+            .with_body(&body[..])
+            .create_async()
+            .await;
+
+        let url = localhost_url(&server);
+        let result = Whitenoise::download_blob_from_blossom(&url, &test_hash())
+            .await
+            .unwrap();
+
+        assert_eq!(result, body);
+    }
+
+    // ── require_https / blossom_client tests ─────────────────────────────────
+
+    #[test]
+    fn blossom_client_accepts_https() {
+        let url = Url::parse("https://blossom.primal.net").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    fn blossom_client_rejects_http() {
+        let url = Url::parse("http://evil.example.com").unwrap();
+        let err = Whitenoise::blossom_client(&url).unwrap_err();
+        assert!(
+            matches!(err, WhitenoiseError::BlossomInsecureUrl(_)),
+            "Expected BlossomInsecureUrl, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn blossom_client_rejects_ftp() {
+        let url = Url::parse("ftp://files.example.com/blob").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_err());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_allows_localhost_http_in_debug() {
+        let url = Url::parse("http://localhost:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_allows_loopback_http_in_debug() {
+        let url = Url::parse("http://127.0.0.1:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_rejects_non_localhost_http_in_debug() {
+        let url = Url::parse("http://192.168.1.1:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_err());
     }
 }

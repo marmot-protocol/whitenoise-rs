@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
 use crate::{
     nostr_manager::{NostrManagerError, Result},
-    perf_instrument,
+    perf_instrument, perf_span,
     relay_control::{
         SubscriptionContext, SubscriptionStream,
         observability::{RelayTelemetry, RelayTelemetryKind},
@@ -43,6 +43,18 @@ struct RelaySetupOutcome {
     failed_relays: Vec<(RelayUrl, String)>,
     added_new_relay: bool,
     last_error: Option<NostrManagerError>,
+}
+
+/// Result of a quorum-based publish operation.
+///
+/// Contains the resolved output (succeeded + failed relays) plus a list of
+/// relay URLs that hadn't responded when quorum was reached. Their
+/// `send_event` futures were cancelled — the event may or may not have been
+/// delivered. Nostr events are idempotent (deduplicated by ID), so retrying
+/// pending relays is safe.
+pub(crate) struct QuorumPublishResult {
+    pub output: Output<EventId>,
+    pub pending: Vec<RelayUrl>,
 }
 
 /// Reusable single-client relay session used by relay planes.
@@ -418,7 +430,11 @@ impl RelaySession {
 
         let usable_relay_urls = prepared_relays.usable_relay_urls;
 
-        let result = self.client.send_event_to(&usable_relay_urls, event).await;
+        let result = {
+            let _span = perf_span!("relay::session_send_event_to");
+            self.client.send_event_to(&usable_relay_urls, event).await
+        };
+
         match result {
             Ok(output) => {
                 for relay_url in &usable_relay_urls {
@@ -451,6 +467,19 @@ impl RelaySession {
                     }
                 }
 
+                tracing::debug!(
+                    target: "whitenoise::relay_control::session",
+                    plane = self.config.plane.as_str(),
+                    event_id = %event.id,
+                    total = usable_relay_urls.len(),
+                    succeeded = output.success.len(),
+                    failed = output.failed.len(),
+                    failed_urls = ?output.failed.keys().collect::<Vec<_>>(),
+                    "Publish outcome: {}/{} relays accepted",
+                    output.success.len(),
+                    usable_relay_urls.len(),
+                );
+
                 Ok(output)
             }
             Err(error) => {
@@ -469,6 +498,170 @@ impl RelaySession {
                 Err(error.into())
             }
         }
+    }
+
+    #[perf_instrument("relay")]
+    pub(crate) async fn publish_event_to_quorum(
+        &self,
+        relay_urls: &[RelayUrl],
+        event: &Event,
+        early_return_threshold: usize,
+    ) -> Result<QuorumPublishResult> {
+        let _publish_guard = self.state.publish_lock.lock().await;
+
+        for relay_url in relay_urls {
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::PublishAttempt,
+                    self.config.plane,
+                    relay_url.clone(),
+                ),
+            ));
+        }
+
+        let prepared_relays = match self.prepare_relay_urls(relay_urls).await {
+            Ok(prepared_relays) => prepared_relays,
+            Err(error) => {
+                for relay_url in relay_urls {
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishFailure,
+                            self.config.plane,
+                            relay_url.clone(),
+                        )
+                        .with_message(error.to_string()),
+                    ));
+                }
+                return Err(error);
+            }
+        };
+
+        for (relay_url, message) in &prepared_relays.failed_relays {
+            self.emit_telemetry(Self::apply_telemetry_scope(
+                self.config.telemetry_account_pubkey,
+                RelayTelemetry::new(
+                    RelayTelemetryKind::PublishFailure,
+                    self.config.plane,
+                    relay_url.clone(),
+                )
+                .with_message(message.clone()),
+            ));
+        }
+
+        let usable_relay_urls = prepared_relays.usable_relay_urls;
+        let effective_quorum = early_return_threshold.max(1).min(usable_relay_urls.len());
+
+        let mut output = Output {
+            val: event.id,
+            success: HashSet::new(),
+            failed: HashMap::new(),
+        };
+
+        let _send_span = perf_span!("relay::session_send_event_to_quorum");
+        let pool = self.client.pool();
+        let mut futs = FuturesUnordered::new();
+
+        for url in &usable_relay_urls {
+            match pool.relay(url.clone()).await {
+                Ok(relay) => {
+                    let url = url.clone();
+                    futs.push(async move { (url, relay.send_event(event).await) });
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishFailure,
+                            self.config.plane,
+                            url.clone(),
+                        )
+                        .with_message(message.clone()),
+                    ));
+                    output.failed.insert(url.clone(), message);
+                }
+            }
+        }
+
+        while let Some((url, result)) = futs.next().await {
+            match result {
+                Ok(_event_id) => {
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishSuccess,
+                            self.config.plane,
+                            url.clone(),
+                        ),
+                    ));
+                    output.success.insert(url);
+                }
+                Err(e) => {
+                    let message = e.to_string();
+                    self.emit_telemetry(Self::apply_telemetry_scope(
+                        self.config.telemetry_account_pubkey,
+                        RelayTelemetry::new(
+                            RelayTelemetryKind::PublishFailure,
+                            self.config.plane,
+                            url.clone(),
+                        )
+                        .with_message(message.clone()),
+                    ));
+                    tracing::warn!(
+                        target: "whitenoise::relay_control::session",
+                        plane = self.config.plane.as_str(),
+                        relay_url = %url,
+                        event_id = %event.id,
+                        "Relay rejected quorum publish: {message}"
+                    );
+                    output.failed.insert(url, message);
+                }
+            }
+
+            if output.success.len() >= effective_quorum {
+                let resolved: HashSet<&RelayUrl> =
+                    output.success.iter().chain(output.failed.keys()).collect();
+                let pending: Vec<RelayUrl> = usable_relay_urls
+                    .iter()
+                    .filter(|u| !resolved.contains(u))
+                    .cloned()
+                    .collect();
+
+                tracing::debug!(
+                    target: "whitenoise::relay_control::session",
+                    plane = self.config.plane.as_str(),
+                    event_id = %event.id,
+                    quorum = effective_quorum,
+                    succeeded = output.success.len(),
+                    failed = output.failed.len(),
+                    pending_count = pending.len(),
+                    "Quorum publish met: {}/{} relays accepted",
+                    output.success.len(),
+                    usable_relay_urls.len(),
+                );
+
+                return Ok(QuorumPublishResult { output, pending });
+            }
+        }
+
+        tracing::debug!(
+            target: "whitenoise::relay_control::session",
+            plane = self.config.plane.as_str(),
+            event_id = %event.id,
+            quorum = effective_quorum,
+            succeeded = output.success.len(),
+            failed = output.failed.len(),
+            "Quorum publish complete: {}/{} relays accepted",
+            output.success.len(),
+            usable_relay_urls.len(),
+        );
+
+        Ok(QuorumPublishResult {
+            output,
+            pending: vec![],
+        })
     }
 
     #[perf_instrument("relay")]
@@ -756,6 +949,9 @@ impl RelaySession {
             // disconnect does not permanently blind the session. The loop
             // exits on a graceful Shutdown notification (Ok return) or when
             // the event_sender channel closes (receiver dropped).
+            const MAX_BACKOFF_SECS: u64 = 30;
+            let mut backoff_secs: u64 = 1;
+
             loop {
                 // Clone per-iteration so the `move` closure owns fresh handles.
                 let sender_i = event_sender.clone();
@@ -763,6 +959,7 @@ impl RelaySession {
                 let router_i = router.clone();
                 let state_i = state.clone();
 
+                let started_at = tokio::time::Instant::now();
                 let result = client
                     .handle_notifications(move |notification| {
                         let sender = sender_i.clone();
@@ -833,12 +1030,33 @@ impl RelaySession {
                                         for target_context in
                                             Self::dedupe_contexts(target_contexts)
                                         {
-                                            let _ = sender
-                                                .send(ProcessableEvent::new_routed_nostr_event(
+                                            match sender.try_send(
+                                                ProcessableEvent::new_routed_nostr_event(
                                                     event.as_ref().clone(),
                                                     target_context,
-                                                ))
-                                                .await;
+                                                ),
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                    tracing::warn!(
+                                                        target: "whitenoise::relay_control::sessions",
+                                                        relay_url = %relay_url,
+                                                        subscription_id = %subscription_id,
+                                                        event_id = %event.id,
+                                                        "Event channel closed, dropping routed event"
+                                                    );
+                                                    return Ok(true);
+                                                }
+                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                    tracing::warn!(
+                                                        target: "whitenoise::relay_control::sessions",
+                                                        relay_url = %relay_url,
+                                                        subscription_id = %subscription_id,
+                                                        event_id = %event.id,
+                                                        "Event channel full, dropping routed event"
+                                                    );
+                                                }
+                                            }
                                         }
                                     } else {
                                         let is_registered = state
@@ -892,11 +1110,18 @@ impl RelaySession {
                         break;
                     }
                     Err(error) => {
+                        // Reset backoff if the handler ran long enough to
+                        // have processed events successfully before failing.
+                        if started_at.elapsed() >= std::time::Duration::from_secs(MAX_BACKOFF_SECS)
+                        {
+                            backoff_secs = 1;
+                        }
                         tracing::error!(
                             target: "whitenoise::relay_control::session",
-                            "Notification handler error: {error}. Restarting in 1s."
+                            "Notification handler error: {error}. Restarting in {backoff_secs}s."
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                     }
                 }
             }
@@ -923,12 +1148,27 @@ impl RelaySession {
                 message,
                 failure_category,
             } => {
-                let _ = sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Notice".to_string(),
-                    ))
-                    .await;
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Notice".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Notice"
+                        );
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Notice"
+                        );
+                    }
+                }
                 let mut telemetry = RelayTelemetry::notice(plane, relay_url, &message);
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
@@ -943,12 +1183,27 @@ impl RelaySession {
                 message,
                 failure_category,
             } => {
-                let _ = sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Closed".to_string(),
-                    ))
-                    .await;
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Closed".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Closed"
+                        );
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Closed"
+                        );
+                    }
+                }
                 let mut telemetry = RelayTelemetry::closed(plane, relay_url, &message);
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
@@ -963,12 +1218,27 @@ impl RelaySession {
                 challenge,
                 failure_category,
             } => {
-                let _ = sender
-                    .send(ProcessableEvent::RelayMessage(
-                        relay_url.clone(),
-                        "Auth".to_string(),
-                    ))
-                    .await;
+                match sender.try_send(ProcessableEvent::RelayMessage(
+                    relay_url.clone(),
+                    "Auth".to_string(),
+                )) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel closed, dropping Auth"
+                        );
+                        return Ok(true);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            target: "whitenoise::relay_control::sessions",
+                            %relay_url,
+                            "Event channel full, dropping Auth"
+                        );
+                    }
+                }
                 let mut telemetry = RelayTelemetry::auth_challenge(plane, relay_url, &challenge);
                 if let Some(failure_category) = failure_category {
                     telemetry = telemetry.with_failure_category(failure_category);
@@ -1278,5 +1548,101 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_quorum_publish_emits_attempt_and_failure_telemetry() {
+        let (sender, _) = mpsc::channel(8);
+        let mut config = RelaySessionConfig::new(RelayPlane::Ephemeral);
+        config.connect_timeout = std::time::Duration::from_millis(10);
+        let session = RelaySession::new(config, sender);
+        let mut telemetry = session.telemetry();
+
+        let relay_url = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("quorum publish test")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = session
+            .publish_event_to_quorum(&[relay_url], &event, 1)
+            .await;
+
+        // Loopback relay fails to connect, so prepare_relay_urls returns error
+        assert!(result.is_err());
+
+        let mut saw_attempt = false;
+        let mut saw_failure = false;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !(saw_attempt && saw_failure) {
+                match telemetry.recv().await.unwrap().kind {
+                    RelayTelemetryKind::PublishAttempt => saw_attempt = true,
+                    RelayTelemetryKind::PublishFailure => saw_failure = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_process_notification_exits_when_channel_closed() {
+        let (sender, receiver) = mpsc::channel(8);
+        drop(receiver);
+        let (telemetry_sender, _) = broadcast::channel(8);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        let result = RelaySession::process_notification(
+            RelayNotification::Notice {
+                relay_url,
+                message: "test".to_string(),
+                failure_category: None,
+            },
+            RelayPlane::Discovery,
+            None,
+            &sender,
+            &telemetry_sender,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result,
+            "expected Ok(true) to signal handler exit on closed channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_notification_warns_and_continues_when_channel_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        // Fill the channel so the next send returns Full.
+        sender
+            .try_send(ProcessableEvent::RelayMessage(
+                RelayUrl::parse("wss://relay.example.com").unwrap(),
+                "filler".to_string(),
+            ))
+            .unwrap();
+        let (telemetry_sender, _) = broadcast::channel(8);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+
+        let result = RelaySession::process_notification(
+            RelayNotification::Notice {
+                relay_url,
+                message: "test".to_string(),
+                failure_category: None,
+            },
+            RelayPlane::Discovery,
+            None,
+            &sender,
+            &telemetry_sender,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result,
+            "expected Ok(false) to continue when channel is full"
+        );
     }
 }

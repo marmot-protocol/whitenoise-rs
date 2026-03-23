@@ -44,6 +44,7 @@ pub mod scheduled_tasks;
 pub mod secrets_store;
 pub mod storage;
 pub mod user_search;
+pub mod user_streaming;
 pub mod users;
 pub mod utils;
 pub mod zapstore;
@@ -147,6 +148,7 @@ pub struct Whitenoise {
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: Arc<message_streaming::MessageStreamManager>,
+    user_stream_manager: user_streaming::UserStreamManager,
     chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
     notification_stream_manager: notification_streaming::NotificationStreamManager,
@@ -154,6 +156,8 @@ pub struct Whitenoise {
     shutdown_sender: Sender<()>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
     contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
+    /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
+    user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
     scheduler_shutdown: watch::Sender<bool>,
     /// Handles for spawned scheduler tasks
@@ -206,12 +210,14 @@ impl std::fmt::Debug for Whitenoise {
             .field("storage", &"<REDACTED>")
             .field("message_aggregator", &"<REDACTED>")
             .field("message_stream_manager", &"<REDACTED>")
+            .field("user_stream_manager", &"<REDACTED>")
             .field("chat_list_stream_manager", &"<REDACTED>")
             .field("archived_chat_list_stream_manager", &"<REDACTED>")
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
+            .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .finish()
@@ -243,6 +249,7 @@ impl Whitenoise {
             storage: components.storage,
             message_aggregator: components.message_aggregator,
             message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
+            user_stream_manager: user_streaming::UserStreamManager::default(),
             chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
             archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
             ),
@@ -251,6 +258,7 @@ impl Whitenoise {
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
             contact_list_guards: DashMap::new(),
+            user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
@@ -268,26 +276,20 @@ impl Whitenoise {
     /// **not** auto-detect a platform backend — callers must register one via
     /// `keyring_core::set_default_store()` before any `Entry` operations.
     ///
-    /// In test and integration-test builds the mock (in-memory) store is used so
-    /// that unit tests never touch the real platform keychain. The
-    /// `benchmark-tests` feature selects the real keyring only for the
-    /// benchmark binary (`cargo run --bin`), not for `cargo test` builds.
+    /// In test, integration-test, and benchmark-test builds the mock (in-memory)
+    /// store is used so that neither `cargo test` nor unsigned `cargo run`
+    /// binaries require real platform keychain entitlements.
     ///
     /// This function is safe to call multiple times; only the first call has
     /// an effect.
     fn initialize_keyring_store() {
         static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
         KEYRING_STORE_INIT.get_or_init(|| {
-            // Always use the mock store in `cargo test` builds so unit tests
-            // never interact with the real platform keychain. The
-            // `benchmark-tests` feature only overrides the mock for the
-            // *benchmark binary* (`cargo run --bin benchmark_test`), which is
-            // not a `cfg(test)` build. The `integration-tests` feature
-            // selects mock for `cargo run --bin integration_test` as well.
-            #[cfg(any(
-                test,
-                all(feature = "integration-tests", not(feature = "benchmark-tests"))
-            ))]
+            // Use the mock (in-memory) store in test, integration-test, and
+            // benchmark-test builds so that `cargo test` and unsigned `cargo run`
+            // binaries never require real platform keychain entitlements.
+            // The real store is reserved for production builds (no feature flags).
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             {
                 keyring_core::set_default_store(
                     keyring_core::mock::Store::new()
@@ -297,27 +299,33 @@ impl Whitenoise {
 
             #[cfg(all(
                 not(test),
-                any(not(feature = "integration-tests"), feature = "benchmark-tests")
+                not(feature = "integration-tests"),
+                not(feature = "benchmark-tests")
             ))]
             {
-                #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+                // CLI builds use the regular Keychain store on all macOS architectures.
+                // The `cli` feature gates the `wn`/`wnd` binaries, which are unsigned
+                // and cannot use the Protected Data store (it requires a provisioning
+                // profile with application-groups entitlement).
+                #[cfg(all(target_os = "macos", feature = "cli"))]
                 {
                     let store = apple_native_keyring_store::keychain::Store::new()
                         .expect("Failed to create macOS Keychain credential store");
                     keyring_core::set_default_store(store);
                 }
-                // Apple Silicon (aarch64) macOS: use the Protected Data store, which
-                // synchronises credentials across devices via iCloud.
-                //
-                // RUNTIME REQUIREMENT: the binary must be code-signed with a
-                // provisioning profile that includes the
-                // com.apple.security.application-groups (or equivalent
-                // keychain-access-groups) entitlement.  The Flutter app build
-                // pipeline satisfies this automatically.  An unsigned `cargo run`
-                // on a developer Mac will panic here with an entitlement error;
-                // in that case build for x86_64 or use the integration-test
-                // feature flag (which substitutes the mock store).
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                // Intel Macs (non-CLI): use the regular Keychain store.
+                // Protected Data store is not available on x86_64.
+                #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
+                {
+                    let store = apple_native_keyring_store::keychain::Store::new()
+                        .expect("Failed to create macOS Keychain credential store");
+                    keyring_core::set_default_store(store);
+                }
+                // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
+                // Requires code-signing with a provisioning profile that includes the
+                // com.apple.security.application-groups entitlement. The Flutter app
+                // build pipeline satisfies this.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
                 {
                     let store = apple_native_keyring_store::protected::Store::new()
                         .expect("Failed to create macOS protected-data credential store");
@@ -425,7 +433,7 @@ impl Whitenoise {
         }
 
         // Create event processing channels
-        let (event_sender, event_receiver) = mpsc::channel(500);
+        let (event_sender, event_receiver) = mpsc::channel(2000);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
 
         // Create scheduler shutdown channel
@@ -544,6 +552,7 @@ impl Whitenoise {
             Arc::new(scheduled_tasks::KeyPackageMaintenance),
             Arc::new(scheduled_tasks::ConsumedKeyPackageCleanup),
             Arc::new(scheduled_tasks::CachedGraphUserCleanup),
+            Arc::new(scheduled_tasks::RelayListMaintenance),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
             whitenoise_ref,
@@ -608,67 +617,54 @@ impl Whitenoise {
 
     #[perf_instrument("whitenoise")]
     async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
-        let accounts = Account::all(&whitenoise_ref.database).await?;
-        if accounts.is_empty() {
-            tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "No accounts found, clearing discovery subscriptions"
-            );
-            // Explicitly sync with empty sets so any previously-active
-            // discovery subscriptions are torn down rather than left live.
-            whitenoise_ref
-                .relay_control
-                .sync_discovery_subscriptions(&[], &[], None)
-                .await
-                .map_err(WhitenoiseError::from)?;
-            return Ok(());
-        }
-
-        whitenoise_ref.sync_discovery_subscriptions().await?;
-        Ok(())
+        whitenoise_ref.sync_discovery_subscriptions().await
     }
 
+    /// Buffer (in seconds) subtracted from `last_synced_at` timestamps when
+    /// computing subscription `since` values, to account for clock drift and
+    /// relay propagation delay.
+    const SUBSCRIPTION_BUFFER_SECS: u64 = 10;
+
     // Compute a shared since timestamp for global user subscriptions.
-    // - Assumes at least one account exists (caller checked signer presence)
+    // - Accepts the already-loaded account list to avoid TOCTOU races
     // - If any account is unsynced (last_synced_at = None), return None
-    // - Otherwise, use min(last_synced_at) minus a 10s buffer, floored at 0
+    // - Otherwise, use min(last_synced_at) minus a buffer, floored at 0
     #[perf_instrument("whitenoise")]
-    async fn compute_global_since_timestamp(
-        whitenoise_ref: &Whitenoise,
-    ) -> Result<Option<nostr_sdk::Timestamp>> {
-        let accounts = Account::all(&whitenoise_ref.database).await?;
+    fn compute_global_since_timestamp(accounts: &[Account]) -> Option<nostr_sdk::Timestamp> {
+        if accounts.is_empty() {
+            tracing::debug!(
+                target: "whitenoise::compute_global_since_timestamp",
+                "No accounts; defaulting to since=None"
+            );
+            return None;
+        }
+
         if accounts.iter().any(|a| a.last_synced_at.is_none()) {
             let unsynced = accounts
                 .iter()
                 .filter(|a| a.last_synced_at.is_none())
                 .count();
             tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
+                target: "whitenoise::compute_global_since_timestamp",
                 "Global subscriptions using since=None due to {} unsynced accounts",
                 unsynced
             );
-            return Ok(None);
+            return None;
         }
 
-        const BUFFER_SECS: u64 = 10;
         let since = accounts
             .iter()
-            .filter_map(|a| a.since_timestamp(BUFFER_SECS))
+            .filter_map(|a| a.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS))
             .min_by_key(|t| t.as_secs());
 
         if let Some(ts) = since {
             tracing::info!(
-                target: "whitenoise::setup_global_users_subscriptions",
+                target: "whitenoise::compute_global_since_timestamp",
                 "Global subscriptions using since={} ({}s buffer)",
-                ts.as_secs(), BUFFER_SECS
-            );
-        } else {
-            tracing::warn!(
-                target: "whitenoise::setup_global_users_subscriptions",
-                "No minimum last_synced_at found; defaulting to since=None"
+                ts.as_secs(), Self::SUBSCRIPTION_BUFFER_SECS
             );
         }
-        Ok(since)
+        since
     }
 
     #[perf_instrument("whitenoise")]
@@ -1165,6 +1161,56 @@ impl Whitenoise {
         })
     }
 
+    /// Subscribe to updates for a single user.
+    ///
+    /// Returns both an initial snapshot AND a receiver for real-time updates.
+    /// The design eliminates race conditions:
+    /// - Subscription is established BEFORE fetching to capture concurrent updates
+    /// - Any updates that arrived during fetch are merged into `initial_user`
+    /// - The receiver only yields updates AFTER the initial snapshot
+    #[perf_instrument("whitenoise")]
+    pub async fn subscribe_to_user(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Result<user_streaming::UserSubscription> {
+        let mut updates = self.user_stream_manager.subscribe(pubkey);
+        let initial_user = self.resolve_user(pubkey).await?;
+        let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
+
+        Ok(user_streaming::UserSubscription {
+            initial_user,
+            updates,
+        })
+    }
+
+    fn drain_user_updates(
+        mut initial_user: User,
+        updates: &mut broadcast::Receiver<user_streaming::UserUpdate>,
+    ) -> Result<User> {
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    initial_user = update.user;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} user updates"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "User stream closed unexpectedly during subscription"
+                    )));
+                }
+            }
+        }
+
+        Ok(initial_user)
+    }
+
     /// Subscribe to chat list updates for a specific account.
     ///
     /// Returns both an initial snapshot AND a receiver for real-time updates.
@@ -1418,16 +1464,43 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Checks if account subscriptions are operational
+    /// Checks if account subscriptions are operational.
     ///
-    /// Returns true if the account inbox plane exists and at least one of its
-    /// relays is connected or connecting.
+    /// Returns true when:
+    /// 1. The inbox plane and group plane both have connected relays, AND
+    /// 2. The number of groups in the group plane matches MDK's active groups.
+    ///
+    /// The group count parity check catches groups that were added to MDK
+    /// (e.g. via `accept_welcome`) but never made it into the group plane
+    /// (e.g. because the background subscription setup failed on mobile).
     #[perf_instrument("whitenoise")]
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
-        Ok(self
+        let relay_healthy = self
             .relay_control
             .has_account_subscriptions(&account.pubkey)
-            .await)
+            .await;
+
+        if !relay_healthy {
+            return Ok(false);
+        }
+
+        let mdk_count = self.active_group_count(account)?;
+        let plane_count = self
+            .relay_control
+            .group_plane_account_group_count(&account.pubkey)
+            .await;
+
+        if mdk_count != plane_count {
+            tracing::info!(
+                target: "whitenoise::is_account_subscriptions_operational",
+                account = %account.pubkey.to_hex(),
+                mdk_groups = mdk_count,
+                plane_groups = plane_count,
+                "Group count mismatch between MDK and group plane",
+            );
+        }
+
+        Ok(mdk_count == plane_count)
     }
 
     /// Checks if global subscriptions are operational without refreshing.
@@ -1447,13 +1520,28 @@ impl Whitenoise {
 
     #[perf_instrument("whitenoise")]
     async fn sync_discovery_subscriptions(&self) -> Result<()> {
+        let accounts = Account::all(&self.database).await?;
+        if accounts.is_empty() {
+            // No accounts — tear down any active discovery subscriptions so they
+            // don't linger after the last account logs out.
+            self.relay_control
+                .sync_discovery_subscriptions(&[], &[], None)
+                .await
+                .map_err(WhitenoiseError::from)?;
+            return Ok(());
+        }
+
         let watched_users = User::all_pubkeys(&self.database).await?;
-        let follow_list_accounts = Account::all(&self.database)
-            .await?
-            .into_iter()
-            .map(|account| (account.pubkey, account.since_timestamp(10)))
+        let follow_list_accounts = accounts
+            .iter()
+            .map(|account| {
+                (
+                    account.pubkey,
+                    account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS),
+                )
+            })
             .collect::<Vec<_>>();
-        let public_since = Self::compute_global_since_timestamp(self).await?;
+        let public_since = Self::compute_global_since_timestamp(&accounts);
 
         self.relay_control
             .sync_discovery_subscriptions(&watched_users, &follow_list_accounts, public_since)
@@ -1514,11 +1602,17 @@ pub mod test_utils {
     /// # Returns
     ///
     /// A tuple containing:
-    /// - `(Whitenoise, TempDir, TempDir)`
+    /// - `(Whitenoise, mpsc::Receiver<ProcessableEvent>, TempDir, TempDir)`
     ///   - `Whitenoise`: The mock Whitenoise instance
+    ///   - `mpsc::Receiver<ProcessableEvent>`: The event receiver paired with the instance sender
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
-    pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+    async fn create_mock_whitenoise_internal() -> (
+        Whitenoise,
+        mpsc::Receiver<ProcessableEvent>,
+        TempDir,
+        TempDir,
+    ) {
         Whitenoise::initialize_mock_keyring_store();
 
         // Wait for local relays to be ready in test environment
@@ -1541,7 +1635,7 @@ pub mod test_utils {
         let secrets_store = SecretsStore::new(&config.keyring_service_id);
 
         // Create channels but don't start processing loop to avoid network calls
-        let (event_sender, _event_receiver) = mpsc::channel(10);
+        let (event_sender, event_receiver) = mpsc::channel(10);
         let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
         let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
 
@@ -1569,6 +1663,12 @@ pub mod test_utils {
         );
         whitenoise.relay_control.start_telemetry_persistors().await;
 
+        (whitenoise, event_receiver, data_temp, logs_temp)
+    }
+
+    pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+        let (whitenoise, _event_receiver, data_temp, logs_temp) =
+            create_mock_whitenoise_internal().await;
         (whitenoise, data_temp, logs_temp)
     }
 
@@ -1652,8 +1752,20 @@ pub mod test_utils {
     }
 
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
-        // Initialize whitenoise for this specific test
-        let (config, _data_temp, _logs_temp) = create_test_config();
+        static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+
+        // Singleton-backed tests can spawn background tasks that outlive the
+        // helper call, so the temp dirs backing the singleton config must stay
+        // alive for the rest of the process.
+        let config = TEST_SINGLETON_CONFIG
+            .get_or_init(|| {
+                let (config, data_temp, logs_temp) = create_test_config();
+                std::mem::forget(data_temp);
+                std::mem::forget(logs_temp);
+                config
+            })
+            .clone();
+
         Whitenoise::initialize_whitenoise(config).await.unwrap();
         Whitenoise::get_instance().unwrap()
     }
@@ -2159,6 +2271,82 @@ mod tests {
         }
     }
 
+    mod user_subscription_tests {
+        use chrono::Utc;
+        use nostr_sdk::{Keys, Metadata};
+        use tokio::sync::broadcast;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn test_subscribe_to_user_returns_initial_snapshot_for_existing_known_user() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = Keys::generate().public_key();
+
+            let mut user = User {
+                id: None,
+                pubkey,
+                metadata: Metadata::new().name("Known User"),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            user.mark_metadata_known_now();
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+
+            let subscription = whitenoise.subscribe_to_user(&pubkey).await.unwrap();
+
+            assert_eq!(subscription.initial_user, saved_user);
+        }
+
+        #[tokio::test]
+        async fn test_subscribe_to_user_creates_initial_snapshot_for_unknown_pubkey() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let pubkey = Keys::generate().public_key();
+
+            let subscription = whitenoise.subscribe_to_user(&pubkey).await.unwrap();
+
+            assert_eq!(subscription.initial_user.pubkey, pubkey);
+            assert!(subscription.initial_user.id.is_some());
+            assert!(subscription.initial_user.metadata_is_unknown());
+
+            let saved_user = User::find_by_pubkey(&pubkey, &whitenoise.database)
+                .await
+                .unwrap();
+            assert_eq!(saved_user, subscription.initial_user);
+        }
+
+        #[test]
+        fn test_drain_user_updates_uses_newest_queued_update() {
+            let pubkey = Keys::generate().public_key();
+            let mut initial_user = User {
+                id: None,
+                pubkey,
+                metadata: Metadata::new().name("Old Name"),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            initial_user.mark_metadata_known_now();
+
+            let mut newest_user = initial_user.clone();
+            newest_user.metadata = Metadata::new().name("Newest Name");
+            newest_user.updated_at = Utc::now();
+
+            let (sender, mut updates) = broadcast::channel(10);
+            sender
+                .send(user_streaming::UserUpdate {
+                    trigger: user_streaming::UserUpdateTrigger::MetadataChanged,
+                    user: newest_user.clone(),
+                })
+                .expect("should queue update");
+
+            let drained_user = Whitenoise::drain_user_updates(initial_user, &mut updates).unwrap();
+
+            assert_eq!(drained_user, newest_user);
+        }
+    }
+
     // Subscription Status Tests
     mod subscription_status_tests {
         use super::*;
@@ -2179,6 +2367,87 @@ mod tests {
             assert!(
                 is_operational,
                 "Account should be operational after create_identity"
+            );
+        }
+
+        /// When MDK has more active groups than the group plane, the parity
+        /// check should detect the mismatch and report non-operational.
+        #[tokio::test]
+        async fn test_is_account_operational_detects_group_count_mismatch() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+            let creator_account = whitenoise.create_identity().await.unwrap();
+            let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+            let member_pubkey = members[0].0.pubkey;
+            wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
+
+            // Starts operational (0 groups in MDK, 0 in plane)
+            assert!(
+                whitenoise
+                    .is_account_subscriptions_operational(&creator_account)
+                    .await
+                    .unwrap(),
+                "Should be operational with zero groups"
+            );
+
+            // Create a group — this adds it to MDK and (via background task)
+            // to the group plane
+            let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+            whitenoise
+                .create_group(&creator_account, vec![member_pubkey], config, None)
+                .await
+                .unwrap();
+
+            // Tear down subscriptions to simulate the welcome-processing
+            // cascade failure (group exists in MDK but not in group plane)
+            whitenoise
+                .relay_control
+                .deactivate_account_subscriptions(&creator_account.pubkey)
+                .await;
+
+            // Re-activate inbox only (without groups) to isolate the test
+            // to the group count parity check — inbox is healthy, groups are not
+            let signer = whitenoise.get_signer_for_account(&creator_account).unwrap();
+            let inbox_relays = crate::whitenoise::relays::Relay::urls(
+                &creator_account
+                    .effective_inbox_relays(&whitenoise)
+                    .await
+                    .unwrap(),
+            );
+            whitenoise
+                .relay_control
+                .activate_account_subscriptions(
+                    creator_account.pubkey,
+                    &inbox_relays,
+                    &[], // empty group specs — simulates the missing group
+                    creator_account.since_timestamp(10),
+                    signer,
+                )
+                .await
+                .unwrap();
+
+            let is_operational = whitenoise
+                .is_account_subscriptions_operational(&creator_account)
+                .await
+                .unwrap();
+            assert!(
+                !is_operational,
+                "Should detect mismatch: MDK has 1 group, plane has 0"
+            );
+
+            // Recovery via ensure should fix it
+            whitenoise
+                .ensure_account_subscriptions(&creator_account)
+                .await
+                .unwrap();
+
+            let is_operational = whitenoise
+                .is_account_subscriptions_operational(&creator_account)
+                .await
+                .unwrap();
+            assert!(
+                is_operational,
+                "Should be operational after ensure recovery"
             );
         }
 
@@ -2998,7 +3267,22 @@ mod tests {
     }
 
     mod subscription_tests {
+        use chrono::{DateTime, TimeDelta, Utc};
+        use nostr_sdk::Keys;
+
         use super::*;
+
+        fn make_account(user_id: i64, last_synced_at: Option<DateTime<Utc>>) -> Account {
+            Account {
+                id: None,
+                pubkey: Keys::generate().public_key(),
+                user_id,
+                account_type: AccountType::Local,
+                last_synced_at,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        }
 
         #[tokio::test]
         async fn test_refresh_all_global_subscriptions_no_account_returns_ok() {
@@ -3010,6 +3294,41 @@ mod tests {
                 result.is_ok(),
                 "refresh_all_global_subscriptions should succeed with no accounts"
             );
+        }
+
+        #[test]
+        fn test_compute_global_since_empty_accounts_returns_none() {
+            assert!(Whitenoise::compute_global_since_timestamp(&[]).is_none());
+        }
+
+        #[test]
+        fn test_compute_global_since_unsynced_account_returns_none() {
+            let accounts = vec![make_account(1, None)];
+            assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
+        }
+
+        #[test]
+        fn test_compute_global_since_all_synced_returns_min_with_buffer() {
+            let now = Utc::now();
+            let older = now - TimeDelta::seconds(200);
+            let newer = now - TimeDelta::seconds(100);
+
+            let accounts = vec![make_account(1, Some(older)), make_account(2, Some(newer))];
+
+            let ts = Whitenoise::compute_global_since_timestamp(&accounts).unwrap();
+            let expected = (older.timestamp().max(0) as u64)
+                .saturating_sub(Whitenoise::SUBSCRIPTION_BUFFER_SECS);
+            assert_eq!(ts.as_secs(), expected);
+        }
+
+        #[test]
+        fn test_compute_global_since_mixed_synced_unsynced_returns_none() {
+            let now = Utc::now();
+            let accounts = vec![
+                make_account(1, Some(now - TimeDelta::seconds(100))),
+                make_account(2, None),
+            ];
+            assert!(Whitenoise::compute_global_since_timestamp(&accounts).is_none());
         }
     }
 

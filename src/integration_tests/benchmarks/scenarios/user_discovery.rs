@@ -4,40 +4,46 @@ use async_trait::async_trait;
 use nostr_sdk::{EventBuilder, Keys, Metadata};
 
 use crate::WhitenoiseError;
-use crate::integration_tests::benchmarks::test_cases::FindOrCreateUserBenchmark;
+use crate::integration_tests::benchmarks::test_cases::{
+    UserResolutionBenchmark, UserResolutionOperation,
+};
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::ScenarioContext;
 use crate::integration_tests::core::test_clients::create_test_client;
-use crate::whitenoise::users::UserSyncMode;
 
 pub struct UserDiscoveryBenchmark {
-    sync_mode: UserSyncMode,
-    test_case: Option<FindOrCreateUserBenchmark>,
+    operation: UserResolutionOperation,
+    test_case: Option<UserResolutionBenchmark>,
 }
 
 impl UserDiscoveryBenchmark {
-    pub fn new(sync_mode: UserSyncMode) -> Self {
+    pub fn new(operation: UserResolutionOperation) -> Self {
         Self {
-            sync_mode,
+            operation,
             test_case: None,
         }
     }
 
-    pub fn with_blocking_mode() -> Self {
-        Self::new(UserSyncMode::Blocking)
+    pub fn for_get_or_create_local() -> Self {
+        Self::new(UserResolutionOperation::GetOrCreateLocal)
     }
 
-    pub fn with_background_mode() -> Self {
-        Self::new(UserSyncMode::Background)
+    pub fn for_resolve_user() -> Self {
+        Self::new(UserResolutionOperation::Resolve)
+    }
+
+    pub fn for_resolve_user_blocking() -> Self {
+        Self::new(UserResolutionOperation::ResolveBlocking)
     }
 }
 
 #[async_trait]
 impl BenchmarkScenario for UserDiscoveryBenchmark {
     fn name(&self) -> &str {
-        match self.sync_mode {
-            UserSyncMode::Blocking => "User Discovery - Blocking Mode",
-            UserSyncMode::Background => "User Discovery - Background Mode",
+        match self.operation {
+            UserResolutionOperation::GetOrCreateLocal => "User Resolution - Local Only",
+            UserResolutionOperation::Resolve => "User Resolution - resolve_user",
+            UserResolutionOperation::ResolveBlocking => "User Resolution - resolve_user_blocking",
         }
     }
 
@@ -86,8 +92,7 @@ impl BenchmarkScenario for UserDiscoveryBenchmark {
             num_users
         );
 
-        // Initialize test case with the pubkeys and sync mode
-        self.test_case = Some(FindOrCreateUserBenchmark::new(self.sync_mode, pubkeys));
+        self.test_case = Some(UserResolutionBenchmark::new(self.operation, pubkeys));
 
         Ok(())
     }

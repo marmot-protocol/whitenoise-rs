@@ -1,6 +1,8 @@
 use crate::integration_tests::benchmarks::scenarios::{
-    IdentityCreationBenchmark, LoginPerformanceBenchmark, MessageAggregationBenchmark,
-    MessagingPerformanceBenchmark, UserDiscoveryBenchmark, UserSearchBenchmark,
+    AddMembersPerformanceBenchmark, GroupCreationBenchmark, IdentityCreationBenchmark,
+    LoginMultistepPerformanceBenchmark, LoginPerformanceBenchmark, LoginStartPerformanceBenchmark,
+    MessageAggregationBenchmark, MessagingPerformanceBenchmark, UserDiscoveryBenchmark,
+    UserSearchBenchmark,
 };
 use crate::integration_tests::benchmarks::{BenchmarkResult, BenchmarkScenario};
 use crate::{Whitenoise, WhitenoiseError};
@@ -56,12 +58,17 @@ macro_rules! benchmark_registry {
 // BENCHMARK REGISTRY - Add new benchmarks here (one line each)
 // ============================================================================
 benchmark_registry! {
+    "add-members" => AddMembersPerformanceBenchmark::default(),
+    "group-creation" => GroupCreationBenchmark::default(),
     "identity-creation" => IdentityCreationBenchmark::default(),
     "login-performance" => LoginPerformanceBenchmark::default(),
+    "login-start" => LoginStartPerformanceBenchmark::default(),
+    "login-multistep" => LoginMultistepPerformanceBenchmark::default(),
     "messaging-performance" => MessagingPerformanceBenchmark::default(),
     "message-aggregation" => MessageAggregationBenchmark::default(),
-    "user-discovery-blocking" => UserDiscoveryBenchmark::with_blocking_mode(),
-    "user-discovery-background" => UserDiscoveryBenchmark::with_background_mode(),
+    "user-resolution-local" => UserDiscoveryBenchmark::for_get_or_create_local(),
+    "resolve-user" => UserDiscoveryBenchmark::for_resolve_user(),
+    "resolve-user-blocking" => UserDiscoveryBenchmark::for_resolve_user_blocking(),
     "user-search" => UserSearchBenchmark,
 }
 // ============================================================================
@@ -198,23 +205,34 @@ mod tests {
     #[test]
     fn test_parse_valid_scenario_names() {
         // Test all valid scenario names can be parsed and instantiated
+        assert!(parse_and_instantiate("add-members").is_ok());
+        assert!(parse_and_instantiate("group-creation").is_ok());
         assert!(parse_and_instantiate("identity-creation").is_ok());
         assert!(parse_and_instantiate("login-performance").is_ok());
+        assert!(parse_and_instantiate("login-start").is_ok());
+        assert!(parse_and_instantiate("login-multistep").is_ok());
         assert!(parse_and_instantiate("messaging-performance").is_ok());
         assert!(parse_and_instantiate("message-aggregation").is_ok());
-        assert!(parse_and_instantiate("user-discovery-blocking").is_ok());
-        assert!(parse_and_instantiate("user-discovery-background").is_ok());
+        assert!(parse_and_instantiate("user-resolution-local").is_ok());
+        assert!(parse_and_instantiate("resolve-user").is_ok());
+        assert!(parse_and_instantiate("resolve-user-blocking").is_ok());
         assert!(parse_and_instantiate("user-search").is_ok());
     }
 
     #[test]
     fn test_parse_case_insensitive() {
         // Test case insensitivity
+        assert!(parse_and_instantiate("ADD-MEMBERS").is_ok());
+        assert!(parse_and_instantiate("GROUP-CREATION").is_ok());
         assert!(parse_and_instantiate("IDENTITY-CREATION").is_ok());
         assert!(parse_and_instantiate("LOGIN-PERFORMANCE").is_ok());
+        assert!(parse_and_instantiate("LOGIN-START").is_ok());
+        assert!(parse_and_instantiate("LOGIN-MULTISTEP").is_ok());
         assert!(parse_and_instantiate("MESSAGING-PERFORMANCE").is_ok());
         assert!(parse_and_instantiate("Message-Aggregation").is_ok());
-        assert!(parse_and_instantiate("USER-DISCOVERY-BLOCKING").is_ok());
+        assert!(parse_and_instantiate("USER-RESOLUTION-LOCAL").is_ok());
+        assert!(parse_and_instantiate("RESOLVE-USER").is_ok());
+        assert!(parse_and_instantiate("RESOLVE-USER-BLOCKING").is_ok());
         assert!(parse_and_instantiate("USER-SEARCH").is_ok());
     }
 
@@ -234,13 +252,19 @@ mod tests {
     fn test_get_all_benchmark_names() {
         // Test that all benchmark names are returned
         let names = get_all_benchmark_names();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 12);
+        assert!(names.contains(&"add-members"));
+        assert!(names.contains(&"group-creation"));
         assert!(names.contains(&"identity-creation"));
         assert!(names.contains(&"login-performance"));
+        assert!(names.contains(&"login-start"));
+        assert!(names.contains(&"login-multistep"));
         assert!(names.contains(&"messaging-performance"));
         assert!(names.contains(&"message-aggregation"));
-        assert!(names.contains(&"user-discovery-blocking"));
-        assert!(names.contains(&"user-discovery-background"));
+        assert!(names.contains(&"user-resolution-local"));
+        assert!(names.contains(&"resolve-user"));
+        assert!(names.contains(&"resolve-user-blocking"));
+        assert!(names.contains(&"user-search"));
     }
 
     #[test]

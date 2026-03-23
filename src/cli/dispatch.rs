@@ -9,7 +9,7 @@ use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::relays::{Relay, RelayType};
-use crate::whitenoise::users::{KeyPackageStatus, UserSyncMode};
+use crate::whitenoise::users::KeyPackageStatus;
 
 use super::protocol::{Request, Response};
 
@@ -871,10 +871,7 @@ async fn find_account(
 
 #[perf_instrument("dispatch")]
 async fn resolve_display_name(wn: &Whitenoise, pubkey: &PublicKey) -> Option<String> {
-    let user = wn
-        .find_or_create_user_by_pubkey(pubkey, UserSyncMode::Blocking)
-        .await
-        .ok()?;
+    let user = wn.resolve_user_blocking(pubkey).await.ok()?;
     user.metadata
         .display_name
         .as_ref()
@@ -1470,7 +1467,7 @@ async fn relays_remove(
 async fn users_show(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Response> {
     let pk = parse_pubkey(pubkey_str)?;
     let user = wn
-        .find_or_create_user_by_pubkey(&pk, UserSyncMode::Blocking)
+        .resolve_user_blocking(&pk)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(to_response(&user))
@@ -2079,7 +2076,7 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
     let pubkey = parse_pubkey(pubkey_str)?;
     // Side effect: creates a local user record if not already present.
     let user = wn
-        .find_or_create_user_by_pubkey(&pubkey, UserSyncMode::Blocking)
+        .resolve_user_blocking(&pubkey)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     let status = user

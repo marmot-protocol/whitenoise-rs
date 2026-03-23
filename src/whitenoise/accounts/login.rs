@@ -10,6 +10,7 @@ use super::{
 };
 use crate::RelayType;
 use crate::perf_instrument;
+use crate::perf_span;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
@@ -202,6 +203,7 @@ impl Whitenoise {
     /// - [`Whitenoise::login_publish_default_relays`] -- publish default relay lists
     /// - [`Whitenoise::login_with_custom_relay`] -- search a user-provided relay
     /// - [`Whitenoise::login_cancel`] -- abort and clean up
+    #[perf_instrument("accounts")]
     pub async fn login_start(
         &self,
         nsec_or_hex_privkey: String,
@@ -214,6 +216,35 @@ impl Whitenoise {
             "Starting login for pubkey: {}",
             pubkey.to_hex()
         );
+
+        // If this account is already fully logged in, return it as-is.
+        // Re-running create_base_account_with_private_key would reset
+        // last_synced_at to NULL (poisoning compute_global_since_timestamp
+        // for all accounts), and re-running activate_account would create
+        // duplicate subscriptions and needlessly kill in-progress background
+        // tasks.
+        //
+        // Three conditions must hold to short-circuit:
+        // 1. Account row exists in the database.
+        // 2. No pending multi-step login is in progress (pending_logins).
+        // 3. An active session exists (background_task_cancellation is set
+        //    by activate_account). Without this check, a concurrent second
+        //    call could see the DB row created by a first call that hasn't
+        //    finished activation yet and return Complete prematurely.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
+            && !self.pending_logins.contains_key(&pubkey)
+            && self.background_task_cancellation.contains_key(&pubkey)
+        {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(LoginResult {
+                account: existing,
+                status: LoginStatus::Complete,
+            });
+        }
 
         let mut account = self
             .create_base_account_with_private_key(&keys)
@@ -275,6 +306,7 @@ impl Whitenoise {
     /// of the three relay list kinds (10002, 10050, 10051) were already found on the
     /// network.  Default relays are assigned and published **only for the missing
     /// ones**; existing lists are left untouched.
+    #[perf_instrument("accounts")]
     pub async fn login_publish_default_relays(
         &self,
         pubkey: &PublicKey,
@@ -313,35 +345,18 @@ impl Whitenoise {
             .relays_or(RelayType::Nip65, &default_relays)
             .to_vec();
 
-        // For each relay type: publish defaults only for the ones that were
-        // missing. Already-found lists were already persisted to the DB by
-        // try_discover_relay_lists in step 1, so no second write is needed.
+        // Persist missing relay lists to the local database, then publish
+        // them to the network concurrently. DB writes are fast (sub-ms) and
+        // use the same connection, so they run sequentially. The publishes
+        // are independent Nostr events (kinds 10002, 10050, 10051) targeting
+        // the same relay set, so they run concurrently — same pattern as
+        // setup_relays_for_existing_account.
+        let _publish_span = perf_span!("accounts::login_publish_defaults::publish_missing");
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             if !discovered.found(relay_type) {
-                // Missing — assign defaults in the DB and publish to the network.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
                     .map_err(LoginError::from)?;
-                if let Err(error) = self
-                    .publish_relay_list(
-                        &default_relays,
-                        relay_type,
-                        &publish_to_relays,
-                        keys.clone(),
-                    )
-                    .await
-                {
-                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
-                        return Err(LoginError::from(error));
-                    }
-
-                    tracing::warn!(
-                        target: "whitenoise::accounts",
-                        pubkey = %pubkey,
-                        ?relay_type,
-                        "Failed to publish default relay list to preserved NIP-65 relays; continuing login with local relay state: {error}"
-                    );
-                }
             } else {
                 tracing::debug!(
                     target: "whitenoise::accounts",
@@ -350,6 +365,68 @@ impl Whitenoise {
                 );
             }
         }
+
+        let nip65_publish = async {
+            if !discovered.found(RelayType::Nip65) {
+                self.publish_relay_list(
+                    &default_relays,
+                    RelayType::Nip65,
+                    &publish_to_relays,
+                    keys.clone(),
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if !discovered.found(RelayType::Inbox) {
+                self.publish_relay_list(
+                    &default_relays,
+                    RelayType::Inbox,
+                    &publish_to_relays,
+                    keys.clone(),
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if !discovered.found(RelayType::KeyPackage) {
+                self.publish_relay_list(
+                    &default_relays,
+                    RelayType::KeyPackage,
+                    &publish_to_relays,
+                    keys.clone(),
+                )
+                .await
+            } else {
+                Ok(())
+            }
+        };
+
+        let (nip65_result, inbox_result, kp_result) =
+            tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+
+        // NIP-65 publish failure is always fatal.
+        nip65_result.map_err(LoginError::from)?;
+
+        for (relay_type, result) in [
+            (RelayType::Inbox, inbox_result),
+            (RelayType::KeyPackage, kp_result),
+        ] {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    pubkey = %pubkey,
+                    ?relay_type,
+                    "Failed to publish default relay list to preserved NIP-65 relays; continuing login with local relay state: {error}"
+                );
+            }
+        }
+
+        drop(_publish_span);
 
         tracing::debug!(
             target: "whitenoise::accounts",
@@ -385,6 +462,7 @@ impl Whitenoise {
     /// If the merged stash is now complete the account is activated and
     /// [`LoginStatus::Complete`] is returned. Otherwise
     /// [`LoginStatus::NeedsRelayLists`] is returned so the caller can re-prompt.
+    #[perf_instrument("accounts")]
     pub async fn login_with_custom_relay(
         &self,
         pubkey: &PublicKey,
@@ -525,6 +603,7 @@ impl Whitenoise {
     ///
     /// Behaves like [`Whitenoise::login_start`] but takes a public key and a
     /// [`NostrSigner`] instead of a private key string.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_start<S>(
         &self,
         pubkey: PublicKey,
@@ -600,6 +679,7 @@ impl Whitenoise {
     /// of the three relay list kinds (10002, 10050, 10051) were already found on the
     /// network.  Default relays are assigned and published **only for the missing
     /// ones**; existing lists are left untouched.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_publish_default_relays(
         &self,
         pubkey: &PublicKey,
@@ -699,6 +779,7 @@ impl Whitenoise {
     }
 
     /// Step 2b for external signer: search a custom relay for existing relay lists.
+    #[perf_instrument("accounts")]
     pub async fn login_external_signer_with_custom_relay(
         &self,
         pubkey: &PublicKey,
@@ -1114,16 +1195,19 @@ impl Whitenoise {
     ///
     /// Callers should check [`DiscoveredRelayLists::is_complete`] to determine
     /// whether login can proceed or whether the user must provide relay lists.
+    #[perf_instrument("accounts")]
     async fn try_discover_relay_lists(
         &self,
         account: &mut Account,
         source_relays: &[Relay],
     ) -> core::result::Result<DiscoveredRelayLists, LoginError> {
         // Step 1: Fetch NIP-65 relay list (kind 10002) from the source relays.
+        let _fetch_nip65 = perf_span!("accounts::discover_relay_lists::fetch_nip65");
         let nip65_relays = self
             .fetch_existing_relays(account.pubkey, RelayType::Nip65, source_relays)
             .await
             .map_err(LoginError::from)?;
+        drop(_fetch_nip65);
 
         // Use the discovered NIP-65 relays as the source for 10050/10051 when
         // available; otherwise fall back to the original source relays so we
@@ -1134,6 +1218,7 @@ impl Whitenoise {
         };
 
         // Steps 2 & 3: Fetch Inbox (10050) and KeyPackage (10051) concurrently.
+        let _fetch_inbox_kp = perf_span!("accounts::discover_relay_lists::fetch_inbox_and_kp");
         let pubkey = account.pubkey;
         let (inbox_result, key_package_result) = tokio::join!(
             self.fetch_existing_relays(pubkey, RelayType::Inbox, &secondary_source),
@@ -1141,9 +1226,11 @@ impl Whitenoise {
         );
         let inbox_relays = inbox_result.map_err(LoginError::from)?;
         let key_package_relays = key_package_result.map_err(LoginError::from)?;
+        drop(_fetch_inbox_kp);
 
         // Persist the exact discovered network state, including empty results,
         // so stale relay rows are removed when a relay list no longer exists.
+        let _sync_span = perf_span!("accounts::discover_relay_lists::sync_to_db");
         self.sync_account_relays(
             account,
             nip65_relays.as_deref().unwrap_or(&[]),
@@ -1165,6 +1252,7 @@ impl Whitenoise {
         )
         .await
         .map_err(LoginError::from)?;
+        drop(_sync_span);
 
         Ok(DiscoveredRelayLists {
             nip65: nip65_relays,
@@ -1221,6 +1309,7 @@ impl Whitenoise {
     }
 
     /// Activate a local-key account after relay lists have been resolved.
+    #[perf_instrument("accounts")]
     async fn complete_login(
         &self,
         account: &Account,
@@ -1237,6 +1326,7 @@ impl Whitenoise {
     }
 
     /// Activate an external-signer account after relay lists have been resolved.
+    #[perf_instrument("accounts")]
     async fn complete_external_signer_login<S>(
         &self,
         account: &Account,
@@ -1398,49 +1488,73 @@ impl Whitenoise {
         let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
         let signer = std::sync::Arc::new(signer);
 
-        if relay_setup.should_publish_nip65 {
-            tracing::debug!(
-                target: "whitenoise::accounts",
-                "Publishing NIP-65 relay list (defaults)"
-            );
-            self.relay_control
-                .publish_relay_list_with_signer(
-                    &nip65_urls,
-                    RelayType::Nip65,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
-        }
+        // Publish all missing relay lists concurrently — each is an
+        // independent Nostr event targeting the same relay set.
+        let nip65_publish = async {
+            if relay_setup.should_publish_nip65 {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing NIP-65 relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &nip65_urls,
+                        RelayType::Nip65,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if relay_setup.should_publish_inbox {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing inbox relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &Relay::urls(&relay_setup.inbox_relays),
+                        RelayType::Inbox,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if relay_setup.should_publish_key_package {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing key package relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &Relay::urls(&relay_setup.key_package_relays),
+                        RelayType::KeyPackage,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
 
-        if relay_setup.should_publish_inbox {
-            tracing::debug!(
-                target: "whitenoise::accounts",
-                "Publishing inbox relay list (defaults)"
-            );
-            self.relay_control
-                .publish_relay_list_with_signer(
-                    &Relay::urls(&relay_setup.inbox_relays),
-                    RelayType::Inbox,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
-        }
-
-        if relay_setup.should_publish_key_package {
-            tracing::debug!(
-                target: "whitenoise::accounts",
-                "Publishing key package relay list (defaults)"
-            );
-            self.relay_control
-                .publish_relay_list_with_signer(
-                    &Relay::urls(&relay_setup.key_package_relays),
-                    RelayType::KeyPackage,
-                    &nip65_urls,
-                    signer.clone(),
-                )
-                .await?;
+        let (r1, r2, r3) = tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+        r1?;
+        for (relay_type, result) in [(RelayType::Inbox, r2), (RelayType::KeyPackage, r3)] {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    ?relay_type,
+                    "Failed to publish relay list with signer; continuing with local relay state: {error}"
+                );
+            }
         }
 
         Ok(())
@@ -1520,6 +1634,15 @@ impl Whitenoise {
 
         // Delete the account from the database
         account.delete(&self.database).await?;
+
+        // Sync discovery subscriptions with remaining accounts (tears down on last logout)
+        if let Err(e) = self.sync_discovery_subscriptions().await {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                account_pubkey = %pubkey,
+                "Failed to refresh discovery subscriptions after logout: {e}"
+            );
+        }
 
         // Remove the private key from the secret store
         // For local accounts this is required; for external accounts this is best-effort cleanup
@@ -2224,6 +2347,33 @@ mod tests {
         assert!(
             result.is_ok(),
             "Logout should succeed for external account without stored key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logout_syncs_discovery_subscriptions() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+
+        // After login, global discovery subscriptions should be active
+        assert!(
+            whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be operational after login"
+        );
+
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // After logging out the last account, discovery subscriptions should be torn down
+        assert!(
+            !whitenoise
+                .is_global_subscriptions_operational()
+                .await
+                .unwrap(),
+            "Global subscriptions should be torn down after last account logout"
         );
     }
 
@@ -3503,6 +3653,149 @@ mod tests {
         let err = LoginError::NoRelayConnections;
         let debug = format!("{:?}", err);
         assert!(debug.contains("NoRelayConnections"));
+    }
+
+    #[tokio::test]
+    async fn test_login_start_already_logged_in_returns_existing() {
+        // If the account is already fully logged in (e.g. via create_identity),
+        // login_start must return the existing account as Complete without
+        // re-creating it or resetting last_synced_at.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Create a fully activated account.
+        let keys = create_test_keys();
+        let original = whitenoise
+            .create_test_identity_with_keys(&keys)
+            .await
+            .unwrap();
+        let original_synced_at = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+            .await
+            .unwrap()
+            .last_synced_at;
+        assert!(
+            original_synced_at.is_some(),
+            "create_identity must set last_synced_at"
+        );
+
+        // Now call login_start with the same nsec — should short-circuit.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.status,
+            LoginStatus::Complete,
+            "Already-logged-in account should return Complete"
+        );
+        assert_eq!(
+            result.account.pubkey, original.pubkey,
+            "Should return the same account"
+        );
+        assert_eq!(
+            result.account.id, original.id,
+            "Should return the same account row, not a new one"
+        );
+
+        // Critical: last_synced_at must NOT have been reset to NULL.
+        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.last_synced_at, original_synced_at,
+            "login_start must not reset last_synced_at for an existing account"
+        );
+
+        // No pending login should have been stashed.
+        assert!(
+            !whitenoise.pending_logins.contains_key(&original.pubkey),
+            "Should not create a pending login for an already-active account"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_login_start_db_row_without_active_session_does_not_short_circuit() {
+        // If an account row exists in the DB but has no active session
+        // (e.g., a concurrent login_start created it but hasn't activated yet),
+        // login_start must NOT return Complete — it should proceed normally.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+
+        // Create the account row directly (simulating the race: first call
+        // created the DB row but hasn't activated yet).
+        whitenoise
+            .create_base_account_with_private_key(&keys)
+            .await
+            .unwrap();
+
+        // Verify: account in DB, no pending login, no cancellation channel.
+        assert!(
+            Account::find_by_pubkey(&pubkey, &whitenoise.database)
+                .await
+                .is_ok()
+        );
+        assert!(!whitenoise.pending_logins.contains_key(&pubkey));
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&pubkey)
+        );
+
+        // login_start should NOT short-circuit — no active session.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+
+        // Must have taken the relay-discovery path, not the short-circuit.
+        // In the mock environment (no relay servers), discovery finds nothing
+        // and returns NeedsRelayLists with a stashed pending login.
+        assert_eq!(
+            result.status,
+            LoginStatus::NeedsRelayLists,
+            "DB row without active session must not short-circuit to Complete"
+        );
+        assert!(
+            whitenoise.pending_logins.contains_key(&pubkey),
+            "Relay discovery path must stash a pending login"
+        );
+
+        let _ = whitenoise.login_cancel(&pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_login_start_partial_login_does_not_short_circuit() {
+        // If a previous login_start returned NeedsRelayLists (account in DB but
+        // pending_logins stash exists), a second login_start must NOT short-circuit
+        // — it should retry relay discovery.
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // First login_start — no relays published, so it returns NeedsRelayLists.
+        let result = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+        assert_eq!(result.status, LoginStatus::NeedsRelayLists);
+        assert!(whitenoise.pending_logins.contains_key(&pubkey));
+
+        // Second login_start — should NOT short-circuit because account is pending.
+        let result2 = whitenoise
+            .login_start(keys.secret_key().to_secret_hex())
+            .await
+            .unwrap();
+        assert_eq!(
+            result2.status,
+            LoginStatus::NeedsRelayLists,
+            "Partial login must retry discovery, not return Complete"
+        );
+
+        // Cleanup
+        let _ = whitenoise.login_cancel(&pubkey).await;
     }
 
     #[tokio::test]

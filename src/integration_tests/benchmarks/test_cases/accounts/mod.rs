@@ -1,5 +1,9 @@
 mod create_identity_benchmark;
 mod login_benchmark;
+mod login_multistep_benchmark;
+mod login_start_benchmark;
 
 pub use create_identity_benchmark::*;
 pub use login_benchmark::*;
+pub use login_multistep_benchmark::*;
+pub use login_start_benchmark::*;

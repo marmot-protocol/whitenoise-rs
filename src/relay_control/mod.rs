@@ -17,7 +17,8 @@ use std::{
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
-use tokio::sync::{RwLock, broadcast, mpsc::Sender};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
+use tokio::task::JoinHandle;
 
 pub(crate) mod account_inbox;
 pub(crate) mod discovery;
@@ -43,18 +44,37 @@ use crate::{
 /// inbox subscriptions already route through this boundary; remaining query
 /// and publish work still migrates incrementally.
 #[derive(Debug)]
+struct AccountInboxEntry {
+    plane: account_inbox::AccountInboxPlane,
+    telemetry_handle: JoinHandle<()>,
+}
+
+impl AccountInboxEntry {
+    async fn deactivate(self) {
+        self.telemetry_handle.abort();
+        self.plane.deactivate().await;
+    }
+
+    fn plane(&self) -> account_inbox::AccountInboxPlane {
+        self.plane.clone()
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct RelayControlPlane {
     database: Arc<Database>,
     event_sender: Sender<ProcessableEvent>,
     session_salt: [u8; 16],
     discovery: discovery::DiscoveryPlane,
-    account_inbox_planes: RwLock<HashMap<PublicKey, account_inbox::AccountInboxPlane>>,
+    account_inbox_planes: RwLock<HashMap<PublicKey, AccountInboxEntry>>,
+    account_inbox_activation_locks: Mutex<HashMap<PublicKey, Arc<Mutex<()>>>>,
     group_plane: groups::GroupPlane,
     ephemeral: ephemeral::EphemeralPlane,
     #[allow(dead_code)]
     router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
+    telemetry_handles: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl RelayControlPlane {
@@ -87,11 +107,13 @@ impl RelayControlPlane {
             session_salt,
             discovery,
             account_inbox_planes: RwLock::new(HashMap::new()),
+            account_inbox_activation_locks: Mutex::new(HashMap::new()),
             group_plane,
             ephemeral,
             router: router::RelayRouter::default(),
             observability,
             telemetry_persistors_started: AtomicBool::new(false),
+            telemetry_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,8 +127,19 @@ impl RelayControlPlane {
             return;
         }
 
-        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry());
-        self.spawn_telemetry_persistor("group", self.group_plane.telemetry());
+        self.spawn_telemetry_persistor("discovery", self.discovery.telemetry())
+            .await;
+        self.spawn_telemetry_persistor("group", self.group_plane.telemetry())
+            .await;
+    }
+
+    async fn account_inbox_activation_lock(&self, account_pubkey: PublicKey) -> Arc<Mutex<()>> {
+        self.account_inbox_activation_locks
+            .lock()
+            .await
+            .entry(account_pubkey)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Access to the shared application database for later relay-control phases.
@@ -152,13 +185,26 @@ impl RelayControlPlane {
         &self.session_salt
     }
 
-    /// Spawn a fire-and-forget telemetry writer that exits when the telemetry
-    /// sender for the subscribed plane is dropped and the broadcast channel closes.
-    fn spawn_telemetry_persistor(
+    /// Spawn a telemetry writer, aborting any previous task registered under
+    /// the same name so that re-activation does not leak persistor tasks.
+    async fn spawn_telemetry_persistor(
+        &self,
+        task_name: &str,
+        receiver: broadcast::Receiver<observability::RelayTelemetry>,
+    ) {
+        let handle = self.spawn_telemetry_persistor_task(task_name, receiver);
+        let task_key = task_name.to_string();
+
+        if let Some(previous) = self.telemetry_handles.lock().await.insert(task_key, handle) {
+            previous.abort();
+        }
+    }
+
+    fn spawn_telemetry_persistor_task(
         &self,
         task_name: &str,
         mut receiver: broadcast::Receiver<observability::RelayTelemetry>,
-    ) {
+    ) -> JoinHandle<()> {
         let database = self.database.clone();
         let observability = self.observability.clone();
         let task_name = task_name.to_string();
@@ -201,7 +247,15 @@ impl RelayControlPlane {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
+        })
+    }
+
+    async fn abort_control_plane_telemetry_persistors(&self) {
+        for (_, handle) in self.telemetry_handles.lock().await.drain() {
+            handle.abort();
+        }
+        self.telemetry_persistors_started
+            .store(false, Ordering::Release);
     }
 
     fn should_persist_telemetry(telemetry: &observability::RelayTelemetry) -> bool {
@@ -251,6 +305,8 @@ impl RelayControlPlane {
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<()> {
+        let account_lock = self.account_inbox_activation_lock(account_pubkey).await;
+        let _account_guard = account_lock.lock().await;
         let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
 
         self.group_plane
@@ -286,22 +342,31 @@ impl RelayControlPlane {
         }
 
         let telemetry_receiver = plane.telemetry();
-
-        if let Some(previous_plane) = self
-            .account_inbox_planes
-            .write()
-            .await
-            .insert(account_pubkey, plane)
-        {
-            previous_plane.deactivate().await;
-        }
-
-        self.spawn_telemetry_persistor(
+        let telemetry_handle = self.spawn_telemetry_persistor_task(
             &format!("account_inbox:{}", account_pubkey.to_hex()),
             telemetry_receiver,
         );
 
+        let previous_entry = {
+            let mut map = self.account_inbox_planes.write().await;
+            map.insert(
+                account_pubkey,
+                AccountInboxEntry {
+                    plane,
+                    telemetry_handle,
+                },
+            )
+        };
+        if let Some(previous_entry) = previous_entry {
+            previous_entry.deactivate().await;
+        }
+
         Ok(())
+    }
+
+    /// Returns the number of groups in the group plane for an account.
+    pub(crate) async fn group_plane_account_group_count(&self, pubkey: &PublicKey) -> usize {
+        self.group_plane.account_group_count(pubkey).await
     }
 
     #[perf_instrument("relay")]
@@ -318,13 +383,15 @@ impl RelayControlPlane {
 
     #[perf_instrument("relay")]
     pub(crate) async fn deactivate_account_subscriptions(&self, account_pubkey: &PublicKey) {
-        if let Some(plane) = self
-            .account_inbox_planes
-            .write()
-            .await
-            .remove(account_pubkey)
-        {
-            plane.deactivate().await;
+        let account_lock = self.account_inbox_activation_lock(*account_pubkey).await;
+        let _account_guard = account_lock.lock().await;
+
+        let entry = {
+            let mut map = self.account_inbox_planes.write().await;
+            map.remove(account_pubkey)
+        };
+        if let Some(entry) = entry {
+            entry.deactivate().await;
         }
 
         self.group_plane.remove_account(account_pubkey).await;
@@ -334,16 +401,26 @@ impl RelayControlPlane {
     /// Deactivates all account subscriptions. Called during full data teardown.
     #[perf_instrument("relay")]
     pub(crate) async fn shutdown_all(&self) {
-        let pubkeys: Vec<_> = self
+        let planes: Vec<_> = self
             .account_inbox_planes
-            .read()
+            .write()
             .await
-            .keys()
-            .cloned()
+            .drain()
+            .map(|(_, entry)| entry)
             .collect();
-        for pubkey in pubkeys {
-            self.deactivate_account_subscriptions(&pubkey).await;
+
+        for entry in planes {
+            entry.deactivate().await;
         }
+
+        self.abort_control_plane_telemetry_persistors().await;
+
+        // Reset group and ephemeral planes independently to ensure any
+        // orphaned entries (e.g. from partial activation failures) are
+        // cleaned up, not just accounts that had inbox planes.
+        self.group_plane.reset().await;
+        self.ephemeral.remove_all_scopes().await;
+        self.account_inbox_activation_locks.lock().await.clear();
     }
 
     #[perf_instrument("relay")]
@@ -357,7 +434,7 @@ impl RelayControlPlane {
                 .read()
                 .await
                 .get(account_pubkey)
-                .cloned();
+                .map(AccountInboxEntry::plane);
             match plane {
                 Some(plane) => plane.has_connected_relay().await,
                 None => false,
@@ -549,7 +626,7 @@ impl RelayControlPlane {
             .read()
             .await
             .iter()
-            .map(|(pubkey, plane)| (*pubkey, plane.clone()))
+            .map(|(pubkey, entry)| (*pubkey, entry.plane()))
             .collect::<Vec<_>>();
 
         let mut account_snapshots = Vec::with_capacity(inbox_planes.len());
@@ -580,15 +657,17 @@ impl RelayControlPlane {
             .write()
             .await
             .drain()
-            .map(|(_, plane)| plane)
+            .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
 
-        for plane in inbox_planes {
-            plane.deactivate().await;
+        for entry in inbox_planes {
+            entry.deactivate().await;
         }
 
+        self.abort_control_plane_telemetry_persistors().await;
         self.group_plane.reset().await;
-        self.ephemeral.remove_all_account_scopes().await;
+        self.ephemeral.remove_all_scopes().await;
+        self.account_inbox_activation_locks.lock().await.clear();
         Ok(())
     }
 }
@@ -725,7 +804,9 @@ mod tests {
         let relay_control =
             RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
         let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
-        relay_control.spawn_telemetry_persistor("test", telemetry_receiver);
+        relay_control
+            .spawn_telemetry_persistor("test", telemetry_receiver)
+            .await;
 
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
         let telemetry = RelayTelemetry::new(
@@ -771,7 +852,9 @@ mod tests {
         .with_subscription_id("account-sub-1");
 
         let (account_sender, account_receiver) = broadcast::channel(8);
-        relay_control.spawn_telemetry_persistor("test-account", account_receiver);
+        relay_control
+            .spawn_telemetry_persistor("test-account", account_receiver)
+            .await;
         account_sender.send(account_telemetry).unwrap();
         account_sender
             .send(
@@ -846,5 +929,128 @@ mod tests {
         assert_eq!(snapshot.ephemeral.account_scope_count, 0);
         assert!(snapshot.ephemeral.anonymous.is_none());
         assert!(snapshot.ephemeral.accounts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_telemetry_persistor_replaces_same_key() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control =
+            RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (sender1, receiver1) = broadcast::channel(8);
+        let (sender2, receiver2) = broadcast::channel(8);
+
+        relay_control
+            .spawn_telemetry_persistor("same-key", receiver1)
+            .await;
+        relay_control
+            .spawn_telemetry_persistor("same-key", receiver2)
+            .await;
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if sender1.receiver_count() == 0 && sender2.receiver_count() == 1 {
+                    break;
+                }
+
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sender2
+            .send(
+                RelayTelemetry::new(
+                    RelayTelemetryKind::SubscriptionSuccess,
+                    RelayPlane::Discovery,
+                    relay_url.clone(),
+                )
+                .with_occurred_at(Utc::now())
+                .with_subscription_id("same-key-sub"),
+            )
+            .unwrap();
+        drop(sender2);
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let status =
+                    RelayStatusRecord::find(&relay_url, RelayPlane::Discovery, None, &database)
+                        .await
+                        .unwrap();
+
+                if let Some(s) = status
+                    && s.success_count == 1
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(sender1);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_all_clears_all_ephemeral_scopes() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+        let anonymous_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+        let account_relay = RelayUrl::parse("ws://127.0.0.1:2").unwrap();
+        let account_pubkey = nostr_sdk::Keys::generate().public_key();
+
+        let _ = relay_control
+            .warm_ephemeral_relays(std::slice::from_ref(&anonymous_relay))
+            .await;
+        let _ = relay_control
+            .warm_ephemeral_relays_for_account(account_pubkey, std::slice::from_ref(&account_relay))
+            .await;
+
+        let before = relay_control.snapshot().await;
+        assert!(before.ephemeral.anonymous.is_some());
+        assert_eq!(before.ephemeral.account_scope_count, 1);
+
+        relay_control.shutdown_all().await;
+
+        let after = relay_control.snapshot().await;
+        assert!(after.ephemeral.anonymous.is_none());
+        assert_eq!(after.ephemeral.account_scope_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_all_resets_telemetry_persistor_start_gate() {
+        let database = Arc::new(setup_test_db().await);
+        let (event_sender, _) = tokio::sync::mpsc::channel(8);
+        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+
+        relay_control.start_telemetry_persistors().await;
+        assert!(
+            relay_control
+                .telemetry_persistors_started
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(relay_control.telemetry_handles.lock().await.len(), 2);
+
+        relay_control.shutdown_all().await;
+
+        assert!(
+            !relay_control
+                .telemetry_persistors_started
+                .load(Ordering::Acquire)
+        );
+        assert!(relay_control.telemetry_handles.lock().await.is_empty());
+
+        relay_control.start_telemetry_persistors().await;
+        assert!(
+            relay_control
+                .telemetry_persistors_started
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(relay_control.telemetry_handles.lock().await.len(), 2);
     }
 }
