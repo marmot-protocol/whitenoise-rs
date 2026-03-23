@@ -1,10 +1,10 @@
 use std::time::Duration as StdDuration;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-tests"))]
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-tests"))]
 use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -43,7 +43,7 @@ enum UserResolutionMode {
     BlockingIfUnknown,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-tests"))]
 static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -400,7 +400,7 @@ impl Whitenoise {
             return Ok(());
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "integration-tests"))]
         {
             let pubkey_hex = pubkey.to_hex();
             USER_RESOLUTION_RUN_COUNTS
@@ -500,6 +500,19 @@ impl Whitenoise {
 
         Ok(())
     }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn reset_user_resolution_run_count_for_testing(&self, pubkey: &PublicKey) {
+        USER_RESOLUTION_RUN_COUNTS.remove(&pubkey.to_hex());
+    }
+
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub(crate) fn user_resolution_run_count_for_testing(&self, pubkey: &PublicKey) -> usize {
+        USER_RESOLUTION_RUN_COUNTS
+            .get(&pubkey.to_hex())
+            .map(|count| *count)
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -524,17 +537,6 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         client.disconnect().await;
-    }
-
-    fn reset_user_resolution_run_count(pubkey: &PublicKey) {
-        USER_RESOLUTION_RUN_COUNTS.remove(&pubkey.to_hex());
-    }
-
-    fn user_resolution_run_count(pubkey: &PublicKey) -> usize {
-        USER_RESOLUTION_RUN_COUNTS
-            .get(&pubkey.to_hex())
-            .map(|count| *count)
-            .unwrap_or(0)
     }
 
     async fn watched_user_count(whitenoise: &Whitenoise) -> usize {
@@ -790,7 +792,7 @@ mod tests {
 
         whitenoise.get_or_create_user_local(&pubkey).await.unwrap();
 
-        reset_user_resolution_run_count(&pubkey);
+        whitenoise.reset_user_resolution_run_count_for_testing(&pubkey);
 
         let (first, second) = tokio::join!(
             whitenoise.resolve_user(&pubkey),
@@ -813,7 +815,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(user_resolution_run_count(&pubkey), 1);
+        assert_eq!(whitenoise.user_resolution_run_count_for_testing(&pubkey), 1);
     }
 
     #[tokio::test]
@@ -828,7 +830,7 @@ mod tests {
             .await
             .unwrap();
 
-        reset_user_resolution_run_count(&keys.public_key());
+        whitenoise.reset_user_resolution_run_count_for_testing(&keys.public_key());
 
         let (first, second) = tokio::join!(
             whitenoise.resolve_unknown_user_blocking_if_needed(keys.public_key()),
@@ -843,7 +845,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(user.metadata.name, metadata.name);
-        assert_eq!(user_resolution_run_count(&keys.public_key()), 1);
+        assert_eq!(
+            whitenoise.user_resolution_run_count_for_testing(&keys.public_key()),
+            1
+        );
     }
 
     #[tokio::test]
@@ -861,7 +866,7 @@ mod tests {
         user.mark_metadata_known_now();
         let saved_user = user.save(&whitenoise.database).await.unwrap();
 
-        reset_user_resolution_run_count(&test_pubkey);
+        whitenoise.reset_user_resolution_run_count_for_testing(&test_pubkey);
 
         let returned_user = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -872,7 +877,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(returned_user, saved_user);
-        assert_eq!(user_resolution_run_count(&test_pubkey), 0);
+        assert_eq!(
+            whitenoise.user_resolution_run_count_for_testing(&test_pubkey),
+            0
+        );
     }
 
     #[tokio::test]
@@ -882,7 +890,7 @@ mod tests {
         let metadata = Metadata::new().name("Blocking User");
         publish_metadata_to_discovery(&keys, &metadata).await;
 
-        reset_user_resolution_run_count(&keys.public_key());
+        whitenoise.reset_user_resolution_run_count_for_testing(&keys.public_key());
 
         let user = whitenoise
             .resolve_user_blocking(&keys.public_key())
@@ -892,7 +900,10 @@ mod tests {
         assert_eq!(user.pubkey, keys.public_key());
         assert_eq!(user.metadata.name, metadata.name);
         assert!(user.metadata_is_known());
-        assert_eq!(user_resolution_run_count(&keys.public_key()), 1);
+        assert_eq!(
+            whitenoise.user_resolution_run_count_for_testing(&keys.public_key()),
+            1
+        );
     }
 
     #[tokio::test]

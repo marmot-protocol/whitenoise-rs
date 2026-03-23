@@ -43,7 +43,7 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
             test_pubkey
         );
 
-        let account = context.whitenoise.create_identity().await?;
+        context.whitenoise.create_identity().await?;
 
         let client = create_test_client(&context.dev_relays, self.test_keys.clone()).await?;
 
@@ -81,11 +81,9 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
         .await?;
         assert!(initial_user.metadata_is_known());
 
-        // Remove the temporary account before publishing the newer event so
-        // the long-lived discovery subscription cannot update local state via
-        // the normal event-processing path while we are testing the explicit
-        // blocking-resolution contract.
-        context.whitenoise.logout(&account.pubkey).await?;
+        context
+            .whitenoise
+            .reset_user_resolution_run_count_for_testing(&test_pubkey);
 
         let newer_timestamp = Timestamp::from(Timestamp::now().as_secs() + 60);
         let newer_event_id = *client
@@ -107,14 +105,19 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
             .whitenoise
             .resolve_user_blocking(&test_pubkey)
             .await?;
-        let stored_user = context.whitenoise.find_user_by_pubkey(&test_pubkey).await?;
 
-        assert_eq!(user_after.metadata.name, self.initial_metadata.name);
-        assert_eq!(stored_user.metadata.name, self.initial_metadata.name);
+        assert!(user_after.metadata_is_known());
+        assert_eq!(
+            context
+                .whitenoise
+                .user_resolution_run_count_for_testing(&test_pubkey),
+            0,
+            "Known metadata should not trigger a second targeted discovery run"
+        );
 
         tracing::info!(
             target: LOG_TARGET,
-            "✓ Known metadata was returned locally without a forced refresh"
+            "✓ Known metadata skipped targeted discovery on the second blocking resolution"
         );
 
         Ok(())
