@@ -1606,8 +1606,20 @@ pub mod test_utils {
     }
 
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
-        // Initialize whitenoise for this specific test
-        let (config, _data_temp, _logs_temp) = create_test_config();
+        static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+
+        // Singleton-backed tests can spawn background tasks that outlive the
+        // helper call, so the temp dirs backing the singleton config must stay
+        // alive for the rest of the process.
+        let config = TEST_SINGLETON_CONFIG
+            .get_or_init(|| {
+                let (config, data_temp, logs_temp) = create_test_config();
+                std::mem::forget(data_temp);
+                std::mem::forget(logs_temp);
+                config
+            })
+            .clone();
+
         Whitenoise::initialize_whitenoise(config).await.unwrap();
         Whitenoise::get_instance().unwrap()
     }
