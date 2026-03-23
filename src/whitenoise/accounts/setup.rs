@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use dashmap::mapref::entry::Entry;
 use mdk_core::prelude::group_types::GroupState;
 use nostr_sdk::prelude::*;
 use tokio::sync::watch;
@@ -16,6 +17,21 @@ use crate::whitenoise::{Whitenoise, WhitenoiseError};
 use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
+    fn ensure_background_task_cancellation_channel(&self, account_pubkey: PublicKey) {
+        match self.background_task_cancellation.entry(account_pubkey) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                let (cancel_tx, _) = watch::channel(false);
+                entry.insert(cancel_tx);
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %account_pubkey,
+                    "Created missing background-task cancellation channel during subscription setup",
+                );
+            }
+        }
+    }
+
     #[perf_instrument("accounts")]
     pub(super) async fn create_base_account_with_private_key(
         &self,
@@ -805,6 +821,11 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
+        // Restored accounts rebuild relay subscriptions at startup without
+        // going through activate_account(), but later group-plane refreshes
+        // depend on this runtime-only channel being present.
+        self.ensure_background_task_cancellation_channel(account.pubkey);
+
         tracing::debug!(
             target: "whitenoise::accounts",
             "Setting up subscriptions for account: {:?}",
@@ -982,6 +1003,14 @@ mod tests {
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
 
+    async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
+        whitenoise.background_task_cancellation.clear();
+        whitenoise.external_signers.clear();
+        whitenoise.pending_logins.clear();
+        whitenoise.reset_nostr_client().await.unwrap();
+        whitenoise.wipe_database().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_active_group_count_no_groups() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -1084,6 +1113,67 @@ mod tests {
             spec.group_id,
             hex::encode(group.nostr_group_id),
             "Group ID should match the created group"
+        );
+    }
+
+    /// Reproduces the startup-restore regression behind "new group replies only
+    /// appear after restart":
+    /// 1. runtime-only state is lost (as after app relaunch),
+    /// 2. startup rebuilds subscriptions from persisted accounts,
+    /// 3. creating a new group must still add that group to the creator's live group plane.
+    #[tokio::test]
+    async fn test_create_group_after_startup_restore_refreshes_creator_group_plane() {
+        let whitenoise = test_get_whitenoise().await;
+        reset_singleton_whitenoise_for_test(whitenoise).await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&member_account]).await;
+
+        // Simulate app restart: runtime-only background-task channels are gone,
+        // then startup restores relay subscriptions from persisted accounts.
+        whitenoise.background_task_cancellation.clear();
+        whitenoise.reset_nostr_client().await.unwrap();
+        Whitenoise::setup_accounts_subscriptions(whitenoise)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            whitenoise
+                .relay_control
+                .group_plane_account_group_count(&creator_account.pubkey)
+                .await,
+            0,
+            "creator should start the restored session with no groups in the plane"
+        );
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+        assert_eq!(
+            whitenoise.active_group_count(&creator_account).unwrap(),
+            1,
+            "creator should have one active group in MDK after create_group"
+        );
+        assert_eq!(
+            whitenoise
+                .relay_control
+                .group_plane_account_group_count(&creator_account.pubkey)
+                .await,
+            1,
+            "creator's live group plane should include the newly created group after startup restore"
+        );
+        assert!(
+            whitenoise
+                .is_account_subscriptions_operational(&creator_account)
+                .await
+                .unwrap(),
+            "creator subscriptions should remain operational after creating a group in a restored session"
         );
     }
 
