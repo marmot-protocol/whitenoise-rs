@@ -6696,7 +6696,12 @@ mod tests {
             .unwrap();
 
         // Verify credentials exist
-        assert!(whitenoise.secrets_store.get_nip46_credentials(&pubkey).is_ok());
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nip46_credentials(&pubkey)
+                .is_ok()
+        );
 
         // Logout should clean up credentials
         whitenoise.logout(&account.pubkey).await.unwrap();
@@ -7007,7 +7012,10 @@ mod tests {
             msg.contains(&pk1.to_hex()),
             "Error should contain expected pubkey"
         );
-        assert!(msg.contains(&pk2.to_hex()), "Error should contain got pubkey");
+        assert!(
+            msg.contains(&pk2.to_hex()),
+            "Error should contain got pubkey"
+        );
         assert!(msg.contains("mismatch"), "Error should mention mismatch");
     }
 }

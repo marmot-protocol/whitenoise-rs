@@ -8,16 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::perf_instrument;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum GroupType {
+    #[default]
     Group,
     DirectMessage,
-}
-
-impl Default for GroupType {
-    fn default() -> Self {
-        Self::Group
-    }
 }
 
 impl fmt::Display for GroupType {

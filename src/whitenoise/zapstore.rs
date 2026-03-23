@@ -237,7 +237,7 @@ mod tests {
             "30063:75d737c3472471029c44876b330d2284288a42779b591a2ed4daa1c6c07efaf7:org.parres.whitenoise@2026.1.0",
         ]);
         // Simulate what extract_version_from_app_event does over a tag list.
-        let tags = vec![tag1, tag2];
+        let tags = [tag1, tag2];
         let result = tags
             .iter()
             .find_map(|t| extract_version_from_a_tag(t, prefix));

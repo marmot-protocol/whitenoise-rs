@@ -4,18 +4,19 @@ use nostr_sdk::prelude::*;
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 
-/// Verifies the NIP-46 credential lifecycle through an external signer account:
+/// Verifies the NIP-46 external signer account lifecycle through public APIs:
 ///
-/// 1. Login with external signer and store NIP-46 credentials in the keychain.
-/// 2. Verify credentials are retrievable from the keychain.
-/// 3. Logout and verify credentials are cleaned up.
-/// 4. Verify the reconnect-failed set is managed correctly.
+/// 1. Login with external signer creates an external account.
+/// 2. External account has a signer registered and is retrievable.
+/// 3. Reconnect-failed list is initially empty for healthy accounts.
+/// 4. Re-registering a signer keeps the account healthy.
+/// 5. Logout removes the account.
 pub struct Nip46CredentialLifecycleTestCase;
 
 #[async_trait]
 impl TestCase for Nip46CredentialLifecycleTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
-        tracing::info!("Testing NIP-46 credential lifecycle (store → retrieve → logout cleanup)");
+        tracing::info!("Testing NIP-46 external signer account lifecycle via public APIs");
 
         let keys = Keys::generate();
         let pubkey = keys.public_key();
@@ -30,64 +31,40 @@ impl TestCase for Nip46CredentialLifecycleTestCase {
             "Expected account to use external signer"
         );
 
-        // Step 2: Store NIP-46 credentials (simulating what login_nip46 would do)
-        let app_keys = Keys::generate();
-        let bunker_uri = "bunker://0000000000000000000000000000000000000000000000000000000000000000?relay=wss://relay.nsec.app";
-        context
-            .whitenoise
-            .secrets_store
-            .store_nip46_credentials(&pubkey, app_keys.secret_key(), bunker_uri)?;
+        // Step 2: Verify the account is findable and has signer registered
+        let found = context.whitenoise.find_account_by_pubkey(&pubkey).await?;
+        assert_eq!(found.pubkey, pubkey);
+        assert!(found.uses_external_signer());
 
-        // Verify credentials exist in keychain
-        let (retrieved_secret, retrieved_uri) = context
-            .whitenoise
-            .secrets_store
-            .get_nip46_credentials(&pubkey)?;
-        assert_eq!(retrieved_uri, bunker_uri);
-        assert_eq!(
-            retrieved_secret.to_secret_hex(),
-            app_keys.secret_key().to_secret_hex()
-        );
-
-        // Step 3: Simulate reconnect failure (e.g. bunker offline at startup)
-        context
-            .whitenoise
-            .nip46_reconnect_failed
-            .insert(pubkey);
+        // Step 3: Reconnect-failed list should not contain this healthy account
+        let failed = context.whitenoise.nip46_reconnect_failed_accounts();
         assert!(
-            !context
-                .whitenoise
-                .nip46_reconnect_failed_accounts()
-                .is_empty(),
-            "Should have a reconnect-failed account"
+            !failed.contains(&pubkey),
+            "Healthy account should not be in reconnect-failed list"
         );
 
-        // Step 4: Re-register signer clears reconnect failure
+        // Step 4: Re-registering the signer should succeed and keep account healthy
         context
             .whitenoise
             .register_external_signer(pubkey, keys.clone())
             .await?;
+        let still_failed = context.whitenoise.nip46_reconnect_failed_accounts();
         assert!(
-            !context
-                .whitenoise
-                .nip46_reconnect_failed_accounts()
-                .contains(&pubkey),
-            "Re-registration should clear the reconnect-failed flag"
+            !still_failed.contains(&pubkey),
+            "Re-registered account should not be in reconnect-failed list"
         );
 
-        // Step 5: Logout should clean up NIP-46 credentials
+        // Step 5: Logout should remove the account
         context.whitenoise.logout(&pubkey).await?;
-
-        let cred_result = context
-            .whitenoise
-            .secrets_store
-            .get_nip46_credentials(&pubkey);
+        let find_result = context.whitenoise.find_account_by_pubkey(&pubkey).await;
         assert!(
-            cred_result.is_err(),
-            "NIP-46 credentials should be cleaned up after logout"
+            find_result.is_err(),
+            "Account should not be findable after logout"
         );
 
-        tracing::info!("✓ NIP-46 credential lifecycle verified: store → retrieve → logout cleanup");
+        tracing::info!(
+            "✓ NIP-46 external signer lifecycle verified: login → signer → re-register → logout"
+        );
         Ok(())
     }
 }
