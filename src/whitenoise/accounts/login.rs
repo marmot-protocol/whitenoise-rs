@@ -6,20 +6,6 @@ use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::error::Result;
 
-// Items used only in tests but kept at module scope so `use super::*` in the
-// test module picks them up correctly.
-#[cfg(test)]
-use super::{
-    AccountType, DiscoveredRelayLists, ExternalSignerRelaySetup, LoginError, LoginResult,
-    LoginStatus,
-};
-#[cfg(test)]
-use crate::RelayType;
-#[cfg(test)]
-use crate::whitenoise::WhitenoiseError;
-#[cfg(test)]
-use crate::whitenoise::relays::Relay;
-
 impl Whitenoise {
     /// Creates a new identity (account) for the user.
     ///
@@ -297,9 +283,16 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeDelta, Utc};
+    use nostr_sdk::prelude::*;
 
-    use super::*;
-    use crate::whitenoise::accounts::Account;
+    use crate::RelayType;
+    use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::WhitenoiseError;
+    use crate::whitenoise::accounts::{
+        Account, AccountType, DiscoveredRelayLists, ExternalSignerRelaySetup, LoginError,
+        LoginResult, LoginStatus,
+    };
+    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
     #[tokio::test]

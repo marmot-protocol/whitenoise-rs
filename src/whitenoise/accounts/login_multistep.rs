@@ -433,7 +433,7 @@ impl Whitenoise {
     /// Callers should check [`DiscoveredRelayLists::is_complete`] to determine
     /// whether login can proceed or whether the user must provide relay lists.
     #[perf_instrument("accounts")]
-    pub(crate) async fn try_discover_relay_lists(
+    pub(super) async fn try_discover_relay_lists(
         &self,
         account: &mut Account,
         source_relays: &[Relay],
@@ -501,7 +501,7 @@ impl Whitenoise {
     /// Merge newly-discovered relay lists into the pending-login stash and
     /// return a snapshot.  The DashMap lock is released before returning so
     /// the caller is free to do async work with the result.
-    pub(crate) fn merge_into_stash(
+    pub(super) fn merge_into_stash(
         &self,
         pubkey: &PublicKey,
         discovered: DiscoveredRelayLists,
@@ -516,7 +516,7 @@ impl Whitenoise {
         Ok(snapshot)
     }
 
-    pub(crate) async fn sync_discovered_relay_lists(
+    pub(super) async fn sync_discovered_relay_lists(
         &self,
         account: &Account,
         discovered: &DiscoveredRelayLists,
@@ -547,7 +547,7 @@ impl Whitenoise {
 
     /// Activate a local-key account after relay lists have been resolved.
     #[perf_instrument("accounts")]
-    pub(crate) async fn complete_login(
+    pub(super) async fn complete_login(
         &self,
         account: &Account,
         inbox_relays: &[Relay],
@@ -562,87 +562,4 @@ impl Whitenoise {
             .map_err(LoginError::from)
     }
 
-    /// Publishes relay lists using an external signer based on the relay setup configuration.
-    ///
-    /// Publishes NIP-65, inbox, and key package relay lists only if they need to be
-    /// published (i.e., using defaults rather than existing user-configured lists).
-    pub(crate) async fn publish_relay_lists_with_signer(
-        &self,
-        relay_setup: &super::ExternalSignerRelaySetup,
-        signer: impl NostrSigner + 'static,
-    ) -> crate::whitenoise::error::Result<()> {
-        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
-        let signer = std::sync::Arc::new(signer);
-
-        // Publish all missing relay lists concurrently — each is an
-        // independent Nostr event targeting the same relay set.
-        let nip65_publish = async {
-            if relay_setup.should_publish_nip65 {
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    "Publishing NIP-65 relay list (defaults)"
-                );
-                self.relay_control
-                    .publish_relay_list_with_signer(
-                        &nip65_urls,
-                        RelayType::Nip65,
-                        &nip65_urls,
-                        signer.clone(),
-                    )
-                    .await
-            } else {
-                Ok(())
-            }
-        };
-        let inbox_publish = async {
-            if relay_setup.should_publish_inbox {
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    "Publishing inbox relay list (defaults)"
-                );
-                self.relay_control
-                    .publish_relay_list_with_signer(
-                        &Relay::urls(&relay_setup.inbox_relays),
-                        RelayType::Inbox,
-                        &nip65_urls,
-                        signer.clone(),
-                    )
-                    .await
-            } else {
-                Ok(())
-            }
-        };
-        let key_package_publish = async {
-            if relay_setup.should_publish_key_package {
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    "Publishing key package relay list (defaults)"
-                );
-                self.relay_control
-                    .publish_relay_list_with_signer(
-                        &Relay::urls(&relay_setup.key_package_relays),
-                        RelayType::KeyPackage,
-                        &nip65_urls,
-                        signer.clone(),
-                    )
-                    .await
-            } else {
-                Ok(())
-            }
-        };
-
-        let (r1, r2, r3) = tokio::join!(nip65_publish, inbox_publish, key_package_publish);
-        r1?;
-        for (relay_type, result) in [(RelayType::Inbox, r2), (RelayType::KeyPackage, r3)] {
-            if let Err(error) = result {
-                tracing::warn!(
-                    target: "whitenoise::accounts",
-                    ?relay_type,
-                    "Failed to publish relay list with signer; continuing with local relay state: {error}"
-                );
-            }
-        }
-
-        Ok(())
-    }
 }

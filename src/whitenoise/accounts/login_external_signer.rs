@@ -128,8 +128,7 @@ impl Whitenoise {
             .map_err(LoginError::from)?;
 
         // Use discovered NIP-65 relays as the publish target when available,
-        // publish_to_urls is the target for relay-list events: use discovered
-        // NIP-65 relays when available, otherwise defaults.
+        // otherwise defaults.
         let publish_to_urls = Relay::urls(discovered.relays_or(RelayType::Nip65, &default_relays));
         let default_urls = Relay::urls(&default_relays);
 
@@ -261,7 +260,7 @@ impl Whitenoise {
 
     /// Activate an external-signer account after relay lists have been resolved.
     #[perf_instrument("accounts")]
-    pub(crate) async fn complete_external_signer_login<S>(
+    pub(super) async fn complete_external_signer_login<S>(
         &self,
         account: &Account,
         inbox_relays: &[Relay],
@@ -293,7 +292,7 @@ impl Whitenoise {
 
     /// Create/update an external signer account record without setting up relays.
     /// Used by the multi-step external signer login flow.
-    pub(crate) async fn setup_external_signer_account_without_relays(
+    pub(super) async fn setup_external_signer_account_without_relays(
         &self,
         pubkey: PublicKey,
     ) -> core::result::Result<(Account, User), LoginError> {
@@ -334,13 +333,12 @@ impl Whitenoise {
         Ok((account, user))
     }
 
-    // -----------------------------------------------------------------------
-    // Original methods (preserved for backward compatibility during transition)
-    // -----------------------------------------------------------------------
-
     /// Sets up an external signer account (creates or updates) and configures relays.
-    /// Also used by tests that need account setup without publishing.
-    pub(crate) async fn setup_external_signer_account(
+    ///
+    /// Only used by `login_with_external_signer_for_test` — the production
+    /// multi-step flow uses `setup_external_signer_account_without_relays`
+    /// instead.
+    pub(super) async fn setup_external_signer_account(
         &self,
         pubkey: PublicKey,
     ) -> crate::whitenoise::error::Result<(Account, super::ExternalSignerRelaySetup)> {
@@ -407,6 +405,90 @@ impl Whitenoise {
                 signer_pubkey.to_hex()
             )));
         }
+        Ok(())
+    }
+
+    /// Publishes relay lists using an external signer based on the relay setup configuration.
+    ///
+    /// Publishes NIP-65, inbox, and key package relay lists only if they need to be
+    /// published (i.e., using defaults rather than existing user-configured lists).
+    pub(super) async fn publish_relay_lists_with_signer(
+        &self,
+        relay_setup: &super::ExternalSignerRelaySetup,
+        signer: impl NostrSigner + 'static,
+    ) -> crate::whitenoise::error::Result<()> {
+        let nip65_urls = Relay::urls(&relay_setup.nip65_relays);
+        let signer = std::sync::Arc::new(signer);
+
+        // Publish all missing relay lists concurrently — each is an
+        // independent Nostr event targeting the same relay set.
+        let nip65_publish = async {
+            if relay_setup.should_publish_nip65 {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing NIP-65 relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &nip65_urls,
+                        RelayType::Nip65,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if relay_setup.should_publish_inbox {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing inbox relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &Relay::urls(&relay_setup.inbox_relays),
+                        RelayType::Inbox,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if relay_setup.should_publish_key_package {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Publishing key package relay list (defaults)"
+                );
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &Relay::urls(&relay_setup.key_package_relays),
+                        RelayType::KeyPackage,
+                        &nip65_urls,
+                        signer.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+
+        let (r1, r2, r3) = tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+        r1?;
+        for (relay_type, result) in [(RelayType::Inbox, r2), (RelayType::KeyPackage, r3)] {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    ?relay_type,
+                    "Failed to publish relay list with signer; continuing with local relay state: {error}"
+                );
+            }
+        }
+
         Ok(())
     }
 

@@ -1,3 +1,5 @@
+use nostr_sdk::RelayUrl;
+
 use crate::perf_instrument;
 use crate::types::RelayControlStateSnapshot;
 use crate::whitenoise::Whitenoise;
@@ -282,5 +284,39 @@ impl Whitenoise {
             .sync_discovery_subscriptions(&watched_users, &follow_list_accounts, public_since)
             .await
             .map_err(WhitenoiseError::from)
+    }
+
+    /// Returns the union of default relays and currently connected relays.
+    ///
+    /// Used as the fallback relay set when a user has no stored NIP-65 relays.
+    /// Discovery fallback is owned by the discovery plane rather than whatever
+    /// other relays happen to be connected for unrelated workloads.
+    #[perf_instrument("whitenoise")]
+    pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
+        self.relay_control.discovery().relays().to_vec()
+    }
+
+    /// Refreshes discovery subscriptions after a single user's relay metadata
+    /// changes (e.g. after processing a relay-list event for that user).
+    ///
+    /// **Note:** The current implementation performs a full replace of every
+    /// watched-user and follow-list batch, identical to
+    /// `refresh_all_global_subscriptions`. Per-user incremental patching is not
+    /// yet implemented. Callers should not rely on this being cheap for large
+    /// user sets — prefer batching multiple user updates and calling
+    /// `refresh_all_global_subscriptions` once instead.
+    #[perf_instrument("whitenoise")]
+    pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
+        self.sync_discovery_subscriptions().await?;
+        Ok(())
+    }
+
+    /// Refreshes discovery subscriptions for all watched users across all
+    /// relay batches. Use after bulk user discovery (e.g. contact-list
+    /// processing) where many users may have changed simultaneously.
+    #[perf_instrument("whitenoise")]
+    pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
+        self.sync_discovery_subscriptions().await?;
+        Ok(())
     }
 }
