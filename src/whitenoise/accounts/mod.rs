@@ -584,9 +584,11 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
+    use crate::whitenoise::accounts::Account;
     use crate::whitenoise::relays::{Relay, RelayType};
     use crate::whitenoise::test_utils::*;
     use crate::whitenoise::user_streaming::UserUpdateTrigger;
+    use nostr_sdk::prelude::*;
     use nostr_sdk::{Metadata, RelayUrl};
 
     #[tokio::test]
@@ -681,5 +683,681 @@ mod tests {
         assert_eq!(update.user.pubkey, account.pubkey);
         assert_eq!(update.user.metadata.name, Some("Local Update".to_string()));
         assert!(update.user.metadata_known_at.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Account / AccountType struct and type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_since_timestamp_none_when_never_synced() {
+        use chrono::Utc;
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(account.since_timestamp(10).is_none());
+    }
+
+    #[test]
+    fn test_since_timestamp_applies_buffer() {
+        use chrono::{TimeDelta, Utc};
+        let now = Utc::now();
+        let last = now - TimeDelta::seconds(100);
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: Some(last),
+            created_at: now,
+            updated_at: now,
+        };
+        let ts = account.since_timestamp(10).unwrap();
+        let expected_secs = (last.timestamp().max(0) as u64).saturating_sub(10);
+        assert_eq!(ts.as_secs(), expected_secs);
+    }
+
+    #[test]
+    fn test_since_timestamp_floors_at_zero() {
+        use chrono::Utc;
+        // Choose a timestamp very close to the epoch so that buffer would underflow
+        let epochish = chrono::DateTime::<Utc>::from_timestamp(5, 0).unwrap();
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: Some(epochish),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let ts = account.since_timestamp(10).unwrap();
+        assert_eq!(ts.as_secs(), 0);
+    }
+
+    #[test]
+    fn test_since_timestamp_clamps_future_to_now_minus_buffer() {
+        use chrono::Utc;
+        let now = Utc::now();
+        let future = now + chrono::TimeDelta::seconds(3600 * 24); // 24h in the future
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: Some(future),
+            created_at: now,
+            updated_at: now,
+        };
+        let buffer = 10u64;
+        let before = Utc::now();
+        let ts = account.since_timestamp(buffer).unwrap();
+        let after = Utc::now();
+
+        let before_secs = before.timestamp().max(0) as u64;
+        let after_secs = after.timestamp().max(0) as u64;
+
+        let min_expected = before_secs.saturating_sub(buffer);
+        let max_expected = after_secs.saturating_sub(buffer);
+
+        let actual = ts.as_secs();
+        assert!(actual >= min_expected && actual <= max_expected);
+    }
+
+    #[test]
+    fn test_has_local_key_returns_true_for_local_account() {
+        use chrono::Utc;
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.has_local_key(),
+            "Local account should have local key"
+        );
+    }
+
+    #[test]
+    fn test_has_local_key_returns_false_for_external_account() {
+        use chrono::Utc;
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_true_for_external() {
+        use chrono::Utc;
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            account.uses_external_signer(),
+            "External account should use external signer"
+        );
+    }
+
+    #[test]
+    fn test_uses_external_signer_returns_false_for_local() {
+        use chrono::Utc;
+        let account = Account {
+            id: None,
+            pubkey: Keys::generate().public_key(),
+            user_id: 1,
+            account_type: crate::whitenoise::accounts::AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not use external signer"
+        );
+    }
+
+    #[test]
+    fn test_account_type_from_str_local() {
+        use crate::whitenoise::accounts::AccountType;
+        let result: std::result::Result<AccountType, String> = "local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+        let result: std::result::Result<AccountType, String> = "LOCAL".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+        let result: std::result::Result<AccountType, String> = "Local".parse();
+        assert_eq!(result.unwrap(), AccountType::Local);
+    }
+
+    #[test]
+    fn test_account_type_from_str_external() {
+        use crate::whitenoise::accounts::AccountType;
+        let result: std::result::Result<AccountType, String> = "external".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+        let result: std::result::Result<AccountType, String> = "EXTERNAL".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+        let result: std::result::Result<AccountType, String> = "External".parse();
+        assert_eq!(result.unwrap(), AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_from_str_invalid() {
+        use crate::whitenoise::accounts::AccountType;
+        let result: std::result::Result<AccountType, String> = "invalid".parse();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unknown account type: invalid");
+        let result: std::result::Result<AccountType, String> = "".parse();
+        assert!(result.is_err());
+        let result: std::result::Result<AccountType, String> = "123".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_account_type_display() {
+        use crate::whitenoise::accounts::AccountType;
+        assert_eq!(format!("{}", AccountType::Local), "local");
+        assert_eq!(format!("{}", AccountType::External), "external");
+    }
+
+    #[test]
+    fn test_account_type_default() {
+        use crate::whitenoise::accounts::AccountType;
+        let default_type = AccountType::default();
+        assert_eq!(default_type, AccountType::Local);
+    }
+
+    #[test]
+    fn test_account_type_json_serialization() {
+        use crate::whitenoise::accounts::AccountType;
+        let json = serde_json::to_string(&AccountType::Local).unwrap();
+        assert_eq!(json, "\"Local\"");
+        let json = serde_json::to_string(&AccountType::External).unwrap();
+        assert_eq!(json, "\"External\"");
+    }
+
+    #[test]
+    fn test_account_type_json_deserialization() {
+        use crate::whitenoise::accounts::AccountType;
+        let local: AccountType = serde_json::from_str("\"Local\"").unwrap();
+        assert_eq!(local, AccountType::Local);
+        let external: AccountType = serde_json::from_str("\"External\"").unwrap();
+        assert_eq!(external, AccountType::External);
+    }
+
+    #[test]
+    fn test_account_type_serialization_roundtrip() {
+        use crate::whitenoise::accounts::AccountType;
+        let serialized = serde_json::to_string(&AccountType::Local).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(AccountType::Local, deserialized);
+
+        let serialized = serde_json::to_string(&AccountType::External).unwrap();
+        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(AccountType::External, deserialized);
+    }
+
+    #[test]
+    fn test_account_type_equality_and_hash() {
+        use crate::whitenoise::accounts::AccountType;
+        use std::collections::HashSet;
+        assert_eq!(AccountType::Local, AccountType::Local);
+        assert_eq!(AccountType::External, AccountType::External);
+        assert_ne!(AccountType::Local, AccountType::External);
+        let mut set = HashSet::new();
+        set.insert(AccountType::Local);
+        set.insert(AccountType::External);
+        assert_eq!(set.len(), 2);
+        set.insert(AccountType::Local);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_account_type_clone() {
+        use crate::whitenoise::accounts::AccountType;
+        let cloned = AccountType::Local.clone();
+        assert_eq!(AccountType::Local, cloned);
+        let cloned = AccountType::External.clone();
+        assert_eq!(AccountType::External, cloned);
+    }
+
+    #[test]
+    fn test_account_type_debug() {
+        use crate::whitenoise::accounts::AccountType;
+        assert!(format!("{:?}", AccountType::Local).contains("Local"));
+        assert!(format!("{:?}", AccountType::External).contains("External"));
+    }
+
+    #[tokio::test]
+    async fn test_new_external_creates_external_account() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = create_test_keys();
+        let pubkey = keys.public_key();
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        assert_eq!(account.account_type, AccountType::External);
+        assert_eq!(account.pubkey, pubkey);
+        assert!(account.id.is_none());
+        assert!(account.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_external_sets_correct_fields() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        assert_eq!(account.pubkey, pubkey);
+        assert_eq!(account.account_type, AccountType::External);
+        assert!(account.id.is_none(), "New account should not be persisted");
+        assert!(account.last_synced_at.is_none());
+        assert!(account.user_id > 0, "Should have a valid user_id");
+    }
+
+    #[tokio::test]
+    async fn test_external_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        assert!(
+            account.uses_external_signer(),
+            "External account should report using external signer"
+        );
+        assert!(
+            !account.has_local_key(),
+            "External account should not have local key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_account_uses_external_signer_and_has_local_key() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, _keys) = Account::new(&whitenoise, None).await.unwrap();
+        assert!(
+            !account.uses_external_signer(),
+            "Local account should not report using external signer"
+        );
+        assert!(
+            account.has_local_key(),
+            "Local account should report having local key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_generated_keys() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = Account::new(&whitenoise, None).await.unwrap();
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, keys.public_key());
+        assert!(account.id.is_none());
+        assert!(account.last_synced_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_creates_local_account_with_provided_keys() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let provided_keys = create_test_keys();
+        let (account, keys) = Account::new(&whitenoise, Some(provided_keys.clone()))
+            .await
+            .unwrap();
+        assert_eq!(account.account_type, AccountType::Local);
+        assert_eq!(account.pubkey, provided_keys.public_key());
+        assert_eq!(keys.public_key(), provided_keys.public_key());
+        assert_eq!(keys.secret_key(), provided_keys.secret_key());
+    }
+
+    #[tokio::test]
+    async fn test_account_json_serialization_roundtrip() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        let external_json = serde_json::to_string(&external_account).unwrap();
+        let external_deserialized: Account = serde_json::from_str(&external_json).unwrap();
+        assert_eq!(external_account.pubkey, external_deserialized.pubkey);
+        assert_eq!(
+            external_account.account_type,
+            external_deserialized.account_type
+        );
+        assert_eq!(external_deserialized.account_type, AccountType::External);
+
+        let local_json = serde_json::to_string(&local_account).unwrap();
+        let local_deserialized: Account = serde_json::from_str(&local_json).unwrap();
+        assert_eq!(local_account.pubkey, local_deserialized.pubkey);
+        assert_eq!(local_account.account_type, local_deserialized.account_type);
+        assert_eq!(local_deserialized.account_type, AccountType::Local);
+    }
+
+    #[tokio::test]
+    async fn test_account_debug_includes_account_type() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+
+        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
+
+        let external_debug = format!("{:?}", external_account);
+        let local_debug = format!("{:?}", local_account);
+
+        assert!(
+            external_debug.contains("External"),
+            "External account debug should contain 'External': {}",
+            external_debug
+        );
+        assert!(
+            local_debug.contains("Local"),
+            "Local account debug should contain 'Local': {}",
+            local_debug
+        );
+    }
+
+    #[tokio::test]
+    async fn test_external_account_database_roundtrip() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let persisted = whitenoise.persist_account(&account).await.unwrap();
+
+        assert!(persisted.id.is_some());
+        assert_eq!(persisted.account_type, AccountType::External);
+
+        let found = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, pubkey);
+        assert_eq!(found.account_type, AccountType::External);
+    }
+
+    #[tokio::test]
+    async fn test_external_account_no_keys_in_secrets_store() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let keys = nostr_sdk::Keys::generate();
+        let pubkey = keys.public_key();
+        let _account = Account::new_external(&whitenoise, pubkey).await.unwrap();
+        let result = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        assert!(
+            result.is_err(),
+            "External account creation should not store any keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_account_type_creation() {
+        use crate::whitenoise::accounts::AccountType;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (local_gen, keys_gen) = Account::new(&whitenoise, None).await.unwrap();
+        assert_eq!(local_gen.account_type, AccountType::Local);
+        assert_eq!(local_gen.pubkey, keys_gen.public_key());
+
+        let provided = create_test_keys();
+        let (local_prov, keys_prov) = Account::new(&whitenoise, Some(provided.clone()))
+            .await
+            .unwrap();
+        assert_eq!(local_prov.account_type, AccountType::Local);
+        assert_eq!(keys_prov.public_key(), provided.public_key());
+
+        let ext_pubkey = nostr_sdk::Keys::generate().public_key();
+        let external = Account::new_external(&whitenoise, ext_pubkey)
+            .await
+            .unwrap();
+        assert_eq!(external.account_type, AccountType::External);
+        assert_eq!(external.pubkey, ext_pubkey);
+        assert!(!external.has_local_key());
+        assert!(external.uses_external_signer());
+    }
+
+    #[tokio::test]
+    async fn test_account_crud_operations() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 0);
+        assert!(whitenoise.all_accounts().await.unwrap().is_empty());
+
+        let (account1, _) = create_test_account(&whitenoise).await;
+        let account1 = whitenoise.persist_account(&account1).await.unwrap();
+        assert!(account1.id.is_some());
+
+        let (account2, _) = create_test_account(&whitenoise).await;
+        whitenoise.persist_account(&account2).await.unwrap();
+
+        assert_eq!(whitenoise.get_accounts_count().await.unwrap(), 2);
+        let all = whitenoise.all_accounts().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        let found = whitenoise
+            .find_account_by_pubkey(&account1.pubkey)
+            .await
+            .unwrap();
+        assert_eq!(found.pubkey, account1.pubkey);
+
+        let random_pk = nostr_sdk::Keys::generate().public_key();
+        assert!(whitenoise.find_account_by_pubkey(&random_pk).await.is_err());
+
+        let user = account1.user(&whitenoise.database).await.unwrap();
+        assert_eq!(user.pubkey, account1.pubkey);
+
+        let metadata = account1.metadata(&whitenoise).await.unwrap();
+        assert!(metadata.name.is_none() || metadata.name.as_deref() == Some(""));
+    }
+
+    #[tokio::test]
+    async fn test_account_relay_operations() {
+        use nostr_sdk::RelayUrl;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(
+            account
+                .key_package_relays(&whitenoise)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let default_relays = whitenoise.load_default_relays().await.unwrap();
+        #[cfg(debug_assertions)]
+        assert_eq!(default_relays.len(), 2);
+
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Nip65)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::Inbox)
+            .await
+            .unwrap();
+        whitenoise
+            .add_relays_to_account(&account, &default_relays, RelayType::KeyPackage)
+            .await
+            .unwrap();
+
+        let nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        let inbox = account.relays(RelayType::Inbox, &whitenoise).await.unwrap();
+        let kp = account
+            .relays(RelayType::KeyPackage, &whitenoise)
+            .await
+            .unwrap();
+        assert_eq!(nip65.len(), default_relays.len());
+        assert_eq!(inbox.len(), default_relays.len());
+        assert_eq!(kp.len(), default_relays.len());
+
+        let test_relay = Relay::find_or_create_by_url(
+            &RelayUrl::parse("wss://test.relay.example").unwrap(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        account
+            .add_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_add = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_add.len(), default_relays.len() + 1);
+
+        account
+            .remove_relay(&test_relay, RelayType::Nip65, &whitenoise)
+            .await
+            .unwrap();
+        let relays_after_remove = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(relays_after_remove.len(), default_relays.len());
+    }
+
+    #[tokio::test]
+    async fn test_account_relay_convenience_methods() {
+        use nostr_sdk::RelayUrl;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = whitenoise.persist_account(&account).await.unwrap();
+        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+
+        assert!(account.nip65_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(account.inbox_relays(&whitenoise).await.unwrap().is_empty());
+        assert!(
+            account
+                .key_package_relays(&whitenoise)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let user = account.user(&whitenoise.database).await.unwrap();
+        let url1 = RelayUrl::parse("ws://127.0.0.1:19010").unwrap();
+        let url2 = RelayUrl::parse("ws://127.0.0.1:19011").unwrap();
+        let url3 = RelayUrl::parse("ws://127.0.0.1:19012").unwrap();
+        let relay1 = whitenoise.find_or_create_relay_by_url(&url1).await.unwrap();
+        let relay2 = whitenoise.find_or_create_relay_by_url(&url2).await.unwrap();
+        let relay3 = whitenoise.find_or_create_relay_by_url(&url3).await.unwrap();
+
+        user.add_relays(&[relay1], RelayType::Nip65, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relays(&[relay2], RelayType::Inbox, &whitenoise.database)
+            .await
+            .unwrap();
+        user.add_relays(&[relay3], RelayType::KeyPackage, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
+        assert_eq!(nip65.len(), 1);
+        assert_eq!(nip65[0].url, url1);
+
+        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].url, url2);
+
+        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        assert_eq!(kp.len(), 1);
+        assert_eq!(kp[0].url, url3);
+
+        let all_nip65 = account.relays(RelayType::Nip65, &whitenoise).await.unwrap();
+        assert_eq!(all_nip65.len(), 1);
+        assert_eq!(all_nip65[0].url, url1);
+    }
+
+    #[test]
+    fn test_create_mdk_success() {
+        crate::whitenoise::Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let pubkey = nostr_sdk::Keys::generate().public_key();
+        let result = Account::create_mdk(pubkey, temp_dir.path(), "com.whitenoise.test");
+        assert!(result.is_ok(), "create_mdk failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_create_mdk_with_invalid_path() {
+        let pubkey = nostr_sdk::Keys::generate().public_key();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let result = Account::create_mdk(pubkey, file.path(), "test.service");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_load_accounts() {
+        use nostr_sdk::prelude::*;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let accounts = Account::all(&whitenoise.database).await.unwrap();
+        assert!(accounts.is_empty());
+
+        let (account1, keys1) = create_test_account(&whitenoise).await;
+        let (account2, keys2) = create_test_account(&whitenoise).await;
+
+        account1.save(&whitenoise.database).await.unwrap();
+        account2.save(&whitenoise.database).await.unwrap();
+
+        whitenoise.secrets_store.store_private_key(&keys1).unwrap();
+        whitenoise.secrets_store.store_private_key(&keys2).unwrap();
+
+        let loaded_accounts = Account::all(&whitenoise.database).await.unwrap();
+        assert_eq!(loaded_accounts.len(), 2);
+        let pubkeys: Vec<PublicKey> = loaded_accounts.iter().map(|a| a.pubkey).collect();
+        assert!(pubkeys.contains(&account1.pubkey));
+        assert!(pubkeys.contains(&account2.pubkey));
+
+        let loaded_account1 = loaded_accounts
+            .iter()
+            .find(|a| a.pubkey == account1.pubkey)
+            .unwrap();
+        assert_eq!(loaded_account1.pubkey, account1.pubkey);
+        assert_eq!(loaded_account1.user_id, account1.user_id);
+        assert_eq!(loaded_account1.last_synced_at, account1.last_synced_at);
+        let created_diff = (loaded_account1.created_at - account1.created_at)
+            .num_milliseconds()
+            .abs();
+        let updated_diff = (loaded_account1.updated_at - account1.updated_at)
+            .num_milliseconds()
+            .abs();
+        assert!(
+            created_diff <= 1,
+            "Created timestamp difference too large: {}ms",
+            created_diff
+        );
+        assert!(
+            updated_diff <= 1,
+            "Updated timestamp difference too large: {}ms",
+            updated_diff
+        );
     }
 }
