@@ -29,7 +29,7 @@ fn batch_count_for(user_count: usize) -> usize {
 fn pubkey_batch_index(pubkey: &PublicKey, batch_count: usize) -> usize {
     let bytes = pubkey.to_bytes();
     // Use the tail bytes — vanity addresses grind the prefix, biasing leading bytes.
-    let offset = bytes.len() - size_of::<usize>();
+    let offset = bytes.len() - std::mem::size_of::<usize>();
     let n = usize::from_le_bytes(std::array::from_fn(|i| bytes[offset + i]));
     n % batch_count
 }
