@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
+use nostr_connect::prelude::NostrConnect;
 use nostr_sdk::prelude::*;
 
 use super::{
@@ -555,6 +558,12 @@ impl Whitenoise {
         // Remove any stashed external signer for this pubkey.
         self.remove_external_signer(pubkey);
 
+        // Discard any in-memory NIP-46 credentials stashed during a
+        // multi-step login (login_nip46_start → NeedsRelayLists path).
+        // These were never written to the keychain, so no keychain cleanup
+        // is needed for this path.
+        self.pending_nip46_credentials.remove(pubkey);
+
         // Clean up the partial account if it exists.
         if let Ok(account) = Account::find_by_pubkey(pubkey, &self.database).await {
             // Remove relay associations that try_discover_relay_lists may have
@@ -835,6 +844,340 @@ impl Whitenoise {
                 status: LoginStatus::NeedsRelayLists,
             })
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 (Nostr Connect / Remote Signer) login API
+    //
+    // Same shape as the NIP-55 (Amber) methods above, but we handle bunker
+    // URI parsing, app key generation, and credential persistence ourselves.
+    // Under the hood NostrConnect implements NostrSigner, so everything
+    // downstream (signing, decryption, giftwrap) just works.
+    // -----------------------------------------------------------------------
+
+    /// Stores NIP-46 credentials in the keychain after a successful login.
+    ///
+    /// When `rollback_login` is `true` and the keychain write fails, the login
+    /// is rolled back via `logout` so the caller never gets an activated
+    /// account that can't reconnect after restart. Pass `false` when the
+    /// account already existed before this login call — rolling it back would
+    /// tear down a valid pre-existing session.
+    async fn store_nip46_credentials_or_rollback(
+        &self,
+        pubkey: &PublicKey,
+        app_keys: &Keys,
+        bunker_uri: &str,
+        rollback_login: bool,
+    ) -> Result<()> {
+        if let Err(store_err) =
+            self.secrets_store
+                .store_nip46_credentials(pubkey, app_keys.secret_key(), bunker_uri)
+        {
+            if rollback_login && let Err(rollback_err) = self.logout(pubkey).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts::login",
+                    "Failed to roll back login after credential store failure for {}: {}",
+                    pubkey.to_hex(),
+                    rollback_err
+                );
+            }
+            return Err(store_err.into());
+        }
+        Ok(())
+    }
+
+    /// Parses a `bunker://` URI, generates a fresh app keypair, and builds a
+    /// [`NostrConnect`] signer ready for use.
+    ///
+    /// **Does not persist credentials.** This is an internal building block
+    /// with an incomplete lifecycle — credential storage is the caller's
+    /// responsibility. External code should use the higher-level entry points
+    /// ([`login_nip46`](Self::login_nip46), [`login_nip46_start`](Self::login_nip46_start),
+    /// [`complete_nip46_client_connect`](Self::complete_nip46_client_connect))
+    /// which handle the full login-and-persist flow atomically.
+    ///
+    /// Returns `(user_pubkey, signer, app_keys)`. The pubkey comes from the
+    /// remote signer during the initial NIP-46 handshake. The app_keys are
+    /// needed by the caller to persist credentials after a successful login.
+    pub(crate) async fn create_nip46_signer(
+        &self,
+        bunker_uri: &str,
+        timeout_secs: u64,
+    ) -> Result<(PublicKey, NostrConnect, Keys)> {
+        let uri = NostrConnectURI::parse(bunker_uri).map_err(WhitenoiseError::Nip46InvalidUri)?;
+
+        let app_keys = Keys::generate();
+        let timeout = Duration::from_secs(timeout_secs);
+
+        let signer = NostrConnect::new(uri, app_keys.clone(), timeout, None)
+            .map_err(WhitenoiseError::Nip46Connection)?;
+
+        // Ask the remote signer for the user's pubkey. This is also what
+        // kicks off the NIP-46 bootstrap (connects to relays, does the
+        // handshake, etc.).
+        let user_pubkey = signer.get_public_key().await.map_err(|e| {
+            WhitenoiseError::Nip46Connection(nostr_connect::error::Error::Response(e.to_string()))
+        })?;
+
+        tracing::info!(
+            target: "whitenoise::accounts::login",
+            "NIP-46 signer created for user pubkey: {}",
+            user_pubkey.to_hex()
+        );
+
+        Ok((user_pubkey, signer, app_keys))
+    }
+
+    /// Builds a `nostrconnect://` URI for the client-initiated NIP-46 flow.
+    ///
+    /// The idea: the app shows this URI as a QR code, the user scans it with
+    /// their signer app, and the signer connects back. We generate fresh app
+    /// keys and hand them back with the URI — hang onto them, you'll need
+    /// them for [`complete_nip46_client_connect`](Self::complete_nip46_client_connect)
+    /// once the signer responds.
+    ///
+    /// Returns `(app_keys, nostrconnect_uri)`.
+    pub fn create_nip46_client_uri(
+        &self,
+        relays: Vec<RelayUrl>,
+        app_name: &str,
+    ) -> (Keys, NostrConnectURI) {
+        let app_keys = Keys::generate();
+        let uri = NostrConnectURI::client(app_keys.public_key(), relays, app_name);
+        (app_keys, uri)
+    }
+
+    /// Finishes the client-initiated NIP-46 flow once the remote signer has
+    /// responded with a `bunker://` URI.
+    ///
+    /// Pass in the same `app_keys` you got from
+    /// [`create_nip46_client_uri`](Self::create_nip46_client_uri) — we need
+    /// them to talk to the signer and to save for future reconnects.
+    pub async fn complete_nip46_client_connect(
+        &self,
+        bunker_uri: &str,
+        app_keys: Keys,
+        timeout_secs: u64,
+    ) -> Result<Account> {
+        let uri = NostrConnectURI::parse(bunker_uri).map_err(WhitenoiseError::Nip46InvalidUri)?;
+
+        let timeout = Duration::from_secs(timeout_secs);
+        let signer = NostrConnect::new(uri, app_keys.clone(), timeout, None)
+            .map_err(WhitenoiseError::Nip46Connection)?;
+
+        let user_pubkey = signer.get_public_key().await.map_err(|e| {
+            WhitenoiseError::Nip46Connection(nostr_connect::error::Error::Response(e.to_string()))
+        })?;
+
+        // Check before login so we know whether to roll back on keychain failure.
+        // If the account already exists, rolling it back would tear down a valid
+        // pre-existing session.
+        let account_is_new = Account::find_by_pubkey(&user_pubkey, &self.database)
+            .await
+            .is_err();
+
+        let account = self.login_with_external_signer(user_pubkey, signer).await?;
+
+        // Persist credentials only after login succeeds. Rolls back a newly
+        // created account on keychain failure; skips rollback for pre-existing
+        // accounts to avoid tearing down a valid session.
+        self.store_nip46_credentials_or_rollback(
+            &user_pubkey,
+            &app_keys,
+            bunker_uri,
+            account_is_new,
+        )
+        .await?;
+
+        Ok(account)
+    }
+
+    /// One-shot NIP-46 login: parses the bunker URI, sets up the signer,
+    /// and runs the full login in a single call.
+    ///
+    /// If you need the multi-step flow (to let the user choose relays),
+    /// start with [`login_nip46_start`](Self::login_nip46_start) instead.
+    pub async fn login_nip46(&self, bunker_uri: &str, timeout_secs: u64) -> Result<Account> {
+        let (pubkey, signer, app_keys) = self.create_nip46_signer(bunker_uri, timeout_secs).await?;
+
+        // Check before login so we know whether to roll back on keychain failure.
+        // If the account already exists, rolling it back would tear down a valid
+        // pre-existing session.
+        let account_is_new = Account::find_by_pubkey(&pubkey, &self.database)
+            .await
+            .is_err();
+
+        let account = self.login_with_external_signer(pubkey, signer).await?;
+
+        // Persist credentials only after login succeeds. Rolls back a newly
+        // created account on keychain failure; skips rollback for pre-existing
+        // accounts to avoid tearing down a valid session.
+        self.store_nip46_credentials_or_rollback(&pubkey, &app_keys, bunker_uri, account_is_new)
+            .await?;
+
+        Ok(account)
+    }
+
+    /// Multi-step NIP-46 login, step 1: creates the signer from the bunker
+    /// URI and tries to discover relay lists on the network.
+    ///
+    /// Works the same way as [`login_start`](Self::login_start) — returns
+    /// [`LoginStatus::Complete`] if relay lists were found, or
+    /// [`LoginStatus::NeedsRelayLists`] if the caller needs to choose.
+    ///
+    /// When the login completes in a single step ([`LoginStatus::Complete`]),
+    /// credentials are persisted immediately. When the login is still in
+    /// progress ([`LoginStatus::NeedsRelayLists`]), credentials are stashed
+    /// internally and persisted only after the caller commits the flow via
+    /// [`login_nip46_publish_default_relays`](Self::login_nip46_publish_default_relays)
+    /// or [`login_nip46_with_custom_relay`](Self::login_nip46_with_custom_relay).
+    /// Abandoned flows leave no orphaned keychain entries.
+    pub async fn login_nip46_start(
+        &self,
+        bunker_uri: &str,
+        timeout_secs: u64,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        let (pubkey, signer, app_keys) = self
+            .create_nip46_signer(bunker_uri, timeout_secs)
+            .await
+            .map_err(LoginError::from)?;
+
+        // Check before login so we know whether to roll back on keychain failure.
+        let account_is_new = Account::find_by_pubkey(&pubkey, &self.database)
+            .await
+            .is_err();
+
+        let result = self.login_external_signer_start(pubkey, signer).await?;
+
+        match result.status {
+            LoginStatus::Complete => {
+                // Single-step success: persist credentials now.
+                self.store_nip46_credentials_or_rollback(
+                    &pubkey,
+                    &app_keys,
+                    bunker_uri,
+                    account_is_new,
+                )
+                .await
+                .map_err(|e| LoginError::Internal(e.to_string()))?;
+            }
+            LoginStatus::NeedsRelayLists => {
+                // Multi-step: stash credentials so step 2 can persist them
+                // after the flow fully completes. No keychain write yet —
+                // abandoned flows leave no orphaned entries.
+                self.pending_nip46_credentials
+                    .insert(pubkey, (bunker_uri.to_string(), app_keys));
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Multi-step NIP-46 login, step 2a: publishes default relay lists for
+    /// whichever kinds are still missing, then finishes the login.
+    pub async fn login_nip46_publish_default_relays(
+        &self,
+        pubkey: &PublicKey,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        let result = self
+            .login_external_signer_publish_default_relays(pubkey)
+            .await?;
+        self.persist_pending_nip46_credentials_if_complete(pubkey, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// Multi-step NIP-46 login, step 2b: looks for relay lists on a
+    /// user-provided relay. If that fills the gaps, login completes.
+    pub async fn login_nip46_with_custom_relay(
+        &self,
+        pubkey: &PublicKey,
+        relay_url: RelayUrl,
+    ) -> core::result::Result<LoginResult, LoginError> {
+        let result = self
+            .login_external_signer_with_custom_relay(pubkey, relay_url)
+            .await?;
+        self.persist_pending_nip46_credentials_if_complete(pubkey, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// Persists stashed NIP-46 credentials to the keychain if the login has
+    /// completed. Also removes the stashed entry regardless of outcome.
+    ///
+    /// Called by the step-2 NIP-46 wrappers after the underlying login step
+    /// returns. On keychain failure the account is rolled back so the caller
+    /// never ends up with an activated account that can't reconnect.
+    async fn persist_pending_nip46_credentials_if_complete(
+        &self,
+        pubkey: &PublicKey,
+        result: &LoginResult,
+    ) -> core::result::Result<(), LoginError> {
+        if result.status != LoginStatus::Complete {
+            // Still in progress — leave stashed credentials in place.
+            return Ok(());
+        }
+
+        // Remove the stashed credentials. If nothing was stashed (e.g. the
+        // caller bypassed login_nip46_start), skip silently.
+        let Some((_, (bunker_uri, app_keys))) = self.pending_nip46_credentials.remove(pubkey)
+        else {
+            return Ok(());
+        };
+
+        // Step 2 always completes an account that was created in step 1 —
+        // it's safe to roll back on keychain failure.
+        self.store_nip46_credentials_or_rollback(pubkey, &app_keys, &bunker_uri, true)
+            .await
+            .map_err(|e| LoginError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Rebuilds the NIP-46 signer from saved credentials and registers it.
+    ///
+    /// Runs automatically at startup for external accounts that have NIP-46
+    /// credentials in the keychain. The user doesn't have to re-authorize —
+    /// we already proved the pubkey matches during the original login.
+    pub(crate) async fn reconnect_nip46(&self, account: &Account, timeout_secs: u64) -> Result<()> {
+        let (app_secret_key, bunker_uri_str) =
+            self.secrets_store.get_nip46_credentials(&account.pubkey)?;
+
+        let uri =
+            NostrConnectURI::parse(&bunker_uri_str).map_err(WhitenoiseError::Nip46InvalidUri)?;
+
+        let app_keys = Keys::new(app_secret_key);
+        let timeout = Duration::from_secs(timeout_secs);
+
+        let signer = NostrConnect::new(uri, app_keys, timeout, None)
+            .map_err(WhitenoiseError::Nip46Connection)?;
+
+        // Do a full round-trip against the remote bunker to confirm it still
+        // controls the key we expect. This catches stale or corrupted keychain
+        // entries before they can register a wrong identity. We deliberately
+        // do NOT call non_secure_set_user_public_key() first: that seeds a
+        // local cache that get_public_key() would return without contacting the
+        // signer, making the comparison tautological.
+        let remote_pubkey = signer.get_public_key().await.map_err(|e| {
+            WhitenoiseError::Nip46Connection(nostr_connect::error::Error::Response(e.to_string()))
+        })?;
+
+        if remote_pubkey != account.pubkey {
+            return Err(WhitenoiseError::Nip46PubkeyMismatch {
+                expected: account.pubkey,
+                got: remote_pubkey,
+            });
+        }
+
+        self.insert_external_signer(account.pubkey, signer).await?;
+
+        tracing::info!(
+            target: "whitenoise::accounts::login",
+            "Reconnected NIP-46 signer for account: {}",
+            account.pubkey.to_hex()
+        );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1309,6 +1652,18 @@ impl Whitenoise {
             (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
             _ => {}
         }
+
+        // Wipe NIP-46 app keys and bunker URI if they exist. Harmless no-op
+        // for NIP-55 or local accounts.
+        if let Err(e) = self.secrets_store.delete_nip46_credentials(pubkey) {
+            tracing::warn!(
+                target: "whitenoise::accounts",
+                "Failed to clean up NIP-46 credentials during logout for {}: {}",
+                pubkey.to_hex(),
+                e
+            );
+        }
+
         Ok(())
     }
 
@@ -6214,5 +6569,453 @@ mod tests {
             !kp.is_empty(),
             "KeyPackage must be filled after publish_default_relays"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nip46_invalid_bunker_uri_produces_error() {
+        let result = NostrConnectURI::parse("not-a-bunker-uri");
+        assert!(result.is_err(), "Should fail on invalid URI scheme");
+    }
+
+    #[test]
+    fn nip46_valid_bunker_uri_parses() {
+        let uri_str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+        let uri = NostrConnectURI::parse(uri_str).expect("Valid bunker URI should parse");
+        assert!(uri.is_bunker());
+        assert!(uri.remote_signer_public_key().is_some());
+        assert_eq!(uri.relays().len(), 1);
+    }
+
+    #[test]
+    fn nip46_bunker_uri_roundtrips() {
+        let uri_str = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+        let uri = NostrConnectURI::parse(uri_str).unwrap();
+        let displayed = uri.to_string();
+        let reparsed = NostrConnectURI::parse(&displayed).expect("Roundtrip should succeed");
+        assert_eq!(
+            uri.remote_signer_public_key(),
+            reparsed.remote_signer_public_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_create_client_uri_has_correct_scheme() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let (app_keys, uri) =
+            whitenoise.create_nip46_client_uri(vec![relay_url.clone()], "Test App");
+
+        let uri_str = uri.to_string();
+        assert!(
+            uri_str.starts_with("nostrconnect://"),
+            "Client URI should start with nostrconnect://"
+        );
+        assert!(
+            uri_str.contains(&app_keys.public_key().to_hex()),
+            "Client URI should contain the app pubkey"
+        );
+        assert!(
+            uri_str.contains("relay.example.com"),
+            "Client URI should contain the relay URL"
+        );
+    }
+
+    #[test]
+    fn nip46_nostr_connect_signer_creation_fails_with_invalid_uri() {
+        let app_keys = Keys::generate();
+        // Construct a Client URI but pass it as if it were bunker — the NostrConnect
+        // constructor should reject it because the pubkey won't match the app_keys.
+        let different_keys = Keys::generate();
+        let uri = NostrConnectURI::client(
+            different_keys.public_key(),
+            vec![RelayUrl::parse("wss://relay.example.com").unwrap()],
+            "Test",
+        );
+        let result = NostrConnect::new(uri, app_keys, Duration::from_secs(10), None);
+        assert!(
+            result.is_err(),
+            "Should fail when client URI pubkey doesn't match app keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_create_client_uri_includes_multiple_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let relay1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
+        let relay2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
+        let (_app_keys, uri) =
+            whitenoise.create_nip46_client_uri(vec![relay1, relay2], "MultiRelay");
+
+        let uri_str = uri.to_string();
+        assert!(uri_str.contains("relay1.example.com"));
+        assert!(uri_str.contains("relay2.example.com"));
+    }
+
+    #[tokio::test]
+    async fn nip46_create_client_uri_generates_fresh_keys_each_time() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let relay = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+
+        let (keys1, _) = whitenoise.create_nip46_client_uri(relay.clone(), "App1");
+        let (keys2, _) = whitenoise.create_nip46_client_uri(relay, "App2");
+
+        assert_ne!(
+            keys1.public_key(),
+            keys2.public_key(),
+            "Each call should generate fresh app keys"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 logout / cancel_login credential cleanup
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nip46_logout_cleans_up_credentials() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Set up an external account and store NIP-46 credentials manually
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let account = whitenoise
+            .login_with_external_signer_for_test(keys.clone())
+            .await
+            .unwrap();
+
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://0000000000000000000000000000000000000000000000000000000000000000?relay=wss://relay.nsec.app";
+        whitenoise
+            .secrets_store
+            .store_nip46_credentials(&pubkey, app_keys.secret_key(), bunker_uri)
+            .unwrap();
+
+        // Verify credentials exist
+        assert!(
+            whitenoise
+                .secrets_store
+                .get_nip46_credentials(&pubkey)
+                .is_ok()
+        );
+
+        // Logout should clean up credentials
+        whitenoise.logout(&account.pubkey).await.unwrap();
+
+        // Verify credentials were removed
+        let result = whitenoise.secrets_store.get_nip46_credentials(&pubkey);
+        assert!(
+            result.is_err(),
+            "NIP-46 credentials should be removed after logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_logout_succeeds_without_credentials() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        // Set up an external account without any NIP-46 credentials (simulating NIP-55)
+        let keys = Keys::generate();
+        let account = whitenoise
+            .login_with_external_signer_for_test(keys.clone())
+            .await
+            .unwrap();
+
+        // Logout should still succeed — no-op for credential cleanup
+        let result = whitenoise.logout(&account.pubkey).await;
+        assert!(
+            result.is_ok(),
+            "Logout should succeed even when no NIP-46 credentials exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_cancel_login_removes_pending_credentials() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://deadbeef?relay=wss://relay.example.com".to_string();
+
+        // Simulate the state that login_nip46_start would create when
+        // returning NeedsRelayLists: a pending login + stashed credentials.
+        // We manually set up this state because calling login_nip46_start
+        // requires a real NIP-46 bunker.
+        whitenoise.pending_logins.insert(
+            pubkey,
+            super::DiscoveredRelayLists {
+                nip65: None,
+                inbox: None,
+                key_package: None,
+            },
+        );
+        whitenoise
+            .pending_nip46_credentials
+            .insert(pubkey, (bunker_uri.clone(), app_keys.clone()));
+
+        // Also create a partial account in DB (like login_nip46_start would)
+        let (account, _) = whitenoise
+            .setup_external_signer_account(pubkey)
+            .await
+            .unwrap();
+        account.save(&whitenoise.database).await.unwrap();
+
+        // Register a signer (login_nip46_start would do this)
+        whitenoise
+            .insert_external_signer(pubkey, keys.clone())
+            .await
+            .unwrap();
+
+        // Cancel the login
+        whitenoise.login_cancel(&pubkey).await.unwrap();
+
+        // Verify pending credentials were removed
+        assert!(
+            whitenoise.pending_nip46_credentials.get(&pubkey).is_none(),
+            "Pending NIP-46 credentials should be removed after cancel"
+        );
+
+        // Verify pending login was removed
+        assert!(
+            whitenoise.pending_logins.get(&pubkey).is_none(),
+            "Pending login should be removed after cancel"
+        );
+
+        // Verify external signer was removed
+        assert!(
+            whitenoise.get_external_signer(&pubkey).is_none(),
+            "External signer should be removed after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_cancel_login_noop_when_no_pending_login() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let pubkey = Keys::generate().public_key();
+
+        // Cancel without any pending login — should be a no-op
+        let result = whitenoise.login_cancel(&pubkey).await;
+        assert!(
+            result.is_ok(),
+            "cancel_login should succeed even with nothing pending"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 pending credentials lifecycle
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nip46_pending_credentials_stash_and_remove() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let pubkey = Keys::generate().public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://aabbccdd?relay=wss://relay.test".to_string();
+
+        // Stash credentials (like login_nip46_start → NeedsRelayLists)
+        whitenoise
+            .pending_nip46_credentials
+            .insert(pubkey, (bunker_uri.clone(), app_keys.clone()));
+
+        assert!(whitenoise.pending_nip46_credentials.get(&pubkey).is_some());
+
+        // Remove (like persist_pending_nip46_credentials_if_complete)
+        let removed = whitenoise.pending_nip46_credentials.remove(&pubkey);
+        assert!(removed.is_some());
+
+        let (_, (uri, keys)) = removed.unwrap();
+        assert_eq!(uri, bunker_uri);
+        assert_eq!(keys.public_key(), app_keys.public_key());
+
+        // Should be gone now
+        assert!(whitenoise.pending_nip46_credentials.get(&pubkey).is_none());
+    }
+
+    #[tokio::test]
+    async fn nip46_persist_pending_skips_when_not_complete() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let pubkey = Keys::generate().public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://aabbccdd?relay=wss://relay.test".to_string();
+
+        // Stash credentials
+        whitenoise
+            .pending_nip46_credentials
+            .insert(pubkey, (bunker_uri, app_keys));
+
+        // Simulate a NeedsRelayLists result
+        let result = LoginResult {
+            account: Account {
+                id: Some(1),
+                pubkey,
+                user_id: 1,
+                account_type: AccountType::External,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_synced_at: None,
+            },
+            status: LoginStatus::NeedsRelayLists,
+        };
+
+        // persist_pending should be a no-op since status != Complete
+        let persist_result = whitenoise
+            .persist_pending_nip46_credentials_if_complete(&pubkey, &result)
+            .await;
+        assert!(persist_result.is_ok());
+
+        // Credentials should still be stashed
+        assert!(
+            whitenoise.pending_nip46_credentials.get(&pubkey).is_some(),
+            "Credentials should remain stashed when login is not complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_persist_pending_persists_on_complete() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create and persist an external account so rollback won't fail
+        let account = whitenoise
+            .login_with_external_signer_for_test(keys.clone())
+            .await
+            .unwrap();
+
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://0000000000000000000000000000000000000000000000000000000000000000?relay=wss://relay.nsec.app".to_string();
+
+        // Stash credentials
+        whitenoise
+            .pending_nip46_credentials
+            .insert(pubkey, (bunker_uri.clone(), app_keys.clone()));
+
+        // Simulate a Complete result
+        let result = LoginResult {
+            account: account.clone(),
+            status: LoginStatus::Complete,
+        };
+
+        let persist_result = whitenoise
+            .persist_pending_nip46_credentials_if_complete(&pubkey, &result)
+            .await;
+        assert!(persist_result.is_ok());
+
+        // Credentials should be removed from pending
+        assert!(
+            whitenoise.pending_nip46_credentials.get(&pubkey).is_none(),
+            "Credentials should be removed from pending after persist"
+        );
+
+        // Credentials should now be in the keychain
+        let (retrieved_secret, retrieved_uri) = whitenoise
+            .secrets_store
+            .get_nip46_credentials(&pubkey)
+            .unwrap();
+        assert_eq!(retrieved_uri, bunker_uri);
+        assert_eq!(
+            retrieved_secret.to_secret_hex(),
+            app_keys.secret_key().to_secret_hex()
+        );
+    }
+
+    #[tokio::test]
+    async fn nip46_persist_pending_noop_when_nothing_stashed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let account = whitenoise
+            .login_with_external_signer_for_test(keys.clone())
+            .await
+            .unwrap();
+
+        // No credentials stashed — persist should be a silent no-op
+        let result = LoginResult {
+            account,
+            status: LoginStatus::Complete,
+        };
+
+        let persist_result = whitenoise
+            .persist_pending_nip46_credentials_if_complete(&pubkey, &result)
+            .await;
+        assert!(
+            persist_result.is_ok(),
+            "Should succeed silently when nothing was stashed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 store_nip46_credentials_or_rollback
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nip46_store_credentials_or_rollback_succeeds() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Create an account first (needed for potential rollback)
+        let _account = whitenoise
+            .login_with_external_signer_for_test(keys.clone())
+            .await
+            .unwrap();
+
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://0000000000000000000000000000000000000000000000000000000000000000?relay=wss://relay.nsec.app";
+
+        let result = whitenoise
+            .store_nip46_credentials_or_rollback(&pubkey, &app_keys, bunker_uri, true)
+            .await;
+        assert!(result.is_ok(), "Should store credentials successfully");
+
+        // Verify they're in the keychain
+        let (secret, uri) = whitenoise
+            .secrets_store
+            .get_nip46_credentials(&pubkey)
+            .unwrap();
+        assert_eq!(uri, bunker_uri);
+        assert_eq!(
+            secret.to_secret_hex(),
+            app_keys.secret_key().to_secret_hex()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NIP-46 error variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nip46_pubkey_mismatch_error_contains_both_keys() {
+        use crate::whitenoise::error::WhitenoiseError;
+
+        let pk1 = Keys::generate().public_key();
+        let pk2 = Keys::generate().public_key();
+
+        let err = WhitenoiseError::Nip46PubkeyMismatch {
+            expected: pk1,
+            got: pk2,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&pk1.to_hex()),
+            "Error should contain expected pubkey"
+        );
+        assert!(
+            msg.contains(&pk2.to_hex()),
+            "Error should contain got pubkey"
+        );
+        assert!(msg.contains("mismatch"), "Error should mention mismatch");
     }
 }

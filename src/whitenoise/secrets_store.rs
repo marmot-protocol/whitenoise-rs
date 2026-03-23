@@ -1,5 +1,5 @@
 use keyring_core::{Entry, Error as KeyringError};
-use nostr_sdk::{Keys, PublicKey};
+use nostr_sdk::{Keys, PublicKey, SecretKey};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,6 +18,16 @@ pub enum SecretsStoreError {
 
     #[error("Key not found")]
     KeyNotFound,
+
+    #[error("Malformed NIP-46 credentials in keychain: {0}")]
+    MalformedNip46Blob(String),
+}
+
+/// Shape of the JSON blob stored in the keychain for NIP-46 accounts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Nip46Payload {
+    app_secret_key: String,
+    bunker_uri: String,
 }
 
 pub struct SecretsStore {
@@ -120,6 +130,76 @@ impl SecretsStore {
         let hex_pubkey = pubkey.to_hex();
         let entry =
             Entry::new(&self.service_name, hex_pubkey.as_str()).map_err(map_keyring_error)?;
+
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(KeyringError::NoEntry) => Ok(()),
+            Err(e) => Err(map_keyring_error(e)),
+        }
+    }
+
+    /// Saves the NIP-46 app secret key and bunker URI for an account.
+    ///
+    /// Both values get packed into a single JSON blob and written to the
+    /// platform keychain. We need them later to rebuild the `NostrConnect`
+    /// signer when the app restarts — without them the user would have to
+    /// re-authorize every launch.
+    pub fn store_nip46_credentials(
+        &self,
+        account_pubkey: &PublicKey,
+        app_secret_key: &SecretKey,
+        bunker_uri: &str,
+    ) -> Result<(), SecretsStoreError> {
+        let entry_key = format!("nip46:{}", account_pubkey.to_hex());
+        let entry = Entry::new(&self.service_name, &entry_key).map_err(map_keyring_error)?;
+
+        let payload = Nip46Payload {
+            app_secret_key: app_secret_key.to_secret_hex(),
+            bunker_uri: bunker_uri.to_string(),
+        };
+
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| SecretsStoreError::MalformedNip46Blob(e.to_string()))?;
+
+        entry.set_password(&json).map_err(map_keyring_error)?;
+        Ok(())
+    }
+
+    /// Loads the NIP-46 app secret key and bunker URI for an account.
+    ///
+    /// Returns `(SecretKey, bunker_uri_string)`. If there aren't any NIP-46
+    /// credentials for this pubkey (the account is NIP-55 or uses local
+    /// keys), you'll get `SecretsStoreError::KeyNotFound`.
+    pub fn get_nip46_credentials(
+        &self,
+        account_pubkey: &PublicKey,
+    ) -> Result<(SecretKey, String), SecretsStoreError> {
+        let entry_key = format!("nip46:{}", account_pubkey.to_hex());
+        let entry = Entry::new(&self.service_name, &entry_key).map_err(map_keyring_error)?;
+
+        match entry.get_password() {
+            Ok(json_str) => {
+                let payload: Nip46Payload = serde_json::from_str(&json_str)
+                    .map_err(|e| SecretsStoreError::MalformedNip46Blob(e.to_string()))?;
+
+                let secret_key = SecretKey::parse(&payload.app_secret_key)?;
+                Ok((secret_key, payload.bunker_uri))
+            }
+            Err(KeyringError::NoEntry) => Err(SecretsStoreError::KeyNotFound),
+            Err(e) => Err(map_keyring_error(e)),
+        }
+    }
+
+    /// Deletes the NIP-46 app key and bunker URI for an account.
+    ///
+    /// Called during logout. If there's nothing to delete (NIP-55 account,
+    /// local keys, already cleaned up) it just returns `Ok(())`.
+    pub fn delete_nip46_credentials(
+        &self,
+        account_pubkey: &PublicKey,
+    ) -> Result<(), SecretsStoreError> {
+        let entry_key = format!("nip46:{}", account_pubkey.to_hex());
+        let entry = Entry::new(&self.service_name, &entry_key).map_err(map_keyring_error)?;
 
         match entry.delete_credential() {
             Ok(()) => Ok(()),
@@ -324,5 +404,175 @@ mod tests {
         // Key should still be retrievable
         let retrieved = secrets_store.get_nostr_keys_for_pubkey(&pubkey).unwrap();
         assert_eq!(retrieved.public_key(), pubkey);
+    }
+
+    #[test]
+    fn test_store_and_retrieve_nip46_credentials() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let account_pubkey = keys.public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+
+        secrets_store
+            .store_nip46_credentials(&account_pubkey, app_keys.secret_key(), bunker_uri)
+            .unwrap();
+
+        let (retrieved_secret, retrieved_uri) = secrets_store
+            .get_nip46_credentials(&account_pubkey)
+            .unwrap();
+
+        assert_eq!(
+            retrieved_secret.to_secret_hex(),
+            app_keys.secret_key().to_secret_hex()
+        );
+        assert_eq!(retrieved_uri, bunker_uri);
+
+        // Clean up
+        secrets_store
+            .delete_nip46_credentials(&account_pubkey)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_get_nonexistent_nip46_credentials() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let result = secrets_store.get_nip46_credentials(&pubkey);
+        assert!(matches!(result, Err(SecretsStoreError::KeyNotFound)));
+    }
+
+    #[test]
+    fn test_delete_nip46_credentials_idempotent() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Deleting nonexistent credentials should succeed
+        let result = secrets_store.delete_nip46_credentials(&pubkey);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_delete_nip46_credentials_removes_entry() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let account_pubkey = keys.public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+
+        secrets_store
+            .store_nip46_credentials(&account_pubkey, app_keys.secret_key(), bunker_uri)
+            .unwrap();
+
+        secrets_store
+            .delete_nip46_credentials(&account_pubkey)
+            .unwrap();
+
+        let result = secrets_store.get_nip46_credentials(&account_pubkey);
+        assert!(matches!(result, Err(SecretsStoreError::KeyNotFound)));
+    }
+
+    #[test]
+    fn test_nip46_credentials_isolated_from_private_keys() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let app_keys = Keys::generate();
+        let bunker_uri = "bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app";
+
+        // Store both a private key and NIP-46 credentials for the same pubkey
+        secrets_store.store_private_key(&keys).unwrap();
+        secrets_store
+            .store_nip46_credentials(&pubkey, app_keys.secret_key(), bunker_uri)
+            .unwrap();
+
+        // Deleting private key should not affect NIP-46 credentials
+        secrets_store
+            .remove_private_key_for_pubkey(&pubkey)
+            .unwrap();
+        let (retrieved_secret, _) = secrets_store.get_nip46_credentials(&pubkey).unwrap();
+        assert_eq!(
+            retrieved_secret.to_secret_hex(),
+            app_keys.secret_key().to_secret_hex()
+        );
+
+        // Deleting NIP-46 credentials should not affect a re-stored private key
+        secrets_store.store_private_key(&keys).unwrap();
+        secrets_store.delete_nip46_credentials(&pubkey).unwrap();
+        let retrieved_keys = secrets_store.get_nostr_keys_for_pubkey(&pubkey).unwrap();
+        assert_eq!(retrieved_keys.public_key(), pubkey);
+    }
+
+    #[test]
+    fn test_get_nip46_credentials_rejects_malformed_json() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Write garbage JSON directly to the keychain entry
+        let entry_key = format!("nip46:{}", pubkey.to_hex());
+        let entry = Entry::new(&secrets_store.service_name, &entry_key).unwrap();
+        entry.set_password("not-valid-json").unwrap();
+
+        let result = secrets_store.get_nip46_credentials(&pubkey);
+        assert!(
+            matches!(result, Err(SecretsStoreError::MalformedNip46Blob(_))),
+            "Should return MalformedNip46Blob for invalid JSON, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_get_nip46_credentials_rejects_invalid_secret_key() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        // Write valid JSON but with an invalid secret key hex
+        let entry_key = format!("nip46:{}", pubkey.to_hex());
+        let entry = Entry::new(&secrets_store.service_name, &entry_key).unwrap();
+        let payload = serde_json::json!({
+            "app_secret_key": "not-a-valid-hex-secret-key",
+            "bunker_uri": "bunker://deadbeef?relay=wss://relay.test"
+        });
+        entry.set_password(&payload.to_string()).unwrap();
+
+        let result = secrets_store.get_nip46_credentials(&pubkey);
+        assert!(
+            result.is_err(),
+            "Should reject credentials with invalid secret key hex"
+        );
+    }
+
+    #[test]
+    fn test_store_nip46_credentials_overwrites_existing() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+
+        let app_keys_1 = Keys::generate();
+        let bunker_uri_1 = "bunker://aaaa?relay=wss://relay1.test";
+        secrets_store
+            .store_nip46_credentials(&pubkey, app_keys_1.secret_key(), bunker_uri_1)
+            .unwrap();
+
+        // Overwrite with different credentials
+        let app_keys_2 = Keys::generate();
+        let bunker_uri_2 = "bunker://bbbb?relay=wss://relay2.test";
+        secrets_store
+            .store_nip46_credentials(&pubkey, app_keys_2.secret_key(), bunker_uri_2)
+            .unwrap();
+
+        let (retrieved_secret, retrieved_uri) =
+            secrets_store.get_nip46_credentials(&pubkey).unwrap();
+        assert_eq!(retrieved_uri, bunker_uri_2, "Should return updated URI");
+        assert_eq!(
+            retrieved_secret.to_secret_hex(),
+            app_keys_2.secret_key().to_secret_hex(),
+            "Should return updated secret key"
+        );
     }
 }
