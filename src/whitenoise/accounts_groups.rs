@@ -191,15 +191,27 @@ impl AccountGroup {
         Ok(updated)
     }
 
-    /// Marks this group as removed by setting removed_at to the current time.
+    /// Marks this group as removed atomically.
+    ///
+    /// Uses a conditional `UPDATE … WHERE removed_at IS NULL` so that concurrent
+    /// calls are safe: only the first writer updates the row and triggers a stream
+    /// emit; subsequent calls see `None` and skip the emit.
+    ///
+    /// Also sets `user_confirmation = true` so that a pending invite whose removal
+    /// commit arrives before the user accepts is no longer surfaced as a pending
+    /// invite after removal.
+    ///
+    /// Returns `Some(updated)` when the row was changed, `None` when it was already
+    /// marked removed.
     #[perf_instrument("account_groups")]
     pub(crate) async fn mark_removed(
         &self,
         whitenoise: &Whitenoise,
-    ) -> Result<Self, WhitenoiseError> {
+    ) -> Result<Option<Self>, WhitenoiseError> {
         let updated = self
-            .update_removed_at(Some(Utc::now()), &whitenoise.database)
-            .await?;
+            .mark_removed_atomic(&whitenoise.database)
+            .await
+            .map_err(WhitenoiseError::from)?;
         Ok(updated)
     }
 }
@@ -401,11 +413,12 @@ impl Whitenoise {
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
-        if account_group.is_removed() {
+        // mark_removed is atomic: returns Some only when the row was actually changed.
+        // If it returns None the group was already removed — skip the emit so
+        // concurrent callers never produce a duplicate stream event.
+        let Some(updated) = account_group.mark_removed(self).await? else {
             return Ok(account_group);
-        }
-
-        let updated = account_group.mark_removed(self).await?;
+        };
 
         self.emit_chat_list_update(
             account,
@@ -1382,10 +1395,17 @@ mod tests {
 
         assert!(!ag.is_removed());
 
-        let removed = ag.mark_removed(&whitenoise).await.unwrap();
+        let removed = ag
+            .mark_removed(&whitenoise)
+            .await
+            .unwrap()
+            .expect("first mark_removed must update the row");
 
         assert!(removed.is_removed());
         assert!(removed.removed_at.is_some());
+        // user_confirmation must be set to true — a pending invite that gets a
+        // removal commit before the user accepts must not surface as pending
+        assert_eq!(removed.user_confirmation, Some(true));
     }
 
     #[tokio::test]
@@ -1398,9 +1418,13 @@ mod tests {
             .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
-        let first = ag.mark_removed(&whitenoise).await.unwrap();
+        let first = ag
+            .mark_removed(&whitenoise)
+            .await
+            .unwrap()
+            .expect("first mark_removed must update the row");
 
-        // Second call must return the existing state unchanged
+        // Second call via mark_as_removed must be a no-op (atomic WHERE removed_at IS NULL)
         let second = whitenoise
             .mark_as_removed(&account, &group_id)
             .await
@@ -1419,7 +1443,11 @@ mod tests {
             .get_or_create_account_group(&account, &group_id, None)
             .await
             .unwrap();
-        let removed = ag.mark_removed(&whitenoise).await.unwrap();
+        let removed = ag
+            .mark_removed(&whitenoise)
+            .await
+            .unwrap()
+            .expect("first mark_removed must update the row");
 
         // Removed groups must still be visible — they stay in the chat list
         // until the user explicitly archives or deletes them
@@ -1439,7 +1467,7 @@ mod tests {
             .unwrap();
 
         // Mark as removed
-        ag.mark_removed(&whitenoise).await.unwrap();
+        ag.mark_removed(&whitenoise).await.unwrap().unwrap();
 
         // Simulate a giftwrap re-processing: save() must NOT overwrite removed_at
         let re_save = AccountGroup {

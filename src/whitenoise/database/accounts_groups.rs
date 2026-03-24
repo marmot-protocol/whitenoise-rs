@@ -397,6 +397,40 @@ impl AccountGroup {
         Ok(row.into())
     }
 
+    /// Atomically marks this AccountGroup as removed, only when it has not already
+    /// been marked removed.
+    ///
+    /// Sets `removed_at` and `user_confirmation = true` in a single `UPDATE … WHERE
+    /// removed_at IS NULL` statement, eliminating the check-then-update race that
+    /// could otherwise cause double stream emissions. The `user_confirmation` is set
+    /// to ensure that a pending invite whose admin removal arrives before the user
+    /// accepts no longer appears as a pending invite after removal.
+    ///
+    /// Returns the updated `AccountGroup` if the row was changed, or `None` if it
+    /// was already marked removed (the caller must not re-emit in that case).
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn mark_removed_atomic(
+        &self,
+        database: &Database,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET removed_at = ?, user_confirmation = 1, updated_at = ?
+             WHERE id = ? AND removed_at IS NULL
+             RETURNING *",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(id)
+        .fetch_optional(&database.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
     /// Atomically updates last_read_message_id only if the new message is newer.
     ///
     /// Returns `Some(updated)` if the update was applied, `None` if skipped

@@ -551,8 +551,13 @@ impl Whitenoise {
                         }
                     }
                     ChatListUpdateTrigger::RemovedFromGroup => {
-                        // Removed groups stay in the active list (read-only) — active only
-                        if has_active {
+                        // Route by archive status — a group can be removed while already
+                        // archived, in which case the update must reach the archived stream.
+                        if update.item.archived_at.is_some() {
+                            if has_archived {
+                                self.archived_chat_list_stream_manager.emit(pubkey, update);
+                            }
+                        } else if has_active {
                             self.chat_list_stream_manager.emit(pubkey, update);
                         }
                     }

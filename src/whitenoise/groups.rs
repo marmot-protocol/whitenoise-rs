@@ -394,14 +394,19 @@ impl Whitenoise {
             .map(|ag| (ag.mls_group_id.clone(), ag))
             .collect();
 
-        // Pair each visible MDK group with its membership record
+        // Pair each visible MDK group with its membership record.
+        // Inactive MDK groups are only included when the membership is explicitly
+        // marked removed — this prevents unrelated inactive groups (e.g. stale MDK
+        // state) from silently reappearing in the chat list.
         Ok(all_groups
             .into_iter()
             .filter_map(|group| {
-                memberships_by_id
-                    .get(&group.mls_group_id)
-                    .cloned()
-                    .map(|membership| GroupWithMembership { group, membership })
+                let membership = memberships_by_id.get(&group.mls_group_id)?.clone();
+                if group.state == group_types::GroupState::Active || membership.is_removed() {
+                    Some(GroupWithMembership { group, membership })
+                } else {
+                    None
+                }
             })
             .collect())
     }
