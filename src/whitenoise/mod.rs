@@ -1600,19 +1600,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_is_global_subscriptions_operational_no_subscriptions() {
+        async fn test_is_global_subscriptions_operational_no_accounts_is_healthy() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-            // No global subscriptions set up in fresh instance
+            // Zero accounts with zero subscriptions is the correct state — healthy.
             let is_operational = whitenoise
                 .is_global_subscriptions_operational()
                 .await
                 .unwrap();
 
-            // Should return false when no global subscriptions exist
             assert!(
-                !is_operational,
-                "Global subscriptions should not be operational without setup"
+                is_operational,
+                "Zero accounts with zero subscriptions should be considered healthy"
             );
         }
     }
@@ -1723,6 +1722,9 @@ mod tests {
             let account1 = whitenoise.create_identity().await.unwrap();
             let account2 = whitenoise.create_identity().await.unwrap();
             let account3 = whitenoise.create_identity().await.unwrap();
+
+            // Flush fire-and-forget rebuild (worker handles this in production)
+            whitenoise.sync_discovery_subscriptions().await.unwrap();
 
             // First call - ensure all subscriptions work
             whitenoise.ensure_all_subscriptions().await.unwrap();
