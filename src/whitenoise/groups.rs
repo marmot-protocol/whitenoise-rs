@@ -359,11 +359,17 @@ impl Whitenoise {
         Ok(groups)
     }
 
-    /// Returns only visible groups for the account (pending + accepted, excluding declined)
+    /// Returns visible groups for the account (pending + accepted + removed, excluding declined).
     ///
-    /// This method filters out groups that the user has explicitly declined.
-    /// It retrieves all active MLS groups and pairs them with their `AccountGroup`
-    /// records, allowing callers to check confirmation status without additional queries.
+    /// `AccountGroup` is the source of truth for visibility:
+    /// - **Pending** (`user_confirmation = NULL`) — invited, not yet accepted
+    /// - **Accepted** (`user_confirmation = true`) — active member
+    /// - **Removed** (`user_confirmation = true`, `removed_at IS NOT NULL`) — kicked by admin;
+    ///   group stays visible (read-only) until the user explicitly archives or deletes it
+    /// - **Declined** (`user_confirmation = false`) — hidden, never shown
+    ///
+    /// All MDK groups (including inactive) are fetched so that removed groups, which MDK
+    /// marks as `Inactive`, are still paired with their `AccountGroup` records and returned.
     ///
     /// # Arguments
     /// * `account` - The account to get visible groups for
@@ -373,9 +379,12 @@ impl Whitenoise {
     /// * `Err(WhitenoiseError)` - If there's an error accessing storage
     #[perf_instrument("groups")]
     pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
-        let all_active_groups = self.groups(account, true).await?;
+        // Fetch all MDK groups (including inactive) — AccountGroup is the source of
+        // truth for visibility. Removed groups (inactive in MDK but with a removed_at
+        // record) must remain visible in the chat list until the user archives them.
+        let all_groups = self.groups(account, false).await?;
 
-        // Get visible AccountGroup records (pending + accepted)
+        // Get visible AccountGroup records (pending + accepted, including removed)
         let visible_account_groups =
             AccountGroup::visible_for_account(self, &account.pubkey).await?;
 
@@ -386,7 +395,7 @@ impl Whitenoise {
             .collect();
 
         // Pair each visible MDK group with its membership record
-        Ok(all_active_groups
+        Ok(all_groups
             .into_iter()
             .filter_map(|group| {
                 memberships_by_id

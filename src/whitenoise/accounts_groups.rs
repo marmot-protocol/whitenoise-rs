@@ -38,16 +38,29 @@ pub struct AccountGroup {
     /// - `None` = not archived (active in chat list)
     /// - `Some(timestamp)` = archived at that time (hidden from main chat list)
     pub archived_at: Option<DateTime<Utc>>,
+    /// When this account was removed from the group by an admin.
+    /// - `None` = not removed (still an active member)
+    /// - `Some(timestamp)` = removed at that time (group is read-only, visible
+    ///   in the chat list until the user explicitly archives or deletes it)
+    pub removed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl AccountGroup {
     /// Returns true if this group should be visible to the user.
-    /// Visible means: pending (NULL) or accepted (true).
-    /// Declined groups (false) are hidden.
+    /// Visible means: pending (NULL), accepted (true), or removed (accepted but
+    /// with `removed_at` set — group stays in the list read-only until archived).
+    /// Declined groups (false) are always hidden.
     pub fn is_visible(&self) -> bool {
         self.user_confirmation != Some(false)
+    }
+
+    /// Returns true if this account was involuntarily removed from the group by
+    /// an admin. Removed groups remain visible in the chat list (read-only) until
+    /// the user explicitly archives or deletes them.
+    pub fn is_removed(&self) -> bool {
+        self.removed_at.is_some()
     }
 
     /// Returns true if this group is pending user confirmation.
@@ -175,6 +188,18 @@ impl AccountGroup {
     #[perf_instrument("account_groups")]
     pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self.update_archived_at(None, &whitenoise.database).await?;
+        Ok(updated)
+    }
+
+    /// Marks this group as removed by setting removed_at to the current time.
+    #[perf_instrument("account_groups")]
+    pub(crate) async fn mark_removed(
+        &self,
+        whitenoise: &Whitenoise,
+    ) -> Result<Self, WhitenoiseError> {
+        let updated = self
+            .update_removed_at(Some(Utc::now()), &whitenoise.database)
+            .await?;
         Ok(updated)
     }
 }
@@ -355,6 +380,40 @@ impl Whitenoise {
             ChatListUpdateTrigger::ChatArchiveChanged,
         )
         .await;
+        Ok(updated)
+    }
+
+    /// Marks a group as removed for the given account.
+    ///
+    /// Called when an MLS removal commit is processed and the current account is
+    /// no longer an active member of the group. The group is kept visible in the
+    /// active chat list (read-only) until the user explicitly archives or deletes it.
+    ///
+    /// Idempotent: if already marked as removed, returns the existing state unchanged.
+    /// Emits a `RemovedFromGroup` stream event so the UI updates in real time.
+    #[perf_instrument("account_groups")]
+    pub(crate) async fn mark_as_removed(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        if account_group.is_removed() {
+            return Ok(account_group);
+        }
+
+        let updated = account_group.mark_removed(self).await?;
+
+        self.emit_chat_list_update(
+            account,
+            mls_group_id,
+            ChatListUpdateTrigger::RemovedFromGroup,
+        )
+        .await;
+
         Ok(updated)
     }
 
@@ -1293,5 +1352,121 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_is_removed_false_by_default() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[100; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(!ag.is_removed());
+        assert!(ag.removed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mark_removed_sets_removed_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[101; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(!ag.is_removed());
+
+        let removed = ag.mark_removed(&whitenoise).await.unwrap();
+
+        assert!(removed.is_removed());
+        assert!(removed.removed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_removed_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[102; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+        let first = ag.mark_removed(&whitenoise).await.unwrap();
+
+        // Second call must return the existing state unchanged
+        let second = whitenoise
+            .mark_as_removed(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(first.removed_at, second.removed_at);
+    }
+
+    #[tokio::test]
+    async fn test_removed_group_is_still_visible() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[103; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+        let removed = ag.mark_removed(&whitenoise).await.unwrap();
+
+        // Removed groups must still be visible — they stay in the chat list
+        // until the user explicitly archives or deletes them
+        assert!(removed.is_visible());
+        assert!(removed.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_removed_at_persists_through_save() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[104; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Mark as removed
+        ag.mark_removed(&whitenoise).await.unwrap();
+
+        // Simulate a giftwrap re-processing: save() must NOT overwrite removed_at
+        let re_save = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        re_save.save(&whitenoise.database).await.unwrap();
+
+        // Fetch and confirm removed_at survived
+        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            found.is_removed(),
+            "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
+        );
     }
 }

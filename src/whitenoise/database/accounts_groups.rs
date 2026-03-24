@@ -21,6 +21,7 @@ struct AccountGroupRow {
     pin_order: Option<i64>,
     dm_peer_pubkey: Option<PublicKey>,
     archived_at: Option<DateTime<Utc>>,
+    removed_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -71,6 +72,7 @@ where
         };
 
         let archived_at = parse_optional_timestamp(row, "archived_at")?;
+        let removed_at = parse_optional_timestamp(row, "removed_at")?;
 
         // Parse pubkey from hex string
         let account_pubkey =
@@ -113,6 +115,7 @@ where
             pin_order,
             dm_peer_pubkey,
             archived_at,
+            removed_at,
             created_at,
             updated_at,
         })
@@ -131,6 +134,7 @@ impl From<AccountGroupRow> for AccountGroup {
             pin_order: row.pin_order,
             dm_peer_pubkey: row.dm_peer_pubkey,
             archived_at: row.archived_at,
+            removed_at: row.removed_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -289,6 +293,8 @@ impl AccountGroup {
                pin_order = excluded.pin_order,
                -- archived_at is intentionally excluded: archive/unarchive use
                -- update_archived_at() so save() never clobbers user preference.
+               -- removed_at is intentionally excluded: removal is set by
+               -- update_removed_at() when an admin removal commit is detected.
                -- Write-once: preserve existing dm_peer_pubkey if already set.
                -- Many code paths construct AccountGroup without knowing the DM peer,
                -- so we only fill this on first write and never overwrite a correct
@@ -354,6 +360,35 @@ impl AccountGroup {
              RETURNING *",
         )
         .bind(archived_at.map(|dt| dt.timestamp_millis()))
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Updates the removed_at timestamp for this AccountGroup.
+    ///
+    /// Called when an MLS removal commit is processed and the current account is
+    /// no longer an active member of the group. The group remains visible in the
+    /// chat list (read-only) until the user explicitly archives or deletes it.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn update_removed_at(
+        &self,
+        removed_at: Option<DateTime<Utc>>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET removed_at = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(removed_at.map(|dt| dt.timestamp_millis()))
         .bind(now_ms)
         .bind(id)
         .fetch_one(&database.pool)
@@ -841,6 +876,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -873,6 +909,7 @@ mod tests {
             pin_order: Some(100),
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -892,6 +929,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -932,6 +970,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1548,5 +1587,135 @@ mod tests {
         .unwrap();
 
         assert_eq!(found.dm_peer_pubkey, Some(original_peer.pubkey));
+    }
+
+    #[tokio::test]
+    async fn test_update_removed_at_sets_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[80; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(account_group.removed_at.is_none());
+
+        let now = Utc::now();
+        let updated = account_group
+            .update_removed_at(Some(now), &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(updated.removed_at.is_some());
+        assert!(updated.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_update_removed_at_clears_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[81; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Set removed
+        let removed = account_group
+            .update_removed_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(removed.is_removed());
+
+        // Clear removed
+        let cleared = removed
+            .update_removed_at(None, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(cleared.removed_at.is_none());
+        assert!(!cleared.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_update_removed_at_persists() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[82; 32]);
+
+        let (account_group, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        account_group
+            .update_removed_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Fetch again and verify persistence
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(found.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_save_does_not_overwrite_removed_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[83; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Mark as removed
+        let removed = ag
+            .update_removed_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(removed.is_removed());
+
+        // Re-save via save() with removed_at = None — simulates giftwrap re-processing
+        let resaved = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        resaved.save(&whitenoise.database).await.unwrap();
+
+        // Fetch and verify removed_at survived
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            found.is_removed(),
+            "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
+        );
     }
 }

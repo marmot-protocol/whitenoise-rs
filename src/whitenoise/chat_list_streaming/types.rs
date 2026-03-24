@@ -12,6 +12,11 @@ pub enum ChatListUpdateTrigger {
     /// `archived_at` field indicates direction: `Some` = archived, `None` = unarchived.
     /// Emitted to both active and archived channels so each can add/remove accordingly.
     ChatArchiveChanged,
+    /// The account was involuntarily removed from this group by an admin.
+    /// The group stays in the active chat list (read-only) until the user
+    /// explicitly archives or deletes it. The item's `removed_at` field is set.
+    /// Emitted only to the active channel.
+    RemovedFromGroup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +51,7 @@ mod tests {
             ChatListUpdateTrigger::NewLastMessage,
             ChatListUpdateTrigger::LastMessageDeleted,
             ChatListUpdateTrigger::ChatArchiveChanged,
+            ChatListUpdateTrigger::RemovedFromGroup,
         ];
 
         for trigger in triggers {
@@ -69,5 +75,8 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatArchiveChanged);
         assert!(debug_str.contains("ChatArchiveChanged"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::RemovedFromGroup);
+        assert!(debug_str.contains("RemovedFromGroup"));
     }
 }

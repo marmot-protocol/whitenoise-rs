@@ -73,6 +73,12 @@ pub struct ChatListItem {
     /// - `None` = active (shown in main chat list)
     /// - `Some(timestamp)` = archived (hidden from main chat list)
     pub archived_at: Option<DateTime<Utc>>,
+
+    /// When this account was removed from the group by an admin, if at all.
+    /// - `None` = still an active member
+    /// - `Some(timestamp)` = removed; group is read-only and stays in the chat
+    ///   list until the user explicitly archives or deletes it
+    pub removed_at: Option<DateTime<Utc>>,
 }
 
 impl ChatListItem {
@@ -193,6 +199,7 @@ fn assemble_chat_list_items(
             let unread_count = *unread_counts.get(&group.mls_group_id).unwrap_or(&0);
             let pin_order = account_group.pin_order;
             let archived_at = account_group.archived_at;
+            let removed_at = account_group.removed_at;
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -208,6 +215,7 @@ fn assemble_chat_list_items(
                 pin_order,
                 dm_peer_pubkey,
                 archived_at,
+                removed_at,
             })
         })
         .collect()
@@ -405,9 +413,10 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order and archived_at
+        // 9. Get pin order, archived_at, and removed_at
         let pin_order = account_group.pin_order;
         let archived_at = account_group.archived_at;
+        let removed_at = account_group.removed_at;
 
         // 10. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
@@ -424,6 +433,7 @@ impl Whitenoise {
             pin_order,
             dm_peer_pubkey,
             archived_at,
+            removed_at,
         }))
     }
 
@@ -538,6 +548,12 @@ impl Whitenoise {
                         }
                         if has_archived {
                             self.archived_chat_list_stream_manager.emit(pubkey, update);
+                        }
+                    }
+                    ChatListUpdateTrigger::RemovedFromGroup => {
+                        // Removed groups stay in the active list (read-only) — active only
+                        if has_active {
+                            self.chat_list_stream_manager.emit(pubkey, update);
                         }
                     }
                     _ => {
@@ -1402,6 +1418,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1417,6 +1434,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1432,6 +1450,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
@@ -1475,6 +1494,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1498,6 +1518,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1521,6 +1542,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
@@ -1634,6 +1656,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1649,6 +1672,7 @@ mod tests {
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
@@ -1680,6 +1704,7 @@ mod tests {
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1695,6 +1720,7 @@ mod tests {
                 pin_order: Some(50),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1710,6 +1736,7 @@ mod tests {
                 pin_order: Some(200),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
@@ -1743,6 +1770,7 @@ mod tests {
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1758,6 +1786,7 @@ mod tests {
                 pin_order: Some(100),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
@@ -1790,6 +1819,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1805,6 +1835,7 @@ mod tests {
                 pin_order: Some(10),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1820,6 +1851,7 @@ mod tests {
                 pin_order: None,
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[4u8; 32]),
@@ -1835,6 +1867,7 @@ mod tests {
                 pin_order: Some(20),
                 dm_peer_pubkey: None,
                 archived_at: None,
+                removed_at: None,
             },
         ];
 
