@@ -55,63 +55,54 @@ pub struct IterationDetail {
 /// Aggregated statistics for a single perf marker across many observations.
 #[derive(Debug, Clone, Serialize)]
 pub struct PerfBreakdown {
-    /// Marker name.
-    #[serde(rename = "name")]
-    pub marker: String,
+    /// Marker name (e.g. `"messages::send_message_to_group"`).
+    pub name: String,
     /// Number of observations.
     pub call_count: u64,
     /// Exact total duration (sum of all samples).
-    #[serde(
-        rename = "total_ns",
-        serialize_with = "super::serde_duration::as_nanos"
-    )]
-    pub total_duration: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub total_ns: Duration,
     /// Mean duration.
-    #[serde(rename = "mean_ns", serialize_with = "super::serde_duration::as_nanos")]
-    pub mean: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub mean_ns: Duration,
     /// Median duration.
-    #[serde(
-        rename = "median_ns",
-        serialize_with = "super::serde_duration::as_nanos"
-    )]
-    pub median: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub median_ns: Duration,
     /// 95th-percentile duration.
-    #[serde(rename = "p95_ns", serialize_with = "super::serde_duration::as_nanos")]
-    pub p95: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub p95_ns: Duration,
     /// 99th-percentile duration.
-    #[serde(rename = "p99_ns", serialize_with = "super::serde_duration::as_nanos")]
-    pub p99: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub p99_ns: Duration,
     /// Minimum observed duration.
-    #[serde(rename = "min_ns", serialize_with = "super::serde_duration::as_nanos")]
-    pub min: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub min_ns: Duration,
     /// Maximum observed duration.
-    #[serde(rename = "max_ns", serialize_with = "super::serde_duration::as_nanos")]
-    pub max: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub max_ns: Duration,
 }
 
 impl PerfBreakdown {
-    fn from_samples(marker: String, mut samples: Vec<Duration>) -> Self {
+    fn from_samples(name: String, mut samples: Vec<Duration>) -> Self {
         let call_count = samples.len() as u64;
-        let total_duration: Duration = samples.iter().sum();
-        let mean = stats::calculate_mean(&samples);
-        // calculate_median sorts in place; p95/p99 re-sort the now-sorted slice (O(n)).
-        // first()/last() for min/max rely on the sort done by calculate_median.
-        let median = stats::calculate_median(&mut samples);
-        let p95 = stats::calculate_percentile(&mut samples, 0.95);
-        let p99 = stats::calculate_percentile(&mut samples, 0.99);
-        let min = *samples.first().unwrap_or(&Duration::ZERO);
-        let max = *samples.last().unwrap_or(&Duration::ZERO);
+        let total_ns: Duration = samples.iter().sum();
+        let mean_ns = stats::calculate_mean(&samples);
+        let min_ns = samples.iter().copied().min().unwrap_or(Duration::ZERO);
+        let max_ns = samples.iter().copied().max().unwrap_or(Duration::ZERO);
+        let median_ns = stats::calculate_median(&mut samples);
+        let p95_ns = stats::calculate_percentile(&mut samples, 0.95);
+        let p99_ns = stats::calculate_percentile(&mut samples, 0.99);
 
         Self {
-            marker,
+            name,
             call_count,
-            total_duration,
-            mean,
-            median,
-            p95,
-            p99,
-            min,
-            max,
+            total_ns,
+            mean_ns,
+            median_ns,
+            p95_ns,
+            p99_ns,
+            min_ns,
+            max_ns,
         }
     }
 }
@@ -206,7 +197,7 @@ impl PerfTracingLayer {
             .collect();
 
         // Hottest markers (most total time) first
-        breakdowns.sort_by(|a, b| b.total_duration.cmp(&a.total_duration));
+        breakdowns.sort_by(|a, b| b.total_ns.cmp(&a.total_ns));
         breakdowns
     }
 

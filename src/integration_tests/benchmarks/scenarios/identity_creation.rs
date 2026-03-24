@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::WhitenoiseError;
-use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
+use crate::integration_tests::benchmarks::core::json_output::{CiTier, ScenarioThresholds};
 use crate::integration_tests::benchmarks::test_cases::CreateIdentityBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::ScenarioContext;
@@ -60,7 +60,7 @@ impl BenchmarkScenario for IdentityCreationBenchmark {
             warn_pct: 5,
             regress_pct: 10,
             break_pct: 20,
-            ci_tier: "stable",
+            ci_tier: CiTier::Stable,
         }
     }
 

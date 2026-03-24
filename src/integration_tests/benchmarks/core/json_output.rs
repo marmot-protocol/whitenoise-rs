@@ -1,6 +1,31 @@
+use std::fmt;
+
 use serde::Serialize;
 
 use super::benchmark_result::BenchmarkResult;
+
+/// CI tier classification for benchmark scenarios.
+///
+/// Determines how `bench_compare` treats regressions:
+/// - `Stable`: merge-gating — regressions block the PR.
+/// - `Relay`: informational — regressions are reported but never block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CiTier {
+    Stable,
+    Relay,
+    Unknown,
+}
+
+impl fmt::Display for CiTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CiTier::Stable => write!(f, "stable"),
+            CiTier::Relay => write!(f, "relay"),
+            CiTier::Unknown => write!(f, "unknown"),
+        }
+    }
+}
 
 /// Per-scenario threshold configuration for regression detection.
 #[derive(Debug, Clone, Serialize)]
@@ -8,7 +33,7 @@ pub struct ScenarioThresholds {
     pub warn_pct: u32,
     pub regress_pct: u32,
     pub break_pct: u32,
-    pub ci_tier: &'static str,
+    pub ci_tier: CiTier,
 }
 
 impl Default for ScenarioThresholds {
@@ -17,7 +42,7 @@ impl Default for ScenarioThresholds {
             warn_pct: 10,
             regress_pct: 20,
             break_pct: 40,
-            ci_tier: "unknown",
+            ci_tier: CiTier::Unknown,
         }
     }
 }

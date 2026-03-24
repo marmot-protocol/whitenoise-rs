@@ -197,12 +197,22 @@ fn compare_scenario(
         });
     }
 
-    // Span breakdowns
+    // Span breakdowns (only available in aggregate mode, not --detailed)
     let mut spans = Vec::new();
-    if let (Some(b_spans), Some(c_spans)) = (
-        baseline.get("perf_breakdown").and_then(|v| v.as_array()),
-        candidate.get("perf_breakdown").and_then(|v| v.as_array()),
-    ) {
+    let b_breakdown = baseline.get("perf_breakdown").and_then(|v| v.as_array());
+    let c_breakdown = candidate.get("perf_breakdown").and_then(|v| v.as_array());
+    if b_breakdown.is_none() || c_breakdown.is_none() {
+        eprintln!(
+            "WARNING: perf_breakdown absent from {} for scenario '{}' — span comparisons skipped",
+            if b_breakdown.is_none() {
+                "baseline"
+            } else {
+                "candidate"
+            },
+            name,
+        );
+    }
+    if let (Some(b_spans), Some(c_spans)) = (b_breakdown, c_breakdown) {
         for b_span in b_spans {
             let span_name = get_str(b_span, "name");
             let Some(c_span) = c_spans.iter().find(|s| get_str(s, "name") == span_name) else {
@@ -263,7 +273,9 @@ fn print_comparison(output: &ComparisonOutput) {
 
         for m in &sc.metrics {
             if m.metric == "total_duration_ns" {
-                continue; // skip total; mean/p95/p99/throughput are more useful
+                // Human-readable output only: total_duration_ns is redundant with
+                // mean/p95/p99/throughput. The JSON output still includes it.
+                continue;
             }
             let sign = if m.delta_pct >= 0.0 { "+" } else { "" };
             if m.metric == "throughput_ops_sec" {

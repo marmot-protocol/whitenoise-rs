@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nostr_sdk::PublicKey;
 
-use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
+use crate::integration_tests::benchmarks::core::json_output::{CiTier, ScenarioThresholds};
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkResult, BenchmarkScenario};
 use crate::integration_tests::core::ScenarioContext;
 use crate::whitenoise::user_search::UserSearchParams;
@@ -61,7 +61,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             warn_pct: 15,
             regress_pct: 30,
             break_pct: 50,
-            ci_tier: "relay",
+            ci_tier: CiTier::Relay,
         }
     }
 

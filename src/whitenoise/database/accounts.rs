@@ -1005,7 +1005,7 @@ mod tests {
 
         // Create test users that will be followers
         let mut test_users = Vec::new();
-        let user_metadata_vec = vec![
+        let user_metadata_vec = [
             nostr_sdk::Metadata::new()
                 .name("Alice")
                 .display_name("Alice Wonderland")

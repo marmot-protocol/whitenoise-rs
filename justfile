@@ -170,19 +170,39 @@ benchmark-json-stable:
 #   just benchmark-baseline                      # All scenarios
 #   just benchmark-baseline messaging-performance  # Specific scenario
 benchmark-baseline scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
     just benchmark-json {{scenario}}
-    cp $(ls -t ./benchmark_results/result_*.json | head -1) ./benchmark_results/baseline.json
-    @echo "Baseline updated: ./benchmark_results/baseline.json"
+    shopt -s nullglob
+    files=(./benchmark_results/result_*.json)
+    shopt -u nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "ERROR: No benchmark result file found"
+        exit 1
+    fi
+    RESULT=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
+    cp "$RESULT" ./benchmark_results/baseline.json
+    echo "Baseline updated: ./benchmark_results/baseline.json"
 
 # Run benchmarks and compare against baseline
 # Usage:
 #   just benchmark-check                      # All scenarios
 #   just benchmark-check messaging-performance  # Specific scenario
 benchmark-check scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
     just benchmark-json {{scenario}}
+    shopt -s nullglob
+    files=(./benchmark_results/result_*.json)
+    shopt -u nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "ERROR: No benchmark result file found"
+        exit 1
+    fi
+    CANDIDATE=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
     cargo run --release --features benchmark-tests --bin bench_compare -- \
         ./benchmark_results/baseline.json \
-        $(ls -t ./benchmark_results/result_*.json | head -1) \
+        "$CANDIDATE" \
         {{ if scenario != "" { "--scenario " + scenario } else { "" } }}
 
 # Run benchmarks with per-iteration detail and emit a Perfetto trace

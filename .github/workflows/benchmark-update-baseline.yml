@@ -24,6 +24,7 @@ jobs:
           ref: perf-hotspot
           fetch-depth: 1
           path: perf-hotspot-data
+          persist-credentials: true
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@master

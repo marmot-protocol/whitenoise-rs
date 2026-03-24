@@ -204,14 +204,14 @@ impl BenchmarkRegistry {
                 for b in breakdown {
                     tracing::info!(
                         "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-                        b.marker,
+                        b.name,
                         b.call_count,
-                        format!("{:.2?}", b.mean),
-                        format!("{:.2?}", b.median),
-                        format!("{:.2?}", b.p95),
-                        format!("{:.2?}", b.p99),
-                        format!("{:.2?}", b.min),
-                        format!("{:.2?}", b.max),
+                        format!("{:.2?}", b.mean_ns),
+                        format!("{:.2?}", b.median_ns),
+                        format!("{:.2?}", b.p95_ns),
+                        format!("{:.2?}", b.p99_ns),
+                        format!("{:.2?}", b.min_ns),
+                        format!("{:.2?}", b.max_ns),
                     );
                 }
             }

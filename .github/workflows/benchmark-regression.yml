@@ -196,6 +196,8 @@ jobs:
                 comment_id: parseInt(commentId),
                 body,
               });
+            } else {
+              core.warning('COMMENT_ID is empty — the initial "running" comment may have failed to post. PR will not be updated.');
             }
 
       - name: Fail on breaking regression

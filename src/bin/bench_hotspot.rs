@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
@@ -245,7 +245,9 @@ fn main() {
         }
     };
 
-    let run_id = args.run_id.unwrap_or_else(|| "unknown".to_string());
+    let run_id = args
+        .run_id
+        .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string());
 
     let week_ago = load_week_ago_means(&args.history_dir);
 
