@@ -221,7 +221,7 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
-             WHERE account_pubkey = ? AND user_confirmation IS NULL",
+             WHERE account_pubkey = ? AND user_confirmation IS NULL AND removed_at IS NULL",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
@@ -294,7 +294,7 @@ impl AccountGroup {
                -- archived_at is intentionally excluded: archive/unarchive use
                -- update_archived_at() so save() never clobbers user preference.
                -- removed_at is intentionally excluded: removal is set by
-               -- update_removed_at() when an admin removal commit is detected.
+               -- mark_removed_atomic() when an admin removal commit is detected.
                -- Write-once: preserve existing dm_peer_pubkey if already set.
                -- Many code paths construct AccountGroup without knowing the DM peer,
                -- so we only fill this on first write and never overwrite a correct
@@ -368,39 +368,8 @@ impl AccountGroup {
         Ok(row.into())
     }
 
-    /// Updates the removed_at timestamp for this AccountGroup.
-    ///
-    /// Called when an MLS removal commit is processed and the current account is
-    /// no longer an active member of the group. The group remains visible in the
-    /// chat list (read-only) until the user explicitly archives or deletes it.
-    #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn update_removed_at(
-        &self,
-        removed_at: Option<DateTime<Utc>>,
-        database: &Database,
-    ) -> Result<Self, sqlx::Error> {
-        let id = self.id.expect("AccountGroup must be persisted");
-        let now_ms = Utc::now().timestamp_millis();
-
-        let row = sqlx::query_as::<_, AccountGroupRow>(
-            "UPDATE accounts_groups
-             SET removed_at = ?, updated_at = ?
-             WHERE id = ?
-             RETURNING *",
-        )
-        .bind(removed_at.map(|dt| dt.timestamp_millis()))
-        .bind(now_ms)
-        .bind(id)
-        .fetch_one(&database.pool)
-        .await?;
-
-        Ok(row.into())
-    }
-
     /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
     ///
-    /// Sets `removed_at` and `user_confirmation = true` together so that a pending
-    /// invite removed before the user accepts is no longer surfaced as pending.
     /// Returns the updated row if changed, `None` if already removed.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn mark_removed_atomic(
@@ -412,7 +381,7 @@ impl AccountGroup {
 
         let row = sqlx::query_as::<_, AccountGroupRow>(
             "UPDATE accounts_groups
-             SET removed_at = ?, user_confirmation = 1, updated_at = ?
+             SET removed_at = ?, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
              RETURNING *",
         )
@@ -1618,85 +1587,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_removed_at_sets_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[80; 32]);
-
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-
-        assert!(account_group.removed_at.is_none());
-
-        let now = Utc::now();
-        let updated = account_group
-            .update_removed_at(Some(now), &whitenoise.database)
-            .await
-            .unwrap();
-
-        assert!(updated.removed_at.is_some());
-        assert!(updated.is_removed());
-    }
-
-    #[tokio::test]
-    async fn test_update_removed_at_clears_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[81; 32]);
-
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-
-        // Set removed
-        let removed = account_group
-            .update_removed_at(Some(Utc::now()), &whitenoise.database)
-            .await
-            .unwrap();
-        assert!(removed.is_removed());
-
-        // Clear removed
-        let cleared = removed
-            .update_removed_at(None, &whitenoise.database)
-            .await
-            .unwrap();
-        assert!(cleared.removed_at.is_none());
-        assert!(!cleared.is_removed());
-    }
-
-    #[tokio::test]
-    async fn test_update_removed_at_persists() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[82; 32]);
-
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-
-        account_group
-            .update_removed_at(Some(Utc::now()), &whitenoise.database)
-            .await
-            .unwrap();
-
-        // Fetch again and verify persistence
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(found.is_removed());
-    }
-
-    #[tokio::test]
     async fn test_save_does_not_overwrite_removed_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -1709,10 +1599,11 @@ mod tests {
 
         // Mark as removed
         let removed = ag
-            .update_removed_at(Some(Utc::now()), &whitenoise.database)
+            .mark_removed_atomic(&whitenoise.database)
             .await
-            .unwrap();
-        assert!(removed.is_removed());
+            .unwrap()
+            .expect("first mark_removed_atomic must update the row");
+        assert!(removed.removed_at.is_some());
 
         // Re-save via save() with removed_at = None — simulates giftwrap re-processing
         let resaved = AccountGroup {
@@ -1742,8 +1633,43 @@ mod tests {
         .unwrap();
 
         assert!(
-            found.is_removed(),
+            found.removed_at.is_some(),
             "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mark_removed_atomic_preserves_declined_user_confirmation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[84; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Decline the invite first
+        let declined = ag
+            .update_user_confirmation(false, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(declined.user_confirmation, Some(false));
+
+        // Admin removes the user — user_confirmation must stay Some(false)
+        let removed = declined
+            .mark_removed_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("mark_removed_atomic must update the row");
+
+        assert!(removed.removed_at.is_some());
+        assert_eq!(
+            removed.user_confirmation,
+            Some(false),
+            "mark_removed_atomic must not overwrite a declined user_confirmation"
+        );
+        // A declined+removed group stays hidden
+        assert!(!removed.is_visible());
     }
 }

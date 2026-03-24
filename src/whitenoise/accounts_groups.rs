@@ -64,8 +64,11 @@ impl AccountGroup {
     }
 
     /// Returns true if this group is pending user confirmation.
+    ///
+    /// A removed group is never pending even if `user_confirmation` was `None` at the
+    /// time of removal: an admin commit that removes the user supersedes the pending state.
     pub fn is_pending(&self) -> bool {
-        self.user_confirmation.is_none()
+        self.user_confirmation.is_none() && self.removed_at.is_none()
     }
 
     /// Returns true if the user has accepted this group.
@@ -399,7 +402,12 @@ impl Whitenoise {
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
         let Some(updated) = account_group.mark_removed(self).await? else {
-            return Ok(account_group);
+            // Another task won the atomic update — reload the current row so
+            // we return the persisted removed_at rather than the stale pre-load value.
+            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
+                .await?
+                .ok_or(WhitenoiseError::GroupNotFound)?;
+            return Ok(current);
         };
 
         self.emit_chat_list_update(
@@ -1385,9 +1393,8 @@ mod tests {
 
         assert!(removed.is_removed());
         assert!(removed.removed_at.is_some());
-        // user_confirmation must be set to true — a pending invite that gets a
-        // removal commit before the user accepts must not surface as pending
-        assert_eq!(removed.user_confirmation, Some(true));
+        // A group removed before the user accepted must not surface as pending.
+        assert!(!removed.is_pending());
     }
 
     #[tokio::test]

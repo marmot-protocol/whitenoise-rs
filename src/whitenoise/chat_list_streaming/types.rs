@@ -13,9 +13,9 @@ pub enum ChatListUpdateTrigger {
     /// Emitted to both active and archived channels so each can add/remove accordingly.
     ChatArchiveChanged,
     /// The account was involuntarily removed from this group by an admin.
-    /// The group stays in the active chat list (read-only) until the user
-    /// explicitly archives or deletes it. The item's `removed_at` field is set.
-    /// Emitted only to the active channel.
+    /// The group stays visible (read-only) until the user explicitly archives or
+    /// deletes it. The item's `removed_at` field is set. Routed to the active
+    /// channel when not archived, or the archived channel if already archived.
     RemovedFromGroup,
 }
 

@@ -220,11 +220,11 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice())
                 );
 
-                // Detect self-removal: if the commit left us inactive, persist the
+                // Detect removal: if the commit left us inactive, persist the
                 // removal state and emit a real-time update. Errors propagate so the
-                // event is not marked processed; transient failures (e.g. DB lock) can
-                // recover on retry. Persistent failures need startup reconciliation
-                // (MDK deduplicates commits, so the removal check won't re-run on retry).
+                // event is not marked processed. Any failure after process_message()
+                // still requires startup reconciliation, because MDK deduplicates
+                // already-processed commits and this branch will not re-run on retry.
                 let still_active =
                     match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
                         Some(group) => group.state == GroupState::Active,
