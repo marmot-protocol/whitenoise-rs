@@ -326,7 +326,6 @@ impl AggregatedMessage {
                ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9 AND am.mls_group_id = ?
                AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
-               AND am.deletion_event_id IS NULL
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT ?",
@@ -3035,11 +3034,11 @@ mod tests {
         );
     }
 
-    /// Deleted messages (those with a non-NULL deletion_event_id) must be excluded from
-    /// paginated results, matching the `deletion_event_id IS NULL` guard used by all other
-    /// message-fetching queries.
+    /// Deleted messages (those with a non-NULL deletion_event_id) must still appear in
+    /// paginated results as tombstones (is_deleted = true), consistent with how
+    /// find_messages_by_group behaves, so the UI can show "Message deleted" in the right spot.
     #[tokio::test]
-    async fn test_paginated_deleted_messages_are_excluded() {
+    async fn test_paginated_deleted_messages_are_included_as_tombstones() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[212; 32]);
         setup_group(&group_id, &whitenoise.database).await;
@@ -3076,15 +3075,19 @@ mod tests {
         .await
         .unwrap();
 
-        let returned_ids: Vec<_> = messages.iter().map(|m| &m.id).collect();
-        assert!(
-            !returned_ids.contains(&&msg2_id),
-            "deleted message must not appear in paginated results; got: {returned_ids:?}"
-        );
         assert_eq!(
             messages.len(),
-            2,
-            "only non-deleted messages should be returned"
+            3,
+            "all 3 messages should be returned, including the deleted tombstone"
+        );
+
+        let deleted = messages
+            .iter()
+            .find(|m| m.id == msg2_id)
+            .expect("deleted message must be present");
+        assert!(
+            deleted.is_deleted,
+            "deleted message must have is_deleted = true"
         );
     }
 
