@@ -220,20 +220,16 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice())
                 );
 
-                // After processing the commit, check whether this account is still an
-                // active member. If not, the commit contained our removal — mark the
-                // group as removed so it stays visible (read-only) in the chat list
-                // until the user explicitly archives it, and push a real-time stream
-                // update so Flutter does not need a manual refresh.
-                let still_active = mdk
-                    .get_groups()
-                    .ok()
-                    .map(|groups| {
-                        groups.iter().any(|g| {
-                            &g.mls_group_id == mls_group_id && g.state == GroupState::Active
-                        })
-                    })
-                    .unwrap_or(true); // conservative: if MDK query fails, do not mark removed
+                // Detect self-removal: if the commit left us inactive, persist the
+                // removal state and emit a real-time update. Errors propagate so the
+                // event is not marked processed; transient failures (e.g. DB lock) can
+                // recover on retry. Persistent failures need startup reconciliation
+                // (MDK deduplicates commits, so the removal check won't re-run on retry).
+                let still_active =
+                    match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
+                        Some(group) => group.state == GroupState::Active,
+                        None => false,
+                    };
 
                 if !still_active {
                     tracing::info!(
@@ -242,20 +238,10 @@ impl Whitenoise {
                         account.pubkey.to_hex(),
                         hex::encode(mls_group_id.as_slice())
                     );
-                    if let Err(e) = self.mark_as_removed(account, mls_group_id).await {
-                        tracing::warn!(
-                            target: "whitenoise::event_handlers::handle_mls_message",
-                            "Failed to mark group {} as removed: {}",
-                            hex::encode(mls_group_id.as_slice()),
-                            e
-                        );
-                    }
+                    self.mark_as_removed(account, mls_group_id).await?;
                 }
 
                 self.background_refresh_account_group_subscriptions(account);
-                // Skip image cache sync for removed groups — the image is already
-                // cached locally and the relay subscription has been dropped, so
-                // there is nothing useful to fetch.
                 if still_active {
                     Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
                 }

@@ -191,18 +191,8 @@ impl AccountGroup {
         Ok(updated)
     }
 
-    /// Marks this group as removed atomically.
-    ///
-    /// Uses a conditional `UPDATE … WHERE removed_at IS NULL` so that concurrent
-    /// calls are safe: only the first writer updates the row and triggers a stream
-    /// emit; subsequent calls see `None` and skip the emit.
-    ///
-    /// Also sets `user_confirmation = true` so that a pending invite whose removal
-    /// commit arrives before the user accepts is no longer surfaced as a pending
-    /// invite after removal.
-    ///
-    /// Returns `Some(updated)` when the row was changed, `None` when it was already
-    /// marked removed.
+    /// Delegates to [`mark_removed_atomic`](crate::whitenoise::database::accounts_groups::AccountGroup::mark_removed_atomic).
+    /// Returns `Some` when the row was changed, `None` when already removed.
     #[perf_instrument("account_groups")]
     pub(crate) async fn mark_removed(
         &self,
@@ -397,12 +387,7 @@ impl Whitenoise {
 
     /// Marks a group as removed for the given account.
     ///
-    /// Called when an MLS removal commit is processed and the current account is
-    /// no longer an active member of the group. The group is kept visible in the
-    /// active chat list (read-only) until the user explicitly archives or deletes it.
-    ///
-    /// Idempotent: if already marked as removed, returns the existing state unchanged.
-    /// Emits a `RemovedFromGroup` stream event so the UI updates in real time.
+    /// Idempotent. Emits [`ChatListUpdateTrigger::RemovedFromGroup`] when the row changes.
     #[perf_instrument("account_groups")]
     pub(crate) async fn mark_as_removed(
         &self,
@@ -413,9 +398,6 @@ impl Whitenoise {
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
-        // mark_removed is atomic: returns Some only when the row was actually changed.
-        // If it returns None the group was already removed — skip the emit so
-        // concurrent callers never produce a duplicate stream event.
         let Some(updated) = account_group.mark_removed(self).await? else {
             return Ok(account_group);
         };

@@ -397,17 +397,11 @@ impl AccountGroup {
         Ok(row.into())
     }
 
-    /// Atomically marks this AccountGroup as removed, only when it has not already
-    /// been marked removed.
+    /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
     ///
-    /// Sets `removed_at` and `user_confirmation = true` in a single `UPDATE … WHERE
-    /// removed_at IS NULL` statement, eliminating the check-then-update race that
-    /// could otherwise cause double stream emissions. The `user_confirmation` is set
-    /// to ensure that a pending invite whose admin removal arrives before the user
-    /// accepts no longer appears as a pending invite after removal.
-    ///
-    /// Returns the updated `AccountGroup` if the row was changed, or `None` if it
-    /// was already marked removed (the caller must not re-emit in that case).
+    /// Sets `removed_at` and `user_confirmation = true` together so that a pending
+    /// invite removed before the user accepts is no longer surfaced as pending.
+    /// Returns the updated row if changed, `None` if already removed.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn mark_removed_atomic(
         &self,
