@@ -132,27 +132,32 @@ impl TestCase for VerifyInitialMessagesTestCase {
             tracing::info!("✓ Message '{}' correctly has no reactions", key);
         }
 
-        // Verify deleted messages are NOT in the initial snapshot
+        // Verify deleted messages ARE in the initial snapshot as tombstones (is_deleted = true)
         for key in &self.expected_deleted {
             let msg_id = context.get_message_id(key)?;
-            let found = subscription
+            let msg = subscription
                 .initial_messages
                 .iter()
-                .any(|m| &m.id == msg_id);
+                .find(|m| &m.id == msg_id);
 
             assert!(
-                !found,
-                "Expected message '{}' to be excluded from initial snapshot because it is deleted, but it was found",
+                msg.is_some(),
+                "Expected deleted message '{}' to appear in initial snapshot as a tombstone, but it was absent",
+                key
+            );
+            assert!(
+                msg.unwrap().is_deleted,
+                "Expected message '{}' to have is_deleted = true, but it was false",
                 key
             );
             tracing::info!(
-                "✓ Message '{}' is correctly excluded from the initial snapshot",
+                "✓ Message '{}' is correctly present in the initial snapshot as a tombstone",
                 key
             );
         }
 
         tracing::info!(
-            "✓ Verified {} initial messages ({} with reactions, {} without reactions, {} deleted)",
+            "✓ Verified {} initial messages ({} with reactions, {} without reactions, {} deleted tombstones)",
             subscription.initial_messages.len(),
             self.expected_with_reactions.len(),
             self.expected_no_reactions.len(),
