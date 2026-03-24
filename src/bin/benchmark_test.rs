@@ -18,7 +18,7 @@ use ::whitenoise::whitenoise::secrets_store::SecretsStore;
 use ::whitenoise::*;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Filename written into the data directory by `--login` and read by `--seed-nsec`.
 ///
@@ -113,8 +113,15 @@ fn write_json_output(
     let scenarios: Vec<ScenarioResult> = results
         .iter()
         .map(|r| ScenarioResult {
+            thresholds: BenchmarkRegistry::thresholds_for(r).unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "whitenoise::benchmarks",
+                    "No registered thresholds for scenario '{}'; using defaults",
+                    r.name
+                );
+                Default::default()
+            }),
             result: r.clone(),
-            thresholds: BenchmarkRegistry::thresholds_for(r),
         })
         .collect();
 
@@ -155,16 +162,29 @@ fn save_keyring_sidecar(
     let line = format!("{db_key_id} {hex_secret}\n");
 
     let path = data_dir.join(KEYRING_SIDECAR);
-    std::fs::write(&path, &line).map_err(|e| {
-        WhitenoiseError::Other(anyhow::anyhow!("failed to write keyring sidecar: {e}"))
-    })?;
-    // Restrict to owner-read/write only — the file contains a raw encryption key.
+    // Use OpenOptions with mode 0o600 at create time so the file is never
+    // world-readable, even briefly. A two-step write+chmod leaves a window
+    // where the raw encryption key is exposed with the process umask.
     #[cfg(unix)]
     {
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!(
-                "failed to set keyring sidecar permissions: {e}"
-            ))
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| {
+                WhitenoiseError::Other(anyhow::anyhow!("failed to create keyring sidecar: {e}"))
+            })?;
+        file.write_all(line.as_bytes()).map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("failed to write keyring sidecar: {e}"))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, &line).map_err(|e| {
+            WhitenoiseError::Other(anyhow::anyhow!("failed to write keyring sidecar: {e}"))
         })?;
     }
 

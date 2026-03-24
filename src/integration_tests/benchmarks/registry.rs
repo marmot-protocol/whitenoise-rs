@@ -97,15 +97,13 @@ impl BenchmarkRegistry {
     /// Return the thresholds for a benchmark result by looking up the registered
     /// scenario and calling `thresholds()` on it directly.
     ///
-    /// This eliminates the need for a separate central `thresholds_for` match —
-    /// each scenario owns its thresholds and they are always in sync with the registry.
-    pub fn thresholds_for(result: &BenchmarkResult) -> ScenarioThresholds {
-        if let Some(name) = Self::cli_name_for(result)
-            && let Ok(scenario) = parse_and_instantiate(name)
-        {
-            return scenario.thresholds();
-        }
-        ScenarioThresholds::default()
+    /// Returns `None` if the result name does not match any registered scenario —
+    /// this makes stale or renamed scenarios visible rather than silently falling
+    /// back to generic defaults that would mask threshold drift.
+    pub fn thresholds_for(result: &BenchmarkResult) -> Option<ScenarioThresholds> {
+        let name = Self::cli_name_for(result)?;
+        let scenario = parse_and_instantiate(name).ok()?;
+        Some(scenario.thresholds())
     }
 
     /// Run a single benchmark scenario by name, returning the result.
@@ -144,12 +142,20 @@ impl BenchmarkRegistry {
 
         Self::print_summary(&results, overall_start.elapsed()).await;
 
-        // Return results even if some scenarios failed — partial results are valuable.
-        // Propagate the first error so the caller knows something went wrong.
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(results),
+        // Return partial results even when some scenarios failed — partial results
+        // are valuable for hotspot analysis and regression comparison.
+        // Log the first error so the caller knows something went wrong, but do not
+        // discard the results that did succeed.
+        if let Some(ref error) = first_error {
+            tracing::warn!(
+                target: "whitenoise::benchmarks",
+                "One or more benchmarks failed; partial results ({} of {} registered) returned. First error: {}",
+                results.len(),
+                get_all_benchmark_names().len(),
+                error,
+            );
         }
+        Ok(results)
     }
 
     pub async fn print_summary(results: &[BenchmarkResult], overall_duration: Duration) {

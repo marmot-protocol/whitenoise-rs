@@ -44,11 +44,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Checkout perf-hotspot branch
+        id: checkout-perf-hotspot
         uses: actions/checkout@v4
         with:
           ref: perf-hotspot
           fetch-depth: 1
           path: perf-hotspot-data
+        continue-on-error: true
 
       - name: Check baseline exists
         id: baseline-check
@@ -210,6 +212,9 @@ jobs:
     if: needs.check-label.outputs.run == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     # Relay-tier scenarios never fail CI — informational only.
+    # continue-on-error ensures infrastructure step failures (toolchain setup,
+    # Docker startup, teardown) also do not block the PR.
+    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4

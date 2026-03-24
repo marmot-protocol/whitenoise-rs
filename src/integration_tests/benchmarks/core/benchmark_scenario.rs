@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -6,7 +7,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use super::benchmark_config::BenchmarkConfig;
 use super::benchmark_result::BenchmarkResult;
 use super::json_output::ScenarioThresholds;
-use std::sync::atomic::Ordering;
 
 use crate::integration_tests::benchmarks::{DETAILED_MODE, PERF_LAYER};
 use crate::integration_tests::core::ScenarioContext;
