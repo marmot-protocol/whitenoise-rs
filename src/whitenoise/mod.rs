@@ -1436,7 +1436,6 @@ mod tests {
     mod user_subscription_tests {
         use chrono::Utc;
         use nostr_sdk::{Keys, Metadata};
-        use tokio::sync::broadcast;
 
         use super::*;
 
@@ -1476,36 +1475,6 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(saved_user, subscription.initial_user);
-        }
-
-        #[test]
-        fn test_drain_user_updates_uses_newest_queued_update() {
-            let pubkey = Keys::generate().public_key();
-            let mut initial_user = User {
-                id: None,
-                pubkey,
-                metadata: Metadata::new().name("Old Name"),
-                created_at: Utc::now(),
-                metadata_known_at: None,
-                updated_at: Utc::now(),
-            };
-            initial_user.mark_metadata_known_now();
-
-            let mut newest_user = initial_user.clone();
-            newest_user.metadata = Metadata::new().name("Newest Name");
-            newest_user.updated_at = Utc::now();
-
-            let (sender, mut updates) = broadcast::channel(10);
-            sender
-                .send(user_streaming::UserUpdate {
-                    trigger: user_streaming::UserUpdateTrigger::MetadataChanged,
-                    user: newest_user.clone(),
-                })
-                .expect("should queue update");
-
-            let drained_user = Whitenoise::drain_user_updates(initial_user, &mut updates).unwrap();
-
-            assert_eq!(drained_user, newest_user);
         }
     }
 

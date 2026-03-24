@@ -79,7 +79,7 @@ impl Whitenoise {
     }
 
     #[perf_instrument("whitenoise")]
-    pub(crate) async fn setup_accounts_subscriptions(
+    pub(super) async fn setup_accounts_subscriptions(
         whitenoise_ref: &'static Whitenoise,
     ) -> Result<()> {
         let accounts = Account::all(&whitenoise_ref.database).await?;
