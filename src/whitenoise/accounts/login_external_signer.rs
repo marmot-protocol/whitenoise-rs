@@ -151,41 +151,85 @@ impl Whitenoise {
         let publish_to_urls = Relay::urls(discovered.relays_or(RelayType::Nip65, &default_relays));
         let default_urls = Relay::urls(&default_relays);
 
-        // For each relay type: publish defaults only for the ones that were
+        // For each relay type: persist defaults only for the ones that were
         // missing. Already-found lists were already persisted to the DB by
         // try_discover_relay_lists in step 1, so no second write is needed.
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             if !discovered.found(relay_type) {
-                // Missing — assign defaults in the DB and publish via the signer.
                 user.add_relays(&default_relays, relay_type, &self.database)
                     .await
                     .map_err(LoginError::from)?;
-                if let Err(error) = self
-                    .relay_control
-                    .publish_relay_list_with_signer(
-                        &default_urls,
-                        relay_type,
-                        &publish_to_urls,
-                        std::sync::Arc::new(signer.clone()),
-                    )
-                    .await
-                {
-                    if discovered.nip65.is_none() || relay_type == RelayType::Nip65 {
-                        return Err(LoginError::from(WhitenoiseError::from(error)));
-                    }
-
-                    tracing::warn!(
-                        target: "whitenoise::accounts",
-                        pubkey = %pubkey,
-                        ?relay_type,
-                        "Failed to publish default relay list via external signer to preserved NIP-65 relays; continuing login with local relay state: {error}"
-                    );
-                }
             } else {
                 tracing::debug!(
                     target: "whitenoise::accounts",
                     "Skipping publish for {:?} — already exists on network",
                     relay_type,
+                );
+            }
+        }
+
+        // Publish all missing relay lists concurrently — same pattern as
+        // publish_relay_lists_with_signer. Only NIP-65 failure is fatal;
+        // 10050/10051 failures are demoted to warnings.
+        let signer_arc = std::sync::Arc::new(signer.clone());
+        let nip65_publish = async {
+            if !discovered.found(RelayType::Nip65) {
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &default_urls,
+                        RelayType::Nip65,
+                        &publish_to_urls,
+                        signer_arc.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let inbox_publish = async {
+            if !discovered.found(RelayType::Inbox) {
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &default_urls,
+                        RelayType::Inbox,
+                        &publish_to_urls,
+                        signer_arc.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+        let key_package_publish = async {
+            if !discovered.found(RelayType::KeyPackage) {
+                self.relay_control
+                    .publish_relay_list_with_signer(
+                        &default_urls,
+                        RelayType::KeyPackage,
+                        &publish_to_urls,
+                        signer_arc.clone(),
+                    )
+                    .await
+            } else {
+                Ok(())
+            }
+        };
+
+        let (nip65_result, inbox_result, kp_result) =
+            tokio::join!(nip65_publish, inbox_publish, key_package_publish);
+
+        nip65_result.map_err(|e| LoginError::from(WhitenoiseError::from(e)))?;
+
+        for (relay_type, result) in [
+            (RelayType::Inbox, inbox_result),
+            (RelayType::KeyPackage, kp_result),
+        ] {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    pubkey = %pubkey,
+                    ?relay_type,
+                    "Failed to publish default relay list via external signer; continuing login with local relay state: {error}"
                 );
             }
         }
