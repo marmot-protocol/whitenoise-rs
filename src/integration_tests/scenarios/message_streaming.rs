@@ -128,7 +128,6 @@ impl MessageStreamingScenario {
                 "msg_plain",
                 "msg_with_reaction",
                 "msg_reaction_deleted",
-                "msg_deleted",
             ])
             .expect_with_reactions(vec!["msg_with_reaction"])
             .expect_no_reactions(vec!["msg_plain", "msg_reaction_deleted"])

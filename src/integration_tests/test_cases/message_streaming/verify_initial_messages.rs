@@ -57,7 +57,7 @@ impl TestCase for VerifyInitialMessagesTestCase {
 
         let subscription = context
             .whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id)
+            .subscribe_to_group_messages(&group.mls_group_id, None)
             .await?;
 
         tracing::info!(
@@ -132,30 +132,32 @@ impl TestCase for VerifyInitialMessagesTestCase {
             tracing::info!("✓ Message '{}' correctly has no reactions", key);
         }
 
-        // Verify deleted messages
+        // Verify deleted messages ARE in the initial snapshot as tombstones (is_deleted = true)
         for key in &self.expected_deleted {
             let msg_id = context.get_message_id(key)?;
             let msg = subscription
                 .initial_messages
                 .iter()
-                .find(|m| &m.id == msg_id)
-                .ok_or_else(|| {
-                    WhitenoiseError::Other(anyhow::anyhow!(
-                        "Message '{}' not found for deletion check",
-                        key
-                    ))
-                })?;
+                .find(|m| &m.id == msg_id);
 
             assert!(
-                msg.is_deleted,
-                "Expected message '{}' to be deleted, but is_deleted is false",
+                msg.is_some(),
+                "Expected deleted message '{}' to appear in initial snapshot as a tombstone, but it was absent",
                 key
             );
-            tracing::info!("✓ Message '{}' is correctly marked as deleted", key);
+            assert!(
+                msg.unwrap().is_deleted,
+                "Expected message '{}' to have is_deleted = true, but it was false",
+                key
+            );
+            tracing::info!(
+                "✓ Message '{}' is correctly present in the initial snapshot as a tombstone",
+                key
+            );
         }
 
         tracing::info!(
-            "✓ Verified {} initial messages ({} with reactions, {} without reactions, {} deleted)",
+            "✓ Verified {} initial messages ({} with reactions, {} without reactions, {} deleted tombstones)",
             subscription.initial_messages.len(),
             self.expected_with_reactions.len(),
             self.expected_no_reactions.len(),

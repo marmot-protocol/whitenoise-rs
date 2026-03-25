@@ -62,7 +62,7 @@ impl VerifyStreamUpdateTestCase {
         let group = context.get_group(&self.group_name)?;
         let subscription = context
             .whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id)
+            .subscribe_to_group_messages(&group.mls_group_id, None)
             .await?;
 
         let mut guard = self.receiver.lock().await;

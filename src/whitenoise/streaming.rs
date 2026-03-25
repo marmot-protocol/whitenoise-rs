@@ -30,6 +30,9 @@ impl Whitenoise {
     ///
     /// # Arguments
     /// * `group_id` - The group to subscribe to
+    /// * `limit`    - Maximum number of messages to include in the initial snapshot
+    ///   (default 50, capped at 200).  Older messages can be fetched on demand via
+    ///   [`Self::fetch_aggregated_messages_for_group`].  Pass `None` to use the default.
     ///
     /// # Returns
     /// A [`message_streaming::GroupMessageSubscription`] containing initial messages and a broadcast receiver
@@ -37,34 +40,64 @@ impl Whitenoise {
     pub async fn subscribe_to_group_messages(
         &self,
         group_id: &mdk_core::prelude::GroupId,
+        limit: Option<u32>,
     ) -> Result<message_streaming::GroupMessageSubscription> {
+        // 1. Subscribe FIRST to capture any concurrent updates that arrive during the fetch.
         let mut updates = self.message_stream_manager.subscribe(group_id);
 
+        // 2. Fetch the most-recent `limit` messages using the paginated query so the initial
+        //    snapshot honours the same page size the Flutter side will use for further loads.
         let fetched_messages =
-            aggregated_message::AggregatedMessage::find_messages_by_group(group_id, &self.database)
-                .await
-                .map_err(|e| {
-                    WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
-                })?;
+            aggregated_message::AggregatedMessage::find_messages_by_group_paginated(
+                group_id,
+                &self.database,
+                None, // no before-cursor → newest page
+                None,
+                limit,
+            )
+            .await
+            .map_err(|e| {
+                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+            })?;
 
+        // 3. Build a map keyed by message ID for deduplication.
         let mut messages_map: HashMap<String, message_aggregator::ChatMessage> = fetched_messages
             .into_iter()
             .map(|m| (m.id.clone(), m))
             .collect();
 
+        // 4. Drain any updates that landed between subscribe() and the DB fetch.
+        //    These are messages that were persisted and broadcast while the query was in
+        //    flight. Without this drain they would be missing from the snapshot even though
+        //    they are already in the database. For NewMessage triggers, always insert: either
+        //    the message is already in the map (update replaces stale DB row) or it arrived
+        //    just after the query cut-off (new message that belongs in the snapshot). For
+        //    other triggers, only apply the update if the message id already exists in the map
+        //    to avoid pulling in old messages. The live `updates` receiver returned to the
+        //    caller covers all future messages; this loop only closes the narrow race window
+        //    on the initial snapshot.
         loop {
             match updates.try_recv() {
                 Ok(update) => {
-                    // Apply update: insert or replace by message ID
-                    messages_map.insert(update.message.id.clone(), update.message);
+                    if update.trigger == message_streaming::UpdateTrigger::NewMessage
+                        || messages_map.contains_key(&update.message.id)
+                    {
+                        messages_map.insert(update.message.id.clone(), update.message);
+                    }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!("subscription drain lagged by {n} messages");
-                    continue;
+                    tracing::error!(
+                        target: "whitenoise::mod",
+                        "subscription drain lagged by {n} messages, snapshot may be incomplete"
+                    );
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Message stream lagged by {} messages during subscription initialization, retry needed",
+                        n
+                    )));
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    // Channel closed unexpectedly - should be unreachable since we hold a receiver
+                    // Channel closed unexpectedly — unreachable while we hold a receiver.
                     return Err(WhitenoiseError::Other(anyhow::anyhow!(
                         "Message stream closed unexpectedly during subscription"
                     )));
@@ -72,9 +105,15 @@ impl Whitenoise {
             }
         }
 
+        // 5. Collect and sort chronologically (oldest first).  The map iteration order is
+        //    arbitrary, so an explicit sort is always needed.
         let mut initial_messages: Vec<message_aggregator::ChatMessage> =
             messages_map.into_values().collect();
-        initial_messages.sort_by_key(|m| m.created_at);
+        initial_messages.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
 
         Ok(message_streaming::GroupMessageSubscription {
             initial_messages,
