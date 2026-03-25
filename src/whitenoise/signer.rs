@@ -51,7 +51,7 @@ impl Whitenoise {
         // Rebuild account subscriptions now that signing/decryption is available.
         // Only inbox_relays is needed by setup_subscriptions; do not gate
         // recovery on the nip65 lookup which is not used here.
-        match account.inbox_relays(self).await {
+        match account.effective_inbox_relays(self).await {
             Ok(inbox_relays) => {
                 if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
