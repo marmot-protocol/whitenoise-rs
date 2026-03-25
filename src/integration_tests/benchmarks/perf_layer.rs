@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
@@ -27,69 +28,93 @@ const PERF_TARGET: &str = "whitenoise::perf";
 const SQLX_TARGET: &str = "sqlx::query";
 
 /// A single timing observation for a named perf marker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PerfSample {
     /// The marker name (e.g. `"messages::send_message_to_group"`).
     pub name: String,
     /// Wall-clock duration of the operation.
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
     pub duration: Duration,
+    /// Microseconds since Unix epoch when the guard was created. Used as the
+    /// `ts` field in Chrome Trace Format. `0` for sqlx events (no timestamp emitted).
+    pub ts_begin_us: u64,
+    /// Trace ID of the logical operation that created this guard. Used as `tid`
+    /// in Chrome Trace Format to group spans from the same request. `0` if unset.
+    pub trace_id: u64,
+}
+
+/// Per-iteration breakdown: all spans captured within a single benchmark
+/// iteration, paired with that iteration's wall-clock time.
+#[derive(Debug, Clone, Serialize)]
+pub struct IterationDetail {
+    pub iteration: usize,
+    pub wall_time_ns: u64,
+    pub spans: Vec<PerfSample>,
 }
 
 /// Aggregated statistics for a single perf marker across many observations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PerfBreakdown {
-    /// Marker name.
-    pub marker: String,
+    /// Marker name (e.g. `"messages::send_message_to_group"`).
+    pub name: String,
     /// Number of observations.
     pub call_count: u64,
     /// Exact total duration (sum of all samples).
-    pub total_duration: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub total_ns: Duration,
     /// Mean duration.
-    pub mean: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub mean_ns: Duration,
     /// Median duration.
-    pub median: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub median_ns: Duration,
     /// 95th-percentile duration.
-    pub p95: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub p95_ns: Duration,
     /// 99th-percentile duration.
-    pub p99: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub p99_ns: Duration,
     /// Minimum observed duration.
-    pub min: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub min_ns: Duration,
     /// Maximum observed duration.
-    pub max: Duration,
+    #[serde(serialize_with = "super::serde_duration::as_nanos")]
+    pub max_ns: Duration,
 }
 
 impl PerfBreakdown {
-    fn from_samples(marker: String, mut samples: Vec<Duration>) -> Self {
+    fn from_samples(name: String, mut samples: Vec<Duration>) -> Self {
         let call_count = samples.len() as u64;
-        let total_duration: Duration = samples.iter().sum();
-        let mean = stats::calculate_mean(&samples);
-        // calculate_median sorts samples in place; p95/p99 reuse the sorted slice.
-        let median = stats::calculate_median(&mut samples);
-        let p95 = stats::calculate_percentile(&mut samples, 0.95);
-        let p99 = stats::calculate_percentile(&mut samples, 0.99);
-        let min = *samples.iter().min().unwrap_or(&Duration::ZERO);
-        let max = *samples.iter().max().unwrap_or(&Duration::ZERO);
+        let total_ns: Duration = samples.iter().sum();
+        let mean_ns = stats::calculate_mean(&samples);
+        let min_ns = samples.iter().copied().min().unwrap_or(Duration::ZERO);
+        let max_ns = samples.iter().copied().max().unwrap_or(Duration::ZERO);
+        let median_ns = stats::calculate_median(&mut samples);
+        let p95_ns = stats::calculate_percentile(&mut samples, 0.95);
+        let p99_ns = stats::calculate_percentile(&mut samples, 0.99);
 
         Self {
-            marker,
+            name,
             call_count,
-            total_duration,
-            mean,
-            median,
-            p95,
-            p99,
-            min,
-            max,
+            total_ns,
+            mean_ns,
+            median_ns,
+            p95_ns,
+            p99_ns,
+            min_ns,
+            max_ns,
         }
     }
 }
 
 // Visitor that extracts fields from both event shapes:
-// - perf events:  `name` (str) + `duration_ns` (u64)
+// - perf events:  `name` (str) + `trace_id` (u64) + `ts_begin_us` (u64) + `duration_ns` (u64)
 // - sqlx events:  `summary` (str) + `elapsed_secs` (f64)
 struct PerfEventVisitor {
     name: Option<String>,
     duration_ns: Option<u64>,
+    ts_begin_us: Option<u64>,
+    trace_id: Option<u64>,
     // sqlx fields
     summary: Option<String>,
     elapsed_secs: Option<f64>,
@@ -105,8 +130,11 @@ impl Visit for PerfEventVisitor {
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "duration_ns" {
-            self.duration_ns = Some(value);
+        match field.name() {
+            "duration_ns" => self.duration_ns = Some(value),
+            "ts_begin_us" => self.ts_begin_us = Some(value),
+            "trace_id" => self.trace_id = Some(value),
+            _ => {}
         }
     }
 
@@ -127,6 +155,9 @@ impl Visit for PerfEventVisitor {
 #[derive(Clone, Default)]
 pub struct PerfTracingLayer {
     samples: Arc<Mutex<Vec<PerfSample>>>,
+    /// Buckets filled by `checkpoint()`: each entry is `(iteration, wall_time_ns, spans)`.
+    #[allow(clippy::type_complexity)]
+    per_iteration_buckets: Arc<Mutex<Vec<(usize, u64, Vec<PerfSample>)>>>,
 }
 
 impl PerfTracingLayer {
@@ -138,6 +169,14 @@ impl PerfTracingLayer {
 
     /// Drain all accumulated samples and return per-marker breakdowns, sorted
     /// by call count descending (hottest markers first).
+    ///
+    /// **Note:** when `--detailed` mode is active, [`checkpoint`] moves samples
+    /// out of the primary buffer after each iteration. In that case this method
+    /// returns an empty `Vec`; use [`drain_per_iteration`] instead to access the
+    /// per-iteration data.
+    ///
+    /// [`checkpoint`]: Self::checkpoint
+    /// [`drain_per_iteration`]: Self::drain_per_iteration
     pub fn drain(&self) -> Vec<PerfBreakdown> {
         let mut guard = self.samples.lock().expect("perf layer mutex poisoned");
         let taken: Vec<PerfSample> = std::mem::take(&mut *guard);
@@ -158,7 +197,7 @@ impl PerfTracingLayer {
             .collect();
 
         // Hottest markers (most total time) first
-        breakdowns.sort_by(|a, b| b.total_duration.cmp(&a.total_duration));
+        breakdowns.sort_by(|a, b| b.total_ns.cmp(&a.total_ns));
         breakdowns
     }
 
@@ -169,6 +208,42 @@ impl PerfTracingLayer {
             .lock()
             .expect("perf layer mutex poisoned")
             .clear();
+        self.per_iteration_buckets
+            .lock()
+            .expect("perf layer bucket mutex poisoned")
+            .clear();
+    }
+
+    /// Drain the current sample buffer into a per-iteration bucket keyed by
+    /// `iteration`. Call this after each iteration when `--detailed` is active.
+    /// The main `drain()` path is unaffected; both can be used independently.
+    pub fn checkpoint(&self, iteration: usize, wall_time_ns: u64) {
+        let mut samples = self.samples.lock().expect("perf layer mutex poisoned");
+        let spans = std::mem::take(&mut *samples);
+        drop(samples);
+        self.per_iteration_buckets
+            .lock()
+            .expect("perf layer bucket mutex poisoned")
+            .push((iteration, wall_time_ns, spans));
+    }
+
+    /// Consume all per-iteration buckets and return structured `IterationDetail`
+    /// values. Call this after the timed loop when `--detailed` is active.
+    pub fn drain_per_iteration(&self) -> Vec<IterationDetail> {
+        let mut buckets = self
+            .per_iteration_buckets
+            .lock()
+            .expect("perf layer bucket mutex poisoned");
+        let taken = std::mem::take(&mut *buckets);
+        drop(buckets);
+        taken
+            .into_iter()
+            .map(|(iteration, wall_time_ns, spans)| IterationDetail {
+                iteration,
+                wall_time_ns,
+                spans,
+            })
+            .collect()
     }
 }
 
@@ -186,26 +261,32 @@ where
         let mut visitor = PerfEventVisitor {
             name: None,
             duration_ns: None,
+            ts_begin_us: None,
+            trace_id: None,
             summary: None,
             elapsed_secs: None,
         };
         event.record(&mut visitor);
 
         let sample = if target == PERF_TARGET {
-            // perf_span! events: name + duration_ns
+            // perf_span! events: name + trace_id + ts_begin_us + duration_ns
             match (visitor.name, visitor.duration_ns) {
                 (Some(name), Some(ns)) => Some(PerfSample {
                     name,
                     duration: Duration::from_nanos(ns),
+                    ts_begin_us: visitor.ts_begin_us.unwrap_or(0),
+                    trace_id: visitor.trace_id.unwrap_or(0),
                 }),
                 _ => None,
             }
         } else if target == SQLX_TARGET {
-            // sqlx query events: summary + elapsed_secs
+            // sqlx query events: summary + elapsed_secs (no ts_begin_us emitted)
             match (visitor.summary, visitor.elapsed_secs) {
                 (Some(summary), Some(secs)) => Some(PerfSample {
                     name: format!("sqlx::{summary}"),
                     duration: Duration::from_secs_f64(secs),
+                    ts_begin_us: 0,
+                    trace_id: 0,
                 }),
                 _ => None,
             }

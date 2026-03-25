@@ -111,6 +111,125 @@ benchmark scenario="":
     fi
     rm -rf ./dev/data/benchmark_test/
 
+# Run benchmarks and emit JSON output
+# Usage:
+#   just benchmark-json                      # All scenarios
+#   just benchmark-json messaging-performance  # Specific scenario
+benchmark-json scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ./benchmark_results
+    rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    SUFFIX=""
+    [ -n "{{scenario}}" ] && SUFFIX="_{{scenario}}"
+    RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+        cargo run --release --features benchmark-tests --bin benchmark_test -- \
+        --data-dir ./dev/data/benchmark_test \
+        --logs-dir ./dev/data/benchmark_test/logs \
+        --output-json "./benchmark_results/result_${TIMESTAMP}${SUFFIX}.json" \
+        {{scenario}}
+    rm -rf ./dev/data/benchmark_test
+
+# Run only stable-tier benchmark scenarios and merge results into a single JSON.
+# Used by the merge-gating CI job so relay-tier failures cannot block a merge.
+benchmark-json-stable:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v jq >/dev/null 2>&1 || { echo "ERROR: jq is required but not installed"; exit 1; }
+    mkdir -p ./benchmark_results
+    rm -rf ./dev/data/benchmark_test/ && mkdir -p ./dev/data/benchmark_test
+    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+    MERGED="./benchmark_results/result_${TIMESTAMP}_stable.json"
+    TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$TMPDIR"' EXIT
+    # Run each stable scenario individually so a single-scenario failure is isolated.
+    SCENARIO_FILES=()
+    for SCENARIO in messaging-performance message-aggregation identity-creation; do
+        RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+            cargo run --release --features benchmark-tests --bin benchmark_test -- \
+            --data-dir ./dev/data/benchmark_test \
+            --logs-dir ./dev/data/benchmark_test/logs \
+            --output-json "$TMPDIR/${SCENARIO}.json" \
+            "$SCENARIO"
+        SCENARIO_FILES+=("$TMPDIR/${SCENARIO}.json")
+    done
+    # Merge the single-scenario JSON files into one envelope.
+    # jq slurps all files, takes generated_at/git_sha from the last file,
+    # and concatenates all scenarios[] arrays.
+    jq -s '{
+        generated_at: .[-1].generated_at,
+        git_sha: .[-1].git_sha,
+        scenarios: [.[].scenarios[]]
+    }' "${SCENARIO_FILES[@]}" > "$MERGED"
+    rm -rf ./dev/data/benchmark_test
+    echo "Stable benchmark results: $MERGED"
+
+# Set current result as regression baseline
+# Usage:
+#   just benchmark-baseline                      # All scenarios
+#   just benchmark-baseline messaging-performance  # Specific scenario
+benchmark-baseline scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just benchmark-json {{scenario}}
+    shopt -s nullglob
+    files=(./benchmark_results/result_*.json)
+    shopt -u nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "ERROR: No benchmark result file found"
+        exit 1
+    fi
+    RESULT=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
+    cp "$RESULT" ./benchmark_results/baseline.json
+    echo "Baseline updated: ./benchmark_results/baseline.json"
+
+# Run benchmarks and compare against baseline
+# Usage:
+#   just benchmark-check                      # All scenarios
+#   just benchmark-check messaging-performance  # Specific scenario
+benchmark-check scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just benchmark-json {{scenario}}
+    shopt -s nullglob
+    files=(./benchmark_results/result_*.json)
+    shopt -u nullglob
+    if [ ${#files[@]} -eq 0 ]; then
+        echo "ERROR: No benchmark result file found"
+        exit 1
+    fi
+    CANDIDATE=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t | head -1)
+    cargo run --release --features benchmark-tests --bin bench_compare -- \
+        ./benchmark_results/baseline.json \
+        "$CANDIDATE" \
+        {{ if scenario != "" { "--scenario " + scenario } else { "" } }}
+
+# Run benchmarks with per-iteration detail and emit a Perfetto trace
+# Usage:
+#   just benchmark-trace                      # All scenarios
+#   just benchmark-trace messaging-performance  # Specific scenario
+benchmark-trace scenario="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ./benchmark_results
+    TS=$(date +%Y%m%d_%H%M%S)
+    SUFFIX=""
+    [ -n "{{scenario}}" ] && SUFFIX="_{{scenario}}"
+    rm -rf ./dev/data/benchmark_test && mkdir -p ./dev/data/benchmark_test
+    RUST_LOG=warn,benchmark_test=info,whitenoise=info \
+        cargo run --release --features benchmark-tests --bin benchmark_test -- \
+        --data-dir ./dev/data/benchmark_test \
+        --logs-dir ./dev/data/benchmark_test/logs \
+        --output-json "./benchmark_results/trace_${TS}${SUFFIX}.json" \
+        --chrome-trace "./benchmark_results/trace_${TS}${SUFFIX}.perfetto.json" \
+        --detailed \
+        {{scenario}}
+    rm -rf ./dev/data/benchmark_test
+    echo "Perfetto trace: ./benchmark_results/trace_${TS}${SUFFIX}.perfetto.json"
+    echo "Open at: https://ui.perfetto.dev"
+
+
 # Measure initialization timing (phase-by-phase breakdown, empty database)
 # Usage:
 #   just benchmark-startup       # Single run

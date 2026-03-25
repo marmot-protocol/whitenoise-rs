@@ -60,8 +60,13 @@ echo ""
 echo "=== Warm Init (account + $ITERATIONS runs) ==="
 for i in $(seq 1 "$ITERATIONS"); do
     [ "$ITERATIONS" -gt 1 ] && echo "--- Run $i/$ITERATIONS ---"
+    # --seed-nsec restores the MDK DB encryption key (saved to benchmark_keyring.txt
+    # by the --login run) into the fresh in-memory mock keyring before
+    # initialize_whitenoise opens the encrypted MLS database. Without this the
+    # warm-init process starts with an empty keyring, finds the encrypted SQLite
+    # file on disk, and fails with KeyringEntryMissingForExistingDatabase.
     RUST_LOG="$RUST_LOG_TIMING" \
-    "${CARGO_BIN[@]}" --data-dir "$DATA_DIR" --logs-dir "$DATA_DIR" --init-only
+    "${CARGO_BIN[@]}" --data-dir "$DATA_DIR" --logs-dir "$DATA_DIR" --seed-nsec "$SEC" --init-only
 done
 
 # ---------------------------------------------------------------------------

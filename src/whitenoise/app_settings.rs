@@ -5,17 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Whitenoise, whitenoise::Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum ThemeMode {
     Light,
     Dark,
+    #[default]
     System,
-}
-
-impl Default for ThemeMode {
-    fn default() -> Self {
-        Self::System
-    }
 }
 
 impl fmt::Display for ThemeMode {
@@ -41,8 +36,9 @@ impl FromStr for ThemeMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum Language {
+    #[default]
     System,
     English,
     Spanish,
@@ -52,12 +48,6 @@ pub enum Language {
     Portuguese,
     Russian,
     Turkish,
-}
-
-impl Default for Language {
-    fn default() -> Self {
-        Self::System
-    }
 }
 
 impl fmt::Display for Language {

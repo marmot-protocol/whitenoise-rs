@@ -1,0 +1,207 @@
+name: Performance Hotspot Digest
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+    - cron: "0 20 * * *"
+  workflow_dispatch:     # manual trigger for testing
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  hotspot-digest:
+    name: Run benchmarks and update hotspot digest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: write   # needed to push hotspot commit to perf-hotspot branch
+      issues: write     # needed to create/update the pinned perf-hotspot issue
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout perf-hotspot branch
+        id: checkout_perf_hotspot
+        uses: actions/checkout@v4
+        with:
+          ref: perf-hotspot
+          fetch-depth: 1
+          path: perf-hotspot-data
+        continue-on-error: true
+
+      - name: Bootstrap perf-hotspot workspace (branch missing)
+        if: steps.checkout_perf_hotspot.outcome != 'success'
+        run: |
+          mkdir -p perf-hotspot-data/hotspots
+          cd perf-hotspot-data
+          git init
+          git checkout -b perf-hotspot
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Wait for services to be ready
+        run: |
+          sleep 5
+          docker compose ps
+          ./scripts/wait_for_relays.sh
+
+      - name: Run full benchmark suite
+        id: benchmark
+        # Relay-tier scenarios can fail due to relay downtime / network jitter.
+        # Accept partial results rather than skipping the digest entirely.
+        run: just benchmark-json
+        continue-on-error: true
+
+      - name: Stop Docker Compose services
+        if: always()
+        run: docker compose down -v
+
+      - name: Detect result file
+        id: result
+        run: |
+          set +e
+          shopt -s nullglob
+          files=(./benchmark_results/result_*.json)
+          shopt -u nullglob
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            FILE=$(printf '%s\0' "${files[@]}" | xargs -0 ls -t -- | head -1)
+            echo "path=$FILE" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute hotspot digest
+        if: steps.result.outputs.found == 'true'
+        id: hotspot
+        env:
+          RESULT_PATH: ${{ steps.result.outputs.path }}
+        run: |
+          TS=$(date -u +%Y-%m-%dT%H%M%SZ)
+          mkdir -p ./perf-hotspot-data/hotspots
+          HOTSPOT_FILE="./perf-hotspot-data/hotspots/${TS}.json"
+          cargo run --release --features benchmark-tests --bin bench_hotspot -- \
+            "$RESULT_PATH" \
+            --history-dir ./perf-hotspot-data/hotspots \
+            --output-json "$HOTSPOT_FILE" \
+            --run-id "$TS"
+          echo "hotspot_path=$HOTSPOT_FILE" >> "$GITHUB_OUTPUT"
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Commit to perf-hotspot branch
+        if: steps.hotspot.outcome == 'success'
+        run: |
+          cd perf-hotspot-data
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add hotspots/
+          if git diff --cached --quiet; then
+            echo "No changes to hotspot digest"
+          else
+            git commit -m "hotspot digest ${{ steps.hotspot.outputs.ts }} from $(git -C .. rev-parse --short HEAD)"
+            git push --set-upstream origin perf-hotspot
+          fi
+
+      - name: Update GitHub hotspot issue
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          BENCHMARK_OUTCOME: ${{ steps.benchmark.outcome }}
+          HOTSPOT_OUTCOME: ${{ steps.hotspot.outcome }}
+          HOTSPOT_PATH: ${{ steps.hotspot.outputs.hotspot_path }}
+          RUN_TS: ${{ steps.hotspot.outputs.ts }}
+        with:
+          script: |
+            const fs = require('fs');
+            const benchmarkOk = process.env.BENCHMARK_OUTCOME === 'success';
+            const hotspotOk = process.env.HOTSPOT_OUTCOME === 'success';
+            const runTs = process.env.RUN_TS || 'unknown';
+
+            // Find or create the pinned hotspot issue (label: perf-hotspot)
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'perf-hotspot',
+              state: 'open',
+            });
+            const issueNumber = issues.length > 0 ? issues[0].number : null;
+
+            let body;
+            if (!hotspotOk) {
+              const reason = !benchmarkOk
+                ? 'The benchmark run failed (relay downtime or network issue).'
+                : 'The hotspot computation failed after a partial benchmark run.';
+              body = `## Performance Hotspot Digest\n\n⚠️ Degraded run at \`${runTs}\` — ${reason}\n\nThe previous digest remains valid until the next successful run.`;
+            } else {
+              let hotspotTable = '';
+              try {
+                const raw = fs.readFileSync(process.env.HOTSPOT_PATH, 'utf8');
+                const data = JSON.parse(raw);
+                hotspotTable = '\n\n| Rank | Span | Scenario | Mean | Contrib% | 7d Trend | Score |\n';
+                hotspotTable += '|------|------|----------|------|----------|----------|-------|\n';
+                const mdSafe = (s) => String(s).replace(/[\r\n]+/g, ' ').replace(/\|/g, '&#124;').replace(/`/g, "'");
+                for (const h of data.hotspots) {
+                  const trend = h.trend_pct === null ? '—'
+                    : h.trend_pct > 10 ? `📈 +${h.trend_pct.toFixed(0)}%`
+                    : h.trend_pct < -10 ? `📉 ${h.trend_pct.toFixed(0)}%`
+                    : `${h.trend_pct > 0 ? '+' : ''}${h.trend_pct.toFixed(0)}%`;
+                  const mean = h.mean_ns >= 1e9 ? `${(h.mean_ns/1e9).toFixed(2)}s`
+                    : h.mean_ns >= 1e6 ? `${(h.mean_ns/1e6).toFixed(1)}ms`
+                    : `${(h.mean_ns/1e3).toFixed(1)}µs`;
+                  const spanName = mdSafe(h.span_name);
+                  const scenarioName = mdSafe(h.scenario_name);
+                  hotspotTable += `| ${h.rank} | \`${spanName}\` | ${scenarioName} | ${mean} | ${h.contribution_pct.toFixed(1)}% | ${trend} | ${h.hotspot_score.toFixed(2)} |\n`;
+                }
+                if (!benchmarkOk) {
+                  hotspotTable = '\n\n⚠️ Partial benchmark run — some scenarios may be missing.' + hotspotTable;
+                }
+              } catch (_) {
+                hotspotTable = '\n\n*(Error reading hotspot data)*';
+              }
+
+              const sha = context.sha.slice(0, 7);
+              body = `![marmot perf hotspot](https://blossom.primal.net/c21c064ac26a6fdbb81d6a697c445df35f3d9bfb3d0c35fb5abd1cc86a600007.png)\n\n⚠️ Please ignore this issue and do not close it.\n\nThis issue is automatically updated twice daily. It tracks the current performance hotspots across the whitenoise-rs benchmark suite — spans taking the longest and contributing the most to overall operation latency.\n\n---\n\n## Hotspot Digest\n*Generated at \`${runTs}\` from \`${sha}\`*\n*Filtering: mean ≥ 10ms · contribution 1–95% of scenario*${hotspotTable}`;
+            }
+
+            if (issueNumber) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+            } else {
+              const newIssue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'Performance Hotspot Digest',
+                body,
+                labels: ['perf-hotspot'],
+              });
+              await github.graphql(`
+                mutation($issueId:ID!) {
+                  pinIssue(input: {issueId: $issueId}) {
+                    issue { id }
+                  }
+                }`, {
+                issueId: newIssue.data.node_id
+              });
+            }

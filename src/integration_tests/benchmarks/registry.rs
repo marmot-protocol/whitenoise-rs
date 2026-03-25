@@ -1,3 +1,4 @@
+use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
 use crate::integration_tests::benchmarks::scenarios::{
     AddMembersPerformanceBenchmark, GroupCreationBenchmark, IdentityCreationBenchmark,
     LoginMultistepPerformanceBenchmark, LoginPerformanceBenchmark, LoginStartPerformanceBenchmark,
@@ -76,52 +77,88 @@ benchmark_registry! {
 pub struct BenchmarkRegistry;
 
 impl BenchmarkRegistry {
-    /// Run a single benchmark scenario by name
+    /// Return the kebab-case CLI name for a benchmark result.
+    ///
+    /// Scenarios store a human-readable display name (e.g. "Messaging Performance")
+    /// but the registry maps kebab-case CLI names to constructors. This method
+    /// finds the CLI name that produced the given result by matching against the
+    /// display name of each registered scenario.
+    pub fn cli_name_for(result: &BenchmarkResult) -> Option<&'static str> {
+        for name in get_all_benchmark_names() {
+            if let Ok(scenario) = parse_and_instantiate(name)
+                && scenario.name() == result.name
+            {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// Return the thresholds for a benchmark result by looking up the registered
+    /// scenario and calling `thresholds()` on it directly.
+    ///
+    /// Returns `None` if the result name does not match any registered scenario —
+    /// this makes stale or renamed scenarios visible rather than silently falling
+    /// back to generic defaults that would mask threshold drift.
+    pub fn thresholds_for(result: &BenchmarkResult) -> Option<ScenarioThresholds> {
+        let name = Self::cli_name_for(result)?;
+        let scenario = parse_and_instantiate(name).ok()?;
+        Some(scenario.thresholds())
+    }
+
+    /// Run a single benchmark scenario by name, returning the result.
     pub async fn run_scenario(
         scenario_name: &str,
         whitenoise: &'static Whitenoise,
-    ) -> Result<(), WhitenoiseError> {
+    ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
 
-        // Parse and instantiate the scenario
         let mut scenario =
             parse_and_instantiate(scenario_name).map_err(WhitenoiseError::InvalidInput)?;
 
         tracing::info!("=== Running Benchmark: {} ===", scenario.name());
 
-        // Run the benchmark
         let result = scenario.run_benchmark(whitenoise).await?;
+        let results = vec![result];
 
-        // Print summary for this single benchmark
-        Self::print_summary(&[result], overall_start.elapsed()).await;
+        Self::print_summary(&results, overall_start.elapsed()).await;
 
         tracing::info!("=== Benchmark Completed Successfully ===");
 
-        Ok(())
+        Ok(results)
     }
 
+    /// Run all registered benchmarks, returning results for those that succeeded.
     pub async fn run_all_benchmarks(
         whitenoise: &'static Whitenoise,
-    ) -> Result<(), WhitenoiseError> {
+    ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
         let mut results = Vec::new();
         let mut first_error = None;
 
         tracing::info!("=== Running Performance Benchmarks ===");
 
-        // Run all registered benchmarks
         run_all_registered(whitenoise, &mut results, &mut first_error).await;
 
         Self::print_summary(&results, overall_start.elapsed()).await;
 
-        // Return the first error encountered, if any
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        // Return partial results even when some scenarios failed — partial results
+        // are valuable for hotspot analysis and regression comparison.
+        // Log the first error so the caller knows something went wrong, but do not
+        // discard the results that did succeed.
+        if let Some(ref error) = first_error {
+            tracing::warn!(
+                target: "whitenoise::benchmarks",
+                "One or more benchmarks failed; partial results ({} of {} registered) returned. First error: {}",
+                results.len(),
+                get_all_benchmark_names().len(),
+                error,
+            );
         }
+        Ok(results)
     }
 
-    async fn print_summary(results: &[BenchmarkResult], overall_duration: Duration) {
+    pub async fn print_summary(results: &[BenchmarkResult], overall_duration: Duration) {
         tokio::time::sleep(Duration::from_millis(500)).await; // Wait for logs to flush
 
         if results.is_empty() {
@@ -167,14 +204,14 @@ impl BenchmarkRegistry {
                 for b in breakdown {
                     tracing::info!(
                         "  {:48}  {:>7}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
-                        b.marker,
+                        b.name,
                         b.call_count,
-                        format!("{:.2?}", b.mean),
-                        format!("{:.2?}", b.median),
-                        format!("{:.2?}", b.p95),
-                        format!("{:.2?}", b.p99),
-                        format!("{:.2?}", b.min),
-                        format!("{:.2?}", b.max),
+                        format!("{:.2?}", b.mean_ns),
+                        format!("{:.2?}", b.median_ns),
+                        format!("{:.2?}", b.p95_ns),
+                        format!("{:.2?}", b.p99_ns),
+                        format!("{:.2?}", b.min_ns),
+                        format!("{:.2?}", b.max_ns),
                     );
                 }
             }

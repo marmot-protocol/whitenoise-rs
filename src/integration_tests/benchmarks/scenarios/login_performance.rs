@@ -5,6 +5,7 @@ use futures::stream::{self, StreamExt};
 use nostr_sdk::prelude::*;
 
 use crate::WhitenoiseError;
+use crate::integration_tests::benchmarks::core::json_output::{CiTier, ScenarioThresholds};
 use crate::integration_tests::benchmarks::test_cases::LoginBenchmark;
 use crate::integration_tests::benchmarks::{BenchmarkConfig, BenchmarkScenario, BenchmarkTestCase};
 use crate::integration_tests::core::ScenarioContext;
@@ -74,6 +75,15 @@ impl BenchmarkScenario for LoginPerformanceBenchmark {
             iterations: 10,
             warmup_iterations: 1,
             cooldown_between_iterations: Duration::from_millis(500),
+        }
+    }
+
+    fn thresholds(&self) -> ScenarioThresholds {
+        ScenarioThresholds {
+            warn_pct: 10,
+            regress_pct: 25,
+            break_pct: 40,
+            ci_tier: CiTier::Relay,
         }
     }
 
