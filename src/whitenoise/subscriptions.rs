@@ -84,7 +84,18 @@ impl Whitenoise {
     ) -> Result<()> {
         let accounts = Account::all(&whitenoise_ref.database).await?;
         for account in accounts {
-            let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
+            let inbox_relays = match account.effective_inbox_relays(whitenoise_ref).await {
+                Ok(relays) => relays,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::initialize_whitenoise",
+                        "Failed to get effective inbox relays for account {}: {}",
+                        account.pubkey.to_hex(),
+                        e
+                    );
+                    continue;
+                }
+            };
             // Setup subscriptions for this account
             match whitenoise_ref
                 .setup_subscriptions(&account, &inbox_relays)
