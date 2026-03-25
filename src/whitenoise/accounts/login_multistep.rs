@@ -381,14 +381,16 @@ impl Whitenoise {
     /// login is pending this is a no-op and returns `Ok(())`.
     pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
         // Only clean up if there was actually a pending login for this pubkey.
-        if self.pending_logins.remove(pubkey).is_none() {
+        // Hold the removed stash value so we can restore it if cleanup fails,
+        // keeping the cancel retryable.
+        let Some((stash_pubkey, stash_discovered)) = self.pending_logins.remove(pubkey) else {
             tracing::debug!(
                 target: "whitenoise::accounts",
                 "No pending login for {}, nothing to cancel",
                 pubkey.to_hex()
             );
             return Ok(());
-        }
+        };
 
         // Remove any stashed external signer for this pubkey.
         self.remove_external_signer(pubkey);
@@ -409,10 +411,11 @@ impl Whitenoise {
                     e
                 );
             }
-            account
-                .delete(&self.database)
-                .await
-                .map_err(LoginError::from)?;
+            if let Err(e) = account.delete(&self.database).await {
+                // Restore the stash so a retry of login_cancel can succeed.
+                self.pending_logins.insert(stash_pubkey, stash_discovered);
+                return Err(LoginError::from(e));
+            }
             // Best-effort removal of the keychain entry.
             let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
             tracing::info!(
