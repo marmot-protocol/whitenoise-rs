@@ -15,6 +15,7 @@ pub(crate) use self::tasks::CachedGraphUserCleanup;
 pub(crate) use self::tasks::ConsumedKeyPackageCleanup;
 pub(crate) use self::tasks::KeyPackageMaintenance;
 pub(crate) use self::tasks::RelayListMaintenance;
+pub(crate) use self::tasks::SubscriptionHealthCheck;
 
 /// Trait for implementing scheduled background tasks.
 ///

@@ -277,18 +277,6 @@ impl RelayControlPlane {
         Ok(())
     }
 
-    #[perf_instrument("relay")]
-    pub(crate) async fn sync_discovery_subscriptions(
-        &self,
-        watched_users: &[PublicKey],
-        follow_list_accounts: &[(PublicKey, Option<nostr_sdk::Timestamp>)],
-        public_since: Option<nostr_sdk::Timestamp>,
-    ) -> NostrResult<()> {
-        self.discovery
-            .sync(watched_users, follow_list_accounts, public_since)
-            .await
-    }
-
     /// Activate group and inbox subscriptions for an account.
     ///
     /// **Atomicity:** First-time activation is NOT atomic across planes. Group
@@ -650,7 +638,7 @@ impl RelayControlPlane {
 
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn reset_for_tests(&self) -> NostrResult<()> {
-        self.sync_discovery_subscriptions(&[], &[], None).await?;
+        self.discovery.retire_all().await;
 
         let inbox_planes = self
             .account_inbox_planes

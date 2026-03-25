@@ -1,3 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use nostr_sdk::RelayUrl;
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc::Sender;
@@ -16,6 +19,47 @@ use crate::{
 };
 
 const MAX_USERS_PER_PUBLIC_DISCOVERY_SUBSCRIPTION: usize = 500;
+
+fn batch_count_for(user_count: usize) -> usize {
+    user_count.div_ceil(MAX_USERS_PER_PUBLIC_DISCOVERY_SUBSCRIPTION)
+}
+
+/// Derives a stable batch index from a pubkey. Pubkeys are uniformly distributed
+/// (secp256k1 curve points), so any byte range gives even distribution.
+fn pubkey_batch_index(pubkey: &PublicKey, batch_count: usize) -> usize {
+    let bytes = pubkey.to_bytes();
+    // Use the tail bytes — vanity addresses grind the prefix, biasing leading bytes.
+    let offset = bytes.len() - std::mem::size_of::<usize>();
+    let n = usize::from_le_bytes(std::array::from_fn(|i| bytes[offset + i]));
+    n % batch_count
+}
+
+fn assign_users_to_batches(users: &[PublicKey], batch_count: usize) -> Vec<Vec<PublicKey>> {
+    let mut batches = vec![Vec::new(); batch_count];
+    for &user in users {
+        let batch_index = pubkey_batch_index(&user, batch_count);
+        batches[batch_index].push(user);
+    }
+    // Sort within each batch for consistent hashing.
+    for batch in &mut batches {
+        batch.sort_unstable_by_key(|pk| pk.to_hex());
+    }
+    batches
+}
+
+fn hash_pubkey_slice(pubkeys: &[PublicKey]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    pubkeys.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Returns subscription IDs present in `old` but not in `new`.
+fn stale_ids(old: Vec<SubscriptionId>, new: &[SubscriptionId]) -> Vec<SubscriptionId> {
+    let new_set: std::collections::HashSet<String> = new.iter().map(|id| id.to_string()).collect();
+    old.into_iter()
+        .filter(|id| !new_set.contains(&id.to_string()))
+        .collect()
+}
 
 /// Configuration for the long-lived discovery plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,12 +113,18 @@ pub(crate) struct DiscoveryPlane {
 
 #[derive(Debug, Default)]
 struct DiscoveryPlaneState {
+    // User-data subscriptions
     public_subscription_ids: Vec<SubscriptionId>,
-    follow_list_subscription_ids: Vec<SubscriptionId>,
     watched_user_count: usize,
-    follow_list_account_count: usize,
     public_since: Option<Timestamp>,
-    last_sync_at: Option<Timestamp>,
+    previous_user_set_hash: Option<u64>,
+    previous_batch_count: Option<usize>,
+    previous_batch_hashes: Vec<u64>,
+
+    // Follow-list subscriptions
+    follow_list_subscription_ids: Vec<SubscriptionId>,
+    follow_list_account_count: usize,
+    previous_follow_set_hash: Option<u64>,
 }
 
 impl DiscoveryPlane {
@@ -101,34 +151,39 @@ impl DiscoveryPlane {
             .await
     }
 
+    // ── Watched-user subscriptions ───────────────────────────────────────
+
+    /// Syncs discovery subscriptions for watched users (metadata, relay lists,
+    /// inbox relays, key package relays). Skips relay work when the user set
+    /// is unchanged; when it did change, only re-subscribes the affected
+    /// batches via hash-based assignment.
     #[perf_instrument("relay")]
-    pub(crate) async fn sync(
+    pub(crate) async fn sync_watched_users(
         &self,
         watched_users: &[PublicKey],
-        follow_list_accounts: &[(PublicKey, Option<Timestamp>)],
         public_since: Option<Timestamp>,
     ) -> Result<()> {
-        // Short-circuit: no relays configured — retire any existing subscriptions.
-        if self.config.relays.is_empty() {
-            let stale = {
-                let mut state = self.state.write().await;
-                let stale = state
-                    .public_subscription_ids
-                    .iter()
-                    .chain(state.follow_list_subscription_ids.iter())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                state.public_subscription_ids.clear();
-                state.follow_list_subscription_ids.clear();
-                state.watched_user_count = 0;
-                state.follow_list_account_count = 0;
-                state.public_since = public_since;
-                state.last_sync_at = Some(Timestamp::now());
-                stale
-            };
-            for id in stale {
-                self.session.unsubscribe(&id).await;
-            }
+        let mut watched_users = watched_users.to_vec();
+        watched_users.sort_unstable_by_key(|pubkey| pubkey.to_hex());
+        watched_users.dedup();
+
+        let user_set_hash = hash_pubkey_slice(&watched_users);
+
+        let (hash_unchanged, previous_batch_count, previous_batch_hashes) = {
+            let state = self.state.read().await;
+            (
+                state.previous_user_set_hash == Some(user_set_hash),
+                state.previous_batch_count,
+                state.previous_batch_hashes.clone(),
+            )
+        };
+
+        if hash_unchanged {
+            tracing::debug!(
+                target: "whitenoise::relay_control::discovery",
+                watched_users = watched_users.len(),
+                "Watched-user sync skipped (user set unchanged)"
+            );
             return Ok(());
         }
 
@@ -140,76 +195,149 @@ impl DiscoveryPlane {
             self.start().await?;
         }
 
-        // Discovery sync is a full replace. We build ALL new subscriptions
-        // before touching existing state so that a mid-sync failure leaves the
-        // old subscriptions intact (no coverage gap). Subscription IDs are
-        // positional and stable across syncs (e.g. `discovery_user_data_0`),
-        // so re-subscribing with the same ID replaces the filter in-place on
-        // the relay rather than creating a duplicate stream.
-        let mut new_public_ids: Vec<SubscriptionId> = Vec::new();
-        let mut new_follow_ids: Vec<SubscriptionId> = Vec::new();
+        let (new_ids, new_batch_hashes) = self
+            .subscribe_watched_user_batches(
+                &watched_users,
+                public_since,
+                previous_batch_count,
+                &previous_batch_hashes,
+            )
+            .await?;
 
-        let mut watched_users = watched_users.to_vec();
-        watched_users.sort_unstable_by_key(|pubkey| pubkey.to_hex());
-        watched_users.dedup();
+        let stale = {
+            let mut state = self.state.write().await;
+            let old_ids = std::mem::replace(&mut state.public_subscription_ids, new_ids);
+            state.watched_user_count = watched_users.len();
+            state.public_since = public_since;
+            state.previous_user_set_hash = Some(user_set_hash);
+            state.previous_batch_count = Some(batch_count_for(watched_users.len()));
+            state.previous_batch_hashes = new_batch_hashes;
+            stale_ids(old_ids, &state.public_subscription_ids)
+        };
+        for id in stale {
+            self.session.unsubscribe(&id).await;
+        }
 
-        for (batch_index, authors) in watched_users
-            .chunks(MAX_USERS_PER_PUBLIC_DISCOVERY_SUBSCRIPTION)
-            .enumerate()
-        {
-            let mut filter = Filter::new().authors(authors.to_vec()).kinds([
-                Kind::Metadata,
-                Kind::RelayList,
-                Kind::InboxRelays,
-                Kind::MlsKeyPackageRelays,
-            ]);
-            if let Some(public_since) = public_since {
-                filter = filter.since(public_since);
-            }
+        Ok(())
+    }
 
+    /// Assigns users to batches via hash and subscribes only the changed batches.
+    async fn subscribe_watched_user_batches(
+        &self,
+        watched_users: &[PublicKey],
+        public_since: Option<Timestamp>,
+        previous_batch_count: Option<usize>,
+        previous_batch_hashes: &[u64],
+    ) -> Result<(Vec<SubscriptionId>, Vec<u64>)> {
+        let batch_count = batch_count_for(watched_users.len());
+        let batches = if batch_count > 0 {
+            assign_users_to_batches(watched_users, batch_count)
+        } else {
+            Vec::new()
+        };
+
+        let new_batch_hashes: Vec<u64> = batches.iter().map(|b| hash_pubkey_slice(b)).collect();
+        let batch_count_changed = previous_batch_count != Some(batch_count);
+
+        let mut new_ids = Vec::new();
+        let mut batches_skipped = 0usize;
+
+        for (batch_index, authors) in batches.iter().enumerate() {
             let subscription_id = SubscriptionId::new(format!("discovery_user_data_{batch_index}"));
-            self.session
-                .subscribe_with_id_to(
-                    &self.config.relays,
-                    subscription_id.clone(),
-                    filter,
-                    // Metadata and relay-list discovery route through the global
-                    // event processor. Follow lists stay separate because they are
-                    // account-scoped and feed account follow processing.
-                    SubscriptionStream::DiscoveryUserData,
-                    None,
-                    &[],
-                )
-                .await?;
-            new_public_ids.push(subscription_id);
-        }
 
-        let mut follow_list_accounts = follow_list_accounts.to_vec();
-        follow_list_accounts.sort_unstable_by_key(|(pubkey, _)| pubkey.to_hex());
+            let hash_changed = batch_count_changed
+                || previous_batch_hashes
+                    .get(batch_index)
+                    .is_none_or(|prev| *prev != new_batch_hashes[batch_index]);
 
-        // Deduplicate by pubkey and keep the earliest replay anchor. `None`
-        // is treated as earliest because it means "full replay required".
-        let mut deduped_follow_list_accounts: Vec<(PublicKey, Option<Timestamp>)> =
-            Vec::with_capacity(follow_list_accounts.len());
-        for (pubkey, since) in follow_list_accounts {
-            match deduped_follow_list_accounts.last_mut() {
-                Some((last_pubkey, last_since)) if *last_pubkey == pubkey => {
-                    *last_since = match (*last_since, since) {
-                        (None, _) | (_, None) => None,
-                        (Some(existing), Some(candidate)) => Some(existing.min(candidate)),
-                    };
+            if hash_changed {
+                let mut filter = Filter::new().authors(authors.clone()).kinds([
+                    Kind::Metadata,
+                    Kind::RelayList,
+                    Kind::InboxRelays,
+                    Kind::MlsKeyPackageRelays,
+                ]);
+                if let Some(public_since) = public_since {
+                    filter = filter.since(public_since);
                 }
-                _ => deduped_follow_list_accounts.push((pubkey, since)),
+
+                self.session
+                    .subscribe_with_id_to(
+                        &self.config.relays,
+                        subscription_id.clone(),
+                        filter,
+                        SubscriptionStream::DiscoveryUserData,
+                        None,
+                        &[],
+                    )
+                    .await?;
+            } else {
+                batches_skipped += 1;
             }
+
+            new_ids.push(subscription_id);
         }
 
-        let follow_list_account_count = deduped_follow_list_accounts.len();
+        if batches_skipped > 0 {
+            tracing::debug!(
+                target: "whitenoise::relay_control::discovery",
+                batches_skipped,
+                batches_updated = batch_count - batches_skipped,
+                "Watched-user sync: skipped unchanged batches"
+            );
+        }
 
-        for (index, (account_pubkey, since)) in deduped_follow_list_accounts.into_iter().enumerate()
+        Ok((new_ids, new_batch_hashes))
+    }
+
+    // ── Follow-list subscriptions ────────────────────────────────────────
+
+    /// Syncs follow-list subscriptions for each account. Skips relay work
+    /// when the account set is unchanged.
+    ///
+    /// Account pubkeys are unique by DB primary key constraint, so no
+    /// deduplication is needed.
+    #[perf_instrument("relay")]
+    pub(crate) async fn sync_follow_lists(
+        &self,
+        follow_list_accounts: &[(PublicKey, Option<Timestamp>)],
+    ) -> Result<()> {
+        let mut follow_pubkeys: Vec<PublicKey> =
+            follow_list_accounts.iter().map(|(pk, _)| *pk).collect();
+        follow_pubkeys.sort_unstable_by_key(|pk| pk.to_hex());
+        follow_pubkeys.dedup();
+
+        let follow_set_hash = hash_pubkey_slice(&follow_pubkeys);
+
+        let hash_unchanged = {
+            let state = self.state.read().await;
+            state.previous_follow_set_hash == Some(follow_set_hash)
+        };
+
+        if hash_unchanged {
+            tracing::debug!(
+                target: "whitenoise::relay_control::discovery",
+                follow_accounts = follow_pubkeys.len(),
+                "Follow list sync skipped (account set unchanged)"
+            );
+            return Ok(());
+        }
+
+        if !self
+            .session
+            .has_any_relay_connected(&self.config.relays)
+            .await
         {
-            let mut filter = Filter::new().kind(Kind::ContactList).author(account_pubkey);
+            self.start().await?;
+        }
+
+        let mut new_ids = Vec::new();
+        for (index, (account_pubkey, since)) in follow_list_accounts.iter().enumerate() {
+            let mut filter = Filter::new()
+                .kind(Kind::ContactList)
+                .author(*account_pubkey);
             if let Some(since) = since {
-                filter = filter.since(since);
+                filter = filter.since(*since);
             }
 
             let subscription_id = SubscriptionId::new(format!("discovery_follow_{index}"));
@@ -218,49 +346,44 @@ impl DiscoveryPlane {
                     &self.config.relays,
                     subscription_id.clone(),
                     filter,
-                    // Discovery follow lists are account-scoped: they run on the
-                    // discovery plane, but still route through account event
-                    // processing and therefore must carry the owning account pubkey.
                     SubscriptionStream::DiscoveryFollowLists,
-                    Some(account_pubkey),
+                    Some(*account_pubkey),
                     &[],
                 )
                 .await?;
-            new_follow_ids.push(subscription_id);
+            new_ids.push(subscription_id);
         }
 
-        // All new subscriptions established. Atomically swap state and retire
-        // only the IDs that were NOT reused in the new set. IDs that appear in
-        // both the old and new sets were replaced in-place above and must not
-        // be unsubscribed.
-        let new_id_strings: std::collections::HashSet<String> = new_public_ids
-            .iter()
-            .chain(new_follow_ids.iter())
-            .map(|id| id.to_string())
-            .collect();
-
-        let stale_to_remove = {
+        let stale = {
             let mut state = self.state.write().await;
-            let old_public = std::mem::replace(&mut state.public_subscription_ids, new_public_ids);
-            let old_follow =
-                std::mem::replace(&mut state.follow_list_subscription_ids, new_follow_ids);
-            state.watched_user_count = watched_users.len();
-            state.follow_list_account_count = follow_list_account_count;
-            state.public_since = public_since;
-            state.last_sync_at = Some(Timestamp::now());
-            old_public
-                .into_iter()
-                .chain(old_follow.into_iter())
-                .filter(|id| !new_id_strings.contains(&id.to_string()))
-                .collect::<Vec<_>>()
+            let old_ids = std::mem::replace(&mut state.follow_list_subscription_ids, new_ids);
+            state.follow_list_account_count = follow_list_accounts.len();
+            state.previous_follow_set_hash = Some(follow_set_hash);
+            stale_ids(old_ids, &state.follow_list_subscription_ids)
         };
-
-        for id in stale_to_remove {
+        for id in stale {
             self.session.unsubscribe(&id).await;
         }
 
         Ok(())
     }
+
+    // ── Lifecycle ────────────────────────────────────────────────────────
+
+    /// Tears down all discovery subscriptions and resets state.
+    /// Used on logout (no remaining accounts) and test cleanup.
+    pub(crate) async fn retire_all(&self) {
+        let old = std::mem::take(&mut *self.state.write().await);
+        for id in old
+            .public_subscription_ids
+            .into_iter()
+            .chain(old.follow_list_subscription_ids)
+        {
+            self.session.unsubscribe(&id).await;
+        }
+    }
+
+    // ── Queries ──────────────────────────────────────────────────────────
 
     pub(crate) fn relays(&self) -> &[RelayUrl] {
         &self.config.relays
@@ -287,6 +410,10 @@ impl DiscoveryPlane {
         self.session
             .fetch_events_from(&self.config.relays, filter, timeout)
             .await
+    }
+
+    pub(crate) async fn watched_user_count(&self) -> usize {
+        self.state.read().await.watched_user_count
     }
 
     pub(crate) async fn has_subscriptions(&self) -> bool {
@@ -332,6 +459,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hash_is_stable_for_same_sorted_input() {
+        let keys: Vec<PublicKey> = (0..3).map(|_| Keys::generate().public_key()).collect();
+
+        let hash1 = hash_pubkey_slice(&keys);
+        let hash2 = hash_pubkey_slice(&keys);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn hash_differs_for_different_input() {
+        let keys_a: Vec<PublicKey> = (0..3).map(|_| Keys::generate().public_key()).collect();
+        let keys_b: Vec<PublicKey> = (0..3).map(|_| Keys::generate().public_key()).collect();
+
+        assert_ne!(hash_pubkey_slice(&keys_a), hash_pubkey_slice(&keys_b));
+    }
+
+    #[test]
+    fn hash_of_empty_slice_is_consistent() {
+        let empty: Vec<PublicKey> = vec![];
+        let hash1 = hash_pubkey_slice(&empty);
+        let hash2 = hash_pubkey_slice(&empty);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn batch_count_is_zero_for_empty_set() {
+        assert_eq!(batch_count_for(0), 0);
+    }
+
+    #[test]
+    fn batch_count_is_one_up_to_max_batch_size() {
+        assert_eq!(batch_count_for(1), 1);
+        assert_eq!(batch_count_for(499), 1);
+        assert_eq!(batch_count_for(500), 1);
+    }
+
+    #[test]
+    fn assign_to_batches_is_deterministic() {
+        let users: Vec<PublicKey> = (0..10).map(|_| Keys::generate().public_key()).collect();
+
+        let batches_1 = assign_users_to_batches(&users, 3);
+        let batches_2 = assign_users_to_batches(&users, 3);
+        assert_eq!(batches_1, batches_2);
+    }
+
+    #[test]
+    fn adding_one_user_changes_exactly_one_batch_hash() {
+        let users: Vec<PublicKey> = (0..20).map(|_| Keys::generate().public_key()).collect();
+        let batch_count = 4;
+
+        let batches_before = assign_users_to_batches(&users, batch_count);
+        let hashes_before: Vec<u64> = batches_before
+            .iter()
+            .map(|b| hash_pubkey_slice(b))
+            .collect();
+
+        let mut users_after = users.clone();
+        users_after.push(Keys::generate().public_key());
+
+        let batches_after = assign_users_to_batches(&users_after, batch_count);
+        let hashes_after: Vec<u64> = batches_after.iter().map(|b| hash_pubkey_slice(b)).collect();
+
+        let changed_count = hashes_before
+            .iter()
+            .zip(&hashes_after)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            changed_count, 1,
+            "Adding one user should change exactly one batch"
+        );
+    }
+
+    #[test]
+    fn assign_to_batches_covers_all_users() {
+        let users: Vec<PublicKey> = (0..100).map(|_| Keys::generate().public_key()).collect();
+
+        let batches = assign_users_to_batches(&users, 3);
+        let total: usize = batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn batch_count_grows_past_max_batch_size() {
+        assert_eq!(batch_count_for(501), 2);
+        assert_eq!(batch_count_for(1000), 2);
+        assert_eq!(batch_count_for(1001), 3);
+    }
+
+    #[test]
+    fn stale_ids_returns_old_ids_not_in_new_set() {
+        let old = vec![
+            SubscriptionId::new("a"),
+            SubscriptionId::new("b"),
+            SubscriptionId::new("c"),
+        ];
+        let new = vec![SubscriptionId::new("a"), SubscriptionId::new("c")];
+
+        let stale = stale_ids(old, &new);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].to_string(), "b");
+    }
+
+    #[test]
+    fn stale_ids_returns_empty_when_sets_match() {
+        let old = vec![SubscriptionId::new("a"), SubscriptionId::new("b")];
+        let new = vec![SubscriptionId::new("a"), SubscriptionId::new("b")];
+
+        assert!(stale_ids(old, &new).is_empty());
+    }
+
+    #[test]
+    fn stale_ids_returns_all_when_new_set_is_empty() {
+        let old = vec![SubscriptionId::new("a"), SubscriptionId::new("b")];
+        let new = vec![];
+
+        let stale = stale_ids(old, &new);
+        assert_eq!(stale.len(), 2);
+    }
+
+    #[test]
     fn test_curated_default_relays_match_literal_count() {
         let relays = DiscoveryPlaneConfig::curated_default_relays();
         assert_eq!(relays.len(), 6);
@@ -346,7 +594,6 @@ mod tests {
     fn test_new_preserves_provided_relays() {
         let relays = vec![RelayUrl::parse("ws://localhost:8080").unwrap()];
         let config = DiscoveryPlaneConfig::new(relays.clone());
-
         assert_eq!(config.relays, relays);
         assert_eq!(
             config.reconnect_policy,

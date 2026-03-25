@@ -24,6 +24,7 @@ pub mod chat_list;
 pub mod chat_list_streaming;
 pub mod database;
 pub mod debug;
+pub(crate) mod discovery_sync_worker;
 pub mod drafts;
 pub mod error;
 mod event_processor;
@@ -177,6 +178,8 @@ pub struct Whitenoise {
     /// The value holds whichever relay lists were already discovered on the
     /// network so that step 2a can publish defaults only for the missing ones.
     pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
+    /// Debounced worker that coalesces discovery subscription rebuilds.
+    discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -257,6 +260,7 @@ impl Whitenoise {
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
             pending_logins: DashMap::new(),
+            discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
         }
     }
 
@@ -544,6 +548,7 @@ impl Whitenoise {
             Arc::new(scheduled_tasks::ConsumedKeyPackageCleanup),
             Arc::new(scheduled_tasks::CachedGraphUserCleanup),
             Arc::new(scheduled_tasks::RelayListMaintenance),
+            Arc::new(scheduled_tasks::SubscriptionHealthCheck),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
             whitenoise_ref,
@@ -552,6 +557,18 @@ impl Whitenoise {
             tasks,
         );
         *whitenoise_ref.scheduler_handles.lock().await = scheduler_handles;
+
+        // Spawn discovery sync worker (must happen after GLOBAL_WHITENOISE is set)
+        {
+            let worker_shutdown_rx = whitenoise_ref.scheduler_shutdown.subscribe();
+            let handle = tokio::spawn(async move {
+                whitenoise_ref
+                    .discovery_sync_worker
+                    .run(whitenoise_ref, worker_shutdown_rx)
+                    .await;
+            });
+            whitenoise_ref.scheduler_handles.lock().await.push(handle);
+        }
 
         init_timing::record("background_tasks");
 
@@ -2553,19 +2570,18 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_is_global_subscriptions_operational_no_subscriptions() {
+        async fn test_is_global_subscriptions_operational_no_accounts_is_healthy() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-            // No global subscriptions set up in fresh instance
+            // Zero accounts with zero subscriptions is the correct state — healthy.
             let is_operational = whitenoise
                 .is_global_subscriptions_operational()
                 .await
                 .unwrap();
 
-            // Should return false when no global subscriptions exist
             assert!(
-                !is_operational,
-                "Global subscriptions should not be operational without setup"
+                is_operational,
+                "Zero accounts with zero subscriptions should be considered healthy"
             );
         }
     }
@@ -2676,6 +2692,9 @@ mod tests {
             let account1 = whitenoise.create_identity().await.unwrap();
             let account2 = whitenoise.create_identity().await.unwrap();
             let account3 = whitenoise.create_identity().await.unwrap();
+
+            // Flush fire-and-forget rebuild (worker handles this in production)
+            whitenoise.sync_discovery_subscriptions().await.unwrap();
 
             // First call - ensure all subscriptions work
             whitenoise.ensure_all_subscriptions().await.unwrap();
@@ -3243,14 +3262,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_refresh_all_global_subscriptions_no_account_returns_ok() {
+        async fn test_sync_discovery_subscriptions_no_account_returns_ok() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
             // With no accounts in the database, should return Ok (early return)
-            let result = whitenoise.refresh_all_global_subscriptions().await;
+            let result = whitenoise.sync_discovery_subscriptions().await;
             assert!(
                 result.is_ok(),
-                "refresh_all_global_subscriptions should succeed with no accounts"
+                "sync_discovery_subscriptions should succeed with no accounts"
             );
         }
 

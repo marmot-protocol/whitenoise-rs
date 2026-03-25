@@ -15,18 +15,20 @@ impl Whitenoise {
         // so they can run concurrently. Using join! (not try_join!) ensures both run
         // to completion — avoids cancelling a partially-activated account if the
         // discovery sync fails.
+        //
+        // Note: request_rebuild_and_wait only fails if the worker is dead (channel
+        // closed). A failed rebuild (e.g. unreachable relays) still advances the
+        // generation counter and returns Ok. This is intentional — the periodic
+        // ensure_all_subscriptions task self-heals discovery within minutes.
         let (global_result, accounts_result) = tokio::join!(
-            Self::setup_global_users_subscriptions(whitenoise_ref),
+            whitenoise_ref
+                .discovery_sync_worker
+                .request_rebuild_and_wait(),
             Self::setup_accounts_subscriptions(whitenoise_ref),
         );
         global_result?;
         accounts_result?;
         Ok(())
-    }
-
-    #[perf_instrument("whitenoise")]
-    async fn setup_global_users_subscriptions(whitenoise_ref: &Whitenoise) -> Result<()> {
-        whitenoise_ref.sync_discovery_subscriptions().await
     }
 
     /// Buffer (in seconds) subtracted from `last_synced_at` timestamps when
@@ -127,6 +129,11 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Signals a discovery rebuild if global subscriptions have drifted.
+    ///
+    /// The rebuild runs asynchronously in the discovery sync worker — this
+    /// method returns immediately after queuing the signal. Duplicate signals
+    /// are coalesced by the worker (at most one pending rebuild at a time).
     #[perf_instrument("whitenoise")]
     pub async fn ensure_global_subscriptions(&self) -> Result<()> {
         let is_operational = self.is_global_subscriptions_operational().await?;
@@ -136,7 +143,7 @@ impl Whitenoise {
                 target: "whitenoise::ensure_global_subscriptions",
                 "Global subscriptions not operational, refreshing..."
             );
-            Self::setup_global_users_subscriptions(self).await?;
+            self.discovery_sync_worker.request_rebuild();
         }
 
         Ok(())
@@ -244,11 +251,39 @@ impl Whitenoise {
 
     /// Checks if global subscriptions are operational without refreshing.
     ///
-    /// Returns true if at least one relay (from the client pool) is connected or connecting
-    /// AND at least one global subscription exists.
+    /// Returns true when the discovery plane's state matches what the database
+    /// says it should be. Zero accounts with zero subscriptions is healthy
+    /// (the expected state after logout or on a fresh install).
     #[perf_instrument("whitenoise")]
     pub async fn is_global_subscriptions_operational(&self) -> Result<bool> {
-        Ok(self.relay_control.has_discovery_subscriptions().await)
+        let has_subscriptions = self.relay_control.has_discovery_subscriptions().await;
+
+        // Zero accounts with zero subscriptions is the correct retired state
+        // (fresh install or after last logout). Users may still exist in the
+        // DB but discovery subscriptions are correctly torn down.
+        let account_count = Account::all(&self.database).await?.len();
+        if account_count == 0 && !has_subscriptions {
+            return Ok(true);
+        }
+
+        let db_user_count = User::all_pubkeys(&self.database).await?.len();
+        let plane_user_count = self.relay_control.discovery().watched_user_count().await;
+
+        if !has_subscriptions {
+            return Ok(false);
+        }
+
+        if db_user_count != plane_user_count {
+            tracing::info!(
+                target: "whitenoise::is_global_subscriptions_operational",
+                db_users = db_user_count,
+                plane_users = plane_user_count,
+                "Watched-user count mismatch between DB and discovery plane",
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// Returns a live in-memory snapshot of relay-plane state for debugging.
@@ -260,18 +295,16 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     pub(crate) async fn sync_discovery_subscriptions(&self) -> Result<()> {
         let accounts = Account::all(&self.database).await?;
+        let discovery = self.relay_control.discovery();
+
         if accounts.is_empty() {
-            // No accounts — tear down any active discovery subscriptions so they
-            // don't linger after the last account logs out.
-            self.relay_control
-                .sync_discovery_subscriptions(&[], &[], None)
-                .await
-                .map_err(WhitenoiseError::from)?;
+            discovery.retire_all().await;
             return Ok(());
         }
 
         let watched_users = User::all_pubkeys(&self.database).await?;
-        let follow_list_accounts = accounts
+        let public_since = Self::compute_global_since_timestamp(&accounts);
+        let follow_list_accounts: Vec<_> = accounts
             .iter()
             .map(|account| {
                 (
@@ -279,13 +312,18 @@ impl Whitenoise {
                     account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS),
                 )
             })
-            .collect::<Vec<_>>();
-        let public_since = Self::compute_global_since_timestamp(&accounts);
+            .collect();
 
-        self.relay_control
-            .sync_discovery_subscriptions(&watched_users, &follow_list_accounts, public_since)
+        discovery
+            .sync_watched_users(&watched_users, public_since)
             .await
-            .map_err(WhitenoiseError::from)
+            .map_err(WhitenoiseError::from)?;
+        discovery
+            .sync_follow_lists(&follow_list_accounts)
+            .await
+            .map_err(WhitenoiseError::from)?;
+
+        Ok(())
     }
 
     /// Returns the union of default relays and currently connected relays.
@@ -296,29 +334,5 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
         self.relay_control.discovery().relays().to_vec()
-    }
-
-    /// Refreshes discovery subscriptions after a single user's relay metadata
-    /// changes (e.g. after processing a relay-list event for that user).
-    ///
-    /// **Note:** The current implementation performs a full replace of every
-    /// watched-user and follow-list batch, identical to
-    /// `refresh_all_global_subscriptions`. Per-user incremental patching is not
-    /// yet implemented. Callers should not rely on this being cheap for large
-    /// user sets — prefer batching multiple user updates and calling
-    /// `refresh_all_global_subscriptions` once instead.
-    #[perf_instrument("whitenoise")]
-    pub(crate) async fn refresh_global_subscription_for_user(&self) -> Result<()> {
-        self.sync_discovery_subscriptions().await?;
-        Ok(())
-    }
-
-    /// Refreshes discovery subscriptions for all watched users across all
-    /// relay batches. Use after bulk user discovery (e.g. contact-list
-    /// processing) where many users may have changed simultaneously.
-    #[perf_instrument("whitenoise")]
-    pub(crate) async fn refresh_all_global_subscriptions(&self) -> Result<()> {
-        self.sync_discovery_subscriptions().await?;
-        Ok(())
     }
 }

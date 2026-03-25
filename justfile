@@ -353,8 +353,24 @@ precommit-quick:
     @just _run-quiet "check-fmt"    "fmt"
     @just _run-quiet "check-docs"   "docs"
     @just _run-quiet "check-clippy" "clippy"
-    @just _run-quiet "test"         "tests"
+    @just _run-quiet "test-unit"    "tests"
     @echo "PRECOMMIT PASSED"
+
+# Unit tests only (no integration-tests feature, no e2e binaries).
+# Used by precommit-quick for fast local validation without Docker.
+test-unit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v cargo-nextest &> /dev/null; then
+        echo "Running unit tests with nextest (parallel)..."
+        cargo nextest run --features cli --all-targets \
+            --filter-expr 'not binary(cli_e2e) and not binary(cli_relay_control_e2e)'
+        cargo test --features cli --doc
+    else
+        echo "Running unit tests with cargo test..."
+        cargo test --features cli --all-targets
+        cargo test --features cli --doc
+    fi
 
 # Quick pre-commit with verbose output
 precommit-quick-verbose: check test
