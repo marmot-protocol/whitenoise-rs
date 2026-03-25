@@ -7,7 +7,6 @@ use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::users::User;
 use crate::whitenoise::{
     aggregated_message, chat_list, chat_list_streaming, media_files, message_aggregator,
     message_streaming, notification_streaming, user_streaming,
@@ -60,7 +59,24 @@ impl Whitenoise {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!("subscription drain lagged by {n} messages");
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} messages; rebuilding snapshot from storage"
+                    );
+                    // Some updates were dropped — rebuild the snapshot from the DB
+                    // so the "initial snapshot + subsequent updates" guarantee holds.
+                    let refetched = aggregated_message::AggregatedMessage::find_messages_by_group(
+                        group_id,
+                        &self.database,
+                    )
+                    .await
+                    .map_err(|e| {
+                        WhitenoiseError::from(anyhow::anyhow!(
+                            "Failed to read cached messages: {}",
+                            e
+                        ))
+                    })?;
+                    messages_map = refetched.into_iter().map(|m| (m.id.clone(), m)).collect();
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
@@ -95,8 +111,31 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> Result<user_streaming::UserSubscription> {
         let mut updates = self.user_stream_manager.subscribe(pubkey);
-        let initial_user = self.resolve_user(pubkey).await?;
-        let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
+        let mut initial_user = self.resolve_user(pubkey).await?;
+
+        loop {
+            match updates.try_recv() {
+                Ok(update) => {
+                    initial_user = update.user;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} user updates; rebuilding snapshot from storage"
+                    );
+                    // Some updates were dropped — re-fetch from storage so the
+                    // "initial snapshot + subsequent updates" guarantee holds.
+                    initial_user = self.resolve_user(pubkey).await?;
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "User stream closed unexpectedly during subscription"
+                    )));
+                }
+            }
+        }
 
         Ok(user_streaming::UserSubscription {
             initial_user,
@@ -104,10 +143,11 @@ impl Whitenoise {
         })
     }
 
+    #[cfg(test)]
     fn drain_user_updates(
-        mut initial_user: User,
+        mut initial_user: crate::whitenoise::users::User,
         updates: &mut broadcast::Receiver<user_streaming::UserUpdate>,
-    ) -> Result<User> {
+    ) -> Result<crate::whitenoise::users::User> {
         loop {
             match updates.try_recv() {
                 Ok(update) => {
@@ -167,7 +207,17 @@ impl Whitenoise {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!("subscription drain lagged by {n} messages");
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} messages; rebuilding snapshot from storage"
+                    );
+                    // Some updates were dropped — rebuild the snapshot from the DB
+                    // so the "initial snapshot + subsequent updates" guarantee holds.
+                    let refetched = self.get_chat_list(account).await?;
+                    items_map = refetched
+                        .into_iter()
+                        .map(|item| (item.mls_group_id.clone(), item))
+                        .collect();
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
@@ -221,7 +271,17 @@ impl Whitenoise {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                    tracing::warn!("subscription drain lagged by {n} messages");
+                    tracing::warn!(
+                        target: "whitenoise",
+                        "subscription drain lagged by {n} messages; rebuilding snapshot from storage"
+                    );
+                    // Some updates were dropped — rebuild the snapshot from the DB
+                    // so the "initial snapshot + subsequent updates" guarantee holds.
+                    let refetched = self.get_archived_chat_list(account).await?;
+                    items_map = refetched
+                        .into_iter()
+                        .map(|item| (item.mls_group_id.clone(), item))
+                        .collect();
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
@@ -268,6 +328,7 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::user_streaming;
+    use crate::whitenoise::users::User;
 
     #[test]
     fn test_drain_user_updates_uses_newest_queued_update() {
