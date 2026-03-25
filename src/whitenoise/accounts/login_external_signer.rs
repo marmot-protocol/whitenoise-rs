@@ -35,6 +35,25 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
 
+        // If this account is already fully logged in, return it as-is.
+        // Same three-condition guard as login_start: avoids re-migrating a live
+        // local-key session to External and deleting its stored private key before
+        // the staged login has succeeded.
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
+            && !self.pending_logins.contains_key(&pubkey)
+            && self.background_task_cancellation.contains_key(&pubkey)
+        {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Account {} is already logged in, returning existing account",
+                pubkey.to_hex()
+            );
+            return Ok(LoginResult {
+                account: existing,
+                status: LoginStatus::Complete,
+            });
+        }
+
         // Create/update the account for this pubkey.
         let (mut account, _) = self
             .setup_external_signer_account_without_relays(pubkey)
