@@ -49,9 +49,9 @@ impl Whitenoise {
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.
-        // Only inbox_relays is needed by setup_subscriptions; do not gate
-        // recovery on the nip65 lookup which is not used here.
-        match account.inbox_relays(self).await {
+        // Use effective_inbox_relays so legacy accounts that have no kind-10050
+        // inbox list can still recover via the NIP-65 fallback.
+        match account.effective_inbox_relays(self).await {
             Ok(inbox_relays) => {
                 if let Err(e) = self.setup_subscriptions(&account, &inbox_relays).await {
                     tracing::warn!(
@@ -118,8 +118,13 @@ impl Whitenoise {
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
-        // First check for a registered external signer
-        if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
+        if account.uses_external_signer() {
+            let external_signer = self.get_external_signer(&account.pubkey).ok_or_else(|| {
+                WhitenoiseError::Other(anyhow::anyhow!(
+                    "External signer not registered for account {}",
+                    account.pubkey.to_hex()
+                ))
+            })?;
             tracing::debug!(
                 target: "whitenoise::signer",
                 "Using external signer for account {}",
@@ -128,7 +133,6 @@ impl Whitenoise {
             return Ok(external_signer);
         }
 
-        // Fall back to local keys from secrets store
         let keys = self
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;
@@ -148,5 +152,82 @@ impl Whitenoise {
             pubkey.to_hex()
         );
         self.external_signers.remove(pubkey);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use nostr_sdk::Keys;
+
+    use super::*;
+    use crate::whitenoise::accounts::AccountType;
+    use crate::whitenoise::test_utils::create_mock_whitenoise;
+
+    #[tokio::test]
+    async fn test_get_signer_for_account_returns_error_for_external_account_without_registered_signer()
+     {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let local_account = whitenoise.create_identity().await.unwrap();
+        let external_account = Account {
+            account_type: AccountType::External,
+            ..local_account
+        };
+
+        let result = whitenoise.get_signer_for_account(&external_account);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_signer_for_account_ignores_external_signer_for_local_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let external_keys = Keys::generate();
+        let external_pubkey = external_keys.public_key();
+
+        whitenoise
+            .insert_external_signer(external_pubkey, external_keys)
+            .await
+            .unwrap();
+
+        let local_account = Account {
+            id: None,
+            pubkey: external_pubkey,
+            user_id: 1,
+            account_type: AccountType::Local,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = whitenoise.get_signer_for_account(&local_account);
+        assert!(
+            result.is_err(),
+            "Local accounts must use local key path even when an external signer exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_export_account_npub_returns_bech32_pubkey() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+
+        let exported = whitenoise.export_account_npub(&account).await.unwrap();
+        assert_eq!(exported, account.pubkey.to_bech32().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_export_account_nsec_rejects_external_signer_accounts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let local_account = whitenoise.create_identity().await.unwrap();
+        let external_account = Account {
+            account_type: AccountType::External,
+            ..local_account
+        };
+
+        let result = whitenoise.export_account_nsec(&external_account).await;
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::ExternalSignerCannotExportNsec)
+        ));
     }
 }

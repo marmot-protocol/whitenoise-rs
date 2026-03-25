@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64ct::{Base64, Encoding};
@@ -300,9 +301,11 @@ impl Whitenoise {
     /// runs in a background task so the caller isn't blocked by network latency.
     ///
     /// The MLS key material is always created synchronously (local, fast).
-    /// Only the relay broadcast + DB tracking are deferred.  If the global
-    /// [`Whitenoise`] singleton isn't available (unit tests), the publish
-    /// runs inline as a fallback.
+    /// Only the relay broadcast + DB tracking are deferred. Background publish
+    /// runs only when `self` is the initialized global singleton (same
+    /// [`Database`](crate::whitenoise::database::Database) as
+    /// [`Whitenoise::get_instance`]); otherwise the publish runs inline so mock
+    /// instances and tests never publish or track against the wrong database.
     ///
     /// Failures are non-fatal — the `KeyPackageMaintenance` scheduler
     /// (10-min interval) retries any that didn't land.
@@ -316,7 +319,12 @@ impl Whitenoise {
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
-        if Whitenoise::get_instance().is_ok() {
+        let use_background_publish = match Whitenoise::get_instance() {
+            Ok(global) => Arc::ptr_eq(&self.database, &global.database),
+            Err(_) => false,
+        };
+
+        if use_background_publish {
             let account = account.clone();
             tokio::spawn(async move {
                 let wn = match Whitenoise::get_instance() {
@@ -348,7 +356,6 @@ impl Whitenoise {
                 }
             });
         } else {
-            // Synchronous fallback (unit tests or pre-initialization).
             match self
                 .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
                 .await
@@ -1204,25 +1211,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_signer_prefers_external_signer_over_local_keys() {
+    async fn test_get_signer_for_local_account_ignores_stale_external_signer() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create account with both local keys and a registered external signer.
-        // Both use the same key material because insert_external_signer validates
-        // that the signer pubkey matches. The point of this test is to verify
-        // the external-signer map takes priority over the secrets store.
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-
-        // Store keys in the secrets store (simulates a local account)
         whitenoise
-            .secrets_store
-            .store_private_key(&keys)
-            .expect("Should store keys");
-
-        // Also register the same keys as an external signer
-        whitenoise
-            .insert_external_signer(pubkey, keys.clone())
+            .insert_external_signer(pubkey, keys)
             .await
             .unwrap();
 
@@ -1230,19 +1225,44 @@ mod tests {
             id: Some(1),
             pubkey,
             user_id: 1,
-            account_type: AccountType::Local, // Even for local account type
+            account_type: AccountType::Local,
             last_synced_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
-        // Should prefer the external signer entry over secrets-store lookup
-        let signer = whitenoise.get_signer_for_account(&account).unwrap();
-        let signer_pubkey = signer.get_public_key().await.unwrap();
+        let result = whitenoise.get_signer_for_account(&account);
+        assert!(
+            result.is_err(),
+            "Local accounts should not use external signer entries"
+        );
+    }
 
-        assert_eq!(
-            signer_pubkey, pubkey,
-            "Should use external signer when available"
+    #[tokio::test]
+    async fn test_get_signer_for_external_account_does_not_fallback_to_local_keys() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        whitenoise
+            .secrets_store
+            .store_private_key(&keys)
+            .expect("Should store keys");
+
+        let account = Account {
+            id: Some(1),
+            pubkey,
+            user_id: 1,
+            account_type: AccountType::External,
+            last_synced_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = whitenoise.get_signer_for_account(&account);
+        assert!(
+            result.is_err(),
+            "External accounts must fail when signer is missing, even if local keys are present"
         );
     }
 
