@@ -118,8 +118,13 @@ impl Whitenoise {
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
-        // First check for a registered external signer
-        if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
+        // Only use the external-signer path when the account is actually typed
+        // as External. A stale map entry must not hijack a local-key account,
+        // and a missing map entry must not silently fall through to local keys
+        // for an External account.
+        if account.uses_external_signer()
+            && let Some(external_signer) = self.get_external_signer(&account.pubkey)
+        {
             tracing::debug!(
                 target: "whitenoise::signer",
                 "Using external signer for account {}",
