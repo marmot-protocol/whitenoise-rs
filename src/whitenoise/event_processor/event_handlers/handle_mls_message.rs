@@ -1,3 +1,4 @@
+use mdk_core::prelude::group_types::GroupState;
 use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingResult};
 use nostr_sdk::prelude::*;
@@ -218,8 +219,32 @@ impl Whitenoise {
                     "Processed commit for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
+
+                // Detect removal: if the commit left us inactive, persist the
+                // removal state and emit a real-time update. Errors propagate so the
+                // event is not marked processed. Any failure after process_message()
+                // still requires startup reconciliation, because MDK deduplicates
+                // already-processed commits and this branch will not re-run on retry.
+                let still_active =
+                    match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
+                        Some(group) => group.state == GroupState::Active,
+                        None => false,
+                    };
+
+                if !still_active {
+                    tracing::info!(
+                        target: "whitenoise::event_handlers::handle_mls_message",
+                        "Account {} was removed from group {} — marking group as removed",
+                        account.pubkey.to_hex(),
+                        hex::encode(mls_group_id.as_slice())
+                    );
+                    self.mark_as_removed(account, mls_group_id).await?;
+                }
+
                 self.background_refresh_account_group_subscriptions(account);
-                Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+                if still_active {
+                    Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+                }
             }
 
             MessageProcessingResult::Unprocessable { ref mls_group_id } => {

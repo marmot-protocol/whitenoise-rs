@@ -177,6 +177,7 @@ impl Whitenoise {
             pin_order: None,
             dm_peer_pubkey,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

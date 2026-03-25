@@ -575,6 +575,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -602,6 +603,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -644,6 +646,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -712,6 +715,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -748,6 +752,7 @@ mod tests {
             pin_order: None,
             dm_peer_pubkey: None,
             archived_at: None,
+            removed_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
