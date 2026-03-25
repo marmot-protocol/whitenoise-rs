@@ -31,10 +31,6 @@ impl Whitenoise {
             pubkey.to_hex()
         );
 
-        self.validate_signer_pubkey(&pubkey, &signer)
-            .await
-            .map_err(LoginError::from)?;
-
         // If this account is already fully logged in, return it as-is.
         // Same three-condition guard as login_start: avoids re-migrating a live
         // local-key session to External and deleting its stored private key before
@@ -53,6 +49,10 @@ impl Whitenoise {
                 status: LoginStatus::Complete,
             });
         }
+
+        self.validate_signer_pubkey(&pubkey, &signer)
+            .await
+            .map_err(LoginError::from)?;
 
         // Create/update the account for this pubkey.
         let (mut account, _) = self
@@ -141,6 +141,8 @@ impl Whitenoise {
             .await
             .map_err(LoginError::from)?;
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
+        self.sync_discovered_relay_lists(&account, &discovered)
+            .await?;
         let user = account
             .user(&self.database)
             .await

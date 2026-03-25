@@ -173,6 +173,13 @@ impl Whitenoise {
             .relays_or(RelayType::Nip65, &default_relays)
             .to_vec();
 
+        // Restore the stash's relay state to the DB before filling defaults.
+        // A prior login_with_custom_relay attempt may have written empty rows
+        // over relay kinds that the stash still has populated; sync_discovered_relay_lists
+        // ensures the DB matches the stash before add_relays fills in defaults.
+        self.sync_discovered_relay_lists(&account, &discovered)
+            .await?;
+
         // Persist missing relay lists to the local database, then publish
         // them to the network concurrently. DB writes are fast (sub-ms) and
         // use the same connection, so they run sequentially. The publishes
