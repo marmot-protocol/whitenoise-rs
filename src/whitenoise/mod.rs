@@ -758,6 +758,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::time::Duration;
+
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::group_information::GroupInformation;
@@ -1026,6 +1028,7 @@ pub mod test_utils {
             })
             .clone();
 
+        wait_for_test_relays().await;
         Whitenoise::initialize_whitenoise(config).await.unwrap();
         Whitenoise::get_instance().unwrap()
     }
@@ -1076,7 +1079,10 @@ pub mod test_utils {
         whitenoise: &Whitenoise,
         publisher_accounts: &[&Account],
     ) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        const OUTER_TIMEOUT: Duration = Duration::from_secs(60);
+        const PER_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+        tokio::time::timeout(OUTER_TIMEOUT, async {
             loop {
                 let mut all_available = true;
 
@@ -1088,13 +1094,17 @@ pub mod test_utils {
                             .unwrap(),
                     );
 
-                    match whitenoise
-                        .relay_control
-                        .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
-                        .await
-                    {
-                        Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => {
+                    let fetch_result = tokio::time::timeout(
+                        PER_FETCH_TIMEOUT,
+                        whitenoise
+                            .relay_control
+                            .fetch_user_key_package(publisher_account.pubkey, &relay_urls),
+                    )
+                    .await;
+
+                    match fetch_result {
+                        Ok(Ok(Some(_))) => {}
+                        Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
                             all_available = false;
                             break;
                         }
@@ -1105,7 +1115,7 @@ pub mod test_utils {
                     break;
                 }
 
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await

@@ -424,7 +424,7 @@ mod tests {
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
     use crate::whitenoise::key_packages::has_encoding_tag;
     use crate::whitenoise::relays::Relay;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, wait_for_key_package_publication};
 
     /// Publishes a key package without the encoding tag for testing outdated package rotation.
     async fn publish_outdated_key_package(
@@ -465,6 +465,26 @@ mod tests {
         Ok(event_id)
     }
 
+    async fn first_tracked_key_package(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        events: &[Event],
+    ) -> PublishedKeyPackage {
+        for event in events {
+            if let Some(pkg) = PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &event.id.to_hex(),
+                &whitenoise.database,
+            )
+            .await
+            .unwrap()
+            {
+                return pkg;
+            }
+        }
+        panic!("expected a relay key package with a published_key_packages row");
+    }
+
     #[tokio::test]
     async fn test_execute_deletes_outdated_packages_when_valid_exists() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -472,6 +492,7 @@ mod tests {
 
         // Create account (this publishes a valid key package automatically)
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
         let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -581,6 +602,7 @@ mod tests {
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
@@ -589,14 +611,7 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), 1, "Should start with exactly one key package");
 
-        let tracked = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &before[0].id.to_hex(),
-            &whitenoise.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let tracked = first_tracked_key_package(whitenoise, &account, &before).await;
 
         let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
         mdk.delete_key_package_from_storage_by_hash_ref(&tracked.key_package_hash_ref)
@@ -638,6 +653,7 @@ mod tests {
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
@@ -646,9 +662,10 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), 1, "Should start with exactly one key package");
 
+        let tracked = first_tracked_key_package(whitenoise, &account, &before).await;
         PublishedKeyPackage::mark_consumed(
             &account.pubkey,
-            &before[0].id.to_hex(),
+            &tracked.event_id,
             &whitenoise.database,
         )
         .await
@@ -687,6 +704,7 @@ mod tests {
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
         let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -700,9 +718,10 @@ mod tests {
             "Should start with exactly one valid key package"
         );
 
+        let tracked = first_tracked_key_package(whitenoise, &account, &before).await;
         PublishedKeyPackage::mark_consumed(
             &account.pubkey,
-            &before[0].id.to_hex(),
+            &tracked.event_id,
             &whitenoise.database,
         )
         .await

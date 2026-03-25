@@ -274,7 +274,7 @@ mod tests {
         relay_type: RelayType,
         source_urls: &[nostr_sdk::RelayUrl],
     ) -> bool {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
         loop {
             match whitenoise

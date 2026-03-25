@@ -471,23 +471,15 @@ impl Whitenoise {
 
     pub(crate) fn start_background_user_resolution_if_unknown(&self, pubkey: PublicKey) {
         let resolution_guard = self.user_resolution_guard(pubkey);
-        let Ok(resolution_guard) = resolution_guard.try_lock_owned() else {
-            tracing::debug!(
-                target: "whitenoise::users::start_background_user_resolution_if_unknown",
-                "User {} resolution already in progress, reusing existing background discovery",
-                pubkey
-            );
-            return;
-        };
 
         tracing::debug!(
             target: "whitenoise::users::start_background_user_resolution_if_unknown",
-            "Starting background discovery catch-up for user {}",
+            "Scheduling background discovery catch-up for user {}",
             pubkey
         );
 
         tokio::spawn(async move {
-            let _resolution_guard = resolution_guard;
+            let _resolution_guard = resolution_guard.lock().await;
             let result = async {
                 let whitenoise = Self::get_instance()?;
                 whitenoise.resolve_unknown_user_under_guard(pubkey).await
@@ -839,7 +831,7 @@ mod tests {
         first.unwrap();
         second.unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
                 if user.metadata_is_known() {
