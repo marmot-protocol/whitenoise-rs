@@ -22,6 +22,7 @@ struct AccountGroupRow {
     dm_peer_pubkey: Option<PublicKey>,
     archived_at: Option<DateTime<Utc>>,
     removed_at: Option<DateTime<Utc>>,
+    muted_until: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -73,6 +74,7 @@ where
 
         let archived_at = parse_optional_timestamp(row, "archived_at")?;
         let removed_at = parse_optional_timestamp(row, "removed_at")?;
+        let muted_until = parse_optional_timestamp(row, "muted_until")?;
 
         // Parse pubkey from hex string
         let account_pubkey =
@@ -116,6 +118,7 @@ where
             dm_peer_pubkey,
             archived_at,
             removed_at,
+            muted_until,
             created_at,
             updated_at,
         })
@@ -135,6 +138,7 @@ impl From<AccountGroupRow> for AccountGroup {
             dm_peer_pubkey: row.dm_peer_pubkey,
             archived_at: row.archived_at,
             removed_at: row.removed_at,
+            muted_until: row.muted_until,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -295,6 +299,8 @@ impl AccountGroup {
                -- update_archived_at() so save() never clobbers user preference.
                -- removed_at is intentionally excluded: removal is set by
                -- mark_removed_atomic() when an admin removal commit is detected.
+               -- muted_until is intentionally excluded: mute/unmute use
+               -- update_muted_until() so save() never clobbers user preference.
                -- Write-once: preserve existing dm_peer_pubkey if already set.
                -- Many code paths construct AccountGroup without knowing the DM peer,
                -- so we only fill this on first write and never overwrite a correct
@@ -366,6 +372,55 @@ impl AccountGroup {
         .await?;
 
         Ok(row.into())
+    }
+
+    /// Updates the muted_until timestamp for this AccountGroup.
+    ///
+    /// - `Some(until)` = muted until that time
+    /// - `None` = unmuted
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn update_muted_until(
+        &self,
+        muted_until: Option<DateTime<Utc>>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET muted_until = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(muted_until.map(|dt| dt.timestamp_millis()))
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Clears `muted_until` for all rows whose mute has expired.
+    ///
+    /// Returns the affected rows so callers can emit stream updates.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn clear_expired_mutes(database: &Database) -> Result<Vec<Self>, sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+
+        let rows = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET muted_until = NULL, updated_at = ?
+             WHERE muted_until IS NOT NULL AND muted_until <= ?
+             RETURNING *",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
     /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
@@ -874,6 +929,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -907,6 +963,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -927,6 +984,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -968,6 +1026,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1617,6 +1676,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

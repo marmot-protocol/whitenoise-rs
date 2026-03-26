@@ -11,7 +11,7 @@ use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::KeyPackageStatus;
 
-use super::protocol::{Request, Response};
+use super::protocol::{MuteDuration, Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
 #[perf_instrument("dispatch")]
@@ -330,6 +330,22 @@ pub async fn dispatch(req: Request) -> Response {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
+
+        Request::MuteChat {
+            account,
+            group_id,
+            duration,
+        } => match mute_chat(wn, &account, &group_id, duration).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UnmuteChat { account, group_id } => {
+            match unmute_chat(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
 
         Request::SettingsShow => match wn.app_settings().await {
             Ok(settings) => to_response(&settings),
@@ -1248,6 +1264,36 @@ async fn unarchive_chat(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     wn.unarchive_chat(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+#[perf_instrument("dispatch")]
+async fn mute_chat(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+    duration: MuteDuration,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    let until = duration.to_expiry();
+    wn.mute_chat(&account, &group_id, until)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+#[perf_instrument("dispatch")]
+async fn unmute_chat(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.unmute_chat(&account, &group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))

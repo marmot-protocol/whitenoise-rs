@@ -79,6 +79,11 @@ pub struct ChatListItem {
     /// - `Some(timestamp)` = removed; group is read-only and stays in the chat
     ///   list until the user explicitly archives or deletes it
     pub removed_at: Option<DateTime<Utc>>,
+
+    /// When this chat's mute expires.
+    /// - `None` = not muted
+    /// - `Some(timestamp)` = muted until that time
+    pub muted_until: Option<DateTime<Utc>>,
 }
 
 impl ChatListItem {
@@ -200,6 +205,7 @@ fn assemble_chat_list_items(
             let pin_order = account_group.pin_order;
             let archived_at = account_group.archived_at;
             let removed_at = account_group.removed_at;
+            let muted_until = account_group.muted_until;
 
             Some(ChatListItem {
                 mls_group_id: group.mls_group_id.clone(),
@@ -216,6 +222,7 @@ fn assemble_chat_list_items(
                 dm_peer_pubkey,
                 archived_at,
                 removed_at,
+                muted_until,
             })
         })
         .collect()
@@ -413,10 +420,11 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order, archived_at, and removed_at
+        // 9. Get pin order, archived_at, removed_at, and muted_until
         let pin_order = account_group.pin_order;
         let archived_at = account_group.archived_at;
         let removed_at = account_group.removed_at;
+        let muted_until = account_group.muted_until;
 
         // 10. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
@@ -434,6 +442,7 @@ impl Whitenoise {
             dm_peer_pubkey,
             archived_at,
             removed_at,
+            muted_until,
         }))
     }
 
@@ -1424,6 +1433,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1440,6 +1450,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1456,6 +1467,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 
@@ -1500,6 +1512,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[1u8; 32]),
@@ -1524,6 +1537,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[128u8; 32]),
@@ -1548,6 +1562,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 
@@ -1662,6 +1677,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1678,6 +1694,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 
@@ -1710,6 +1727,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1726,6 +1744,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1742,6 +1761,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 
@@ -1776,6 +1796,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1792,6 +1813,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 
@@ -1825,6 +1847,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[2u8; 32]),
@@ -1841,6 +1864,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[3u8; 32]),
@@ -1857,6 +1881,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
             ChatListItem {
                 mls_group_id: GroupId::from_slice(&[4u8; 32]),
@@ -1873,6 +1898,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                muted_until: None,
             },
         ];
 

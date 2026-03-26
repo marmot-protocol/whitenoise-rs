@@ -1,6 +1,64 @@
 use std::fmt;
+use std::str::FromStr;
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::whitenoise::accounts_groups::MUTE_FOREVER;
+
+/// Mute duration for the `mute_chat` CLI command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MuteDuration {
+    OneHour,
+    EightHours,
+    OneDay,
+    OneWeek,
+    Forever,
+}
+
+impl MuteDuration {
+    /// Converts this duration into an absolute `DateTime<Utc>` expiry timestamp.
+    pub fn to_expiry(self) -> DateTime<Utc> {
+        match self {
+            Self::OneHour => Utc::now() + Duration::hours(1),
+            Self::EightHours => Utc::now() + Duration::hours(8),
+            Self::OneDay => Utc::now() + Duration::days(1),
+            Self::OneWeek => Utc::now() + Duration::weeks(1),
+            Self::Forever => MUTE_FOREVER,
+        }
+    }
+}
+
+impl FromStr for MuteDuration {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "1h" => Ok(Self::OneHour),
+            "8h" => Ok(Self::EightHours),
+            "1d" => Ok(Self::OneDay),
+            "1w" => Ok(Self::OneWeek),
+            "forever" => Ok(Self::Forever),
+            _ => Err(format!(
+                "invalid mute duration '{}': expected 1h, 8h, 1d, 1w, or forever",
+                s
+            )),
+        }
+    }
+}
+
+impl fmt::Display for MuteDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OneHour => write!(f, "1h"),
+            Self::EightHours => write!(f, "8h"),
+            Self::OneDay => write!(f, "1d"),
+            Self::OneWeek => write!(f, "1w"),
+            Self::Forever => write!(f, "forever"),
+        }
+    }
+}
 
 /// A request from the CLI client to the daemon.
 ///
@@ -120,6 +178,14 @@ pub enum Request {
     UnarchiveChat { account: String, group_id: String },
     #[serde(rename = "archived_chats_list")]
     ArchivedChatsList { account: String },
+    #[serde(rename = "mute_chat")]
+    MuteChat {
+        account: String,
+        group_id: String,
+        duration: MuteDuration,
+    },
+    #[serde(rename = "unmute_chat")]
+    UnmuteChat { account: String, group_id: String },
 
     // Settings
     #[serde(rename = "settings_show")]
@@ -1543,5 +1609,88 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::KeysCheck { pubkey } if pubkey == "npub1abc"));
+    }
+
+    #[test]
+    fn mute_chat_roundtrip() {
+        let req = Request::MuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+            duration: MuteDuration::OneHour,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, Request::MuteChat { account, group_id, duration }
+                if account == "npub1abc" && group_id == "deadbeef" && duration == MuteDuration::OneHour)
+        );
+    }
+
+    #[test]
+    fn mute_chat_forever_roundtrip() {
+        let req = Request::MuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+            duration: MuteDuration::Forever,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, Request::MuteChat { duration, .. } if duration == MuteDuration::Forever)
+        );
+    }
+
+    #[test]
+    fn unmute_chat_roundtrip() {
+        let req = Request::UnmuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::UnmuteChat { account, group_id }
+                if account == "npub1abc" && group_id == "deadbeef"));
+    }
+
+    #[test]
+    fn mute_duration_from_str() {
+        assert_eq!("1h".parse::<MuteDuration>().unwrap(), MuteDuration::OneHour);
+        assert_eq!(
+            "8h".parse::<MuteDuration>().unwrap(),
+            MuteDuration::EightHours
+        );
+        assert_eq!("1d".parse::<MuteDuration>().unwrap(), MuteDuration::OneDay);
+        assert_eq!("1w".parse::<MuteDuration>().unwrap(), MuteDuration::OneWeek);
+        assert_eq!(
+            "forever".parse::<MuteDuration>().unwrap(),
+            MuteDuration::Forever
+        );
+        assert!("2h".parse::<MuteDuration>().is_err());
+        assert!("".parse::<MuteDuration>().is_err());
+    }
+
+    #[test]
+    fn mute_duration_display() {
+        assert_eq!(MuteDuration::OneHour.to_string(), "1h");
+        assert_eq!(MuteDuration::EightHours.to_string(), "8h");
+        assert_eq!(MuteDuration::OneDay.to_string(), "1d");
+        assert_eq!(MuteDuration::OneWeek.to_string(), "1w");
+        assert_eq!(MuteDuration::Forever.to_string(), "forever");
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_forever_uses_sentinel() {
+        let expiry = MuteDuration::Forever.to_expiry();
+        assert_eq!(expiry, MUTE_FOREVER);
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_one_hour_is_future() {
+        let before = Utc::now();
+        let expiry = MuteDuration::OneHour.to_expiry();
+        let after = Utc::now() + Duration::hours(1) + Duration::seconds(1);
+
+        assert!(expiry > before);
+        assert!(expiry < after);
     }
 }
