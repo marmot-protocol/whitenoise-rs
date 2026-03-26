@@ -39,6 +39,7 @@ pub mod message_aggregator;
 pub mod message_streaming;
 pub mod messages;
 pub mod notification_streaming;
+pub mod push_notifications;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
