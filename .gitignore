@@ -33,7 +33,3 @@ coverage/
 
 # Benchmark results
 benchmark_results/
-
-# Git worktrees
-/trees/*
-!/trees/.gitkeep
