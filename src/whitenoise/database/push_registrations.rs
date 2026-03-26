@@ -145,6 +145,14 @@ impl PushRegistration {
                  raw_token = excluded.raw_token,
                  server_pubkey = excluded.server_pubkey,
                  relay_hint = excluded.relay_hint,
+                 last_shared_at = CASE
+                     WHEN push_registrations.platform IS excluded.platform
+                      AND push_registrations.raw_token IS excluded.raw_token
+                      AND push_registrations.server_pubkey IS excluded.server_pubkey
+                      AND push_registrations.relay_hint IS excluded.relay_hint
+                     THEN push_registrations.last_shared_at
+                     ELSE NULL
+                 END,
                  updated_at = excluded.updated_at
              RETURNING *",
         )
@@ -180,6 +188,7 @@ impl PushRegistration {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{DateTime, Utc};
     use nostr_sdk::{Keys, RelayUrl};
 
     use super::*;
@@ -281,5 +290,62 @@ mod tests {
 
         assert!(account_one_registration.is_none());
         assert_eq!(account_two_registration.unwrap().raw_token, "token-two");
+    }
+
+    #[tokio::test]
+    async fn test_push_registration_upsert_preserves_or_clears_last_shared_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://relay.push.example.com").unwrap();
+
+        PushRegistration::upsert(
+            &account.pubkey,
+            PushPlatform::Apns,
+            "token-a",
+            &server_pubkey,
+            Some(&relay_hint),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let shared_at_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE push_registrations
+             SET last_shared_at = ?
+             WHERE account_pubkey = ?",
+        )
+        .bind(shared_at_ms)
+        .bind(account.pubkey.to_hex())
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let expected_shared_at = DateTime::from_timestamp_millis(shared_at_ms).unwrap();
+
+        let no_op = PushRegistration::upsert(
+            &account.pubkey,
+            PushPlatform::Apns,
+            "token-a",
+            &server_pubkey,
+            Some(&relay_hint),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(no_op.last_shared_at, Some(expected_shared_at));
+
+        let changed = PushRegistration::upsert(
+            &account.pubkey,
+            PushPlatform::Apns,
+            "token-b",
+            &server_pubkey,
+            Some(&relay_hint),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(changed.last_shared_at.is_none());
     }
 }

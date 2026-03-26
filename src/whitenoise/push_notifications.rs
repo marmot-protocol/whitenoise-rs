@@ -52,7 +52,7 @@ impl FromStr for PushPlatform {
 }
 
 /// This device's locally persisted push registration for a specific account.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PushRegistration {
     pub account_pubkey: PublicKey,
     pub platform: PushPlatform,
@@ -65,7 +65,7 @@ pub struct PushRegistration {
 }
 
 /// Cached encrypted push token for a group member leaf.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupPushToken {
     pub account_pubkey: PublicKey,
     pub group_id: GroupId,
@@ -74,6 +74,35 @@ pub struct GroupPushToken {
     pub relay_hint: Option<RelayUrl>,
     pub encrypted_token: String,
     pub updated_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for PushRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushRegistration")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("platform", &self.platform)
+            .field("raw_token", &"<redacted>")
+            .field("server_pubkey", &self.server_pubkey)
+            .field("relay_hint", &self.relay_hint)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_shared_at", &self.last_shared_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for GroupPushToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupPushToken")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("group_id", &self.group_id)
+            .field("leaf_index", &self.leaf_index)
+            .field("server_pubkey", &self.server_pubkey)
+            .field("relay_hint", &self.relay_hint)
+            .field("encrypted_token", &"<redacted>")
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 impl Whitenoise {
@@ -235,5 +264,42 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_push_registration_debug_redacts_raw_token() {
+        let registration = PushRegistration {
+            account_pubkey: Keys::generate().public_key(),
+            platform: PushPlatform::Apns,
+            raw_token: "super-secret-token".to_string(),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_shared_at: None,
+        };
+
+        let debug_output = format!("{registration:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("super-secret-token"));
+    }
+
+    #[test]
+    fn test_group_push_token_debug_redacts_encrypted_token() {
+        let token = GroupPushToken {
+            account_pubkey: Keys::generate().public_key(),
+            group_id: GroupId::from_slice(&[7; 32]),
+            leaf_index: 3,
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            encrypted_token: "ciphertext-value".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let debug_output = format!("{token:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("ciphertext-value"));
     }
 }
