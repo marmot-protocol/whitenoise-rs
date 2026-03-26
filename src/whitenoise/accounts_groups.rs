@@ -52,10 +52,10 @@ pub struct AccountGroup {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Sentinel timestamp representing "muted forever" (year 9999).
+/// Sentinel timestamp representing "muted forever" (9999-12-31T23:59:59Z).
 /// Use this instead of crafting ad-hoc far-future timestamps.
 pub const MUTE_FOREVER: DateTime<Utc> = {
-    match DateTime::<Utc>::from_timestamp(253_402_300_800, 0) {
+    match DateTime::<Utc>::from_timestamp(253_402_300_799, 0) {
         Some(dt) => dt,
         None => unreachable!(),
     }

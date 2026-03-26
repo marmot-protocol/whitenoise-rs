@@ -8,12 +8,16 @@ use crate::whitenoise::accounts_groups::MUTE_FOREVER;
 
 /// Mute duration for the `mute_chat` CLI command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MuteDuration {
+    #[serde(rename = "1h")]
     OneHour,
+    #[serde(rename = "8h")]
     EightHours,
+    #[serde(rename = "1d")]
     OneDay,
+    #[serde(rename = "1w")]
     OneWeek,
+    #[serde(rename = "forever")]
     Forever,
 }
 
@@ -1676,6 +1680,40 @@ mod tests {
         assert_eq!(MuteDuration::OneDay.to_string(), "1d");
         assert_eq!(MuteDuration::OneWeek.to_string(), "1w");
         assert_eq!(MuteDuration::Forever.to_string(), "forever");
+    }
+
+    #[test]
+    fn mute_duration_serde_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneHour).unwrap(),
+            "\"1h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::EightHours).unwrap(),
+            "\"8h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneDay).unwrap(),
+            "\"1d\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneWeek).unwrap(),
+            "\"1w\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::Forever).unwrap(),
+            "\"forever\""
+        );
+
+        // Deserialize from wire tokens
+        assert_eq!(
+            serde_json::from_str::<MuteDuration>("\"1h\"").unwrap(),
+            MuteDuration::OneHour
+        );
+        assert_eq!(
+            serde_json::from_str::<MuteDuration>("\"1w\"").unwrap(),
+            MuteDuration::OneWeek
+        );
     }
 
     #[test]
