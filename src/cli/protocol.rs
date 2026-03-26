@@ -13,9 +13,9 @@ pub enum MuteDuration {
     OneHour,
     #[serde(rename = "8h")]
     EightHours,
-    #[serde(rename = "1d")]
+    #[serde(rename = "1d", alias = "24h", alias = "one_day")]
     OneDay,
-    #[serde(rename = "1w")]
+    #[serde(rename = "1w", alias = "7d", alias = "one_week")]
     OneWeek,
     #[serde(rename = "forever")]
     Forever,
