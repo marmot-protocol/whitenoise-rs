@@ -38,6 +38,8 @@ pub mod message_aggregator;
 pub mod message_streaming;
 pub mod messages;
 pub mod notification_streaming;
+#[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+pub(crate) mod preflight;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
@@ -734,6 +736,8 @@ pub mod test_utils {
     use nostr_sdk::{Keys, PublicKey, RelayUrl};
     use tempfile::TempDir;
 
+    const REQUIRED_TEST_RELAYS: &[&str] = &["127.0.0.1:8080", "127.0.0.1:7777"];
+
     // Test configuration and setup helpers
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");
@@ -776,9 +780,6 @@ pub mod test_utils {
         TempDir,
     ) {
         Whitenoise::initialize_mock_keyring_store();
-
-        // Wait for local relays to be ready in test environment
-        wait_for_test_relays().await;
 
         let (config, data_temp, logs_temp) = create_test_config();
 
@@ -834,87 +835,15 @@ pub mod test_utils {
         (whitenoise, data_temp, logs_temp)
     }
 
-    /// Wait for local test relays to be ready
-    async fn wait_for_test_relays() {
-        use std::time::Duration;
-        use tokio::time::{sleep, timeout};
-
-        // Only wait for relays in debug builds (where we use localhost relays)
-        if !cfg!(debug_assertions) {
-            return;
-        }
-
-        tracing::debug!(target: "whitenoise::test_utils", "Waiting for local test relays to be ready...");
-
-        let relay_urls = vec!["ws://localhost:8080", "ws://localhost:7777"];
-
-        for relay_url in relay_urls {
-            let mut attempts = 0;
-            const MAX_ATTEMPTS: u32 = 10;
-            const WAIT_INTERVAL: Duration = Duration::from_millis(500);
-
-            while attempts < MAX_ATTEMPTS {
-                // Try to establish a WebSocket connection to test readiness
-                match timeout(Duration::from_secs(2), test_relay_connection(relay_url)).await {
-                    Ok(Ok(())) => {
-                        tracing::debug!(target: "whitenoise::test_utils", "Relay {} is ready", relay_url);
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        tracing::debug!(target: "whitenoise::test_utils",
-                            "Relay {} not ready yet (attempt {}/{}): {:?}",
-                            relay_url, attempts + 1, MAX_ATTEMPTS, e);
-                    }
-                    Err(_) => {
-                        tracing::debug!(target: "whitenoise::test_utils",
-                            "Relay {} connection timeout (attempt {}/{})",
-                            relay_url, attempts + 1, MAX_ATTEMPTS);
-                    }
-                }
-
-                attempts += 1;
-                if attempts < MAX_ATTEMPTS {
-                    sleep(WAIT_INTERVAL).await;
-                }
-            }
-
-            if attempts >= MAX_ATTEMPTS {
-                tracing::warn!(target: "whitenoise::test_utils",
-                    "Relay {} may not be fully ready after {} attempts", relay_url, MAX_ATTEMPTS);
-            }
-        }
-
-        // Give relays a bit more time to stabilize
-        sleep(Duration::from_millis(100)).await;
-        tracing::debug!(target: "whitenoise::test_utils", "Relay readiness check completed");
-    }
-
-    /// Test if a relay is ready by attempting a simple connection
-    async fn test_relay_connection(
-        relay_url: &str,
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use nostr_sdk::prelude::*;
-
-        // Create a minimal client for testing connection
-        let client = Client::default();
-        client.add_relay(relay_url).await?;
-
-        // Try to connect - this will fail if relay isn't ready
-        client.connect().await;
-
-        // Give it a moment to establish connection
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Check if we're connected
-        let relay_url_parsed = RelayUrl::parse(relay_url)?;
-        match client.relay(&relay_url_parsed).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
         static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+
+        super::preflight::assert_test_endpoints_reachable(
+            REQUIRED_TEST_RELAYS,
+            "Start Docker services with `just docker-up` before running `just test`.",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
 
         // Singleton-backed tests can spawn background tasks that outlive the
         // helper call, so the temp dirs backing the singleton config must stay

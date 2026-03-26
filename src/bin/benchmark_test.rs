@@ -6,6 +6,7 @@ use clap::Parser;
 use ::whitenoise::init_tracing_with_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::init_perf_layer;
 use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
+use ::whitenoise::integration_tests::core::ensure_local_test_services_running;
 use ::whitenoise::*;
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
+
+    if args.login.is_none() && !args.init_only {
+        ensure_local_test_services_running().await?;
+    }
 
     // Initialise the perf layer BEFORE Whitenoise initialises tracing so that
     // the layer is part of the subscriber stack from the very first span.
