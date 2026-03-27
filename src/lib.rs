@@ -87,6 +87,7 @@ pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTri
 pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
+pub use whitenoise::push_notifications::{GroupPushToken, PushPlatform, PushRegistration};
 
 // User search
 pub use whitenoise::user_search::{

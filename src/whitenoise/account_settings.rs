@@ -29,6 +29,10 @@ impl Whitenoise {
     }
 
     /// Sets the notification preference for `account` and returns the updated settings.
+    ///
+    /// Disabling notifications here does not clear any locally stored push
+    /// registration. MIP-05 sharing/removal decisions are handled separately by
+    /// the push-notifications subsystem.
     pub async fn update_notifications_enabled(
         &self,
         account: &Account,
