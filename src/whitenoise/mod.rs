@@ -550,6 +550,7 @@ impl Whitenoise {
             Arc::new(scheduled_tasks::CachedGraphUserCleanup),
             Arc::new(scheduled_tasks::RelayListMaintenance),
             Arc::new(scheduled_tasks::SubscriptionHealthCheck),
+            Arc::new(scheduled_tasks::MuteExpiryCleanup),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
             whitenoise_ref,

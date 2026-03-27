@@ -17,6 +17,9 @@ pub enum ChatListUpdateTrigger {
     /// deletes it. The item's `removed_at` field is set. Routed to the active
     /// channel when not archived, or the archived channel if already archived.
     RemovedFromGroup,
+    /// The chat's mute status changed (muted or unmuted). The item's
+    /// `muted_until` field indicates the new state.
+    ChatMuteChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ mod tests {
             ChatListUpdateTrigger::LastMessageDeleted,
             ChatListUpdateTrigger::ChatArchiveChanged,
             ChatListUpdateTrigger::RemovedFromGroup,
+            ChatListUpdateTrigger::ChatMuteChanged,
         ];
 
         for trigger in triggers {
@@ -78,5 +82,8 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::RemovedFromGroup);
         assert!(debug_str.contains("RemovedFromGroup"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatMuteChanged);
+        assert!(debug_str.contains("ChatMuteChanged"));
     }
 }

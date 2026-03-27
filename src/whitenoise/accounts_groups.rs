@@ -43,9 +43,23 @@ pub struct AccountGroup {
     /// - `Some(timestamp)` = removed at that time (group is read-only, visible
     ///   in the chat list until the user explicitly archives or deletes it)
     pub removed_at: Option<DateTime<Utc>>,
+    /// When this chat's mute expires.
+    /// - `None` = not muted (notifications enabled)
+    /// - `Some(timestamp)` = muted until that time; use [`MUTE_FOREVER`] for
+    ///   "always muted until manually unmuted"
+    pub muted_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// Sentinel timestamp representing "muted forever" (9999-12-31T23:59:59Z).
+/// Use this instead of crafting ad-hoc far-future timestamps.
+pub const MUTE_FOREVER: DateTime<Utc> = {
+    match DateTime::<Utc>::from_timestamp(253_402_300_799, 0) {
+        Some(dt) => dt,
+        None => unreachable!(),
+    }
+};
 
 impl AccountGroup {
     /// Returns true if this group should be visible to the user.
@@ -84,6 +98,19 @@ impl AccountGroup {
     /// Returns true if this chat is archived.
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Returns true if this chat is currently muted (mute has not expired).
+    pub fn is_muted(&self) -> bool {
+        match self.muted_until {
+            Some(until) => Utc::now() < until,
+            None => false,
+        }
+    }
+
+    /// Returns true if this chat is muted forever (until manually unmuted).
+    pub fn is_muted_forever(&self) -> bool {
+        self.muted_until >= Some(MUTE_FOREVER)
     }
 
     /// Creates or retrieves an AccountGroup for the given account and group.
@@ -191,6 +218,26 @@ impl AccountGroup {
     #[perf_instrument("account_groups")]
     pub async fn unarchive(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
         let updated = self.update_archived_at(None, &whitenoise.database).await?;
+        Ok(updated)
+    }
+
+    /// Mutes this chat until the given time.
+    #[perf_instrument("account_groups")]
+    pub async fn mute(
+        &self,
+        until: DateTime<Utc>,
+        whitenoise: &Whitenoise,
+    ) -> Result<Self, WhitenoiseError> {
+        let updated = self
+            .update_muted_until(Some(until), &whitenoise.database)
+            .await?;
+        Ok(updated)
+    }
+
+    /// Unmutes this chat by clearing muted_until.
+    #[perf_instrument("account_groups")]
+    pub async fn unmute(&self, whitenoise: &Whitenoise) -> Result<Self, WhitenoiseError> {
+        let updated = self.update_muted_until(None, &whitenoise.database).await?;
         Ok(updated)
     }
 
@@ -383,6 +430,62 @@ impl Whitenoise {
             account,
             mls_group_id,
             ChatListUpdateTrigger::ChatArchiveChanged,
+        )
+        .await;
+        Ok(updated)
+    }
+
+    /// Mutes a chat for the given account until the specified time.
+    ///
+    /// Returns `InvalidInput` if `until` is in the past. Re-muting with a
+    /// different duration always overwrites the previous `muted_until` value.
+    #[perf_instrument("account_groups")]
+    pub async fn mute_chat(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+        until: DateTime<Utc>,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        if until <= Utc::now() {
+            return Err(WhitenoiseError::InvalidInput(
+                "mute_chat: `until` must be in the future".to_string(),
+            ));
+        }
+
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        let updated = account_group.mute(until, self).await?;
+        self.emit_chat_list_update(
+            account,
+            mls_group_id,
+            ChatListUpdateTrigger::ChatMuteChanged,
+        )
+        .await;
+        Ok(updated)
+    }
+
+    /// Unmutes a chat for the given account.
+    ///
+    /// Always clears `muted_until` and emits `ChatMuteChanged`, even if the
+    /// mute has already expired. This ensures an explicit "Unmute" action is
+    /// immediate rather than waiting for the background cleanup task.
+    #[perf_instrument("account_groups")]
+    pub async fn unmute_chat(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        let updated = account_group.unmute(self).await?;
+        self.emit_chat_list_update(
+            account,
+            mls_group_id,
+            ChatListUpdateTrigger::ChatMuteChanged,
         )
         .await;
         Ok(updated)
@@ -1445,6 +1548,372 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_muted_false_by_default() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[110; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(!ag.is_muted());
+        assert!(!ag.is_muted_forever());
+        assert!(ag.muted_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_sets_muted_until() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[111; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let until = Utc::now() + chrono::Duration::hours(1);
+        let muted = whitenoise
+            .mute_chat(&account, &group_id, until)
+            .await
+            .unwrap();
+
+        assert!(muted.is_muted());
+        assert!(!muted.is_muted_forever());
+        // Compare at millisecond precision — SQLite stores timestamps as integer ms
+        assert_eq!(
+            muted.muted_until.map(|t| t.timestamp_millis()),
+            Some(until.timestamp_millis())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_forever() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[112; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let muted = whitenoise
+            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .await
+            .unwrap();
+
+        assert!(muted.is_muted());
+        assert!(muted.is_muted_forever());
+        assert_eq!(muted.muted_until, Some(MUTE_FOREVER));
+    }
+
+    #[tokio::test]
+    async fn test_unmute_chat_clears_muted_until() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[113; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Mute first
+        whitenoise
+            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .await
+            .unwrap();
+
+        // Unmute
+        let unmuted = whitenoise.unmute_chat(&account, &group_id).await.unwrap();
+
+        assert!(!unmuted.is_muted());
+        assert!(!unmuted.is_muted_forever());
+        assert!(unmuted.muted_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unmute_chat_on_unmuted_chat_is_safe() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[114; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Unmute without ever muting — should succeed without error
+        let result = whitenoise.unmute_chat(&account, &group_id).await.unwrap();
+
+        assert!(!result.is_muted());
+        assert!(result.muted_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_overwrites_previous_mute() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[115; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Mute for 1 hour
+        let first_until = Utc::now() + chrono::Duration::hours(1);
+        whitenoise
+            .mute_chat(&account, &group_id, first_until)
+            .await
+            .unwrap();
+
+        // Re-mute for 1 week — must overwrite, not be a no-op
+        let second_until = Utc::now() + chrono::Duration::weeks(1);
+        let remuted = whitenoise
+            .mute_chat(&account, &group_id, second_until)
+            .await
+            .unwrap();
+
+        // Compare at millisecond precision — SQLite stores timestamps as integer ms
+        assert_eq!(
+            remuted.muted_until.map(|t| t.timestamp_millis()),
+            Some(second_until.timestamp_millis())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_muted_false_for_expired_mute() {
+        let ag = AccountGroup {
+            id: Some(1),
+            account_pubkey: PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .unwrap(),
+            mls_group_id: GroupId::from_slice(&[116; 32]),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            // Expired 10 seconds ago
+            muted_until: Some(Utc::now() - chrono::Duration::seconds(10)),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert!(!ag.is_muted(), "expired mute should return false");
+        assert!(!ag.is_muted_forever());
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[117; 32]);
+
+        let result = whitenoise
+            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_unmute_chat_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[118; 32]);
+
+        let result = whitenoise.unmute_chat(&account, &group_id).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_rejects_past_timestamp() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[130; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let result = whitenoise.mute_chat(&account, &group_id, past).await;
+
+        assert!(
+            matches!(result, Err(WhitenoiseError::InvalidInput(_))),
+            "mute_chat should reject past timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_muted_until_persists_through_save() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[119; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Mute the chat
+        whitenoise
+            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .await
+            .unwrap();
+
+        // Simulate a giftwrap re-processing: save() must NOT overwrite muted_until
+        let re_save = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            muted_until: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        re_save.save(&whitenoise.database).await.unwrap();
+
+        // Fetch and confirm muted_until survived
+        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            found.is_muted(),
+            "save() must not overwrite muted_until — giftwrap re-processing would silently unmute chats"
+        );
+        assert!(found.is_muted_forever());
+    }
+
+    #[tokio::test]
+    async fn test_clear_expired_mutes_clears_expired_rows() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id1 = GroupId::from_slice(&[120; 32]);
+        let group_id2 = GroupId::from_slice(&[121; 32]);
+
+        // Create two groups and set both to expired mutes via update_muted_until
+        // (mute_chat rejects past timestamps, so we go through the DB layer directly)
+        let (ag1, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id1, None)
+            .await
+            .unwrap();
+        let (ag2, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id2, None)
+            .await
+            .unwrap();
+
+        let past = Utc::now() - chrono::Duration::seconds(10);
+        ag1.update_muted_until(Some(past), &whitenoise.database)
+            .await
+            .unwrap();
+        ag2.update_muted_until(Some(past), &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Run cleanup
+        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(cleared.len(), 2);
+
+        // Verify DB rows are actually cleared
+        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id1)
+            .await
+            .unwrap()
+            .unwrap();
+        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id2)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(ag1.muted_until.is_none());
+        assert!(ag2.muted_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_expired_mutes_preserves_active_mutes() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let expired_group = GroupId::from_slice(&[122; 32]);
+        let forever_group = GroupId::from_slice(&[123; 32]);
+        let future_group = GroupId::from_slice(&[124; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &expired_group, None)
+            .await
+            .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &forever_group, None)
+            .await
+            .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &future_group, None)
+            .await
+            .unwrap();
+
+        // One expired (set via DB layer), one forever, one future
+        let past = Utc::now() - chrono::Duration::seconds(10);
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let expired_ag = AccountGroup::get(&whitenoise, &account.pubkey, &expired_group)
+            .await
+            .unwrap()
+            .unwrap();
+        expired_ag
+            .update_muted_until(Some(past), &whitenoise.database)
+            .await
+            .unwrap();
+        whitenoise
+            .mute_chat(&account, &forever_group, MUTE_FOREVER)
+            .await
+            .unwrap();
+        whitenoise
+            .mute_chat(&account, &future_group, future)
+            .await
+            .unwrap();
+
+        // Run cleanup — should only clear the expired one
+        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.database)
+            .await
+            .unwrap();
+
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].mls_group_id, expired_group);
+
+        // Active mutes must be untouched
+        let forever_ag = AccountGroup::get(&whitenoise, &account.pubkey, &forever_group)
+            .await
+            .unwrap()
+            .unwrap();
+        let future_ag = AccountGroup::get(&whitenoise, &account.pubkey, &future_group)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(forever_ag.is_muted_forever());
+        assert!(future_ag.is_muted());
+    }
+
+    #[tokio::test]
     async fn test_removed_at_persists_through_save() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
@@ -1470,6 +1939,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
