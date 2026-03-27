@@ -587,6 +587,12 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Buffer (in seconds) used when resubscribing after a teardown/rebuild
+    /// cycle. Larger than `SUBSCRIPTION_BUFFER_SECS` to cover the gap window
+    /// created by tearing down old subscriptions before new ones are live.
+    /// Any events fetched that were already processed are deduplicated by the
+    /// event tracker.
+    const RESUBSCRIBE_BUFFER_SECS: u64 = 60;
     /// Returns a reference to the global Whitenoise singleton instance.
     ///
     /// This method provides access to the globally initialized Whitenoise instance that was
