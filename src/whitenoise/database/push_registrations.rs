@@ -1,5 +1,6 @@
 //! Database operations for local push registrations.
 
+use core::fmt;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,6 @@ use super::{
 use crate::perf_instrument;
 use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 
-#[derive(Debug)]
 struct PushRegistrationRow {
     account_pubkey: PublicKey,
     platform: PushPlatform,
@@ -22,6 +22,21 @@ struct PushRegistrationRow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     last_shared_at: Option<DateTime<Utc>>,
+}
+
+impl fmt::Debug for PushRegistrationRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushRegistrationRow")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("platform", &self.platform)
+            .field("raw_token", &"<redacted>")
+            .field("server_pubkey", &self.server_pubkey)
+            .field("relay_hint", &self.relay_hint)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("last_shared_at", &self.last_shared_at)
+            .finish()
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for PushRegistrationRow
@@ -431,5 +446,24 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    #[test]
+    fn test_push_registration_row_debug_redacts_raw_token() {
+        let row = PushRegistrationRow {
+            account_pubkey: Keys::generate().public_key(),
+            platform: PushPlatform::Apns,
+            raw_token: "super-secret-token".to_string(),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_shared_at: None,
+        };
+
+        let debug_output = format!("{row:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("super-secret-token"));
     }
 }

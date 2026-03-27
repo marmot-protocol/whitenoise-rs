@@ -26,7 +26,9 @@ CREATE TABLE group_push_tokens (
     leaf_index INTEGER NOT NULL CHECK (leaf_index >= 0),
     server_pubkey TEXT NOT NULL,
     relay_hint TEXT,
-    encrypted_token TEXT NOT NULL CHECK (length(encrypted_token) > 0),
+    encrypted_token TEXT NOT NULL CHECK (
+        length(trim(encrypted_token, ' ' || char(9) || char(10) || char(13))) > 0
+    ),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE

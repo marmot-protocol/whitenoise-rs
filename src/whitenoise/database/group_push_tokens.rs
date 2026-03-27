@@ -1,5 +1,7 @@
 //! Database operations for cached per-group push tokens.
 
+use core::fmt;
+
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{PublicKey, RelayUrl};
@@ -8,7 +10,6 @@ use super::{Database, utils::parse_timestamp};
 use crate::perf_instrument;
 use crate::whitenoise::push_notifications::GroupPushToken;
 
-#[derive(Debug)]
 struct GroupPushTokenRow {
     account_pubkey: PublicKey,
     mls_group_id: GroupId,
@@ -18,6 +19,21 @@ struct GroupPushTokenRow {
     encrypted_token: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for GroupPushTokenRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupPushTokenRow")
+            .field("account_pubkey", &self.account_pubkey)
+            .field("mls_group_id", &self.mls_group_id)
+            .field("leaf_index", &self.leaf_index)
+            .field("server_pubkey", &self.server_pubkey)
+            .field("relay_hint", &self.relay_hint)
+            .field("encrypted_token", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for GroupPushTokenRow
@@ -413,5 +429,46 @@ mod tests {
         assert_eq!(updated.created_at, expected_created_at);
         assert_eq!(updated.server_pubkey, second_server);
         assert_eq!(updated.encrypted_token, "ciphertext-two");
+    }
+
+    #[tokio::test]
+    async fn test_group_push_tokens_upsert_rejects_whitespace_only_encrypted_token() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mls_group_id = make_group_id(44);
+        let server_pubkey = Keys::generate().public_key();
+
+        let error = GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            1,
+            &server_pubkey,
+            None,
+            " \n\t\r ",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, sqlx::Error::Database(_)));
+    }
+
+    #[test]
+    fn test_group_push_token_row_debug_redacts_encrypted_token() {
+        let row = GroupPushTokenRow {
+            account_pubkey: Keys::generate().public_key(),
+            mls_group_id: make_group_id(55),
+            leaf_index: 2,
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            encrypted_token: "ciphertext-value".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let debug_output = format!("{row:?}");
+
+        assert!(debug_output.contains("<redacted>"));
+        assert!(!debug_output.contains("ciphertext-value"));
     }
 }
