@@ -9,7 +9,7 @@ use super::{
     Database,
     utils::{parse_optional_timestamp, parse_timestamp},
 };
-use crate::perf_span;
+use crate::perf_instrument;
 use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 
 #[derive(Debug)]
@@ -100,11 +100,11 @@ impl From<PushRegistrationRow> for PushRegistration {
 }
 
 impl PushRegistration {
+    #[perf_instrument("db::push_registrations")]
     pub(crate) async fn find_by_account_pubkey(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let _span = perf_span!("db::push_registrations_find");
         let row = sqlx::query_as::<_, PushRegistrationRow>(
             "SELECT *
              FROM push_registrations
@@ -117,6 +117,7 @@ impl PushRegistration {
         Ok(row.map(Into::into))
     }
 
+    #[perf_instrument("db::push_registrations")]
     pub(crate) async fn upsert(
         account_pubkey: &PublicKey,
         platform: PushPlatform,
@@ -125,7 +126,6 @@ impl PushRegistration {
         relay_hint: Option<&RelayUrl>,
         database: &Database,
     ) -> Result<Self, sqlx::Error> {
-        let _span = perf_span!("db::push_registrations_upsert");
         let now = Utc::now().timestamp_millis();
 
         let row = sqlx::query_as::<_, PushRegistrationRow>(
@@ -176,11 +176,11 @@ impl PushRegistration {
         Ok(row.into())
     }
 
+    #[perf_instrument("db::push_registrations")]
     pub(crate) async fn delete_by_account_pubkey(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<bool, sqlx::Error> {
-        let _span = perf_span!("db::push_registrations_delete");
         let result = sqlx::query(
             "DELETE FROM push_registrations
              WHERE account_pubkey = ?",
@@ -411,5 +411,25 @@ mod tests {
         .await
         .unwrap();
         assert!(changed.updated_at > expected_updated_at);
+    }
+
+    #[tokio::test]
+    async fn test_push_registration_upsert_rejects_whitespace_only_token_at_db_level() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let server_pubkey = Keys::generate().public_key();
+
+        let error = PushRegistration::upsert(
+            &account.pubkey,
+            PushPlatform::Apns,
+            "   ",
+            &server_pubkey,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, sqlx::Error::Database(_)));
     }
 }

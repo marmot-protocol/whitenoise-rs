@@ -43,7 +43,7 @@ impl FromStr for PushPlatform {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
+        match value {
             "apns" => Ok(Self::Apns),
             "fcm" => Ok(Self::Fcm),
             _ => Err(format!("Invalid push platform: {value}")),
@@ -68,11 +68,12 @@ pub struct PushRegistration {
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupPushToken {
     pub account_pubkey: PublicKey,
-    pub group_id: GroupId,
+    pub mls_group_id: GroupId,
     pub leaf_index: u32,
     pub server_pubkey: PublicKey,
     pub relay_hint: Option<RelayUrl>,
     pub encrypted_token: String,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -95,11 +96,12 @@ impl fmt::Debug for GroupPushToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GroupPushToken")
             .field("account_pubkey", &self.account_pubkey)
-            .field("group_id", &self.group_id)
+            .field("mls_group_id", &self.mls_group_id)
             .field("leaf_index", &self.leaf_index)
             .field("server_pubkey", &self.server_pubkey)
             .field("relay_hint", &self.relay_hint)
             .field("encrypted_token", &"<redacted>")
+            .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
     }
@@ -289,11 +291,12 @@ mod tests {
     fn test_group_push_token_debug_redacts_encrypted_token() {
         let token = GroupPushToken {
             account_pubkey: Keys::generate().public_key(),
-            group_id: GroupId::from_slice(&[7; 32]),
+            mls_group_id: GroupId::from_slice(&[7; 32]),
             leaf_index: 3,
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
             encrypted_token: "ciphertext-value".to_string(),
+            created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
@@ -301,5 +304,12 @@ mod tests {
 
         assert!(debug_output.contains("<redacted>"));
         assert!(!debug_output.contains("ciphertext-value"));
+    }
+
+    #[test]
+    fn test_push_platform_from_str_is_case_sensitive() {
+        assert_eq!(PushPlatform::from_str("apns").unwrap(), PushPlatform::Apns);
+        assert_eq!(PushPlatform::from_str("fcm").unwrap(), PushPlatform::Fcm);
+        assert!(PushPlatform::from_str("APNS").is_err());
     }
 }
