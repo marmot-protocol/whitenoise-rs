@@ -244,11 +244,11 @@ impl Whitenoise {
             Err(e) => {
                 tracing::warn!(
                     target: "whitenoise::notification_streaming",
-                    "Failed to check notification status for group {}, defaulting to suppressed: {}",
+                    "Failed to check notification status for group {}, delivering anyway: {}",
                     hex::encode(group_id.as_slice()),
                     e
                 );
-                Some("error")
+                None
             }
         }
     }

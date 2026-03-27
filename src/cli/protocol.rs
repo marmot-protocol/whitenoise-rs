@@ -41,8 +41,8 @@ impl FromStr for MuteDuration {
         match s {
             "1h" => Ok(Self::OneHour),
             "8h" => Ok(Self::EightHours),
-            "1d" => Ok(Self::OneDay),
-            "1w" => Ok(Self::OneWeek),
+            "1d" | "24h" | "one_day" => Ok(Self::OneDay),
+            "1w" | "7d" | "one_week" => Ok(Self::OneWeek),
             "forever" => Ok(Self::Forever),
             _ => Err(format!(
                 "invalid mute duration '{}': expected 1h, 8h, 1d, 1w, or forever",
