@@ -110,7 +110,7 @@ impl AccountGroup {
 
     /// Returns true if this chat is muted forever (until manually unmuted).
     pub fn is_muted_forever(&self) -> bool {
-        self.muted_until == Some(MUTE_FOREVER)
+        self.muted_until >= Some(MUTE_FOREVER)
     }
 
     /// Creates or retrieves an AccountGroup for the given account and group.
