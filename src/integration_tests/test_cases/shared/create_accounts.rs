@@ -1,6 +1,9 @@
+use std::time::Duration;
+
+use async_trait::async_trait;
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
-use async_trait::async_trait;
 
 pub struct CreateAccountsTestCase {
     account_names: Vec<String>,
@@ -30,7 +33,36 @@ impl TestCase for CreateAccountsTestCase {
         let final_count = context.whitenoise.get_accounts_count().await?;
         assert_eq!(final_count, initial_count + self.account_names.len());
 
-        tracing::info!("✓ Created {} accounts", self.account_names.len());
+        retry(
+            50,
+            Duration::from_millis(100),
+            || async {
+                for name in &self.account_names {
+                    let account = context.get_account(name)?;
+                    let key_packages = context
+                        .whitenoise
+                        .fetch_all_key_packages_for_account(account)
+                        .await?;
+
+                    if key_packages.is_empty() {
+                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            "Key package not yet published for account '{}' ({})",
+                            name,
+                            account.pubkey.to_hex()
+                        )));
+                    }
+                }
+
+                Ok(())
+            },
+            "wait for created accounts to publish initial key packages",
+        )
+        .await?;
+
+        tracing::info!(
+            "✓ Created {} accounts with published key packages",
+            self.account_names.len()
+        );
         Ok(())
     }
 }
