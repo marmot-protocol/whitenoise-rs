@@ -5,8 +5,9 @@ use ::rand::RngCore;
 
 use anyhow::Context;
 use dashmap::DashMap;
+use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
-use nostr_sdk::{PublicKey, RelayUrl};
+use nostr_sdk::{EventId, PublicKey, RelayUrl};
 use tokio::sync::{
     Mutex, OnceCell, Semaphore,
     mpsc::{self, Sender},
@@ -181,6 +182,8 @@ pub struct Whitenoise {
     pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
     /// Debounced worker that coalesces discovery subscription rebuilds.
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
+    /// In-memory coordination for delayed MIP-05 token-list responses.
+    pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -217,6 +220,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
+            .field("pending_push_token_responses", &"<REDACTED>")
             .finish()
     }
 }
@@ -262,6 +266,7 @@ impl Whitenoise {
             background_task_cancellation: DashMap::new(),
             pending_logins: DashMap::new(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
+            pending_push_token_responses: Arc::new(DashMap::new()),
         }
     }
 
