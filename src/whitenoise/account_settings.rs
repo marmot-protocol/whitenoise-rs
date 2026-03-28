@@ -38,10 +38,28 @@ impl Whitenoise {
         account: &Account,
         enabled: bool,
     ) -> Result<AccountSettings, WhitenoiseError> {
-        Ok(
+        let settings =
             AccountSettings::update_notifications_enabled(&account.pubkey, enabled, &self.database)
-                .await?,
-        )
+                .await?;
+
+        let result = if enabled {
+            self.share_local_push_token_to_joined_groups(account).await
+        } else {
+            self.remove_local_push_token_from_joined_groups(account)
+                .await
+        };
+
+        if let Err(error) = result {
+            tracing::warn!(
+                target: "whitenoise::account_settings",
+                account = %account.pubkey.to_hex(),
+                enabled,
+                error = %error,
+                "Failed to reconcile shared push tokens after notification preference change"
+            );
+        }
+
+        Ok(settings)
     }
 }
 

@@ -81,6 +81,9 @@ pub enum WhitenoiseError {
     #[error("MDK error: {0}")]
     MdkCoreError(#[from] mdk_core::Error),
 
+    #[error("MIP-05 error: {0}")]
+    Mip05(#[from] mdk_core::mip05::Mip05Error),
+
     #[error("Invalid event: {0}")]
     InvalidEvent(String),
 
