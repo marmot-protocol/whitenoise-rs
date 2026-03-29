@@ -64,70 +64,92 @@ impl Whitenoise {
         drop(_mls_proc);
 
         // Extract and store media references synchronously for application messages.
-        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome)
-            && !self
-                .handle_received_push_group_message(
-                    account,
-                    &message,
-                    outcome.context.sender_leaf_index,
-                )
-                .await?
-        {
-            let parsed_references = {
-                let media_manager = mdk.media_manager(group_id.clone());
-                self.media_files()
-                    .parse_imeta_tags_from_event(&inner_event, &media_manager)?
-            };
+        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
+            let is_push_group_message = message.kind
+                == Kind::from(mdk_core::mip05::TOKEN_REQUEST_KIND)
+                || message.kind == Kind::from(mdk_core::mip05::TOKEN_LIST_RESPONSE_KIND)
+                || message.kind == Kind::from(mdk_core::mip05::TOKEN_REMOVAL_KIND);
 
-            self.media_files()
-                .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
-                .await?;
-
-            match message.kind {
-                Kind::ChatMessage => {
-                    let msg = self.cache_chat_message(&group_id, &message).await?;
-                    let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                    Whitenoise::spawn_new_message_notification_if_enabled(
-                        account, &group_id, &msg, group_name,
-                    );
-                    self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
-                    self.emit_chat_list_update(
+            if is_push_group_message {
+                if let Err(error) = self
+                    .handle_received_push_group_message(
                         account,
-                        &group_id,
-                        ChatListUpdateTrigger::NewLastMessage,
+                        &message,
+                        outcome.context.sender_leaf_index,
                     )
-                    .await;
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::event_handlers::handle_mls_message",
+                        account = %account.pubkey.to_hex(),
+                        group_id = %hex::encode(group_id.as_slice()),
+                        sender_leaf_index = ?outcome.context.sender_leaf_index,
+                        message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
+                        error = %error,
+                        "Failed to reconcile received MIP-05 group message after MLS acceptance"
+                    );
                 }
-                Kind::Reaction => {
-                    if let Some(target) = self.cache_reaction(&group_id, &message).await? {
-                        self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
-                    }
-                }
-                Kind::EventDeletion => {
-                    let last_message_id = self.get_last_message_id(&group_id).await;
+            } else {
+                let parsed_references = {
+                    let media_manager = mdk.media_manager(group_id.clone());
+                    self.media_files()
+                        .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+                };
 
-                    for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
-                        self.emit_message_update(&group_id, trigger, msg);
-                    }
+                self.media_files()
+                    .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
+                    .await?;
 
-                    // Check if the deleted message was the last message.
-                    // This check must happen AFTER get_last_message_id but the
-                    // result is only valid for the FIRST handler (before cache_deletion
-                    // modifies shared state). We emit for ALL subscribed accounts because
-                    // subsequent handlers will see incorrect post-deletion state.
-                    if let Some(last_message_id) = last_message_id {
-                        let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
-                        if deleted_ids.contains(&last_message_id) {
-                            self.emit_chat_list_update_for_group(
+                match message.kind {
+                    Kind::ChatMessage => {
+                        let msg = self.cache_chat_message(&group_id, &message).await?;
+                        let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                        Whitenoise::spawn_new_message_notification_if_enabled(
+                            account, &group_id, &msg, group_name,
+                        );
+                        self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
+                        self.emit_chat_list_update(
+                            account,
+                            &group_id,
+                            ChatListUpdateTrigger::NewLastMessage,
+                        )
+                        .await;
+                    }
+                    Kind::Reaction => {
+                        if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                            self.emit_message_update(
                                 &group_id,
-                                ChatListUpdateTrigger::LastMessageDeleted,
-                            )
-                            .await;
+                                UpdateTrigger::ReactionAdded,
+                                target,
+                            );
                         }
                     }
-                }
-                _ => {
-                    tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
+                    Kind::EventDeletion => {
+                        let last_message_id = self.get_last_message_id(&group_id).await;
+
+                        for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
+                            self.emit_message_update(&group_id, trigger, msg);
+                        }
+
+                        // Check if the deleted message was the last message.
+                        // This check must happen AFTER get_last_message_id but the
+                        // result is only valid for the FIRST handler (before cache_deletion
+                        // modifies shared state). We emit for ALL subscribed accounts because
+                        // subsequent handlers will see incorrect post-deletion state.
+                        if let Some(last_message_id) = last_message_id {
+                            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+                            if deleted_ids.contains(&last_message_id) {
+                                self.emit_chat_list_update_for_group(
+                                    &group_id,
+                                    ChatListUpdateTrigger::LastMessageDeleted,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
+                    }
                 }
             }
         }
@@ -249,9 +271,18 @@ impl Whitenoise {
                     self.mark_as_removed(account, mls_group_id).await?;
                 }
 
-                if still_active {
-                    self.reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
-                        .await?;
+                if still_active
+                    && let Err(error) = self
+                        .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
+                        .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::event_handlers::handle_mls_message",
+                        account = %account.pubkey.to_hex(),
+                        group_id = %hex::encode(mls_group_id.as_slice()),
+                        error = %error,
+                        "Failed to reconcile group push tokens after commit processing"
+                    );
                 }
 
                 self.background_refresh_account_group_subscriptions(account);

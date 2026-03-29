@@ -213,13 +213,14 @@ impl Whitenoise {
                 }
             }
             Mip05GroupMessage::TokenListResponse(response) => {
+                let request_event_id = response.request_event_id;
+                self.merge_token_list_response(account, &message.mls_group_id, response)
+                    .await?;
                 self.clear_pending_token_response(
                     &account.pubkey,
                     &message.mls_group_id,
-                    &response.request_event_id,
+                    &request_event_id,
                 );
-                self.merge_token_list_response(account, &message.mls_group_id, response)
-                    .await?;
             }
             Mip05GroupMessage::TokenRemoval(_) => {
                 let leaf_index = sender_leaf_index.ok_or_else(|| {
@@ -304,7 +305,7 @@ impl Whitenoise {
                 return;
             }
 
-            let whitenoise = match Whitenoise::get_instance() {
+            let whitenoise = match Self::get_instance() {
                 Ok(whitenoise) => whitenoise,
                 Err(error) => {
                     tracing::warn!(
@@ -352,6 +353,7 @@ impl Whitenoise {
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
+        let mut publish_failures = Vec::new();
 
         for group in groups {
             if group.state != GroupState::Active {
@@ -363,11 +365,25 @@ impl Whitenoise {
                 nostr_sdk::Timestamp::now(),
                 vec![token_tag.clone()],
             )?;
-            self.publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await?;
+            if let Err(error) = self
+                .publish_push_group_message(account, &group.mls_group_id, rumor)
+                .await
+            {
+                publish_failures.push(format!(
+                    "{}: {error}",
+                    hex::encode(group.mls_group_id.as_slice())
+                ));
+            }
         }
 
-        Ok(())
+        if publish_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WhitenoiseError::Configuration(format!(
+                "failed to share push token to one or more groups: {}",
+                publish_failures.join(", ")
+            )))
+        }
     }
     #[perf_instrument("push_notifications")]
     pub(crate) async fn reconcile_group_push_tokens_for_active_leaves(
@@ -425,6 +441,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
+        let mut publish_failures = Vec::new();
 
         for group in groups {
             if group.state != GroupState::Active {
@@ -432,11 +449,25 @@ impl Whitenoise {
             }
 
             let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-            self.publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await?;
+            if let Err(error) = self
+                .publish_push_group_message(account, &group.mls_group_id, rumor)
+                .await
+            {
+                publish_failures.push(format!(
+                    "{}: {error}",
+                    hex::encode(group.mls_group_id.as_slice())
+                ));
+            }
         }
 
-        Ok(())
+        if publish_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WhitenoiseError::Configuration(format!(
+                "failed to remove push token from one or more groups: {}",
+                publish_failures.join(", ")
+            )))
+        }
     }
 
     fn is_push_group_message_kind(kind: Kind) -> bool {
