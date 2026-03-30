@@ -717,54 +717,6 @@ mod tests {
         group_id
     }
 
-    async fn setup_group_with_welcome_for_member(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
-        let key_pkg_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(member_account.pubkey, &relay_urls)
-            .await
-            .unwrap()
-            .expect("member must have a published key package");
-
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
-            .unwrap();
-
-        let group_id = create_result.group.mls_group_id.clone();
-        let welcome_rumor = create_result
-            .welcome_rumors
-            .first()
-            .expect("welcome rumor exists")
-            .clone();
-
-        let admin_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-        let giftwrap =
-            EventBuilder::gift_wrap(&admin_signer, &member_account.pubkey, welcome_rumor, vec![])
-                .await
-                .unwrap();
-
-        whitenoise
-            .handle_giftwrap(member_account, giftwrap)
-            .await
-            .expect("member should process welcome successfully");
-
-        group_id
-    }
-
     async fn wait_for_published_event_count(
         whitenoise: &Whitenoise,
         account: &Account,
@@ -1014,8 +966,7 @@ mod tests {
             .await
             .unwrap();
 
-        let group_id =
-            setup_group_with_welcome_for_member(&whitenoise, &admin_account, &member_account).await;
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let before_count = count_published_events_for_account(&whitenoise, &member_account).await;
         let member_mdk = whitenoise
             .create_mdk_for_account(member_account.pubkey)
