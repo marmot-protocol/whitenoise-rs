@@ -1813,6 +1813,67 @@ mod tests {
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
     }
 
+    #[test]
+    fn test_mute_duration_to_expiry_all_variants() {
+        let now = Utc::now();
+
+        let expiry = MuteDuration::OneHour.to_expiry();
+        assert!(expiry > now && expiry <= now + Duration::hours(1) + Duration::seconds(1));
+
+        let expiry = MuteDuration::EightHours.to_expiry();
+        assert!(expiry > now && expiry <= now + Duration::hours(8) + Duration::seconds(1));
+
+        let expiry = MuteDuration::OneDay.to_expiry();
+        assert!(expiry > now && expiry <= now + Duration::days(1) + Duration::seconds(1));
+
+        let expiry = MuteDuration::OneWeek.to_expiry();
+        assert!(expiry > now && expiry <= now + Duration::weeks(1) + Duration::seconds(1));
+
+        assert_eq!(MuteDuration::Forever.to_expiry(), MUTE_FOREVER);
+
+        let custom = now + Duration::hours(3);
+        assert_eq!(MuteDuration::Custom(custom).to_expiry(), custom);
+    }
+
+    #[test]
+    fn test_mute_duration_display() {
+        assert_eq!(MuteDuration::OneHour.to_string(), "1h");
+        assert_eq!(MuteDuration::EightHours.to_string(), "8h");
+        assert_eq!(MuteDuration::OneDay.to_string(), "1d");
+        assert_eq!(MuteDuration::OneWeek.to_string(), "1w");
+        assert_eq!(MuteDuration::Forever.to_string(), "forever");
+
+        let custom = Utc::now() + Duration::hours(3);
+        let s = MuteDuration::Custom(custom).to_string();
+        assert!(s.starts_with("custom(") && s.ends_with(')'));
+    }
+
+    #[test]
+    fn test_mute_duration_from_str() {
+        assert_eq!("1h".parse::<MuteDuration>().unwrap(), MuteDuration::OneHour);
+        assert_eq!(
+            "8h".parse::<MuteDuration>().unwrap(),
+            MuteDuration::EightHours
+        );
+        assert_eq!("1d".parse::<MuteDuration>().unwrap(), MuteDuration::OneDay);
+        assert_eq!("24h".parse::<MuteDuration>().unwrap(), MuteDuration::OneDay);
+        assert_eq!(
+            "one_day".parse::<MuteDuration>().unwrap(),
+            MuteDuration::OneDay
+        );
+        assert_eq!("1w".parse::<MuteDuration>().unwrap(), MuteDuration::OneWeek);
+        assert_eq!("7d".parse::<MuteDuration>().unwrap(), MuteDuration::OneWeek);
+        assert_eq!(
+            "one_week".parse::<MuteDuration>().unwrap(),
+            MuteDuration::OneWeek
+        );
+        assert_eq!(
+            "forever".parse::<MuteDuration>().unwrap(),
+            MuteDuration::Forever
+        );
+        assert!("2h".parse::<MuteDuration>().is_err());
+    }
+
     #[tokio::test]
     async fn test_mute_chat_custom_future_timestamp() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
