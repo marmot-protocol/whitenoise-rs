@@ -166,7 +166,7 @@ impl Whitenoise {
     async fn fetch_users_batch(
         whitenoise: &Whitenoise,
         pubkeys: &[PublicKey],
-        cancel_rx: Option<watch::Receiver<bool>>,
+        mut cancel_rx: Option<watch::Receiver<bool>>,
     ) -> usize {
         let mut unique_pubkeys = pubkeys.to_vec();
         unique_pubkeys.sort_unstable_by_key(|pubkey| pubkey.to_hex());
@@ -189,15 +189,6 @@ impl Whitenoise {
         let mut queued_user_count = 0usize;
 
         for authors in unique_pubkeys.chunks(CONTACT_LIST_CATCH_UP_BATCH_SIZE) {
-            let cancelled = cancel_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(false);
-            if cancelled {
-                tracing::debug!(
-                    target: "whitenoise::handle_contact_list",
-                    "Discovery catch-up cancelled, stopping"
-                );
-                break;
-            }
-
             let filter = Filter::new().authors(authors.to_vec()).kinds([
                 Kind::Metadata,
                 Kind::RelayList,
@@ -205,12 +196,35 @@ impl Whitenoise {
                 Kind::MlsKeyPackageRelays,
             ]);
 
-            match whitenoise
-                .relay_control
-                .discovery()
-                .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT)
-                .await
-            {
+            let batch_result = if let Some(cancel_rx) = cancel_rx.as_mut() {
+                tokio::select! {
+                    result = whitenoise
+                        .relay_control
+                        .discovery()
+                        .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT) => Some(result),
+                    _ = cancel_rx.changed() => {
+                        tracing::debug!(
+                            target: "whitenoise::handle_contact_list",
+                            "Discovery catch-up cancelled, stopping"
+                        );
+                        None
+                    }
+                }
+            } else {
+                Some(
+                    whitenoise
+                        .relay_control
+                        .discovery()
+                        .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT)
+                        .await,
+                )
+            };
+
+            let Some(batch_result) = batch_result else {
+                break;
+            };
+
+            match batch_result {
                 Ok(events) => {
                     if let Err(error) =
                         Self::queue_discovery_catch_up_events(whitenoise, &events, &context_relay)
