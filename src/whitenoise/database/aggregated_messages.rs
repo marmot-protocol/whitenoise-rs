@@ -347,6 +347,113 @@ impl AggregatedMessage {
         Ok(messages)
     }
 
+    /// Fetch the newest messages for a group, returning at least `minimum` messages
+    /// and enough additional messages to include all unread ones.
+    ///
+    /// The effective fetch size is `max(unread_count, minimum)`, so the caller always
+    /// receives a full page even when there are zero unread messages, and always
+    /// receives every unread message when there are more than `minimum` unreads.
+    ///
+    /// The count and fetch happen in a single SQL round-trip via a CTE.
+    ///
+    /// # Arguments
+    /// * `group_id`    - The MLS group to query
+    /// * `read_marker` - The last-read message ID (`last_read_message_id`). `None` means
+    ///                   all messages are unread.
+    /// * `minimum`     - Floor on the number of messages to return (e.g. 50 for a full page).
+    ///                   Capped at 200.
+    ///
+    /// # Returns
+    /// Messages in oldest-first order (same as `find_messages_by_group_paginated`).
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn find_messages_with_unread_minimum(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        minimum: u32,
+        database: &Database,
+    ) -> Result<Vec<ChatMessage>> {
+        let minimum_val = i64::from(minimum.min(200));
+
+        // Single-query approach: a CTE computes the unread count, then the outer
+        // SELECT uses MAX(unread_count, minimum) as the LIMIT.  This avoids a
+        // separate COUNT round-trip and keeps the logic in one atomic read.
+        //
+        // The unread count uses the same timestamp-subquery logic as
+        // `count_unread_for_group`: messages whose `created_at` is strictly after
+        // the read marker's `created_at` are considered unread.  When there is no
+        // read marker every non-deleted kind-9 message is unread.
+        let rows: Vec<AggregatedMessageRow> = match read_marker {
+            Some(marker_id) => {
+                sqlx::query_as(
+                    "WITH unread_count AS (
+                       SELECT COUNT(*) AS cnt
+                       FROM aggregated_messages
+                       WHERE mls_group_id = ?
+                         AND kind = 9
+                         AND deletion_event_id IS NULL
+                         AND created_at > COALESCE(
+                           (SELECT created_at FROM aggregated_messages
+                            WHERE message_id = ? AND mls_group_id = ?),
+                           0
+                         )
+                     )
+                     SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id
+                      AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9
+                       AND am.mls_group_id = ?
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at DESC, am.message_id DESC
+                     LIMIT MAX((SELECT cnt FROM unread_count), ?)",
+                )
+                .bind(group_id.as_slice()) // unread CTE: mls_group_id
+                .bind(marker_id.to_hex()) // unread CTE: read marker message_id
+                .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
+                .bind(group_id.as_slice()) // outer SELECT: mls_group_id
+                .bind(minimum_val) // MAX(cnt, minimum)
+                .fetch_all(&database.pool)
+                .await?
+            }
+            None => {
+                // No read marker: every non-deleted kind-9 message is unread.
+                // The effective limit is MAX(total_count, minimum).
+                sqlx::query_as(
+                    "WITH unread_count AS (
+                       SELECT COUNT(*) AS cnt
+                       FROM aggregated_messages
+                       WHERE mls_group_id = ?
+                         AND kind = 9
+                         AND deletion_event_id IS NULL
+                     )
+                     SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id
+                      AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9
+                       AND am.mls_group_id = ?
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at DESC, am.message_id DESC
+                     LIMIT MAX((SELECT cnt FROM unread_count), ?)",
+                )
+                .bind(group_id.as_slice()) // unread CTE: mls_group_id
+                .bind(group_id.as_slice()) // outer SELECT: mls_group_id
+                .bind(minimum_val) // MAX(cnt, minimum)
+                .fetch_all(&database.pool)
+                .await?
+            }
+        };
+
+        let mut messages: Vec<ChatMessage> = rows
+            .into_iter()
+            .map(Self::row_to_chat_message)
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Search messages within a group by content using forward-order substring matching.
     ///
     /// Matches against `content_normalized`, a NFC-lowercased copy of the content

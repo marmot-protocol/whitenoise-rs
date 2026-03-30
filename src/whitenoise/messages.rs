@@ -674,6 +674,51 @@ impl Whitenoise {
         })
     }
 
+    /// Fetch the newest messages for a group, ensuring all unread messages are included
+    /// and at least `minimum` messages are returned.
+    ///
+    /// The effective fetch size is `max(unread_count, minimum)`, so the caller always
+    /// receives a full page even when there are no unread messages, and always receives
+    /// every unread message when there are more unreads than the minimum.
+    ///
+    /// Messages are returned in oldest-first order, ready for display in a chat view.
+    ///
+    /// # Arguments
+    /// * `pubkey`   - The public key of the requesting user (security check; must be a
+    ///                registered account).
+    /// * `group_id` - The MLS group to fetch messages for.
+    /// * `minimum`  - Floor on the number of messages to return. `None` defaults to 50.
+    ///                Values above 200 are clamped to 200.
+    #[perf_instrument("messages")]
+    pub async fn fetch_messages_unread_with_minimum(
+        &self,
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        minimum: Option<u32>,
+    ) -> Result<Vec<ChatMessage>> {
+        Account::find_by_pubkey(pubkey, &self.database).await?;
+
+        let read_marker = self
+            .get_last_read_message_id(
+                &Account::find_by_pubkey(pubkey, &self.database).await?,
+                group_id,
+            )
+            .await?;
+
+        let minimum_val = minimum.unwrap_or(50);
+
+        AggregatedMessage::find_messages_with_unread_minimum(
+            group_id,
+            read_marker.as_ref(),
+            minimum_val,
+            &self.database,
+        )
+        .await
+        .map_err(|e| {
+            WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+        })
+    }
+
     /// Fetch a single aggregated message by its event ID.
     ///
     /// Returns `None` if the message does not exist in the cache or belongs to a different group.
@@ -2737,6 +2782,203 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none(), "Expected None for an unknown message ID");
+    }
+
+    /// fetch_messages_unread_with_minimum returns all unread messages when unread count
+    /// exceeds the minimum — the caller gets every message since the read marker.
+    #[tokio::test]
+    async fn test_fetch_messages_unread_with_minimum_returns_all_unreads() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send 3 messages spaced 1 second apart.  Nostr Timestamp is second-precision, so
+        // messages sent within the same second share the same `created_at`.  The unread count
+        // uses `created_at > marker_created_at` (strict greater-than), so all messages must
+        // have distinct timestamps for the boundary to work correctly.
+        let mut sent_ids = Vec::new();
+        for i in 0..3 {
+            let msg = whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("message {i}"),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+            sent_ids.push(msg.message.id);
+            if i < 2 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+
+        // Mark the first message as read — 2 messages remain unread
+        whitenoise
+            .mark_message_read(&creator, &sent_ids[0])
+            .await
+            .unwrap();
+
+        // minimum=1, but 2 messages are unread — unread count wins, expect 2
+        let result = whitenoise
+            .fetch_messages_unread_with_minimum(&creator.pubkey, &group.mls_group_id, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 unread messages, got {}",
+            result.len()
+        );
+    }
+
+    /// fetch_messages_unread_with_minimum applies the minimum floor when fewer messages
+    /// are unread — ensures the caller always gets at least a full page.
+    #[tokio::test]
+    async fn test_fetch_messages_unread_with_minimum_applies_floor() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send 5 messages, mark all as read
+        let mut last_id = None;
+        for i in 0..5 {
+            let msg = whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("message {i}"),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+            last_id = Some(msg.message.id);
+        }
+        whitenoise
+            .mark_message_read(&creator, &last_id.unwrap())
+            .await
+            .unwrap();
+
+        // 0 unread, minimum=3 — floor should kick in, returning 3 newest messages
+        let result = whitenoise
+            .fetch_messages_unread_with_minimum(&creator.pubkey, &group.mls_group_id, Some(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            3,
+            "Expected minimum of 3 messages (floor), got {}",
+            result.len()
+        );
+    }
+
+    /// fetch_messages_unread_with_minimum with no read marker treats every message
+    /// as unread, so all messages are returned (all unread > minimum=3).
+    #[tokio::test]
+    async fn test_fetch_messages_unread_with_minimum_no_read_marker() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send 4 messages, never mark any as read
+        for i in 0..4 {
+            whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("message {i}"),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // No read marker: all 4 are unread, minimum=3 — unread wins
+        let result = whitenoise
+            .fetch_messages_unread_with_minimum(&creator.pubkey, &group.mls_group_id, Some(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            4,
+            "Expected all 4 messages (all unread), got {}",
+            result.len()
+        );
+    }
+
+    /// fetch_messages_unread_with_minimum rejects an unknown account (security check).
+    #[tokio::test]
+    async fn test_fetch_messages_unread_with_minimum_rejects_unknown_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![members[0].0.pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stranger = Keys::generate().public_key();
+        let result = whitenoise
+            .fetch_messages_unread_with_minimum(&stranger, &group.mls_group_id, None)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            WhitenoiseError::AccountNotFound
+        ));
     }
 
     /// fetch_message_by_id enforces the account-existence security check: an unregistered
