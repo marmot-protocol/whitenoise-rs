@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::whitenoise::accounts_groups::MuteDuration;
+
 /// A request from the CLI client to the daemon.
 ///
 /// Each variant maps to one daemon method. The JSON wire format uses
@@ -120,6 +122,14 @@ pub enum Request {
     UnarchiveChat { account: String, group_id: String },
     #[serde(rename = "archived_chats_list")]
     ArchivedChatsList { account: String },
+    #[serde(rename = "mute_chat")]
+    MuteChat {
+        account: String,
+        group_id: String,
+        duration: MuteDuration,
+    },
+    #[serde(rename = "unmute_chat")]
+    UnmuteChat { account: String, group_id: String },
 
     // Settings
     #[serde(rename = "settings_show")]
@@ -380,7 +390,10 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+
     use super::*;
+    use crate::whitenoise::accounts_groups::MUTE_FOREVER;
     use serde_json::json;
 
     /// Unit variants must serialize without a "params" key.
@@ -1543,5 +1556,146 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::KeysCheck { pubkey } if pubkey == "npub1abc"));
+    }
+
+    #[test]
+    fn mute_chat_roundtrip() {
+        let req = Request::MuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+            duration: MuteDuration::OneHour,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, Request::MuteChat { account, group_id, duration }
+                if account == "npub1abc" && group_id == "deadbeef" && duration == MuteDuration::OneHour)
+        );
+    }
+
+    #[test]
+    fn mute_chat_forever_roundtrip() {
+        let req = Request::MuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+            duration: MuteDuration::Forever,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(parsed, Request::MuteChat { duration, .. } if duration == MuteDuration::Forever)
+        );
+    }
+
+    #[test]
+    fn unmute_chat_roundtrip() {
+        let req = Request::UnmuteChat {
+            account: "npub1abc".to_string(),
+            group_id: "deadbeef".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::UnmuteChat { account, group_id }
+                if account == "npub1abc" && group_id == "deadbeef"));
+    }
+
+    #[test]
+    fn mute_duration_from_str() {
+        assert_eq!("1h".parse::<MuteDuration>().unwrap(), MuteDuration::OneHour);
+        assert_eq!(
+            "8h".parse::<MuteDuration>().unwrap(),
+            MuteDuration::EightHours
+        );
+        assert_eq!("1d".parse::<MuteDuration>().unwrap(), MuteDuration::OneDay);
+        assert_eq!("1w".parse::<MuteDuration>().unwrap(), MuteDuration::OneWeek);
+        assert_eq!(
+            "forever".parse::<MuteDuration>().unwrap(),
+            MuteDuration::Forever
+        );
+        assert!("2h".parse::<MuteDuration>().is_err());
+        assert!("".parse::<MuteDuration>().is_err());
+    }
+
+    #[test]
+    fn mute_duration_display() {
+        assert_eq!(MuteDuration::OneHour.to_string(), "1h");
+        assert_eq!(MuteDuration::EightHours.to_string(), "8h");
+        assert_eq!(MuteDuration::OneDay.to_string(), "1d");
+        assert_eq!(MuteDuration::OneWeek.to_string(), "1w");
+        assert_eq!(MuteDuration::Forever.to_string(), "forever");
+    }
+
+    #[test]
+    fn mute_duration_serde_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneHour).unwrap(),
+            "\"1h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::EightHours).unwrap(),
+            "\"8h\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneDay).unwrap(),
+            "\"1d\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::OneWeek).unwrap(),
+            "\"1w\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MuteDuration::Forever).unwrap(),
+            "\"forever\""
+        );
+
+        // Deserialize from wire tokens
+        assert_eq!(
+            serde_json::from_str::<MuteDuration>("\"1h\"").unwrap(),
+            MuteDuration::OneHour
+        );
+        assert_eq!(
+            serde_json::from_str::<MuteDuration>("\"1w\"").unwrap(),
+            MuteDuration::OneWeek
+        );
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_forever_uses_sentinel() {
+        let expiry = MuteDuration::Forever.to_expiry();
+        assert_eq!(expiry, MUTE_FOREVER);
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_one_hour_is_future() {
+        let before = Utc::now();
+        let expiry = MuteDuration::OneHour.to_expiry();
+        let after = Utc::now() + Duration::hours(1) + Duration::seconds(1);
+
+        assert!(expiry > before);
+        assert!(expiry < after);
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_custom_returns_inner_value() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let expiry = MuteDuration::Custom(custom_time).to_expiry();
+        assert_eq!(expiry, custom_time);
+    }
+
+    #[test]
+    fn mute_duration_display_custom() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let display = MuteDuration::Custom(custom_time).to_string();
+        assert!(display.starts_with("custom("));
+        assert!(display.ends_with(')'));
+    }
+
+    #[test]
+    fn mute_duration_serde_custom_roundtrip() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let duration = MuteDuration::Custom(custom_time);
+        let serialized = serde_json::to_string(&duration).unwrap();
+        let deserialized: MuteDuration = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(duration, deserialized);
     }
 }
