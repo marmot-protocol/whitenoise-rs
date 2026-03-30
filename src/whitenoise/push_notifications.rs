@@ -137,6 +137,13 @@ impl Whitenoise {
         relay_hint: Option<&RelayUrl>,
     ) -> Result<PushRegistration> {
         validate_raw_token(raw_token)?;
+        let previous_token_tag = self
+            .push_registration(account)
+            .await?
+            .as_ref()
+            .map(PushRegistration::token_tag)
+            .transpose()?
+            .flatten();
 
         let registration = PushRegistration::upsert(
             &account.pubkey,
@@ -148,7 +155,21 @@ impl Whitenoise {
         )
         .await?;
 
-        if let Err(error) = self.share_local_push_token_to_joined_groups(account).await {
+        let new_token_tag = registration.token_tag()?;
+
+        if previous_token_tag.is_some() && new_token_tag.is_none() {
+            if let Err(error) = self
+                .remove_local_push_token_from_joined_groups(account)
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    error = %error,
+                    "Failed to remove previously shared push token after registration became unshareable"
+                );
+            }
+        } else if let Err(error) = self.share_local_push_token_to_joined_groups(account).await {
             tracing::warn!(
                 target: "whitenoise::push_notifications",
                 account = %account.pubkey.to_hex(),
@@ -373,6 +394,17 @@ impl Whitenoise {
                     "{}: {error}",
                     hex::encode(group.mls_group_id.as_slice())
                 ));
+                continue;
+            }
+
+            if let Err(error) = self
+                .sync_local_group_push_token_cache(account, &group.mls_group_id, Some(&token_tag))
+                .await
+            {
+                publish_failures.push(format!(
+                    "{}: {error}",
+                    hex::encode(group.mls_group_id.as_slice())
+                ));
             }
         }
 
@@ -429,9 +461,11 @@ impl Whitenoise {
         let rumor = build_token_request_rumor(
             account.pubkey,
             nostr_sdk::Timestamp::now(),
-            vec![token_tag],
+            vec![token_tag.clone()],
         )?;
         self.publish_push_group_message(account, group_id, rumor)
+            .await?;
+        self.sync_local_group_push_token_cache(account, group_id, Some(&token_tag))
             .await
     }
 
@@ -452,6 +486,17 @@ impl Whitenoise {
             let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
             if let Err(error) = self
                 .publish_push_group_message(account, &group.mls_group_id, rumor)
+                .await
+            {
+                publish_failures.push(format!(
+                    "{}: {error}",
+                    hex::encode(group.mls_group_id.as_slice())
+                ));
+                continue;
+            }
+
+            if let Err(error) = self
+                .sync_local_group_push_token_cache(account, &group.mls_group_id, None)
                 .await
             {
                 publish_failures.push(format!(
@@ -608,24 +653,44 @@ impl Whitenoise {
     }
 
     #[perf_instrument("push_notifications")]
+    async fn sync_local_group_push_token_cache(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        token_tag: Option<&TokenTag>,
+    ) -> Result<()> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let leaf_index = mdk.own_leaf_index(group_id)?;
+
+        match token_tag {
+            Some(token_tag) => {
+                GroupPushToken::upsert(
+                    &account.pubkey,
+                    group_id,
+                    leaf_index,
+                    &token_tag.server_pubkey,
+                    Some(&token_tag.relay_hint),
+                    &token_tag.encrypted_token.to_base64(),
+                    &self.database,
+                )
+                .await?;
+            }
+            None => {
+                GroupPushToken::delete(&account.pubkey, group_id, leaf_index, &self.database)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[perf_instrument("push_notifications")]
     async fn local_push_token_tag(&self, account: &Account) -> Result<Option<TokenTag>> {
         let Some(registration) = self.push_registration(account).await? else {
             return Ok(None);
         };
 
-        let plaintext = registration.push_token_plaintext()?;
-        let encrypted_token = encrypt_push_token(&registration.server_pubkey, &plaintext)?;
-        let relay_hint = registration.relay_hint.clone().ok_or_else(|| {
-            WhitenoiseError::InvalidInput(
-                "push registration relay hint is required before sharing tokens".to_string(),
-            )
-        })?;
-
-        Ok(Some(TokenTag {
-            encrypted_token,
-            server_pubkey: registration.server_pubkey,
-            relay_hint,
-        }))
+        registration.token_tag()
     }
 
     #[perf_instrument("push_notifications")]
@@ -655,6 +720,21 @@ fn validate_raw_token(raw_token: &str) -> Result<()> {
 }
 
 impl PushRegistration {
+    fn token_tag(&self) -> Result<Option<TokenTag>> {
+        let Some(relay_hint) = self.relay_hint.clone() else {
+            return Ok(None);
+        };
+
+        let plaintext = self.push_token_plaintext()?;
+        let encrypted_token = encrypt_push_token(&self.server_pubkey, &plaintext)?;
+
+        Ok(Some(TokenTag {
+            encrypted_token,
+            server_pubkey: self.server_pubkey,
+            relay_hint,
+        }))
+    }
+
     fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
         match self.platform {
             PushPlatform::Apns => {
@@ -741,6 +821,23 @@ mod tests {
             .await
             .expect("member should process welcome successfully");
 
+        let group_name = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap()
+            .get_group(&group_id)
+            .unwrap()
+            .expect("member should have group after welcome")
+            .name;
+        Whitenoise::finalize_welcome_with_instance(
+            whitenoise,
+            member_account,
+            &group_id,
+            &group_name,
+            EventId::all_zeros(),
+            admin_account.pubkey,
+        )
+        .await;
+
         group_id
     }
 
@@ -780,14 +877,14 @@ mod tests {
             .upsert_push_registration(
                 &account,
                 PushPlatform::Apns,
-                "token-one",
+                &"aa".repeat(32),
                 &server_pubkey,
                 Some(&relay_hint),
             )
             .await
             .unwrap();
         assert_eq!(created.platform, PushPlatform::Apns);
-        assert_eq!(created.raw_token, "token-one");
+        assert_eq!(created.raw_token, "aa".repeat(32));
         assert_eq!(created.server_pubkey, server_pubkey);
         assert_eq!(created.relay_hint, Some(relay_hint.clone()));
 
@@ -873,7 +970,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let before_count = count_published_events_for_account(&whitenoise, &admin_account).await;
         let server_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
@@ -893,6 +990,25 @@ mod tests {
         let after_count =
             wait_for_published_event_count(&whitenoise, &admin_account, before_count).await;
         assert!(after_count > before_count);
+
+        let own_leaf_index = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap()
+            .own_leaf_index(&group_id)
+            .unwrap();
+        let cached_tokens = GroupPushToken::find_by_account_and_group(
+            &admin_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_tokens
+                .iter()
+                .any(|token| token.leaf_index == own_leaf_index),
+            "local cache should include the sender's own shared token after publish"
+        );
     }
 
     #[tokio::test]
@@ -961,30 +1077,30 @@ mod tests {
             .await
             .unwrap();
 
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let before_count = count_published_events_for_account(&whitenoise, &member_account).await;
-        let member_mdk = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap();
-        let group_name = member_mdk
-            .get_group(&group_id)
-            .unwrap()
-            .expect("member should have group after welcome")
-            .name;
-
-        Whitenoise::finalize_welcome_with_instance(
-            &whitenoise,
-            &member_account,
-            &group_id,
-            &group_name,
-            EventId::all_zeros(),
-            admin_account.pubkey,
-        )
-        .await;
-
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let after_count =
             wait_for_published_event_count(&whitenoise, &member_account, before_count).await;
         assert!(after_count > before_count);
+
+        let own_leaf_index = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap()
+            .own_leaf_index(&group_id)
+            .unwrap();
+        let cached_tokens = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_tokens
+                .iter()
+                .any(|token| token.leaf_index == own_leaf_index),
+            "welcome-triggered share should update the local cache for the new group"
+        );
     }
 
     #[tokio::test]
@@ -1030,6 +1146,86 @@ mod tests {
         let expected_removal_count = expected_share_count + 2;
         wait_for_exact_published_event_count(&whitenoise, &admin_account, expected_removal_count)
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_upsert_push_registration_removes_shared_token_when_new_registration_is_unshareable()
+     {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let before_share_count =
+            count_published_events_for_account(&whitenoise, &admin_account).await;
+
+        whitenoise
+            .upsert_push_registration(
+                &admin_account,
+                PushPlatform::Apns,
+                &"55".repeat(32),
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+
+        let after_share_count =
+            wait_for_published_event_count(&whitenoise, &admin_account, before_share_count).await;
+        assert!(after_share_count > before_share_count);
+
+        let own_leaf_index = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap()
+            .own_leaf_index(&group_id)
+            .unwrap();
+        let cached_after_share = GroupPushToken::find_by_account_and_group(
+            &admin_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_after_share
+                .iter()
+                .any(|token| token.leaf_index == own_leaf_index),
+            "initial share should populate the local cache"
+        );
+
+        whitenoise
+            .upsert_push_registration(
+                &admin_account,
+                PushPlatform::Fcm,
+                "token-without-relay-hint",
+                &server_pubkey,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let after_removal_count =
+            wait_for_published_event_count(&whitenoise, &admin_account, after_share_count).await;
+        assert!(after_removal_count > after_share_count);
+
+        let cached_after_removal = GroupPushToken::find_by_account_and_group(
+            &admin_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_after_removal
+                .iter()
+                .all(|token| token.leaf_index != own_leaf_index),
+            "transitioning to an unshareable registration should remove the local cache entry"
+        );
     }
 
     #[test]
