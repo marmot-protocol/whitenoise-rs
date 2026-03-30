@@ -385,6 +385,7 @@ impl Whitenoise {
             )))
         }
     }
+
     #[perf_instrument("push_notifications")]
     pub(crate) async fn reconcile_group_push_tokens_for_active_leaves(
         &self,
@@ -511,18 +512,41 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         response: mdk_core::mip05::TokenListResponse,
     ) -> Result<()> {
+        let mut tx = self.database.pool.begin().await?;
+
         for token in response.tokens {
-            GroupPushToken::upsert(
-                &account.pubkey,
-                mls_group_id,
-                token.leaf_index,
-                &token.token_tag.server_pubkey,
-                Some(&token.token_tag.relay_hint),
-                &token.token_tag.encrypted_token.to_base64(),
-                &self.database,
+            let now = Utc::now().timestamp_millis();
+            sqlx::query(
+                "INSERT INTO group_push_tokens (
+                     account_pubkey,
+                     mls_group_id,
+                     leaf_index,
+                     server_pubkey,
+                     relay_hint,
+                     encrypted_token,
+                     created_at,
+                     updated_at
+                 )
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                     server_pubkey = excluded.server_pubkey,
+                     relay_hint = excluded.relay_hint,
+                     encrypted_token = excluded.encrypted_token,
+                     updated_at = excluded.updated_at",
             )
+            .bind(account.pubkey.to_hex())
+            .bind(mls_group_id.as_slice())
+            .bind(i64::from(token.leaf_index))
+            .bind(token.token_tag.server_pubkey.to_hex())
+            .bind(token.token_tag.relay_hint.to_string())
+            .bind(token.token_tag.encrypted_token.to_base64())
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
             .await?;
         }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -634,6 +658,8 @@ impl PushRegistration {
     fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
         match self.platform {
             PushPlatform::Apns => {
+                // iOS tokens are typically 32 raw bytes, but some app layers surface
+                // them as 64-char hex strings, so accept either representation.
                 let token_bytes = if self.raw_token.len() == 64 {
                     hex::decode(&self.raw_token).map_err(|error| {
                         WhitenoiseError::InvalidInput(format!(
@@ -664,8 +690,9 @@ mod tests {
     use crate::whitenoise::{
         relays::Relay,
         test_utils::{
-            create_mock_whitenoise, create_nostr_group_config_data, setup_multiple_test_accounts,
-            wait_for_key_package_publication,
+            count_published_events_for_account, create_mock_whitenoise,
+            create_nostr_group_config_data, setup_multiple_test_accounts,
+            wait_for_key_package_publication, wait_for_published_event_count,
         },
     };
 
@@ -715,38 +742,6 @@ mod tests {
             .expect("member should process welcome successfully");
 
         group_id
-    }
-
-    async fn wait_for_published_event_count(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        previous_count: usize,
-    ) -> usize {
-        for _ in 0..20 {
-            let new_count = count_published_events_for_account(whitenoise, account).await;
-            if new_count > previous_count {
-                return new_count;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        panic!("timed out waiting for new published event");
-    }
-
-    async fn count_published_events_for_account(
-        whitenoise: &Whitenoise,
-        account: &Account,
-    ) -> usize {
-        let account_id = account.id.expect("account must be persisted");
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_one(&whitenoise.database.pool)
-                .await
-                .unwrap();
-
-        usize::try_from(count.0).unwrap()
     }
 
     async fn wait_for_exact_published_event_count(

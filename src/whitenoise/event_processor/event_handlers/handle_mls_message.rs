@@ -1787,38 +1787,6 @@ mod tests {
         group_id
     }
 
-    async fn wait_for_published_event_count(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        previous_count: usize,
-    ) -> usize {
-        for _ in 0..20 {
-            let new_count = count_published_events_for_account(whitenoise, account).await;
-            if new_count > previous_count {
-                return new_count;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        panic!("timed out waiting for new published event");
-    }
-
-    async fn count_published_events_for_account(
-        whitenoise: &Whitenoise,
-        account: &Account,
-    ) -> usize {
-        let account_id = account.id.expect("account must be persisted");
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_one(&whitenoise.database.pool)
-                .await
-                .unwrap();
-
-        usize::try_from(count.0).unwrap()
-    }
-
     /// Test that auto-committed proposals (e.g., admin auto-commits a
     /// member's self-removal) are published and merged successfully.
     #[tokio::test]
