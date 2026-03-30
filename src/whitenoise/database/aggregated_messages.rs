@@ -380,71 +380,51 @@ impl AggregatedMessage {
         //
         // The unread count uses the same timestamp-subquery logic as
         // `count_unread_for_group`: messages whose `created_at` is strictly after
-        // the read marker's `created_at` are considered unread.  When there is no
-        // read marker every non-deleted kind-9 message is unread.
-        let rows: Vec<AggregatedMessageRow> = match read_marker {
-            Some(marker_id) => {
-                sqlx::query_as(
-                    "WITH unread_count AS (
-                       SELECT COUNT(*) AS cnt
-                       FROM aggregated_messages
-                       WHERE mls_group_id = ?
-                         AND kind = 9
-                         AND deletion_event_id IS NULL
-                         AND created_at > COALESCE(
-                           (SELECT created_at FROM aggregated_messages
-                            WHERE message_id = ? AND mls_group_id = ?),
-                           0
-                         )
-                     )
-                     SELECT am.*, mds.status AS delivery_status
-                     FROM aggregated_messages am
-                     LEFT JOIN message_delivery_status mds
-                       ON am.message_id = mds.message_id
-                      AND am.mls_group_id = mds.mls_group_id
-                     WHERE am.kind = 9
-                       AND am.mls_group_id = ?
-                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-                     ORDER BY am.created_at DESC, am.message_id DESC
-                     LIMIT MAX((SELECT cnt FROM unread_count), ?)",
-                )
-                .bind(group_id.as_slice()) // unread CTE: mls_group_id
-                .bind(marker_id.to_hex()) // unread CTE: read marker message_id
-                .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
-                .bind(group_id.as_slice()) // outer SELECT: mls_group_id
-                .bind(minimum_val) // MAX(cnt, minimum)
-                .fetch_all(&database.pool)
-                .await?
-            }
-            None => {
-                // No read marker: every non-deleted kind-9 message is unread.
-                // The effective limit is MAX(total_count, minimum).
-                sqlx::query_as(
-                    "WITH unread_count AS (
-                       SELECT COUNT(*) AS cnt
-                       FROM aggregated_messages
-                       WHERE mls_group_id = ?
-                         AND kind = 9
-                         AND deletion_event_id IS NULL
-                     )
-                     SELECT am.*, mds.status AS delivery_status
-                     FROM aggregated_messages am
-                     LEFT JOIN message_delivery_status mds
-                       ON am.message_id = mds.message_id
-                      AND am.mls_group_id = mds.mls_group_id
-                     WHERE am.kind = 9
-                       AND am.mls_group_id = ?
-                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-                     ORDER BY am.created_at DESC, am.message_id DESC
-                     LIMIT MAX((SELECT cnt FROM unread_count), ?)",
-                )
-                .bind(group_id.as_slice()) // unread CTE: mls_group_id
-                .bind(group_id.as_slice()) // outer SELECT: mls_group_id
-                .bind(minimum_val) // MAX(cnt, minimum)
-                .fetch_all(&database.pool)
-                .await?
-            }
-        };
+        // the read marker's `created_at` are considered unread.  When `marker_hex`
+        // is NULL (no read marker), the COALESCE falls back to 0 and every
+        // non-deleted kind-9 message is treated as unread.
+        //
+        // Both the CTE and the outer SELECT apply identical visibility rules
+        // (kind = 9, deletion_event_id IS NULL, Retried excluded) so the count and
+        // the returned rows are always in sync.
+        let marker_hex = read_marker.map(EventId::to_hex);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "WITH unread_count AS (
+               SELECT COUNT(*) AS cnt
+               FROM aggregated_messages am
+               LEFT JOIN message_delivery_status mds
+                 ON am.message_id = mds.message_id
+                AND am.mls_group_id = mds.mls_group_id
+               WHERE am.mls_group_id = ?
+                 AND am.kind = 9
+                 AND am.deletion_event_id IS NULL
+                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                 AND am.created_at > COALESCE(
+                   (SELECT created_at FROM aggregated_messages
+                    WHERE message_id = ? AND mls_group_id = ?),
+                   0
+                 )
+             )
+             SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id
+              AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9
+               AND am.mls_group_id = ?
+               AND am.deletion_event_id IS NULL
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             ORDER BY am.created_at DESC, am.message_id DESC
+             LIMIT MAX((SELECT cnt FROM unread_count), ?)",
+        )
+        .bind(group_id.as_slice()) // unread CTE: mls_group_id
+        .bind(marker_hex.as_deref()) // unread CTE: read marker message_id (NULL = no marker)
+        .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
+        .bind(group_id.as_slice()) // outer SELECT: mls_group_id
+        .bind(minimum_val) // MAX(cnt, minimum)
+        .fetch_all(&database.pool)
+        .await?;
 
         let mut messages: Vec<ChatMessage> = rows
             .into_iter()

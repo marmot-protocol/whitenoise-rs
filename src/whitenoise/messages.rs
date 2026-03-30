@@ -696,14 +696,9 @@ impl Whitenoise {
         group_id: &GroupId,
         minimum: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
-        Account::find_by_pubkey(pubkey, &self.database).await?;
+        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
 
-        let read_marker = self
-            .get_last_read_message_id(
-                &Account::find_by_pubkey(pubkey, &self.database).await?,
-                group_id,
-            )
-            .await?;
+        let read_marker = self.get_last_read_message_id(&account, group_id).await?;
 
         let minimum_val = minimum.unwrap_or(50);
 
