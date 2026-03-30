@@ -197,17 +197,25 @@ impl Whitenoise {
             ]);
 
             let batch_result = if let Some(cancel_rx) = cancel_rx.as_mut() {
-                tokio::select! {
-                    result = whitenoise
-                        .relay_control
-                        .discovery()
-                        .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT) => Some(result),
-                    _ = cancel_rx.changed() => {
-                        tracing::debug!(
-                            target: "whitenoise::handle_contact_list",
-                            "Discovery catch-up cancelled, stopping"
-                        );
-                        None
+                if *cancel_rx.borrow() {
+                    tracing::debug!(
+                        target: "whitenoise::handle_contact_list",
+                        "Discovery catch-up cancelled, stopping"
+                    );
+                    None
+                } else {
+                    tokio::select! {
+                        result = whitenoise
+                            .relay_control
+                            .discovery()
+                            .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT) => Some(result),
+                        _ = cancel_rx.changed() => {
+                            tracing::debug!(
+                                target: "whitenoise::handle_contact_list",
+                                "Discovery catch-up cancelled, stopping"
+                            );
+                            None
+                        }
                     }
                 }
             } else {
