@@ -53,7 +53,7 @@ pub use whitenoise::account_settings::AccountSettings;
 pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
 
 // Groups and relays
-pub use whitenoise::accounts_groups::{AccountGroup, MUTE_FOREVER, MuteDuration};
+pub use whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 pub use whitenoise::group_information::{GroupInformation, GroupType};
 pub use whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use whitenoise::relays::{Relay, RelayType};

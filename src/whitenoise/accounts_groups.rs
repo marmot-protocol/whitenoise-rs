@@ -48,7 +48,7 @@ pub struct AccountGroup {
     pub removed_at: Option<DateTime<Utc>>,
     /// When this chat's mute expires.
     /// - `None` = not muted (notifications enabled)
-    /// - `Some(timestamp)` = muted until that time; use [`MUTE_FOREVER`] for
+    /// - `Some(timestamp)` = muted until that time; use `MUTE_FOREVER` for
     ///   "always muted until manually unmuted"
     pub muted_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -57,7 +57,7 @@ pub struct AccountGroup {
 
 /// Sentinel timestamp representing "muted forever" (9999-12-31T23:59:59Z).
 /// Use this instead of crafting ad-hoc far-future timestamps.
-pub const MUTE_FOREVER: DateTime<Utc> = {
+pub(crate) const MUTE_FOREVER: DateTime<Utc> = {
     match DateTime::<Utc>::from_timestamp(253_402_300_799, 0) {
         Some(dt) => dt,
         None => unreachable!(),
