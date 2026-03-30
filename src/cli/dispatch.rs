@@ -1278,8 +1278,7 @@ async fn mute_chat(
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
-    let until = duration.to_expiry();
-    wn.mute_chat(&account, &group_id, until)
+    wn.mute_chat(&account, &group_id, duration)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))

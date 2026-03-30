@@ -1,4 +1,7 @@
-use chrono::{DateTime, Utc};
+use std::fmt;
+use std::str::FromStr;
+
+use chrono::{DateTime, Duration, Utc};
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,75 @@ pub const MUTE_FOREVER: DateTime<Utc> = {
         None => unreachable!(),
     }
 };
+
+/// Mute duration for [`Whitenoise::mute_chat`].
+///
+/// Use a preset variant for common durations or [`MuteDuration::Custom`] for an
+/// arbitrary expiry timestamp. All variants resolve to a future [`DateTime<Utc>`]
+/// via [`MuteDuration::to_expiry`]. Use [`MuteDuration::Forever`] to mute until
+/// the user manually unmutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MuteDuration {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "8h")]
+    EightHours,
+    #[serde(rename = "1d", alias = "24h", alias = "one_day")]
+    OneDay,
+    #[serde(rename = "1w", alias = "7d", alias = "one_week")]
+    OneWeek,
+    #[serde(rename = "forever")]
+    Forever,
+    /// Arbitrary expiry timestamp for callers that need a duration not covered
+    /// by the preset variants. The timestamp must be in the future; [`Whitenoise::mute_chat`]
+    /// will return [`WhitenoiseError::InvalidInput`] if it is not.
+    #[serde(rename = "custom")]
+    Custom(DateTime<Utc>),
+}
+
+impl MuteDuration {
+    /// Converts this duration into an absolute [`DateTime<Utc>`] expiry timestamp.
+    pub fn to_expiry(self) -> DateTime<Utc> {
+        match self {
+            Self::OneHour => Utc::now() + Duration::hours(1),
+            Self::EightHours => Utc::now() + Duration::hours(8),
+            Self::OneDay => Utc::now() + Duration::days(1),
+            Self::OneWeek => Utc::now() + Duration::weeks(1),
+            Self::Forever => MUTE_FOREVER,
+            Self::Custom(until) => until,
+        }
+    }
+}
+
+impl FromStr for MuteDuration {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "1h" => Ok(Self::OneHour),
+            "8h" => Ok(Self::EightHours),
+            "1d" | "24h" | "one_day" => Ok(Self::OneDay),
+            "1w" | "7d" | "one_week" => Ok(Self::OneWeek),
+            "forever" => Ok(Self::Forever),
+            _ => Err(format!(
+                "invalid mute duration '{s}': expected 1h, 8h, 1d, 1w, forever, or a custom timestamp"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for MuteDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OneHour => write!(f, "1h"),
+            Self::EightHours => write!(f, "8h"),
+            Self::OneDay => write!(f, "1d"),
+            Self::OneWeek => write!(f, "1w"),
+            Self::Forever => write!(f, "forever"),
+            Self::Custom(until) => write!(f, "custom({})", until.to_rfc3339()),
+        }
+    }
+}
 
 impl AccountGroup {
     /// Returns true if this group should be visible to the user.
@@ -435,17 +507,20 @@ impl Whitenoise {
         Ok(updated)
     }
 
-    /// Mutes a chat for the given account until the specified time.
+    /// Mutes a chat for the given account for the specified duration.
     ///
-    /// Returns `InvalidInput` if `until` is in the past. Re-muting with a
-    /// different duration always overwrites the previous `muted_until` value.
+    /// Re-muting with a different duration always overwrites the previous
+    /// `muted_until` value. Use [`MuteDuration::Forever`] to mute indefinitely.
+    /// Returns [`WhitenoiseError::InvalidInput`] if [`MuteDuration::Custom`] carries
+    /// a timestamp that is not in the future.
     #[perf_instrument("account_groups")]
     pub async fn mute_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
-        until: DateTime<Utc>,
+        duration: MuteDuration,
     ) -> Result<AccountGroup, WhitenoiseError> {
+        let until = duration.to_expiry();
         if until <= Utc::now() {
             return Err(WhitenoiseError::InvalidInput(
                 "mute_chat: `until` must be in the future".to_string(),
@@ -1574,18 +1649,20 @@ mod tests {
             .await
             .unwrap();
 
-        let until = Utc::now() + chrono::Duration::hours(1);
         let muted = whitenoise
-            .mute_chat(&account, &group_id, until)
+            .mute_chat(&account, &group_id, MuteDuration::OneHour)
             .await
             .unwrap();
 
         assert!(muted.is_muted());
         assert!(!muted.is_muted_forever());
-        // Compare at millisecond precision — SQLite stores timestamps as integer ms
-        assert_eq!(
-            muted.muted_until.map(|t| t.timestamp_millis()),
-            Some(until.timestamp_millis())
+        // muted_until should be approximately 1 hour from now
+        let expected_min = Utc::now() + Duration::minutes(59);
+        let expected_max = Utc::now() + Duration::minutes(61);
+        let stored = muted.muted_until.unwrap();
+        assert!(
+            stored >= expected_min && stored <= expected_max,
+            "muted_until should be ~1h from now"
         );
     }
 
@@ -1601,7 +1678,7 @@ mod tests {
             .unwrap();
 
         let muted = whitenoise
-            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .mute_chat(&account, &group_id, MuteDuration::Forever)
             .await
             .unwrap();
 
@@ -1623,7 +1700,7 @@ mod tests {
 
         // Mute first
         whitenoise
-            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .mute_chat(&account, &group_id, MuteDuration::Forever)
             .await
             .unwrap();
 
@@ -1665,23 +1742,24 @@ mod tests {
             .unwrap();
 
         // Mute for 1 hour
-        let first_until = Utc::now() + chrono::Duration::hours(1);
         whitenoise
-            .mute_chat(&account, &group_id, first_until)
+            .mute_chat(&account, &group_id, MuteDuration::OneHour)
             .await
             .unwrap();
 
         // Re-mute for 1 week — must overwrite, not be a no-op
-        let second_until = Utc::now() + chrono::Duration::weeks(1);
         let remuted = whitenoise
-            .mute_chat(&account, &group_id, second_until)
+            .mute_chat(&account, &group_id, MuteDuration::OneWeek)
             .await
             .unwrap();
 
-        // Compare at millisecond precision — SQLite stores timestamps as integer ms
-        assert_eq!(
-            remuted.muted_until.map(|t| t.timestamp_millis()),
-            Some(second_until.timestamp_millis())
+        // muted_until should be approximately 1 week from now
+        let expected_min = Utc::now() + Duration::days(6);
+        let expected_max = Utc::now() + Duration::days(8);
+        let stored = remuted.muted_until.unwrap();
+        assert!(
+            stored >= expected_min && stored <= expected_max,
+            "re-mute must overwrite with ~1 week expiry"
         );
     }
 
@@ -1718,7 +1796,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[117; 32]);
 
         let result = whitenoise
-            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .mute_chat(&account, &group_id, MuteDuration::Forever)
             .await;
 
         assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
@@ -1736,7 +1814,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mute_chat_rejects_past_timestamp() {
+    async fn test_mute_chat_custom_future_timestamp() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[131; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let until = Utc::now() + chrono::Duration::days(3);
+        let muted = whitenoise
+            .mute_chat(&account, &group_id, MuteDuration::Custom(until))
+            .await
+            .unwrap();
+
+        assert!(muted.is_muted());
+        assert!(!muted.is_muted_forever());
+        assert_eq!(
+            muted.muted_until.map(|t| t.timestamp_millis()),
+            Some(until.timestamp_millis())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mute_chat_rejects_past_custom_timestamp() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[130; 32]);
@@ -1747,11 +1850,13 @@ mod tests {
             .unwrap();
 
         let past = Utc::now() - chrono::Duration::hours(1);
-        let result = whitenoise.mute_chat(&account, &group_id, past).await;
+        let result = whitenoise
+            .mute_chat(&account, &group_id, MuteDuration::Custom(past))
+            .await;
 
         assert!(
             matches!(result, Err(WhitenoiseError::InvalidInput(_))),
-            "mute_chat should reject past timestamps"
+            "mute_chat should reject a Custom timestamp in the past"
         );
     }
 
@@ -1768,7 +1873,7 @@ mod tests {
 
         // Mute the chat
         whitenoise
-            .mute_chat(&account, &group_id, MUTE_FOREVER)
+            .mute_chat(&account, &group_id, MuteDuration::Forever)
             .await
             .unwrap();
 
@@ -1873,7 +1978,6 @@ mod tests {
 
         // One expired (set via DB layer), one forever, one future
         let past = Utc::now() - chrono::Duration::seconds(10);
-        let future = Utc::now() + chrono::Duration::hours(1);
         let expired_ag = AccountGroup::get(&whitenoise, &account.pubkey, &expired_group)
             .await
             .unwrap()
@@ -1883,11 +1987,11 @@ mod tests {
             .await
             .unwrap();
         whitenoise
-            .mute_chat(&account, &forever_group, MUTE_FOREVER)
+            .mute_chat(&account, &forever_group, MuteDuration::Forever)
             .await
             .unwrap();
         whitenoise
-            .mute_chat(&account, &future_group, future)
+            .mute_chat(&account, &future_group, MuteDuration::OneHour)
             .await
             .unwrap();
 

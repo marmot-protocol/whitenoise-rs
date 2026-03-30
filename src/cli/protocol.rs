@@ -1,68 +1,8 @@
 use std::fmt;
-use std::str::FromStr;
 
-use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::whitenoise::accounts_groups::MUTE_FOREVER;
-
-/// Mute duration for the `mute_chat` CLI command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MuteDuration {
-    #[serde(rename = "1h")]
-    OneHour,
-    #[serde(rename = "8h")]
-    EightHours,
-    #[serde(rename = "1d", alias = "24h", alias = "one_day")]
-    OneDay,
-    #[serde(rename = "1w", alias = "7d", alias = "one_week")]
-    OneWeek,
-    #[serde(rename = "forever")]
-    Forever,
-}
-
-impl MuteDuration {
-    /// Converts this duration into an absolute `DateTime<Utc>` expiry timestamp.
-    pub fn to_expiry(self) -> DateTime<Utc> {
-        match self {
-            Self::OneHour => Utc::now() + Duration::hours(1),
-            Self::EightHours => Utc::now() + Duration::hours(8),
-            Self::OneDay => Utc::now() + Duration::days(1),
-            Self::OneWeek => Utc::now() + Duration::weeks(1),
-            Self::Forever => MUTE_FOREVER,
-        }
-    }
-}
-
-impl FromStr for MuteDuration {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "1h" => Ok(Self::OneHour),
-            "8h" => Ok(Self::EightHours),
-            "1d" | "24h" | "one_day" => Ok(Self::OneDay),
-            "1w" | "7d" | "one_week" => Ok(Self::OneWeek),
-            "forever" => Ok(Self::Forever),
-            _ => Err(format!(
-                "invalid mute duration '{}': expected 1h, 8h, 1d, 1w, or forever",
-                s
-            )),
-        }
-    }
-}
-
-impl fmt::Display for MuteDuration {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OneHour => write!(f, "1h"),
-            Self::EightHours => write!(f, "8h"),
-            Self::OneDay => write!(f, "1d"),
-            Self::OneWeek => write!(f, "1w"),
-            Self::Forever => write!(f, "forever"),
-        }
-    }
-}
+pub use crate::whitenoise::accounts_groups::MuteDuration;
 
 /// A request from the CLI client to the daemon.
 ///
@@ -450,7 +390,10 @@ impl Response {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+
     use super::*;
+    use crate::whitenoise::accounts_groups::MUTE_FOREVER;
     use serde_json::json;
 
     /// Unit variants must serialize without a "params" key.
@@ -1730,5 +1673,29 @@ mod tests {
 
         assert!(expiry > before);
         assert!(expiry < after);
+    }
+
+    #[test]
+    fn mute_duration_to_expiry_custom_returns_inner_value() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let expiry = MuteDuration::Custom(custom_time).to_expiry();
+        assert_eq!(expiry, custom_time);
+    }
+
+    #[test]
+    fn mute_duration_display_custom() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let display = MuteDuration::Custom(custom_time).to_string();
+        assert!(display.starts_with("custom("));
+        assert!(display.ends_with(')'));
+    }
+
+    #[test]
+    fn mute_duration_serde_custom_roundtrip() {
+        let custom_time = Utc::now() + Duration::days(3);
+        let duration = MuteDuration::Custom(custom_time);
+        let serialized = serde_json::to_string(&duration).unwrap();
+        let deserialized: MuteDuration = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(duration, deserialized);
     }
 }
