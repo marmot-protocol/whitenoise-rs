@@ -137,6 +137,16 @@ impl Whitenoise {
         relay_hint: Option<&RelayUrl>,
     ) -> Result<PushRegistration> {
         validate_raw_token(raw_token)?;
+        let pending_registration = PushRegistration {
+            account_pubkey: account.pubkey,
+            platform,
+            raw_token: raw_token.to_string(),
+            server_pubkey: *server_pubkey,
+            relay_hint: relay_hint.cloned(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_shared_at: None,
+        };
         let previous_token_tag = self
             .push_registration(account)
             .await?
@@ -144,6 +154,7 @@ impl Whitenoise {
             .map(PushRegistration::token_tag)
             .transpose()?
             .flatten();
+        let new_token_tag = pending_registration.token_tag()?;
 
         let registration = PushRegistration::upsert(
             &account.pubkey,
@@ -154,8 +165,6 @@ impl Whitenoise {
             &self.database,
         )
         .await?;
-
-        let new_token_tag = registration.token_tag()?;
 
         if previous_token_tag.is_some() && new_token_tag.is_none() {
             if let Err(error) = self
@@ -557,9 +566,16 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         response: mdk_core::mip05::TokenListResponse,
     ) -> Result<()> {
+        let active_leaf_map = self
+            .create_mdk_for_account(account.pubkey)?
+            .group_leaf_map(mls_group_id)?;
         let mut tx = self.database.pool.begin().await?;
 
         for token in response.tokens {
+            if !active_leaf_map.contains_key(&token.leaf_index) {
+                continue;
+            }
+
             let now = Utc::now().timestamp_millis();
             sqlx::query(
                 "INSERT INTO group_push_tokens (
@@ -721,11 +737,11 @@ fn validate_raw_token(raw_token: &str) -> Result<()> {
 
 impl PushRegistration {
     fn token_tag(&self) -> Result<Option<TokenTag>> {
+        let plaintext = self.push_token_plaintext()?;
         let Some(relay_hint) = self.relay_hint.clone() else {
             return Ok(None);
         };
 
-        let plaintext = self.push_token_plaintext()?;
         let encrypted_token = encrypt_push_token(&self.server_pubkey, &plaintext)?;
 
         Ok(Some(TokenTag {
@@ -928,7 +944,7 @@ mod tests {
         whitenoise
             .upsert_push_registration(
                 &account,
-                PushPlatform::Apns,
+                PushPlatform::Fcm,
                 "device-token",
                 &server_pubkey,
                 None,

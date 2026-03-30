@@ -1403,6 +1403,7 @@ mod tests {
 
         let leaf_zero = make_token_tag(2);
         let leaf_one = make_token_tag(3);
+        let inactive_leaf = make_token_tag(9);
         let response = build_token_list_response_rumor(
             admin_account.pubkey,
             Timestamp::now(),
@@ -1415,6 +1416,10 @@ mod tests {
                 LeafTokenTag {
                     token_tag: leaf_one.clone(),
                     leaf_index: 1,
+                },
+                LeafTokenTag {
+                    token_tag: inactive_leaf,
+                    leaf_index: 99,
                 },
             ],
         )
