@@ -46,38 +46,53 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             kp_relays.len()
         );
 
-        // Delete any existing key packages to start with a clean slate
+        // `create_identity()` publishes the initial key package in a background
+        // task when running against the real singleton used by integration tests.
+        // Wait for that publish to land before trying to clean the relays.
+        let initially_published = wait_for_key_packages(
+            context,
+            &account,
+            "initial key package publication after account creation",
+            |packages| !packages.is_empty(),
+        )
+        .await?;
+        tracing::info!(
+            "✓ Initial account setup published {} key package(s)",
+            initially_published.len()
+        );
+
+        // Delete any existing key packages to start with a clean slate.
         let deleted = context
             .whitenoise
             .delete_all_key_packages_for_account(&account, true)
             .await?;
         tracing::info!("✓ Deleted {} existing key package(s)", deleted);
 
-        // Wait for relays to process deletions
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        let before_count = context
-            .whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await?
-            .len();
-        assert_eq!(before_count, 0, "Should have 0 key packages after deletion");
+        let before_delete = wait_for_key_packages(
+            context,
+            &account,
+            "key package relays to be empty after deletion",
+            |packages| packages.is_empty(),
+        )
+        .await?;
+        assert_eq!(
+            before_delete.len(),
+            0,
+            "Should have 0 key packages after deletion"
+        );
         tracing::info!("✓ Verified 0 key packages exist");
 
         // Run maintenance
         let task = KeyPackageMaintenance;
         task.execute(context.whitenoise).await?;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        let after_publish = context
-            .whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await?;
-        assert!(
-            !after_publish.is_empty(),
-            "Should have at least one key package after maintenance"
-        );
+        let after_publish = wait_for_key_packages(
+            context,
+            &account,
+            "maintenance to publish a replacement key package",
+            |packages| !packages.is_empty(),
+        )
+        .await?;
         tracing::info!(
             "✓ Key package maintenance published {} key package(s)",
             after_publish.len()
@@ -88,7 +103,13 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             .whitenoise
             .delete_all_key_packages_for_account(&account, true)
             .await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        wait_for_key_packages(
+            context,
+            &account,
+            "key package relays to be empty before publishing an expired package",
+            |packages| packages.is_empty(),
+        )
+        .await?;
 
         // Publish a backdated key package (31 days old)
         let expired_event_id =
@@ -98,13 +119,14 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             expired_event_id.to_hex()
         );
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         // Verify we have exactly 1 expired key package
-        let before_rotate = context
-            .whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await?;
+        let before_rotate = wait_for_key_packages(
+            context,
+            &account,
+            "the expired key package to be the only package before rotation",
+            |packages| packages.len() == 1 && packages[0].id == expired_event_id,
+        )
+        .await?;
         assert_eq!(
             before_rotate.len(),
             1,
@@ -119,13 +141,14 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         // Run maintenance - should publish new and delete expired
         task.execute(context.whitenoise).await?;
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
         // Verify rotation: old one deleted, new one published
-        let after_rotate = context
-            .whitenoise
-            .fetch_all_key_packages_for_account(&account)
-            .await?;
+        let after_rotate = wait_for_key_packages(
+            context,
+            &account,
+            "expired key package rotation to complete",
+            |packages| !packages.is_empty() && packages.iter().all(|e| e.id != expired_event_id),
+        )
+        .await?;
 
         // Should have at least 1 key package (the new one)
         assert!(
@@ -147,6 +170,44 @@ impl TestCase for KeyPackageMaintenanceTestCase {
 
         Ok(())
     }
+}
+
+async fn wait_for_key_packages<F>(
+    context: &ScenarioContext,
+    account: &crate::Account,
+    description: &str,
+    predicate: F,
+) -> Result<Vec<Event>, WhitenoiseError>
+where
+    F: Fn(&[Event]) -> bool + Copy,
+{
+    let whitenoise = context.whitenoise;
+    let account = account.clone();
+
+    retry(
+        50,
+        Duration::from_millis(100),
+        || {
+            let account = account.clone();
+            async move {
+                let key_packages = whitenoise
+                    .fetch_all_key_packages_for_account(&account)
+                    .await?;
+
+                if predicate(&key_packages) {
+                    Ok(key_packages)
+                } else {
+                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Observed {} key package(s) while waiting for {}",
+                        key_packages.len(),
+                        description,
+                    )))
+                }
+            }
+        },
+        description,
+    )
+    .await
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.
