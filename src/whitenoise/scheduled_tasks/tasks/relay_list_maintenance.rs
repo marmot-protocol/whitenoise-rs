@@ -268,6 +268,31 @@ mod tests {
     use super::*;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
 
+    async fn wait_for_relay_list_on_network(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        relay_type: RelayType,
+        source_urls: &[nostr_sdk::RelayUrl],
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        loop {
+            match whitenoise
+                .relay_control
+                .fetch_user_relays(account.pubkey, relay_type, source_urls)
+                .await
+            {
+                Ok(Some(_)) => return true,
+                Ok(None) | Err(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_task_properties() {
         let task = RelayListMaintenance;
@@ -363,23 +388,20 @@ mod tests {
         // Verify relay lists are discoverable on the network before maintenance
         let nip65_urls = Relay::urls(&account.nip65_relays(whitenoise).await.unwrap());
 
-        let inbox_before = whitenoise
-            .relay_control
-            .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_urls)
-            .await
-            .unwrap();
         assert!(
-            inbox_before.is_some(),
+            wait_for_relay_list_on_network(whitenoise, &account, RelayType::Inbox, &nip65_urls)
+                .await,
             "Inbox relay list should be on network before maintenance"
         );
 
-        let kp_before = whitenoise
-            .relay_control
-            .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_urls)
-            .await
-            .unwrap();
         assert!(
-            kp_before.is_some(),
+            wait_for_relay_list_on_network(
+                whitenoise,
+                &account,
+                RelayType::KeyPackage,
+                &nip65_urls,
+            )
+            .await,
             "Key package relay list should be on network before maintenance"
         );
 

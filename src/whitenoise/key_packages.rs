@@ -153,52 +153,6 @@ pub(crate) fn filter_key_package_events_for_account(
 }
 
 impl Whitenoise {
-    /// Filters key package events to only include those that can be parsed by the local MDK.
-    ///
-    /// This serves as a proxy for "ownership" filtering: if a key package can be successfully
-    /// parsed by our MDK instance (which validates the encoding tag, ciphersuite, extensions,
-    /// and identity binding), it is compatible with this app. Packages from other Marmot apps
-    /// using different MDK versions or configurations will fail parsing and be excluded.
-    ///
-    /// Note: This does NOT verify that the private key material exists in local MLS storage,
-    /// so in a multi-device scenario using the same MDK version, packages from other devices
-    /// may still pass this filter. Full device-level ownership verification would require
-    /// checking the OpenMLS key package storage, which is not currently exposed by the MDK.
-    pub(crate) fn filter_locally_parseable_key_packages(
-        &self,
-        account: &Account,
-        packages: Vec<Event>,
-    ) -> Vec<Event> {
-        let mdk = match self.create_mdk_for_account(account.pubkey) {
-            Ok(mdk) => mdk,
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::key_packages",
-                    "Failed to create MDK for account {}, skipping all packages: {}",
-                    account.pubkey.to_hex(),
-                    e
-                );
-                return Vec::new();
-            }
-        };
-
-        packages
-            .into_iter()
-            .filter(|event| match mdk.parse_key_package(event) {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "whitenoise::key_packages",
-                        "Key package {} not parseable by local MDK (skipping): {}",
-                        event.id,
-                        e
-                    );
-                    false
-                }
-            })
-            .collect()
-    }
-
     /// Helper method to create and encode a key package for the given account.
     ///
     /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
@@ -1040,6 +994,23 @@ impl Whitenoise {
         event_id: &str,
     ) -> Result<Option<PublishedKeyPackage>> {
         PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.database)
+            .await
+            .map_err(|e| WhitenoiseError::Other(e.into()))
+    }
+
+    /// Records a published key package in the lifecycle tracking table.
+    ///
+    /// Integration-test helper for cases that manually publish custom key
+    /// package events (for example with a backdated timestamp) and still need
+    /// maintenance to treat them as locally-owned packages.
+    #[cfg(feature = "integration-tests")]
+    pub async fn track_published_key_package_for_testing(
+        &self,
+        account_pubkey: &nostr_sdk::PublicKey,
+        hash_ref: &[u8],
+        event_id: &str,
+    ) -> Result<()> {
+        PublishedKeyPackage::create(account_pubkey, hash_ref, event_id, &self.database)
             .await
             .map_err(|e| WhitenoiseError::Other(e.into()))
     }

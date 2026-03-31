@@ -218,7 +218,7 @@ async fn publish_backdated_key_package(
     days_old: u64,
 ) -> Result<EventId, WhitenoiseError> {
     // Get the encoded key package and tags
-    let (encoded_key_package, tags, _hash_ref) = context
+    let (encoded_key_package, tags, hash_ref) = context
         .whitenoise
         .encoded_key_package(account, relays)
         .await?;
@@ -245,6 +245,11 @@ async fn publish_backdated_key_package(
     let client = create_test_client(&relay_urls, keys).await?;
     client.send_event(&event).await?;
     client.disconnect().await;
+
+    context
+        .whitenoise
+        .track_published_key_package_for_testing(&account.pubkey, &hash_ref, &event_id.to_hex())
+        .await?;
 
     tracing::debug!(
         "Published backdated key package {} ({}d old)",

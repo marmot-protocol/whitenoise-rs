@@ -17,6 +17,22 @@ use crate::whitenoise::{Whitenoise, WhitenoiseError};
 use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
+    fn replace_background_task_cancellation_channel(&self, account_pubkey: PublicKey) {
+        let (cancel_tx, _) = watch::channel(false);
+        let previous_cancel_tx = self
+            .background_task_cancellation
+            .insert(account_pubkey, cancel_tx);
+
+        if let Some(previous_cancel_tx) = previous_cancel_tx {
+            let _ = previous_cancel_tx.send(true);
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                account_pubkey = %account_pubkey,
+                "Replaced background-task cancellation channel and cancelled prior tasks",
+            );
+        }
+    }
+
     fn ensure_background_task_cancellation_channel(&self, account_pubkey: PublicKey) {
         match self.background_task_cancellation.entry(account_pubkey) {
             Entry::Occupied(_) => {}
@@ -57,12 +73,7 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
-        // Create a fresh cancellation channel for this account's background tasks.
-        // Any previous channel (from a prior login) is replaced, which also drops
-        // any stale receivers.
-        let (cancel_tx, _) = tokio::sync::watch::channel(false);
-        self.background_task_cancellation
-            .insert(account.pubkey, cancel_tx);
+        self.replace_background_task_cancellation_channel(account.pubkey);
 
         self.discovery_sync_worker.request_rebuild();
 
@@ -94,9 +105,7 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
-        let (cancel_tx, _) = tokio::sync::watch::channel(false);
-        self.background_task_cancellation
-            .insert(account.pubkey, cancel_tx);
+        self.replace_background_task_cancellation_channel(account.pubkey);
 
         self.discovery_sync_worker.request_rebuild();
 
@@ -1041,6 +1050,40 @@ mod tests {
         assert!(
             *cancel_rx.borrow(),
             "existing cancellation channel should not be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replace_background_task_cancellation_channel_cancels_existing_channel() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account_pubkey = Keys::generate().public_key();
+        let (existing_cancel_tx, _) = watch::channel(false);
+        let mut existing_cancel_rx = existing_cancel_tx.subscribe();
+
+        whitenoise
+            .background_task_cancellation
+            .insert(account_pubkey, existing_cancel_tx);
+
+        whitenoise.replace_background_task_cancellation_channel(account_pubkey);
+
+        existing_cancel_rx
+            .changed()
+            .await
+            .expect("existing receiver should observe cancellation");
+        assert!(
+            *existing_cancel_rx.borrow_and_update(),
+            "previous cancellation channel should be signalled before replacement"
+        );
+
+        let cancel_tx = whitenoise
+            .background_task_cancellation
+            .get(&account_pubkey)
+            .expect("missing replacement cancellation channel");
+        let cancel_rx = cancel_tx.subscribe();
+
+        assert!(
+            !*cancel_rx.borrow(),
+            "replacement cancellation channel should start in the non-cancelled state"
         );
     }
 

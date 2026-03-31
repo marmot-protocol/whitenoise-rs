@@ -178,6 +178,7 @@ impl Whitenoise {
             dm_peer_pubkey,
             archived_at: None,
             removed_at: None,
+            muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
