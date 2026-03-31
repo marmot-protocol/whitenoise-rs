@@ -117,6 +117,13 @@ pub enum GroupsCmd {
         /// Admin pubkey (npub or hex) to demote
         pubkey: String,
     },
+
+    /// Step down as admin (required before leaving if you are an admin)
+    #[clap(name = "self-demote")]
+    SelfDemote {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
 }
 
 impl GroupsCmd {
@@ -155,6 +162,9 @@ impl GroupsCmd {
             }
             Self::Demote { group_id, pubkey } => {
                 demote(socket, json, account_flag, group_id, pubkey).await
+            }
+            Self::SelfDemote { group_id } => {
+                self_demote(socket, json, account_flag, group_id).await
             }
         }
     }
@@ -414,6 +424,24 @@ async fn demote(
             account,
             group_id,
             pubkey,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn self_demote(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::SelfDemote {
+            account: pubkey,
+            group_id,
         },
     )
     .await?;

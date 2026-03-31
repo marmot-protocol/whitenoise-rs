@@ -222,6 +222,13 @@ pub async fn dispatch(req: Request) -> Response {
             }
         }
 
+        Request::SelfDemote { account, group_id } => {
+            match self_demote(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
+
         Request::RenameGroup {
             account,
             group_id,
@@ -1051,6 +1058,20 @@ async fn leave_group(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     wn.leave_group(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+#[perf_instrument("dispatch")]
+async fn self_demote(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let group_id = parse_group_id(group_id_hex)?;
+    wn.self_demote(&account, &group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!(null)))

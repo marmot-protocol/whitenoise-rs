@@ -70,6 +70,8 @@ pub enum Request {
     },
     #[serde(rename = "leave_group")]
     LeaveGroup { account: String, group_id: String },
+    #[serde(rename = "self_demote")]
+    SelfDemote { account: String, group_id: String },
     #[serde(rename = "rename_group")]
     RenameGroup {
         account: String,
@@ -674,6 +676,21 @@ mod tests {
         assert!(matches!(
             parsed,
             Request::LeaveGroup { account, group_id }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn self_demote_roundtrip() {
+        let req = Request::SelfDemote {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SelfDemote { account, group_id }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
