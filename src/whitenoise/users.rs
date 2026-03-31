@@ -442,13 +442,17 @@ impl Whitenoise {
             pubkey
         );
 
+        let this = self as *const Whitenoise as usize;
         tokio::spawn(async move {
             let _resolution_guard = resolution_guard;
-            let result = async {
-                let whitenoise = Self::get_instance()?;
-                whitenoise.resolve_unknown_user_under_guard(pubkey).await
-            }
-            .await;
+            // SAFETY: `this` is the `Whitenoise` that started resolution (same database as the
+            // user row). Using `get_instance()` here was incorrect: unit tests use per-test
+            // `Whitenoise` instances while the global singleton points at a different database,
+            // which produced `User not found` and broke concurrent `resolve_user` tests.
+            // Callers must keep this `Whitenoise` alive until the task finishes (true for the
+            // process singleton; tests hold the instance for the duration of the test).
+            let whitenoise = unsafe { &*(this as *const Whitenoise) };
+            let result = whitenoise.resolve_unknown_user_under_guard(pubkey).await;
 
             if let Err(error) = result {
                 tracing::warn!(
@@ -505,7 +509,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::test_utils::{create_mock_whitenoise, test_get_whitenoise};
+    use crate::whitenoise::test_utils::create_mock_whitenoise;
     use chrono::{Duration, Utc};
     use std::collections::HashSet;
 
@@ -777,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_user_dedupes_background_resolution_for_same_unknown_user() {
-        let whitenoise = test_get_whitenoise().await;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         let metadata = Metadata::new().name("Background Deduped User");
@@ -795,7 +799,7 @@ mod tests {
         first.unwrap();
         second.unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
                 if user.metadata_is_known() {

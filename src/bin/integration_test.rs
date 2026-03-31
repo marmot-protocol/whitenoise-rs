@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use nostr_sdk::RelayUrl;
 
+use ::whitenoise::integration_tests::core::ensure_local_test_services_running;
 use ::whitenoise::integration_tests::registry::ScenarioRegistry;
 use ::whitenoise::*;
 
@@ -24,6 +25,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
+
+    ensure_local_test_services_running().await?;
 
     // Initialize mock keyring store for integration tests
     // This is required for MDK database encryption in test environments

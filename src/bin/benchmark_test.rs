@@ -14,6 +14,7 @@ use ::whitenoise::integration_tests::benchmarks::core::json_output::{
 };
 use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
 use ::whitenoise::integration_tests::benchmarks::{DETAILED_MODE, init_perf_layer};
+use ::whitenoise::integration_tests::core::ensure_local_test_services_running;
 use ::whitenoise::whitenoise::secrets_store::SecretsStore;
 use ::whitenoise::*;
 
@@ -256,6 +257,10 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
 #[tokio::main]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
+
+    if args.login.is_none() && !args.init_only {
+        ensure_local_test_services_running().await?;
+    }
 
     // Initialise the perf layer BEFORE Whitenoise initialises tracing so that
     // the layer is part of the subscriber stack from the very first span.

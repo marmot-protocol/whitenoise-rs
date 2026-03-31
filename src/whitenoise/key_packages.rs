@@ -210,6 +210,8 @@ impl Whitenoise {
 
             match self
                 .publish_key_package_to_relays(
+                    account,
+                    &hash_ref,
                     &encoded_key_package,
                     &relay_urls,
                     &tags,
@@ -217,9 +219,7 @@ impl Whitenoise {
                 )
                 .await
             {
-                Ok(event_id) => {
-                    self.track_published_key_package(account, &hash_ref, &event_id)
-                        .await;
+                Ok(()) => {
                     return Ok(());
                 }
                 Err(e) => {
@@ -260,16 +260,15 @@ impl Whitenoise {
         let (encoded_key_package, tags, hash_ref) =
             self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
-        let event_id = self
-            .publish_key_package_to_relays(
-                &encoded_key_package,
-                &relay_urls,
-                &tags,
-                std::sync::Arc::new(signer),
-            )
-            .await?;
-        self.track_published_key_package(account, &hash_ref, &event_id)
-            .await;
+        self.publish_key_package_to_relays(
+            account,
+            &hash_ref,
+            &encoded_key_package,
+            &relay_urls,
+            &tags,
+            std::sync::Arc::new(signer),
+        )
+        .await?;
         Ok(())
     }
 
@@ -288,11 +287,15 @@ impl Whitenoise {
             self.encoded_key_package(account, relays).await?;
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
-        let event_id = self
-            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
-            .await?;
-        self.track_published_key_package(account, &hash_ref, &event_id)
-            .await;
+        self.publish_key_package_to_relays(
+            account,
+            &hash_ref,
+            &encoded_key_package,
+            &relay_urls,
+            &tags,
+            signer,
+        )
+        .await?;
         Ok(())
     }
 
@@ -300,9 +303,10 @@ impl Whitenoise {
     /// runs in a background task so the caller isn't blocked by network latency.
     ///
     /// The MLS key material is always created synchronously (local, fast).
-    /// Only the relay broadcast + DB tracking are deferred.  If the global
-    /// [`Whitenoise`] singleton isn't available (unit tests), the publish
-    /// runs inline as a fallback.
+    /// Only the relay broadcast + DB tracking are deferred. If the global
+    /// [`Whitenoise`] singleton isn't available, or the crate is built for
+    /// unit tests (`cfg(test)`), the publish runs inline so tests do not race
+    /// relay visibility against DB tracking.
     ///
     /// Failures are non-fatal — the `KeyPackageMaintenance` scheduler
     /// (10-min interval) retries any that didn't land.
@@ -316,7 +320,7 @@ impl Whitenoise {
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
-        if Whitenoise::get_instance().is_ok() {
+        if Whitenoise::get_instance().is_ok() && !cfg!(test) {
             let account = account.clone();
             tokio::spawn(async move {
                 let wn = match Whitenoise::get_instance() {
@@ -331,13 +335,17 @@ impl Whitenoise {
                     }
                 };
                 match wn
-                    .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                    .publish_key_package_to_relays(
+                        &account,
+                        &hash_ref,
+                        &encoded_key_package,
+                        &relay_urls,
+                        &tags,
+                        signer,
+                    )
                     .await
                 {
-                    Ok(event_id) => {
-                        wn.track_published_key_package(&account, &hash_ref, &event_id)
-                            .await;
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         tracing::warn!(
                             target: "whitenoise::key_packages",
@@ -350,13 +358,17 @@ impl Whitenoise {
         } else {
             // Synchronous fallback (unit tests or pre-initialization).
             match self
-                .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                .publish_key_package_to_relays(
+                    account,
+                    &hash_ref,
+                    &encoded_key_package,
+                    &relay_urls,
+                    &tags,
+                    signer,
+                )
                 .await
             {
-                Ok(event_id) => {
-                    self.track_published_key_package(account, &hash_ref, &event_id)
-                        .await;
-                }
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
@@ -375,14 +387,20 @@ impl Whitenoise {
     /// Returns an error if no relay accepted the event. This method is
     /// intentionally separated from key package creation so callers can retry
     /// the relay publish without generating additional MLS key material.
+    ///
+    /// On success, records the published key package in the lifecycle table
+    /// immediately before returning, so maintenance can correlate relay events
+    /// with local state without racing relay visibility.
     #[perf_instrument("key_packages")]
     async fn publish_key_package_to_relays(
         &self,
+        account: &Account,
+        hash_ref: &[u8],
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
         signer: std::sync::Arc<dyn NostrSigner>,
-    ) -> Result<EventId> {
+    ) -> Result<()> {
         let result = self
             .relay_control
             .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
@@ -394,13 +412,17 @@ impl Whitenoise {
             ));
         }
 
+        let event_id = *result.id();
+        self.track_published_key_package(account, hash_ref, &event_id)
+            .await;
+
         tracing::debug!(
             target: "whitenoise::key_packages",
             "Published key package to {} relay(s)",
             result.success.len(),
         );
 
-        Ok(*result.id())
+        Ok(())
     }
 
     /// Records a successfully published key package in the lifecycle tracking table.

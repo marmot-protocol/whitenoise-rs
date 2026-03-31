@@ -195,11 +195,32 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
             return publish_new_key_package(whitenoise, account).await;
         }
 
-        let live_valid_packages =
-            match find_live_published_key_packages(whitenoise, account, valid_packages).await {
+        let mut live_valid_packages =
+            match find_live_published_key_packages(whitenoise, account, valid_packages.clone())
+                .await
+            {
                 Ok(packages) => packages,
                 Err(e) => return MaintenanceResult::Error(e),
             };
+
+        if live_valid_packages.is_empty() {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                live_valid_packages = match find_live_published_key_packages(
+                    whitenoise,
+                    account,
+                    valid_packages.clone(),
+                )
+                .await
+                {
+                    Ok(packages) => packages,
+                    Err(e) => return MaintenanceResult::Error(e),
+                };
+                if !live_valid_packages.is_empty() {
+                    break;
+                }
+            }
+        }
 
         if live_valid_packages.is_empty() {
             tracing::info!(
@@ -227,10 +248,26 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
     // and still have live local key material. This mirrors the login-time
     // recovery path: if every relay package is foreign or already consumed on
     // this device, publish a fresh one.
-    let our_packages = match find_live_published_key_packages(whitenoise, account, packages).await {
-        Ok(packages) => packages,
-        Err(e) => return MaintenanceResult::Error(e),
-    };
+    let mut our_packages =
+        match find_live_published_key_packages(whitenoise, account, packages.clone()).await {
+            Ok(packages) => packages,
+            Err(e) => return MaintenanceResult::Error(e),
+        };
+
+    if our_packages.is_empty() {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            our_packages =
+                match find_live_published_key_packages(whitenoise, account, packages.clone()).await
+                {
+                    Ok(packages) => packages,
+                    Err(e) => return MaintenanceResult::Error(e),
+                };
+            if !our_packages.is_empty() {
+                break;
+            }
+        }
+    }
 
     if our_packages.is_empty() {
         tracing::info!(

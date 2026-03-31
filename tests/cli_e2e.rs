@@ -174,6 +174,7 @@ async fn group_metadata_and_membership() {
         .unwrap()
         .to_string();
     wait_for_key_package(&bob.socket, &bob_pk).await;
+    wait_for_key_package(&alice.socket, &bob_pk).await;
 
     let group = wn(
         &alice.socket,
@@ -265,6 +266,7 @@ async fn cross_daemon_group_messaging() {
         .unwrap()
         .to_string();
     wait_for_key_package(&bob.socket, &bob_pk).await;
+    wait_for_key_package(&alice.socket, &bob_pk).await;
 
     let group = wn(
         &alice.socket,
@@ -335,6 +337,7 @@ async fn second_identity_does_not_break_first_account_messaging() {
         .unwrap()
         .to_string();
     wait_for_key_package(&bob.socket, &bob_pk).await;
+    wait_for_key_package(&alice.socket, &bob_pk).await;
 
     // Establish a working chat with account 1
     let group = wn(
