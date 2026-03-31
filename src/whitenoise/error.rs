@@ -36,6 +36,9 @@ pub enum WhitenoiseError {
     #[error("Group not found")]
     GroupNotFound,
 
+    #[error("Already departed from group")]
+    AlreadyDepartedFromGroup,
+
     #[error("Message not found")]
     MessageNotFound,
 

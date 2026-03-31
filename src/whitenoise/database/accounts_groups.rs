@@ -22,6 +22,7 @@ struct AccountGroupRow {
     dm_peer_pubkey: Option<PublicKey>,
     archived_at: Option<DateTime<Utc>>,
     removed_at: Option<DateTime<Utc>>,
+    self_removed: bool,
     muted_until: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -74,6 +75,8 @@ where
 
         let archived_at = parse_optional_timestamp(row, "archived_at")?;
         let removed_at = parse_optional_timestamp(row, "removed_at")?;
+        let self_removed_int: i64 = row.try_get("self_removed")?;
+        let self_removed = self_removed_int != 0;
         let muted_until = parse_optional_timestamp(row, "muted_until")?;
 
         // Parse pubkey from hex string
@@ -118,6 +121,7 @@ where
             dm_peer_pubkey,
             archived_at,
             removed_at,
+            self_removed,
             muted_until,
             created_at,
             updated_at,
@@ -138,6 +142,7 @@ impl From<AccountGroupRow> for AccountGroup {
             dm_peer_pubkey: row.dm_peer_pubkey,
             archived_at: row.archived_at,
             removed_at: row.removed_at,
+            self_removed: row.self_removed,
             muted_until: row.muted_until,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -297,8 +302,8 @@ impl AccountGroup {
                pin_order = excluded.pin_order,
                -- archived_at is intentionally excluded: archive/unarchive use
                -- update_archived_at() so save() never clobbers user preference.
-               -- removed_at is intentionally excluded: removal is set by
-               -- mark_removed_atomic() when an admin removal commit is detected.
+               -- removed_at and self_removed are intentionally excluded:
+               -- set by mark_removed_atomic() or mark_left_atomic() only.
                -- muted_until is intentionally excluded: mute/unmute use
                -- update_muted_until() so save() never clobbers user preference.
                -- Write-once: preserve existing dm_peer_pubkey if already set.
@@ -421,6 +426,35 @@ impl AccountGroup {
         .await?;
 
         Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    /// Atomically marks this AccountGroup as voluntarily departed
+    /// (`UPDATE ... WHERE removed_at IS NULL`).
+    ///
+    /// Sets both `removed_at` and `self_removed` in one statement.
+    /// Returns `Some(updated_row)` on success, `None` if already departed
+    /// (another task won the race, or the user was already removed/left).
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn mark_left_atomic(
+        &self,
+        database: &Database,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET removed_at = ?, self_removed = 1, updated_at = ?
+             WHERE id = ? AND removed_at IS NULL
+             RETURNING *",
+        )
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(id)
+        .fetch_optional(&database.pool)
+        .await?;
+
+        Ok(row.map(Into::into))
     }
 
     /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
@@ -929,6 +963,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -963,6 +998,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -984,6 +1020,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1026,6 +1063,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1676,6 +1714,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1695,6 +1734,194 @@ mod tests {
         assert!(
             found.removed_at.is_some(),
             "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_left_atomic_sets_removed_at_and_self_removed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[90; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(ag.removed_at.is_none());
+        assert!(!ag.self_removed);
+
+        let left = ag
+            .mark_left_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("first mark_left_atomic must update the row");
+
+        assert!(left.removed_at.is_some(), "removed_at must be set");
+        assert!(left.self_removed, "self_removed must be true");
+        assert!(left.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_mark_left_atomic_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[91; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        let first = ag
+            .mark_left_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("first call must succeed");
+
+        // Second call must be a no-op
+        let second = first.mark_left_atomic(&whitenoise.database).await.unwrap();
+        assert!(second.is_none(), "second mark_left_atomic must return None");
+    }
+
+    #[tokio::test]
+    async fn test_mark_removed_atomic_noop_when_already_left() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[92; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // User leaves voluntarily
+        let left = ag
+            .mark_left_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("mark_left_atomic must succeed");
+        assert!(left.self_removed);
+
+        // Later commit arrives — mark_removed_atomic must be a no-op
+        let removed = left
+            .mark_removed_atomic(&whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            removed.is_none(),
+            "mark_removed_atomic must no-op when mark_left_atomic already ran"
+        );
+
+        // Verify self_removed is still true (not overwritten)
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            found.self_removed,
+            "self_removed must survive mark_removed_atomic no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_left_atomic_noop_when_already_removed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[93; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Admin kicks user first
+        let removed = ag
+            .mark_removed_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("mark_removed_atomic must succeed");
+        assert!(!removed.self_removed);
+
+        // User tries to leave — must be a no-op
+        let left = removed
+            .mark_left_atomic(&whitenoise.database)
+            .await
+            .unwrap();
+        assert!(
+            left.is_none(),
+            "mark_left_atomic must no-op when mark_removed_atomic already ran"
+        );
+
+        // Verify self_removed is still false
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !found.self_removed,
+            "self_removed must remain false after admin kick"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_save_does_not_overwrite_self_removed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[94; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // User leaves voluntarily
+        let left = ag
+            .mark_left_atomic(&whitenoise.database)
+            .await
+            .unwrap()
+            .expect("mark_left_atomic must succeed");
+        assert!(left.self_removed);
+
+        // Re-save via save() — simulates giftwrap re-processing
+        let resaved = AccountGroup {
+            id: None,
+            account_pubkey: account.pubkey,
+            mls_group_id: group_id.clone(),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            self_removed: false,
+            muted_until: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        resaved.save(&whitenoise.database).await.unwrap();
+
+        // Fetch and verify self_removed survived
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(found.self_removed, "save() must not overwrite self_removed");
+        assert!(
+            found.removed_at.is_some(),
+            "save() must not overwrite removed_at either"
         );
     }
 

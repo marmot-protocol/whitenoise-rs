@@ -74,11 +74,15 @@ pub struct ChatListItem {
     /// - `Some(timestamp)` = archived (hidden from main chat list)
     pub archived_at: Option<DateTime<Utc>>,
 
-    /// When this account was removed from the group by an admin, if at all.
+    /// When this account's membership in the group ended, if at all.
     /// - `None` = still an active member
-    /// - `Some(timestamp)` = removed; group is read-only and stays in the chat
+    /// - `Some(timestamp)` = departed; group is read-only and stays in the chat
     ///   list until the user explicitly archives or deletes it
     pub removed_at: Option<DateTime<Utc>>,
+
+    /// Whether the departure was voluntary (user chose to leave)
+    /// vs involuntary (admin removed). Only meaningful when `removed_at` is `Some`.
+    pub self_removed: bool,
 
     /// When this chat's mute expires.
     /// - `None` = not muted
@@ -205,6 +209,7 @@ fn assemble_chat_list_items(
             let pin_order = account_group.pin_order;
             let archived_at = account_group.archived_at;
             let removed_at = account_group.removed_at;
+            let self_removed = account_group.self_removed;
             let muted_until = account_group.muted_until;
 
             Some(ChatListItem {
@@ -222,6 +227,7 @@ fn assemble_chat_list_items(
                 dm_peer_pubkey,
                 archived_at,
                 removed_at,
+                self_removed,
                 muted_until,
             })
         })
@@ -420,10 +426,11 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order, archived_at, removed_at, and muted_until
+        // 9. Get pin order, archived_at, removed_at, self_removed, and muted_until
         let pin_order = account_group.pin_order;
         let archived_at = account_group.archived_at;
         let removed_at = account_group.removed_at;
+        let self_removed = account_group.self_removed;
         let muted_until = account_group.muted_until;
 
         // 10. Assemble and return ChatListItem
@@ -442,6 +449,7 @@ impl Whitenoise {
             dm_peer_pubkey,
             archived_at,
             removed_at,
+            self_removed,
             muted_until,
         }))
     }
@@ -559,8 +567,8 @@ impl Whitenoise {
                             self.archived_chat_list_stream_manager.emit(pubkey, update);
                         }
                     }
-                    ChatListUpdateTrigger::RemovedFromGroup => {
-                        // Route by archive status — a group can be removed while already
+                    ChatListUpdateTrigger::RemovedFromGroup | ChatListUpdateTrigger::LeftGroup => {
+                        // Route by archive status — a group can be departed while already
                         // archived, in which case the update must reach the archived stream.
                         if update.item.archived_at.is_some() {
                             if has_archived {
@@ -1433,6 +1441,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1450,6 +1459,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1467,6 +1477,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];
@@ -1512,6 +1523,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1537,6 +1549,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1562,6 +1575,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];
@@ -1677,6 +1691,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1694,6 +1709,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];
@@ -1727,6 +1743,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1744,6 +1761,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1761,6 +1779,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];
@@ -1796,6 +1815,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1813,6 +1833,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];
@@ -1847,6 +1868,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1864,6 +1886,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1881,6 +1904,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
             ChatListItem {
@@ -1898,6 +1922,7 @@ mod tests {
                 dm_peer_pubkey: None,
                 archived_at: None,
                 removed_at: None,
+                self_removed: false,
                 muted_until: None,
             },
         ];

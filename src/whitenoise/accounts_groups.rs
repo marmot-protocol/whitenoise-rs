@@ -41,11 +41,16 @@ pub struct AccountGroup {
     /// - `None` = not archived (active in chat list)
     /// - `Some(timestamp)` = archived at that time (hidden from main chat list)
     pub archived_at: Option<DateTime<Utc>>,
-    /// When this account was removed from the group by an admin.
-    /// - `None` = not removed (still an active member)
-    /// - `Some(timestamp)` = removed at that time (group is read-only, visible
+    /// When this account's membership in the group ended.
+    /// - `None` = still an active member
+    /// - `Some(timestamp)` = departed at that time (group is read-only, visible
     ///   in the chat list until the user explicitly archives or deletes it)
     pub removed_at: Option<DateTime<Utc>>,
+    /// Whether the departure was voluntary (user chose to leave via SelfRemove).
+    /// Only meaningful when `removed_at` is `Some`.
+    /// - `false` = removed by an admin
+    /// - `true` = user left voluntarily
+    pub self_removed: bool,
     /// When this chat's mute expires.
     /// - `None` = not muted (notifications enabled)
     /// - `Some(timestamp)` = muted until that time; use `MUTE_FOREVER` for
@@ -142,9 +147,8 @@ impl AccountGroup {
         self.user_confirmation != Some(false)
     }
 
-    /// Returns true if this account was involuntarily removed from the group by
-    /// an admin. Removed groups remain visible in the chat list (read-only) until
-    /// the user explicitly archives or deletes them.
+    /// Returns true if this account is no longer a member of the group —
+    /// either removed by an admin or voluntarily departed.
     pub fn is_removed(&self) -> bool {
         self.removed_at.is_some()
     }
@@ -320,11 +324,21 @@ impl AccountGroup {
         &self,
         whitenoise: &Whitenoise,
     ) -> Result<Option<Self>, WhitenoiseError> {
-        let updated = self
-            .mark_removed_atomic(&whitenoise.database)
+        self.mark_removed_atomic(&whitenoise.database)
             .await
-            .map_err(WhitenoiseError::from)?;
-        Ok(updated)
+            .map_err(WhitenoiseError::from)
+    }
+
+    /// Delegates to [`mark_left_atomic`](crate::whitenoise::database::accounts_groups::AccountGroup::mark_left_atomic).
+    /// Returns `Some` when the row was changed, `None` when already departed.
+    #[perf_instrument("account_groups")]
+    pub(crate) async fn mark_left(
+        &self,
+        whitenoise: &Whitenoise,
+    ) -> Result<Option<Self>, WhitenoiseError> {
+        self.mark_left_atomic(&whitenoise.database)
+            .await
+            .map_err(WhitenoiseError::from)
     }
 }
 
@@ -563,6 +577,33 @@ impl Whitenoise {
             ChatListUpdateTrigger::ChatMuteChanged,
         )
         .await;
+        Ok(updated)
+    }
+
+    /// Marks a group as voluntarily departed for the given account.
+    ///
+    /// Idempotent. Emits [`ChatListUpdateTrigger::LeftGroup`] when the row changes.
+    #[perf_instrument("account_groups")]
+    pub(crate) async fn mark_as_left(
+        &self,
+        account: &Account,
+        mls_group_id: &GroupId,
+    ) -> Result<AccountGroup, WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        let Some(updated) = account_group.mark_left(self).await? else {
+            // Already departed (left or removed) — reload current state.
+            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
+                .await?
+                .ok_or(WhitenoiseError::GroupNotFound)?;
+            return Ok(current);
+        };
+
+        self.emit_chat_list_update(account, mls_group_id, ChatListUpdateTrigger::LeftGroup)
+            .await;
+
         Ok(updated)
     }
 
@@ -1779,6 +1820,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             // Expired 10 seconds ago
             muted_until: Some(Utc::now() - chrono::Duration::seconds(10)),
             created_at: Utc::now(),
@@ -1950,6 +1992,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2104,6 +2147,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2119,6 +2163,88 @@ mod tests {
         assert!(
             found.is_removed(),
             "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_self_removed_false_by_default() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[110; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(!ag.self_removed);
+        assert!(!ag.is_removed());
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_left_sets_self_removed() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[111; 32]);
+
+        let (ag, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        assert!(!ag.self_removed);
+
+        let left = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+
+        assert!(left.is_removed(), "removed_at must be set");
+        assert!(left.self_removed, "self_removed must be true");
+        assert!(!left.is_pending(), "must not be pending after leaving");
+        assert!(left.is_visible(), "left groups stay visible until archived");
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_left_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[112; 32]);
+
+        let (_, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let first = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        let second = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+
+        assert_eq!(first.removed_at, second.removed_at);
+        assert!(second.self_removed);
+    }
+
+    #[tokio::test]
+    async fn test_mark_as_removed_noop_after_left() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[113; 32]);
+
+        let (_, _) = whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // User leaves first
+        let left = whitenoise.mark_as_left(&account, &group_id).await.unwrap();
+        assert!(left.self_removed);
+
+        // Admin kick arrives later — must not overwrite self_removed
+        let removed = whitenoise
+            .mark_as_removed(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(left.removed_at, removed.removed_at);
+        assert!(
+            removed.self_removed,
+            "self_removed must survive mark_as_removed no-op"
         );
     }
 }
