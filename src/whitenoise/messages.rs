@@ -702,16 +702,12 @@ impl Whitenoise {
 
         let minimum_val = minimum.unwrap_or(50);
 
-        AggregatedMessage::find_messages_with_unread_minimum(
+        Ok(AggregatedMessage::find_messages_with_unread_minimum(
             group_id,
             read_marker.as_ref(),
             minimum_val,
             &self.database,
-        )
-        .await
-        .map_err(|e| {
-            WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
-        })
+        ).await?)
     }
 
     /// Fetch a single aggregated message by its event ID.
@@ -2974,6 +2970,61 @@ mod tests {
             result.unwrap_err(),
             WhitenoiseError::AccountNotFound
         ));
+    }
+
+    /// fetch_messages_unread_with_minimum with `None` minimum uses the default floor
+    /// of 50 — if fewer messages exist, all are returned.
+    #[tokio::test]
+    async fn test_fetch_messages_unread_with_minimum_none_uses_default_50() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_pubkey],
+                create_nostr_group_config_data(vec![creator.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Send 60 messages and mark all as read — 0 unread
+        let mut last_id = None;
+        for i in 0..60 {
+            let msg = whitenoise
+                .send_message_to_group(
+                    &creator,
+                    &group.mls_group_id,
+                    format!("message {i}"),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+            last_id = Some(msg.message.id);
+        }
+        whitenoise
+            .mark_message_read(&creator, &last_id.unwrap())
+            .await
+            .unwrap();
+
+        // None minimum → default 50. All 60 are read, so unread=0, floor=50 → exactly 50 returned.
+        let result = whitenoise
+            .fetch_messages_unread_with_minimum(&creator.pubkey, &group.mls_group_id, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.len(),
+            50,
+            "Expected exactly 50 messages (default floor), got {}",
+            result.len()
+        );
     }
 
     /// fetch_message_by_id enforces the account-existence security check: an unregistered

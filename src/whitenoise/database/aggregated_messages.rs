@@ -384,9 +384,10 @@ impl AggregatedMessage {
         // is NULL (no read marker), the COALESCE falls back to 0 and every
         // non-deleted kind-9 message is treated as unread.
         //
-        // Both the CTE and the outer SELECT apply identical visibility rules
-        // (kind = 9, deletion_event_id IS NULL, Retried excluded) so the count and
-        // the returned rows are always in sync.
+        // The CTE excludes deleted messages from the unread count (tombstones
+        // aren't "unread"), but the outer SELECT includes them so the UI can
+        // render "message deleted" placeholders — matching the tombstone contract
+        // in `find_messages_by_group_paginated`.
         let marker_hex = read_marker.map(EventId::to_hex);
 
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
@@ -413,7 +414,6 @@ impl AggregatedMessage {
               AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9
                AND am.mls_group_id = ?
-               AND am.deletion_event_id IS NULL
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT MAX((SELECT cnt FROM unread_count), ?)",
@@ -3158,6 +3158,59 @@ mod tests {
             None,
             None,
             None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "all 3 messages should be returned, including the deleted tombstone"
+        );
+
+        let deleted = messages
+            .iter()
+            .find(|m| m.id == msg2_id)
+            .expect("deleted message must be present");
+        assert!(
+            deleted.is_deleted,
+            "deleted message must have is_deleted = true"
+        );
+    }
+
+    /// Deleted messages must appear in unread-with-minimum results as tombstones,
+    /// matching the contract in `find_messages_by_group_paginated`. The unread count
+    /// CTE excludes tombstones (they aren't "unread"), but the outer SELECT includes
+    /// them so the UI can render "message deleted" placeholders.
+    #[tokio::test]
+    async fn test_unread_minimum_deleted_messages_are_included_as_tombstones() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[214; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_702_000_000;
+
+        // Insert 3 messages: seeds 1, 2, 3
+        for i in 1u8..=3 {
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
+                .await;
+        }
+
+        // Delete seed-2 message
+        let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
+        let deletion_id = format!("{:0>64x}", 0xde1212u64);
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // No read marker → all non-deleted messages are unread (cnt=2), minimum=3
+        // LIMIT = MAX(2, 3) = 3, so all 3 rows (including the tombstone) are returned.
+        let messages = AggregatedMessage::find_messages_with_unread_minimum(
+            &group_id,
+            None,
+            3,
+            &whitenoise.database,
         )
         .await
         .unwrap();
