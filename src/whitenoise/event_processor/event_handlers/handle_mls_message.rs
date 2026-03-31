@@ -1,6 +1,7 @@
 use mdk_core::prelude::group_types::GroupState;
 use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResult};
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 
 use crate::{
@@ -63,169 +64,175 @@ impl Whitenoise {
         };
         drop(_mls_proc);
 
-        // Extract and store media references synchronously for application messages.
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
-            let is_push_group_message = message.kind
-                == Kind::from(mdk_core::mip05::TOKEN_REQUEST_KIND)
-                || message.kind == Kind::from(mdk_core::mip05::TOKEN_LIST_RESPONSE_KIND)
-                || message.kind == Kind::from(mdk_core::mip05::TOKEN_REMOVAL_KIND);
-
-            if is_push_group_message {
-                if let Err(error) = self
-                    .handle_received_push_group_message(
-                        account,
-                        &message,
-                        outcome.context.sender_leaf_index,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        account = %account.pubkey.to_hex(),
-                        group_id = %hex::encode(group_id.as_slice()),
-                        sender_leaf_index = ?outcome.context.sender_leaf_index,
-                        message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
-                        error = %error,
-                        "Failed to reconcile received MIP-05 group message after MLS acceptance"
-                    );
-                }
-            } else {
-                let parsed_references = {
-                    let media_manager = mdk.media_manager(group_id.clone());
-                    self.media_files()
-                        .parse_imeta_tags_from_event(&inner_event, &media_manager)?
-                };
-
-                self.media_files()
-                    .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
-                    .await?;
-
-                match message.kind {
-                    Kind::ChatMessage => {
-                        let msg = self.cache_chat_message(&group_id, &message).await?;
-                        let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                        Whitenoise::spawn_new_message_notification_if_enabled(
-                            account, &group_id, &msg, group_name,
-                        );
-                        self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
-                        self.emit_chat_list_update(
-                            account,
-                            &group_id,
-                            ChatListUpdateTrigger::NewLastMessage,
-                        )
-                        .await;
-                    }
-                    Kind::Reaction => {
-                        if let Some(target) = self.cache_reaction(&group_id, &message).await? {
-                            self.emit_message_update(
-                                &group_id,
-                                UpdateTrigger::ReactionAdded,
-                                target,
-                            );
-                        }
-                    }
-                    Kind::EventDeletion => {
-                        let last_message_id = self.get_last_message_id(&group_id).await;
-
-                        for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
-                            self.emit_message_update(&group_id, trigger, msg);
-                        }
-
-                        // Check if the deleted message was the last message.
-                        // This check must happen AFTER get_last_message_id but the
-                        // result is only valid for the FIRST handler (before cache_deletion
-                        // modifies shared state). We emit for ALL subscribed accounts because
-                        // subsequent handlers will see incorrect post-deletion state.
-                        if let Some(last_message_id) = last_message_id {
-                            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
-                            if deleted_ids.contains(&last_message_id) {
-                                self.emit_chat_list_update_for_group(
-                                    &group_id,
-                                    ChatListUpdateTrigger::LastMessageDeleted,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    _ => {
-                        tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
-                    }
-                }
-            }
+            self.handle_application_message_outcome(
+                account,
+                &mdk,
+                &outcome,
+                group_id,
+                inner_event,
+                message,
+            )
+            .await?;
         }
 
-        // Dispatch on every variant explicitly so the compiler enforces exhaustiveness.
-        // Unprocessable and PreviouslyFailed are returned as errors so the caller does
-        // not mark the event as processed or advance last_synced_at.
-        match outcome.result {
-            MessageProcessingResult::ApplicationMessage(_) => {
-                // Already handled above via extract_message_details.
-            }
+        self.handle_non_application_outcome(account, &mdk, outcome.result)
+            .await?;
 
-            MessageProcessingResult::Proposal(ref update_result) => {
-                // Auto-committed proposal (e.g., admin auto-commits a member's
-                // self-removal): publish the resulting commit event so other group
-                // members learn about the change, then merge the pending commit into
-                // our local MLS state.
-                //
-                // Uses publish_and_merge_commit to ensure MIP-03 ordering:
-                // publish first, merge only on success, clear pending commit on
-                // failure. This prevents local state from advancing to an epoch
-                // that no other group member knows about.
-                let group_id = &update_result.mls_group_id;
-                let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+        Ok(())
+    }
 
-                self.publish_and_merge_commit(
-                    update_result.evolution_event.clone(),
-                    &account.pubkey,
-                    group_id,
-                    &relay_urls,
-                )
-                .await?;
+    #[perf_instrument("event_handlers")]
+    async fn handle_application_message_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        outcome: &MessageProcessingOutcome,
+        group_id: GroupId,
+        inner_event: UnsignedEvent,
+        message: Message,
+    ) -> Result<()> {
+        if Self::is_push_group_message_kind(message.kind) {
+            self.handle_push_application_message(account, outcome, &group_id, &message)
+                .await;
+            return Ok(());
+        }
 
-                self.background_refresh_account_group_subscriptions(account);
+        self.handle_standard_application_message(account, mdk, group_id, inner_event, message)
+            .await
+    }
 
-                if let Some(welcome_rumors) = &update_result.welcome_rumors
-                    && !welcome_rumors.is_empty()
-                {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        "Auto-committed proposal produced {} welcome \
-                         rumors that were not delivered",
-                        welcome_rumors.len()
-                    );
-                }
+    async fn handle_push_application_message(
+        &self,
+        account: &Account,
+        outcome: &MessageProcessingOutcome,
+        group_id: &GroupId,
+        message: &Message,
+    ) {
+        if let Err(error) = self
+            .handle_received_push_group_message(account, message, outcome.context.sender_leaf_index)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                group_id = %hex::encode(group_id.as_slice()),
+                sender_leaf_index = ?outcome.context.sender_leaf_index,
+                message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
+                error = %error,
+                "Failed to reconcile received MIP-05 group message after MLS acceptance"
+            );
+        }
+    }
 
-                tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
-                    "Published auto-committed proposal evolution event for group {}",
-                    hex::encode(group_id.as_slice())
+    #[perf_instrument("event_handlers")]
+    async fn handle_standard_application_message(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        group_id: GroupId,
+        inner_event: UnsignedEvent,
+        message: Message,
+    ) -> Result<()> {
+        let parsed_references = {
+            let media_manager = mdk.media_manager(group_id.clone());
+            self.media_files()
+                .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+        };
+
+        self.media_files()
+            .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
+            .await?;
+
+        match message.kind {
+            Kind::ChatMessage => {
+                let msg = self.cache_chat_message(&group_id, &message).await?;
+                let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                Whitenoise::spawn_new_message_notification_if_enabled(
+                    account, &group_id, &msg, group_name,
                 );
-
+                self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
                 self.emit_chat_list_update(
                     account,
-                    group_id,
+                    &group_id,
                     ChatListUpdateTrigger::NewLastMessage,
                 )
                 .await;
-
-                Self::background_sync_group_image_cache_if_needed(
-                    account,
-                    &update_result.mls_group_id,
-                );
             }
+            Kind::Reaction => {
+                if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                    self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
+                }
+            }
+            Kind::EventDeletion => {
+                self.handle_deletion_application_message(&group_id, &message)
+                    .await?;
+            }
+            _ => {
+                tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
+            }
+        }
 
-            MessageProcessingResult::PendingProposal { ref mls_group_id } => {
+        Ok(())
+    }
+
+    async fn handle_deletion_application_message(
+        &self,
+        group_id: &GroupId,
+        message: &Message,
+    ) -> Result<()> {
+        let last_message_id = self.get_last_message_id(group_id).await;
+
+        for (trigger, msg) in self.cache_deletion(group_id, message).await? {
+            self.emit_message_update(group_id, trigger, msg);
+        }
+
+        // Check if the deleted message was the last message.
+        // This check must happen AFTER get_last_message_id but the
+        // result is only valid for the FIRST handler (before cache_deletion
+        // modifies shared state). We emit for ALL subscribed accounts because
+        // subsequent handlers will see incorrect post-deletion state.
+        if let Some(last_message_id) = last_message_id {
+            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+            if deleted_ids.contains(&last_message_id) {
+                self.emit_chat_list_update_for_group(
+                    group_id,
+                    ChatListUpdateTrigger::LastMessageDeleted,
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_non_application_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        result: MessageProcessingResult,
+    ) -> Result<()> {
+        // Dispatch on every variant explicitly so the compiler enforces exhaustiveness.
+        // Unprocessable and PreviouslyFailed are returned as errors so the caller does
+        // not mark the event as processed or advance last_synced_at.
+        match result {
+            MessageProcessingResult::ApplicationMessage(_) => Ok(()),
+            MessageProcessingResult::Proposal(update_result) => {
+                self.handle_auto_committed_proposal(account, mdk, update_result)
+                    .await
+            }
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "Stored pending proposal for group {} (awaiting admin commit)",
                     hex::encode(mls_group_id.as_slice())
                 );
+                Ok(())
             }
-
             MessageProcessingResult::IgnoredProposal {
-                ref mls_group_id,
-                ref reason,
+                mls_group_id,
+                reason,
             } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
@@ -233,65 +240,21 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice()),
                     reason
                 );
+                Ok(())
             }
-
-            MessageProcessingResult::ExternalJoinProposal { ref mls_group_id } => {
+            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "Received external join proposal for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
+                Ok(())
             }
-
-            MessageProcessingResult::Commit { ref mls_group_id } => {
-                tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
-                    "Processed commit for group {}",
-                    hex::encode(mls_group_id.as_slice())
-                );
-
-                // Detect removal: if the commit left us inactive, persist the
-                // removal state and emit a real-time update. Errors propagate so the
-                // event is not marked processed. Any failure after process_message()
-                // still requires startup reconciliation, because MDK deduplicates
-                // already-processed commits and this branch will not re-run on retry.
-                let still_active =
-                    match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
-                        Some(group) => group.state == GroupState::Active,
-                        None => false,
-                    };
-
-                if !still_active {
-                    tracing::info!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        "Account {} was removed from group {} — marking group as removed",
-                        account.pubkey.to_hex(),
-                        hex::encode(mls_group_id.as_slice())
-                    );
-                    self.mark_as_removed(account, mls_group_id).await?;
-                }
-
-                if still_active
-                    && let Err(error) = self
-                        .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
-                        .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        account = %account.pubkey.to_hex(),
-                        group_id = %hex::encode(mls_group_id.as_slice()),
-                        error = %error,
-                        "Failed to reconcile group push tokens after commit processing"
-                    );
-                }
-
-                self.background_refresh_account_group_subscriptions(account);
-                if still_active {
-                    Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
-                }
+            MessageProcessingResult::Commit { mls_group_id } => {
+                self.handle_commit_outcome(account, mdk, &mls_group_id)
+                    .await
             }
-
-            MessageProcessingResult::Unprocessable { ref mls_group_id } => {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
                 tracing::warn!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "MLS message unprocessable for group {} (account {}): \
@@ -299,11 +262,10 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice()),
                     account.pubkey.to_hex()
                 );
-                return Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
+                Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
                     mls_group_id.as_slice(),
-                )));
+                )))
             }
-
             MessageProcessingResult::PreviouslyFailed => {
                 tracing::warn!(
                     target: "whitenoise::event_handlers::handle_mls_message",
@@ -311,8 +273,99 @@ impl Whitenoise {
                      event will not be marked processed",
                     account.pubkey.to_hex()
                 );
-                return Err(WhitenoiseError::MlsMessagePreviouslyFailed);
+                Err(WhitenoiseError::MlsMessagePreviouslyFailed)
             }
+        }
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_auto_committed_proposal(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        update_result: mdk_core::prelude::UpdateGroupResult,
+    ) -> Result<()> {
+        let group_id = &update_result.mls_group_id;
+        let relay_urls = Self::ensure_group_relays(mdk, group_id)?;
+
+        self.publish_and_merge_commit(
+            update_result.evolution_event.clone(),
+            &account.pubkey,
+            group_id,
+            &relay_urls,
+        )
+        .await?;
+
+        self.background_refresh_account_group_subscriptions(account);
+
+        if let Some(welcome_rumors) = &update_result.welcome_rumors
+            && !welcome_rumors.is_empty()
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                "Auto-committed proposal produced {} welcome rumors that were not delivered",
+                welcome_rumors.len()
+            );
+        }
+
+        tracing::info!(
+            target: "whitenoise::event_handlers::handle_mls_message",
+            "Published auto-committed proposal evolution event for group {}",
+            hex::encode(group_id.as_slice())
+        );
+
+        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewLastMessage)
+            .await;
+        Self::background_sync_group_image_cache_if_needed(account, group_id);
+
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_commit_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        mls_group_id: &GroupId,
+    ) -> Result<()> {
+        tracing::info!(
+            target: "whitenoise::event_handlers::handle_mls_message",
+            "Processed commit for group {}",
+            hex::encode(mls_group_id.as_slice())
+        );
+
+        let still_active = match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
+            Some(group) => group.state == GroupState::Active,
+            None => false,
+        };
+
+        if !still_active {
+            tracing::info!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                "Account {} was removed from group {} — marking group as removed",
+                account.pubkey.to_hex(),
+                hex::encode(mls_group_id.as_slice())
+            );
+            self.mark_as_removed(account, mls_group_id).await?;
+        }
+
+        if still_active
+            && let Err(error) = self
+                .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
+                .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                group_id = %hex::encode(mls_group_id.as_slice()),
+                error = %error,
+                "Failed to reconcile group push tokens after commit processing"
+            );
+        }
+
+        self.background_refresh_account_group_subscriptions(account);
+        if still_active {
+            Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
         }
 
         Ok(())

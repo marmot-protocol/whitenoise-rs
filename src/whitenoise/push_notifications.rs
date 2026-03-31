@@ -1,6 +1,7 @@
 //! Push notification registration state and per-group token cache models.
 
 use core::fmt;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -525,7 +526,7 @@ impl Whitenoise {
         }
     }
 
-    fn is_push_group_message_kind(kind: Kind) -> bool {
+    pub(crate) fn is_push_group_message_kind(kind: Kind) -> bool {
         kind == Kind::from(mdk_core::mip05::TOKEN_REQUEST_KIND)
             || kind == Kind::from(mdk_core::mip05::TOKEN_LIST_RESPONSE_KIND)
             || kind == Kind::from(mdk_core::mip05::TOKEN_REMOVAL_KIND)
@@ -566,48 +567,20 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         response: mdk_core::mip05::TokenListResponse,
     ) -> Result<()> {
-        let active_leaf_map = self
+        let active_leaf_indices: HashSet<u32> = self
             .create_mdk_for_account(account.pubkey)?
-            .group_leaf_map(mls_group_id)?;
-        let mut tx = self.database.pool.begin().await?;
+            .group_leaf_map(mls_group_id)?
+            .into_keys()
+            .collect();
 
-        for token in response.tokens {
-            if !active_leaf_map.contains_key(&token.leaf_index) {
-                continue;
-            }
-
-            let now = Utc::now().timestamp_millis();
-            sqlx::query(
-                "INSERT INTO group_push_tokens (
-                     account_pubkey,
-                     mls_group_id,
-                     leaf_index,
-                     server_pubkey,
-                     relay_hint,
-                     encrypted_token,
-                     created_at,
-                     updated_at
-                 )
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
-                     server_pubkey = excluded.server_pubkey,
-                     relay_hint = excluded.relay_hint,
-                     encrypted_token = excluded.encrypted_token,
-                     updated_at = excluded.updated_at",
-            )
-            .bind(account.pubkey.to_hex())
-            .bind(mls_group_id.as_slice())
-            .bind(i64::from(token.leaf_index))
-            .bind(token.token_tag.server_pubkey.to_hex())
-            .bind(token.token_tag.relay_hint.to_string())
-            .bind(token.token_tag.encrypted_token.to_base64())
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
+        GroupPushToken::upsert_active_token_list_response(
+            &account.pubkey,
+            mls_group_id,
+            &active_leaf_indices,
+            response.tokens,
+            &self.database,
+        )
+        .await?;
 
         Ok(())
     }
@@ -788,7 +761,8 @@ mod tests {
         test_utils::{
             count_published_events_for_account, create_mock_whitenoise,
             create_nostr_group_config_data, setup_multiple_test_accounts,
-            wait_for_key_package_publication, wait_for_published_event_count,
+            wait_for_exact_published_event_count, wait_for_key_package_publication,
+            wait_for_published_event_count,
         },
     };
 
@@ -855,23 +829,6 @@ mod tests {
         .await;
 
         group_id
-    }
-
-    async fn wait_for_exact_published_event_count(
-        whitenoise: &Whitenoise,
-        account: &Account,
-        expected_count: usize,
-    ) {
-        for _ in 0..20 {
-            let count = count_published_events_for_account(whitenoise, account).await;
-            if count == expected_count {
-                return;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        panic!("timed out waiting for published event count {expected_count}");
     }
 
     #[tokio::test]

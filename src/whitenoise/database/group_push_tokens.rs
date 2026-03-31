@@ -1,6 +1,7 @@
 //! Database operations for cached per-group push tokens.
 
 use core::fmt;
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
@@ -220,6 +221,59 @@ impl GroupPushToken {
             .into_iter()
             .map(|(mls_group_id_bytes,)| GroupId::from_slice(&mls_group_id_bytes))
             .collect())
+    }
+
+    #[perf_instrument("db::group_push_tokens")]
+    pub(crate) async fn upsert_active_token_list_response(
+        account_pubkey: &PublicKey,
+        mls_group_id: &GroupId,
+        active_leaf_indices: &HashSet<u32>,
+        tokens: Vec<mdk_core::mip05::LeafTokenTag>,
+        database: &Database,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = database.pool.begin().await?;
+
+        for token in tokens {
+            if !active_leaf_indices.contains(&token.leaf_index) {
+                continue;
+            }
+
+            let now = Utc::now().timestamp_millis();
+            sqlx::query(
+                "INSERT INTO group_push_tokens (
+                     account_pubkey,
+                     mls_group_id,
+                     leaf_index,
+                     server_pubkey,
+                     relay_hint,
+                     encrypted_token,
+                     created_at,
+                     updated_at
+                 )
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                     server_pubkey = excluded.server_pubkey,
+                     relay_hint = excluded.relay_hint,
+                     encrypted_token = excluded.encrypted_token,
+                     updated_at = excluded.updated_at",
+            )
+            .bind(account_pubkey.to_hex())
+            .bind(mls_group_id.as_slice())
+            .bind(i64::from(token.leaf_index))
+            .bind(token.token_tag.server_pubkey.to_hex())
+            .bind(super::utils::normalize_relay_url(
+                &token.token_tag.relay_hint,
+            ))
+            .bind(token.token_tag.encrypted_token.to_base64())
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(())
     }
 }
 

@@ -889,6 +889,23 @@ pub mod test_utils {
         usize::try_from(count.0).unwrap()
     }
 
+    pub(crate) async fn wait_for_exact_published_event_count(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        expected_count: usize,
+    ) {
+        for _ in 0..20 {
+            let count = count_published_events_for_account(whitenoise, account).await;
+            if count == expected_count {
+                return;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        panic!("timed out waiting for published event count {expected_count}");
+    }
+
     /// Wait for local test relays to be ready
     async fn wait_for_test_relays() {
         use std::time::Duration;
