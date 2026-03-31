@@ -846,10 +846,11 @@ impl Whitenoise {
         group_id: &GroupId,
         token_tag: Option<&TokenTag>,
     ) -> Result<()> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let leaf_index = mdk.own_leaf_index(group_id)?;
+
         match token_tag {
             Some(token_tag) => {
-                let mdk = self.create_mdk_for_account(account.pubkey)?;
-                let leaf_index = mdk.own_leaf_index(group_id)?;
                 GroupPushToken::upsert(
                     &account.pubkey,
                     group_id,
@@ -863,8 +864,6 @@ impl Whitenoise {
                 .await?;
             }
             None => {
-                let mdk = self.create_mdk_for_account(account.pubkey)?;
-                let leaf_index = mdk.own_leaf_index(group_id)?;
                 GroupPushToken::delete(&account.pubkey, group_id, leaf_index, &self.database)
                     .await?;
             }
