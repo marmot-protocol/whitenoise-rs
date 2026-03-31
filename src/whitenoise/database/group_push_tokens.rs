@@ -154,8 +154,8 @@ impl GroupPushToken {
                  updated_at
              )
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_pubkey, mls_group_id, member_pubkey) DO UPDATE SET
-                 leaf_index = excluded.leaf_index,
+             ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                 member_pubkey = excluded.member_pubkey,
                  server_pubkey = excluded.server_pubkey,
                  relay_hint = excluded.relay_hint,
                  encrypted_token = excluded.encrypted_token,
@@ -287,8 +287,8 @@ impl GroupPushToken {
                      updated_at
                  )
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(account_pubkey, mls_group_id, member_pubkey) DO UPDATE SET
-                     leaf_index = excluded.leaf_index,
+                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                     member_pubkey = excluded.member_pubkey,
                      server_pubkey = excluded.server_pubkey,
                      relay_hint = excluded.relay_hint,
                      encrypted_token = excluded.encrypted_token,
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_group_push_tokens_upsert_moves_member_to_new_leaf() {
+    async fn test_group_push_tokens_upsert_allows_multiple_leaves_for_same_member() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let mls_group_id = make_group_id(9);
@@ -416,7 +416,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let updated = GroupPushToken::upsert(
+        let second_leaf = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
             &member_pubkey,
@@ -436,10 +436,65 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(updated.leaf_index, 7);
-        assert_eq!(updated.server_pubkey, second_server);
-        assert_eq!(stored[0], updated);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(second_leaf.leaf_index, 7);
+        assert_eq!(second_leaf.server_pubkey, second_server);
+        assert!(stored.iter().any(|token| token.leaf_index == 3));
+        assert!(stored.iter().any(|token| token == &second_leaf));
+    }
+
+    #[tokio::test]
+    async fn test_group_push_tokens_delete_by_member_pubkey_removes_all_leaves() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mls_group_id = make_group_id(10);
+        let member_pubkey = Keys::generate().public_key();
+        let first_server = Keys::generate().public_key();
+        let second_server = Keys::generate().public_key();
+
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &first_server,
+            None,
+            "ciphertext-one",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            7,
+            &second_server,
+            None,
+            "ciphertext-two",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let deleted = GroupPushToken::delete_by_member_pubkey(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(stored.is_empty());
     }
 
     #[tokio::test]

@@ -95,7 +95,7 @@ impl Whitenoise {
     ) -> Result<()> {
         if is_push_group_message_kind(message.kind) {
             if let Err(error) = self
-                .handle_push_application_message(account, outcome, &group_id, &message)
+                .handle_push_application_message(account, outcome, &message)
                 .await
             {
                 tracing::warn!(
@@ -119,7 +119,6 @@ impl Whitenoise {
         &self,
         account: &Account,
         outcome: &MessageProcessingOutcome,
-        _group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
         self.handle_received_push_group_message(

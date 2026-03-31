@@ -20,14 +20,14 @@ CREATE TABLE group_push_tokens (
     FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX idx_group_push_tokens_account_group_member
-    ON group_push_tokens(account_pubkey, mls_group_id, member_pubkey);
+CREATE UNIQUE INDEX idx_group_push_tokens_account_group_leaf
+    ON group_push_tokens(account_pubkey, mls_group_id, leaf_index);
 
 CREATE INDEX idx_group_push_tokens_account_group
     ON group_push_tokens(account_pubkey, mls_group_id);
 
-CREATE INDEX idx_group_push_tokens_account_group_leaf
-    ON group_push_tokens(account_pubkey, mls_group_id, leaf_index);
+CREATE INDEX idx_group_push_tokens_account_group_member
+    ON group_push_tokens(account_pubkey, mls_group_id, member_pubkey);
 
 CREATE INDEX idx_group_push_tokens_account_server
     ON group_push_tokens(account_pubkey, server_pubkey);

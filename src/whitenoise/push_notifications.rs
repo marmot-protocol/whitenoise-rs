@@ -1,7 +1,6 @@
 //! Push notification registration state and per-group token cache models.
 
 use core::fmt;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,24 +207,34 @@ async fn group_push_token_tags_for_response_with(
 ) -> Result<Vec<LeafTokenTag>> {
     let tokens =
         GroupPushToken::find_by_account_and_group(account_pubkey, group_id, database).await?;
-    let active_leaf_indices_by_member: HashMap<PublicKey, u32> = mdk
-        .group_leaf_map(group_id)?
-        .into_iter()
-        .map(|(leaf_index, member_pubkey)| (member_pubkey, leaf_index))
-        .collect();
+    let active_leaf_map = mdk.group_leaf_map(group_id)?;
 
     let mut response_tokens = Vec::with_capacity(tokens.len());
     for token in tokens {
-        let Some(leaf_index) = active_leaf_indices_by_member.get(&token.member_pubkey) else {
+        let Some(active_member_pubkey) = active_leaf_map.get(&token.leaf_index) else {
             tracing::warn!(
                 target: "whitenoise::push_notifications",
                 account = %account_pubkey.to_hex(),
                 group_id = %hex::encode(group_id.as_slice()),
                 member_pubkey = %token.member_pubkey.to_hex(),
-                "Skipping cached push token for inactive group member"
+                leaf_index = token.leaf_index,
+                "Skipping cached push token for inactive group leaf"
             );
             continue;
         };
+
+        if active_member_pubkey != &token.member_pubkey {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                account = %account_pubkey.to_hex(),
+                group_id = %hex::encode(group_id.as_slice()),
+                member_pubkey = %token.member_pubkey.to_hex(),
+                leaf_index = token.leaf_index,
+                active_member_pubkey = %active_member_pubkey.to_hex(),
+                "Skipping cached push token whose member pubkey no longer matches the active leaf"
+            );
+            continue;
+        }
 
         let Some(relay_hint) = token.relay_hint.clone() else {
             tracing::warn!(
@@ -253,7 +262,7 @@ async fn group_push_token_tags_for_response_with(
         };
 
         response_tokens.push(LeafTokenTag {
-            leaf_index: *leaf_index,
+            leaf_index: token.leaf_index,
             token_tag: TokenTag {
                 encrypted_token,
                 server_pubkey: token.server_pubkey,
@@ -436,16 +445,16 @@ impl Whitenoise {
                 );
             }
             Mip05GroupMessage::TokenRemoval(_) => {
-                sender_leaf_index.ok_or_else(|| {
+                let leaf_index = sender_leaf_index.ok_or_else(|| {
                     WhitenoiseError::InvalidEvent(
                         "MIP-05 token removal missing sender leaf index".to_string(),
                     )
                 })?;
 
-                GroupPushToken::delete_by_member_pubkey(
+                GroupPushToken::delete(
                     &account.pubkey,
                     &message.mls_group_id,
-                    &message.event.pubkey,
+                    leaf_index,
                     &self.database,
                 )
                 .await?;
@@ -610,42 +619,48 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let active_leaf_map = mdk.group_leaf_map(group_id)?;
-        let active_leaf_indices_by_member: HashMap<PublicKey, u32> = active_leaf_map
-            .into_iter()
-            .map(|(leaf_index, member_pubkey)| (member_pubkey, leaf_index))
-            .collect();
         let cached_tokens =
             GroupPushToken::find_by_account_and_group(&account.pubkey, group_id, &self.database)
                 .await?;
 
         for token in cached_tokens {
-            let Some(active_leaf_index) = active_leaf_indices_by_member.get(&token.member_pubkey)
-            else {
-                GroupPushToken::delete_by_member_pubkey(
-                    &account.pubkey,
-                    group_id,
-                    &token.member_pubkey,
-                    &self.database,
-                )
-                .await?;
-                continue;
-            };
+            match active_leaf_map.get(&token.leaf_index) {
+                Some(active_member_pubkey) if active_member_pubkey == &token.member_pubkey => {
+                    continue;
+                }
+                Some(_) => {
+                    GroupPushToken::delete(
+                        &account.pubkey,
+                        group_id,
+                        token.leaf_index,
+                        &self.database,
+                    )
+                    .await?;
+                }
+                None => {
+                    let member_still_active = active_leaf_map
+                        .values()
+                        .any(|member_pubkey| member_pubkey == &token.member_pubkey);
 
-            if token.leaf_index == *active_leaf_index {
-                continue;
+                    if member_still_active {
+                        GroupPushToken::delete(
+                            &account.pubkey,
+                            group_id,
+                            token.leaf_index,
+                            &self.database,
+                        )
+                        .await?;
+                    } else {
+                        GroupPushToken::delete_by_member_pubkey(
+                            &account.pubkey,
+                            group_id,
+                            &token.member_pubkey,
+                            &self.database,
+                        )
+                        .await?;
+                    }
+                }
             }
-
-            GroupPushToken::upsert(
-                &account.pubkey,
-                group_id,
-                &token.member_pubkey,
-                *active_leaf_index,
-                &token.server_pubkey,
-                token.relay_hint.as_ref(),
-                &token.encrypted_token,
-                &self.database,
-            )
-            .await?;
         }
 
         Ok(())
@@ -848,13 +863,10 @@ impl Whitenoise {
                 .await?;
             }
             None => {
-                GroupPushToken::delete_by_member_pubkey(
-                    &account.pubkey,
-                    group_id,
-                    &account.pubkey,
-                    &self.database,
-                )
-                .await?;
+                let mdk = self.create_mdk_for_account(account.pubkey)?;
+                let leaf_index = mdk.own_leaf_index(group_id)?;
+                GroupPushToken::delete(&account.pubkey, group_id, leaf_index, &self.database)
+                    .await?;
             }
         }
 
