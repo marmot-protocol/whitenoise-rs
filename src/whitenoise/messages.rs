@@ -707,7 +707,8 @@ impl Whitenoise {
             read_marker.as_ref(),
             minimum_val,
             &self.database,
-        ).await?)
+        )
+        .await?)
     }
 
     /// Fetch a single aggregated message by its event ID.

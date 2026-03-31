@@ -3193,8 +3193,14 @@ mod tests {
 
         // Insert 3 messages: seeds 1, 2, 3
         for i in 1u8..=3 {
-            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
-                .await;
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
         }
 
         // Delete seed-2 message
