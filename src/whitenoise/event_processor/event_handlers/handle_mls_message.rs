@@ -15,6 +15,7 @@ use crate::{
         media_files::MediaFile,
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
+        push_notifications::is_push_group_message_kind,
     },
 };
 #[cfg(test)]
@@ -92,9 +93,21 @@ impl Whitenoise {
         inner_event: UnsignedEvent,
         message: Message,
     ) -> Result<()> {
-        if Self::is_push_group_message_kind(message.kind) {
-            self.handle_push_application_message(account, outcome, &group_id, &message)
-                .await;
+        if is_push_group_message_kind(message.kind) {
+            if let Err(error) = self
+                .handle_push_application_message(account, outcome, &group_id, &message)
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    account = %account.pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    sender_leaf_index = ?outcome.context.sender_leaf_index,
+                    message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
+                    error = %error,
+                    "Failed to reconcile received MIP-05 group message after MLS acceptance"
+                );
+            }
             return Ok(());
         }
 
@@ -106,23 +119,16 @@ impl Whitenoise {
         &self,
         account: &Account,
         outcome: &MessageProcessingOutcome,
-        group_id: &GroupId,
+        _group_id: &GroupId,
         message: &Message,
-    ) {
-        if let Err(error) = self
-            .handle_received_push_group_message(account, message, outcome.context.sender_leaf_index)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::event_handlers::handle_mls_message",
-                account = %account.pubkey.to_hex(),
-                group_id = %hex::encode(group_id.as_slice()),
-                sender_leaf_index = ?outcome.context.sender_leaf_index,
-                message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
-                error = %error,
-                "Failed to reconcile received MIP-05 group message after MLS acceptance"
-            );
-        }
+    ) -> Result<()> {
+        self.handle_received_push_group_message(
+            account,
+            message,
+            outcome.context.sender_leaf_index,
+        )
+        .await?;
+        Ok(())
     }
 
     #[perf_instrument("event_handlers")]
@@ -799,7 +805,7 @@ mod tests {
     use super::*;
     use crate::whitenoise::{
         aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus,
-        push_notifications::GroupPushToken, relays::Relay, test_utils::*,
+        push_notifications::GroupPushToken, test_utils::*,
     };
 
     fn make_token_tag(seed: u8) -> TokenTag {
@@ -808,6 +814,19 @@ mod tests {
             server_pubkey: Keys::generate().public_key(),
             relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
         }
+    }
+
+    async fn setup_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        setup_two_member_group_with_accepted_account_groups(
+            whitenoise,
+            admin_account,
+            member_account,
+        )
+        .await
     }
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
@@ -1530,6 +1549,7 @@ mod tests {
         GroupPushToken::upsert(
             &member_account.pubkey,
             &group_id,
+            &admin_account.pubkey,
             admin_leaf_index,
             &token_tag.server_pubkey,
             Some(&token_tag.relay_hint),
@@ -1698,6 +1718,7 @@ mod tests {
         GroupPushToken::upsert(
             &member_two.pubkey,
             &group_id,
+            &member_one.pubkey,
             removed_leaf_index,
             &stale_token.server_pubkey,
             Some(&stale_token.relay_hint),
@@ -1736,113 +1757,6 @@ mod tests {
                 .all(|token| token.leaf_index != removed_leaf_index),
             "inactive leaf token should be pruned after commit processing"
         );
-    }
-
-    /// Helper: create a group via MDK directly and have a member join via
-    /// welcome giftwrap, returning the group ID. This gives both the admin's
-    /// and member's MDK instances full MLS state for the group.
-    async fn setup_two_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        // Fetch the member's key package from relays
-        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
-        let key_pkg_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(member_account.pubkey, &relay_urls)
-            .await
-            .unwrap()
-            .expect("member must have a published key package");
-
-        // Create group via MDK directly so we get the welcome rumor
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
-            .unwrap();
-
-        let group_id = create_result.group.mls_group_id.clone();
-        let welcome_rumor = create_result
-            .welcome_rumors
-            .first()
-            .expect("welcome rumor exists")
-            .clone();
-
-        // Build giftwrap so the member can process the welcome
-        let admin_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-        let giftwrap =
-            EventBuilder::gift_wrap(&admin_signer, &member_account.pubkey, welcome_rumor, vec![])
-                .await
-                .unwrap();
-
-        // Member processes the welcome -- now their MDK has the group
-        whitenoise
-            .handle_giftwrap(member_account, giftwrap)
-            .await
-            .expect("member should process welcome successfully");
-
-        group_id
-    }
-
-    async fn setup_three_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        first_member: &Account,
-        second_member: &Account,
-    ) -> GroupId {
-        let member_accounts = [first_member, second_member];
-        let relay_urls = Relay::urls(&first_member.key_package_relays(whitenoise).await.unwrap());
-        let mut key_package_events = Vec::new();
-
-        for member in member_accounts {
-            let key_package_event = whitenoise
-                .relay_control
-                .fetch_user_key_package(member.pubkey, &relay_urls)
-                .await
-                .unwrap()
-                .expect("member must have a published key package");
-            key_package_events.push(key_package_event);
-        }
-
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                key_package_events,
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
-            .unwrap();
-
-        let group_id = create_result.group.mls_group_id.clone();
-        let admin_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-
-        for (member, welcome_rumor) in member_accounts.iter().zip(create_result.welcome_rumors) {
-            let giftwrap =
-                EventBuilder::gift_wrap(&admin_signer, &member.pubkey, welcome_rumor, vec![])
-                    .await
-                    .unwrap();
-
-            whitenoise
-                .handle_giftwrap(member, giftwrap)
-                .await
-                .expect("member should process welcome successfully");
-        }
-
-        group_id
     }
 
     /// Test that auto-committed proposals (e.g., admin auto-commits a

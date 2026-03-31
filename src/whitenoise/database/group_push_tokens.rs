@@ -1,7 +1,7 @@
 //! Database operations for cached per-group push tokens.
 
 use core::fmt;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
@@ -14,6 +14,7 @@ use crate::whitenoise::push_notifications::GroupPushToken;
 struct GroupPushTokenRow {
     account_pubkey: PublicKey,
     mls_group_id: GroupId,
+    member_pubkey: PublicKey,
     leaf_index: u32,
     server_pubkey: PublicKey,
     relay_hint: Option<RelayUrl>,
@@ -27,6 +28,7 @@ impl fmt::Debug for GroupPushTokenRow {
         f.debug_struct("GroupPushTokenRow")
             .field("account_pubkey", &self.account_pubkey)
             .field("mls_group_id", &self.mls_group_id)
+            .field("member_pubkey", &self.member_pubkey)
             .field("leaf_index", &self.leaf_index)
             .field("server_pubkey", &self.server_pubkey)
             .field("relay_hint", &self.relay_hint)
@@ -56,6 +58,13 @@ where
 
         let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
         let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
+
+        let member_pubkey_str: String = row.try_get("member_pubkey")?;
+        let member_pubkey =
+            PublicKey::parse(&member_pubkey_str).map_err(|error| sqlx::Error::ColumnDecode {
+                index: "member_pubkey".to_string(),
+                source: Box::new(error),
+            })?;
 
         let leaf_index_int: i64 = row.try_get("leaf_index")?;
         let leaf_index =
@@ -88,6 +97,7 @@ where
         Ok(Self {
             account_pubkey,
             mls_group_id,
+            member_pubkey,
             leaf_index,
             server_pubkey,
             relay_hint,
@@ -103,6 +113,7 @@ impl From<GroupPushTokenRow> for GroupPushToken {
         Self {
             account_pubkey: row.account_pubkey,
             mls_group_id: row.mls_group_id,
+            member_pubkey: row.member_pubkey,
             leaf_index: row.leaf_index,
             server_pubkey: row.server_pubkey,
             relay_hint: row.relay_hint,
@@ -121,6 +132,7 @@ impl GroupPushToken {
     pub(crate) async fn upsert(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
+        member_pubkey: &PublicKey,
         leaf_index: u32,
         server_pubkey: &PublicKey,
         relay_hint: Option<&RelayUrl>,
@@ -133,6 +145,7 @@ impl GroupPushToken {
             "INSERT INTO group_push_tokens (
                  account_pubkey,
                  mls_group_id,
+                 member_pubkey,
                  leaf_index,
                  server_pubkey,
                  relay_hint,
@@ -140,8 +153,9 @@ impl GroupPushToken {
                  created_at,
                  updated_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(account_pubkey, mls_group_id, member_pubkey) DO UPDATE SET
+                 leaf_index = excluded.leaf_index,
                  server_pubkey = excluded.server_pubkey,
                  relay_hint = excluded.relay_hint,
                  encrypted_token = excluded.encrypted_token,
@@ -150,6 +164,7 @@ impl GroupPushToken {
         )
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
+        .bind(member_pubkey.to_hex())
         .bind(i64::from(leaf_index))
         .bind(server_pubkey.to_hex())
         .bind(relay_hint.map(super::utils::normalize_relay_url))
@@ -176,6 +191,26 @@ impl GroupPushToken {
         .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
         .bind(i64::from(leaf_index))
+        .execute(&database.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[perf_instrument("db::group_push_tokens")]
+    pub(crate) async fn delete_by_member_pubkey(
+        account_pubkey: &PublicKey,
+        mls_group_id: &GroupId,
+        member_pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM group_push_tokens
+             WHERE account_pubkey = ? AND mls_group_id = ? AND member_pubkey = ?",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(mls_group_id.as_slice())
+        .bind(member_pubkey.to_hex())
         .execute(&database.pool)
         .await?;
 
@@ -227,22 +262,23 @@ impl GroupPushToken {
     pub(crate) async fn upsert_active_token_list_response(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
-        active_leaf_indices: &HashSet<u32>,
+        active_leaf_map: &BTreeMap<u32, PublicKey>,
         tokens: Vec<mdk_core::mip05::LeafTokenTag>,
         database: &Database,
     ) -> Result<(), sqlx::Error> {
         let mut tx = database.pool.begin().await?;
+        let now = Utc::now().timestamp_millis();
 
         for token in tokens {
-            if !active_leaf_indices.contains(&token.leaf_index) {
+            let Some(member_pubkey) = active_leaf_map.get(&token.leaf_index) else {
                 continue;
-            }
+            };
 
-            let now = Utc::now().timestamp_millis();
             sqlx::query(
                 "INSERT INTO group_push_tokens (
                      account_pubkey,
                      mls_group_id,
+                     member_pubkey,
                      leaf_index,
                      server_pubkey,
                      relay_hint,
@@ -250,8 +286,9 @@ impl GroupPushToken {
                      created_at,
                      updated_at
                  )
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(account_pubkey, mls_group_id, member_pubkey) DO UPDATE SET
+                     leaf_index = excluded.leaf_index,
                      server_pubkey = excluded.server_pubkey,
                      relay_hint = excluded.relay_hint,
                      encrypted_token = excluded.encrypted_token,
@@ -259,6 +296,7 @@ impl GroupPushToken {
             )
             .bind(account_pubkey.to_hex())
             .bind(mls_group_id.as_slice())
+            .bind(member_pubkey.to_hex())
             .bind(i64::from(token.leaf_index))
             .bind(token.token_tag.server_pubkey.to_hex())
             .bind(super::utils::normalize_relay_url(
@@ -295,11 +333,13 @@ mod tests {
         let mls_group_id = make_group_id(1);
         let first_server = Keys::generate().public_key();
         let second_server = Keys::generate().public_key();
+        let member_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://server.example.com/").unwrap();
 
         let created = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
+            &member_pubkey,
             7,
             &first_server,
             Some(&relay_hint),
@@ -315,6 +355,7 @@ mod tests {
         let replaced = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
+            &member_pubkey,
             7,
             &second_server,
             None,
@@ -355,17 +396,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_group_push_tokens_upsert_moves_member_to_new_leaf() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mls_group_id = make_group_id(9);
+        let member_pubkey = Keys::generate().public_key();
+        let first_server = Keys::generate().public_key();
+        let second_server = Keys::generate().public_key();
+
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &first_server,
+            None,
+            "ciphertext-one",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let updated = GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            7,
+            &second_server,
+            None,
+            "ciphertext-two",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(updated.leaf_index, 7);
+        assert_eq!(updated.server_pubkey, second_server);
+        assert_eq!(stored[0], updated);
+    }
+
+    #[tokio::test]
     async fn test_group_push_tokens_are_scoped_by_account_and_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account_one = whitenoise.create_identity().await.unwrap();
         let account_two = whitenoise.create_identity().await.unwrap();
         let group_one = make_group_id(11);
         let group_two = make_group_id(22);
+        let first_member = Keys::generate().public_key();
+        let second_member = Keys::generate().public_key();
+        let third_member = Keys::generate().public_key();
         let server_pubkey = Keys::generate().public_key();
 
         GroupPushToken::upsert(
             &account_one.pubkey,
             &group_one,
+            &first_member,
             1,
             &server_pubkey,
             None,
@@ -377,6 +469,7 @@ mod tests {
         GroupPushToken::upsert(
             &account_one.pubkey,
             &group_two,
+            &second_member,
             2,
             &server_pubkey,
             None,
@@ -388,6 +481,7 @@ mod tests {
         GroupPushToken::upsert(
             &account_two.pubkey,
             &group_one,
+            &third_member,
             3,
             &server_pubkey,
             None,
@@ -439,10 +533,12 @@ mod tests {
         let mls_group_id = make_group_id(33);
         let first_server = Keys::generate().public_key();
         let second_server = Keys::generate().public_key();
+        let member_pubkey = Keys::generate().public_key();
 
         GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
+            &member_pubkey,
             4,
             &first_server,
             None,
@@ -471,6 +567,7 @@ mod tests {
         let updated = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
+            &member_pubkey,
             4,
             &second_server,
             None,
@@ -492,9 +589,12 @@ mod tests {
         let mls_group_id = make_group_id(44);
         let server_pubkey = Keys::generate().public_key();
 
+        let member_pubkey = Keys::generate().public_key();
+
         let error = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
+            &member_pubkey,
             1,
             &server_pubkey,
             None,
@@ -512,6 +612,7 @@ mod tests {
         let row = GroupPushTokenRow {
             account_pubkey: Keys::generate().public_key(),
             mls_group_id: make_group_id(55),
+            member_pubkey: Keys::generate().public_key(),
             leaf_index: 2,
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),

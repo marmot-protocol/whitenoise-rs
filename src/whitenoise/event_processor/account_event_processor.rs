@@ -389,81 +389,13 @@ fn validate_giftwrap_target(account: &Account, event: &Event) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use mdk_core::prelude::GroupId;
     use nostr_sdk::prelude::*;
     use sha2::{Digest, Sha256};
 
     use crate::relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream};
     use crate::types::EventSource;
-    use crate::whitenoise::Whitenoise;
     use crate::whitenoise::accounts::Account;
-    use crate::whitenoise::accounts_groups::AccountGroup;
-    use crate::whitenoise::group_information::GroupInformation;
-    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
-
-    async fn setup_two_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
-        let key_pkg_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(member_account.pubkey, &relay_urls)
-            .await
-            .unwrap()
-            .expect("member must have a published key package");
-
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
-            .unwrap();
-
-        let group_id = create_result.group.mls_group_id.clone();
-        let welcome_rumor = create_result
-            .welcome_rumors
-            .first()
-            .expect("welcome rumor exists")
-            .clone();
-        let admin_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-        let giftwrap =
-            EventBuilder::gift_wrap(&admin_signer, &member_account.pubkey, welcome_rumor, vec![])
-                .await
-                .unwrap();
-
-        whitenoise
-            .handle_giftwrap(member_account, giftwrap)
-            .await
-            .expect("member should process welcome successfully");
-
-        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
-            .await
-            .unwrap();
-
-        let (admin_group, _) =
-            AccountGroup::get_or_create(whitenoise, &admin_account.pubkey, &group_id, None)
-                .await
-                .unwrap();
-        admin_group.accept(whitenoise).await.unwrap();
-
-        let (member_group, _) =
-            AccountGroup::get_or_create(whitenoise, &member_account.pubkey, &group_id, None)
-                .await
-                .unwrap();
-        member_group.accept(whitenoise).await.unwrap();
-
-        group_id
-    }
 
     #[tokio::test]
     async fn test_extract_pubkey_from_subscription_id() {
@@ -551,7 +483,12 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let group_id = setup_two_member_group_with_accepted_account_groups(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
         let admin_mdk = whitenoise
             .create_mdk_for_account(admin_account.pubkey)
             .unwrap();
