@@ -60,6 +60,25 @@ pub(crate) struct EphemeralScope {
     scope_account_pubkey: Option<PublicKey>,
 }
 
+#[derive(Debug)]
+pub(crate) enum MessagePublishResult {
+    Published(Output<EventId>),
+    Failed,
+}
+
+impl MessagePublishResult {
+    pub(crate) fn output(&self) -> Option<&Output<EventId>> {
+        match self {
+            Self::Published(output) => Some(output),
+            Self::Failed => None,
+        }
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        self.output().is_some()
+    }
+}
+
 impl EphemeralPlane {
     pub(crate) fn new(
         config: EphemeralPlaneConfig,
@@ -514,7 +533,7 @@ impl EphemeralPlane {
         group_id: &GroupId,
         database: &Database,
         stream_manager: &Arc<MessageStreamManager>,
-    ) -> bool {
+    ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
             Ok(output) if !output.success.is_empty() => {
                 let status = DeliveryStatus::Sent(output.success.len());
@@ -526,7 +545,7 @@ impl EphemeralPlane {
                     stream_manager,
                 )
                 .await;
-                true
+                MessagePublishResult::Published(output)
             }
             Ok(output) => {
                 tracing::warn!(
@@ -543,7 +562,7 @@ impl EphemeralPlane {
                     stream_manager,
                 )
                 .await;
-                false
+                MessagePublishResult::Failed
             }
             Err(error) => {
                 tracing::warn!(
@@ -559,7 +578,7 @@ impl EphemeralPlane {
                     stream_manager,
                 )
                 .await;
-                false
+                MessagePublishResult::Failed
             }
         }
     }

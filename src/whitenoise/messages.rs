@@ -13,6 +13,7 @@ use crate::{
             ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
         },
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
+        push_notifications::publish_notification_requests_after_chat_delivery_with,
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
@@ -100,7 +101,10 @@ impl Whitenoise {
         // Spawn background publish task with retries + delivery tracking for all kinds.
         // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
         let ephemeral = self.relay_control.ephemeral();
+        let user_relay_sync = self.user_relay_sync_context();
+        let config = self.config.clone();
         let event_id_str = event_id.to_string();
+        let message_id = event_id;
         let account_pubkey = account.pubkey;
         let database = self.database.clone();
         let stream_manager = self.message_stream_manager.clone();
@@ -110,7 +114,7 @@ impl Whitenoise {
         let reaction_content = mdk_message.content.clone();
 
         tokio::spawn(async move {
-            let success = ephemeral
+            let publish_result = ephemeral
                 .publish_message_event(
                     message_event,
                     &account_pubkey,
@@ -122,8 +126,29 @@ impl Whitenoise {
                 )
                 .await;
 
+            if kind == 9
+                && let Some(_publish_output) = publish_result.output()
+                && let Err(error) = publish_notification_requests_after_chat_delivery_with(
+                    &config,
+                    &database,
+                    &user_relay_sync,
+                    &ephemeral,
+                    account_pubkey,
+                    &group_id_clone,
+                    &message_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account_pubkey.to_hex(),
+                    error = %error,
+                    "Failed to publish best-effort notification requests after chat delivery"
+                );
+            }
+
             // On failure, reverse optimistic aggregated effects for reactions/deletions
-            if !success {
+            if !publish_result.succeeded() {
                 Whitenoise::cascade_delivery_failure(
                     kind,
                     &event_id_str,

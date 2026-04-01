@@ -1,16 +1,19 @@
 //! Push notification registration state and per-group token cache models.
 
 use core::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashSet},
+    str::FromStr,
+};
 
 use ::rand::Rng;
 use chrono::{DateTime, Utc};
 use mdk_core::mip05::{
     EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
-    TokenTag, build_token_list_response_rumor, build_token_removal_rumor,
-    build_token_request_rumor, encrypt_push_token, parse_group_message,
+    TokenTag, build_notification_batches, build_token_list_response_rumor,
+    build_token_removal_rumor, build_token_request_rumor, encrypt_push_token, parse_group_message,
 };
 use mdk_core::prelude::{GroupId, group_types::GroupState};
 use mdk_sqlite_storage::MdkSqliteStorage;
@@ -23,8 +26,13 @@ use crate::whitenoise::{
     accounts::Account,
     database::Database,
     error::{Result, WhitenoiseError},
+    relays::{Relay, RelayType},
+    users::UserRelaySyncContext,
 };
-use crate::{perf_instrument, relay_control::RelayControlPlane};
+use crate::{
+    perf_instrument,
+    relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
+};
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -291,6 +299,301 @@ async fn publish_push_group_message_with(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationRelaySource {
+    Cached,
+    Synced,
+    HintFallback,
+}
+
+impl NotificationRelaySource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Synced => "synced",
+            Self::HintFallback => "hint-fallback",
+        }
+    }
+}
+
+fn dedupe_relay_urls(relay_urls: &[RelayUrl]) -> Vec<RelayUrl> {
+    let mut deduped = Vec::with_capacity(relay_urls.len());
+
+    for relay_url in relay_urls {
+        if !deduped.contains(relay_url) {
+            deduped.push(relay_url.clone());
+        }
+    }
+
+    deduped
+}
+
+fn prepare_notification_recipient_tokens(
+    account_pubkey: &PublicKey,
+    cached_tokens: &[GroupPushToken],
+    active_leaf_map: &BTreeMap<u32, PublicKey>,
+    sender_member_pubkey: &PublicKey,
+) -> Vec<TokenTag> {
+    let mut recipient_tokens = Vec::with_capacity(cached_tokens.len());
+    let mut seen_tokens: HashSet<(PublicKey, EncryptedToken)> =
+        HashSet::with_capacity(cached_tokens.len());
+
+    for token in cached_tokens {
+        let Some(active_member_pubkey) = active_leaf_map.get(&token.leaf_index) else {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                account = %account_pubkey.to_hex(),
+                member_pubkey = %token.member_pubkey.to_hex(),
+                leaf_index = token.leaf_index,
+                "Skipping cached push token for inactive group leaf during notification publish"
+            );
+            continue;
+        };
+
+        if active_member_pubkey != &token.member_pubkey {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                account = %account_pubkey.to_hex(),
+                member_pubkey = %token.member_pubkey.to_hex(),
+                leaf_index = token.leaf_index,
+                active_member_pubkey = %active_member_pubkey.to_hex(),
+                "Skipping cached push token whose member pubkey no longer matches the active leaf during notification publish"
+            );
+            continue;
+        }
+
+        if active_member_pubkey == sender_member_pubkey {
+            continue;
+        }
+
+        let Some(relay_hint) = token.relay_hint.clone() else {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                account = %account_pubkey.to_hex(),
+                member_pubkey = %token.member_pubkey.to_hex(),
+                leaf_index = token.leaf_index,
+                "Skipping cached push token without relay hint during notification publish"
+            );
+            continue;
+        };
+
+        let encrypted_token = match EncryptedToken::from_base64(&token.encrypted_token) {
+            Ok(encrypted_token) => encrypted_token,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account_pubkey.to_hex(),
+                    member_pubkey = %token.member_pubkey.to_hex(),
+                    leaf_index = token.leaf_index,
+                    error = %error,
+                    "Skipping cached push token with invalid encrypted payload during notification publish"
+                );
+                continue;
+            }
+        };
+
+        if !seen_tokens.insert((token.server_pubkey, encrypted_token.clone())) {
+            continue;
+        }
+
+        recipient_tokens.push(TokenTag {
+            encrypted_token,
+            server_pubkey: token.server_pubkey,
+            relay_hint,
+        });
+    }
+
+    recipient_tokens
+}
+
+fn notification_token_counts_by_server(tokens: &[TokenTag]) -> BTreeMap<PublicKey, usize> {
+    let mut counts = BTreeMap::new();
+
+    for token in tokens {
+        *counts.entry(token.server_pubkey).or_insert(0) += 1;
+    }
+
+    counts
+}
+
+async fn resolve_notification_server_relays(
+    database: &Database,
+    user_relay_sync: &UserRelaySyncContext,
+    server_pubkey: PublicKey,
+    relay_hints: &[RelayUrl],
+) -> Result<(Vec<RelayUrl>, NotificationRelaySource)> {
+    let (server_user, _created) =
+        crate::whitenoise::users::User::find_or_create_by_pubkey(&server_pubkey, database).await?;
+
+    let cached_relays = server_user.relays(RelayType::Inbox, database).await?;
+    if !cached_relays.is_empty() {
+        return Ok((Relay::urls(&cached_relays), NotificationRelaySource::Cached));
+    }
+
+    let deduped_hints = dedupe_relay_urls(relay_hints);
+    if !deduped_hints.is_empty() {
+        if let Err(error) = user_relay_sync
+            .sync_relay_type_for_pubkey(server_pubkey, RelayType::Inbox, &deduped_hints)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                server_pubkey = %server_pubkey.to_hex(),
+                relay_source = NotificationRelaySource::Synced.as_str(),
+                relay_hint_count = deduped_hints.len(),
+                error = %error,
+                "Failed to sync notification server inbox relays from relay hints"
+            );
+        }
+    }
+
+    let synced_relays = server_user.relays(RelayType::Inbox, database).await?;
+    if !synced_relays.is_empty() {
+        return Ok((Relay::urls(&synced_relays), NotificationRelaySource::Synced));
+    }
+
+    if !deduped_hints.is_empty() {
+        return Ok((deduped_hints, NotificationRelaySource::HintFallback));
+    }
+
+    Ok((Vec::new(), NotificationRelaySource::HintFallback))
+}
+
+async fn publish_notification_batches_best_effort(
+    database: &Database,
+    user_relay_sync: &UserRelaySyncContext,
+    ephemeral: &EphemeralPlane,
+    account_pubkey: PublicKey,
+    token_counts_by_server: &BTreeMap<PublicKey, usize>,
+    batches: Vec<mdk_core::prelude::NotificationEventBatch>,
+) {
+    for batch in batches {
+        let token_count = token_counts_by_server
+            .get(&batch.server_pubkey)
+            .copied()
+            .unwrap_or_default();
+        let event_count = batch.events.len();
+        let relay_resolution = resolve_notification_server_relays(
+            database,
+            user_relay_sync,
+            batch.server_pubkey,
+            &batch.relay_hints,
+        )
+        .await;
+
+        let (relay_urls, relay_source) = match relay_resolution {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    server_pubkey = %batch.server_pubkey.to_hex(),
+                    token_count,
+                    publish_outcome = "relay-resolution-failed",
+                    error = %error,
+                    "Failed to resolve notification server relays"
+                );
+                continue;
+            }
+        };
+
+        if relay_urls.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                server_pubkey = %batch.server_pubkey.to_hex(),
+                token_count,
+                relay_source = relay_source.as_str(),
+                publish_outcome = "skipped-no-relays",
+                "Skipping notification request publish because no server relays were available"
+            );
+            continue;
+        }
+
+        for (event_index, event) in batch.events.into_iter().enumerate() {
+            match ephemeral
+                .publish_event_to(event, &account_pubkey, &relay_urls)
+                .await
+            {
+                Ok(output) => {
+                    tracing::info!(
+                        target: "whitenoise::push_notifications",
+                        server_pubkey = %batch.server_pubkey.to_hex(),
+                        token_count,
+                        relay_source = relay_source.as_str(),
+                        accepted_relays = output.success.len(),
+                        failed_relays = output.failed.len(),
+                        event_index = event_index + 1,
+                        event_count,
+                        publish_outcome = "accepted",
+                        "Published best-effort notification request batch"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::push_notifications",
+                        server_pubkey = %batch.server_pubkey.to_hex(),
+                        token_count,
+                        relay_source = relay_source.as_str(),
+                        event_index = event_index + 1,
+                        event_count,
+                        publish_outcome = "failed",
+                        error = %error,
+                        "Failed to publish best-effort notification request batch"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn publish_notification_requests_after_chat_delivery_with(
+    config: &WhitenoiseConfig,
+    database: &Database,
+    user_relay_sync: &UserRelaySyncContext,
+    ephemeral: &EphemeralPlane,
+    account_pubkey: PublicKey,
+    group_id: &GroupId,
+    _message_id: &EventId,
+) -> Result<()> {
+    let mdk = Account::create_mdk(account_pubkey, &config.data_dir, &config.keyring_service_id)?;
+    let own_leaf_index = mdk.own_leaf_index(group_id)?;
+    let active_leaf_map = mdk.group_leaf_map(group_id)?;
+    let sender_member_pubkey = active_leaf_map
+        .get(&own_leaf_index)
+        .copied()
+        .ok_or_else(|| {
+            WhitenoiseError::Configuration(
+                "sender leaf index missing from active group leaf map".to_string(),
+            )
+        })?;
+    let cached_tokens =
+        GroupPushToken::find_by_account_and_group(&account_pubkey, group_id, database).await?;
+    let recipient_tokens = prepare_notification_recipient_tokens(
+        &account_pubkey,
+        &cached_tokens,
+        &active_leaf_map,
+        &sender_member_pubkey,
+    );
+
+    if recipient_tokens.is_empty() {
+        return Ok(());
+    }
+
+    let token_counts_by_server = notification_token_counts_by_server(&recipient_tokens);
+    let batches = build_notification_batches(recipient_tokens)?;
+
+    publish_notification_batches_best_effort(
+        database,
+        user_relay_sync,
+        ephemeral,
+        account_pubkey,
+        &token_counts_by_server,
+        batches,
+    )
+    .await;
+
+    Ok(())
+}
+
 impl Whitenoise {
     /// Returns the locally stored push registration for `account`, if present.
     #[perf_instrument("push_notifications")]
@@ -300,8 +603,8 @@ impl Whitenoise {
 
     /// Creates or replaces the locally stored push registration for `account`.
     ///
-    /// This only updates local persistence. MLS token sharing and notification
-    /// request publication are handled in later MIP-05 PRs.
+    /// This updates local persistence and, when notifications remain shareable,
+    /// best-effort MIP-05 token sharing for the account's joined groups.
     #[perf_instrument("push_notifications")]
     pub async fn upsert_push_registration(
         &self,
@@ -891,6 +1194,28 @@ impl Whitenoise {
         publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
             .await
     }
+
+    #[perf_instrument("push_notifications")]
+    pub(crate) async fn publish_notification_requests_after_chat_delivery(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        message_id: &EventId,
+    ) -> Result<()> {
+        let user_relay_sync = self.user_relay_sync_context();
+        let ephemeral = self.relay_control.ephemeral();
+
+        publish_notification_requests_after_chat_delivery_with(
+            &self.config,
+            &self.database,
+            &user_relay_sync,
+            &ephemeral,
+            account.pubkey,
+            group_id,
+            message_id,
+        )
+        .await
+    }
 }
 
 fn validate_raw_token(raw_token: &str) -> Result<()> {
@@ -952,15 +1277,564 @@ impl PushRegistration {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeMap, time::Duration};
+
+    use mdk_core::mip05::parse_notification_request_rumor;
     use mdk_core::prelude::NostrGroupDataUpdate;
-    use nostr_sdk::{Keys, RelayUrl};
+    use nostr_sdk::{Filter, Keys, Kind, RelayUrl, nips::nip59};
 
     use super::*;
+    use crate::relay_control::{
+        ephemeral::{EphemeralPlane, EphemeralPlaneConfig},
+        sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy},
+    };
     use crate::whitenoise::test_utils::{
         count_published_events_for_account, create_mock_whitenoise, setup_multiple_test_accounts,
         setup_two_member_group_with_welcome_finalization, wait_for_exact_published_event_count,
         wait_for_key_package_publication, wait_for_published_event_count,
     };
+    use crate::whitenoise::{
+        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus, relays::Relay,
+    };
+
+    fn encrypted_fcm_token_base64(server_pubkey: &PublicKey, raw_token: &str) -> String {
+        let plaintext =
+            PushTokenPlaintext::new(NotificationPlatform::Fcm, raw_token.as_bytes().to_vec())
+                .unwrap();
+
+        encrypt_push_token(server_pubkey, &plaintext)
+            .unwrap()
+            .to_base64()
+    }
+
+    fn test_group_push_token(
+        account_pubkey: PublicKey,
+        group_id: GroupId,
+        member_pubkey: PublicKey,
+        leaf_index: u32,
+        server_pubkey: PublicKey,
+        relay_hint: Option<RelayUrl>,
+        encrypted_token: String,
+    ) -> GroupPushToken {
+        GroupPushToken {
+            account_pubkey,
+            mls_group_id: group_id,
+            member_pubkey,
+            leaf_index,
+            server_pubkey,
+            relay_hint,
+            encrypted_token,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    async fn wait_for_user_inbox_relays_on_network(
+        whitenoise: &Whitenoise,
+        user_pubkey: PublicKey,
+        query_relays: &[RelayUrl],
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if whitenoise
+                    .relay_control
+                    .fetch_user_relays(user_pubkey, RelayType::Inbox, query_relays)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for inbox relay list publication");
+    }
+
+    async fn wait_for_notification_giftwraps(
+        whitenoise: &Whitenoise,
+        relay_urls: &[RelayUrl],
+        receiver_pubkey: PublicKey,
+        expected_count: usize,
+    ) -> Vec<nostr_sdk::Event> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = whitenoise
+                    .relay_control
+                    .ephemeral()
+                    .fetch_events_from(
+                        relay_urls,
+                        Filter::new().kind(Kind::GiftWrap).pubkey(receiver_pubkey),
+                    )
+                    .await
+                    .unwrap();
+                let mut unique_events = Vec::new();
+                let mut seen_ids = std::collections::HashSet::new();
+
+                for event in events {
+                    if seen_ids.insert(event.id) {
+                        unique_events.push(event);
+                    }
+                }
+
+                if unique_events.len() >= expected_count {
+                    return unique_events;
+                }
+
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for notification gift wraps")
+    }
+
+    async fn wait_for_message_sent_status(
+        whitenoise: &Whitenoise,
+        group_id: &GroupId,
+        message_id: &EventId,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = AggregatedMessage::find_by_id(
+                    &message_id.to_string(),
+                    group_id,
+                    &whitenoise.database,
+                )
+                .await
+                .unwrap()
+                .expect("message should stay cached");
+
+                if matches!(message.delivery_status, Some(DeliveryStatus::Sent(_))) {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Sent delivery status");
+    }
+
+    fn test_ephemeral_plane(whitenoise: &Whitenoise) -> EphemeralPlane {
+        EphemeralPlane::new(
+            EphemeralPlaneConfig {
+                timeout: Duration::from_millis(200),
+                reconnect_policy: RelaySessionReconnectPolicy::Disabled,
+                auth_policy: RelaySessionAuthPolicy::Disabled,
+                max_publish_attempts: 1,
+                ad_hoc_relay_ttl: Duration::from_secs(30),
+            },
+            whitenoise.database.clone(),
+            whitenoise.event_sender.clone(),
+            whitenoise.relay_control.observability().clone(),
+        )
+    }
+
+    #[test]
+    fn test_prepare_notification_recipient_tokens_selects_valid_non_sender_tokens() {
+        let account_pubkey = Keys::generate().public_key();
+        let sender_other_device_pubkey = account_pubkey;
+        let recipient_pubkey = Keys::generate().public_key();
+        let mismatched_pubkey = Keys::generate().public_key();
+        let inactive_pubkey = Keys::generate().public_key();
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let group_id = GroupId::from_slice(&[42; 32]);
+        let active_leaf_map = BTreeMap::from([
+            (1u32, account_pubkey),
+            (2u32, sender_other_device_pubkey),
+            (3u32, recipient_pubkey),
+            (4u32, mismatched_pubkey),
+        ]);
+        let cached_tokens = vec![
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                account_pubkey,
+                1,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                encrypted_fcm_token_base64(&server_pubkey, "sender-primary"),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                sender_other_device_pubkey,
+                2,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                encrypted_fcm_token_base64(&server_pubkey, "sender-secondary"),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                recipient_pubkey,
+                3,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                encrypted_fcm_token_base64(&server_pubkey, "recipient-device"),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                recipient_pubkey,
+                3,
+                server_pubkey,
+                None,
+                encrypted_fcm_token_base64(&server_pubkey, "missing-relay-hint"),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                recipient_pubkey,
+                3,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                "not-base64".to_string(),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                recipient_pubkey,
+                4,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                encrypted_fcm_token_base64(&server_pubkey, "mismatched-member"),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id,
+                inactive_pubkey,
+                9,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                encrypted_fcm_token_base64(&server_pubkey, "inactive-member"),
+            ),
+        ];
+
+        let recipient_tokens = prepare_notification_recipient_tokens(
+            &account_pubkey,
+            &cached_tokens,
+            &active_leaf_map,
+            &account_pubkey,
+        );
+
+        assert_eq!(recipient_tokens.len(), 1);
+        assert_eq!(recipient_tokens[0].server_pubkey, server_pubkey);
+        assert_eq!(recipient_tokens[0].relay_hint, relay_hint);
+    }
+
+    #[test]
+    fn test_prepare_notification_recipient_tokens_dedupes_duplicate_tokens_per_server() {
+        let account_pubkey = Keys::generate().public_key();
+        let recipient_pubkey = Keys::generate().public_key();
+        let second_recipient_pubkey = Keys::generate().public_key();
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let group_id = GroupId::from_slice(&[7; 32]);
+        let duplicated_token = encrypted_fcm_token_base64(&server_pubkey, "same-device");
+        let active_leaf_map = BTreeMap::from([
+            (1u32, account_pubkey),
+            (2u32, recipient_pubkey),
+            (3u32, second_recipient_pubkey),
+        ]);
+        let cached_tokens = vec![
+            test_group_push_token(
+                account_pubkey,
+                group_id.clone(),
+                recipient_pubkey,
+                2,
+                server_pubkey,
+                Some(relay_hint.clone()),
+                duplicated_token.clone(),
+            ),
+            test_group_push_token(
+                account_pubkey,
+                group_id,
+                second_recipient_pubkey,
+                3,
+                server_pubkey,
+                Some(relay_hint),
+                duplicated_token,
+            ),
+        ];
+
+        let recipient_tokens = prepare_notification_recipient_tokens(
+            &account_pubkey,
+            &cached_tokens,
+            &active_leaf_map,
+            &account_pubkey,
+        );
+
+        assert_eq!(recipient_tokens.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_notification_recipient_tokens_empty_cache_is_noop() {
+        let account_pubkey = Keys::generate().public_key();
+        let active_leaf_map = BTreeMap::from([(1u32, account_pubkey)]);
+
+        let recipient_tokens = prepare_notification_recipient_tokens(
+            &account_pubkey,
+            &[],
+            &active_leaf_map,
+            &account_pubkey,
+        );
+
+        assert!(recipient_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_notification_requests_after_chat_delivery_publishes_1059_with_expected_446_tokens()
+     {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let mut accounts = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let (member_account, _member_keys) = accounts.remove(0);
+        let (server_account, server_keys) = accounts.remove(0);
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group_with_welcome_finalization(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
+        let server_inbox_relays = server_account.inbox_relays(&whitenoise).await.unwrap();
+        let server_relay_urls = Relay::urls(&server_inbox_relays);
+
+        wait_for_user_inbox_relays_on_network(
+            &whitenoise,
+            server_account.pubkey,
+            &server_relay_urls,
+        )
+        .await;
+
+        let server_user = whitenoise
+            .find_user_by_pubkey(&server_account.pubkey)
+            .await
+            .unwrap();
+        server_user
+            .remove_all_relays(&whitenoise.database)
+            .await
+            .unwrap();
+
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let active_leaf_map = admin_mdk.group_leaf_map(&group_id).unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let member_leaf_index = active_leaf_map
+            .iter()
+            .find_map(|(leaf_index, pubkey)| {
+                (*pubkey == member_account.pubkey).then_some(*leaf_index)
+            })
+            .unwrap();
+        let sender_token = encrypted_fcm_token_base64(&server_account.pubkey, "sender-own-device");
+        let recipient_token = encrypt_push_token(
+            &server_account.pubkey,
+            &PushTokenPlaintext::new(NotificationPlatform::Fcm, b"recipient-device".to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+
+        GroupPushToken::upsert(
+            &admin_account.pubkey,
+            &group_id,
+            &admin_account.pubkey,
+            admin_leaf_index,
+            &server_account.pubkey,
+            Some(&server_relay_urls[0]),
+            &sender_token,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        GroupPushToken::upsert(
+            &admin_account.pubkey,
+            &group_id,
+            &member_account.pubkey,
+            member_leaf_index,
+            &server_account.pubkey,
+            Some(&server_relay_urls[0]),
+            &recipient_token.to_base64(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        whitenoise
+            .send_message_to_group(
+                &admin_account,
+                &group_id,
+                "hello relay-backed notifications".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let giftwraps = wait_for_notification_giftwraps(
+            &whitenoise,
+            &server_relay_urls,
+            server_account.pubkey,
+            1,
+        )
+        .await;
+        let unwrapped = nip59::extract_rumor(&server_keys, &giftwraps[0])
+            .await
+            .unwrap();
+        let parsed = parse_notification_request_rumor(&unwrapped.rumor).unwrap();
+
+        assert_eq!(parsed.tokens, vec![recipient_token]);
+    }
+
+    #[tokio::test]
+    async fn test_publish_notification_batches_best_effort_publishes_multiple_1059_events_for_large_batch()
+     {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let sender_account = whitenoise.create_identity().await.unwrap();
+        let mut server_accounts = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let (server_account, server_keys) = server_accounts.remove(0);
+        let server_inbox_relays = server_account.inbox_relays(&whitenoise).await.unwrap();
+        let server_relay_urls = Relay::urls(&server_inbox_relays);
+
+        wait_for_user_inbox_relays_on_network(
+            &whitenoise,
+            server_account.pubkey,
+            &server_relay_urls,
+        )
+        .await;
+
+        let server_user = whitenoise
+            .find_user_by_pubkey(&server_account.pubkey)
+            .await
+            .unwrap();
+        server_user
+            .remove_all_relays(&whitenoise.database)
+            .await
+            .unwrap();
+
+        let relay_hint = server_relay_urls[0].clone();
+        let token_tags: Vec<TokenTag> = (0..(mdk_core::mip05::MAX_NOTIFICATION_REQUEST_TOKENS + 1))
+            .map(|index| TokenTag {
+                encrypted_token: encrypt_push_token(
+                    &server_account.pubkey,
+                    &PushTokenPlaintext::new(
+                        NotificationPlatform::Fcm,
+                        format!("candidate-token-{index}").into_bytes(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                server_pubkey: server_account.pubkey,
+                relay_hint: relay_hint.clone(),
+            })
+            .collect();
+        let batches = build_notification_batches(token_tags.clone()).unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].events.len() > 1);
+
+        publish_notification_batches_best_effort(
+            &whitenoise.database,
+            &whitenoise.user_relay_sync_context(),
+            &whitenoise.relay_control.ephemeral(),
+            sender_account.pubkey,
+            &notification_token_counts_by_server(&token_tags),
+            batches,
+        )
+        .await;
+
+        let giftwraps = wait_for_notification_giftwraps(
+            &whitenoise,
+            &server_relay_urls,
+            server_account.pubkey,
+            2,
+        )
+        .await;
+        let mut received_tokens = Vec::new();
+
+        for giftwrap in giftwraps {
+            let unwrapped = nip59::extract_rumor(&server_keys, &giftwrap).await.unwrap();
+            let parsed = parse_notification_request_rumor(&unwrapped.rumor).unwrap();
+            received_tokens.extend(parsed.tokens);
+        }
+
+        assert_eq!(received_tokens.len(), token_tags.len());
+    }
+
+    #[tokio::test]
+    async fn test_notification_publish_failure_does_not_change_chat_delivery_status() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let mut member_accounts = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member = member_accounts.remove(0).0;
+
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
+
+        let group_id =
+            setup_two_member_group_with_welcome_finalization(&whitenoise, &creator, &member).await;
+        let send_result = whitenoise
+            .send_message_to_group(&creator, &group_id, "status isolation".to_string(), 9, None)
+            .await
+            .unwrap();
+
+        wait_for_message_sent_status(&whitenoise, &group_id, &send_result.message.id).await;
+
+        let creator_mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
+        let active_leaf_map = creator_mdk.group_leaf_map(&group_id).unwrap();
+        let member_leaf_index = active_leaf_map
+            .iter()
+            .find_map(|(leaf_index, pubkey)| (*pubkey == member.pubkey).then_some(*leaf_index))
+            .unwrap();
+        let unreachable_server_pubkey = Keys::generate().public_key();
+        let unreachable_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
+
+        GroupPushToken::upsert(
+            &creator.pubkey,
+            &group_id,
+            &member.pubkey,
+            member_leaf_index,
+            &unreachable_server_pubkey,
+            Some(&unreachable_relay),
+            &encrypted_fcm_token_base64(&unreachable_server_pubkey, "bad-recipient-device"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let ephemeral = test_ephemeral_plane(&whitenoise);
+        let user_relay_sync = whitenoise.user_relay_sync_context();
+
+        publish_notification_requests_after_chat_delivery_with(
+            &whitenoise.config,
+            &whitenoise.database,
+            &user_relay_sync,
+            &ephemeral,
+            creator.pubkey,
+            &group_id,
+            &send_result.message.id,
+        )
+        .await
+        .unwrap();
+
+        let cached_message = AggregatedMessage::find_by_id(
+            &send_result.message.id.to_string(),
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(matches!(
+            cached_message.delivery_status,
+            Some(DeliveryStatus::Sent(_))
+        ));
+    }
 
     #[tokio::test]
     async fn test_public_push_registration_lifecycle() {

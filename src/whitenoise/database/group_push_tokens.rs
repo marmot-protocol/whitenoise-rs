@@ -124,8 +124,6 @@ impl From<GroupPushTokenRow> for GroupPushToken {
     }
 }
 
-// PR 1 only persists the cache locally; gossip/publication flows consume these
-// helpers in follow-up PRs, while tests exercise them now.
 #[allow(dead_code)]
 impl GroupPushToken {
     #[perf_instrument("db::group_push_tokens")]
