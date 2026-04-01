@@ -431,20 +431,19 @@ async fn resolve_notification_server_relays(
     }
 
     let deduped_hints = dedupe_relay_urls(relay_hints);
-    if !deduped_hints.is_empty() {
-        if let Err(error) = user_relay_sync
+    if !deduped_hints.is_empty()
+        && let Err(error) = user_relay_sync
             .sync_relay_type_for_pubkey(server_pubkey, RelayType::Inbox, &deduped_hints)
             .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                server_pubkey = %server_pubkey.to_hex(),
-                relay_source = NotificationRelaySource::Synced.as_str(),
-                relay_hint_count = deduped_hints.len(),
-                error = %error,
-                "Failed to sync notification server inbox relays from relay hints"
-            );
-        }
+    {
+        tracing::warn!(
+            target: "whitenoise::push_notifications",
+            server_pubkey = %server_pubkey.to_hex(),
+            relay_source = NotificationRelaySource::Synced.as_str(),
+            relay_hint_count = deduped_hints.len(),
+            error = %error,
+            "Failed to sync notification server inbox relays from relay hints"
+        );
     }
 
     let synced_relays = server_user.relays(RelayType::Inbox, database).await?;
