@@ -347,6 +347,93 @@ impl AggregatedMessage {
         Ok(messages)
     }
 
+    /// Fetch the newest messages for a group, returning at least `minimum` messages
+    /// and enough additional messages to include all unread ones.
+    ///
+    /// The effective fetch size is `max(unread_count, minimum)`, so the caller always
+    /// receives a full page even when there are zero unread messages, and always
+    /// receives every unread message when there are more than `minimum` unreads.
+    ///
+    /// The count and fetch happen in a single SQL round-trip via a CTE.
+    ///
+    /// # Arguments
+    /// * `group_id`    - The MLS group to query
+    /// * `read_marker` - The last-read message ID (`last_read_message_id`). `None` means
+    ///                   all messages are unread.
+    /// * `minimum`     - Floor on the number of messages to return (e.g. 50 for a full page).
+    ///                   Capped at 200.
+    ///
+    /// # Returns
+    /// Messages in oldest-first order (same as `find_messages_by_group_paginated`).
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn find_messages_with_unread_minimum(
+        group_id: &GroupId,
+        read_marker: Option<&EventId>,
+        minimum: u32,
+        database: &Database,
+    ) -> Result<Vec<ChatMessage>> {
+        let minimum_val = i64::from(minimum.min(200));
+
+        // Single-query approach: a CTE computes the unread count, then the outer
+        // SELECT uses MAX(unread_count, minimum) as the LIMIT.  This avoids a
+        // separate COUNT round-trip and keeps the logic in one atomic read.
+        //
+        // The unread count uses the same timestamp-subquery logic as
+        // `count_unread_for_group`: messages whose `created_at` is strictly after
+        // the read marker's `created_at` are considered unread.  When `marker_hex`
+        // is NULL (no read marker), the COALESCE falls back to 0 and every
+        // non-deleted kind-9 message is treated as unread.
+        //
+        // The CTE excludes deleted messages from the unread count (tombstones
+        // aren't "unread"), but the outer SELECT includes them so the UI can
+        // render "message deleted" placeholders — matching the tombstone contract
+        // in `find_messages_by_group_paginated`.
+        let marker_hex = read_marker.map(EventId::to_hex);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "WITH unread_count AS (
+               SELECT COUNT(*) AS cnt
+               FROM aggregated_messages am
+               LEFT JOIN message_delivery_status mds
+                 ON am.message_id = mds.message_id
+                AND am.mls_group_id = mds.mls_group_id
+               WHERE am.mls_group_id = ?
+                 AND am.kind = 9
+                 AND am.deletion_event_id IS NULL
+                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                 AND am.created_at > COALESCE(
+                   (SELECT created_at FROM aggregated_messages
+                    WHERE message_id = ? AND mls_group_id = ?),
+                   0
+                 )
+             )
+             SELECT am.*, mds.status AS delivery_status
+             FROM aggregated_messages am
+             LEFT JOIN message_delivery_status mds
+               ON am.message_id = mds.message_id
+              AND am.mls_group_id = mds.mls_group_id
+             WHERE am.kind = 9
+               AND am.mls_group_id = ?
+               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             ORDER BY am.created_at DESC, am.message_id DESC
+             LIMIT MAX((SELECT cnt FROM unread_count), ?)",
+        )
+        .bind(group_id.as_slice()) // unread CTE: mls_group_id
+        .bind(marker_hex.as_deref()) // unread CTE: read marker message_id (NULL = no marker)
+        .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
+        .bind(group_id.as_slice()) // outer SELECT: mls_group_id
+        .bind(minimum_val) // MAX(cnt, minimum)
+        .fetch_all(&database.pool)
+        .await?;
+
+        let mut messages: Vec<ChatMessage> = rows
+            .into_iter()
+            .map(Self::row_to_chat_message)
+            .collect::<Result<Vec<_>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Search messages within a group by content using forward-order substring matching.
     ///
     /// Matches against `content_normalized`, a NFC-lowercased copy of the content
@@ -3071,6 +3158,65 @@ mod tests {
             None,
             None,
             None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "all 3 messages should be returned, including the deleted tombstone"
+        );
+
+        let deleted = messages
+            .iter()
+            .find(|m| m.id == msg2_id)
+            .expect("deleted message must be present");
+        assert!(
+            deleted.is_deleted,
+            "deleted message must have is_deleted = true"
+        );
+    }
+
+    /// Deleted messages must appear in unread-with-minimum results as tombstones,
+    /// matching the contract in `find_messages_by_group_paginated`. The unread count
+    /// CTE excludes tombstones (they aren't "unread"), but the outer SELECT includes
+    /// them so the UI can render "message deleted" placeholders.
+    #[tokio::test]
+    async fn test_unread_minimum_deleted_messages_are_included_as_tombstones() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[214; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_702_000_000;
+
+        // Insert 3 messages: seeds 1, 2, 3
+        for i in 1u8..=3 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Delete seed-2 message
+        let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
+        let deletion_id = format!("{:0>64x}", 0xde1212u64);
+        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // No read marker → all non-deleted messages are unread (cnt=2), minimum=3
+        // LIMIT = MAX(2, 3) = 3, so all 3 rows (including the tombstone) are returned.
+        let messages = AggregatedMessage::find_messages_with_unread_minimum(
+            &group_id,
+            None,
+            3,
+            &whitenoise.database,
         )
         .await
         .unwrap();
