@@ -46,78 +46,51 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             kp_relays.len()
         );
 
-        retry_default(
-            || {
-                let whitenoise = context.whitenoise;
-                let account = account.clone();
-                async move {
-                    let key_packages = whitenoise
-                        .fetch_all_key_packages_for_account(&account)
-                        .await?;
-                    if !key_packages.is_empty() {
-                        return Ok(());
-                    }
-
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "initial key package publish still in flight"
-                    )))
-                }
-            },
-            "initial account key package publish",
+        // `create_identity()` publishes the initial key package in a background
+        // task when running against the real singleton used by integration tests.
+        // Wait for that publish to land before trying to clean the relays.
+        let initially_published = wait_for_key_packages(
+            context,
+            &account,
+            "initial key package publication after account creation",
+            |packages| !packages.is_empty(),
         )
         .await?;
+        tracing::info!(
+            "✓ Initial account setup published {} key package(s)",
+            initially_published.len()
+        );
 
-        // Delete any existing key packages to start with a clean slate
+        // Delete any existing key packages to start with a clean slate.
         let deleted = context
             .whitenoise
             .delete_all_key_packages_for_account(&account, true)
             .await?;
         tracing::info!("✓ Deleted {} existing key package(s)", deleted);
 
-        retry_default(
-            || {
-                let whitenoise = context.whitenoise;
-                let account = account.clone();
-                async move {
-                    let key_packages = whitenoise
-                        .fetch_all_key_packages_for_account(&account)
-                        .await?;
-                    if key_packages.is_empty() {
-                        return Ok(());
-                    }
-
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "expected 0 key packages after deletion, found {}",
-                        key_packages.len()
-                    )))
-                }
-            },
-            "all key packages deleted",
+        let before_delete = wait_for_key_packages(
+            context,
+            &account,
+            "key package relays to be empty after deletion",
+            |packages| packages.is_empty(),
         )
         .await?;
+        assert_eq!(
+            before_delete.len(),
+            0,
+            "Should have 0 key packages after deletion"
+        );
         tracing::info!("✓ Verified 0 key packages exist");
 
         // Run maintenance
         let task = KeyPackageMaintenance;
         task.execute(context.whitenoise).await?;
 
-        let after_publish = retry_default(
-            || {
-                let whitenoise = context.whitenoise;
-                let account = account.clone();
-                async move {
-                    let key_packages = whitenoise
-                        .fetch_all_key_packages_for_account(&account)
-                        .await?;
-                    if key_packages.is_empty() {
-                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "waiting for maintenance to publish a key package"
-                        )));
-                    }
-                    Ok(key_packages)
-                }
-            },
-            "maintenance published key package",
+        let after_publish = wait_for_key_packages(
+            context,
+            &account,
+            "maintenance to publish a replacement key package",
+            |packages| !packages.is_empty(),
         )
         .await?;
         tracing::info!(
@@ -130,7 +103,13 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             .whitenoise
             .delete_all_key_packages_for_account(&account, true)
             .await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        wait_for_key_packages(
+            context,
+            &account,
+            "key package relays to be empty before publishing an expired package",
+            |packages| packages.is_empty(),
+        )
+        .await?;
 
         // Publish a backdated key package (31 days old)
         let expired_event_id =
@@ -141,56 +120,48 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         );
 
         // Verify we have exactly 1 expired key package
-        retry_default(
-            || {
-                let whitenoise = context.whitenoise;
-                let account = account.clone();
-                async move {
-                    let key_packages = whitenoise.fetch_all_key_packages_for_account(&account).await?;
-                    if key_packages.len() != 1 || key_packages[0].id != expired_event_id {
-                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "waiting for the backdated key package to become the only relay key package"
-                        )));
-                    }
-                    Ok(key_packages)
-                }
-            },
-            "backdated key package published",
+        let before_rotate = wait_for_key_packages(
+            context,
+            &account,
+            "the expired key package to be the only package before rotation",
+            |packages| packages.len() == 1 && packages[0].id == expired_event_id,
         )
         .await?;
+        assert_eq!(
+            before_rotate.len(),
+            1,
+            "Should have exactly 1 key package before rotation"
+        );
+        assert_eq!(
+            before_rotate[0].id, expired_event_id,
+            "The key package should be our expired one"
+        );
         tracing::info!("✓ Verified 1 expired key package exists");
 
         // Run maintenance - should publish new and delete expired
         task.execute(context.whitenoise).await?;
 
         // Verify rotation: old one deleted, new one published
-        let after_rotate = retry_default(
-            || {
-                let whitenoise = context.whitenoise;
-                let account = account.clone();
-                async move {
-                    let key_packages = whitenoise
-                        .fetch_all_key_packages_for_account(&account)
-                        .await?;
-                    if key_packages.is_empty() {
-                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "waiting for maintenance to publish a replacement key package"
-                        )));
-                    }
-                    if key_packages
-                        .iter()
-                        .any(|event| event.id == expired_event_id)
-                    {
-                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "waiting for maintenance to delete the expired key package"
-                        )));
-                    }
-                    Ok(key_packages)
-                }
-            },
-            "expired key package rotated",
+        let after_rotate = wait_for_key_packages(
+            context,
+            &account,
+            "expired key package rotation to complete",
+            |packages| !packages.is_empty() && packages.iter().all(|e| e.id != expired_event_id),
         )
         .await?;
+
+        // Should have at least 1 key package (the new one)
+        assert!(
+            !after_rotate.is_empty(),
+            "Should have at least one key package after rotation"
+        );
+
+        // The expired one should be gone
+        let expired_still_exists = after_rotate.iter().any(|e| e.id == expired_event_id);
+        assert!(
+            !expired_still_exists,
+            "Expired key package should have been deleted"
+        );
 
         tracing::info!(
             "✓ Rotation complete: expired package deleted, {} fresh package(s) exist",
@@ -199,6 +170,44 @@ impl TestCase for KeyPackageMaintenanceTestCase {
 
         Ok(())
     }
+}
+
+async fn wait_for_key_packages<F>(
+    context: &ScenarioContext,
+    account: &crate::Account,
+    description: &str,
+    predicate: F,
+) -> Result<Vec<Event>, WhitenoiseError>
+where
+    F: Fn(&[Event]) -> bool + Copy,
+{
+    let whitenoise = context.whitenoise;
+    let account = account.clone();
+
+    retry(
+        50,
+        Duration::from_millis(100),
+        || {
+            let account = account.clone();
+            async move {
+                let key_packages = whitenoise
+                    .fetch_all_key_packages_for_account(&account)
+                    .await?;
+
+                if predicate(&key_packages) {
+                    Ok(key_packages)
+                } else {
+                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        "Observed {} key package(s) while waiting for {}",
+                        key_packages.len(),
+                        description,
+                    )))
+                }
+            }
+        },
+        description,
+    )
+    .await
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.

@@ -1,6 +1,7 @@
 use mdk_core::prelude::group_types::GroupState;
 use mdk_core::prelude::message_types::Message;
-use mdk_core::prelude::{GroupId, MessageProcessingResult};
+use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResult};
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 
 use crate::{
@@ -14,6 +15,7 @@ use crate::{
         media_files::MediaFile,
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
+        push_notifications::is_push_group_message_kind,
     },
 };
 #[cfg(test)]
@@ -32,13 +34,13 @@ impl Whitenoise {
 
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let _mls_proc = perf_span!("event_handlers::mls_process_message");
-        let result = match mdk.process_message(&event) {
-            Ok(result) => {
+        let outcome = match mdk.process_message_with_context(&event) {
+            Ok(outcome) => {
                 tracing::debug!(
                   target: "whitenoise::event_handlers::handle_mls_message",
                   "MLS message {} processed - Result variant: {}",
                   event.id.to_hex(),
-                  match &result {
+                  match &outcome.result {
                       mdk_core::prelude::MessageProcessingResult::ApplicationMessage(_) => "ApplicationMessage",
                       mdk_core::prelude::MessageProcessingResult::Commit { .. } => "Commit",
                       mdk_core::prelude::MessageProcessingResult::Proposal(_) => "Proposal",
@@ -49,7 +51,7 @@ impl Whitenoise {
                       mdk_core::prelude::MessageProcessingResult::PreviouslyFailed => "PreviouslyFailed",
                   }
                 );
-                result
+                outcome
             }
             Err(e) => {
                 tracing::error!(
@@ -63,139 +65,179 @@ impl Whitenoise {
         };
         drop(_mls_proc);
 
-        // Extract and store media references synchronously for application messages.
-        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&result) {
-            let parsed_references = {
-                let media_manager = mdk.media_manager(group_id.clone());
-                self.media_files()
-                    .parse_imeta_tags_from_event(&inner_event, &media_manager)?
-            };
+        if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
+            self.handle_application_message_outcome(
+                account,
+                &mdk,
+                &outcome,
+                group_id,
+                inner_event,
+                message,
+            )
+            .await?;
+        }
 
+        self.handle_non_application_outcome(account, &mdk, outcome.result)
+            .await?;
+
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_application_message_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        outcome: &MessageProcessingOutcome,
+        group_id: GroupId,
+        inner_event: UnsignedEvent,
+        message: Message,
+    ) -> Result<()> {
+        if is_push_group_message_kind(message.kind) {
+            if let Err(error) = self
+                .handle_push_application_message(account, outcome, &message)
+                .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    account = %account.pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    sender_leaf_index = ?outcome.context.sender_leaf_index,
+                    message_id = ?message.event.id.map(|event_id| event_id.to_hex()),
+                    error = %error,
+                    "Failed to reconcile received MIP-05 group message after MLS acceptance"
+                );
+            }
+            return Ok(());
+        }
+
+        self.handle_standard_application_message(account, mdk, group_id, inner_event, message)
+            .await
+    }
+
+    async fn handle_push_application_message(
+        &self,
+        account: &Account,
+        outcome: &MessageProcessingOutcome,
+        message: &Message,
+    ) -> Result<()> {
+        self.handle_received_push_group_message(
+            account,
+            message,
+            outcome.context.sender_leaf_index,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_standard_application_message(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        group_id: GroupId,
+        inner_event: UnsignedEvent,
+        message: Message,
+    ) -> Result<()> {
+        let parsed_references = {
+            let media_manager = mdk.media_manager(group_id.clone());
             self.media_files()
-                .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
-                .await?;
+                .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+        };
 
-            match message.kind {
-                Kind::ChatMessage => {
-                    let msg = self.cache_chat_message(&group_id, &message).await?;
-                    let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                    Whitenoise::spawn_new_message_notification_if_enabled(
-                        account, &group_id, &msg, group_name,
-                    );
-                    self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
-                    self.emit_chat_list_update(
-                        account,
-                        &group_id,
-                        ChatListUpdateTrigger::NewLastMessage,
-                    )
-                    .await;
-                }
-                Kind::Reaction => {
-                    if let Some(target) = self.cache_reaction(&group_id, &message).await? {
-                        self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
-                    }
-                }
-                Kind::EventDeletion => {
-                    let last_message_id = self.get_last_message_id(&group_id).await;
+        self.media_files()
+            .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
+            .await?;
 
-                    for (trigger, msg) in self.cache_deletion(&group_id, &message).await? {
-                        self.emit_message_update(&group_id, trigger, msg);
-                    }
-
-                    // Check if the deleted message was the last message.
-                    // This check must happen AFTER get_last_message_id but the
-                    // result is only valid for the FIRST handler (before cache_deletion
-                    // modifies shared state). We emit for ALL subscribed accounts because
-                    // subsequent handlers will see incorrect post-deletion state.
-                    if let Some(last_message_id) = last_message_id {
-                        let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
-                        if deleted_ids.contains(&last_message_id) {
-                            self.emit_chat_list_update_for_group(
-                                &group_id,
-                                ChatListUpdateTrigger::LastMessageDeleted,
-                            )
-                            .await;
-                        }
-                    }
+        match message.kind {
+            Kind::ChatMessage => {
+                let msg = self.cache_chat_message(&group_id, &message).await?;
+                let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
+                Whitenoise::spawn_new_message_notification_if_enabled(
+                    account, &group_id, &msg, group_name,
+                );
+                self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
+                self.emit_chat_list_update(
+                    account,
+                    &group_id,
+                    ChatListUpdateTrigger::NewLastMessage,
+                )
+                .await;
+            }
+            Kind::Reaction => {
+                if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                    self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
                 }
-                _ => {
-                    tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
-                }
+            }
+            Kind::EventDeletion => {
+                self.handle_deletion_application_message(&group_id, &message)
+                    .await?;
+            }
+            _ => {
+                tracing::debug!("Ignoring message kind {:?} for cache", message.kind);
             }
         }
 
+        Ok(())
+    }
+
+    async fn handle_deletion_application_message(
+        &self,
+        group_id: &GroupId,
+        message: &Message,
+    ) -> Result<()> {
+        let last_message_id = self.get_last_message_id(group_id).await;
+
+        for (trigger, msg) in self.cache_deletion(group_id, message).await? {
+            self.emit_message_update(group_id, trigger, msg);
+        }
+
+        // Check if the deleted message was the last message.
+        // This check must happen AFTER get_last_message_id but the
+        // result is only valid for the FIRST handler (before cache_deletion
+        // modifies shared state). We emit for ALL subscribed accounts because
+        // subsequent handlers will see incorrect post-deletion state.
+        if let Some(last_message_id) = last_message_id {
+            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+            if deleted_ids.contains(&last_message_id) {
+                self.emit_chat_list_update_for_group(
+                    group_id,
+                    ChatListUpdateTrigger::LastMessageDeleted,
+                )
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_non_application_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        result: MessageProcessingResult,
+    ) -> Result<()> {
         // Dispatch on every variant explicitly so the compiler enforces exhaustiveness.
         // Unprocessable and PreviouslyFailed are returned as errors so the caller does
         // not mark the event as processed or advance last_synced_at.
         match result {
-            MessageProcessingResult::ApplicationMessage(_) => {
-                // Already handled above via extract_message_details.
+            MessageProcessingResult::ApplicationMessage(_) => Ok(()),
+            MessageProcessingResult::Proposal(update_result) => {
+                self.handle_auto_committed_proposal(account, mdk, update_result)
+                    .await
             }
-
-            MessageProcessingResult::Proposal(ref update_result) => {
-                // Auto-committed proposal (e.g., admin auto-commits a member's
-                // self-removal): publish the resulting commit event so other group
-                // members learn about the change, then merge the pending commit into
-                // our local MLS state.
-                //
-                // Uses publish_and_merge_commit to ensure MIP-03 ordering:
-                // publish first, merge only on success, clear pending commit on
-                // failure. This prevents local state from advancing to an epoch
-                // that no other group member knows about.
-                let group_id = &update_result.mls_group_id;
-                let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-                self.publish_and_merge_commit(
-                    update_result.evolution_event.clone(),
-                    &account.pubkey,
-                    group_id,
-                    &relay_urls,
-                )
-                .await?;
-
-                self.background_refresh_account_group_subscriptions(account);
-
-                if let Some(welcome_rumors) = &update_result.welcome_rumors
-                    && !welcome_rumors.is_empty()
-                {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        "Auto-committed proposal produced {} welcome \
-                         rumors that were not delivered",
-                        welcome_rumors.len()
-                    );
-                }
-
-                tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
-                    "Published auto-committed proposal evolution event for group {}",
-                    hex::encode(group_id.as_slice())
-                );
-
-                self.emit_chat_list_update(
-                    account,
-                    group_id,
-                    ChatListUpdateTrigger::NewLastMessage,
-                )
-                .await;
-
-                Self::background_sync_group_image_cache_if_needed(
-                    account,
-                    &update_result.mls_group_id,
-                );
-            }
-
-            MessageProcessingResult::PendingProposal { ref mls_group_id } => {
+            MessageProcessingResult::PendingProposal { mls_group_id } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "Stored pending proposal for group {} (awaiting admin commit)",
                     hex::encode(mls_group_id.as_slice())
                 );
+                Ok(())
             }
-
             MessageProcessingResult::IgnoredProposal {
-                ref mls_group_id,
-                ref reason,
+                mls_group_id,
+                reason,
             } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
@@ -203,51 +245,21 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice()),
                     reason
                 );
+                Ok(())
             }
-
-            MessageProcessingResult::ExternalJoinProposal { ref mls_group_id } => {
+            MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 tracing::info!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "Received external join proposal for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
+                Ok(())
             }
-
-            MessageProcessingResult::Commit { ref mls_group_id } => {
-                tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
-                    "Processed commit for group {}",
-                    hex::encode(mls_group_id.as_slice())
-                );
-
-                // Detect removal: if the commit left us inactive, persist the
-                // removal state and emit a real-time update. Errors propagate so the
-                // event is not marked processed. Any failure after process_message()
-                // still requires startup reconciliation, because MDK deduplicates
-                // already-processed commits and this branch will not re-run on retry.
-                let still_active =
-                    match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
-                        Some(group) => group.state == GroupState::Active,
-                        None => false,
-                    };
-
-                if !still_active {
-                    tracing::info!(
-                        target: "whitenoise::event_handlers::handle_mls_message",
-                        "Account {} was removed from group {} — marking group as removed",
-                        account.pubkey.to_hex(),
-                        hex::encode(mls_group_id.as_slice())
-                    );
-                    self.mark_as_removed(account, mls_group_id).await?;
-                }
-
-                self.background_refresh_account_group_subscriptions(account);
-                if still_active {
-                    Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
-                }
+            MessageProcessingResult::Commit { mls_group_id } => {
+                self.handle_commit_outcome(account, mdk, &mls_group_id)
+                    .await
             }
-
-            MessageProcessingResult::Unprocessable { ref mls_group_id } => {
+            MessageProcessingResult::Unprocessable { mls_group_id } => {
                 tracing::warn!(
                     target: "whitenoise::event_handlers::handle_mls_message",
                     "MLS message unprocessable for group {} (account {}): \
@@ -255,11 +267,10 @@ impl Whitenoise {
                     hex::encode(mls_group_id.as_slice()),
                     account.pubkey.to_hex()
                 );
-                return Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
+                Err(WhitenoiseError::MlsMessageUnprocessable(hex::encode(
                     mls_group_id.as_slice(),
-                )));
+                )))
             }
-
             MessageProcessingResult::PreviouslyFailed => {
                 tracing::warn!(
                     target: "whitenoise::event_handlers::handle_mls_message",
@@ -267,8 +278,99 @@ impl Whitenoise {
                      event will not be marked processed",
                     account.pubkey.to_hex()
                 );
-                return Err(WhitenoiseError::MlsMessagePreviouslyFailed);
+                Err(WhitenoiseError::MlsMessagePreviouslyFailed)
             }
+        }
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_auto_committed_proposal(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        update_result: mdk_core::prelude::UpdateGroupResult,
+    ) -> Result<()> {
+        let group_id = &update_result.mls_group_id;
+        let relay_urls = Self::ensure_group_relays(mdk, group_id)?;
+
+        self.publish_and_merge_commit(
+            update_result.evolution_event.clone(),
+            &account.pubkey,
+            group_id,
+            &relay_urls,
+        )
+        .await?;
+
+        self.background_refresh_account_group_subscriptions(account);
+
+        if let Some(welcome_rumors) = &update_result.welcome_rumors
+            && !welcome_rumors.is_empty()
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                "Auto-committed proposal produced {} welcome rumors that were not delivered",
+                welcome_rumors.len()
+            );
+        }
+
+        tracing::info!(
+            target: "whitenoise::event_handlers::handle_mls_message",
+            "Published auto-committed proposal evolution event for group {}",
+            hex::encode(group_id.as_slice())
+        );
+
+        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewLastMessage)
+            .await;
+        Self::background_sync_group_image_cache_if_needed(account, group_id);
+
+        Ok(())
+    }
+
+    #[perf_instrument("event_handlers")]
+    async fn handle_commit_outcome(
+        &self,
+        account: &Account,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+        mls_group_id: &GroupId,
+    ) -> Result<()> {
+        tracing::info!(
+            target: "whitenoise::event_handlers::handle_mls_message",
+            "Processed commit for group {}",
+            hex::encode(mls_group_id.as_slice())
+        );
+
+        let still_active = match mdk.get_group(mls_group_id).map_err(WhitenoiseError::from)? {
+            Some(group) => group.state == GroupState::Active,
+            None => false,
+        };
+
+        if !still_active {
+            tracing::info!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                "Account {} was removed from group {} — marking group as removed",
+                account.pubkey.to_hex(),
+                hex::encode(mls_group_id.as_slice())
+            );
+            self.mark_as_removed(account, mls_group_id).await?;
+        }
+
+        if still_active
+            && let Err(error) = self
+                .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
+                .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                account = %account.pubkey.to_hex(),
+                group_id = %hex::encode(mls_group_id.as_slice()),
+                error = %error,
+                "Failed to reconcile group push tokens after commit processing"
+            );
+        }
+
+        self.background_refresh_account_group_subscriptions(account);
+        if still_active {
+            Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
         }
 
         Ok(())
@@ -280,9 +382,9 @@ impl Whitenoise {
     /// None otherwise (e.g., for commits, proposals, or other non-message results).
     /// The returned Message preserves all MDK-set fields (processed_at, epoch, state, etc.).
     fn extract_message_details(
-        result: &MessageProcessingResult,
+        outcome: &MessageProcessingOutcome,
     ) -> Option<(mdk_core::prelude::GroupId, UnsignedEvent, Message)> {
-        match result {
+        match &outcome.result {
             MessageProcessingResult::ApplicationMessage(message) => {
                 // The message.event is the decrypted rumor (UnsignedEvent) from the MLS message
                 Some((
@@ -694,11 +796,37 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use mdk_core::mip05::{
+        ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
+        build_token_removal_rumor, build_token_request_rumor,
+    };
+
     use super::*;
     use crate::whitenoise::{
-        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus, relays::Relay,
-        test_utils::*,
+        aggregated_message::AggregatedMessage, message_aggregator::DeliveryStatus,
+        push_notifications::GroupPushToken, test_utils::*,
     };
+
+    fn make_token_tag(seed: u8) -> TokenTag {
+        TokenTag {
+            encrypted_token: mdk_core::mip05::EncryptedToken::from([seed; ENCRYPTED_TOKEN_LEN]),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
+        }
+    }
+
+    async fn setup_two_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        setup_two_member_group_with_accepted_account_groups(
+            whitenoise,
+            admin_account,
+            member_account,
+        )
+        .await
+    }
 
     /// Test handling of different MLS message types: regular messages, reactions, and deletions
     #[tokio::test]
@@ -1158,8 +1286,11 @@ mod tests {
             state: mdk_core::prelude::message_types::MessageState::Processed,
         };
 
-        let result = MessageProcessingResult::ApplicationMessage(message);
-        let extracted = Whitenoise::extract_message_details(&result);
+        let outcome = MessageProcessingOutcome {
+            result: MessageProcessingResult::ApplicationMessage(message),
+            context: mdk_core::prelude::MessageProcessingContext::default(),
+        };
+        let extracted = Whitenoise::extract_message_details(&outcome);
         assert!(extracted.is_some(), "Should extract application message");
         let (extracted_group_id, extracted_event, extracted_message) = extracted.unwrap();
         assert_eq!(extracted_group_id, group_id);
@@ -1168,10 +1299,13 @@ mod tests {
         assert_eq!(extracted_message.mls_group_id, group_id);
 
         // Test extract_message_details with non-ApplicationMessage
-        let commit_result = MessageProcessingResult::Commit {
-            mls_group_id: group_id,
+        let commit_outcome = MessageProcessingOutcome {
+            result: MessageProcessingResult::Commit {
+                mls_group_id: group_id,
+            },
+            context: mdk_core::prelude::MessageProcessingContext::default(),
         };
-        let extracted = Whitenoise::extract_message_details(&commit_result);
+        let extracted = Whitenoise::extract_message_details(&commit_outcome);
         assert!(extracted.is_none(), "Should not extract commit");
 
         // Test extract_reaction_target_id
@@ -1271,59 +1405,357 @@ mod tests {
         assert_eq!(fetched.len(), 3, "Should fetch all cached messages");
     }
 
-    /// Helper: create a group via MDK directly and have a member join via
-    /// welcome giftwrap, returning the group ID. This gives both the admin's
-    /// and member's MDK instances full MLS state for the group.
-    async fn setup_two_member_group(
-        whitenoise: &Whitenoise,
-        admin_account: &Account,
-        member_account: &Account,
-    ) -> GroupId {
-        // Fetch the member's key package from relays
-        let relay_urls = Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
-        let key_pkg_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(member_account.pubkey, &relay_urls)
-            .await
-            .unwrap()
-            .expect("member must have a published key package");
+    #[tokio::test]
+    async fn test_handle_mls_message_stores_token_request_in_group_push_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
 
-        // Create group via MDK directly so we get the welcome rumor
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
         let admin_mdk = whitenoise
             .create_mdk_for_account(admin_account.pubkey)
             .unwrap();
-        let create_result = admin_mdk
-            .create_group(
-                &admin_account.pubkey,
-                vec![key_pkg_event],
-                create_nostr_group_config_data(vec![admin_account.pubkey]),
-            )
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+
+        let token_tag = make_token_tag(1);
+        let request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![token_tag.clone()],
+        )
+        .unwrap();
+        let event = admin_mdk.create_message(&group_id, request).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
             .unwrap();
 
-        let group_id = create_result.group.mls_group_id.clone();
-        let welcome_rumor = create_result
-            .welcome_rumors
-            .first()
-            .expect("welcome rumor exists")
-            .clone();
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
-        // Build giftwrap so the member can process the welcome
-        let admin_signer = whitenoise
-            .secrets_store
-            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
-            .unwrap();
-        let giftwrap =
-            EventBuilder::gift_wrap(&admin_signer, &member_account.pubkey, welcome_rumor, vec![])
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].leaf_index, admin_leaf_index);
+        assert_eq!(stored[0].server_pubkey, token_tag.server_pubkey);
+        assert_eq!(stored[0].relay_hint, Some(token_tag.relay_hint));
+        assert_eq!(
+            stored[0].encrypted_token,
+            token_tag.encrypted_token.to_base64()
+        );
+
+        let cached_messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
                 .await
                 .unwrap();
+        assert!(cached_messages.is_empty());
+    }
 
-        // Member processes the welcome -- now their MDK has the group
+    #[tokio::test]
+    async fn test_handle_mls_message_merges_token_list_response_into_group_push_cache() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let leaf_zero = make_token_tag(2);
+        let leaf_one = make_token_tag(3);
+        let inactive_leaf = make_token_tag(9);
+        let response = build_token_list_response_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            EventId::all_zeros(),
+            vec![
+                LeafTokenTag {
+                    token_tag: leaf_zero.clone(),
+                    leaf_index: 0,
+                },
+                LeafTokenTag {
+                    token_tag: leaf_one.clone(),
+                    leaf_index: 1,
+                },
+                LeafTokenTag {
+                    token_tag: inactive_leaf,
+                    leaf_index: 99,
+                },
+            ],
+        )
+        .unwrap();
+        let event = admin_mdk.create_message(&group_id, response).unwrap();
+
         whitenoise
-            .handle_giftwrap(member_account, giftwrap)
+            .handle_mls_message(&member_account, event)
             .await
-            .expect("member should process welcome successfully");
+            .unwrap();
 
-        group_id
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].leaf_index, 0);
+        assert_eq!(
+            stored[0].encrypted_token,
+            leaf_zero.encrypted_token.to_base64()
+        );
+        assert_eq!(stored[1].leaf_index, 1);
+        assert_eq!(
+            stored[1].encrypted_token,
+            leaf_one.encrypted_token.to_base64()
+        );
+
+        let cached_messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(cached_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_removes_token_on_token_removal() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
+        let token_tag = make_token_tag(4);
+
+        GroupPushToken::upsert(
+            &member_account.pubkey,
+            &group_id,
+            &admin_account.pubkey,
+            admin_leaf_index,
+            &token_tag.server_pubkey,
+            Some(&token_tag.relay_hint),
+            &token_tag.encrypted_token.to_base64(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let removal = build_token_removal_rumor(admin_account.pubkey, Timestamp::now());
+        let event = admin_mdk.create_message(&group_id, removal).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(stored.is_empty());
+
+        let cached_messages =
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(cached_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_token_request_schedules_token_list_response() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let before_count = count_published_events_for_account(&whitenoise, &member_account).await;
+
+        let token_tag = make_token_tag(5);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        let dispatched = whitenoise
+            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .await
+            .unwrap();
+        assert!(dispatched);
+
+        let after_count =
+            wait_for_published_event_count(&whitenoise, &member_account, before_count).await;
+        assert!(after_count > before_count);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_matching_token_list_response_suppresses_pending_reply() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let request = build_token_request_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            vec![make_token_tag(6)],
+        )
+        .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let request_event = admin_mdk.create_message(&group_id, request).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, request_event)
+            .await
+            .unwrap();
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        let response = build_token_list_response_rumor(
+            admin_account.pubkey,
+            Timestamp::now(),
+            request_event_id,
+            vec![LeafTokenTag {
+                token_tag: make_token_tag(7),
+                leaf_index: 0,
+            }],
+        )
+        .unwrap();
+        let response_event = admin_mdk.create_message(&group_id, response).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, response_event)
+            .await
+            .unwrap();
+
+        assert!(!whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        let dispatched = whitenoise
+            .dispatch_pending_token_response(&member_account, &group_id, request_event_id)
+            .await
+            .unwrap();
+        assert!(!dispatched);
+    }
+
+    #[tokio::test]
+    async fn test_handle_mls_message_commit_prunes_inactive_leaf_tokens() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 2).await;
+        let member_one = members[0].0.clone();
+        let member_two = members[1].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
+
+        let group_id =
+            setup_three_member_group(&whitenoise, &admin_account, &member_one, &member_two).await;
+
+        let observer_mdk = whitenoise
+            .create_mdk_for_account(member_two.pubkey)
+            .unwrap();
+        let removed_leaf_index = observer_mdk
+            .group_leaf_map(&group_id)
+            .unwrap()
+            .iter()
+            .find_map(|(leaf_index, pubkey)| (*pubkey == member_one.pubkey).then_some(*leaf_index))
+            .expect("removed member leaf should exist before removal");
+        let stale_token = make_token_tag(8);
+
+        GroupPushToken::upsert(
+            &member_two.pubkey,
+            &group_id,
+            &member_one.pubkey,
+            removed_leaf_index,
+            &stale_token.server_pubkey,
+            Some(&stale_token.relay_hint),
+            &stale_token.encrypted_token.to_base64(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let removal_event = {
+            let admin_mdk = whitenoise
+                .create_mdk_for_account(admin_account.pubkey)
+                .unwrap();
+            admin_mdk
+                .remove_members(&group_id, &[member_one.pubkey])
+                .unwrap()
+                .evolution_event
+        };
+
+        whitenoise
+            .handle_mls_message(&member_two, removal_event)
+            .await
+            .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &member_two.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            stored
+                .iter()
+                .all(|token| token.leaf_index != removed_leaf_index),
+            "inactive leaf token should be pruned after commit processing"
+        );
     }
 
     /// Test that auto-committed proposals (e.g., admin auto-commits a

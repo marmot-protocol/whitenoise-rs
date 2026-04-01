@@ -373,6 +373,7 @@ mod tests {
 
         // Create account — this publishes relay lists to the local test relays
         let account = whitenoise.create_identity().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify local relay config exists
         let inbox_relays = account.inbox_relays(whitenoise).await.unwrap();

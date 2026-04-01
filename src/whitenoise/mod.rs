@@ -5,8 +5,9 @@ use ::rand::RngCore;
 
 use anyhow::Context;
 use dashmap::DashMap;
+use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
-use nostr_sdk::{PublicKey, RelayUrl};
+use nostr_sdk::{EventId, PublicKey, RelayUrl};
 use tokio::sync::{
     Mutex, OnceCell, Semaphore,
     mpsc::{self, Sender},
@@ -148,7 +149,7 @@ pub struct Whitenoise {
     event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
     content_parser: crate::nostr_manager::parser::ContentParser,
     #[allow(dead_code)]
-    relay_control: RelayControlPlane,
+    relay_control: Arc<RelayControlPlane>,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
@@ -181,6 +182,8 @@ pub struct Whitenoise {
     pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
     /// Debounced worker that coalesces discovery subscription rebuilds.
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
+    /// In-memory coordination for delayed MIP-05 token-list responses.
+    pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -217,6 +220,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
+            .field("pending_push_token_responses", &"<REDACTED>")
             .finish()
     }
 }
@@ -229,12 +233,12 @@ impl Whitenoise {
     ) -> Self {
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
-        let relay_control = RelayControlPlane::new(
+        let relay_control = Arc::new(RelayControlPlane::new(
             database.clone(),
             config.discovery_relays.clone(),
             components.event_sender.clone(),
             session_salt,
-        );
+        ));
 
         Self {
             config,
@@ -262,6 +266,7 @@ impl Whitenoise {
             background_task_cancellation: DashMap::new(),
             pending_logins: DashMap::new(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
+            pending_push_token_responses: Arc::new(DashMap::new()),
         }
     }
 
@@ -748,9 +753,11 @@ impl Whitenoise {
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
+    use crate::whitenoise::accounts_groups::AccountGroup;
+    use crate::whitenoise::group_information::GroupInformation;
     use crate::whitenoise::relays::Relay;
     use mdk_core::prelude::*;
-    use nostr_sdk::{Keys, PublicKey, RelayUrl};
+    use nostr_sdk::{EventBuilder, EventId, Keys, PublicKey, RelayUrl, UnsignedEvent};
     use tempfile::TempDir;
 
     // Test configuration and setup helpers
@@ -851,6 +858,72 @@ pub mod test_utils {
         let (whitenoise, _event_receiver, data_temp, logs_temp) =
             create_mock_whitenoise_internal().await;
         (whitenoise, data_temp, logs_temp)
+    }
+
+    async fn wait_for_published_event_count_matching<F>(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        predicate: F,
+        failure_message: &str,
+    ) -> usize
+    where
+        F: Fn(usize) -> bool,
+    {
+        for _ in 0..20 {
+            let count = count_published_events_for_account(whitenoise, account).await;
+            if predicate(count) {
+                return count;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        panic!("{failure_message}");
+    }
+
+    pub(crate) async fn wait_for_published_event_count(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        previous_count: usize,
+    ) -> usize {
+        wait_for_published_event_count_matching(
+            whitenoise,
+            account,
+            |count| count > previous_count,
+            "timed out waiting for new published event",
+        )
+        .await
+    }
+
+    pub(crate) async fn count_published_events_for_account(
+        whitenoise: &Whitenoise,
+        account: &Account,
+    ) -> usize {
+        let account_id = account.id.expect("account must be persisted");
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
+                .bind(account_id)
+                .fetch_one(&whitenoise.database.pool)
+                .await
+                .unwrap();
+
+        usize::try_from(count.0).unwrap()
+    }
+
+    pub(crate) async fn wait_for_exact_published_event_count(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        expected_count: usize,
+    ) {
+        let failure_message =
+            format!("timed out waiting for published event count {expected_count}");
+        let _ = wait_for_published_event_count_matching(
+            whitenoise,
+            account,
+            |count| count == expected_count,
+            &failure_message,
+        )
+        .await;
     }
 
     /// Wait for local test relays to be ready
@@ -1036,6 +1109,148 @@ pub mod test_utils {
                 publisher_accounts.len()
             )
         });
+    }
+
+    async fn create_group_with_member_welcomes(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_accounts: &[&Account],
+    ) -> (GroupId, Vec<UnsignedEvent>) {
+        let mut key_package_events = Vec::with_capacity(member_accounts.len());
+        for member_account in member_accounts {
+            let relay_urls =
+                Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
+            let key_package_event = whitenoise
+                .relay_control
+                .fetch_user_key_package(member_account.pubkey, &relay_urls)
+                .await
+                .unwrap()
+                .expect("member must have a published key package");
+            key_package_events.push(key_package_event);
+        }
+
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+        let create_result = admin_mdk
+            .create_group(
+                &admin_account.pubkey,
+                key_package_events,
+                create_nostr_group_config_data(vec![admin_account.pubkey]),
+            )
+            .unwrap();
+
+        (
+            create_result.group.mls_group_id.clone(),
+            create_result.welcome_rumors,
+        )
+    }
+
+    async fn deliver_group_welcomes(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_accounts: &[&Account],
+        welcome_rumors: Vec<UnsignedEvent>,
+    ) {
+        assert_eq!(
+            member_accounts.len(),
+            welcome_rumors.len(),
+            "each invited member should receive exactly one welcome rumor"
+        );
+
+        let admin_signer = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&admin_account.pubkey)
+            .unwrap();
+
+        for (member_account, welcome_rumor) in member_accounts.iter().zip(welcome_rumors) {
+            let giftwrap = EventBuilder::gift_wrap(
+                &admin_signer,
+                &member_account.pubkey,
+                welcome_rumor,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+            whitenoise
+                .handle_giftwrap(member_account, giftwrap)
+                .await
+                .expect("member should process welcome successfully");
+        }
+    }
+
+    pub(crate) async fn setup_two_member_group_with_welcome_finalization(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        let member_accounts = [member_account];
+        let (group_id, welcome_rumors) =
+            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
+        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
+
+        let group_name = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap()
+            .get_group(&group_id)
+            .unwrap()
+            .expect("member should have group after welcome")
+            .name;
+        Whitenoise::finalize_welcome_with_instance(
+            whitenoise,
+            member_account,
+            &group_id,
+            &group_name,
+            EventId::all_zeros(),
+            admin_account.pubkey,
+        )
+        .await;
+
+        group_id
+    }
+
+    pub(crate) async fn setup_two_member_group_with_accepted_account_groups(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        member_account: &Account,
+    ) -> GroupId {
+        let member_accounts = [member_account];
+        let (group_id, welcome_rumors) =
+            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
+        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
+
+        GroupInformation::create_for_group(whitenoise, &group_id, None, "Test group")
+            .await
+            .unwrap();
+
+        let (admin_group, _) =
+            AccountGroup::get_or_create(whitenoise, &admin_account.pubkey, &group_id, None)
+                .await
+                .unwrap();
+        admin_group.accept(whitenoise).await.unwrap();
+
+        let (member_group, _) =
+            AccountGroup::get_or_create(whitenoise, &member_account.pubkey, &group_id, None)
+                .await
+                .unwrap();
+        member_group.accept(whitenoise).await.unwrap();
+
+        group_id
+    }
+
+    pub(crate) async fn setup_three_member_group(
+        whitenoise: &Whitenoise,
+        admin_account: &Account,
+        first_member: &Account,
+        second_member: &Account,
+    ) -> GroupId {
+        let member_accounts = [first_member, second_member];
+        let (group_id, welcome_rumors) =
+            create_group_with_member_welcomes(whitenoise, admin_account, &member_accounts).await;
+        deliver_group_welcomes(whitenoise, admin_account, &member_accounts, welcome_rumors).await;
+
+        group_id
     }
 }
 

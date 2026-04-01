@@ -344,6 +344,19 @@ impl Whitenoise {
             );
         }
 
+        if let Err(error) = whitenoise
+            .share_local_push_token_to_group(account, group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::event_processor::process_welcome::background",
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after welcome finalization"
+            );
+        }
+
         // --- Step 3: self-update (only if subscriptions are live) ---
         //
         // The self-update advances the group epoch.  It runs only when
