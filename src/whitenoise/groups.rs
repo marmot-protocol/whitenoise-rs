@@ -827,12 +827,19 @@ impl Whitenoise {
         self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
-        // Optimistic local update: mark as departed immediately.
+        // Optimistic local update is best-effort after publish success.
         // When the auto-committed removal commit arrives later,
-        // mark_as_removed() will be a no-op (removed_at already set).
-        self.mark_as_left(account, group_id).await?;
+        // mark_as_removed() will converge the local state regardless.
+        if let Err(error) = self.mark_as_left(account, group_id).await {
+            tracing::warn!(
+                target: "whitenoise::groups",
+                account_pubkey = %account.pubkey,
+                group_id = %hex::encode(group_id.as_slice()),
+                "SelfRemove published but failed to mark local departure: {error}",
+            );
+        }
 
-        // Refresh subscriptions so we stop listening to this group's relays
+        // Always refresh subscriptions after publish
         self.background_refresh_account_group_subscriptions(account);
 
         Ok(())

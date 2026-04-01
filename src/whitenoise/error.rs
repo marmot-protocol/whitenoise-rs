@@ -277,6 +277,10 @@ mod tests {
             "Group not found"
         );
         assert_eq!(
+            WhitenoiseError::AlreadyDepartedFromGroup.to_string(),
+            "Already departed from group"
+        );
+        assert_eq!(
             WhitenoiseError::MessageNotFound.to_string(),
             "Message not found"
         );
