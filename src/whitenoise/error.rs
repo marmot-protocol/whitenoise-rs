@@ -36,6 +36,9 @@ pub enum WhitenoiseError {
     #[error("Group not found")]
     GroupNotFound,
 
+    #[error("Already departed from group")]
+    AlreadyDepartedFromGroup,
+
     #[error("Message not found")]
     MessageNotFound,
 
@@ -272,6 +275,10 @@ mod tests {
         assert_eq!(
             WhitenoiseError::GroupNotFound.to_string(),
             "Group not found"
+        );
+        assert_eq!(
+            WhitenoiseError::AlreadyDepartedFromGroup.to_string(),
+            "Already departed from group"
         );
         assert_eq!(
             WhitenoiseError::MessageNotFound.to_string(),

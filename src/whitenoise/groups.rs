@@ -767,32 +767,81 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Initiates the process to leave a group by creating a self-removal proposal.
+    /// Removes the caller from the group's `admin_pubkeys` list.
     ///
-    /// This method creates a self-removal proposal using the nostr-mls library and publishes
-    /// it to the group relays (with retry). The proposal will need to be committed by a group
-    /// admin before the removal is finalized.
+    /// This is a prerequisite for `leave_group()` — the MIP-03 protocol requires
+    /// admins to relinquish admin status before sending a SelfRemove proposal.
+    /// If the caller is the last admin, they must designate another admin first
+    /// via `update_group_data()`.
+    #[perf_instrument("groups")]
+    pub async fn self_demote(&self, account: &Account, group_id: &GroupId) -> Result<()> {
+        self.ensure_account_is_group_admin(account, group_id)
+            .await?;
+
+        let (relay_urls, evolution_event) = {
+            let mdk = self.create_mdk_for_account(account.pubkey)?;
+            let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
+            let update_result = mdk.self_demote(group_id)?;
+            (relay_urls, update_result.evolution_event)
+        };
+
+        self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
+            .await
+    }
+
+    /// Leaves a group by creating a SelfRemove proposal and publishing it.
+    ///
+    /// After the proposal is successfully published, the group is optimistically
+    /// marked as departed locally (`removed_at` + `self_removed`). When another
+    /// member auto-commits the proposal, the resulting commit will trigger
+    /// `mark_as_removed()` which no-ops idempotently since `removed_at` is
+    /// already set.
     ///
     /// # Arguments
     /// * `account` - The account that wants to leave the group
     /// * `group_id` - The ID of the group to leave
+    ///
+    /// # Errors
+    /// * `AlreadyDepartedFromGroup` if the account has already departed
+    /// * MDK errors if the caller is still an admin (must call `self_demote()` first)
+    /// * Relay errors if the proposal cannot be published
     #[perf_instrument("groups")]
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
+        // Guard: can't leave a group you've already departed from
+        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        if account_group.is_removed() {
+            return Err(WhitenoiseError::AlreadyDepartedFromGroup);
+        }
+
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
-            // Create a self-removal proposal
             let update_result = mdk.leave_group(group_id)?;
-
             (relay_urls, update_result.evolution_event)
         };
 
-        // Publish the self-removal proposal to the group
+        // Publish the SelfRemove proposal to the group relays
         self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
-        // TODO: Do any local updates to ensure that we're accurately reflecting that the account is trying to leave this group
+        // Optimistic local update is best-effort after publish success.
+        // When the auto-committed removal commit arrives later,
+        // mark_as_removed() will converge the local state regardless.
+        if let Err(error) = self.mark_as_left(account, group_id).await {
+            tracing::warn!(
+                target: "whitenoise::groups",
+                account_pubkey = %account.pubkey,
+                group_id = %hex::encode(group_id.as_slice()),
+                "SelfRemove published but failed to mark local departure: {error}",
+            );
+        }
+
+        // Always refresh subscriptions after publish
+        self.background_refresh_account_group_subscriptions(account);
+
         Ok(())
     }
 }
@@ -1884,7 +1933,13 @@ mod tests {
             .unwrap();
         assert_eq!(initial_members.len(), 3); // creator + 2 members
 
-        // Creator leaves the group (creates proposal)
+        // Creator must self-demote before leaving (MIP-03: admins cannot SelfRemove)
+        whitenoise
+            .self_demote(&creator_account, &group.mls_group_id)
+            .await
+            .expect("self_demote should succeed (another admin exists)");
+
+        // Creator leaves the group (creates SelfRemove proposal)
         // Note: In a real scenario, members would need to accept welcome messages
         // to have access to the group. For this test, we use the creator who
         // has immediate access to the group.
@@ -1903,8 +1958,15 @@ mod tests {
         // but that's part of the message processing pipeline that would be
         // tested separately in integration tests.
 
-        // For now, we just verify that the proposal was successfully created and published
-        // without errors, which indicates the leave_group method works correctly.
+        // A second leave attempt must be rejected — the account already departed
+        let second_leave = whitenoise
+            .leave_group(&creator_account, &group.mls_group_id)
+            .await;
+        assert!(
+            matches!(second_leave, Err(WhitenoiseError::AlreadyDepartedFromGroup)),
+            "Expected AlreadyDepartedFromGroup, got: {:?}",
+            second_leave
+        );
     }
 
     #[tokio::test]

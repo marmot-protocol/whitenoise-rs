@@ -20,6 +20,11 @@ pub enum ChatListUpdateTrigger {
     /// The chat's mute status changed (muted or unmuted). The item's
     /// `muted_until` field indicates the new state.
     ChatMuteChanged,
+    /// The account voluntarily left this group via SelfRemove.
+    /// The group stays visible (read-only) until the user explicitly archives
+    /// or deletes it. The item's `removed_at` and `self_removed` fields are set.
+    /// Routing: same as RemovedFromGroup — active or archived based on archive status.
+    LeftGroup,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +61,7 @@ mod tests {
             ChatListUpdateTrigger::ChatArchiveChanged,
             ChatListUpdateTrigger::RemovedFromGroup,
             ChatListUpdateTrigger::ChatMuteChanged,
+            ChatListUpdateTrigger::LeftGroup,
         ];
 
         for trigger in triggers {
@@ -85,5 +91,8 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatMuteChanged);
         assert!(debug_str.contains("ChatMuteChanged"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::LeftGroup);
+        assert!(debug_str.contains("LeftGroup"));
     }
 }

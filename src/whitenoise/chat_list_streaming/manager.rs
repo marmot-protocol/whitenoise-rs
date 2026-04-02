@@ -90,6 +90,7 @@ mod tests {
             dm_peer_pubkey: None,
             archived_at: None,
             removed_at: None,
+            self_removed: false,
             muted_until: None,
         }
     }
