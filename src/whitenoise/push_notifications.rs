@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ::rand::Rng;
+use futures::stream::{self, StreamExt};
 use chrono::{DateTime, Utc};
 use mdk_core::mip05::{
     EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
@@ -25,6 +26,11 @@ use crate::whitenoise::{
     error::{Result, WhitenoiseError},
 };
 use crate::{perf_instrument, relay_control::RelayControlPlane};
+
+/// Maximum number of groups to process concurrently for push token operations.
+/// This bounds the parallelism to avoid overwhelming the relay connections
+/// while still reducing latency from O(N × RTT) to roughly O(N / CONCURRENCY + RTT).
+const MAX_CONCURRENT_GROUP_OPERATIONS: usize = 5;
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -548,39 +554,34 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if group.state != GroupState::Active {
-                continue;
-            }
+        // Process groups concurrently to reduce latency from O(N × RTT) to
+        // roughly O(ceil(N / CONCURRENCY) × RTT). Uses buffer_unordered to
+        // limit concurrent relay operations and prevent connection overload.
+        let results: Vec<Result<()>> = stream::iter(groups)
+            .filter(|group| futures::future::ready(group.state == GroupState::Active))
+            .map(|group| async move {
+                let rumor = build_token_request_rumor(
+                    account.pubkey,
+                    nostr_sdk::Timestamp::now(),
+                    vec![token_tag.clone()],
+                )?;
+                self.publish_push_group_message(account, &group.mls_group_id, rumor)
+                    .await?;
+                self.sync_local_group_push_token_cache(account, &group.mls_group_id, Some(token_tag))
+                    .await
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_OPERATIONS)
+            .collect()
+            .await;
 
-            let rumor = build_token_request_rumor(
-                account.pubkey,
-                nostr_sdk::Timestamp::now(),
-                vec![token_tag.clone()],
-            )?;
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-                continue;
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, Some(token_tag))
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
+        let publish_failures: Vec<String> = results
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            })
+            .collect();
 
         if publish_failures.is_empty() {
             Ok(())
@@ -711,34 +712,29 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if group.state != GroupState::Active {
-                continue;
-            }
+        // Process groups concurrently to reduce latency from O(N × RTT) to
+        // roughly O(ceil(N / CONCURRENCY) × RTT).
+        let results: Vec<Result<()>> = stream::iter(groups)
+            .filter(|group| futures::future::ready(group.state == GroupState::Active))
+            .map(|group| async move {
+                let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
+                self.publish_push_group_message(account, &group.mls_group_id, rumor)
+                    .await?;
+                self.sync_local_group_push_token_cache(account, &group.mls_group_id, None)
+                    .await
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_OPERATIONS)
+            .collect()
+            .await;
 
-            let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, None)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
+        let publish_failures: Vec<String> = results
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            })
+            .collect();
 
         if publish_failures.is_empty() {
             Ok(())
