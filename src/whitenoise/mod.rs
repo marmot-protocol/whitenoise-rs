@@ -1258,6 +1258,7 @@ pub mod test_utils {
 mod tests {
     use super::test_utils::*;
     use super::*;
+    use database::aggregated_messages::PaginationOptions;
 
     // Configuration Tests
     mod config_tests {
@@ -1521,7 +1522,12 @@ mod tests {
 
             // Fetching messages for a non-existent group should return empty list (no error)
             let result = whitenoise
-                .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, None, None, None)
+                .fetch_aggregated_messages_for_group(
+                    &account.pubkey,
+                    &group_id,
+                    &PaginationOptions::default(),
+                    None,
+                )
                 .await;
 
             assert!(result.is_ok(), "Should succeed with empty list");
@@ -2290,8 +2296,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_in_snapshot.created_at),
-                    Some(oldest_in_snapshot.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_in_snapshot.created_at),
+                        before_message_id: Some(oldest_in_snapshot.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(5),
                 )
                 .await
@@ -2450,8 +2459,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_p1.created_at),
-                    Some(oldest_p1.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_p1.created_at),
+                        before_message_id: Some(oldest_p1.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(5),
                 )
                 .await
@@ -2464,8 +2476,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_p2.created_at),
-                    Some(oldest_p2.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_p2.created_at),
+                        before_message_id: Some(oldest_p2.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(5),
                 )
                 .await
@@ -2504,8 +2519,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_p1.created_at),
-                    Some(oldest_p1.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_p1.created_at),
+                        before_message_id: Some(oldest_p1.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(5),
                 )
                 .await
@@ -2517,8 +2535,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_p2.created_at),
-                    Some(oldest_p2.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_p2.created_at),
+                        before_message_id: Some(oldest_p2.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(5),
                 )
                 .await
@@ -2603,8 +2624,11 @@ mod tests {
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
                     &group_id,
-                    Some(oldest_in_snapshot.created_at),
-                    Some(oldest_in_snapshot.id.as_str()),
+                    &PaginationOptions {
+                        before: Some(oldest_in_snapshot.created_at),
+                        before_message_id: Some(oldest_in_snapshot.id.as_str()),
+                        ..Default::default()
+                    },
                     Some(3),
                 )
                 .await

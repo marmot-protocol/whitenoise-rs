@@ -6,7 +6,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::{Database, retry_on_lock},
+        database::{Database, aggregated_messages::PaginationOptions, retry_on_lock},
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
         message_aggregator::{
@@ -633,25 +633,16 @@ impl Whitenoise {
     /// - Startup sync: Populates cache with existing messages on initialization
     ///
     /// # Arguments
-    /// * `pubkey`  - The public key of the user requesting messages
+    /// * `pubkey`   - The public key of the user requesting messages
     /// * `group_id` - The group to fetch messages for
-    /// * `before`            - Cursor timestamp. If `Some`, return only messages with
-    ///   `created_at` strictly before this value **or** at the same second but with a
-    ///   lexicographically smaller message ID. Pass the `created_at` of the oldest message
-    ///   currently loaded to fetch the preceding page (infinite scroll upward). Omit for the
-    ///   initial load.
-    /// * `before_message_id` - Companion cursor ID. Pass the `id` of the same oldest message
-    ///   used for `before` so that ties at the same second are resolved deterministically.
-    ///   Must be `Some` whenever `before` is `Some`; `None` is only valid when `before` is also
-    ///   `None` (initial load). Passing `before` without `before_message_id` returns an error.
-    /// * `limit`             - Maximum number of messages to return. Defaults to 50, capped at 200.
+    /// * `options`  - Pagination cursor and direction (see [`PaginationOptions`]).
+    /// * `limit`    - Maximum number of messages to return. Defaults to 50, capped at 200.
     #[perf_instrument("messages")]
     pub async fn fetch_aggregated_messages_for_group(
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
-        before: Option<Timestamp>,
-        before_message_id: Option<&str>,
+        options: &PaginationOptions<'_>,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
@@ -659,8 +650,7 @@ impl Whitenoise {
         AggregatedMessage::find_messages_by_group_paginated(
             group_id,
             &self.database,
-            before,
-            before_message_id,
+            options,
             limit,
         )
         .await
@@ -1501,8 +1491,7 @@ mod tests {
             .fetch_aggregated_messages_for_group(
                 &creator.pubkey,
                 &group.mls_group_id,
-                None,
-                None,
+                &PaginationOptions::default(),
                 None,
             )
             .await
@@ -1578,8 +1567,7 @@ mod tests {
             .fetch_aggregated_messages_for_group(
                 &creator.pubkey,
                 &group.mls_group_id,
-                None,
-                None,
+                &PaginationOptions::default(),
                 None,
             )
             .await

@@ -4,6 +4,8 @@ use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResu
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::*;
 
+#[cfg(test)]
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::{
     perf_instrument, perf_span,
     whitenoise::{
@@ -1396,8 +1398,7 @@ mod tests {
             .fetch_aggregated_messages_for_group(
                 &creator_account.pubkey,
                 &group.mls_group_id,
-                None,
-                None,
+                &PaginationOptions::default(),
                 None,
             )
             .await

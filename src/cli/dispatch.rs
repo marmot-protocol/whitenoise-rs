@@ -8,6 +8,7 @@ use crate::Whitenoise;
 use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::KeyPackageStatus;
 
@@ -1656,14 +1657,13 @@ async fn list_messages(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let before_ts = before.map(Timestamp::from);
+    let options = PaginationOptions {
+        before: before_ts,
+        before_message_id,
+        ..Default::default()
+    };
     let messages = wn
-        .fetch_aggregated_messages_for_group(
-            &account.pubkey,
-            &group_id,
-            before_ts,
-            before_message_id,
-            limit,
-        )
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, &options, limit)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 
