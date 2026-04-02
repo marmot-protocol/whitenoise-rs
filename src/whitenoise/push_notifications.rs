@@ -431,10 +431,8 @@ async fn resolve_notification_server_relays(
 
     let cached_relays = server_user.relays(RelayType::Inbox, database).await?;
     if !cached_relays.is_empty() {
-        let mut merged_relays = Relay::urls(&cached_relays);
-        merged_relays.extend(deduped_hints);
         return Ok((
-            dedupe_relay_urls(&merged_relays),
+            dedupe_relay_urls(&Relay::urls(&cached_relays)),
             NotificationRelaySource::Cached,
         ));
     }
@@ -1645,7 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_notification_server_relays_merges_cached_relays_with_fresh_hints() {
+    async fn test_resolve_notification_server_relays_ignores_hints_when_cached_relays_exist() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let server_pubkey = Keys::generate().public_key();
         let cached_relay = RelayUrl::parse("wss://cached-push.example.com").unwrap();
@@ -1675,7 +1673,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resolved_relays, vec![cached_relay.clone(), fresh_hint]);
+        assert_eq!(resolved_relays, vec![cached_relay.clone()]);
         assert_eq!(relay_source, NotificationRelaySource::Cached);
         assert_eq!(
             Relay::urls(
