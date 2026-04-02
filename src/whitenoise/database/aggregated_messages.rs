@@ -3160,6 +3160,281 @@ mod tests {
         );
     }
 
+    // ── "After" cursor (forward pagination) tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_returns_only_newer_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[220; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_000_000;
+
+        // Insert 5 messages: ts+1 … ts+5
+        for i in 1u8..=5 {
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
+                .await;
+        }
+
+        // Cursor at ts+2 (seed 2): should return only messages with created_at > ts+2 → ts+3, ts+4, ts+5.
+        let cursor_ts = Timestamp::from(base_ts + 2);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 2u8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.as_str()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 3, "should return 3 messages after the cursor");
+        assert_eq!(messages[0].created_at, Timestamp::from(base_ts + 3));
+        assert_eq!(messages[1].created_at, Timestamp::from(base_ts + 4));
+        assert_eq!(messages[2].created_at, Timestamp::from(base_ts + 5));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_returns_oldest_first() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[221; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_100_000;
+
+        for i in 1u8..=10 {
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
+                .await;
+        }
+
+        // Cursor at ts+3: should return ts+4 … ts+10 in ascending order
+        let cursor_ts = Timestamp::from(base_ts + 3);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.as_str()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 7);
+        for w in messages.windows(2) {
+            assert!(
+                w[0].created_at < w[1].created_at
+                    || (w[0].created_at == w[1].created_at && w[0].id < w[1].id),
+                "after-cursor results must be ordered (created_at, id) ascending"
+            );
+        }
+    }
+
+    /// Forward-paginating through tied timestamps must not skip or duplicate messages.
+    #[tokio::test]
+    async fn test_paginated_after_cursor_tied_timestamps() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[222; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let tie_ts: u64 = 1_710_200_000;
+
+        // Insert one message before the tie, six at tie_ts, one after
+        insert_message_at(7, author, tie_ts - 1, &group_id, &whitenoise.database).await;
+        for i in 1u8..=6 {
+            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.database).await;
+        }
+        insert_message_at(8, author, tie_ts + 1, &group_id, &whitenoise.database).await;
+
+        // Use the earliest message (seed 7, ts-1) as the after cursor
+        let cursor_ts = Timestamp::from(tie_ts - 1);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 7u8));
+
+        // Page through with limit 3
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.as_str()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page1.len(), 3, "page 1 should have 3 messages");
+
+        let c1_ts = page1.last().unwrap().created_at;
+        let c1_id = page1.last().unwrap().id.clone();
+        let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(c1_ts),
+                after_message_id: Some(c1_id.as_str()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page2.len(), 3, "page 2 should have 3 messages");
+
+        let c2_ts = page2.last().unwrap().created_at;
+        let c2_id = page2.last().unwrap().id.clone();
+        let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(c2_ts),
+                after_message_id: Some(c2_id.as_str()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page3.len(), 1, "page 3 should have the remaining 1 message");
+
+        // No duplicates, no gaps: exactly 7 unique messages after the cursor
+        let all_ids: std::collections::HashSet<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(
+            all_ids.len(),
+            7,
+            "all 7 messages after cursor must be returned exactly once"
+        );
+
+        // Verify ascending order within each page
+        for (page_num, page) in [&page1, &page2, &page3].iter().enumerate() {
+            for w in page.windows(2) {
+                assert!(
+                    w[0].created_at < w[1].created_at
+                        || (w[0].created_at == w[1].created_at && w[0].id < w[1].id),
+                    "page {} must be ordered (created_at, id) ascending",
+                    page_num + 1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paginated_both_before_and_after_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[223; 32]);
+        let ts = Timestamp::from(1_710_300_000u64);
+        let id = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                before: Some(ts),
+                before_message_id: Some(id),
+                after: Some(ts),
+                after_message_id: Some(id),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor when both before and after are specified, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginated_half_specified_after_cursor_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[224; 32]);
+        let ts = Timestamp::from(1_710_400_000u64);
+
+        // after=Some, after_message_id=None → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(ts),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
+
+        // after=None, after_message_id=Some → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after_message_id: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                ),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_past_newest_returns_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[225; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_500_000;
+
+        for i in 1u8..=3 {
+            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
+                .await;
+        }
+
+        // Cursor beyond all messages
+        let cursor_ts = Timestamp::from(base_ts + 100);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 0xffu8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.as_str()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(messages.is_empty(), "cursor past newest message should yield empty page");
+    }
+
     // ── Additional pagination tests ───────────────────────────────────────────
 
     /// Messages in group A must not appear when paginating group B.
