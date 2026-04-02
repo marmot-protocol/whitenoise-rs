@@ -535,7 +535,7 @@ impl EphemeralPlane {
         stream_manager: &Arc<MessageStreamManager>,
     ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
-            Ok(output) if !output.success.is_empty() => {
+            Ok(output) => {
                 let status = DeliveryStatus::Sent(output.success.len());
                 Self::update_and_emit_delivery_status(
                     event_id,
@@ -547,29 +547,24 @@ impl EphemeralPlane {
                 .await;
                 MessagePublishResult::Published(output)
             }
-            Ok(output) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Publish completed but no relay accepted the message (failed: {:?})",
-                    output.failed.keys().collect::<Vec<_>>(),
-                );
-                let status = DeliveryStatus::Failed("No relay accepted the message".to_string());
-                Self::update_and_emit_delivery_status(
-                    event_id,
-                    group_id,
-                    &status,
-                    database,
-                    stream_manager,
-                )
-                .await;
-                MessagePublishResult::Failed
-            }
             Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Publish failed after bounded retries: {error}"
-                );
-                let status = DeliveryStatus::Failed(error.to_string());
+                let failure_message = match &error {
+                    NostrManagerError::NoRelayAccepted => {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Publish failed after bounded retries because no relay accepted the message"
+                        );
+                        "No relay accepted the message".to_string()
+                    }
+                    _ => {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Publish failed after bounded retries: {error}"
+                        );
+                        error.to_string()
+                    }
+                };
+                let status = DeliveryStatus::Failed(failure_message);
                 Self::update_and_emit_delivery_status(
                     event_id,
                     group_id,
@@ -822,7 +817,7 @@ impl EphemeralScope {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::SystemTime};
+    use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
     use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::mpsc;
@@ -875,6 +870,23 @@ mod tests {
         );
         assert_eq!(config.max_publish_attempts, 3);
         assert_eq!(config.ad_hoc_relay_ttl, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_message_publish_result_helpers() {
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let event_id = EventId::from_hex(&"11".repeat(32)).unwrap();
+        let output = Output {
+            val: event_id,
+            success: std::collections::HashSet::from([relay_url]),
+            failed: HashMap::new(),
+        };
+        let published = MessagePublishResult::Published(output);
+
+        assert_eq!(published.output().unwrap().id(), &event_id);
+        assert!(published.succeeded());
+        assert!(MessagePublishResult::Failed.output().is_none());
+        assert!(!MessagePublishResult::Failed.succeeded());
     }
 
     #[tokio::test]

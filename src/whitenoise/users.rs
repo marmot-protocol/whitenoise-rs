@@ -2613,6 +2613,39 @@ mod tests {
                 assert!(!changed);
             }
         }
+
+        #[tokio::test]
+        async fn test_sync_user_relay_type_from_query_relays_returns_existing_relays_when_query_list_is_empty()
+         {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("wss://inbox.example.com").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+
+            saved_user
+                .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let relays = whitenoise
+                .sync_user_relay_type_from_query_relays(&test_pubkey, RelayType::Inbox, &[])
+                .await
+                .unwrap();
+
+            assert_eq!(Relay::urls(&relays), vec![relay_url]);
+        }
     }
 
     mod key_package_status_tests {
