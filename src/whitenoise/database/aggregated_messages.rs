@@ -3173,8 +3173,14 @@ mod tests {
 
         // Insert 5 messages: ts+1 … ts+5
         for i in 1u8..=5 {
-            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
-                .await;
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
         }
 
         // Cursor at ts+2 (seed 2): should return only messages with created_at > ts+2 → ts+3, ts+4, ts+5.
@@ -3193,7 +3199,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(messages.len(), 3, "should return 3 messages after the cursor");
+        assert_eq!(
+            messages.len(),
+            3,
+            "should return 3 messages after the cursor"
+        );
         assert_eq!(messages[0].created_at, Timestamp::from(base_ts + 3));
         assert_eq!(messages[1].created_at, Timestamp::from(base_ts + 4));
         assert_eq!(messages[2].created_at, Timestamp::from(base_ts + 5));
@@ -3209,8 +3219,14 @@ mod tests {
         let base_ts: u64 = 1_710_100_000;
 
         for i in 1u8..=10 {
-            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
-                .await;
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
         }
 
         // Cursor at ts+3: should return ts+4 … ts+10 in ascending order
@@ -3412,8 +3428,14 @@ mod tests {
         let base_ts: u64 = 1_710_500_000;
 
         for i in 1u8..=3 {
-            insert_message_at(i, author, base_ts + u64::from(i), &group_id, &whitenoise.database)
-                .await;
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
         }
 
         // Cursor beyond all messages
@@ -3432,7 +3454,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(messages.is_empty(), "cursor past newest message should yield empty page");
+        assert!(
+            messages.is_empty(),
+            "cursor past newest message should yield empty page"
+        );
     }
 
     // ── Additional pagination tests ───────────────────────────────────────────
