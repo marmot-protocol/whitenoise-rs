@@ -321,10 +321,8 @@ fn dedupe_relay_urls(relay_urls: &[RelayUrl]) -> Vec<RelayUrl> {
     let mut seen = HashSet::with_capacity(relay_urls.len());
 
     for relay_url in relay_urls {
-        let relay_url = relay_url.clone();
-
         if seen.insert(relay_url.clone()) {
-            deduped.push(relay_url);
+            deduped.push(relay_url.clone());
         }
     }
 
@@ -410,6 +408,7 @@ fn prepare_notification_recipient_tokens(
     recipient_tokens
 }
 
+/// Returns per-server token counts for logging/observability only.
 fn notification_token_counts_by_server(tokens: &[TokenTag]) -> BTreeMap<PublicKey, usize> {
     let mut counts = BTreeMap::new();
 
@@ -428,29 +427,39 @@ async fn resolve_notification_server_relays(
 ) -> Result<(Vec<RelayUrl>, NotificationRelaySource)> {
     let (server_user, _created) =
         crate::whitenoise::users::User::find_or_create_by_pubkey(&server_pubkey, database).await?;
+    let deduped_hints = dedupe_relay_urls(relay_hints);
 
     let cached_relays = server_user.relays(RelayType::Inbox, database).await?;
     if !cached_relays.is_empty() {
-        return Ok((Relay::urls(&cached_relays), NotificationRelaySource::Cached));
+        let mut merged_relays = Relay::urls(&cached_relays);
+        merged_relays.extend(deduped_hints);
+        return Ok((
+            dedupe_relay_urls(&merged_relays),
+            NotificationRelaySource::Cached,
+        ));
     }
 
-    let deduped_hints = dedupe_relay_urls(relay_hints);
-    if !deduped_hints.is_empty()
-        && let Err(error) = user_relay_sync
+    let synced_relays = if deduped_hints.is_empty() {
+        Vec::new()
+    } else {
+        match user_relay_sync
             .sync_relay_type_for_pubkey(server_pubkey, RelayType::Inbox, &deduped_hints)
             .await
-    {
-        tracing::warn!(
-            target: "whitenoise::push_notifications",
-            server_pubkey = %server_pubkey.to_hex(),
-            relay_source = NotificationRelaySource::Synced.as_str(),
-            relay_hint_count = deduped_hints.len(),
-            error = %error,
-            "Failed to sync notification server inbox relays from relay hints"
-        );
-    }
-
-    let synced_relays = server_user.relays(RelayType::Inbox, database).await?;
+        {
+            Ok(relays) => relays,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    server_pubkey = %server_pubkey.to_hex(),
+                    relay_source = NotificationRelaySource::Synced.as_str(),
+                    relay_hint_count = deduped_hints.len(),
+                    error = %error,
+                    "Failed to sync notification server inbox relays from relay hints"
+                );
+                server_user.relays(RelayType::Inbox, database).await?
+            }
+        }
+    };
     if !synced_relays.is_empty() {
         return Ok((Relay::urls(&synced_relays), NotificationRelaySource::Synced));
     }
@@ -555,7 +564,6 @@ pub(crate) async fn publish_notification_requests_after_chat_delivery_with(
     ephemeral: &EphemeralPlane,
     account_pubkey: PublicKey,
     group_id: &GroupId,
-    _message_id: &EventId,
 ) -> Result<()> {
     let mdk = Account::create_mdk(account_pubkey, &config.data_dir, &config.keyring_service_id)?;
     let own_leaf_index = mdk.own_leaf_index(group_id)?;
@@ -1203,7 +1211,6 @@ impl Whitenoise {
         &self,
         account: &Account,
         group_id: &GroupId,
-        message_id: &EventId,
     ) -> Result<()> {
         let user_relay_sync = self.user_relay_sync_context();
         let ephemeral = self.relay_control.ephemeral();
@@ -1215,7 +1222,6 @@ impl Whitenoise {
             &ephemeral,
             account.pubkey,
             group_id,
-            message_id,
         )
         .await
     }
@@ -1639,6 +1645,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_notification_server_relays_merges_cached_relays_with_fresh_hints() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let server_pubkey = Keys::generate().public_key();
+        let cached_relay = RelayUrl::parse("wss://cached-push.example.com").unwrap();
+        let fresh_hint = RelayUrl::parse("wss://fresh-hint.example.com").unwrap();
+        let duplicate_cached_hint = RelayUrl::parse("wss://cached-push.example.com").unwrap();
+        let (server_user, _created) = crate::whitenoise::users::User::find_or_create_by_pubkey(
+            &server_pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let relay = Relay::find_or_create_by_url(&cached_relay, &whitenoise.database)
+            .await
+            .unwrap();
+
+        server_user
+            .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let (resolved_relays, relay_source) = resolve_notification_server_relays(
+            &whitenoise.database,
+            &whitenoise.user_relay_sync_context(),
+            server_pubkey,
+            &[duplicate_cached_hint, fresh_hint.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved_relays, vec![cached_relay.clone(), fresh_hint]);
+        assert_eq!(relay_source, NotificationRelaySource::Cached);
+        assert_eq!(
+            Relay::urls(
+                &server_user
+                    .relays(RelayType::Inbox, &whitenoise.database)
+                    .await
+                    .unwrap()
+            ),
+            vec![cached_relay]
+        );
+    }
+
+    #[tokio::test]
     async fn test_resolve_notification_server_relays_without_hints_returns_empty_fallback() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let server_pubkey = Keys::generate().public_key();
@@ -1726,14 +1776,8 @@ mod tests {
             &member_account,
         )
         .await;
-        let message_id = EventId::from_hex(&"11".repeat(32)).unwrap();
-
         whitenoise
-            .publish_notification_requests_after_chat_delivery(
-                &admin_account,
-                &group_id,
-                &message_id,
-            )
+            .publish_notification_requests_after_chat_delivery(&admin_account, &group_id)
             .await
             .unwrap();
 
@@ -1977,7 +2021,6 @@ mod tests {
             &ephemeral,
             creator.pubkey,
             &group_id,
-            &send_result.message.id,
         )
         .await
         .unwrap();

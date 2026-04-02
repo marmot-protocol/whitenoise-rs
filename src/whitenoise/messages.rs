@@ -104,7 +104,6 @@ impl Whitenoise {
         let user_relay_sync = self.user_relay_sync_context();
         let config = self.config.clone();
         let event_id_str = event_id.to_string();
-        let message_id = event_id;
         let account_pubkey = account.pubkey;
         let database = self.database.clone();
         let stream_manager = self.message_stream_manager.clone();
@@ -135,7 +134,6 @@ impl Whitenoise {
                     &ephemeral,
                     account_pubkey,
                     &group_id_clone,
-                    &message_id,
                 )
                 .await
             {

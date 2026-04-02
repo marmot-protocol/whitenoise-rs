@@ -14,6 +14,7 @@ use crate::{
     relay_control::RelayControlPlane,
     whitenoise::{
         Whitenoise,
+        database::Database,
         database::processed_events::ProcessedEvent,
         error::{Result, WhitenoiseError},
         event_tracker::EventTracker,
@@ -50,14 +51,14 @@ static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::
 
 #[derive(Clone)]
 pub(crate) struct UserRelaySyncContext {
-    database: Arc<crate::whitenoise::database::Database>,
+    database: Arc<Database>,
     event_tracker: Arc<dyn EventTracker>,
     relay_control: Arc<RelayControlPlane>,
 }
 
 impl UserRelaySyncContext {
     pub(crate) fn new(
-        database: Arc<crate::whitenoise::database::Database>,
+        database: Arc<Database>,
         event_tracker: Arc<dyn EventTracker>,
         relay_control: Arc<RelayControlPlane>,
     ) -> Self {

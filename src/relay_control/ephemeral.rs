@@ -536,6 +536,10 @@ impl EphemeralPlane {
     ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
             Ok(output) => {
+                debug_assert!(
+                    !output.success.is_empty(),
+                    "publish_event_to returned Ok with no accepted relays"
+                );
                 let status = DeliveryStatus::Sent(output.success.len());
                 Self::update_and_emit_delivery_status(
                     event_id,
