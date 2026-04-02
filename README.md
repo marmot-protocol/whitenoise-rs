@@ -56,8 +56,9 @@ To get started contributing you'll need to have the [Rust](https://www.rust-lang
    ```
 1. Now you can run the integration tests with `just int-test`.
 
-`just docker-up` will auto-generate `dev/transponder/.env` if it is missing and put a local-only
-test key there for the Transponder container. The file is gitignored and should not be committed.
+`just docker-up` will auto-generate `dev/transponder/.env` if it is missing, wait for the local
+stack to become ready, and put a local-only test key there for the Transponder container. The file
+is gitignored and should not be committed.
 
 ### Development Tools
 

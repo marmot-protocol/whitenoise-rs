@@ -34,10 +34,25 @@ wait_for_http_endpoint() {
     return 1
 }
 
+check_http_endpoint() {
+    local url=$1
+    local label=$2
+
+    echo "Checking $label at $url"
+
+    if curl --fail --silent --show-error "$url" >/dev/null; then
+        echo "✓ $label is responding"
+        return 0
+    fi
+
+    echo "✗ $label is not responding after service startup" >&2
+    return 1
+}
+
 echo "Waiting for local docker services to be ready..."
-bash "$REPO_ROOT/scripts/wait_for_relays.sh"
+"$REPO_ROOT/scripts/wait_for_relays.sh"
 wait_for_http_endpoint "$TRANSPONDER_BASE_URL/health" "Transponder health endpoint"
-wait_for_http_endpoint "$TRANSPONDER_BASE_URL/metrics" "Transponder metrics endpoint"
+check_http_endpoint "$TRANSPONDER_BASE_URL/metrics" "Transponder metrics endpoint"
 
 echo "Note: Transponder /ready is expected to stay not-ready in this stack because APNs and FCM are disabled."
 echo "✓ All local docker services are ready!"

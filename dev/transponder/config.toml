@@ -1,5 +1,6 @@
 [server]
-# Loaded from dev/transponder/.env by docker compose.
+# Transponder overrides this at runtime from the TRANSPONDER_SERVER_PRIVATE_KEY env var.
+# The value comes from dev/transponder/.env, which docker compose loads for this service.
 private_key = ""
 shutdown_timeout_secs = 10
 max_dedup_cache_size = 10000

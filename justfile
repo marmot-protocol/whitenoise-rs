@@ -449,10 +449,16 @@ build-release:
 # Docker
 ######################
 
-# Start docker compose services
+# Build the local Transponder image without starting the stack
+docker-build:
+    ./scripts/ensure_transponder_env.sh
+    docker compose build transponder
+
+# Start docker compose services and wait for them to become ready
 docker-up:
     ./scripts/ensure_transponder_env.sh
-    docker compose up -d --build
+    docker compose up -d
+    ./scripts/wait_for_dev_services.sh
 
 # Wait for local docker services to become ready
 docker-smoke:

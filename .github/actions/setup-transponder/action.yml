@@ -1,0 +1,32 @@
+name: Setup Transponder
+description: Prepare the local Transponder env file and build the cached dev image.
+
+inputs:
+  cache-scope:
+    description: GitHub Actions cache scope used for the Transponder image build.
+    required: false
+    default: transponder-dev
+  image-tag:
+    description: Local image tag loaded into the Docker daemon for compose runs.
+    required: false
+    default: whitenoise-rs-transponder:latest
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare Transponder dev env
+      shell: bash
+      run: ./scripts/ensure_transponder_env.sh
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build cached Transponder image
+      uses: docker/build-push-action@v6
+      with:
+        context: ./dev/transponder
+        file: ./dev/transponder/Dockerfile
+        load: true
+        tags: ${{ inputs.image-tag }}
+        cache-from: type=gha,scope=${{ inputs.cache-scope }}
+        cache-to: type=gha,scope=${{ inputs.cache-scope }},mode=max

@@ -19,9 +19,7 @@ if [ -f "$ENV_FILE" ] && grep -Eq '^TRANSPONDER_SERVER_PRIVATE_KEY=[0-9a-f]{64}$
     exit 0
 fi
 
-if [ ! -f "$ENV_FILE" ]; then
-    cp "$ENV_EXAMPLE" "$ENV_FILE"
-fi
+cp "$ENV_EXAMPLE" "$ENV_FILE"
 
 PRIVATE_KEY=$(openssl rand -hex 32)
 TMP_FILE=$(mktemp)
