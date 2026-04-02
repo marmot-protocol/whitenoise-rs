@@ -726,10 +726,17 @@ impl Whitenoise {
             .sync_account_group_subscriptions(
                 account.pubkey,
                 &group_specs,
-                account.since_timestamp(10),
+                Self::group_resubscribe_since(account),
             )
             .await
             .map_err(WhitenoiseError::from)
+    }
+
+    /// Replay anchor for any group-subscription rebuild path.
+    ///
+    /// Uses the widened resubscribe buffer to cover teardown/rebuild gaps.
+    fn group_resubscribe_since(account: &Account) -> Option<Timestamp> {
+        account.since_timestamp(Self::RESUBSCRIBE_BUFFER_SECS)
     }
 
     #[perf_instrument("accounts")]
@@ -747,7 +754,29 @@ impl Whitenoise {
             return Ok(());
         }
 
-        self.sync_group_subscriptions(account).await
+        let group_specs = self.extract_group_subscription_specs(account).await?;
+
+        for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
+            Relay::find_or_create_by_url(relay_url, &self.database).await?;
+        }
+
+        if Self::is_background_task_cancelled(cancel_rx) {
+            tracing::debug!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                account_pubkey = %account.pubkey,
+                "Skipping group subscription sync because the account was cancelled",
+            );
+            return Ok(());
+        }
+
+        self.relay_control
+            .sync_account_group_subscriptions(
+                account.pubkey,
+                &group_specs,
+                Self::group_resubscribe_since(account),
+            )
+            .await
+            .map_err(WhitenoiseError::from)
     }
 
     fn is_background_task_cancelled(cancel_rx: Option<&watch::Receiver<bool>>) -> bool {
@@ -832,13 +861,14 @@ impl Whitenoise {
             Relay::find_or_create_by_url(relay_url, &self.database).await?;
         }
 
-        // Compute per-account since with a 10s lookback buffer when available
-        let since = account.since_timestamp(10);
+        // Standard buffer for initial activation (no prior teardown gap to cover).
+        let since = account.since_timestamp(Self::SUBSCRIPTION_BUFFER_SECS);
         match since {
             Some(ts) => tracing::debug!(
                 target: "whitenoise::accounts",
-                "Computed per-account since={}s (10s buffer) for {}",
+                "Computed per-account since={}s ({}s buffer) for {}",
                 ts.as_secs(),
+                Self::SUBSCRIPTION_BUFFER_SECS,
                 account.pubkey.to_hex()
             ),
             None => tracing::debug!(
@@ -904,9 +934,11 @@ impl Whitenoise {
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
-        // 10s buffer to avoid missing events at the boundary of the last sync window.
+        // Use a larger buffer when resubscribing after teardown to cover the gap
+        // window between deactivate and the new subscriptions going live.
+        // Any duplicate events are deduplicated by the event tracker.
         // Gift-wrap backdating is handled separately inside setup_giftwrap_subscription.
-        let since = account.since_timestamp(10);
+        let since = Self::group_resubscribe_since(account);
 
         let signer = self.get_signer_for_account(account)?;
 
@@ -1011,8 +1043,7 @@ mod tests {
         assert!(
             !whitenoise
                 .background_task_cancellation
-                .contains_key(&account_pubkey),
-            "test account should start without a cancellation channel"
+                .contains_key(&account_pubkey)
         );
 
         whitenoise.ensure_background_task_cancellation_channel(account_pubkey);
@@ -1070,10 +1101,7 @@ mod tests {
             .changed()
             .await
             .expect("existing receiver should observe cancellation");
-        assert!(
-            *existing_cancel_rx.borrow_and_update(),
-            "previous cancellation channel should be signalled before replacement"
-        );
+        assert!(*existing_cancel_rx.borrow_and_update());
 
         let cancel_tx = whitenoise
             .background_task_cancellation
@@ -1175,14 +1203,8 @@ mod tests {
         let spec = &group_specs[0];
 
         // Verify relays were extracted for the group
-        assert!(
-            spec.relays.contains(&relay1),
-            "Should contain relay1 from group config"
-        );
-        assert!(
-            spec.relays.contains(&relay2),
-            "Should contain relay2 from group config"
-        );
+        assert!(spec.relays.contains(&relay1));
+        assert!(spec.relays.contains(&relay2));
 
         // Verify group ID was extracted
         assert_eq!(
@@ -1295,10 +1317,7 @@ mod tests {
             .into_iter()
             .map(|relay| relay.url)
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            initial_urls.contains(&stale_relay.url),
-            "Test setup should create an initial stale relay entry"
-        );
+        assert!(initial_urls.contains(&stale_relay.url));
 
         whitenoise
             .sync_account_relays(
@@ -1323,10 +1342,7 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
         );
-        assert!(
-            !stored_urls.contains(&stale_relay.url),
-            "Stale relay should be removed during sync"
-        );
+        assert!(!stored_urls.contains(&stale_relay.url));
     }
 
     #[tokio::test]
@@ -1401,5 +1417,134 @@ mod tests {
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_none_returns_true() {
+        assert!(Whitenoise::is_background_task_cancelled(None));
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_false_receiver_returns_false() {
+        let (_, rx) = watch::channel(false);
+        assert!(!Whitenoise::is_background_task_cancelled(Some(&rx)));
+    }
+
+    #[test]
+    fn test_is_background_task_cancelled_true_receiver_returns_true() {
+        let (_, rx) = watch::channel(true);
+        assert!(Whitenoise::is_background_task_cancelled(Some(&rx)));
+    }
+
+    async fn make_stub_account(whitenoise: &Whitenoise) -> Account {
+        let keys = Keys::generate();
+        let (account, _) = Account::new(whitenoise, Some(keys)).await.unwrap();
+        account
+    }
+
+    #[tokio::test]
+    async fn test_refresh_account_group_subscriptions_with_cancel_skips_when_cancelled_at_start() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = make_stub_account(&whitenoise).await;
+
+        let (_, rx) = watch::channel(true);
+        let result = whitenoise
+            .refresh_account_group_subscriptions_with_cancel(&account, Some(&rx))
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_account_group_subscriptions_with_cancel_succeeds_with_no_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = make_stub_account(&whitenoise).await;
+
+        let (_, rx) = watch::channel(false);
+        let result = whitenoise
+            .refresh_account_group_subscriptions_with_cancel(&account, Some(&rx))
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_refresh_account_group_subscriptions_with_cancel_persists_group_relays() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let relay_url = RelayUrl::parse("ws://127.0.0.1:9").unwrap();
+        let config = NostrGroupConfigData::new(
+            "Test Group".to_string(),
+            "Relay persistence test".to_string(),
+            None,
+            None,
+            None,
+            vec![relay_url.clone()],
+            vec![creator_account.pubkey],
+        );
+
+        whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let (_, rx) = watch::channel(false);
+        let _ = whitenoise
+            .refresh_account_group_subscriptions_with_cancel(&creator_account, Some(&rx))
+            .await;
+
+        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(stored_relay.url, relay_url);
+    }
+
+    #[tokio::test]
+    async fn test_setup_subscriptions_persists_group_relays_before_activation() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let relay_url = RelayUrl::parse("ws://127.0.0.1:9").unwrap();
+        let config = NostrGroupConfigData::new(
+            "Setup Group".to_string(),
+            "Setup relay persistence test".to_string(),
+            None,
+            None,
+            None,
+            vec![relay_url.clone()],
+            vec![creator_account.pubkey],
+        );
+
+        whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let _ = whitenoise.setup_subscriptions(&creator_account, &[]).await;
+
+        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(stored_relay.url, relay_url);
+    }
+
+    #[tokio::test]
+    async fn test_background_refresh_account_group_subscriptions_no_channel_noop() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = make_stub_account(&whitenoise).await;
+
+        whitenoise.background_refresh_account_group_subscriptions(&account);
+        tokio::task::yield_now().await;
+
+        assert!(
+            !whitenoise
+                .background_task_cancellation
+                .contains_key(&account.pubkey)
+        );
     }
 }
