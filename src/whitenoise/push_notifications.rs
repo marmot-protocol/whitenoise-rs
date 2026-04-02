@@ -1202,26 +1202,6 @@ impl Whitenoise {
         publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
             .await
     }
-
-    #[perf_instrument("push_notifications")]
-    pub(crate) async fn publish_notification_requests_after_delivery(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let user_relay_sync = self.user_relay_sync_context();
-        let ephemeral = self.relay_control.ephemeral();
-
-        publish_notification_requests_after_delivery_with(
-            &self.config,
-            &self.database,
-            &user_relay_sync,
-            &ephemeral,
-            account.pubkey,
-            group_id,
-        )
-        .await
-    }
 }
 
 fn validate_raw_token(raw_token: &str) -> Result<()> {
@@ -1333,6 +1313,25 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn publish_notification_requests_after_delivery_for_test(
+        whitenoise: &Whitenoise,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let user_relay_sync = whitenoise.user_relay_sync_context();
+        let ephemeral = whitenoise.relay_control.ephemeral();
+
+        publish_notification_requests_after_delivery_with(
+            &whitenoise.config,
+            &whitenoise.database,
+            &user_relay_sync,
+            &ephemeral,
+            account.pubkey,
+            group_id,
+        )
+        .await
     }
 
     async fn wait_for_user_inbox_relays_on_network(
@@ -1772,10 +1771,13 @@ mod tests {
             &member_account,
         )
         .await;
-        whitenoise
-            .publish_notification_requests_after_delivery(&admin_account, &group_id)
-            .await
-            .unwrap();
+        publish_notification_requests_after_delivery_for_test(
+            &whitenoise,
+            &admin_account,
+            &group_id,
+        )
+        .await
+        .unwrap();
 
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
