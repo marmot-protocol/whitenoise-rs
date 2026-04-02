@@ -25,6 +25,23 @@ use crate::{
     },
 };
 
+fn build_follow_list_event_builder(
+    follow_list: &[PublicKey],
+    created_at: Option<Timestamp>,
+) -> EventBuilder {
+    let tags: Vec<Tag> = follow_list
+        .iter()
+        .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
+        .collect();
+
+    let builder = EventBuilder::new(Kind::ContactList, "").tags(tags);
+    if let Some(created_at) = created_at {
+        builder.custom_created_at(created_at)
+    } else {
+        builder
+    }
+}
+
 /// Configuration for short-lived, targeted relay work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EphemeralPlaneConfig {
@@ -263,12 +280,19 @@ impl EphemeralPlane {
         target_relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
-        let tags: Vec<Tag> = follow_list
-            .iter()
-            .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
-            .collect();
-        let event_builder = EventBuilder::new(Kind::ContactList, "").tags(tags);
+        self.publish_follow_list_with_signer_at(follow_list, target_relays, None, signer)
+            .await
+    }
 
+    #[perf_instrument("relay")]
+    pub(crate) async fn publish_follow_list_with_signer_at(
+        &self,
+        follow_list: &[PublicKey],
+        target_relays: &[RelayUrl],
+        created_at: Option<Timestamp>,
+        signer: Arc<dyn NostrSigner>,
+    ) -> Result<()> {
+        let event_builder = build_follow_list_event_builder(follow_list, created_at);
         self.publish_event_builder_with_signer(event_builder, target_relays, signer)
             .await?;
 
@@ -915,6 +939,20 @@ mod tests {
             sender_keys.public_key(),
             "Giftwrap should use an ephemeral outer key, not the sender key"
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_follow_list_event_builder_uses_custom_created_at() {
+        let keys = Keys::generate();
+        let follow_list = vec![Keys::generate().public_key()];
+        let created_at = Timestamp::from(1_234_567_890_u64);
+
+        let event = build_follow_list_event_builder(&follow_list, Some(created_at))
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        assert_eq!(event.created_at, created_at);
     }
 
     #[tokio::test]
