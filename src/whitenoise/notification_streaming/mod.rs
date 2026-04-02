@@ -232,7 +232,9 @@ impl Whitenoise {
             .await
         {
             Ok(Some(ag)) => {
-                if !ag.is_accepted() {
+                if ag.is_removed() {
+                    Some("departed")
+                } else if !ag.is_accepted() {
                     Some("unaccepted")
                 } else if ag.is_muted() {
                     Some("muted")
@@ -581,7 +583,7 @@ mod tests {
         whitenoise: &Whitenoise,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
-    ) {
+    ) -> AccountGroup {
         let ag = AccountGroup {
             id: None,
             account_pubkey: *account_pubkey,
@@ -598,7 +600,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.database).await.unwrap();
+        ag.save(&whitenoise.database).await.unwrap()
     }
 
     #[tokio::test]
@@ -954,6 +956,24 @@ mod tests {
                 .should_suppress_notification(&account.pubkey, &group_id)
                 .await,
             Some("unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_should_suppress_notification_suppresses_departed_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[35u8; 32]);
+
+        // Create an accepted group, then mark it as left (voluntary departure)
+        let ag = create_accepted_account_group(&whitenoise, &account.pubkey, &group_id).await;
+        ag.mark_left(&whitenoise).await.unwrap();
+
+        assert_eq!(
+            whitenoise
+                .should_suppress_notification(&account.pubkey, &group_id)
+                .await,
+            Some("departed")
         );
     }
 
