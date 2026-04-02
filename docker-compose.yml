@@ -52,3 +52,37 @@ services:
     depends_on:
       setup:
         condition: service_completed_successfully
+
+  transponder:
+    image: whitenoise-rs-transponder:latest
+    build:
+      context: ./dev/transponder
+      dockerfile: Dockerfile
+    env_file:
+      - ./dev/transponder/.env
+    volumes:
+      - ./dev/transponder/config.toml:/etc/transponder/config.toml:ro
+    ports:
+      - "127.0.0.1:8081:8080"
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/transponder", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      nostr-rs-relay:
+        condition: service_started
+      strfry-nostr-relay:
+        condition: service_started

@@ -155,25 +155,39 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare Transponder dev env
+        run: ./scripts/ensure_transponder_env.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cached Transponder image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dev/transponder
+          file: ./dev/transponder/Dockerfile
+          load: true
+          tags: whitenoise-rs-transponder:latest
+          cache-from: type=gha,scope=transponder-dev
+          cache-to: type=gha,scope=transponder-dev,mode=max
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Unit and integration tests (non-Docker)
         # Exclude CLI e2e test binaries: they spawn real daemon processes and
@@ -221,25 +235,39 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare Transponder dev env
+        run: ./scripts/ensure_transponder_env.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cached Transponder image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dev/transponder
+          file: ./dev/transponder/Dockerfile
+          load: true
+          tags: whitenoise-rs-transponder:latest
+          cache-from: type=gha,scope=transponder-dev
+          cache-to: type=gha,scope=transponder-dev,mode=max
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Test with Coverage
         run: |
@@ -487,25 +515,39 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare Transponder dev env
+        run: ./scripts/ensure_transponder_env.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build cached Transponder image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dev/transponder
+          file: ./dev/transponder/Dockerfile
+          load: true
+          tags: whitenoise-rs-transponder:latest
+          cache-from: type=gha,scope=transponder-dev
+          cache-to: type=gha,scope=transponder-dev,mode=max
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Integration Test
         run: |

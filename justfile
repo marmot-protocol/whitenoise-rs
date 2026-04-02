@@ -451,7 +451,12 @@ build-release:
 
 # Start docker compose services
 docker-up:
-    docker compose up -d
+    ./scripts/ensure_transponder_env.sh
+    docker compose up -d --build
+
+# Wait for local docker services to become ready
+docker-smoke:
+    ./scripts/wait_for_dev_services.sh
 
 # Stop docker compose services
 docker-down:
