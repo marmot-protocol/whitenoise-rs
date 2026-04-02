@@ -127,7 +127,7 @@ impl Whitenoise {
                 )
                 .await;
 
-            if let Some(_publish_output) = publish_result.output()
+            if publish_result.succeeded()
                 && let Err(error) = publish_notification_requests_after_delivery_with(
                     &config,
                     &database,

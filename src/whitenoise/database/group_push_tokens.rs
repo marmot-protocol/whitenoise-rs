@@ -124,7 +124,6 @@ impl From<GroupPushTokenRow> for GroupPushToken {
     }
 }
 
-#[allow(dead_code)]
 impl GroupPushToken {
     #[perf_instrument("db::group_push_tokens")]
     pub(crate) async fn upsert(
