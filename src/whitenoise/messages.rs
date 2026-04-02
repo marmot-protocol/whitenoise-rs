@@ -13,7 +13,7 @@ use crate::{
             ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
         },
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
-        push_notifications::publish_notification_requests_after_chat_delivery_with,
+        push_notifications::publish_notification_requests_after_delivery_with,
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
@@ -99,6 +99,8 @@ impl Whitenoise {
         }
 
         // Spawn background publish task with retries + delivery tracking for all kinds.
+        // Any successfully delivered outgoing event can fan out best-effort notification
+        // requests; receivers decide what to surface locally.
         // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
         let ephemeral = self.relay_control.ephemeral();
         let user_relay_sync = self.user_relay_sync_context();
@@ -125,9 +127,8 @@ impl Whitenoise {
                 )
                 .await;
 
-            if kind == 9
-                && let Some(_publish_output) = publish_result.output()
-                && let Err(error) = publish_notification_requests_after_chat_delivery_with(
+            if let Some(_publish_output) = publish_result.output()
+                && let Err(error) = publish_notification_requests_after_delivery_with(
                     &config,
                     &database,
                     &user_relay_sync,
@@ -141,7 +142,7 @@ impl Whitenoise {
                     target: "whitenoise::push_notifications",
                     account = %account_pubkey.to_hex(),
                     error = %error,
-                    "Failed to publish best-effort notification requests after chat delivery"
+                    "Failed to publish best-effort notification requests after message delivery"
                 );
             }
 

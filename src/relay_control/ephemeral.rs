@@ -560,10 +560,23 @@ impl EphemeralPlane {
     ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
             Ok(output) => {
-                debug_assert!(
-                    !output.success.is_empty(),
-                    "publish_event_to returned Ok with no accepted relays"
-                );
+                // Defensive boundary: publish_event_to currently returns
+                // Err(NoRelayAccepted) for zero accepted relays, but keep the
+                // delivery-status mapping correct if that contract changes.
+                if output.success.is_empty() {
+                    let status =
+                        DeliveryStatus::Failed("No relay accepted the message".to_string());
+                    Self::update_and_emit_delivery_status(
+                        event_id,
+                        group_id,
+                        &status,
+                        database,
+                        stream_manager,
+                    )
+                    .await;
+                    return MessagePublishResult::Failed;
+                }
+
                 let status = DeliveryStatus::Sent(output.success.len());
                 Self::update_and_emit_delivery_status(
                     event_id,
