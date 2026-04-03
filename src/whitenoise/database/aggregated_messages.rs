@@ -461,6 +461,9 @@ impl AggregatedMessage {
     /// `position` is computed via `ROW_NUMBER()` over the entire group (O(group_size))
     /// because it must reflect the absolute offset in the full message ordering — the
     /// LIKE filter cannot be pushed inside the window without changing position semantics.
+    /// The window intentionally includes deleted tombstones so that positions match the
+    /// pagination ordering used by `find_messages_by_group_paginated`; the
+    /// `deletion_event_id IS NULL` filter is applied in the outer SELECT instead.
     /// Migration 0043 adds a covering index on
     /// `(kind, mls_group_id, deletion_event_id, created_at DESC, message_id DESC)`
     /// so the window scan uses an index walk instead of a temp B-tree sort.
@@ -483,11 +486,11 @@ impl AggregatedMessage {
                  ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
                WHERE am.kind = 9
                  AND am.mls_group_id = ?1
-                 AND am.deletion_event_id IS NULL
                  AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              )
              SELECT * FROM ranked
-             WHERE content_normalized LIKE ?2
+             WHERE deletion_event_id IS NULL
+               AND content_normalized LIKE ?2
              ORDER BY created_at DESC, message_id DESC
              LIMIT ?3",
         )
