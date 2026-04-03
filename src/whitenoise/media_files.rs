@@ -31,6 +31,8 @@ pub(crate) struct ParsedMediaReference {
     encrypted_hash: [u8; 32],
     /// Blurhash for image preview (optional, not parsed by MDK)
     blurhash: Option<String>,
+    /// Thumbhash for image preview (optional, not parsed by MDK)
+    thumbhash: Option<String>,
 }
 
 /// Extracts encrypted hash from Blossom URL
@@ -304,31 +306,48 @@ impl<'a> MediaFiles<'a> {
                 }
             };
 
-            // Extract blurhash (optional field that MDK doesn't parse)
-            let blurhash = Self::extract_blurhash_from_tag(tag);
+            // Extract blurhash and thumbhash (optional fields that MDK doesn't parse)
+            let (blurhash, thumbhash) = Self::extract_hashes_from_tag(tag);
 
             parsed.push(ParsedMediaReference {
                 reference,
                 encrypted_hash: encrypted_file_hash,
                 blurhash,
+                thumbhash,
             });
         }
 
         Ok(parsed)
     }
 
-    /// Extracts blurhash from an imeta tag
+    /// Extracts blurhash and thumbhash from an imeta tag in a single pass.
     ///
-    /// MDK's parser doesn't extract blurhash, so we do it ourselves.
-    /// Format: "blurhash <blurhash_string>"
-    fn extract_blurhash_from_tag(tag: &Tag) -> Option<String> {
+    /// MDK's parser doesn't extract these fields, so we do it ourselves.
+    /// Formats: "blurhash <string>", "thumbhash <string>"
+    fn extract_hashes_from_tag(tag: &Tag) -> (Option<String>, Option<String>) {
         let tag_vec = tag.clone().to_vec();
+        let mut blurhash = None;
+        let mut thumbhash = None;
+
         for value in tag_vec.iter().skip(1) {
-            if let Some(blur) = value.strip_prefix("blurhash ") {
-                return Some(blur.to_string());
+            if blurhash.is_none()
+                && let Some(blur) = value.strip_prefix("blurhash ")
+                && !blur.is_empty()
+            {
+                blurhash = Some(blur.to_string());
+            }
+            if thumbhash.is_none()
+                && let Some(thumb) = value.strip_prefix("thumbhash ")
+                && !thumb.is_empty()
+            {
+                thumbhash = Some(thumb.to_string());
+            }
+            if blurhash.is_some() && thumbhash.is_some() {
+                break;
             }
         }
-        None
+
+        (blurhash, thumbhash)
     }
 
     /// Stores parsed media references to the database
@@ -364,6 +383,7 @@ impl<'a> MediaFiles<'a> {
                 original_filename: Some(reference.filename.clone()),
                 dimensions,
                 blurhash: parsed.blurhash,
+                thumbhash: parsed.thumbhash,
             });
 
             // Create MediaFile record (without file yet - empty path until downloaded)
@@ -608,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_blurhash_from_tag_with_blurhash() {
+    fn test_extract_hashes_with_blurhash_only() {
         let tag = Tag::custom(
             TagKind::Custom("imeta".into()),
             [
@@ -616,24 +636,72 @@ mod tests {
                 "blurhash LEHV6nWB2yk8pyoJadR*.7kCMdnj",
             ],
         );
-        let result = MediaFiles::extract_blurhash_from_tag(&tag);
-        assert_eq!(result, Some("LEHV6nWB2yk8pyoJadR*.7kCMdnj".to_string()));
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert_eq!(blurhash, Some("LEHV6nWB2yk8pyoJadR*.7kCMdnj".to_string()));
+        assert!(thumbhash.is_none());
     }
 
     #[test]
-    fn test_extract_blurhash_from_tag_without_blurhash() {
+    fn test_extract_hashes_with_thumbhash_only() {
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                "url https://blossom.example.com/abc123",
+                "thumbhash 3OcRJYB4d3h/iIeHeEh3eIhw+j2w",
+            ],
+        );
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert!(blurhash.is_none());
+        assert_eq!(thumbhash, Some("3OcRJYB4d3h/iIeHeEh3eIhw+j2w".to_string()));
+    }
+
+    #[test]
+    fn test_extract_hashes_with_both() {
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                "url https://blossom.example.com/abc123",
+                "blurhash LEHV6nWB2yk8pyoJadR*.7kCMdnj",
+                "thumbhash 3OcRJYB4d3h/iIeHeEh3eIhw+j2w",
+            ],
+        );
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert_eq!(blurhash, Some("LEHV6nWB2yk8pyoJadR*.7kCMdnj".to_string()));
+        assert_eq!(thumbhash, Some("3OcRJYB4d3h/iIeHeEh3eIhw+j2w".to_string()));
+    }
+
+    #[test]
+    fn test_extract_hashes_without_either() {
         let tag = Tag::custom(
             TagKind::Custom("imeta".into()),
             ["url https://blossom.example.com/abc123", "m image/jpeg"],
         );
-        let result = MediaFiles::extract_blurhash_from_tag(&tag);
-        assert!(result.is_none());
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert!(blurhash.is_none());
+        assert!(thumbhash.is_none());
     }
 
     #[test]
-    fn test_extract_blurhash_from_tag_empty_tag() {
+    fn test_extract_hashes_empty_tag() {
         let tag = Tag::custom(TagKind::Custom("imeta".into()), Vec::<String>::new());
-        let result = MediaFiles::extract_blurhash_from_tag(&tag);
-        assert!(result.is_none());
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert!(blurhash.is_none());
+        assert!(thumbhash.is_none());
+    }
+
+    #[test]
+    fn test_extract_hashes_ignores_empty_values() {
+        // Malformed tags like "blurhash " or "thumbhash " should yield None
+        let tag = Tag::custom(
+            TagKind::Custom("imeta".into()),
+            [
+                "url https://blossom.example.com/abc123",
+                "blurhash ",
+                "thumbhash ",
+            ],
+        );
+        let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
+        assert!(blurhash.is_none());
+        assert!(thumbhash.is_none());
     }
 }

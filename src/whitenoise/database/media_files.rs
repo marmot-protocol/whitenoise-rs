@@ -20,6 +20,9 @@ pub struct FileMetadata {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blurhash: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
 }
 
 impl FileMetadata {
@@ -43,8 +46,16 @@ impl FileMetadata {
         self
     }
 
+    pub fn with_thumbhash(mut self, thumbhash: String) -> Self {
+        self.thumbhash = Some(thumbhash);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.original_filename.is_none() && self.dimensions.is_none() && self.blurhash.is_none()
+        self.original_filename.is_none()
+            && self.dimensions.is_none()
+            && self.blurhash.is_none()
+            && self.thumbhash.is_none()
     }
 }
 
@@ -1592,6 +1603,120 @@ mod tests {
         assert!(
             not_found.is_none(),
             "Account 3 should not find records belonging to other accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_metadata_with_thumbhash() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+
+        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
+        let encrypted_hash = [42u8; 32];
+        let file_path = temp_dir.path().join("test.jpg");
+
+        create_test_account(&db, &pubkey).await;
+
+        // Save with both blurhash and thumbhash
+        let metadata = FileMetadata::new()
+            .with_filename("photo.jpg".to_string())
+            .with_dimensions("800x600".to_string())
+            .with_blurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string())
+            .with_thumbhash("3OcRJYB4d3h/iIeHeEh3eIhw+j2w".to_string());
+
+        MediaFile::save(
+            &db,
+            &group_id,
+            &pubkey,
+            MediaFileParams {
+                file_path: &file_path,
+                original_file_hash: None,
+                encrypted_file_hash: &encrypted_hash,
+                mime_type: "image/jpeg",
+                media_type: "chat_media",
+                blossom_url: Some("https://blossom.example.com/hash42"),
+                nostr_key: None,
+                file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Retrieve and verify both hashes are persisted
+        let found = MediaFile::find_by_hash(&db, &encrypted_hash)
+            .await
+            .unwrap()
+            .expect("Should find the saved media file");
+
+        let retrieved = found.file_metadata.expect("Should have file_metadata");
+        assert_eq!(
+            retrieved.blurhash,
+            Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string())
+        );
+        assert_eq!(
+            retrieved.thumbhash,
+            Some("3OcRJYB4d3h/iIeHeEh3eIhw+j2w".to_string())
+        );
+        assert_eq!(retrieved.original_filename, Some("photo.jpg".to_string()));
+        assert_eq!(retrieved.dimensions, Some("800x600".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_file_metadata_without_thumbhash_backwards_compat() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+
+        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
+        let encrypted_hash = [42u8; 32];
+        let file_path = temp_dir.path().join("test.jpg");
+
+        create_test_account(&db, &pubkey).await;
+
+        // Save with only blurhash (simulating old client behavior)
+        let metadata = FileMetadata::new()
+            .with_filename("old_photo.jpg".to_string())
+            .with_blurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string());
+
+        MediaFile::save(
+            &db,
+            &group_id,
+            &pubkey,
+            MediaFileParams {
+                file_path: &file_path,
+                original_file_hash: None,
+                encrypted_file_hash: &encrypted_hash,
+                mime_type: "image/jpeg",
+                media_type: "chat_media",
+                blossom_url: Some("https://blossom.example.com/hash42"),
+                nostr_key: None,
+                file_metadata: Some(&metadata),
+                nonce: None,
+                scheme_version: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Retrieve and verify thumbhash is None while blurhash is present
+        let found = MediaFile::find_by_hash(&db, &encrypted_hash)
+            .await
+            .unwrap()
+            .expect("Should find the saved media file");
+
+        let retrieved = found.file_metadata.expect("Should have file_metadata");
+        assert_eq!(
+            retrieved.blurhash,
+            Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string())
+        );
+        assert!(
+            retrieved.thumbhash.is_none(),
+            "Old records without thumbhash should deserialize with None"
         );
     }
 }
