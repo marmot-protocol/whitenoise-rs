@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([erskingardner])
 - CLI message reactions (react/unreact) ([jgmontoya])
 - CLI message delete, retry, and reply commands ([jgmontoya])
 - CLI media commands for uploading files and images ([jgmontoya])
 - Chat archiving: archive/unarchive chats, list archived, subscribe to archived chat list updates ([jgmontoya])
 - Relay control plane with health monitoring scaffold ([erskingardner])
 - Relay observability persistence for connection metrics and failure tracking ([erskingardner])
+
+### Changed
+
+- **Breaking:** `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([erskingardner])
 
 ## [v0.2.1] - 2026-03-05
 
