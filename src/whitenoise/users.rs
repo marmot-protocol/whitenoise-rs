@@ -1,4 +1,4 @@
-use std::time::Duration as StdDuration;
+use std::{sync::Arc, time::Duration as StdDuration};
 
 #[cfg(any(test, feature = "integration-tests"))]
 use std::sync::LazyLock;
@@ -11,10 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     perf_instrument,
+    relay_control::RelayControlPlane,
     whitenoise::{
         Whitenoise,
+        database::Database,
         database::processed_events::ProcessedEvent,
         error::{Result, WhitenoiseError},
+        event_tracker::EventTracker,
         relays::{Relay, RelayType},
         user_streaming::{UserUpdate, UserUpdateTrigger},
         utils::timestamp_to_datetime,
@@ -45,6 +48,27 @@ enum UserResolutionMode {
 
 #[cfg(any(test, feature = "integration-tests"))]
 static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
+
+#[derive(Clone)]
+pub(crate) struct UserRelaySyncContext {
+    database: Arc<Database>,
+    event_tracker: Arc<dyn EventTracker>,
+    relay_control: Arc<RelayControlPlane>,
+}
+
+impl UserRelaySyncContext {
+    pub(crate) fn new(
+        database: Arc<Database>,
+        event_tracker: Arc<dyn EventTracker>,
+        relay_control: Arc<RelayControlPlane>,
+    ) -> Self {
+        Self {
+            database,
+            event_tracker,
+            relay_control,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct User {
@@ -175,6 +199,14 @@ impl User {
 }
 
 impl Whitenoise {
+    pub(crate) fn user_relay_sync_context(&self) -> UserRelaySyncContext {
+        UserRelaySyncContext::new(
+            Arc::clone(&self.database),
+            Arc::clone(&self.event_tracker),
+            Arc::clone(&self.relay_control),
+        )
+    }
+
     /// Retrieves a user by their public key.
     ///
     /// This method looks up a user in the database using their Nostr public key.
@@ -211,6 +243,18 @@ impl Whitenoise {
     /// - The public key format is invalid (though this is typically caught at the type level)
     pub async fn find_user_by_pubkey(&self, pubkey: &PublicKey) -> Result<User> {
         User::find_by_pubkey(pubkey, &self.database).await
+    }
+
+    #[perf_instrument("users")]
+    pub(crate) async fn sync_user_relay_type_from_query_relays(
+        &self,
+        pubkey: &PublicKey,
+        relay_type: RelayType,
+        query_relay_urls: &[RelayUrl],
+    ) -> Result<Vec<Relay>> {
+        self.user_relay_sync_context()
+            .sync_relay_type_for_pubkey(*pubkey, relay_type, query_relay_urls)
+            .await
     }
 
     fn targeted_discovery_filter(pubkey: PublicKey) -> Filter {
@@ -2569,6 +2613,39 @@ mod tests {
 
                 assert!(!changed);
             }
+        }
+
+        #[tokio::test]
+        async fn test_sync_user_relay_type_from_query_relays_returns_existing_relays_when_query_list_is_empty()
+         {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let test_pubkey = Keys::generate().public_key();
+            let user = User {
+                id: None,
+                pubkey: test_pubkey,
+                metadata: Metadata::new(),
+                created_at: Utc::now(),
+                metadata_known_at: None,
+                updated_at: Utc::now(),
+            };
+            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let relay_url = RelayUrl::parse("wss://inbox.example.com").unwrap();
+            let relay = whitenoise
+                .find_or_create_relay_by_url(&relay_url)
+                .await
+                .unwrap();
+
+            saved_user
+                .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+                .await
+                .unwrap();
+
+            let relays = whitenoise
+                .sync_user_relay_type_from_query_relays(&test_pubkey, RelayType::Inbox, &[])
+                .await
+                .unwrap();
+
+            assert_eq!(Relay::urls(&relays), vec![relay_url]);
         }
     }
 

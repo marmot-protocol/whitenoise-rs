@@ -650,13 +650,19 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
+        let created_at = Timestamp::now();
 
         tokio::spawn(async move {
             tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing follow list for account: {:?}", account_clone.pubkey);
 
             let relays_urls = Relay::urls(&relays);
             ephemeral
-                .publish_follow_list_with_signer(&follows_pubkeys, &relays_urls, signer)
+                .publish_follow_list_with_signer_at(
+                    &follows_pubkeys,
+                    &relays_urls,
+                    Some(created_at),
+                    signer,
+                )
                 .await?;
 
             tracing::debug!(target: "whitenoise::accounts", "Successfully published follow list for account: {:?}", account_clone.pubkey);

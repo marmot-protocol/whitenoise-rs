@@ -7,10 +7,11 @@ use crate::perf_instrument;
 use crate::relay_control::ephemeral::EphemeralScope;
 use crate::whitenoise::{
     Whitenoise,
+    database::Database,
     database::processed_events::ProcessedEvent,
     error::Result,
     relays::{Relay, RelayType},
-    users::User,
+    users::{User, UserRelaySyncContext},
     utils::timestamp_to_datetime,
 };
 
@@ -195,14 +196,28 @@ impl User {
         new_relay_urls: &HashSet<RelayUrl>,
         event_created_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
+        self.sync_relay_urls_with_database(
+            &whitenoise.database,
+            relay_type,
+            new_relay_urls,
+            event_created_at,
+        )
+        .await
+    }
+
+    #[perf_instrument("relay_sync")]
+    async fn sync_relay_urls_with_database(
+        &self,
+        database: &Database,
+        relay_type: RelayType,
+        new_relay_urls: &HashSet<RelayUrl>,
+        event_created_at: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
         // First, check if we should process this event based on timestamp
         if let Some(new_timestamp) = event_created_at {
-            let newest_stored_timestamp = ProcessedEvent::newest_relay_event_timestamp(
-                &self.pubkey,
-                relay_type,
-                &whitenoise.database,
-            )
-            .await?;
+            let newest_stored_timestamp =
+                ProcessedEvent::newest_relay_event_timestamp(&self.pubkey, relay_type, database)
+                    .await?;
 
             match newest_stored_timestamp {
                 Some(stored_timestamp)
@@ -237,7 +252,7 @@ impl User {
             }
         }
 
-        let stored_relays = self.relays(relay_type, &whitenoise.database).await?;
+        let stored_relays = self.relays(relay_type, database).await?;
         let stored_urls: HashSet<&RelayUrl> = stored_relays.iter().map(|r| &r.url).collect();
         let new_urls_set: HashSet<&RelayUrl> = new_relay_urls.iter().collect();
 
@@ -263,7 +278,7 @@ impl User {
         for existing_relay in &stored_relays {
             if !new_urls_set.contains(&existing_relay.url)
                 && let Err(e) = self
-                    .remove_relay(existing_relay, relay_type, &whitenoise.database)
+                    .remove_relay(existing_relay, relay_type, database)
                     .await
             {
                 tracing::warn!(
@@ -280,13 +295,8 @@ impl User {
 
         for new_relay_url in new_relay_urls {
             if !stored_urls.contains(new_relay_url) {
-                let new_relay = whitenoise
-                    .find_or_create_relay_by_url(new_relay_url)
-                    .await?;
-                if let Err(e) = self
-                    .add_relay(&new_relay, relay_type, &whitenoise.database)
-                    .await
-                {
+                let new_relay = Relay::find_or_create_by_url(new_relay_url, database).await?;
+                if let Err(e) = self.add_relay(&new_relay, relay_type, database).await {
                     tracing::warn!(
                         target: "whitenoise::users::sync_relay_urls",
                         "Failed to add {:?} relay {} for user {}: {}",
@@ -303,6 +313,27 @@ impl User {
         Ok(true)
     }
 
+    #[perf_instrument("relay_sync")]
+    pub(crate) async fn sync_relay_type_from_query_urls(
+        &self,
+        context: &UserRelaySyncContext,
+        relay_type: RelayType,
+        query_relay_urls: &[RelayUrl],
+    ) -> Result<Vec<Relay>> {
+        let existing_relays = self.relays(relay_type, &context.database).await?;
+        if query_relay_urls.is_empty() {
+            return Ok(existing_relays);
+        }
+
+        let query_relays: Vec<Relay> = query_relay_urls.iter().map(Relay::new).collect();
+        let scope = context.relay_control.ephemeral().anonymous_scope();
+        let _changed = self
+            .sync_relays_for_type_with_context(context, &scope, relay_type, &query_relays)
+            .await?;
+
+        self.relays(relay_type, &context.database).await
+    }
+
     /// Synchronizes relays for a specific type with the network state.
     ///
     /// Returns `true` if changes were made, `false` if no changes needed.
@@ -314,14 +345,19 @@ impl User {
         query_relays: &[Relay],
     ) -> Result<bool> {
         let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
-        self.sync_relays_for_type_with_scope(whitenoise, &scope, relay_type, query_relays)
-            .await
+        self.sync_relays_for_type_with_context(
+            &whitenoise.user_relay_sync_context(),
+            &scope,
+            relay_type,
+            query_relays,
+        )
+        .await
     }
 
     #[perf_instrument("relay_sync")]
-    async fn sync_relays_for_type_with_scope(
+    async fn sync_relays_for_type_with_context(
         &self,
-        whitenoise: &Whitenoise,
+        context: &UserRelaySyncContext,
         scope: &EphemeralScope,
         relay_type: RelayType,
         query_relays: &[Relay],
@@ -339,8 +375,25 @@ impl User {
                 e
             })?;
 
-        self.apply_relay_event(whitenoise, relay_type, relay_event)
+        self.apply_relay_event_with_context(context, relay_type, relay_event)
             .await
+    }
+
+    #[perf_instrument("relay_sync")]
+    async fn sync_relays_for_type_with_scope(
+        &self,
+        whitenoise: &Whitenoise,
+        scope: &EphemeralScope,
+        relay_type: RelayType,
+        query_relays: &[Relay],
+    ) -> Result<bool> {
+        self.sync_relays_for_type_with_context(
+            &whitenoise.user_relay_sync_context(),
+            scope,
+            relay_type,
+            query_relays,
+        )
+        .await
     }
 
     #[perf_instrument("relay_sync")]
@@ -350,13 +403,28 @@ impl User {
         relay_type: RelayType,
         relay_event: Option<Event>,
     ) -> Result<bool> {
+        self.apply_relay_event_with_context(
+            &whitenoise.user_relay_sync_context(),
+            relay_type,
+            relay_event,
+        )
+        .await
+    }
+
+    #[perf_instrument("relay_sync")]
+    async fn apply_relay_event_with_context(
+        &self,
+        context: &UserRelaySyncContext,
+        relay_type: RelayType,
+        relay_event: Option<Event>,
+    ) -> Result<bool> {
         match relay_event {
             Some(event) => {
                 let relay_hashset: HashSet<_> =
                     crate::nostr_manager::utils::relay_urls_from_event(&event);
                 let changed = self
-                    .sync_relay_urls(
-                        whitenoise,
+                    .sync_relay_urls_with_database(
+                        &context.database,
                         relay_type,
                         &relay_hashset,
                         Some(timestamp_to_datetime(event.created_at)?),
@@ -364,7 +432,7 @@ impl User {
                     .await?;
 
                 if changed {
-                    whitenoise
+                    context
                         .event_tracker
                         .track_processed_global_event(&event)
                         .await?;
@@ -394,5 +462,19 @@ impl User {
         whitenoise: &Whitenoise,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>> {
         Self::all_with_nip65_relay_urls(&whitenoise.database).await
+    }
+}
+
+impl UserRelaySyncContext {
+    #[perf_instrument("relay_sync")]
+    pub(crate) async fn sync_relay_type_for_pubkey(
+        &self,
+        pubkey: PublicKey,
+        relay_type: RelayType,
+        query_relay_urls: &[RelayUrl],
+    ) -> Result<Vec<Relay>> {
+        let (user, _created) = User::find_or_create_by_pubkey(&pubkey, &self.database).await?;
+        user.sync_relay_type_from_query_urls(self, relay_type, query_relay_urls)
+            .await
     }
 }

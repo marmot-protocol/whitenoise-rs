@@ -25,6 +25,23 @@ use crate::{
     },
 };
 
+fn build_follow_list_event_builder(
+    follow_list: &[PublicKey],
+    created_at: Option<Timestamp>,
+) -> EventBuilder {
+    let tags: Vec<Tag> = follow_list
+        .iter()
+        .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
+        .collect();
+
+    let builder = EventBuilder::new(Kind::ContactList, "").tags(tags);
+    if let Some(created_at) = created_at {
+        builder.custom_created_at(created_at)
+    } else {
+        builder
+    }
+}
+
 /// Configuration for short-lived, targeted relay work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EphemeralPlaneConfig {
@@ -58,6 +75,25 @@ pub(crate) struct EphemeralPlane {
 pub(crate) struct EphemeralScope {
     plane: EphemeralPlane,
     scope_account_pubkey: Option<PublicKey>,
+}
+
+#[derive(Debug)]
+pub(crate) enum MessagePublishResult {
+    Published(Output<EventId>),
+    Failed,
+}
+
+impl MessagePublishResult {
+    pub(crate) fn output(&self) -> Option<&Output<EventId>> {
+        match self {
+            Self::Published(output) => Some(output),
+            Self::Failed => None,
+        }
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        self.output().is_some()
+    }
 }
 
 impl EphemeralPlane {
@@ -244,12 +280,19 @@ impl EphemeralPlane {
         target_relays: &[RelayUrl],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<()> {
-        let tags: Vec<Tag> = follow_list
-            .iter()
-            .map(|pubkey| Tag::custom(TagKind::p(), [pubkey.to_hex()]))
-            .collect();
-        let event_builder = EventBuilder::new(Kind::ContactList, "").tags(tags);
+        self.publish_follow_list_with_signer_at(follow_list, target_relays, None, signer)
+            .await
+    }
 
+    #[perf_instrument("relay")]
+    pub(crate) async fn publish_follow_list_with_signer_at(
+        &self,
+        follow_list: &[PublicKey],
+        target_relays: &[RelayUrl],
+        created_at: Option<Timestamp>,
+        signer: Arc<dyn NostrSigner>,
+    ) -> Result<()> {
+        let event_builder = build_follow_list_event_builder(follow_list, created_at);
         self.publish_event_builder_with_signer(event_builder, target_relays, signer)
             .await?;
 
@@ -514,9 +557,26 @@ impl EphemeralPlane {
         group_id: &GroupId,
         database: &Database,
         stream_manager: &Arc<MessageStreamManager>,
-    ) -> bool {
+    ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
-            Ok(output) if !output.success.is_empty() => {
+            Ok(output) => {
+                // Defensive boundary: publish_event_to currently returns
+                // Err(NoRelayAccepted) for zero accepted relays, but keep the
+                // delivery-status mapping correct if that contract changes.
+                if output.success.is_empty() {
+                    let status =
+                        DeliveryStatus::Failed("No relay accepted the message".to_string());
+                    Self::update_and_emit_delivery_status(
+                        event_id,
+                        group_id,
+                        &status,
+                        database,
+                        stream_manager,
+                    )
+                    .await;
+                    return MessagePublishResult::Failed;
+                }
+
                 let status = DeliveryStatus::Sent(output.success.len());
                 Self::update_and_emit_delivery_status(
                     event_id,
@@ -526,31 +586,26 @@ impl EphemeralPlane {
                     stream_manager,
                 )
                 .await;
-                true
-            }
-            Ok(output) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Publish completed but no relay accepted the message (failed: {:?})",
-                    output.failed.keys().collect::<Vec<_>>(),
-                );
-                let status = DeliveryStatus::Failed("No relay accepted the message".to_string());
-                Self::update_and_emit_delivery_status(
-                    event_id,
-                    group_id,
-                    &status,
-                    database,
-                    stream_manager,
-                )
-                .await;
-                false
+                MessagePublishResult::Published(output)
             }
             Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Publish failed after bounded retries: {error}"
-                );
-                let status = DeliveryStatus::Failed(error.to_string());
+                let failure_message = match &error {
+                    NostrManagerError::NoRelayAccepted => {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Publish failed after bounded retries because no relay accepted the message"
+                        );
+                        "No relay accepted the message".to_string()
+                    }
+                    _ => {
+                        tracing::warn!(
+                            target: "whitenoise::messages::delivery",
+                            "Publish failed after bounded retries: {error}"
+                        );
+                        error.to_string()
+                    }
+                };
+                let status = DeliveryStatus::Failed(failure_message);
                 Self::update_and_emit_delivery_status(
                     event_id,
                     group_id,
@@ -559,7 +614,7 @@ impl EphemeralPlane {
                     stream_manager,
                 )
                 .await;
-                false
+                MessagePublishResult::Failed
             }
         }
     }
@@ -803,7 +858,7 @@ impl EphemeralScope {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::SystemTime};
+    use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
     use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::mpsc;
@@ -858,6 +913,23 @@ mod tests {
         assert_eq!(config.ad_hoc_relay_ttl, Duration::from_secs(300));
     }
 
+    #[test]
+    fn test_message_publish_result_helpers() {
+        let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let event_id = EventId::from_hex(&"11".repeat(32)).unwrap();
+        let output = Output {
+            val: event_id,
+            success: std::collections::HashSet::from([relay_url]),
+            failed: HashMap::new(),
+        };
+        let published = MessagePublishResult::Published(output);
+
+        assert_eq!(published.output().unwrap().id(), &event_id);
+        assert!(published.succeeded());
+        assert!(MessagePublishResult::Failed.output().is_none());
+        assert!(!MessagePublishResult::Failed.succeeded());
+    }
+
     #[tokio::test]
     async fn test_giftwrap_uses_ephemeral_outer_key() {
         let sender_keys = Keys::generate();
@@ -880,6 +952,20 @@ mod tests {
             sender_keys.public_key(),
             "Giftwrap should use an ephemeral outer key, not the sender key"
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_follow_list_event_builder_uses_custom_created_at() {
+        let keys = Keys::generate();
+        let follow_list = vec![Keys::generate().public_key()];
+        let created_at = Timestamp::from(1_234_567_890_u64);
+
+        let event = build_follow_list_event_builder(&follow_list, Some(created_at))
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        assert_eq!(event.created_at, created_at);
     }
 
     #[tokio::test]
