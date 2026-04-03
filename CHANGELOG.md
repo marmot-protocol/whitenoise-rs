@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([#714])
+- Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([#714]) ([erskingardner])
 - CLI message reactions (react/unreact) ([jgmontoya])
 - CLI message delete, retry, and reply commands ([jgmontoya])
 - CLI media commands for uploading files and images ([jgmontoya])
@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 
-- `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([#714])
+- `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([#714]) ([erskingardner])
 
 ## [v0.2.1] - 2026-03-05
 
