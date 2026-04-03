@@ -11,6 +11,16 @@ impl Whitenoise {
     /// syncs the local cache.
     #[perf_instrument("event_handlers")]
     pub(crate) async fn handle_mute_list(&self, account: &Account, event: Event) -> Result<()> {
+        // Only process mute list events authored by this account
+        if event.pubkey != account.pubkey {
+            tracing::debug!(
+                target: "whitenoise::event_handlers::handle_mute_list",
+                "Ignoring mute list event from foreign author {}",
+                event.pubkey,
+            );
+            return Ok(());
+        }
+
         let signer = self.get_signer_for_account(account)?;
 
         let mut entries: Vec<(PublicKey, bool)> = Vec::new();
@@ -22,27 +32,36 @@ impl Whitenoise {
             }
         }
 
-        // Private content: decrypt with NIP-44 via signer and extract "p" tags
+        // Private content: decrypt with NIP-44 via signer and extract "p" tags.
+        // If decryption or parsing fails, abort — do not replace the cache with a partial result.
         if !event.content.is_empty() {
-            match signer.nip44_decrypt(&account.pubkey, &event.content).await {
-                Ok(decrypted) => {
-                    if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(&decrypted) {
-                        for tag in &tags {
-                            if tag.len() >= 2
-                                && tag[0] == "p"
-                                && let Ok(pk) = PublicKey::parse(&tag[1])
-                            {
-                                entries.push((pk, true));
-                            }
-                        }
-                    }
-                }
+            let decrypted = match signer.nip44_decrypt(&account.pubkey, &event.content).await {
+                Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::event_handlers::handle_mute_list",
                         "Failed to decrypt mute list content: {}",
                         e,
                     );
+                    return Ok(());
+                }
+            };
+
+            let tags = match serde_json::from_str::<Vec<Vec<String>>>(&decrypted) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::event_handlers::handle_mute_list",
+                        "Failed to parse private mute list content: {}",
+                        e,
+                    );
+                    return Ok(());
+                }
+            };
+
+            for tag in &tags {
+                if tag.len() >= 2 && tag[0] == "p" && let Ok(pk) = PublicKey::parse(&tag[1]) {
+                    entries.push((pk, true));
                 }
             }
         }

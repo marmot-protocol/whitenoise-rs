@@ -112,27 +112,36 @@ impl Whitenoise {
             }
         }
 
-        // Private content: decrypt with NIP-44 via signer and extract "p" tags
+        // Private content: decrypt with NIP-44 via signer and extract "p" tags.
+        // If decryption or parsing fails, abort — do not replace the cache with a partial result.
         if !event.content.is_empty() {
-            match signer.nip44_decrypt(&account.pubkey, &event.content).await {
-                Ok(decrypted) => {
-                    if let Ok(tags) = serde_json::from_str::<Vec<Vec<String>>>(&decrypted) {
-                        for tag in &tags {
-                            if tag.len() >= 2
-                                && tag[0] == "p"
-                                && let Ok(pk) = PublicKey::parse(&tag[1])
-                            {
-                                entries.push((pk, true));
-                            }
-                        }
-                    }
-                }
+            let decrypted = match signer.nip44_decrypt(&account.pubkey, &event.content).await {
+                Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::mute_list",
                         "Failed to decrypt mute list content: {}",
                         e,
                     );
+                    return Ok(());
+                }
+            };
+
+            let tags = match serde_json::from_str::<Vec<Vec<String>>>(&decrypted) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::mute_list",
+                        "Failed to parse private mute list content: {}",
+                        e,
+                    );
+                    return Ok(());
+                }
+            };
+
+            for tag in &tags {
+                if tag.len() >= 2 && tag[0] == "p" && let Ok(pk) = PublicKey::parse(&tag[1]) {
+                    entries.push((pk, true));
                 }
             }
         }

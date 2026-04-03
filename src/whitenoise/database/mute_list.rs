@@ -164,7 +164,7 @@ impl MuteListEntry {
 
         for (muted_pubkey, is_private) in entries {
             sqlx::query(
-                "INSERT INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
+                "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
                  VALUES (?, ?, ?, strftime('%s', 'now') * 1000)",
             )
             .bind(account_pubkey.to_hex())
@@ -298,5 +298,41 @@ mod tests {
 
         let entries = MuteListEntry::find_by_account(&account, &db).await.unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sync_from_event_with_duplicate_pubkeys_is_safe() {
+        let (db, _tmp) = create_test_db().await;
+        let account = Keys::generate().public_key();
+        let target = Keys::generate().public_key();
+
+        // Same pubkey appears twice (e.g. in both public and private sections of one event)
+        let entries = vec![(target, false), (target, true)];
+        MuteListEntry::sync_from_event(&account, &entries, &db)
+            .await
+            .unwrap();
+
+        let result = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(MuteListEntry::exists(&account, &target, &db).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sync_from_event_with_empty_list_clears_all() {
+        let (db, _tmp) = create_test_db().await;
+        let account = Keys::generate().public_key();
+        let target = Keys::generate().public_key();
+
+        MuteListEntry::insert(&account, &target, true, &db)
+            .await
+            .unwrap();
+
+        MuteListEntry::sync_from_event(&account, &[], &db)
+            .await
+            .unwrap();
+
+        assert!(!MuteListEntry::exists(&account, &target, &db).await.unwrap());
+        let entries = MuteListEntry::find_by_account(&account, &db).await.unwrap();
+        assert!(entries.is_empty());
     }
 }
