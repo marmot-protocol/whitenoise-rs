@@ -85,6 +85,11 @@ pub struct SearchResult {
     /// Char-index spans `[start, end]` (half-open) for each matched query token,
     /// in the order they appear in `message.content`.
     pub highlight_spans: Vec<[usize; 2]>,
+
+    /// 0-based position of the message within the group (0 = newest),
+    /// matching the `created_at DESC, message_id DESC` ordering used by pagination.
+    /// The frontend can compute `page = position / page_size` to jump to this message.
+    pub position: u64,
 }
 
 /// Lightweight message summary for previews (chat list).
