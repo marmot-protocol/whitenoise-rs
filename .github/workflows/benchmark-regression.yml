@@ -73,6 +73,9 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
@@ -80,7 +83,7 @@ jobs:
         run: |
           sleep 5
           docker compose ps
-          ./scripts/wait_for_relays.sh
+          ./scripts/wait_for_dev_services.sh
 
       - name: Post "running" comment
         id: post-running
@@ -232,6 +235,9 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
@@ -239,7 +245,7 @@ jobs:
         run: |
           sleep 5
           docker compose ps
-          ./scripts/wait_for_relays.sh
+          ./scripts/wait_for_dev_services.sh
 
       - name: Run relay-tier scenarios
         run: |

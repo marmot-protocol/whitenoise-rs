@@ -50,15 +50,15 @@ To get started contributing you'll need to have the [Rust](https://www.rust-lang
 
 1. Clone the repo: `git clone https://github.com/marmot-protocol/whitenoise-rs.git` and `cd whitenoise-rs`.
 1. Install recommended development tools: `just install-tools` (optional but recommended)
-1. Start the development services (two Nostr relays; nostr-rs-relay and strfry, and a blossom server):
+1. Start the development services (two Nostr relays, a Blossom server, and a local Transponder instance):
    ```bash
-   docker compose up -d
-   ```
-   Or if using older Docker versions:
-   ```bash
-   docker-compose up -d
+   just docker-up
    ```
 1. Now you can run the integration tests with `just int-test`.
+
+`just docker-up` will auto-generate `dev/transponder/.env` if it is missing, wait for the local
+stack to become ready, and put a local-only test key there for the Transponder container. The file
+is gitignored and should not be committed.
 
 ### Development Tools
 
@@ -112,7 +112,7 @@ just deny-check      # Check licenses and dependencies
 
 ```bash
 # Start required services
-docker compose up -d
+just docker-up
 
 # Generate coverage
 just coverage        # Generate lcov.info report

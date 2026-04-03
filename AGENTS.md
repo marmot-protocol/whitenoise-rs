@@ -60,7 +60,7 @@ On failure, the failing step prints its full output for diagnosis before exiting
 Docker Compose services **must** be running before running integration tests:
 
 ```sh
-just docker-up      # Start Docker services (two Nostr relays + Blossom media server)
+just docker-up      # Start Docker services (two Nostr relays + Blossom + local Transponder) and wait for readiness
 just int-test       # Run all integration test scenarios
 just int-test basic-messaging   # Run a specific scenario
 just docker-down    # Stop Docker services

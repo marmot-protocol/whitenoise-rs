@@ -62,7 +62,7 @@ ScenarioContext enables TestCases within the same scenario to share data.
 
 **Prerequisites:**
 
-- Docker Compose services must be running: `docker compose up -d`
+- Docker services must be running: `just docker-up`
 
 **Commands:**
 
@@ -267,7 +267,7 @@ Performance benchmarks are a separate category of tests designed to measure and 
 
 **Prerequisites:**
 
-- Docker Compose services must be running: `docker compose up -d`
+- Docker services must be running: `just docker-up`
 
 **Commands:**
 

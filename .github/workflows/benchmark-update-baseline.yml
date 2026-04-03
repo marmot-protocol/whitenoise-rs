@@ -37,15 +37,18 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           docker compose ps
-          ./scripts/wait_for_relays.sh
+          ./scripts/wait_for_dev_services.sh
 
       - name: Run benchmarks
         run: just benchmark-json

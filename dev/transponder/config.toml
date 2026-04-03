@@ -1,0 +1,46 @@
+[server]
+# Transponder overrides this at runtime from the TRANSPONDER_SERVER_PRIVATE_KEY env var.
+# The value comes from dev/transponder/.env, which docker compose loads for this service.
+private_key = ""
+shutdown_timeout_secs = 10
+max_dedup_cache_size = 10000
+max_rate_limit_cache_size = 10000
+encrypted_token_rate_limit_per_minute = 240
+encrypted_token_rate_limit_per_hour = 5000
+device_token_rate_limit_per_minute = 240
+device_token_rate_limit_per_hour = 5000
+
+[relays]
+# Use compose service DNS names inside the local docker network.
+clearnet = [
+    "ws://nostr-rs-relay:8080",
+    "ws://strfry-nostr-relay:7777",
+]
+onion = []
+reconnect_interval_secs = 5
+max_reconnect_attempts = 10
+connection_timeout_secs = 60
+
+[apns]
+enabled = false
+key_id = ""
+team_id = ""
+private_key_path = ""
+environment = "sandbox"
+bundle_id = ""
+
+[fcm]
+enabled = false
+service_account_path = ""
+project_id = ""
+
+[health]
+enabled = true
+bind_address = "0.0.0.0:8080"
+
+[metrics]
+enabled = true
+
+[logging]
+level = "info"
+format = "pretty"

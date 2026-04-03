@@ -155,25 +155,26 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Unit and integration tests (non-Docker)
         # Exclude CLI e2e test binaries: they spawn real daemon processes and
@@ -221,25 +222,26 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Test with Coverage
         run: |
@@ -487,25 +489,26 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Prepare local Transponder image
+        uses: ./.github/actions/setup-transponder
+
       - name: Start Docker Compose services
         run: docker compose up -d
 
       - name: Wait for services to be ready
         run: |
-          echo "Running Nostr health checks..."
+          echo "Running local docker service health checks..."
           sleep 5
           echo "Checking if services are running:"
           docker compose ps
-          echo "Checking relay logs for startup issues:"
+          echo "Checking service logs for startup issues:"
           echo "=== nostr-rs-relay logs ==="
           docker compose logs nostr-rs-relay
           echo "=== strfry-nostr-relay logs ==="
           docker compose logs strfry-nostr-relay
-          echo "Testing basic HTTP connectivity first:"
-          curl -v http://localhost:8080/ || echo "nostr-rs-relay HTTP failed"
-          curl -v http://localhost:7777/ || echo "strfry HTTP failed"
-          echo "Testing WebSocket connectivity:"
-          ./scripts/wait_for_relays.sh
+          echo "=== transponder logs ==="
+          docker compose logs transponder
+          ./scripts/wait_for_dev_services.sh
 
       - name: Integration Test
         run: |
