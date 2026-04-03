@@ -360,11 +360,15 @@ impl Whitenoise {
         let hash_hex = hex::encode(prepared.encrypted_hash);
         let cached_filename = format!("{}.{}", hash_hex, media_detection.extension());
 
-        let file_metadata = if prepared.dimensions.is_some() || prepared.blurhash.is_some() {
+        let file_metadata = if prepared.dimensions.is_some()
+            || prepared.blurhash.is_some()
+            || prepared.thumbhash.is_some()
+        {
             Some(FileMetadata {
                 original_filename: Some(prepared.filename.clone()),
                 dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
                 blurhash: prepared.blurhash.clone(),
+                thumbhash: prepared.thumbhash.clone(),
             })
         } else {
             None

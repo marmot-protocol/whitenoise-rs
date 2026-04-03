@@ -1145,6 +1145,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fast-thumbhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5243a22cce29dff488db8ef03d8e0e54dd06cd3e6d98475160dff390fa414de2"
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2546,15 +2552,17 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=6e34398333a7a2ee8b3018511f4e9ca7db7e85cc#6e34398333a7a2ee8b3018511f4e9ca7db7e85cc"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fbd3a1bee99feae39e475ee00bf4634c4fe3443a#fbd3a1bee99feae39e475ee00bf4634c4fe3443a"
 dependencies = [
  "base64",
  "blurhash",
  "chacha20poly1305",
+ "fast-thumbhash",
  "hex",
  "hkdf",
  "image",
  "kamadak-exif",
+ "mdk-macros",
  "mdk-storage-traits",
  "nostr",
  "openmls",
@@ -2570,9 +2578,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdk-macros"
+version = "0.7.1"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fbd3a1bee99feae39e475ee00bf4634c4fe3443a#fbd3a1bee99feae39e475ee00bf4634c4fe3443a"
+
+[[package]]
 name = "mdk-sqlite-storage"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=6e34398333a7a2ee8b3018511f4e9ca7db7e85cc#6e34398333a7a2ee8b3018511f4e9ca7db7e85cc"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fbd3a1bee99feae39e475ee00bf4634c4fe3443a#fbd3a1bee99feae39e475ee00bf4634c4fe3443a"
 dependencies = [
  "getrandom 0.4.2",
  "hex",
@@ -2593,11 +2606,12 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=6e34398333a7a2ee8b3018511f4e9ca7db7e85cc#6e34398333a7a2ee8b3018511f4e9ca7db7e85cc"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fbd3a1bee99feae39e475ee00bf4634c4fe3443a#fbd3a1bee99feae39e475ee00bf4634c4fe3443a"
 dependencies = [
  "nostr",
  "openmls",
  "openmls_traits",
+ "pastey 0.2.1",
  "postcard",
  "serde",
  "serde_json",

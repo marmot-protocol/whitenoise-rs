@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Thumbhash support for media previews alongside existing blurhash, allowing clients to migrate over time ([#714]) ([erskingardner])
 - CLI message reactions (react/unreact) ([jgmontoya])
 - CLI message delete, retry, and reply commands ([jgmontoya])
 - CLI media commands for uploading files and images ([jgmontoya])
 - Chat archiving: archive/unarchive chats, list archived, subscribe to archived chat list updates ([jgmontoya])
 - Relay control plane with health monitoring scaffold ([erskingardner])
 - Relay observability persistence for connection metrics and failure tracking ([erskingardner])
+
+### Breaking
+
+- `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([#714]) ([erskingardner])
 
 ## [v0.2.1] - 2026-03-05
 
@@ -215,6 +220,9 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 [johnathanCorgan]: <https://github.com/jcorgan>
 
 
+
+<!-- PRs -->
+[#714]: https://github.com/marmot-protocol/whitenoise-rs/pull/714
 
 <!-- Tags -->
 [Unreleased]: https://github.com/marmot-protocol/whitenoise-rs/compare/v0.2.1...HEAD
