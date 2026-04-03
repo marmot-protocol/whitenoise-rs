@@ -4,6 +4,7 @@
 //! (web of trust) to find users matching a query, prioritized by social distance.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 mod graph;
 pub mod matcher;
 mod metrics;
+mod nip50;
 mod types;
 
 use crate::perf_instrument;
@@ -50,6 +52,25 @@ const CANDIDATE_CHANNEL_CAPACITY: usize = 500;
 
 /// Capacity for inter-tier channels.
 const TIER_CHANNEL_CAPACITY: usize = 500;
+
+/// NIP-50 search relay for supplementary keyword results.
+const NIP50_SEARCH_RELAY: &str = "wss://relay.vertexlab.io";
+
+/// Parsed relay URL, validated once at first use.
+static NIP50_RELAY_URL: LazyLock<RelayUrl> = LazyLock::new(|| {
+    RelayUrl::parse(NIP50_SEARCH_RELAY).expect("NIP50_SEARCH_RELAY is a valid URL")
+});
+
+/// Maximum results to request from the NIP-50 relay.
+const NIP50_RESULT_LIMIT: usize = 50;
+
+/// Sentinel radius for NIP-50 results (not a social distance).
+/// Sorts after all graph results. Replace with SearchSource enum
+/// if a second non-graph source is added.
+const NIP50_RADIUS: u8 = u8::MAX;
+
+/// Safety ceiling for the NIP-50 task (connection + protocol timeout).
+const NIP50_SAFETY_TIMEOUT_SECS: u64 = 10;
 
 /// Well-connected pubkey injected as a graph entrypoint when the searcher's
 /// social graph is exhausted (e.g., new account with no follows).
@@ -166,6 +187,7 @@ impl Whitenoise {
                 searcher_pubkey,
                 radius_start,
                 radius_end,
+                Some(&NIP50_RELAY_URL),
             )
             .await;
         }));
@@ -244,11 +266,14 @@ struct UserRelayFetchResult {
 /// Background search task that orchestrates a multi-tier pipeline.
 ///
 /// ```text
-/// Producer → T1 (User table) → T2 (Cache) → T3 (Network) → T4 (Relay lists) → T5 (User relays)
-///               ↓ emit            ↓ emit        ↓ emit          ↓ emit              ↓ emit
-///           ResultsFound      ResultsFound   ResultsFound    ResultsFound        ResultsFound
-///                                                                              RadiusCompleted
-///                                                                              SearchCompleted
+/// Producer -> T1 (User table) -> T2 (Cache) -> T3 (Network) -> T4 (Relay lists) -> T5 (User relays)
+///                | emit            | emit        | emit          | emit              | emit
+///            ResultsFound      ResultsFound   ResultsFound    ResultsFound        ResultsFound
+///                                                                               RadiusCompleted
+///
+/// NIP-50 relay search (parallel) ----> ResultsFound (radius: 255)
+///
+/// All tasks complete -> SearchCompleted
 /// ```
 ///
 /// Each tier emits matches immediately and passes misses to the next tier.
@@ -263,6 +288,7 @@ async fn search_task(
     searcher_pubkey: PublicKey,
     radius_start: u8,
     radius_end: u8,
+    nip50_relay: Option<&RelayUrl>,
 ) {
     let total_results = AtomicUsize::new(0);
     let metrics = metrics::PipelineMetrics::new();
@@ -321,16 +347,23 @@ async fn search_task(
             &total_results,
             &metrics,
         ),
-        tier5_user_relay_consumer(
-            whitenoise,
-            &tx,
-            rx_tier5,
-            &query,
-            &total_results,
-            radius_end,
-            &metrics,
-        ),
+        tier5_user_relay_consumer(whitenoise, &tx, rx_tier5, &query, &total_results, &metrics,),
+        nip50_search_task(whitenoise, &tx, &query, &total_results, nip50_relay),
     );
+
+    // All tasks done. Emit terminal event.
+    #[cfg(feature = "benchmark-tests")]
+    metrics.log_summary();
+
+    let total = total_results.load(Ordering::Relaxed);
+    let _ = tx.send(UserSearchUpdate {
+        trigger: SearchUpdateTrigger::SearchCompleted {
+            final_radius: radius_end,
+            total_results: total,
+        },
+        new_results: vec![],
+        total_result_count: total,
+    });
 }
 
 /// Push candidate batches to the channel, chunked by PUBKEY_BATCH_SIZE.
@@ -617,6 +650,42 @@ fn match_and_emit(
             total_result_count: total,
         });
     }
+}
+
+/// NIP-50 relay search: fetch keyword matches and emit results.
+///
+/// Runs concurrently with the graph pipeline. Handles its own timeout,
+/// empty-query guard, and cancellation check internally. On failure,
+/// timeout, or `None` relay, exits silently -- the graph pipeline is
+/// unaffected.
+#[perf_instrument("user_search")]
+async fn nip50_search_task(
+    whitenoise: &Whitenoise,
+    tx: &broadcast::Sender<UserSearchUpdate>,
+    query: &str,
+    total_results: &AtomicUsize,
+    relay: Option<&RelayUrl>,
+) {
+    let Some(relay) = relay else { return };
+    if query.trim().is_empty() || tx.receiver_count() == 0 {
+        return;
+    }
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(NIP50_SAFETY_TIMEOUT_SECS),
+        nip50::try_nip50_search(whitenoise, query, relay, NIP50_RESULT_LIMIT),
+    )
+    .await;
+
+    let Ok(Ok(found)) = result else { return };
+
+    let pubkeys: Vec<PublicKey> = found.keys().copied().collect();
+    let fetched = pubkeys.len();
+    match_and_emit(tx, &found, &pubkeys, query, NIP50_RADIUS, total_results);
+    tracing::debug!(
+        target: "whitenoise::user_search",
+        "NIP-50: {fetched} events fetched from relay",
+    );
 }
 
 /// Tier 1 consumer: checks User table for metadata.
@@ -1177,7 +1246,7 @@ async fn process_tier4_result(
 /// - Error + retries left → requeue
 /// - Error + retries exhausted → don't cache (uncertain)
 ///
-/// Emits `RadiusCompleted` and `SearchCompleted` as the final pipeline tier.
+/// Emits `RadiusCompleted` as the final pipeline tier.
 #[perf_instrument("user_search")]
 async fn tier5_user_relay_consumer(
     whitenoise: &Whitenoise,
@@ -1185,7 +1254,6 @@ async fn tier5_user_relay_consumer(
     mut rx: mpsc::Receiver<UserRelayBatch>,
     query: &str,
     total_results: &AtomicUsize,
-    radius_end: u8,
     metrics: &metrics::PipelineMetrics,
 ) {
     // (pubkey, relays, radius, attempt)
@@ -1282,20 +1350,6 @@ async fn tier5_user_relay_consumer(
             }
         }
     }
-
-    // Channel closed — all tiers done. Emit SearchCompleted.
-    #[cfg(feature = "benchmark-tests")]
-    metrics.log_summary();
-
-    let total = total_results.load(Ordering::Relaxed);
-    let _ = tx.send(UserSearchUpdate {
-        trigger: SearchUpdateTrigger::SearchCompleted {
-            final_radius: radius_end,
-            total_results: total,
-        },
-        new_results: vec![],
-        total_result_count: total,
-    });
 }
 
 /// Process a completed tier 5 per-user relay metadata fetch.
@@ -1548,7 +1602,7 @@ mod tests {
     ) -> Vec<UserSearchUpdate> {
         let (tx, mut rx) = broadcast::channel(SEARCH_CHANNEL_BUFFER_SIZE);
 
-        // Run search task directly (not spawned)
+        // Run search task directly (not spawned), without NIP-50 relay
         search_task(
             whitenoise,
             tx,
@@ -1556,6 +1610,7 @@ mod tests {
             searcher_pubkey,
             radius_start,
             radius_end,
+            None,
         )
         .await;
 
@@ -1680,6 +1735,7 @@ mod tests {
             account.pubkey,
             0,
             10, // Large radius that would take a while
+            None,
         )
         .await;
 
@@ -2748,5 +2804,10 @@ mod tests {
             !found_seed,
             "Fallback seed should NOT appear when graph is not empty"
         );
+    }
+
+    #[test]
+    fn nip50_relay_url_parses() {
+        let _ = &*NIP50_RELAY_URL;
     }
 }

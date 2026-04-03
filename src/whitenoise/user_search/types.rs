@@ -14,6 +14,8 @@ pub struct UserSearchResult {
     /// The user's metadata (fetched from network or cache, not persisted as User).
     pub metadata: Metadata,
     /// Social distance from searcher (0 = self, 1 = direct follow, etc.).
+    /// `u8::MAX` indicates a non-graph source (e.g., NIP-50 relay search) --
+    /// see `NIP50_RADIUS` constant.
     pub radius: u8,
     /// Quality of the match (for ordering within same radius).
     pub match_quality: MatchQuality,
