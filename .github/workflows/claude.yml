@@ -28,6 +28,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
+      id-token: write # Required by claude-code-action for OIDC auth
       actions: read
     steps:
       - name: Check for fork PR (issue_comment)
