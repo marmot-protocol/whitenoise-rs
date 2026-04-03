@@ -455,6 +455,15 @@ impl AggregatedMessage {
     /// Each returned [`SearchResult`] includes the matched [`ChatMessage`] and
     /// `highlight_spans`: char-index `[start, end]` pairs for each query token in the
     /// order they appear in the message content, ready for frontend highlighting.
+    ///
+    /// # Performance
+    ///
+    /// `position` is computed via `ROW_NUMBER()` over the entire group (O(group_size))
+    /// because it must reflect the absolute offset in the full message ordering — the
+    /// LIKE filter cannot be pushed inside the window without changing position semantics.
+    /// Migration 0043 adds a covering index on
+    /// `(kind, mls_group_id, deletion_event_id, created_at DESC, message_id DESC)`
+    /// so the window scan uses an index walk instead of a temp B-tree sort.
     pub async fn search_messages_in_group(
         group_id: &GroupId,
         query: &str,
@@ -479,7 +488,7 @@ impl AggregatedMessage {
              )
              SELECT * FROM ranked
              WHERE content_normalized LIKE ?2
-             ORDER BY created_at DESC
+             ORDER BY created_at DESC, message_id DESC
              LIMIT ?3",
         )
         .bind(group_id.as_slice())
@@ -490,7 +499,16 @@ impl AggregatedMessage {
 
         rows.into_iter()
             .map(|row| {
-                let position = row.position.unwrap_or(0) as u64;
+                let position_i64 =
+                    row.position
+                        .ok_or_else(|| DatabaseError::MissingSearchPosition {
+                            message_id: row.message_id.to_string(),
+                        })?;
+                let position = u64::try_from(position_i64).map_err(|_| {
+                    DatabaseError::MissingSearchPosition {
+                        message_id: row.message_id.to_string(),
+                    }
+                })?;
                 let message = Self::row_to_chat_message(row)?;
                 let highlight_spans =
                     super::content_search::find_highlight_spans(&message.content, query);
@@ -3802,5 +3820,69 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression test: when multiple messages share the same `created_at`,
+    /// results and positions must be deterministic (ordered by `message_id DESC`).
+    #[tokio::test]
+    async fn test_search_same_timestamp_deterministic_ordering() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[99; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let same_ts = Timestamp::from(1_700_000_000u64);
+
+        // Three messages with the same timestamp but different IDs.
+        // message_id ordering (hex): "cc" > "bb" > "aa"
+        // So DESC order is: cc, bb, aa → positions 0, 1, 2
+        let ids_and_content = vec![
+            (format!("{:0>64}", "aa"), "alpha same-ts"),
+            (format!("{:0>64}", "bb"), "beta same-ts"),
+            (format!("{:0>64}", "cc"), "gamma same-ts"),
+        ];
+
+        for (id, content) in &ids_and_content {
+            let msg = ChatMessage {
+                id: id.clone(),
+                author,
+                content: content.to_string(),
+                created_at: same_ts,
+                tags: Tags::new(),
+                is_reply: false,
+                reply_to_id: None,
+                is_deleted: false,
+                content_tokens: vec![],
+                reactions: ReactionSummary::default(),
+                kind: 9,
+                media_attachments: vec![],
+                delivery_status: None,
+            };
+            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Search for all three: "same-ts" matches every message
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "same-ts",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+
+        // Returned order must be message_id DESC: cc, bb, aa
+        assert_eq!(results[0].message.content, "gamma same-ts");
+        assert_eq!(results[1].message.content, "beta same-ts");
+        assert_eq!(results[2].message.content, "alpha same-ts");
+
+        // Positions must be sequential from the window function
+        assert_eq!(results[0].position, 0);
+        assert_eq!(results[1].position, 1);
+        assert_eq!(results[2].position, 2);
     }
 }
