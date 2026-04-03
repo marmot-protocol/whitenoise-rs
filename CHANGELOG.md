@@ -46,9 +46,9 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 - Search for contacts by npub or hex pubkey ([#153] [@erskingardner])
 - Copy npub button in settings page ([#82] [@josefinalliende])
 - Basic NWC support for paying invoices in messages ([#89] [@a-mpch], [@F3r10], [@jgmontoya], [@josefinalliende])
-- Show invoice payments as a system message reply rather than as a reaction ([@a-mpch], [@jgmontoya])
-- Blur QRs and hide pay button for paid invoices in messages ([@a-mpch], [@jgmontoya], [@josefinalliende])
-- Truncate invoice content in messages ([@a-mpch], [@jgmontoya], [@josefinalliende])
+- Show invoice payments as a system message reply rather than as a reaction ([#95] [@a-mpch], [@jgmontoya])
+- Blur QRs and hide pay button for paid invoices in messages ([#95] [@a-mpch], [@jgmontoya], [@josefinalliende])
+- Truncate invoice content in messages ([#95] [@a-mpch], [@jgmontoya], [@josefinalliende])
 - Add the ability to delete messages ([#97] [@jgmontoya])
 - `KeyPackageStatus` enum to detect incompatible key packages before group operations ([#497] [@mubarakcoded])
 - Key package ownership verification before skipping publish ([#499] [@mubarakcoded])
@@ -154,7 +154,7 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 - Enhanced toast messages design ([@erskingardner])
 - Updated styling for Android/iOS ([@erskingardner])
 - Updated to nostr-sdk v38 ([@erskingardner])
-- Improved build system for multiple platforms (Linux, Android, iOS, MacOS) ([@erskingardner])
+- Improved build system for multiple platforms (Linux, Android, iOS, macOS) ([@erskingardner])
 - Split build workflows for better efficiency ([@erskingardner])
 
 ### Removed
@@ -210,7 +210,6 @@ Complete architectural rewrite from Tauri desktop/mobile app to a pure Rust libr
 <!-- Contributors -->
 [@erskingardner]: <https://github.com/erskingardner> (nostr:npub1zuuajd7u3sx8xu92yav9jwxpr839cs0kc3q6t56vd5u9q033xmhsk6c2uc)
 [@justinmoon]: <https://github.com/justinmoon> (nostr:npub1zxu639qym0esxnn7rzrt48wycmfhdu3e5yvzwx7ja3t84zyc2r8qz8cx2y)
-[@hodlbod]: <https://github.com/staab> (nostr:npub1jlrs53pkdfjnts29kveljul2sm0actt6n8dxrrzqcersttvcuv3qdjynqn)
 [@dmcarrington]: <https://github.com/dmcarrington>
 [@josefinalliende]: <https://github.com/josefinalliende> (nostr:npub1peps0fg2us0rzrsz40we8dw069yahjvzfuyznvnq68cyf9e9cw7s8agrxw)
 [@jgmontoya]: <https://github.com/jgmontoya> (nostr:npub1jgm0ntzjr03wuzj5788llhed7l6fst05um4ej2r86ueaa08etv6sgd669p)
