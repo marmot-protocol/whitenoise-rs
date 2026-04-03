@@ -154,6 +154,14 @@ pub enum Request {
         radius_end: u8,
     },
 
+    // Block / Unblock
+    #[serde(rename = "block_user")]
+    BlockUser { account: String, pubkey: String },
+    #[serde(rename = "unblock_user")]
+    UnblockUser { account: String, pubkey: String },
+    #[serde(rename = "blocked_users")]
+    BlockedUsers { account: String },
+
     // Relays
     #[serde(rename = "relays_list")]
     RelaysList {

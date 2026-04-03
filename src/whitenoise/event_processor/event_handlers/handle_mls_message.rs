@@ -184,6 +184,19 @@ impl Whitenoise {
         inner_event: UnsignedEvent,
         message: Message,
     ) -> Result<()> {
+        // Drop messages from blocked users before any DB insert
+        if self
+            .is_user_blocked(&account.pubkey, &message.pubkey)
+            .await?
+        {
+            tracing::debug!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                "Dropping message from blocked user {}",
+                message.pubkey,
+            );
+            return Ok(());
+        }
+
         let parsed_references = {
             let media_manager = mdk.media_manager(group_id.clone());
             self.media_files()

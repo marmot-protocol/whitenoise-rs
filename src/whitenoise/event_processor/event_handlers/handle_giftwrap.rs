@@ -156,6 +156,19 @@ impl Whitenoise {
         let group_name = welcome.group_name.clone();
         let welcomer_pubkey = welcome.welcomer;
 
+        // Auto-decline welcome from blocked users
+        if self
+            .is_user_blocked(&account.pubkey, &welcomer_pubkey)
+            .await?
+        {
+            tracing::info!(
+                target: "whitenoise::event_processor::process_welcome",
+                "Auto-declining welcome from blocked user {}",
+                welcomer_pubkey,
+            );
+            return Ok(());
+        }
+
         // For DM groups (empty name), the welcomer is the other participant.
         // In the Marmot protocol, DM welcomes are always sent by the initiator,
         // who is the only other member in a two-party DM group.

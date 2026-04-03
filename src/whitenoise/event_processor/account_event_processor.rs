@@ -321,6 +321,7 @@ impl Whitenoise {
                 self.handle_relay_list(event.clone()).await
             }
             Kind::ContactList => self.handle_contact_list(account, event.clone()).await,
+            Kind::MuteList => self.handle_mute_list(account, event.clone()).await,
             _ => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::route_event_for_processing",
