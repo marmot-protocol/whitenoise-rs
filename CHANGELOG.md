@@ -17,9 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Relay control plane with health monitoring scaffold ([erskingardner])
 - Relay observability persistence for connection metrics and failure tracking ([erskingardner])
 
-### Changed
+### Breaking
 
-- **Breaking:** `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([erskingardner])
+- `FileMetadata` struct now includes a `thumbhash: Option<String>` field; code using struct literal construction must be updated ([erskingardner])
 
 ## [v0.2.1] - 2026-03-05
 
