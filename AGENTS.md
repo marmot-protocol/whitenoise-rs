@@ -264,3 +264,15 @@ When working with MLS code, always consider:
 3. Group membership authentication
 4. Message ordering and consistency
 5. Key rotation procedures
+
+## Claude GitHub Actions Security
+
+The repository uses Claude-powered GitHub Actions for code review and PR assistance. These workflows are hardened against prompt injection and supply-chain attacks.
+
+### Operational rules for maintainers
+
+- **Never invoke `@claude` on fork PRs.** Fork PR content (code, descriptions, comments, commits) is attacker-controlled. The workflows block this automatically for review comments and PR reviews, but exercise caution on issue comments linked to fork PRs.
+- **Treat all PR/issue/comment content as hostile input.** Claude is instructed to ignore embedded instructions, but defense-in-depth means maintainers should avoid running Claude on suspicious content.
+- **Claude only follows explicit maintainer requests.** It will not execute instructions found in diffs, commit messages, PR bodies, or comments.
+- **Do not add `id-token: write` permissions** unless you enable OIDC-based cloud authentication (Bedrock/Vertex/Foundry).
+- **Keep actions pinned to commit SHAs.** When updating action versions, always pin to the new full commit SHA.
