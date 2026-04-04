@@ -244,3 +244,66 @@ impl Whitenoise {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::{EventBuilder, Keys, Kind, Tag};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_mute_list_entries_public_tags_only() {
+        let keys = Keys::generate();
+        let signer = keys.clone();
+        let target = Keys::generate().public_key();
+
+        let event = EventBuilder::new(Kind::MuteList, "")
+            .tags([Tag::public_key(target)])
+            .sign(&signer)
+            .await
+            .unwrap();
+
+        let entries =
+            Whitenoise::parse_mute_list_entries(&signer, &keys.public_key(), &event).await;
+
+        let entries = entries.expect("should return Some");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, target);
+        assert!(!entries[0].1); // is_private = false
+    }
+
+    #[tokio::test]
+    async fn parse_mute_list_entries_empty_event_returns_empty_list() {
+        let keys = Keys::generate();
+        let signer = keys.clone();
+
+        let event = EventBuilder::new(Kind::MuteList, "")
+            .sign(&signer)
+            .await
+            .unwrap();
+
+        let entries =
+            Whitenoise::parse_mute_list_entries(&signer, &keys.public_key(), &event).await;
+
+        let entries = entries.expect("should return Some");
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_mute_list_entries_bad_content_returns_none() {
+        let keys = Keys::generate();
+        let signer = keys.clone();
+
+        // Non-empty content that is not valid NIP-44 ciphertext
+        let event = EventBuilder::new(Kind::MuteList, "not-valid-ciphertext")
+            .sign(&signer)
+            .await
+            .unwrap();
+
+        let entries =
+            Whitenoise::parse_mute_list_entries(&signer, &keys.public_key(), &event).await;
+
+        // Decrypt failure → None, so cache must not be replaced
+        assert!(entries.is_none());
+    }
+}
