@@ -95,7 +95,7 @@ impl Whitenoise {
 
                 // Advance account sync timestamp only for account-scoped events
                 match event.kind {
-                    Kind::ContactList | Kind::MlsGroupMessage => {
+                    Kind::ContactList | Kind::MlsGroupMessage | Kind::MuteList => {
                         // Cap timestamp to prevent future corruption
                         let safe_timestamp = cap_timestamp_to_now(event.created_at);
                         let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
