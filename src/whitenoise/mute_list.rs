@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use nostr_sdk::{Event, EventBuilder, Filter, Kind, NostrSigner, PublicKey, Tag, TagStandard};
 
 use crate::perf_instrument;
@@ -204,6 +206,27 @@ impl Whitenoise {
         }
 
         Some(entries)
+    }
+
+    /// Replaces the mute list cache and emits `UserBlockChanged` for every
+    /// pubkey that was added or removed compared to the previous state.
+    pub(crate) async fn sync_and_emit(
+        &self,
+        account: &Account,
+        entries: &[(PublicKey, bool)],
+    ) -> Result<()> {
+        let old = MuteListEntry::find_by_account(&account.pubkey, &self.database).await?;
+        let old_pubkeys: HashSet<PublicKey> = old.iter().map(|e| e.muted_pubkey).collect();
+
+        MuteListEntry::sync_from_event(&account.pubkey, entries, &self.database).await?;
+
+        let new_pubkeys: HashSet<PublicKey> = entries.iter().map(|(pk, _)| *pk).collect();
+
+        for pubkey in old_pubkeys.symmetric_difference(&new_pubkeys) {
+            self.emit_block_changed(account, pubkey).await;
+        }
+
+        Ok(())
     }
 
     /// Emits a `UserBlockChanged` chat list update for the DM group with the

@@ -1,9 +1,7 @@
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
-use crate::whitenoise::{
-    Whitenoise, accounts::Account, database::mute_list::MuteListEntry, error::Result,
-};
+use crate::whitenoise::{Whitenoise, accounts::Account, error::Result};
 
 impl Whitenoise {
     /// Handles an incoming kind 10000 mute list event (our own, from another
@@ -28,7 +26,7 @@ impl Whitenoise {
             return Ok(());
         };
 
-        MuteListEntry::sync_from_event(&account.pubkey, &entries, &self.database).await?;
+        self.sync_and_emit(account, &entries).await?;
 
         tracing::debug!(
             target: "whitenoise::event_processor::handle_mute_list",
