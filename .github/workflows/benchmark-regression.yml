@@ -38,7 +38,7 @@ jobs:
     name: Stable scenarios (merge-gating)
     needs: check-label
     if: needs.check-label.outputs.run == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -215,7 +215,7 @@ jobs:
     name: Relay scenarios (informational)
     needs: check-label
     if: needs.check-label.outputs.run == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     # Relay-tier scenarios never fail CI — informational only.
     # continue-on-error ensures infrastructure step failures (toolchain setup,
     # Docker startup, teardown) also do not block the PR.

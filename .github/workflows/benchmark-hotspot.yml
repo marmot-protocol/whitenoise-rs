@@ -16,7 +16,7 @@ env:
 jobs:
   hotspot-digest:
     name: Run benchmarks and update hotspot digest
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to push hotspot commit to perf-hotspot branch
       issues: write     # needed to create/update the pinned perf-hotspot issue
