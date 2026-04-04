@@ -1,4 +1,4 @@
-use nostr_sdk::{EventBuilder, Filter, Kind, PublicKey, Tag, TagStandard};
+use nostr_sdk::{Event, EventBuilder, Filter, Kind, NostrSigner, PublicKey, Tag, TagStandard};
 
 use crate::perf_instrument;
 use crate::whitenoise::{
@@ -78,7 +78,7 @@ impl Whitenoise {
     #[perf_instrument("mute_list")]
     pub async fn sync_mute_list(&self, account: &Account) -> Result<()> {
         let signer = self.get_signer_for_account(account)?;
-        let relay_urls = self.fallback_relay_urls().await;
+        let relay_urls = self.account_relay_urls(account).await;
 
         let filter = Filter::new()
             .author(account.pubkey)
@@ -103,6 +103,25 @@ impl Whitenoise {
             }
         };
 
+        let entries = Self::parse_mute_list_entries(signer.as_ref(), &account.pubkey, event).await;
+        let Some(entries) = entries else {
+            return Ok(());
+        };
+
+        MuteListEntry::sync_from_event(&account.pubkey, &entries, &self.database).await?;
+
+        Ok(())
+    }
+
+    /// Parses public and private "p" tags from a kind 10000 mute list event.
+    ///
+    /// Returns `None` if the event has non-empty content that cannot be decrypted
+    /// or parsed — callers must not replace the local cache in that case.
+    pub(crate) async fn parse_mute_list_entries(
+        signer: &dyn NostrSigner,
+        account_pubkey: &PublicKey,
+        event: &Event,
+    ) -> Option<Vec<(PublicKey, bool)>> {
         let mut entries: Vec<(PublicKey, bool)> = Vec::new();
 
         // Public tags: extract "p" tags
@@ -113,9 +132,10 @@ impl Whitenoise {
         }
 
         // Private content: decrypt with NIP-44 via signer and extract "p" tags.
-        // If decryption or parsing fails, abort — do not replace the cache with a partial result.
+        // If decryption or parsing fails, return None — callers must not replace
+        // the local cache with a partial (public-only) result.
         if !event.content.is_empty() {
-            let decrypted = match signer.nip44_decrypt(&account.pubkey, &event.content).await {
+            let decrypted = match signer.nip44_decrypt(account_pubkey, &event.content).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(
@@ -123,7 +143,7 @@ impl Whitenoise {
                         "Failed to decrypt mute list content: {}",
                         e,
                     );
-                    return Ok(());
+                    return None;
                 }
             };
 
@@ -135,20 +155,21 @@ impl Whitenoise {
                         "Failed to parse private mute list content: {}",
                         e,
                     );
-                    return Ok(());
+                    return None;
                 }
             };
 
             for tag in &tags {
-                if tag.len() >= 2 && tag[0] == "p" && let Ok(pk) = PublicKey::parse(&tag[1]) {
+                if tag.len() >= 2
+                    && tag[0] == "p"
+                    && let Ok(pk) = PublicKey::parse(&tag[1])
+                {
                     entries.push((pk, true));
                 }
             }
         }
 
-        MuteListEntry::sync_from_event(&account.pubkey, &entries, &self.database).await?;
-
-        Ok(())
+        Some(entries)
     }
 
     /// Emits a `UserBlockChanged` chat list update for the DM group with the
@@ -183,7 +204,7 @@ impl Whitenoise {
     #[perf_instrument("mute_list")]
     async fn publish_mute_list(&self, account: &Account) -> Result<()> {
         let signer = self.get_signer_for_account(account)?;
-        let relay_urls = self.fallback_relay_urls().await;
+        let relay_urls = self.account_relay_urls(account).await;
 
         let entries = MuteListEntry::find_by_account(&account.pubkey, &self.database).await?;
 

@@ -23,48 +23,10 @@ impl Whitenoise {
 
         let signer = self.get_signer_for_account(account)?;
 
-        let mut entries: Vec<(PublicKey, bool)> = Vec::new();
-
-        // Public tags: extract "p" tags
-        for tag in event.tags.iter() {
-            if let Some(TagStandard::PublicKey { public_key, .. }) = tag.as_standardized() {
-                entries.push((*public_key, false));
-            }
-        }
-
-        // Private content: decrypt with NIP-44 via signer and extract "p" tags.
-        // If decryption or parsing fails, abort — do not replace the cache with a partial result.
-        if !event.content.is_empty() {
-            let decrypted = match signer.nip44_decrypt(&account.pubkey, &event.content).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mute_list",
-                        "Failed to decrypt mute list content: {}",
-                        e,
-                    );
-                    return Ok(());
-                }
-            };
-
-            let tags = match serde_json::from_str::<Vec<Vec<String>>>(&decrypted) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::event_handlers::handle_mute_list",
-                        "Failed to parse private mute list content: {}",
-                        e,
-                    );
-                    return Ok(());
-                }
-            };
-
-            for tag in &tags {
-                if tag.len() >= 2 && tag[0] == "p" && let Ok(pk) = PublicKey::parse(&tag[1]) {
-                    entries.push((pk, true));
-                }
-            }
-        }
+        let entries = Self::parse_mute_list_entries(signer.as_ref(), &account.pubkey, &event).await;
+        let Some(entries) = entries else {
+            return Ok(());
+        };
 
         MuteListEntry::sync_from_event(&account.pubkey, &entries, &self.database).await?;
 
