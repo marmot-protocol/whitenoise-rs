@@ -13,8 +13,20 @@ use crate::whitenoise::{
 impl Whitenoise {
     /// Blocks a user by adding them to the local mute list cache and publishing
     /// an updated NIP-51 kind 10000 event to relays.
+    ///
+    /// Fetches the latest mute list from relays first so that blocks made on
+    /// other devices are preserved (merge, not replace).
     #[perf_instrument("mute_list")]
     pub async fn block_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
+        if let Err(e) = self.sync_mute_list(account).await {
+            tracing::warn!(
+                target: "whitenoise::mute_list",
+                "Failed to sync mute list before blocking {}: {}",
+                target_pubkey,
+                e,
+            );
+        }
+
         if MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
             return Ok(());
         }
@@ -37,8 +49,20 @@ impl Whitenoise {
 
     /// Unblocks a user by removing them from the local mute list cache and
     /// publishing an updated NIP-51 kind 10000 event to relays.
+    ///
+    /// Fetches the latest mute list from relays first so that blocks made on
+    /// other devices are preserved (merge, not replace).
     #[perf_instrument("mute_list")]
     pub async fn unblock_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
+        if let Err(e) = self.sync_mute_list(account).await {
+            tracing::warn!(
+                target: "whitenoise::mute_list",
+                "Failed to sync mute list before unblocking {}: {}",
+                target_pubkey,
+                e,
+            );
+        }
+
         MuteListEntry::delete(&account.pubkey, target_pubkey, &self.database).await?;
 
         if let Err(e) = self.publish_mute_list(account).await {
@@ -131,19 +155,29 @@ impl Whitenoise {
             }
         }
 
-        // Private content: decrypt with NIP-44 via signer and extract "p" tags.
+        // Private content: decrypt with NIP-44 (fallback NIP-04) and extract "p" tags.
         // If decryption or parsing fails, return None — callers must not replace
         // the local cache with a partial (public-only) result.
         if !event.content.is_empty() {
             let decrypted = match signer.nip44_decrypt(account_pubkey, &event.content).await {
                 Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(
+                Err(nip44_err) => {
+                    tracing::debug!(
                         target: "whitenoise::mute_list",
-                        "Failed to decrypt mute list content: {}",
-                        e,
+                        "NIP-44 decrypt failed ({}), trying NIP-04 fallback",
+                        nip44_err,
                     );
-                    return None;
+                    match signer.nip04_decrypt(account_pubkey, &event.content).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "whitenoise::mute_list",
+                                "Failed to decrypt mute list content (NIP-44 and NIP-04 both failed): {}",
+                                e,
+                            );
+                            return None;
+                        }
+                    }
                 }
             };
 

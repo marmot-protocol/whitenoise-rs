@@ -47,7 +47,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
         tracing::debug!(
-          target: "whitenoise::event_handlers::handle_mls_message",
+          target: "whitenoise::event_processor::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",
           event.id.to_hex(),
           event.kind.as_u16(),
@@ -59,7 +59,7 @@ impl Whitenoise {
         let outcome = match mdk.process_message_with_context(&event) {
             Ok(outcome) => {
                 tracing::debug!(
-                  target: "whitenoise::event_handlers::handle_mls_message",
+                  target: "whitenoise::event_processor::handle_mls_message",
                   "MLS message {} processed - Result variant: {}",
                   event.id.to_hex(),
                   match &outcome.result {
@@ -77,7 +77,7 @@ impl Whitenoise {
             }
             Err(e) => {
                 tracing::error!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message handling failed for account {}: {}",
                     account.pubkey.to_hex(),
                     e
@@ -142,7 +142,7 @@ impl Whitenoise {
                 .await
             {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     account = %account.pubkey.to_hex(),
                     group_id = %hex::encode(group_id.as_slice()),
                     sender_leaf_index = ?outcome.context.sender_leaf_index,
@@ -190,7 +190,7 @@ impl Whitenoise {
             .await?
         {
             tracing::debug!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 "Dropping message from blocked user {}",
                 message.pubkey,
             );
@@ -287,7 +287,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::PendingProposal { mls_group_id } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Stored pending proposal for group {} (awaiting admin commit)",
                     hex::encode(mls_group_id.as_slice())
                 );
@@ -298,7 +298,7 @@ impl Whitenoise {
                 reason,
             } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Ignored proposal for group {}: {}",
                     hex::encode(mls_group_id.as_slice()),
                     reason
@@ -307,7 +307,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Received external join proposal for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
@@ -319,7 +319,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::Unprocessable { mls_group_id } => {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message unprocessable for group {} (account {}): \
                      event will not be marked processed",
                     hex::encode(mls_group_id.as_slice()),
@@ -331,7 +331,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::PreviouslyFailed => {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message was previously failed for account {}: \
                      event will not be marked processed",
                     account.pubkey.to_hex()
@@ -365,14 +365,14 @@ impl Whitenoise {
             && !welcome_rumors.is_empty()
         {
             tracing::warn!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 "Auto-committed proposal produced {} welcome rumors that were not delivered",
                 welcome_rumors.len()
             );
         }
 
         tracing::info!(
-            target: "whitenoise::event_handlers::handle_mls_message",
+            target: "whitenoise::event_processor::handle_mls_message",
             "Published auto-committed proposal evolution event for group {}",
             hex::encode(group_id.as_slice())
         );
@@ -392,7 +392,7 @@ impl Whitenoise {
         mls_group_id: &GroupId,
     ) -> Result<()> {
         tracing::info!(
-            target: "whitenoise::event_handlers::handle_mls_message",
+            target: "whitenoise::event_processor::handle_mls_message",
             "Processed commit for group {}",
             hex::encode(mls_group_id.as_slice())
         );
@@ -404,7 +404,7 @@ impl Whitenoise {
 
         if !still_active {
             tracing::info!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 "Account {} was removed from group {} — marking group as removed",
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
@@ -418,7 +418,7 @@ impl Whitenoise {
                 .await
         {
             tracing::warn!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 account = %account.pubkey.to_hex(),
                 group_id = %hex::encode(mls_group_id.as_slice()),
                 error = %error,

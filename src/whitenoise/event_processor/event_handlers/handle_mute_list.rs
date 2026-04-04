@@ -14,7 +14,7 @@ impl Whitenoise {
         // Only process mute list events authored by this account
         if event.pubkey != account.pubkey {
             tracing::debug!(
-                target: "whitenoise::event_handlers::handle_mute_list",
+                target: "whitenoise::event_processor::handle_mute_list",
                 "Ignoring mute list event from foreign author {}",
                 event.pubkey,
             );
@@ -31,7 +31,7 @@ impl Whitenoise {
         MuteListEntry::sync_from_event(&account.pubkey, &entries, &self.database).await?;
 
         tracing::debug!(
-            target: "whitenoise::event_handlers::handle_mute_list",
+            target: "whitenoise::event_processor::handle_mute_list",
             "Synced mute list for {}: {} entries",
             account.pubkey,
             entries.len(),
