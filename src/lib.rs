@@ -65,6 +65,9 @@ pub use whitenoise::drafts::Draft;
 // Media files
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 
+// Mute list
+pub use whitenoise::database::mute_list::MuteListEntry;
+
 // Messaging
 pub use whitenoise::message_aggregator::{
     ChatMessage, DeliveryStatus, EmojiReaction, ReactionSummary, UserReaction,
