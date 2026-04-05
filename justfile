@@ -451,6 +451,10 @@ install-tools:
 build-release:
     cargo build --release
 
+# Install wn and wnd CLI binaries to ~/.cargo/bin
+install-cli:
+    cargo install --path . --features cli
+
 ######################
 # Docker
 ######################
