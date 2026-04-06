@@ -1383,13 +1383,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(messages.len(), 3, "All messages should be cached");
-        for (i, msg) in messages.iter().enumerate() {
-            assert!(
-                msg.content.contains(&format!("Message {}", i + 1)),
-                "Message {} content should be correct",
-                i + 1
-            );
-        }
+        let mut contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        contents.sort();
+        assert_eq!(contents, vec!["Message 1", "Message 2", "Message 3"]);
 
         // Verify messages are accessible via public API
         let fetched = whitenoise
