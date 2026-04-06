@@ -56,6 +56,10 @@ impl Whitenoise {
     /// other devices are preserved (merge, not replace).
     #[perf_instrument("mute_list")]
     pub async fn unblock_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
+        if !MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
+            return Ok(());
+        }
+
         if let Err(e) = self.sync_mute_list(account).await {
             tracing::warn!(
                 target: "whitenoise::mute_list",
@@ -102,7 +106,7 @@ impl Whitenoise {
     /// Fetches the latest kind 10000 mute list from relays, decrypts the
     /// private section, and replaces the local cache.
     #[perf_instrument("mute_list")]
-    pub async fn sync_mute_list(&self, account: &Account) -> Result<()> {
+    pub(crate) async fn sync_mute_list(&self, account: &Account) -> Result<()> {
         let signer = self.get_signer_for_account(account)?;
         let relay_urls = self.account_relay_urls(account).await;
 

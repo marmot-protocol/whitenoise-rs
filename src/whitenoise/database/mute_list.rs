@@ -54,7 +54,6 @@ where
 /// Public mute list entry exposed to consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MuteListEntry {
-    pub id: Option<i64>,
     pub account_pubkey: PublicKey,
     pub muted_pubkey: PublicKey,
     pub is_private: bool,
@@ -64,7 +63,6 @@ pub struct MuteListEntry {
 impl From<MuteListRow> for MuteListEntry {
     fn from(row: MuteListRow) -> Self {
         Self {
-            id: Some(row.id),
             account_pubkey: row.account_pubkey,
             muted_pubkey: row.muted_pubkey,
             is_private: row.is_private,
@@ -84,11 +82,12 @@ impl MuteListEntry {
     ) -> std::result::Result<(), DatabaseError> {
         sqlx::query(
             "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
-             VALUES (?, ?, ?, strftime('%s', 'now') * 1000)",
+             VALUES (?, ?, ?, ?)",
         )
         .bind(account_pubkey.to_hex())
         .bind(muted_pubkey.to_hex())
         .bind(i64::from(is_private))
+        .bind(Utc::now().timestamp_millis())
         .execute(&db.pool)
         .await?;
         Ok(())
@@ -165,11 +164,12 @@ impl MuteListEntry {
         for (muted_pubkey, is_private) in entries {
             sqlx::query(
                 "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)
-                 VALUES (?, ?, ?, strftime('%s', 'now') * 1000)",
+                 VALUES (?, ?, ?, ?)",
             )
             .bind(account_pubkey.to_hex())
             .bind(muted_pubkey.to_hex())
             .bind(i64::from(*is_private))
+            .bind(Utc::now().timestamp_millis())
             .execute(&mut *txn)
             .await?;
         }
