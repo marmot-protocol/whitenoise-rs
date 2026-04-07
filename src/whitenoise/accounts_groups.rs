@@ -393,7 +393,7 @@ impl Whitenoise {
             .await
         {
             tracing::warn!(
-                target: "whitenoise::account_groups",
+                target: "whitenoise::accounts_groups",
                 account = %account.pubkey.to_hex(),
                 group = %hex::encode(mls_group_id.as_slice()),
                 error = %error,
@@ -422,7 +422,7 @@ impl Whitenoise {
             .await
         {
             tracing::warn!(
-                target: "whitenoise::account_groups",
+                target: "whitenoise::accounts_groups",
                 account = %account.pubkey.to_hex(),
                 group = %hex::encode(mls_group_id.as_slice()),
                 error = %error,

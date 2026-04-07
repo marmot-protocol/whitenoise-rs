@@ -866,7 +866,17 @@ impl Whitenoise {
         }
         match AccountGroup::get(self, &account.pubkey, group_id).await {
             Ok(Some(ag)) => ag.is_accepted() && !ag.is_removed(),
-            _ => false,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %error,
+                    "Failed to check push gossip eligibility; treating as ineligible"
+                );
+                false
+            }
         }
     }
 
@@ -1105,15 +1115,21 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let group = mdk.get_group(group_id)?;
-        if group.is_none()
-            || group
-                .as_ref()
-                .is_some_and(|g| g.state != GroupState::Active)
-        {
-            // Nothing to remove if the group is not active.
-            self.sync_local_group_push_token_cache(account, group_id, None)
-                .await?;
+        let group_state = mdk
+            .get_group(group_id)?
+            .map(|g| g.state)
+            .unwrap_or(GroupState::Inactive);
+
+        if group_state != GroupState::Active {
+            // Group is missing or inactive — clear any stale cache rows directly
+            // since own_leaf_index() is unavailable without an active MLS group.
+            GroupPushToken::delete_by_member_pubkey(
+                &account.pubkey,
+                group_id,
+                &account.pubkey,
+                &self.database,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -1348,9 +1364,10 @@ mod tests {
         ephemeral::{EphemeralPlane, EphemeralPlaneConfig},
         sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy},
     };
+    use crate::whitenoise::group_information::GroupType;
     use crate::whitenoise::test_utils::{
-        count_published_events_for_account, create_mock_whitenoise, setup_multiple_test_accounts,
-        setup_two_member_group_with_accepted_account_groups,
+        count_published_events_for_account, create_mock_whitenoise, create_nostr_group_config_data,
+        setup_multiple_test_accounts, setup_two_member_group_with_accepted_account_groups,
         setup_two_member_group_with_welcome_finalization, wait_for_exact_published_event_count,
         wait_for_key_package_publication, wait_for_published_event_count,
     };
@@ -2998,9 +3015,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_creation_shares_creator_push_token() {
-        use crate::whitenoise::group_information::GroupType;
-        use crate::whitenoise::test_utils::create_nostr_group_config_data;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
