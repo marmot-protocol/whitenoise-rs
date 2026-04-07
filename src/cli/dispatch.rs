@@ -1702,6 +1702,7 @@ async fn search_messages(
             let mut msg = format_chat_message(&r.message, &display_names)?;
             msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans)
                 .unwrap_or(serde_json::Value::Array(vec![]));
+            msg["position"] = serde_json::Value::Number(r.position.into());
             Some(msg)
         })
         .collect();

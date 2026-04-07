@@ -34,6 +34,9 @@ struct AggregatedMessageRow {
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
     pub delivery_status: Option<DeliveryStatus>,
+    /// Position of this message within the group (0 = newest).
+    /// Only populated by search queries that include a ROW_NUMBER window.
+    pub position: Option<i64>,
 }
 
 impl<'r, R> sqlx::FromRow<'r, R> for AggregatedMessageRow
@@ -143,6 +146,14 @@ where
                 Err(e) => return Err(e),
             };
 
+        // Optional position column — only present in search queries that use
+        // a ROW_NUMBER window function.
+        let position: Option<i64> = match row.try_get::<Option<i64>, _>("position") {
+            Ok(v) => v,
+            Err(sqlx::Error::ColumnNotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
         Ok(Self {
             id,
             message_id,
@@ -158,6 +169,7 @@ where
             reactions,
             media_attachments,
             delivery_status,
+            position,
         })
     }
 }
@@ -443,6 +455,18 @@ impl AggregatedMessage {
     /// Each returned [`SearchResult`] includes the matched [`ChatMessage`] and
     /// `highlight_spans`: char-index `[start, end]` pairs for each query token in the
     /// order they appear in the message content, ready for frontend highlighting.
+    ///
+    /// # Performance
+    ///
+    /// `position` is computed via `ROW_NUMBER()` over the entire group (O(group_size))
+    /// because it must reflect the absolute offset in the full message ordering — the
+    /// LIKE filter cannot be pushed inside the window without changing position semantics.
+    /// The window intentionally includes deleted tombstones so that positions match the
+    /// pagination ordering used by `find_messages_by_group_paginated`; the
+    /// `deletion_event_id IS NULL` filter is applied in the outer SELECT instead.
+    /// Migration 0043 adds a covering index on
+    /// `(kind, mls_group_id, deletion_event_id, created_at DESC, message_id DESC)`
+    /// so the window scan uses an index walk instead of a temp B-tree sort.
     pub async fn search_messages_in_group(
         group_id: &GroupId,
         query: &str,
@@ -453,17 +477,22 @@ impl AggregatedMessage {
         let like_pattern = super::content_search::query_to_like_pattern(query);
 
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT am.*, mds.status AS delivery_status
-             FROM aggregated_messages am
-             LEFT JOIN message_delivery_status mds
-               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
-             WHERE am.kind = 9
-               AND am.mls_group_id = ?
-               AND am.deletion_event_id IS NULL
-               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-               AND am.content_normalized LIKE ?
-             ORDER BY am.created_at DESC
-             LIMIT ?",
+            "WITH ranked AS (
+               SELECT am.*,
+                      mds.status AS delivery_status,
+                      (ROW_NUMBER() OVER (ORDER BY am.created_at DESC, am.message_id DESC)) - 1 AS position
+               FROM aggregated_messages am
+               LEFT JOIN message_delivery_status mds
+                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               WHERE am.kind = 9
+                 AND am.mls_group_id = ?1
+                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             )
+             SELECT * FROM ranked
+             WHERE deletion_event_id IS NULL
+               AND content_normalized LIKE ?2
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT ?3",
         )
         .bind(group_id.as_slice())
         .bind(&like_pattern)
@@ -473,12 +502,23 @@ impl AggregatedMessage {
 
         rows.into_iter()
             .map(|row| {
+                let position_i64 =
+                    row.position
+                        .ok_or_else(|| DatabaseError::MissingSearchPosition {
+                            message_id: row.message_id.to_string(),
+                        })?;
+                let position = u64::try_from(position_i64).map_err(|_| {
+                    DatabaseError::MissingSearchPosition {
+                        message_id: row.message_id.to_string(),
+                    }
+                })?;
                 let message = Self::row_to_chat_message(row)?;
                 let highlight_spans =
                     super::content_search::find_highlight_spans(&message.content, query);
                 Ok(SearchResult {
                     message,
                     highlight_spans,
+                    position,
                 })
             })
             .collect()
@@ -3683,6 +3723,8 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message.content, "hello world");
+        // Position 5 = oldest of 6 messages (0-indexed, newest-first)
+        assert_eq!(results[0].position, 5);
 
         // Forward-order multi-word search
         let results = AggregatedMessage::search_messages_in_group(
@@ -3698,6 +3740,8 @@ mod tests {
             results[0].message.content,
             "our big plans are bigger than you imagine"
         );
+        // Message 3 (timestamp 3) is the 4th oldest → position 3 in DESC order
+        assert_eq!(results[0].position, 3);
 
         // Substring matching ("big" matches "bigger")
         let results =
@@ -3764,12 +3808,14 @@ mod tests {
         .unwrap();
         assert!(results.is_empty());
 
-        // Empty query matches all
+        // Empty query matches all — positions are sequential newest-first
         let results =
             AggregatedMessage::search_messages_in_group(&group_id, "", 50, &whitenoise.database)
                 .await
                 .unwrap();
         assert_eq!(results.len(), 6);
+        let positions: Vec<u64> = results.iter().map(|r| r.position).collect();
+        assert_eq!(positions, vec![0, 1, 2, 3, 4, 5]);
 
         // Limit is respected
         let results =
@@ -3777,5 +3823,69 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    /// Regression test: when multiple messages share the same `created_at`,
+    /// results and positions must be deterministic (ordered by `message_id DESC`).
+    #[tokio::test]
+    async fn test_search_same_timestamp_deterministic_ordering() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[99; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let same_ts = Timestamp::from(1_700_000_000u64);
+
+        // Three messages with the same timestamp but different IDs.
+        // message_id ordering (hex): "cc" > "bb" > "aa"
+        // So DESC order is: cc, bb, aa → positions 0, 1, 2
+        let ids_and_content = vec![
+            (format!("{:0>64}", "aa"), "alpha same-ts"),
+            (format!("{:0>64}", "bb"), "beta same-ts"),
+            (format!("{:0>64}", "cc"), "gamma same-ts"),
+        ];
+
+        for (id, content) in &ids_and_content {
+            let msg = ChatMessage {
+                id: id.clone(),
+                author,
+                content: content.to_string(),
+                created_at: same_ts,
+                tags: Tags::new(),
+                is_reply: false,
+                reply_to_id: None,
+                is_deleted: false,
+                content_tokens: vec![],
+                reactions: ReactionSummary::default(),
+                kind: 9,
+                media_attachments: vec![],
+                delivery_status: None,
+            };
+            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // Search for all three: "same-ts" matches every message
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "same-ts",
+            50,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 3);
+
+        // Returned order must be message_id DESC: cc, bb, aa
+        assert_eq!(results[0].message.content, "gamma same-ts");
+        assert_eq!(results[1].message.content, "beta same-ts");
+        assert_eq!(results[2].message.content, "alpha same-ts");
+
+        // Positions must be sequential from the window function
+        assert_eq!(results[0].position, 0);
+        assert_eq!(results[1].position, 1);
+        assert_eq!(results[2].position, 2);
     }
 }

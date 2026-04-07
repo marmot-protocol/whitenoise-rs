@@ -53,6 +53,8 @@ pub enum DatabaseError {
     InvalidCursor { reason: &'static str },
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("Search query did not return a position column for message {message_id}")]
+    MissingSearchPosition { message_id: String },
 }
 
 impl DatabaseError {
