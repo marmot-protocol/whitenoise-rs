@@ -1,5 +1,6 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 
@@ -101,8 +102,7 @@ impl TestCase for SendMessageWithMediaTestCase {
                     .fetch_aggregated_messages_for_group(
                         &sender_account.pubkey,
                         &group.mls_group_id,
-                        None,
-                        None,
+                        &PaginationOptions::default(),
                         None,
                     )
                     .await?;

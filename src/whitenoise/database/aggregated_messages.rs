@@ -18,6 +18,29 @@ use crate::whitenoise::{
 
 type Result<T> = std::result::Result<T, DatabaseError>;
 
+/// Options for cursor-based pagination of messages.
+///
+/// Supports two directions:
+/// - **Before** (scroll up / older): set `before` + `before_message_id`
+/// - **After** (scroll down / newer): set `after` + `after_message_id`
+///
+/// Each pair must be provided together or both `None`.
+/// Specifying both `before` and `after` at the same time is an error.
+/// When all fields are `None` the newest page is returned.
+#[derive(Debug, Default, Clone)]
+pub struct PaginationOptions {
+    /// Upper-bound cursor timestamp (Unix seconds). Messages **older** than
+    /// this timestamp are returned.
+    pub before: Option<Timestamp>,
+    /// Upper-bound cursor message ID (64-char hex). Required when `before` is set.
+    pub before_message_id: Option<String>,
+    /// Lower-bound cursor timestamp (Unix seconds). Messages **newer** than
+    /// this timestamp are returned.
+    pub after: Option<Timestamp>,
+    /// Lower-bound cursor message ID (64-char hex). Required when `after` is set.
+    pub after_message_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct AggregatedMessageRow {
     pub id: i64,
@@ -189,6 +212,12 @@ impl AggregatedMessageRow {
     }
 }
 
+/// Direction of cursor-based pagination.
+enum Direction {
+    Before,
+    After,
+}
+
 impl AggregatedMessage {
     const DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS: [u64; 3] = [25, 50, 100];
 
@@ -256,106 +285,160 @@ impl AggregatedMessage {
     ///
     /// # Pagination protocol
     ///
-    /// * Initial load: pass `before = None`, `before_message_id = None`.
-    /// * Subsequent pages: pass the `created_at` **and** `id` of the *oldest* message
-    ///   in the current page as `before` and `before_message_id` respectively.
+    /// * Initial load: pass default `PaginationOptions` (all `None`).
+    /// * Older pages (scroll up): set `before` + `before_message_id` to the
+    ///   `created_at` and `id` of the *oldest* message in the current page.
+    /// * Newer pages (scroll down): set `after` + `after_message_id` to the
+    ///   `created_at` and `id` of the *newest* message in the current page.
     ///
-    /// Both cursor fields must be provided together.  Supplying only one half returns
-    /// `Err(DatabaseError::InvalidCursor)`.
+    /// Each cursor pair must be provided together.  Supplying only one half, or
+    /// specifying both `before` and `after`, returns `Err(DatabaseError::InvalidCursor)`.
     ///
     /// # Arguments
-    /// * `group_id`          – the MLS group to query
-    /// * `database`          – database handle
-    /// * `before`            – cursor timestamp (Unix seconds); `None` means no upper bound
-    /// * `before_message_id` – cursor message ID (hex); must be `Some` when `before` is `Some`
-    /// * `limit`             – maximum rows to return (default 50, capped at 200)
+    /// * `group_id`   – the MLS group to query
+    /// * `database`   – database handle
+    /// * `options`    – pagination cursor and direction
+    /// * `limit`      – maximum rows to return (default 50, capped at 200)
     ///
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group_paginated(
         group_id: &GroupId,
         database: &Database,
-        before: Option<Timestamp>,
-        before_message_id: Option<&str>,
+        options: &PaginationOptions,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         // Clamp limit: default 50, max 200.
         let limit_val = i64::from(limit.unwrap_or(50).min(200));
 
-        // Validate and resolve the compound before-cursor.
+        // Reject specifying both directions at the same time.
+        let has_before = options.before.is_some() || options.before_message_id.is_some();
+        let has_after = options.after.is_some() || options.after_message_id.is_some();
+        if has_before && has_after {
+            return Err(DatabaseError::InvalidCursor {
+                reason: "cannot specify both before and after cursors at the same time",
+            });
+        }
+
+        // Determine which direction we're paginating.
+        let direction = if has_after {
+            Direction::After
+        } else {
+            Direction::Before
+        };
+
+        // Validate and resolve the compound cursor.
         //
-        // Both fields must be present together or both absent.  A half-specified cursor
-        // (one Some, one None) is rejected immediately rather than falling back to lossy
-        // single-field logic that silently skips messages at a tied timestamp.
+        // Both fields in a pair must be present together or both absent.  A half-specified
+        // cursor is rejected immediately rather than falling back to lossy single-field
+        // logic that silently skips messages at a tied timestamp.
         //
         // The DB stores created_at as Unix milliseconds (i64); Timestamp is Unix seconds,
-        // so we multiply by 1000.  When the cursor is absent we use i64::MAX as a sentinel
-        // so that `created_at < MAX` is unconditionally true and the single query branch
-        // still uses the covering index.
-        let (before_ms, before_id_str): (i64, String) = match (before, before_message_id) {
-            // No cursor: use i64::MAX so `created_at < MAX` is unconditionally true for every
-            // real timestamp, returning the newest page without a cursor filter.
-            //
-            // The SQL predicate is:
-            //   AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
-            //
-            // With before_ms = i64::MAX and before_id_str = "", the second conjunct becomes
-            // `am.message_id < ''`, which is always false because no hex string is
-            // lexicographically less than the empty string in SQLite.  That is intentional:
-            // the first OR branch (`created_at < i64::MAX`) already matches every row whose
-            // timestamp is a realistic value, so the second conjunct is unreachable and its
-            // falseness is harmless.  Both bind slots must still be filled to satisfy sqlx's
-            // parameter count, hence the empty string placeholder.
-            (None, None) => (i64::MAX, String::new()),
-            (Some(ts), Some(id)) => {
-                // Canonicalize to lowercase hex so the lexicographic tie-break comparison
-                // against stored message_ids (always lowercase) is stable regardless of the
-                // case the caller used.  An invalid or wrong-length ID is rejected here
-                // rather than silently producing an incorrect page boundary.
-                let canonical = EventId::from_hex(id).map(|eid| eid.to_hex()).map_err(|_| {
-                    DatabaseError::InvalidCursor {
-                        reason: "before_message_id is not a valid 64-character hex event ID",
+        // so we multiply by 1000.
+        let (cursor_ms, cursor_id_str): (i64, String) = match direction {
+            Direction::Before => {
+                match (options.before, options.before_message_id.as_deref()) {
+                    // No cursor: use i64::MAX so `created_at < MAX` is unconditionally true
+                    // for every real timestamp, returning the newest page.
+                    (None, None) => (i64::MAX, String::new()),
+                    (Some(ts), Some(id)) => {
+                        let canonical =
+                            EventId::from_hex(id).map(|eid| eid.to_hex()).map_err(|_| {
+                                DatabaseError::InvalidCursor {
+                                    reason:
+                                        "before_message_id is not a valid 64-character hex event ID",
+                                }
+                            })?;
+                        ((ts.as_secs() as i64).saturating_mul(1_000), canonical)
                     }
-                })?;
-                ((ts.as_secs() as i64).saturating_mul(1_000), canonical)
+                    (Some(_), None) => {
+                        return Err(DatabaseError::InvalidCursor {
+                            reason: "before_message_id is required when before is provided",
+                        });
+                    }
+                    (None, Some(_)) => {
+                        return Err(DatabaseError::InvalidCursor {
+                            reason: "before is required when before_message_id is provided",
+                        });
+                    }
+                }
             }
-            (Some(_), None) => {
-                return Err(DatabaseError::InvalidCursor {
-                    reason: "before_message_id is required when before is provided",
-                });
+            Direction::After => match (options.after, options.after_message_id.as_deref()) {
+                (None, None) => unreachable!("has_after is true but both fields are None"),
+                (Some(ts), Some(id)) => {
+                    let canonical =
+                        EventId::from_hex(id).map(|eid| eid.to_hex()).map_err(|_| {
+                            DatabaseError::InvalidCursor {
+                                reason: "after_message_id is not a valid 64-character hex event ID",
+                            }
+                        })?;
+                    ((ts.as_secs() as i64).saturating_mul(1_000), canonical)
+                }
+                (Some(_), None) => {
+                    return Err(DatabaseError::InvalidCursor {
+                        reason: "after_message_id is required when after is provided",
+                    });
+                }
+                (None, Some(_)) => {
+                    return Err(DatabaseError::InvalidCursor {
+                        reason: "after is required when after_message_id is provided",
+                    });
+                }
+            },
+        };
+
+        let rows: Vec<AggregatedMessageRow> = match direction {
+            Direction::Before => {
+                sqlx::query_as(
+                    "SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at DESC, am.message_id DESC
+                     LIMIT ?",
+                )
+                .bind(group_id.as_slice())
+                .bind(cursor_ms)
+                .bind(cursor_ms)
+                .bind(&cursor_id_str)
+                .bind(limit_val)
+                .fetch_all(&database.pool)
+                .await?
             }
-            (None, Some(_)) => {
-                return Err(DatabaseError::InvalidCursor {
-                    reason: "before is required when before_message_id is provided",
-                });
+            Direction::After => {
+                sqlx::query_as(
+                    "SELECT am.*, mds.status AS delivery_status
+                     FROM aggregated_messages am
+                     LEFT JOIN message_delivery_status mds
+                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                     WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND (am.created_at > ? OR (am.created_at = ? AND am.message_id > ?))
+                       AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+                     ORDER BY am.created_at ASC, am.message_id ASC
+                     LIMIT ?",
+                )
+                .bind(group_id.as_slice())
+                .bind(cursor_ms)
+                .bind(cursor_ms)
+                .bind(&cursor_id_str)
+                .bind(limit_val)
+                .fetch_all(&database.pool)
+                .await?
             }
         };
 
-        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
-            "SELECT am.*, mds.status AS delivery_status
-             FROM aggregated_messages am
-             LEFT JOIN message_delivery_status mds
-               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
-             WHERE am.kind = 9 AND am.mls_group_id = ?
-               AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
-               AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-             ORDER BY am.created_at DESC, am.message_id DESC
-             LIMIT ?",
-        )
-        .bind(group_id.as_slice())
-        .bind(before_ms)
-        .bind(before_ms)
-        .bind(before_id_str)
-        .bind(limit_val)
-        .fetch_all(&database.pool)
-        .await?;
-
-        // Rows arrive newest-first (DESC, DESC); reverse to restore oldest-first for callers.
+        // For "before" direction, rows arrive newest-first (DESC); reverse to oldest-first.
+        // For "after" direction, rows already arrive oldest-first (ASC).
         let mut messages: Vec<ChatMessage> = rows
             .into_iter()
             .map(Self::row_to_chat_message)
             .collect::<Result<Vec<_>>>()?;
-        messages.reverse();
+        if matches!(direction, Direction::Before) {
+            messages.reverse();
+        }
         Ok(messages)
     }
 
@@ -2652,8 +2735,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -2682,12 +2764,11 @@ mod tests {
             .await;
         }
 
-        // Default (None, None) should return the 50 newest
+        // Default (no cursor) should return the 50 newest
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -2744,8 +2825,11 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor_ts),
-            Some(cursor_id.as_str()),
+            &PaginationOptions {
+                before: Some(cursor_ts),
+                before_message_id: Some(cursor_id.clone()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -2783,8 +2867,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             Some(3),
         )
         .await
@@ -2828,8 +2911,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             Some(u32::MAX),
         )
         .await
@@ -2863,8 +2945,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             Some(5),
         )
         .await
@@ -2877,8 +2958,11 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor_ts),
-            Some(cursor_id),
+            &PaginationOptions {
+                before: Some(cursor_ts),
+                before_message_id: Some(cursor_id.to_string()),
+                ..Default::default()
+            },
             Some(5),
         )
         .await
@@ -2901,8 +2985,11 @@ mod tests {
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(cursor_ts2),
-            Some(cursor_id2),
+            &PaginationOptions {
+                before: Some(cursor_ts2),
+                before_message_id: Some(cursor_id2.to_string()),
+                ..Default::default()
+            },
             Some(5),
         )
         .await
@@ -2939,8 +3026,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             Some(3),
         )
         .await
@@ -2953,8 +3039,11 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(c1_ts),
-            Some(c1_id.as_str()),
+            &PaginationOptions {
+                before: Some(c1_ts),
+                before_message_id: Some(c1_id.clone()),
+                ..Default::default()
+            },
             Some(3),
         )
         .await
@@ -2967,8 +3056,11 @@ mod tests {
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(c2_ts),
-            Some(c2_id.as_str()),
+            &PaginationOptions {
+                before: Some(c2_ts),
+                before_message_id: Some(c2_id.clone()),
+                ..Default::default()
+            },
             Some(3),
         )
         .await
@@ -2985,8 +3077,11 @@ mod tests {
         let page4 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(c3_ts),
-            Some(c3_id.as_str()),
+            &PaginationOptions {
+                before: Some(c3_ts),
+                before_message_id: Some(c3_id.clone()),
+                ..Default::default()
+            },
             Some(3),
         )
         .await
@@ -3031,8 +3126,10 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(ts),
-            None,
+            &PaginationOptions {
+                before: Some(ts),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3046,8 +3143,12 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            Some("0000000000000000000000000000000000000000000000000000000000000001"),
+            &PaginationOptions {
+                before_message_id: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                ),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3068,8 +3169,11 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(ts),
-            Some("not-valid-hex-at-all"),
+            &PaginationOptions {
+                before: Some(ts),
+                before_message_id: Some("not-valid-hex-at-all".to_string()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3083,8 +3187,11 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(ts),
-            Some("00000000000000000000000000000001"),
+            &PaginationOptions {
+                before: Some(ts),
+                before_message_id: Some("00000000000000000000000000000001".to_string()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3092,6 +3199,306 @@ mod tests {
         assert!(
             matches!(err, DatabaseError::InvalidCursor { .. }),
             "expected InvalidCursor for short hex id, got: {err}"
+        );
+    }
+
+    // ── "After" cursor (forward pagination) tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_returns_only_newer_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[220; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_000_000;
+
+        // Insert 5 messages: ts+1 … ts+5
+        for i in 1u8..=5 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Cursor at ts+2 (seed 2): should return only messages with created_at > ts+2 → ts+3, ts+4, ts+5.
+        let cursor_ts = Timestamp::from(base_ts + 2);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 2u8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "should return 3 messages after the cursor"
+        );
+        assert_eq!(messages[0].created_at, Timestamp::from(base_ts + 3));
+        assert_eq!(messages[1].created_at, Timestamp::from(base_ts + 4));
+        assert_eq!(messages[2].created_at, Timestamp::from(base_ts + 5));
+    }
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_returns_oldest_first() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[221; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_100_000;
+
+        for i in 1u8..=10 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Cursor at ts+3: should return ts+4 … ts+10 in ascending order
+        let cursor_ts = Timestamp::from(base_ts + 3);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(messages.len(), 7);
+        for w in messages.windows(2) {
+            assert!(
+                w[0].created_at < w[1].created_at
+                    || (w[0].created_at == w[1].created_at && w[0].id < w[1].id),
+                "after-cursor results must be ordered (created_at, id) ascending"
+            );
+        }
+    }
+
+    /// Forward-paginating through tied timestamps must not skip or duplicate messages.
+    #[tokio::test]
+    async fn test_paginated_after_cursor_tied_timestamps() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[222; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let tie_ts: u64 = 1_710_200_000;
+
+        // Insert one message before the tie, six at tie_ts, one after
+        insert_message_at(7, author, tie_ts - 1, &group_id, &whitenoise.database).await;
+        for i in 1u8..=6 {
+            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.database).await;
+        }
+        insert_message_at(8, author, tie_ts + 1, &group_id, &whitenoise.database).await;
+
+        // Use the earliest message (seed 7, ts-1) as the after cursor
+        let cursor_ts = Timestamp::from(tie_ts - 1);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 7u8));
+
+        // Page through with limit 3
+        let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.clone()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page1.len(), 3, "page 1 should have 3 messages");
+
+        let c1_ts = page1.last().unwrap().created_at;
+        let c1_id = page1.last().unwrap().id.clone();
+        let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(c1_ts),
+                after_message_id: Some(c1_id.clone()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page2.len(), 3, "page 2 should have 3 messages");
+
+        let c2_ts = page2.last().unwrap().created_at;
+        let c2_id = page2.last().unwrap().id.clone();
+        let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(c2_ts),
+                after_message_id: Some(c2_id.clone()),
+                ..Default::default()
+            },
+            Some(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page3.len(), 1, "page 3 should have the remaining 1 message");
+
+        // No duplicates, no gaps: exactly 7 unique messages after the cursor
+        let all_ids: std::collections::HashSet<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .chain(page3.iter())
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(
+            all_ids.len(),
+            7,
+            "all 7 messages after cursor must be returned exactly once"
+        );
+
+        // Verify ascending order within each page
+        for (page_num, page) in [&page1, &page2, &page3].iter().enumerate() {
+            for w in page.windows(2) {
+                assert!(
+                    w[0].created_at < w[1].created_at
+                        || (w[0].created_at == w[1].created_at && w[0].id < w[1].id),
+                    "page {} must be ordered (created_at, id) ascending",
+                    page_num + 1
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paginated_both_before_and_after_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[223; 32]);
+        let ts = Timestamp::from(1_710_300_000u64);
+        let id = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                before: Some(ts),
+                before_message_id: Some(id.to_string()),
+                after: Some(ts),
+                after_message_id: Some(id.to_string()),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor when both before and after are specified, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginated_half_specified_after_cursor_is_rejected() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[224; 32]);
+        let ts = Timestamp::from(1_710_400_000u64);
+
+        // after=Some, after_message_id=None → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(ts),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
+
+        // after=None, after_message_id=Some → InvalidCursor
+        let err = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after_message_id: Some(
+                    "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+                ),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, DatabaseError::InvalidCursor { .. }),
+            "expected InvalidCursor, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginated_after_cursor_past_newest_returns_empty() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[225; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_710_500_000;
+
+        for i in 1u8..=3 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // Cursor beyond all messages
+        let cursor_ts = Timestamp::from(base_ts + 100);
+        let cursor_id = format!("{:0>64}", format!("{:x}", 0xffu8));
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions {
+                after: Some(cursor_ts),
+                after_message_id: Some(cursor_id.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            messages.is_empty(),
+            "cursor past newest message should yield empty page"
         );
     }
 
@@ -3134,8 +3541,7 @@ mod tests {
         let results_a = AggregatedMessage::find_messages_by_group_paginated(
             &group_a,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3143,8 +3549,7 @@ mod tests {
         let results_b = AggregatedMessage::find_messages_by_group_paginated(
             &group_b,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3195,8 +3600,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3318,8 +3722,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3370,8 +3773,11 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(Timestamp::from(base_ts + 3)),
-            Some(uppercase_id.as_str()),
+            &PaginationOptions {
+                before: Some(Timestamp::from(base_ts + 3)),
+                before_message_id: Some(uppercase_id.clone()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3403,8 +3809,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3420,8 +3825,11 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(page1[0].created_at),
-            Some(page1[0].id.as_str()),
+            &PaginationOptions {
+                before: Some(page1[0].created_at),
+                before_message_id: Some(page1[0].id.clone()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3457,8 +3865,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3473,8 +3880,11 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(page1[0].created_at),
-            Some(page1[0].id.as_str()),
+            &PaginationOptions {
+                before: Some(page1[0].created_at),
+                before_message_id: Some(page1[0].id.clone()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3512,16 +3922,19 @@ mod tests {
         let mut cursor: Option<(Timestamp, String)> = None;
 
         loop {
-            let (before, before_id) = match &cursor {
-                None => (None, None),
-                Some((ts, id)) => (Some(*ts), Some(id.as_str())),
+            let opts = match &cursor {
+                None => PaginationOptions::default(),
+                Some((ts, id)) => PaginationOptions {
+                    before: Some(*ts),
+                    before_message_id: Some(id.clone()),
+                    ..Default::default()
+                },
             };
 
             let page = AggregatedMessage::find_messages_by_group_paginated(
                 &group_id,
                 &whitenoise.database,
-                before,
-                before_id,
+                &opts,
                 Some(1),
             )
             .await
@@ -3580,8 +3993,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await
@@ -3593,8 +4005,11 @@ mod tests {
         let next_page = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            Some(oldest.created_at),
-            Some(oldest.id.as_str()),
+            &PaginationOptions {
+                before: Some(oldest.created_at),
+                before_message_id: Some(oldest.id.clone()),
+                ..Default::default()
+            },
             None,
         )
         .await
@@ -3643,8 +4058,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &whitenoise.database,
-            None,
-            None,
+            &PaginationOptions::default(),
             None,
         )
         .await

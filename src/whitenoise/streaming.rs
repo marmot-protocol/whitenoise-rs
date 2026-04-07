@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{
@@ -51,8 +52,7 @@ impl Whitenoise {
             aggregated_message::AggregatedMessage::find_messages_by_group_paginated(
                 group_id,
                 &self.database,
-                None, // no before-cursor → newest page
-                None,
+                &PaginationOptions::default(),
                 limit,
             )
             .await

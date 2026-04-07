@@ -8,6 +8,7 @@ use crate::Whitenoise;
 use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::KeyPackageStatus;
 
@@ -405,13 +406,17 @@ pub async fn dispatch(req: Request) -> Response {
             group_id,
             before,
             before_message_id,
+            after,
+            after_message_id,
             limit,
         } => match list_messages(
             wn,
             &account,
             &group_id,
             before,
-            before_message_id.as_deref(),
+            before_message_id,
+            after,
+            after_message_id,
             limit,
         )
         .await
@@ -1650,20 +1655,23 @@ async fn list_messages(
     account_str: &str,
     group_id_hex: &str,
     before: Option<u64>,
-    before_message_id: Option<&str>,
+    before_message_id: Option<String>,
+    after: Option<u64>,
+    after_message_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let before_ts = before.map(Timestamp::from);
+    let after_ts = after.map(Timestamp::from);
+    let options = PaginationOptions {
+        before: before_ts,
+        before_message_id,
+        after: after_ts,
+        after_message_id,
+    };
     let messages = wn
-        .fetch_aggregated_messages_for_group(
-            &account.pubkey,
-            &group_id,
-            before_ts,
-            before_message_id,
-            limit,
-        )
+        .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, &options, limit)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

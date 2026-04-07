@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::WhitenoiseError;
 use crate::integration_tests::benchmarks::BenchmarkTestCase;
 use crate::integration_tests::core::ScenarioContext;
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
 /// Benchmark test case for measuring fetch_aggregated_messages_for_group performance
 pub struct FetchAggregatedMessagesBenchmark {
@@ -38,8 +39,7 @@ impl BenchmarkTestCase for FetchAggregatedMessagesBenchmark {
             .fetch_aggregated_messages_for_group(
                 &account.pubkey,
                 &group.mls_group_id,
-                None,
-                None,
+                &PaginationOptions::default(),
                 None,
             )
             .await?;

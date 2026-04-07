@@ -1,5 +1,6 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use async_trait::async_trait;
 
 /// Test case to verify that after deleting a reaction, the parent message
@@ -51,8 +52,7 @@ impl TestCase for VerifyReactionDeletionTestCase {
                     .fetch_aggregated_messages_for_group(
                         &account.pubkey,
                         &group.mls_group_id,
-                        None,
-                        None,
+                        &PaginationOptions::default(),
                         None,
                     )
                     .await?;

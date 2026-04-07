@@ -1,5 +1,6 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use async_trait::async_trait;
 
 pub struct AggregateMessagesTestCase {
@@ -47,8 +48,7 @@ impl TestCase for AggregateMessagesTestCase {
                     .fetch_aggregated_messages_for_group(
                         &account.pubkey,
                         &group.mls_group_id,
-                        None,
-                        None,
+                        &PaginationOptions::default(),
                         Some(fetch_limit),
                     )
                     .await?;
@@ -79,8 +79,7 @@ impl TestCase for AggregateMessagesTestCase {
                     .fetch_aggregated_messages_for_group(
                         &account.pubkey,
                         &group.mls_group_id,
-                        None,
-                        None,
+                        &PaginationOptions::default(),
                         Some(fetch_limit),
                     )
                     .await

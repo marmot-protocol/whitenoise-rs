@@ -26,6 +26,18 @@ pub enum MessagesCmd {
         #[arg(long)]
         before_message_id: Option<String>,
 
+        /// Cursor timestamp: Unix seconds taken from the `created_at` of the newest
+        /// message in the current page. Only messages strictly after this timestamp
+        /// (or at the same second with a larger ID) are returned.
+        #[arg(long)]
+        after: Option<u64>,
+
+        /// Companion cursor ID: the `id` field of the same newest message used for
+        /// `--after`. Ensures deterministic ordering when multiple messages share
+        /// the same second.
+        #[arg(long)]
+        after_message_id: Option<String>,
+
         /// Maximum number of messages to return (default: 50, max: 200)
         #[arg(long)]
         limit: Option<u32>,
@@ -121,6 +133,8 @@ impl MessagesCmd {
                 group_id,
                 before,
                 before_message_id,
+                after,
+                after_message_id,
                 limit,
             } => {
                 list(
@@ -130,6 +144,8 @@ impl MessagesCmd {
                     group_id,
                     before,
                     before_message_id,
+                    after,
+                    after_message_id,
                     limit,
                 )
                 .await
@@ -167,6 +183,7 @@ impl MessagesCmd {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn list(
     socket: &Path,
     json: bool,
@@ -174,6 +191,8 @@ async fn list(
     group_id: String,
     before: Option<u64>,
     before_message_id: Option<String>,
+    after: Option<u64>,
+    after_message_id: Option<String>,
     limit: Option<u32>,
 ) -> anyhow::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
@@ -184,6 +203,8 @@ async fn list(
             group_id,
             before,
             before_message_id,
+            after,
+            after_message_id,
             limit,
         },
     )
