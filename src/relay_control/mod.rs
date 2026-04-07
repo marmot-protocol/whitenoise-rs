@@ -272,7 +272,6 @@ impl RelayControlPlane {
         &self,
         account_pubkey: PublicKey,
         inbox_relays: &[RelayUrl],
-        nip65_relays: &[RelayUrl],
         group_specs: &[groups::GroupSubscriptionSpec],
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
@@ -286,19 +285,12 @@ impl RelayControlPlane {
             .await?;
 
         let plane = account_inbox::AccountInboxPlane::new(
-            account_inbox::AccountInboxPlaneConfig::new(
-                account_pubkey,
-                inbox_relays.to_vec(),
-                nip65_relays.to_vec(),
-            ),
+            account_inbox::AccountInboxPlaneConfig::new(account_pubkey, inbox_relays.to_vec()),
             self.event_sender.clone(),
             self.session_salt,
         );
 
-        if let Err(error) = plane
-            .activate(inbox_relays, nip65_relays, since, signer)
-            .await
-        {
+        if let Err(error) = plane.activate(inbox_relays, since, signer).await {
             plane.deactivate().await;
 
             if let Some(previous_group_specs) = previous_group_state {

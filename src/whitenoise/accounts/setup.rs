@@ -902,7 +902,6 @@ impl Whitenoise {
         );
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(inbox_relays);
-        let nip65_relays: Vec<RelayUrl> = self.account_relay_urls(account).await;
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
@@ -938,7 +937,6 @@ impl Whitenoise {
             self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
-                &nip65_relays,
                 &group_specs,
                 since,
                 signer,
@@ -982,7 +980,6 @@ impl Whitenoise {
         // Gather all inputs before touching existing subscriptions so that a
         // fallible data-fetch cannot leave the account with no active subs.
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
-        let nip65_relays: Vec<RelayUrl> = self.account_relay_urls(account).await;
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
@@ -1003,7 +1000,6 @@ impl Whitenoise {
             self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
-                &nip65_relays,
                 &group_specs,
                 since,
                 signer,

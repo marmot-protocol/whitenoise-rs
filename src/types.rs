@@ -160,9 +160,6 @@ pub struct AccountInboxPlanesStateSnapshot {
 pub struct AccountInboxPlaneStateSnapshot {
     pub account_pubkey: String,
     pub subscription_id: String,
-    /// Subscription ID for the mute list subscription, if NIP-65 relays are
-    /// configured for this account. `None` when no NIP-65 relays are available.
-    pub mute_list_subscription_id: Option<String>,
     pub relay_count: usize,
     pub session: RelaySessionStateSnapshot,
 }

@@ -2831,7 +2831,6 @@ mod tests {
                 .activate_account_subscriptions(
                     creator_account.pubkey,
                     &inbox_relays,
-                    &[], // no NIP-65 relays in test context
                     &[], // empty group specs — simulates the missing group
                     creator_account.since_timestamp(10),
                     signer,
