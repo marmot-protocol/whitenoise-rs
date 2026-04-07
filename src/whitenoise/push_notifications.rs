@@ -2339,7 +2339,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2394,7 +2394,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2545,7 +2545,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2631,13 +2631,13 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&first_member, &second_member]).await;
 
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &first_member,
         )
         .await;
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &second_member,
@@ -2686,7 +2686,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
