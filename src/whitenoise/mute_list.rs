@@ -17,17 +17,17 @@ impl Whitenoise {
     /// an updated NIP-51 kind 10000 event to relays.
     ///
     /// Fetches the latest mute list from relays first so that blocks made on
-    /// other devices are preserved (merge, not replace).
+    /// other devices are preserved (merge, not replace). The sync is required
+    /// — if it fails the operation is aborted so we never publish a stale list
+    /// that would silently wipe blocks added on other devices.
+    ///
+    /// If publishing fails the local insert is rolled back so the caller can
+    /// retry the full operation cleanly.
     #[perf_instrument("mute_list")]
     pub async fn block_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
-        if let Err(e) = self.sync_mute_list(account).await {
-            tracing::warn!(
-                target: "whitenoise::mute_list",
-                "Failed to sync mute list before blocking {}: {}",
-                target_pubkey,
-                e,
-            );
-        }
+        // Fail fast — proceeding with a stale local cache after a sync failure
+        // would publish {stale + new} and silently wipe remote-only blocks.
+        self.sync_mute_list(account).await?;
 
         if MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
             return Ok(());
@@ -36,12 +36,18 @@ impl Whitenoise {
         MuteListEntry::insert(&account.pubkey, target_pubkey, true, &self.database).await?;
 
         if let Err(e) = self.publish_mute_list(account).await {
-            tracing::warn!(
-                target: "whitenoise::mute_list",
-                "Failed to publish mute list after blocking {}: {}",
-                target_pubkey,
-                e,
-            );
+            // Roll back the local insert so a retry runs the full flow from scratch.
+            if let Err(rb_err) =
+                MuteListEntry::delete(&account.pubkey, target_pubkey, &self.database).await
+            {
+                tracing::warn!(
+                    target: "whitenoise::mute_list",
+                    "Failed to roll back local block insert for {}: {}",
+                    target_pubkey,
+                    rb_err,
+                );
+            }
+            return Err(e);
         }
 
         self.emit_block_changed(account, target_pubkey).await;
@@ -53,31 +59,47 @@ impl Whitenoise {
     /// publishing an updated NIP-51 kind 10000 event to relays.
     ///
     /// Fetches the latest mute list from relays first so that blocks made on
-    /// other devices are preserved (merge, not replace).
+    /// other devices are preserved (merge, not replace). The sync is required
+    /// — if it fails the operation is aborted so we never publish a stale list
+    /// that would silently wipe blocks added on other devices.
+    ///
+    /// If publishing fails the local delete is rolled back so the caller can
+    /// retry the full operation cleanly.
     #[perf_instrument("mute_list")]
     pub async fn unblock_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
         if !MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
             return Ok(());
         }
 
-        if let Err(e) = self.sync_mute_list(account).await {
-            tracing::warn!(
-                target: "whitenoise::mute_list",
-                "Failed to sync mute list before unblocking {}: {}",
-                target_pubkey,
-                e,
-            );
-        }
+        // Fail fast — same data-loss risk as block_user if we proceed with
+        // a stale cache after a failed sync.
+        self.sync_mute_list(account).await?;
+
+        // Capture is_private before deleting so the rollback re-inserts the
+        // entry exactly as it was.
+        let entries = MuteListEntry::find_by_account(&account.pubkey, &self.database).await?;
+        let is_private = entries
+            .iter()
+            .find(|e| e.muted_pubkey == *target_pubkey)
+            .map(|e| e.is_private)
+            .unwrap_or(true);
 
         MuteListEntry::delete(&account.pubkey, target_pubkey, &self.database).await?;
 
         if let Err(e) = self.publish_mute_list(account).await {
-            tracing::warn!(
-                target: "whitenoise::mute_list",
-                "Failed to publish mute list after unblocking {}: {}",
-                target_pubkey,
-                e,
-            );
+            // Roll back the local delete so a retry runs the full flow from scratch.
+            if let Err(rb_err) =
+                MuteListEntry::insert(&account.pubkey, target_pubkey, is_private, &self.database)
+                    .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::mute_list",
+                    "Failed to roll back local unblock delete for {}: {}",
+                    target_pubkey,
+                    rb_err,
+                );
+            }
+            return Err(e);
         }
 
         self.emit_block_changed(account, target_pubkey).await;
