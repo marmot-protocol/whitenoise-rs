@@ -15,6 +15,7 @@ use crate::{
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
         error::{Result, WhitenoiseError},
+        group_information::{GroupInformation, GroupType},
         media_files::MediaFile,
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
@@ -184,14 +185,22 @@ impl Whitenoise {
         inner_event: UnsignedEvent,
         message: Message,
     ) -> Result<()> {
-        // Drop messages from blocked users before any DB insert
-        if self
-            .is_user_blocked(&account.pubkey, &message.pubkey)
-            .await?
+        // Drop DM messages from blocked users before any DB insert.
+        // Group messages are intentionally not dropped: blocking does not
+        // affect existing multi-person groups (per the block/unblock design
+        // — messages still appear in groups; only DMs are silenced).
+        let is_dm = match GroupInformation::find_by_mls_group_id(&group_id, &self.database).await {
+            Ok(info) => info.group_type == GroupType::DirectMessage,
+            Err(_) => false,
+        };
+        if is_dm
+            && self
+                .is_user_blocked(&account.pubkey, &message.pubkey)
+                .await?
         {
             tracing::debug!(
                 target: "whitenoise::event_processor::handle_mls_message",
-                "Dropping message from blocked user {}",
+                "Dropping DM message from blocked user {}",
                 message.pubkey,
             );
             return Ok(());

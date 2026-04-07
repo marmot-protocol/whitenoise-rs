@@ -532,6 +532,55 @@ mod tests {
         );
     }
 
+    /// Verifies that events arriving on the `AccountMuteList` subscription
+    /// stream are dispatched to `process_account_event` (i.e. they end up in
+    /// the account-scoped handler pipeline).  We use a `Kind::MuteList` event
+    /// authored and signed by the account so it passes the author guard inside
+    /// `handle_mute_list`, and we confirm the event ID is recorded in the
+    /// processed-events tracker after the call returns.
+    #[tokio::test]
+    async fn test_account_mute_list_stream_routes_to_account_event_processor() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+
+        // Build a syntactically valid but empty mute list event.
+        let event = EventBuilder::new(Kind::MuteList, "")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(account.pubkey),
+                    relay_url: relay_url.clone(),
+                    stream: SubscriptionStream::AccountMuteList,
+                    group_ids: vec![],
+                }),
+                Default::default(),
+            )
+            .await;
+
+        // The event must have been processed (not dropped or mis-routed).
+        let was_processed = whitenoise
+            .event_tracker
+            .already_processed_account_event(&event.id, &account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            was_processed,
+            "AccountMuteList stream event should be tracked as processed"
+        );
+    }
+
     #[tokio::test]
     async fn test_validate_giftwrap_target_missing_p_tag() {
         let keys = Keys::generate();
