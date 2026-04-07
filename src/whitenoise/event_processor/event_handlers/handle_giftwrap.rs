@@ -345,18 +345,9 @@ impl Whitenoise {
             );
         }
 
-        if let Err(error) = whitenoise
-            .share_local_push_token_to_group(account, group_id)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                account = %account.pubkey.to_hex(),
-                group = %hex::encode(group_id.as_slice()),
-                error = %error,
-                "Failed to share local push token after welcome finalization"
-            );
-        }
+        // Push token sharing is deferred until the user explicitly accepts
+        // the group invite (see accept_account_group). This prevents leaking
+        // the device's push token into pending or declined groups.
 
         // --- Step 3: self-update (only if subscriptions are live) ---
         //

@@ -385,7 +385,23 @@ impl Whitenoise {
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
-        account_group.accept(self).await
+        let accepted = account_group.accept(self).await?;
+
+        // Best-effort: share the local push token now that the group is accepted.
+        if let Err(error) = self
+            .share_local_push_token_to_group(account, mls_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::account_groups",
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(mls_group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after accepting group"
+            );
+        }
+
+        Ok(accepted)
     }
 
     /// Declines a group invite for the given account and MLS group.
@@ -398,7 +414,23 @@ impl Whitenoise {
         let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
-        account_group.decline(self).await
+        let declined = account_group.decline(self).await?;
+
+        // Best-effort: remove any push token previously shared under the old behavior.
+        if let Err(error) = self
+            .remove_local_push_token_from_group(account, mls_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::account_groups",
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(mls_group_id.as_slice()),
+                error = %error,
+                "Failed to remove local push token after declining group"
+            );
+        }
+
+        Ok(declined)
     }
 
     /// Marks a message as read for the given account.

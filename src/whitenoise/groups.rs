@@ -198,6 +198,20 @@ impl Whitenoise {
         .await?;
         account_group.accept(self).await?;
 
+        // Best-effort: share the creator's push token into the new group.
+        if let Err(error) = self
+            .share_local_push_token_to_group(creator_account, &group.mls_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::groups",
+                account = %creator_account.pubkey.to_hex(),
+                group = %hex::encode(group.mls_group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after group creation"
+            );
+        }
+
         Ok(())
     }
 
