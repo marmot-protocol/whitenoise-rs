@@ -406,12 +406,11 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
-        Request::UnblockUser { account, pubkey } => {
-            match unblock_user(wn, &account, &pubkey).await {
-                Ok(resp) => resp,
-                Err(resp) => resp,
-            }
-        }
+        Request::UnblockUser { account, pubkey } => match unblock_user(wn, &account, &pubkey).await
+        {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
 
         Request::BlockedUsers { account } => match blocked_users(wn, &account).await {
             Ok(resp) => resp,

@@ -19,15 +19,24 @@ use crate::{
 pub(crate) struct AccountInboxPlaneConfig {
     pub(crate) account_pubkey: PublicKey,
     pub(crate) inbox_relays: Vec<RelayUrl>,
+    /// NIP-65 (kind 10002) write relays for this account. Used to subscribe to
+    /// the account's own replaceable events (e.g. kind 10000 mute list) so that
+    /// blocks made on other devices are received in real-time.
+    pub(crate) nip65_relays: Vec<RelayUrl>,
     pub(crate) auth_policy: RelaySessionAuthPolicy,
     pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
 }
 
 impl AccountInboxPlaneConfig {
-    pub(crate) fn new(account_pubkey: PublicKey, inbox_relays: Vec<RelayUrl>) -> Self {
+    pub(crate) fn new(
+        account_pubkey: PublicKey,
+        inbox_relays: Vec<RelayUrl>,
+        nip65_relays: Vec<RelayUrl>,
+    ) -> Self {
         Self {
             account_pubkey,
             inbox_relays,
+            nip65_relays,
             auth_policy: RelaySessionAuthPolicy::Allowed,
             reconnect_policy: RelaySessionReconnectPolicy::Conservative,
         }
@@ -67,6 +76,7 @@ impl AccountInboxPlane {
     pub(crate) async fn activate(
         &self,
         inbox_relays: &[RelayUrl],
+        nip65_relays: &[RelayUrl],
         since: Option<Timestamp>,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
@@ -74,6 +84,21 @@ impl AccountInboxPlane {
 
         self.session.ensure_relays_connected(inbox_relays).await?;
         self.subscribe_giftwrap(inbox_relays, since).await?;
+
+        if !nip65_relays.is_empty()
+            && let Err(e) = self
+                .session
+                .ensure_relays_connected(nip65_relays)
+                .await
+                .and(self.subscribe_mute_list(nip65_relays).await)
+        {
+            tracing::warn!(
+                target: "whitenoise::relay_control::account_inbox",
+                account_pubkey = %self.config.account_pubkey,
+                "Failed to subscribe to mute list on NIP-65 relays: {}",
+                e,
+            );
+        }
 
         Ok(())
     }
@@ -83,6 +108,12 @@ impl AccountInboxPlane {
         self.session
             .unsubscribe(&SubscriptionId::new(format!(
                 "{}_giftwrap",
+                self.pubkey_hash()
+            )))
+            .await;
+        self.session
+            .unsubscribe(&SubscriptionId::new(format!(
+                "{}_mute_list",
                 self.pubkey_hash()
             )))
             .await;
@@ -100,6 +131,28 @@ impl AccountInboxPlane {
         &self,
     ) -> tokio::sync::broadcast::Receiver<super::observability::RelayTelemetry> {
         self.session.telemetry()
+    }
+
+    /// Subscribes to the account's own kind 10000 mute list events on the
+    /// provided NIP-65 relays. Called during `activate` when NIP-65 relays are
+    /// available, so that block list changes from other devices are received in
+    /// real-time and the local cache stays up-to-date.
+    #[perf_instrument("relay")]
+    async fn subscribe_mute_list(&self, nip65_relays: &[RelayUrl]) -> Result<()> {
+        let filter = Filter::new()
+            .kind(Kind::MuteList)
+            .author(self.config.account_pubkey);
+
+        self.session
+            .subscribe_with_id_to(
+                nip65_relays,
+                SubscriptionId::new(format!("{}_mute_list", self.pubkey_hash())),
+                filter,
+                SubscriptionStream::AccountMuteList,
+                Some(self.config.account_pubkey),
+                &[],
+            )
+            .await
     }
 
     #[perf_instrument("relay")]
@@ -133,11 +186,37 @@ impl AccountInboxPlane {
     }
 
     pub(crate) async fn snapshot(&self) -> AccountInboxPlaneStateSnapshot {
+        let mute_list_subscription_id = if self.config.nip65_relays.is_empty() {
+            None
+        } else {
+            Some(format!("{}_mute_list", self.pubkey_hash()))
+        };
         AccountInboxPlaneStateSnapshot {
             account_pubkey: self.config.account_pubkey.to_hex(),
             subscription_id: format!("{}_giftwrap", self.pubkey_hash()),
+            mute_list_subscription_id,
             relay_count: self.config.inbox_relays.len(),
             session: self.session.snapshot(&self.config.inbox_relays).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+
+    use super::*;
+
+    #[test]
+    fn test_new_sets_account_inbox_defaults() {
+        let config =
+            AccountInboxPlaneConfig::new(Keys::generate().public_key(), Vec::new(), Vec::new());
+
+        assert_eq!(config.auth_policy, RelaySessionAuthPolicy::Allowed);
+        assert_eq!(
+            config.reconnect_policy,
+            RelaySessionReconnectPolicy::Conservative
+        );
+        assert_eq!(config.session_config().plane, RelayPlane::AccountInbox);
     }
 }

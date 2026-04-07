@@ -272,6 +272,7 @@ impl RelayControlPlane {
         &self,
         account_pubkey: PublicKey,
         inbox_relays: &[RelayUrl],
+        nip65_relays: &[RelayUrl],
         group_specs: &[groups::GroupSubscriptionSpec],
         since: Option<nostr_sdk::Timestamp>,
         signer: Arc<dyn nostr_sdk::NostrSigner>,
@@ -285,12 +286,19 @@ impl RelayControlPlane {
             .await?;
 
         let plane = account_inbox::AccountInboxPlane::new(
-            account_inbox::AccountInboxPlaneConfig::new(account_pubkey, inbox_relays.to_vec()),
+            account_inbox::AccountInboxPlaneConfig::new(
+                account_pubkey,
+                inbox_relays.to_vec(),
+                nip65_relays.to_vec(),
+            ),
             self.event_sender.clone(),
             self.session_salt,
         );
 
-        if let Err(error) = plane.activate(inbox_relays, since, signer).await {
+        if let Err(error) = plane
+            .activate(inbox_relays, nip65_relays, since, signer)
+            .await
+        {
             plane.deactivate().await;
 
             if let Some(previous_group_specs) = previous_group_state {
@@ -683,7 +691,23 @@ pub(crate) enum SubscriptionStream {
     DiscoveryFollowLists,
     GroupMessages,
     AccountInboxGiftwraps,
+    AccountMuteList,
 }
+
+impl SubscriptionStream {
+    /// Stable identifier used only within White Noise.
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::DiscoveryUserData => "discovery_user_data",
+            Self::DiscoveryFollowLists => "discovery_follow_lists",
+            Self::GroupMessages => "group_messages",
+            Self::AccountInboxGiftwraps => "account_inbox_giftwraps",
+            Self::AccountMuteList => "account_mute_list",
+        }
+    }
+}
+
 
 pub(crate) fn hash_pubkey_for_subscription_id(
     session_salt: &[u8; 16],
@@ -728,6 +752,19 @@ mod tests {
         assert_eq!("group".parse::<RelayPlane>().unwrap(), RelayPlane::Group);
         assert!("not-a-plane".parse::<RelayPlane>().is_err());
     }
+
+    #[test]
+    fn test_subscription_stream_as_str() {
+        assert_eq!(
+            SubscriptionStream::AccountInboxGiftwraps.as_str(),
+            "account_inbox_giftwraps"
+        );
+        assert_eq!(
+            SubscriptionStream::AccountMuteList.as_str(),
+            "account_mute_list"
+        );
+    }
+
 
     async fn setup_test_db() -> Database {
         let pool = SqlitePoolOptions::new()

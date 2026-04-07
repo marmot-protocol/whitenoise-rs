@@ -93,6 +93,13 @@ impl Whitenoise {
             );
         }
         sub_result?;
+
+        // Populate the local mute list cache from relays as a background task
+        // so that blocked users are enforced immediately after login/restore
+        // without blocking account activation. The live subscription
+        // will keep the cache up-to-date on reconnect.
+        self.background_sync_mute_list(account);
+
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
     }
@@ -111,6 +118,9 @@ impl Whitenoise {
 
         self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
+
+        // Populate the local mute list cache from relays as a background task.
+        self.background_sync_mute_list(account);
 
         // Note: We skip key package setup for external signer accounts.
         // Key packages need to be published separately with the external signer.
@@ -671,6 +681,39 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Spawns a fire-and-forget background task that fetches the account's
+    /// kind 10000 mute list from relays and populates the local cache.
+    ///
+    /// This is intentionally non-blocking: activation completes immediately
+    /// and the sync happens in the background. If the sync fails (e.g. relay
+    /// unavailable) the live `AccountMuteList` subscription will deliver the
+    /// event once connected.
+    pub(crate) fn background_sync_mute_list(&self, account: &Account) {
+        let account_clone = account.clone();
+        tokio::spawn(async move {
+            let whitenoise = match Whitenoise::get_instance() {
+                Ok(wn) => wn,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::accounts",
+                        account_pubkey = %account_clone.pubkey,
+                        "background_sync_mute_list: failed to get Whitenoise instance: {}",
+                        e,
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = whitenoise.sync_mute_list(&account_clone).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    account_pubkey = %account_clone.pubkey,
+                    "Mute list startup sync failed, live subscription will recover: {}",
+                    e,
+                );
+            }
+        });
+    }
+
     /// Returns the number of active groups in MDK for an account.
     ///
     /// Cheaper than `extract_group_subscription_specs` — counts without
@@ -859,6 +902,7 @@ impl Whitenoise {
         );
 
         let inbox_relays: Vec<RelayUrl> = Relay::urls(inbox_relays);
+        let nip65_relays: Vec<RelayUrl> = self.account_relay_urls(account).await;
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
@@ -894,6 +938,7 @@ impl Whitenoise {
             self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
+                &nip65_relays,
                 &group_specs,
                 since,
                 signer,
@@ -937,6 +982,7 @@ impl Whitenoise {
         // Gather all inputs before touching existing subscriptions so that a
         // fallible data-fetch cannot leave the account with no active subs.
         let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
+        let nip65_relays: Vec<RelayUrl> = self.account_relay_urls(account).await;
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
@@ -957,6 +1003,7 @@ impl Whitenoise {
             self.relay_control.activate_account_subscriptions(
                 account.pubkey,
                 &inbox_relays,
+                &nip65_relays,
                 &group_specs,
                 since,
                 signer,
