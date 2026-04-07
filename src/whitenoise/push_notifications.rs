@@ -24,6 +24,7 @@ use crate::whitenoise::{
     Whitenoise, WhitenoiseConfig,
     account_settings::AccountSettings,
     accounts::Account,
+    accounts_groups::AccountGroup,
     database::Database,
     error::{Result, WhitenoiseError},
     relays::{Relay, RelayType},
@@ -851,6 +852,34 @@ impl Whitenoise {
         });
     }
 
+    /// Returns `true` when push-gossip is allowed for the given group:
+    /// the MLS group must be active, the account must have an accepted
+    /// `AccountGroup` row, and the row must not be marked as removed.
+    async fn is_push_gossip_eligible(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        group_state: GroupState,
+    ) -> bool {
+        if group_state != GroupState::Active {
+            return false;
+        }
+        match AccountGroup::get(self, &account.pubkey, group_id).await {
+            Ok(Some(ag)) => ag.is_accepted() && !ag.is_removed(),
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %error,
+                    "Failed to check push gossip eligibility; treating as ineligible"
+                );
+                false
+            }
+        }
+    }
+
     #[perf_instrument("push_notifications")]
     async fn share_push_token_to_joined_groups(
         &self,
@@ -862,7 +891,10 @@ impl Whitenoise {
         let mut publish_failures = Vec::new();
 
         for group in groups {
-            if group.state != GroupState::Active {
+            if !self
+                .is_push_gossip_eligible(account, &group.mls_group_id, group.state)
+                .await
+            {
                 continue;
             }
 
@@ -1001,6 +1033,19 @@ impl Whitenoise {
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
+        // Only share to groups the user has explicitly accepted.
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let group_state = mdk
+            .get_group(group_id)?
+            .map(|g| g.state)
+            .unwrap_or(GroupState::Inactive);
+        if !self
+            .is_push_gossip_eligible(account, group_id, group_state)
+            .await
+        {
+            return Ok(());
+        }
+
         if !AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
             .await?
         {
@@ -1059,6 +1104,51 @@ impl Whitenoise {
                 publish_failures.join(", ")
             )))
         }
+    }
+
+    /// Removes the local push token from a single group and clears
+    /// the sender's own cached leaf token for that group.
+    #[perf_instrument("push_notifications")]
+    pub(crate) async fn remove_local_push_token_from_group(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let group_state = mdk
+            .get_group(group_id)?
+            .map(|g| g.state)
+            .unwrap_or(GroupState::Inactive);
+
+        if group_state != GroupState::Active {
+            // Group is missing or inactive — clear any stale cache rows directly
+            // since own_leaf_index() is unavailable without an active MLS group.
+            GroupPushToken::delete_by_member_pubkey(
+                &account.pubkey,
+                group_id,
+                &account.pubkey,
+                &self.database,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
+        if let Err(error) = self
+            .publish_push_group_message(account, group_id, rumor)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::push_notifications",
+                account = %account.pubkey.to_hex(),
+                group = %hex::encode(group_id.as_slice()),
+                error = %error,
+                "Failed to publish token removal to group"
+            );
+        }
+
+        self.sync_local_group_push_token_cache(account, group_id, None)
+            .await
     }
 
     #[perf_instrument("push_notifications")]
@@ -1274,8 +1364,10 @@ mod tests {
         ephemeral::{EphemeralPlane, EphemeralPlaneConfig},
         sessions::{RelaySessionAuthPolicy, RelaySessionReconnectPolicy},
     };
+    use crate::whitenoise::group_information::GroupType;
     use crate::whitenoise::test_utils::{
-        count_published_events_for_account, create_mock_whitenoise, setup_multiple_test_accounts,
+        count_published_events_for_account, create_mock_whitenoise, create_nostr_group_config_data,
+        setup_multiple_test_accounts, setup_two_member_group_with_accepted_account_groups,
         setup_two_member_group_with_welcome_finalization, wait_for_exact_published_event_count,
         wait_for_key_package_publication, wait_for_published_event_count,
     };
@@ -2264,7 +2356,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2319,7 +2411,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2415,7 +2507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_welcome_flow_shares_existing_registration_for_new_member() {
+    async fn test_welcome_finalization_does_not_share_token_for_pending_invite() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
@@ -2438,22 +2530,14 @@ mod tests {
             .await
             .unwrap();
 
-        let before_count = count_published_events_for_account(&whitenoise, &member_account).await;
         let group_id = setup_two_member_group_with_welcome_finalization(
             &whitenoise,
             &admin_account,
             &member_account,
         )
         .await;
-        let after_count =
-            wait_for_published_event_count(&whitenoise, &member_account, before_count).await;
-        assert!(after_count > before_count);
 
-        let own_leaf_index = whitenoise
-            .create_mdk_for_account(member_account.pubkey)
-            .unwrap()
-            .own_leaf_index(&group_id)
-            .unwrap();
+        // The member's group invite is still pending — no token should be shared.
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
@@ -2462,10 +2546,10 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            cached_tokens
+            !cached_tokens
                 .iter()
-                .any(|token| token.leaf_index == own_leaf_index),
-            "welcome-triggered share should update the local cache for the new group"
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "pending welcome finalization must not share the local push token"
         );
     }
 
@@ -2478,7 +2562,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2564,13 +2648,13 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&first_member, &second_member]).await;
 
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &first_member,
         )
         .await;
-        setup_two_member_group_with_welcome_finalization(
+        setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &second_member,
@@ -2619,7 +2703,7 @@ mod tests {
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
-        let group_id = setup_two_member_group_with_welcome_finalization(
+        let group_id = setup_two_member_group_with_accepted_account_groups(
             &whitenoise,
             &admin_account,
             &member_account,
@@ -2782,5 +2866,273 @@ mod tests {
             WhitenoiseError::InvalidInput(message)
             if message == "APNs token must be 32 raw bytes or 64 hex characters"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_accept_account_group_shares_local_push_token() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let apns_hex_token = "33".repeat(32);
+
+        whitenoise
+            .upsert_push_registration(
+                &member_account,
+                PushPlatform::Apns,
+                &apns_hex_token,
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+
+        let group_id = setup_two_member_group_with_welcome_finalization(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
+
+        // Before acceptance: no token cached for the member.
+        let cached_before = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !cached_before
+                .iter()
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "token must not be cached before acceptance"
+        );
+
+        // Accept the group invite.
+        whitenoise
+            .accept_account_group(&member_account, &group_id)
+            .await
+            .unwrap();
+
+        // After acceptance: the member's own token should be cached.
+        let own_leaf_index = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap()
+            .own_leaf_index(&group_id)
+            .unwrap();
+        let cached_after = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_after
+                .iter()
+                .any(|token| token.leaf_index == own_leaf_index),
+            "accepting the group should share and cache the local push token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_joined_group_fanout_only_targets_accepted_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        // Create an accepted group (admin auto-accepts during creation).
+        let accepted_group_id = setup_two_member_group_with_accepted_account_groups(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
+
+        // Create a pending group (welcome finalized but not accepted by member).
+        let pending_group_id = setup_two_member_group_with_welcome_finalization(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let apns_hex_token = "33".repeat(32);
+
+        // Register push and trigger fanout via upsert.
+        whitenoise
+            .upsert_push_registration(
+                &member_account,
+                PushPlatform::Apns,
+                &apns_hex_token,
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+
+        // The accepted group should have the member's token cached.
+        let accepted_tokens = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &accepted_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            accepted_tokens
+                .iter()
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "fanout should share to accepted groups"
+        );
+
+        // The pending group must NOT have the member's token cached.
+        let pending_tokens = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &pending_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !pending_tokens
+                .iter()
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "fanout must not share to pending groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_creation_shares_creator_push_token() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        whitenoise
+            .upsert_push_registration(
+                &creator,
+                PushPlatform::Apns,
+                &"44".repeat(32),
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(
+                &creator,
+                vec![member_account.pubkey],
+                config,
+                Some(GroupType::Group),
+            )
+            .await
+            .unwrap();
+
+        // The creator is auto-accepted, so their token should be cached.
+        let cached_tokens = GroupPushToken::find_by_account_and_group(
+            &creator.pubkey,
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_tokens
+                .iter()
+                .any(|token| token.member_pubkey == creator.pubkey),
+            "group creation should share the creator's push token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decline_account_group_removes_push_token() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let server_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        whitenoise
+            .upsert_push_registration(
+                &member_account,
+                PushPlatform::Apns,
+                &"55".repeat(32),
+                &server_pubkey,
+                Some(&relay_hint),
+            )
+            .await
+            .unwrap();
+
+        // Set up group with accepted account groups so the token gets shared.
+        let group_id = setup_two_member_group_with_accepted_account_groups(
+            &whitenoise,
+            &admin_account,
+            &member_account,
+        )
+        .await;
+
+        // Trigger fanout so the member's token is shared to the accepted group.
+        whitenoise
+            .share_local_push_token_to_joined_groups(&member_account)
+            .await
+            .unwrap();
+
+        let cached_before = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cached_before
+                .iter()
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "token should be cached before decline"
+        );
+
+        // Decline the group.
+        whitenoise
+            .decline_account_group(&member_account, &group_id)
+            .await
+            .unwrap();
+
+        // The token cache should be cleared.
+        let cached_after = GroupPushToken::find_by_account_and_group(
+            &member_account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !cached_after
+                .iter()
+                .any(|token| token.member_pubkey == member_account.pubkey),
+            "declining a group should remove any cached push token"
+        );
     }
 }
