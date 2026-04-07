@@ -1,3 +1,5 @@
+pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
+
 use crate::{
     perf_instrument, perf_span,
     types::MessageWithTokens,
@@ -6,7 +8,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::{Database, aggregated_messages::PaginationOptions, retry_on_lock},
+        database::{Database, retry_on_lock},
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
         message_aggregator::{
@@ -642,7 +644,7 @@ impl Whitenoise {
         &self,
         pubkey: &PublicKey,
         group_id: &GroupId,
-        options: &PaginationOptions<'_>,
+        options: &PaginationOptions,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)

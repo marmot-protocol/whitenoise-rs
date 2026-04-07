@@ -407,16 +407,7 @@ pub async fn dispatch(req: Request) -> Response {
             before,
             before_message_id,
             limit,
-        } => match list_messages(
-            wn,
-            &account,
-            &group_id,
-            before,
-            before_message_id.as_deref(),
-            limit,
-        )
-        .await
-        {
+        } => match list_messages(wn, &account, &group_id, before, before_message_id, limit).await {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1651,7 +1642,7 @@ async fn list_messages(
     account_str: &str,
     group_id_hex: &str,
     before: Option<u64>,
-    before_message_id: Option<&str>,
+    before_message_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;

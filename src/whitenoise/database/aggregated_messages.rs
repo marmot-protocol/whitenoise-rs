@@ -28,17 +28,17 @@ type Result<T> = std::result::Result<T, DatabaseError>;
 /// Specifying both `before` and `after` at the same time is an error.
 /// When all fields are `None` the newest page is returned.
 #[derive(Debug, Default, Clone)]
-pub struct PaginationOptions<'a> {
+pub struct PaginationOptions {
     /// Upper-bound cursor timestamp (Unix seconds). Messages **older** than
     /// this timestamp are returned.
     pub before: Option<Timestamp>,
     /// Upper-bound cursor message ID (64-char hex). Required when `before` is set.
-    pub before_message_id: Option<&'a str>,
+    pub before_message_id: Option<String>,
     /// Lower-bound cursor timestamp (Unix seconds). Messages **newer** than
     /// this timestamp are returned.
     pub after: Option<Timestamp>,
     /// Lower-bound cursor message ID (64-char hex). Required when `after` is set.
-    pub after_message_id: Option<&'a str>,
+    pub after_message_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -200,6 +200,12 @@ impl AggregatedMessageRow {
     }
 }
 
+/// Direction of cursor-based pagination.
+enum Direction {
+    Before,
+    After,
+}
+
 impl AggregatedMessage {
     const DELIVERY_STATUS_LOCK_RETRY_DELAYS_MS: [u64; 3] = [25, 50, 100];
 
@@ -287,7 +293,7 @@ impl AggregatedMessage {
     pub async fn find_messages_by_group_paginated(
         group_id: &GroupId,
         database: &Database,
-        options: &PaginationOptions<'_>,
+        options: &PaginationOptions,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         // Clamp limit: default 50, max 200.
@@ -303,10 +309,6 @@ impl AggregatedMessage {
         }
 
         // Determine which direction we're paginating.
-        enum Direction {
-            Before,
-            After,
-        }
         let direction = if has_after {
             Direction::After
         } else {
@@ -323,7 +325,7 @@ impl AggregatedMessage {
         // so we multiply by 1000.
         let (cursor_ms, cursor_id_str): (i64, String) = match direction {
             Direction::Before => {
-                match (options.before, options.before_message_id) {
+                match (options.before, options.before_message_id.as_deref()) {
                     // No cursor: use i64::MAX so `created_at < MAX` is unconditionally true
                     // for every real timestamp, returning the newest page.
                     (None, None) => (i64::MAX, String::new()),
@@ -349,7 +351,7 @@ impl AggregatedMessage {
                     }
                 }
             }
-            Direction::After => match (options.after, options.after_message_id) {
+            Direction::After => match (options.after, options.after_message_id.as_deref()) {
                 (None, None) => unreachable!("has_after is true but both fields are None"),
                 (Some(ts), Some(id)) => {
                     let canonical =
@@ -2785,7 +2787,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(cursor_ts),
-                before_message_id: Some(cursor_id.as_str()),
+                before_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
             None,
@@ -2918,7 +2920,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(cursor_ts),
-                before_message_id: Some(cursor_id),
+                before_message_id: Some(cursor_id.to_string()),
                 ..Default::default()
             },
             Some(5),
@@ -2945,7 +2947,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(cursor_ts2),
-                before_message_id: Some(cursor_id2),
+                before_message_id: Some(cursor_id2.to_string()),
                 ..Default::default()
             },
             Some(5),
@@ -2999,7 +3001,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(c1_ts),
-                before_message_id: Some(c1_id.as_str()),
+                before_message_id: Some(c1_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3016,7 +3018,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(c2_ts),
-                before_message_id: Some(c2_id.as_str()),
+                before_message_id: Some(c2_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3037,7 +3039,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(c3_ts),
-                before_message_id: Some(c3_id.as_str()),
+                before_message_id: Some(c3_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3103,7 +3105,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before_message_id: Some(
-                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 ),
                 ..Default::default()
             },
@@ -3129,7 +3131,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(ts),
-                before_message_id: Some("not-valid-hex-at-all"),
+                before_message_id: Some("not-valid-hex-at-all".to_string()),
                 ..Default::default()
             },
             None,
@@ -3147,7 +3149,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(ts),
-                before_message_id: Some("00000000000000000000000000000001"),
+                before_message_id: Some("00000000000000000000000000000001".to_string()),
                 ..Default::default()
             },
             None,
@@ -3191,7 +3193,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
-                after_message_id: Some(cursor_id.as_str()),
+                after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
             None,
@@ -3237,7 +3239,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
-                after_message_id: Some(cursor_id.as_str()),
+                after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
             None,
@@ -3282,7 +3284,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
-                after_message_id: Some(cursor_id.as_str()),
+                after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3298,7 +3300,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(c1_ts),
-                after_message_id: Some(c1_id.as_str()),
+                after_message_id: Some(c1_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3314,7 +3316,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(c2_ts),
-                after_message_id: Some(c2_id.as_str()),
+                after_message_id: Some(c2_id.clone()),
                 ..Default::default()
             },
             Some(3),
@@ -3361,9 +3363,9 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(ts),
-                before_message_id: Some(id),
+                before_message_id: Some(id.to_string()),
                 after: Some(ts),
-                after_message_id: Some(id),
+                after_message_id: Some(id.to_string()),
             },
             None,
         )
@@ -3404,7 +3406,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after_message_id: Some(
-                    "0000000000000000000000000000000000000000000000000000000000000001",
+                    "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
                 ),
                 ..Default::default()
             },
@@ -3446,7 +3448,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
-                after_message_id: Some(cursor_id.as_str()),
+                after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
             None,
@@ -3733,7 +3735,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(Timestamp::from(base_ts + 3)),
-                before_message_id: Some(uppercase_id.as_str()),
+                before_message_id: Some(uppercase_id.clone()),
                 ..Default::default()
             },
             None,
@@ -3785,7 +3787,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
-                before_message_id: Some(page1[0].id.as_str()),
+                before_message_id: Some(page1[0].id.clone()),
                 ..Default::default()
             },
             None,
@@ -3840,7 +3842,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
-                before_message_id: Some(page1[0].id.as_str()),
+                before_message_id: Some(page1[0].id.clone()),
                 ..Default::default()
             },
             None,
@@ -3884,7 +3886,7 @@ mod tests {
                 None => PaginationOptions::default(),
                 Some((ts, id)) => PaginationOptions {
                     before: Some(*ts),
-                    before_message_id: Some(id.as_str()),
+                    before_message_id: Some(id.clone()),
                     ..Default::default()
                 },
             };
@@ -3965,7 +3967,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions {
                 before: Some(oldest.created_at),
-                before_message_id: Some(oldest.id.as_str()),
+                before_message_id: Some(oldest.id.clone()),
                 ..Default::default()
             },
             None,

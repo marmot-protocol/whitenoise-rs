@@ -2298,7 +2298,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_in_snapshot.created_at),
-                        before_message_id: Some(oldest_in_snapshot.id.as_str()),
+                        before_message_id: Some(oldest_in_snapshot.id.clone()),
                         ..Default::default()
                     },
                     Some(5),
@@ -2461,7 +2461,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_p1.created_at),
-                        before_message_id: Some(oldest_p1.id.as_str()),
+                        before_message_id: Some(oldest_p1.id.clone()),
                         ..Default::default()
                     },
                     Some(5),
@@ -2478,7 +2478,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_p2.created_at),
-                        before_message_id: Some(oldest_p2.id.as_str()),
+                        before_message_id: Some(oldest_p2.id.clone()),
                         ..Default::default()
                     },
                     Some(5),
@@ -2521,7 +2521,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_p1.created_at),
-                        before_message_id: Some(oldest_p1.id.as_str()),
+                        before_message_id: Some(oldest_p1.id.clone()),
                         ..Default::default()
                     },
                     Some(5),
@@ -2537,7 +2537,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_p2.created_at),
-                        before_message_id: Some(oldest_p2.id.as_str()),
+                        before_message_id: Some(oldest_p2.id.clone()),
                         ..Default::default()
                     },
                     Some(5),
@@ -2626,7 +2626,7 @@ mod tests {
                     &group_id,
                     &PaginationOptions {
                         before: Some(oldest_in_snapshot.created_at),
-                        before_message_id: Some(oldest_in_snapshot.id.as_str()),
+                        before_message_id: Some(oldest_in_snapshot.id.clone()),
                         ..Default::default()
                     },
                     Some(3),
