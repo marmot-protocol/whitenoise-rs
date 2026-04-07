@@ -406,8 +406,21 @@ pub async fn dispatch(req: Request) -> Response {
             group_id,
             before,
             before_message_id,
+            after,
+            after_message_id,
             limit,
-        } => match list_messages(wn, &account, &group_id, before, before_message_id, limit).await {
+        } => match list_messages(
+            wn,
+            &account,
+            &group_id,
+            before,
+            before_message_id,
+            after,
+            after_message_id,
+            limit,
+        )
+        .await
+        {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -1643,15 +1656,19 @@ async fn list_messages(
     group_id_hex: &str,
     before: Option<u64>,
     before_message_id: Option<String>,
+    after: Option<u64>,
+    after_message_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
     let before_ts = before.map(Timestamp::from);
+    let after_ts = after.map(Timestamp::from);
     let options = PaginationOptions {
         before: before_ts,
         before_message_id,
-        ..Default::default()
+        after: after_ts,
+        after_message_id,
     };
     let messages = wn
         .fetch_aggregated_messages_for_group(&account.pubkey, &group_id, &options, limit)

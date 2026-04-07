@@ -187,6 +187,14 @@ pub enum Request {
         /// Pair with `before` so that ties at the same second are resolved deterministically.
         #[serde(default)]
         before_message_id: Option<String>,
+        /// Cursor timestamp: fetch messages created after this Unix timestamp (seconds).
+        /// Omit (or pass null) for the most-recent page.
+        #[serde(default)]
+        after: Option<u64>,
+        /// Companion cursor ID: the `id` of the newest message in the current page.
+        /// Pair with `after` so that ties at the same second are resolved deterministically.
+        #[serde(default)]
+        after_message_id: Option<String>,
         /// Maximum number of messages to return. Defaults to 50 when absent, capped at 200.
         #[serde(default)]
         limit: Option<u32>,
@@ -558,31 +566,55 @@ mod tests {
             group_id: "abcd1234".to_string(),
             before: None,
             before_message_id: None,
+            after: None,
+            after_message_id: None,
             limit: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::ListMessages { account, group_id, before: None, before_message_id: None, limit: None }
+            Request::ListMessages { account, group_id, before: None, before_message_id: None, after: None, after_message_id: None, limit: None }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
 
     #[test]
-    fn list_messages_with_pagination_roundtrip() {
+    fn list_messages_with_before_pagination_roundtrip() {
         let req = Request::ListMessages {
             account: "npub1abc".to_string(),
             group_id: "abcd1234".to_string(),
             before: Some(1_700_000_000),
             before_message_id: Some("abc123".to_string()),
+            after: None,
+            after_message_id: None,
             limit: Some(20),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            Request::ListMessages { account, group_id, before: Some(1_700_000_000), before_message_id: Some(_), limit: Some(20) }
+            Request::ListMessages { account, group_id, before: Some(1_700_000_000), before_message_id: Some(_), after: None, after_message_id: None, limit: Some(20) }
+            if account == "npub1abc" && group_id == "abcd1234"
+        ));
+    }
+
+    #[test]
+    fn list_messages_with_after_pagination_roundtrip() {
+        let req = Request::ListMessages {
+            account: "npub1abc".to_string(),
+            group_id: "abcd1234".to_string(),
+            before: None,
+            before_message_id: None,
+            after: Some(1_700_000_000),
+            after_message_id: Some("abc123".to_string()),
+            limit: Some(20),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::ListMessages { account, group_id, before: None, before_message_id: None, after: Some(1_700_000_000), after_message_id: Some(_), limit: Some(20) }
             if account == "npub1abc" && group_id == "abcd1234"
         ));
     }
