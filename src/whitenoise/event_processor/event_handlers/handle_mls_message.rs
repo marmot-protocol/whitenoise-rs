@@ -1006,8 +1006,7 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        mdk.create_message(&group.mls_group_id, inner, None)
-            .unwrap();
+        mdk.create_message(&group.mls_group_id, inner, None).unwrap();
 
         let message = mdk
             .get_message(&group.mls_group_id, &message_id)
@@ -1080,9 +1079,7 @@ mod tests {
             "Valid message".to_string(),
         );
         inner.ensure_id();
-        let valid_event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
+        let valid_event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
 
         // Corrupt the event by changing its kind (MLS processing should fail)
         let mut bad_event = valid_event;
@@ -1136,9 +1133,7 @@ mod tests {
             "+".to_string(), // Use simple emoji that won't be normalized
         );
         orphaned_reaction.ensure_id();
-        let reaction_event = mdk
-            .create_message(group_id, orphaned_reaction, None)
-            .unwrap();
+        let reaction_event = mdk.create_message(group_id, orphaned_reaction, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -1254,9 +1249,7 @@ mod tests {
             "".to_string(), // Empty content is invalid
         );
         invalid_reaction.ensure_id();
-        let invalid_event = mdk
-            .create_message(group_id, invalid_reaction, None)
-            .unwrap();
+        let invalid_event = mdk.create_message(group_id, invalid_reaction, None).unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, invalid_event)
@@ -1419,9 +1412,7 @@ mod tests {
                 format!("Message {}", i),
             );
             inner.ensure_id();
-            let event = mdk
-                .create_message(&group.mls_group_id, inner, None)
-                .unwrap();
+            let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
 
             whitenoise
                 .handle_mls_message(&creator_account, event)
@@ -1430,13 +1421,10 @@ mod tests {
         }
 
         // Verify all messages are in cache
-        let messages = AggregatedMessage::find_messages_by_group(
-            &group.mls_group_id,
-            None,
-            &whitenoise.database,
-        )
-        .await
-        .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
+                .await
+                .unwrap();
 
         assert_eq!(messages.len(), 3, "All messages should be cached");
         let mut contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
@@ -1503,7 +1491,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1574,7 +1562,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1627,7 +1615,7 @@ mod tests {
         assert!(stored.is_empty());
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1895,9 +1883,7 @@ mod tests {
             "Test message".to_string(),
         );
         inner.ensure_id();
-        let event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
+        let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
 
         // First processing: should succeed
         let first = whitenoise
@@ -1970,9 +1956,7 @@ mod tests {
             "Unprocessable test".to_string(),
         );
         inner.ensure_id();
-        let event = mdk
-            .create_message(&group.mls_group_id, inner, None)
-            .unwrap();
+        let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
         let event_id = event.id;
 
         // Build a relay-plane source context for this account.
@@ -2073,6 +2057,46 @@ mod tests {
             message_event.is_ok(),
             "Admin should be able to create messages after auto-committed removal: {:?}",
             message_event.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_request_dropped_when_semaphore_exhausted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        // Hold all semaphore permits so the next scheduled response task is dropped.
+        let _guard = whitenoise.exhaust_token_response_semaphore();
+
+        let token_tag = make_token_tag(20);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        // The task should have been dropped; no pending entry should remain.
+        assert!(
+            !whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &group_id,
+                &request_event_id,
+            ),
+            "pending entry should be removed when the concurrency cap is reached"
         );
     }
 

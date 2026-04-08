@@ -776,6 +776,17 @@ impl Whitenoise {
         Ok(true)
     }
 
+    /// Acquires all permits from the token-response semaphore and returns the
+    /// owned guard. Dropping the guard releases the permits. Used in tests to
+    /// simulate a fully-saturated semaphore.
+    #[cfg(test)]
+    pub(crate) fn exhaust_token_response_semaphore(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.token_response_semaphore
+            .clone()
+            .try_acquire_many_owned(10)
+            .expect("semaphore should be fully available at start of test")
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending_token_response(
         &self,
