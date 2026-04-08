@@ -70,8 +70,6 @@ pub(crate) struct RelayControlPlane {
     account_inbox_activation_locks: Mutex<HashMap<PublicKey, Arc<Mutex<()>>>>,
     group_plane: groups::GroupPlane,
     ephemeral: ephemeral::EphemeralPlane,
-    #[allow(dead_code)]
-    router: router::RelayRouter,
     observability: observability::RelayObservability,
     telemetry_persistors_started: AtomicBool,
     telemetry_handles: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -110,7 +108,6 @@ impl RelayControlPlane {
             account_inbox_activation_locks: Mutex::new(HashMap::new()),
             group_plane,
             ephemeral,
-            router: router::RelayRouter::default(),
             observability,
             telemetry_persistors_started: AtomicBool::new(false),
             telemetry_handles: Mutex::new(HashMap::new()),
@@ -142,26 +139,12 @@ impl RelayControlPlane {
             .clone()
     }
 
-    /// Access to the shared application database for later relay-control phases.
-    #[allow(dead_code)]
-    pub(crate) fn database(&self) -> &Arc<Database> {
-        &self.database
-    }
-
-    /// Local relay-routing metadata owned by the control plane.
-    #[allow(dead_code)]
-    pub(crate) fn router(&self) -> &router::RelayRouter {
-        &self.router
-    }
-
     /// Structured relay observability configuration and helpers.
-    #[allow(dead_code)]
     pub(crate) fn observability(&self) -> &observability::RelayObservability {
         &self.observability
     }
 
     /// Persist structured relay telemetry for later observability and retry work.
-    #[allow(dead_code)]
     #[perf_instrument("relay")]
     pub(crate) async fn record_relay_telemetry(
         &self,
@@ -528,7 +511,6 @@ impl RelayControlPlane {
             .await
     }
 
-    #[allow(dead_code)]
     #[perf_instrument("relay")]
     pub(crate) async fn publish_metadata_with_signer(
         &self,
@@ -554,7 +536,6 @@ impl RelayControlPlane {
             .await
     }
 
-    #[allow(dead_code)]
     #[perf_instrument("relay")]
     pub(crate) async fn publish_follow_list_with_signer(
         &self,
@@ -704,19 +685,6 @@ pub(crate) enum SubscriptionStream {
     AccountInboxGiftwraps,
 }
 
-impl SubscriptionStream {
-    /// Stable identifier used only within White Noise.
-    #[allow(dead_code)]
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Self::DiscoveryUserData => "discovery_user_data",
-            Self::DiscoveryFollowLists => "discovery_follow_lists",
-            Self::GroupMessages => "group_messages",
-            Self::AccountInboxGiftwraps => "account_inbox_giftwraps",
-        }
-    }
-}
-
 pub(crate) fn hash_pubkey_for_subscription_id(
     session_salt: &[u8; 16],
     pubkey: &PublicKey,
@@ -759,14 +727,6 @@ mod tests {
     fn test_relay_plane_from_str() {
         assert_eq!("group".parse::<RelayPlane>().unwrap(), RelayPlane::Group);
         assert!("not-a-plane".parse::<RelayPlane>().is_err());
-    }
-
-    #[test]
-    fn test_subscription_stream_as_str() {
-        assert_eq!(
-            SubscriptionStream::AccountInboxGiftwraps.as_str(),
-            "account_inbox_giftwraps"
-        );
     }
 
     async fn setup_test_db() -> Database {

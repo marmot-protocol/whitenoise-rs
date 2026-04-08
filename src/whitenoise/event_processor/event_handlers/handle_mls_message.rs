@@ -21,7 +21,10 @@ use crate::{
     },
 };
 #[cfg(test)]
-use crate::{relay_control::hash_pubkey_for_subscription_id, types::EventSource};
+use crate::{
+    relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
+    types::EventSource,
+};
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
@@ -1917,22 +1920,18 @@ mod tests {
         let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
         let event_id = event.id;
 
-        // Build a valid subscription ID for this account.
-        let sub_id = format!(
-            "{}_mls_messages",
-            hash_pubkey_for_subscription_id(
-                whitenoise.relay_control.session_salt(),
-                &creator_account.pubkey
-            )
-        );
+        // Build a relay-plane source context for this account.
+        let source = EventSource::RelaySubscription(SubscriptionContext {
+            plane: RelayPlane::Group,
+            account_pubkey: Some(creator_account.pubkey),
+            relay_url: RelayUrl::parse("wss://relay.example.com").unwrap(),
+            stream: SubscriptionStream::GroupMessages,
+            group_ids: vec![],
+        });
 
         // First pass through process_account_event: succeeds, event is tracked.
         whitenoise
-            .process_account_event(
-                event.clone(),
-                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
-                Default::default(),
-            )
+            .process_account_event(event.clone(), source.clone(), Default::default())
             .await;
 
         let tracked_after_first = whitenoise
@@ -1950,11 +1949,7 @@ mod tests {
         // is not advanced for a duplicate.  This is the intended guard.
         // We verify the skip path by confirming it doesn't panic or double-advance.
         whitenoise
-            .process_account_event(
-                event.clone(),
-                EventSource::LegacySubscriptionId(Some(sub_id.clone())),
-                Default::default(),
-            )
+            .process_account_event(event.clone(), source.clone(), Default::default())
             .await;
 
         // Still tracked — no double-entry, no crash.

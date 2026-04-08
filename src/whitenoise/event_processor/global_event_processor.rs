@@ -1,12 +1,11 @@
 use nostr_sdk::prelude::*;
 
+#[cfg(test)]
+use crate::whitenoise::error::WhitenoiseError;
 use crate::{
     perf_instrument,
     types::{EventSource, RetryInfo},
-    whitenoise::{
-        Whitenoise,
-        error::{Result, WhitenoiseError},
-    },
+    whitenoise::{Whitenoise, error::Result},
 };
 
 impl Whitenoise {
@@ -17,21 +16,6 @@ impl Whitenoise {
         source: EventSource,
         retry_info: RetryInfo,
     ) {
-        // Relay-plane events already carry typed source context. The
-        // `global_users_*` prefix check only exists for the legacy shared-client
-        // compatibility path.
-        if let EventSource::LegacySubscriptionId(Some(subscription_id)) = &source
-            && self
-                .validate_batched_subscription_id(subscription_id)
-                .is_err()
-        {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_global_event",
-                "Invalid batched subscription ID: {}", subscription_id
-            );
-            return;
-        }
-
         match self.should_skip_global_event_processing(&event).await {
             Some(skip_reason) => {
                 tracing::debug!(
@@ -135,6 +119,7 @@ impl Whitenoise {
         }
     }
 
+    #[cfg(test)]
     fn validate_batched_subscription_id(&self, subscription_id: &str) -> Result<()> {
         // Simple validation format: global_users_abc123_0
         // we could have a more robust validation here but this is good enough for now

@@ -483,7 +483,6 @@ impl Whitenoise {
     /// advance local state after confirming the relay accepted the event.
     /// If all publish attempts fail, the pending commit is never merged and
     /// the group state remains unchanged.
-    #[allow(dead_code)]
     #[perf_instrument("event_handlers")]
     async fn perform_self_update(
         whitenoise: &Whitenoise,

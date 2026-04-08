@@ -58,19 +58,12 @@ impl Default for RetryInfo {
 /// This enum supports gradual migration from legacy subscription management to
 /// the relay-plane architecture. Events flow through one of two paths:
 ///
-/// - **Legacy path**: Old `NostrManager` subscriptions identify streams by an
-///   opaque string subscription ID. The processor inspects the ID prefix to
-///   determine whether the event is global- or account-scoped.
+/// Event source context attached by relay-plane sessions at receipt time.
 ///
-/// - **Relay-plane path**: New relay-plane sessions attach a typed
-///   [`SubscriptionContext`] at event receipt time, so the processor never
-///   needs to parse subscription IDs.
+/// Relay-plane sessions attach a typed [`SubscriptionContext`] at event receipt
+/// time, so the processor never needs to parse subscription IDs.
 #[derive(Debug, Clone)]
 pub enum EventSource {
-    /// Legacy compatibility: the raw subscription ID from the old NostrManager.
-    /// `None` when the event arrived without a subscription ID.
-    #[allow(dead_code)]
-    LegacySubscriptionId(Option<String>),
     /// Relay-plane path: fully typed routing context attached by the session.
     RelaySubscription(SubscriptionContext),
 }
@@ -90,16 +83,6 @@ pub enum ProcessableEvent {
 }
 
 impl ProcessableEvent {
-    /// Create a new legacy NostrEvent with default retry settings.
-    #[allow(dead_code)]
-    pub fn new_nostr_event(event: Event, subscription_id: Option<String>) -> Self {
-        Self::NostrEvent {
-            event,
-            source: EventSource::LegacySubscriptionId(subscription_id),
-            retry_info: RetryInfo::new(),
-        }
-    }
-
     /// Create a new relay-plane NostrEvent with default retry settings.
     pub fn new_routed_nostr_event(event: Event, source: SubscriptionContext) -> Self {
         Self::NostrEvent {

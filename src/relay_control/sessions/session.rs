@@ -11,7 +11,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nostr_sdk::prelude::*;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
 
-use super::{RelaySessionConfig, RelaySessionRelayPolicy, notifications::RelayNotification};
+use super::{RelaySessionConfig, notifications::RelayNotification};
 use crate::{
     nostr_manager::{NostrManagerError, Result},
     perf_instrument, perf_span,
@@ -89,14 +89,9 @@ impl RelaySession {
         session
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn client(&self) -> &Client {
         &self.client
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn config(&self) -> &RelaySessionConfig {
-        &self.config
     }
 
     pub(crate) fn telemetry(&self) -> broadcast::Receiver<RelayTelemetry> {
@@ -293,7 +288,6 @@ impl RelaySession {
         })
     }
 
-    #[allow(dead_code)]
     #[perf_instrument("relay")]
     pub(crate) async fn fetch_events_from(
         &self,
@@ -842,24 +836,6 @@ impl RelaySession {
         self.client.shutdown().await;
     }
 
-    #[allow(dead_code)]
-    #[perf_instrument("relay")]
-    pub(crate) async fn unsubscribe_all(&self) {
-        let subscription_ids: Vec<SubscriptionId> = self
-            .state
-            .subscription_relays
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect();
-
-        for subscription_id in subscription_ids {
-            self.unsubscribe(&subscription_id).await;
-        }
-        self.client.unsubscribe_all().await;
-    }
-
     pub(crate) async fn snapshot(&self, known_relays: &[RelayUrl]) -> RelaySessionStateSnapshot {
         let notification_handler_registered = self.notification_handler_registered();
         let router_context_count = self.router.context_count().await;
@@ -1248,27 +1224,6 @@ impl RelaySession {
                     telemetry,
                 ));
             }
-            RelayNotification::Connected { relay_url } => {
-                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
-                    telemetry_account_pubkey,
-                    RelayTelemetry::new(RelayTelemetryKind::Connected, plane, relay_url),
-                ));
-            }
-            RelayNotification::Disconnected {
-                relay_url,
-                failure_category,
-            } => {
-                let mut telemetry =
-                    RelayTelemetry::new(RelayTelemetryKind::Disconnected, plane, relay_url);
-                if let Some(failure_category) = failure_category {
-                    telemetry = telemetry.with_failure_category(failure_category);
-                }
-                let _ = telemetry_sender.send(Self::apply_telemetry_scope(
-                    telemetry_account_pubkey,
-                    telemetry,
-                ));
-            }
-            RelayNotification::Shutdown => return Ok(true),
         }
 
         Ok(false)
@@ -1308,18 +1263,10 @@ impl RelaySession {
     async fn ensure_relay_in_client(&self, relay_url: &RelayUrl) -> Result<bool> {
         match self.client.relay(relay_url).await {
             Ok(_) => Ok(false),
-            Err(_) => match self.config.relay_policy {
-                RelaySessionRelayPolicy::Dynamic => {
-                    self.client.add_relay(relay_url.clone()).await?;
-                    Ok(true)
-                }
-                RelaySessionRelayPolicy::ExplicitOnly => {
-                    Err(NostrManagerError::WhitenoiseInstance(format!(
-                        "relay {} is not allowed by explicit-only session policy",
-                        relay_url
-                    )))
-                }
-            },
+            Err(_) => {
+                self.client.add_relay(relay_url.clone()).await?;
+                Ok(true)
+            }
         }
     }
 
