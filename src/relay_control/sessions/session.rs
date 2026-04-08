@@ -836,7 +836,6 @@ impl RelaySession {
         self.client.shutdown().await;
     }
 
-
     pub(crate) async fn snapshot(&self, known_relays: &[RelayUrl]) -> RelaySessionStateSnapshot {
         let notification_handler_registered = self.notification_handler_registered();
         let router_context_count = self.router.context_count().await;

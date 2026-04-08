@@ -177,7 +177,7 @@ impl GroupPlane {
             .map(|state| state.groups.clone())
     }
 
-    #[perf_instrument("relay")]
+    #[cfg(test)]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
         self.accounts.read().await.contains_key(pubkey)
     }

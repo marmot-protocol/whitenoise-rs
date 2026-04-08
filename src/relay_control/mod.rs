@@ -139,11 +139,6 @@ impl RelayControlPlane {
             .clone()
     }
 
-    /// Access to the shared application database for later relay-control phases.
-    pub(crate) fn database(&self) -> &Arc<Database> {
-        &self.database
-    }
-
     /// Structured relay observability configuration and helpers.
     pub(crate) fn observability(&self) -> &observability::RelayObservability {
         &self.observability
