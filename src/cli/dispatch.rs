@@ -1713,6 +1713,10 @@ async fn search_messages(
         results.iter().map(|r| r.message.clone()).collect();
     let display_names = resolve_chat_display_names(wn, &messages).await;
 
+    // Note: mls_group_id is intentionally omitted from the per-group response.
+    // The caller already knows the group (they passed group_id in the request).
+    // The cross-group search_all_messages handler includes it because the caller
+    // needs to know which group each result belongs to.
     let clean: Vec<serde_json::Value> = results
         .iter()
         .filter_map(|r| {
