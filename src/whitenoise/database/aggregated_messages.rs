@@ -595,11 +595,86 @@ impl AggregatedMessage {
                         message_id: row.message_id.to_string(),
                     }
                 })?;
+                let mls_group_id = row.mls_group_id.clone();
                 let message = Self::row_to_chat_message(row)?;
                 let highlight_spans =
                     super::content_search::find_highlight_spans(&message.content, query);
                 Ok(SearchResult {
                     message,
+                    mls_group_id,
+                    highlight_spans,
+                    position,
+                })
+            })
+            .collect()
+    }
+
+    /// Search messages across **all** groups belonging to an account.
+    ///
+    /// Behaves identically to [`search_messages_in_group`](Self::search_messages_in_group)
+    /// except that it removes the single-group filter and scopes results to groups
+    /// the account is a member of (via `accounts_groups`). Each result carries its
+    /// `mls_group_id` so Flutter can group them by conversation.
+    ///
+    /// `position` is computed per-group via `PARTITION BY mls_group_id` so the
+    /// frontend can still jump to the correct page within each conversation.
+    pub async fn search_messages(
+        pubkey: &PublicKey,
+        query: &str,
+        limit: u32,
+        database: &Database,
+    ) -> Result<Vec<SearchResult>> {
+        let limit_val = i64::from(limit.min(200));
+        let like_pattern = super::content_search::query_to_like_pattern(query);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "WITH ranked AS (
+               SELECT am.*,
+                      mds.status AS delivery_status,
+                      (ROW_NUMBER() OVER (
+                         PARTITION BY am.mls_group_id
+                         ORDER BY am.created_at DESC, am.message_id DESC
+                      )) - 1 AS position
+               FROM aggregated_messages am
+               JOIN accounts_groups ag
+                 ON ag.mls_group_id = am.mls_group_id
+               LEFT JOIN message_delivery_status mds
+                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               WHERE am.kind = 9
+                 AND ag.account_pubkey = ?1
+                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             )
+             SELECT * FROM ranked
+             WHERE deletion_event_id IS NULL
+               AND content_normalized LIKE ?2
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT ?3",
+        )
+        .bind(pubkey.to_hex())
+        .bind(&like_pattern)
+        .bind(limit_val)
+        .fetch_all(&database.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let position_i64 =
+                    row.position
+                        .ok_or_else(|| DatabaseError::MissingSearchPosition {
+                            message_id: row.message_id.to_string(),
+                        })?;
+                let position = u64::try_from(position_i64).map_err(|_| {
+                    DatabaseError::MissingSearchPosition {
+                        message_id: row.message_id.to_string(),
+                    }
+                })?;
+                let mls_group_id = row.mls_group_id.clone();
+                let message = Self::row_to_chat_message(row)?;
+                let highlight_spans =
+                    super::content_search::find_highlight_spans(&message.content, query);
+                Ok(SearchResult {
+                    message,
+                    mls_group_id,
                     highlight_spans,
                     position,
                 })

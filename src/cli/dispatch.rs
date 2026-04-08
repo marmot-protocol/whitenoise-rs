@@ -435,6 +435,15 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::SearchAllMessages {
+            account,
+            query,
+            limit,
+        } => match search_all_messages(wn, &account, &query, limit).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         Request::SendMessage {
             account,
             group_id,
@@ -1708,6 +1717,38 @@ async fn search_messages(
         .iter()
         .filter_map(|r| {
             let mut msg = format_chat_message(&r.message, &display_names)?;
+            msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans)
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            msg["position"] = serde_json::Value::Number(r.position.into());
+            Some(msg)
+        })
+        .collect();
+
+    Ok(to_response(&clean))
+}
+
+#[perf_instrument("dispatch")]
+async fn search_all_messages(
+    wn: &Whitenoise,
+    account_str: &str,
+    query: &str,
+    limit: Option<u32>,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let results = wn
+        .search_messages(&account.pubkey, query, limit)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let messages: Vec<crate::whitenoise::message_aggregator::ChatMessage> =
+        results.iter().map(|r| r.message.clone()).collect();
+    let display_names = resolve_chat_display_names(wn, &messages).await;
+
+    let clean: Vec<serde_json::Value> = results
+        .iter()
+        .filter_map(|r| {
+            let mut msg = format_chat_message(&r.message, &display_names)?;
+            msg["mls_group_id"] = serde_json::Value::String(hex::encode(r.mls_group_id.as_slice()));
             msg["highlight_spans"] = serde_json::to_value(&r.highlight_spans)
                 .unwrap_or(serde_json::Value::Array(vec![]));
             msg["position"] = serde_json::Value::Number(r.position.into());

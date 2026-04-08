@@ -243,6 +243,14 @@ pub enum Request {
         limit: Option<u32>,
     },
 
+    #[serde(rename = "search_all_messages")]
+    SearchAllMessages {
+        account: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+
     // Media
     #[serde(rename = "upload_media")]
     UploadMedia {
@@ -1482,6 +1490,51 @@ mod tests {
         assert!(matches!(
             parsed_wire,
             Request::SearchMessages { limit, .. }
+            if limit.is_none()
+        ));
+    }
+
+    #[test]
+    fn search_all_messages_roundtrip_with_limit() {
+        let req = Request::SearchAllMessages {
+            account: "npub1abc".to_string(),
+            query: "hello world".to_string(),
+            limit: Some(25),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""method":"search_all_messages""#));
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchAllMessages { account, query, limit }
+            if account == "npub1abc"
+                && query == "hello world"
+                && limit == Some(25)
+        ));
+    }
+
+    #[test]
+    fn search_all_messages_roundtrip_limit_omitted() {
+        let req = Request::SearchAllMessages {
+            account: "npub1abc".to_string(),
+            query: "marmot".to_string(),
+            limit: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            Request::SearchAllMessages { limit, .. }
+            if limit.is_none()
+        ));
+
+        // Wire format with field omitted
+        let wire =
+            r#"{"method":"search_all_messages","params":{"account":"npub1abc","query":"marmot"}}"#;
+        let parsed_wire: Request = serde_json::from_str(wire).unwrap();
+        assert!(matches!(
+            parsed_wire,
+            Request::SearchAllMessages { limit, .. }
             if limit.is_none()
         ));
     }
