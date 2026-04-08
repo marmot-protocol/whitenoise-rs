@@ -2061,6 +2061,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_duplicate_token_request_does_not_create_second_task() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let fake_event_id = EventId::all_zeros();
+        let fake_group_id = GroupId::from_slice(&[1u8; 32]);
+
+        // First schedule: inserts the key.
+        whitenoise.schedule_token_response_for_test(
+            member_account.clone(),
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &fake_group_id,
+            &fake_event_id,
+        ));
+
+        // Second schedule with the same key hits the duplicate-dedup early-return;
+        // the existing entry must remain intact.
+        whitenoise.schedule_token_response_for_test(
+            member_account.clone(),
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(
+            whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &fake_group_id,
+                &fake_event_id,
+            ),
+            "pending entry should still be present after duplicate request"
+        );
+
+        let _ = admin_account;
+    }
+
+    #[tokio::test]
     async fn test_token_request_dropped_when_semaphore_exhausted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let admin_account = whitenoise.create_identity().await.unwrap();

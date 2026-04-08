@@ -776,6 +776,18 @@ impl Whitenoise {
         Ok(true)
     }
 
+    /// Calls `schedule_pending_token_response` directly. Used in tests to exercise
+    /// the scheduling logic without going through the full MLS message pipeline.
+    #[cfg(test)]
+    pub(crate) fn schedule_token_response_for_test(
+        &self,
+        account: Account,
+        group_id: GroupId,
+        request_event_id: EventId,
+    ) {
+        self.schedule_pending_token_response(account, group_id, request_event_id);
+    }
+
     /// Acquires all permits from the token-response semaphore and returns the
     /// owned guard. Dropping the guard releases the permits. Used in tests to
     /// simulate a fully-saturated semaphore.
@@ -847,7 +859,7 @@ impl Whitenoise {
         }
 
         // Key is freshly owned by us; now enforce the concurrency cap.
-        let permit = match self.token_response_semaphore.clone().try_acquire_owned() {
+        let _permit = match self.token_response_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!(
@@ -887,8 +899,6 @@ impl Whitenoise {
                     "Failed to send delayed MIP-05 token-list response"
                 );
             }
-
-            drop(permit);
         });
     }
 
