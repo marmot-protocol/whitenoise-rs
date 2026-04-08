@@ -6,6 +6,7 @@ use crate::{
     whitenoise::{
         Whitenoise,
         accounts::Account,
+        accounts_groups::AccountGroup,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
         database::{Database, retry_on_lock},
@@ -65,7 +66,7 @@ impl Whitenoise {
         }
 
         let _mls_span = perf_span!("messages::mls_create_message");
-        let message_event = mdk.create_message(group_id, inner_event)?;
+        let message_event = mdk.create_message(group_id, inner_event, None)?;
         let mdk_message =
             mdk.get_message(group_id, &event_id)?
                 .ok_or(WhitenoiseError::MdkCoreError(
@@ -673,11 +674,15 @@ impl Whitenoise {
     ) -> Result<Vec<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
 
+        let cleared_at_ms =
+            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
+
         AggregatedMessage::find_messages_by_group_paginated(
             group_id,
             &self.database,
             options,
             limit,
+            cleared_at_ms,
         )
         .await
         .map_err(|e| match e {
@@ -716,6 +721,9 @@ impl Whitenoise {
 
         let read_marker = self.get_last_read_message_id(&account, group_id).await?;
 
+        let cleared_at_ms =
+            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
+
         let minimum_val = minimum.unwrap_or(50);
 
         Ok(AggregatedMessage::find_messages_with_unread_minimum(
@@ -723,6 +731,7 @@ impl Whitenoise {
             read_marker.as_ref(),
             minimum_val,
             &self.database,
+            cleared_at_ms,
         )
         .await?)
     }
@@ -766,11 +775,18 @@ impl Whitenoise {
     ) -> Result<Vec<SearchResult>> {
         Account::find_by_pubkey(pubkey, &self.database).await?;
 
+        let cleared_at_ms =
+            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
+
         let limit_val = limit.unwrap_or(50);
-        Ok(
-            AggregatedMessage::search_messages_in_group(group_id, query, limit_val, &self.database)
-                .await?,
+        Ok(AggregatedMessage::search_messages_in_group(
+            group_id,
+            query,
+            limit_val,
+            &self.database,
+            cleared_at_ms,
         )
+        .await?)
     }
 
     /// Search messages across all groups the account belongs to.
@@ -1334,10 +1350,13 @@ mod tests {
         assert!(!needs_sync, "Cache should not need sync after syncing");
 
         // Verify we can fetch the messages from cache
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages[0].content.contains("Message"));
         assert!(messages[1].content.contains("Message"));
@@ -1402,10 +1421,13 @@ mod tests {
         assert_eq!(cached_count, 3);
 
         // Verify all messages are retrievable
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 3);
 
         let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
@@ -1464,10 +1486,13 @@ mod tests {
         assert_eq!(cached_count, 5);
 
         // Verify messages are correct
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 5);
         let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         for i in 1..=5 {
@@ -1864,7 +1889,7 @@ mod tests {
 
         // Subscribe before retry so we can verify live delivery status transition.
         let mut updates = whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id, None)
+            .subscribe_to_group_messages(&creator.pubkey, &group.mls_group_id, None)
             .await
             .unwrap()
             .updates;
@@ -1897,10 +1922,13 @@ mod tests {
 
         // A new message should exist in cache in a non-failure state.
         // The background publish may complete before we read, so accept Sending OR Sent.
-        let all_messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let all_messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // find_messages_by_group excludes Retried, so only the new message should appear
         let new_msg = all_messages
@@ -2153,10 +2181,13 @@ mod tests {
             .unwrap();
 
         // Verify messages were recovered
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 3, "All 3 messages should be recovered");
 
         let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
@@ -2247,10 +2278,13 @@ mod tests {
         whitenoise.sync_message_cache_on_startup().await.unwrap();
 
         // Verify all messages were recovered
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 4, "All 4 messages should be recovered");
 
         let contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
@@ -2324,10 +2358,13 @@ mod tests {
         assert!(target.is_deleted, "Message should be marked as deleted");
 
         // Also verify via find_messages_by_group — message should have is_deleted flag
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
         assert!(
             target_msg.is_deleted,
@@ -2476,10 +2513,13 @@ mod tests {
             .unwrap();
 
         // Verify message is marked as deleted
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
         assert!(target_msg.is_deleted, "Message should be marked as deleted");
 
@@ -2501,10 +2541,13 @@ mod tests {
         .await;
 
         // Message should no longer be deleted after cascade
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         let target_msg = messages.iter().find(|m| m.id == target_id).unwrap();
         assert!(
             !target_msg.is_deleted,

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 /// contains all expected messages with correct state.
 pub struct VerifyInitialMessagesTestCase {
     group_name: String,
+    account_name: String,
     expected_message_keys: Vec<String>,
     expected_with_reactions: Vec<String>,
     expected_no_reactions: Vec<String>,
@@ -14,9 +15,10 @@ pub struct VerifyInitialMessagesTestCase {
 }
 
 impl VerifyInitialMessagesTestCase {
-    pub fn new(group_name: &str) -> Self {
+    pub fn new(group_name: &str, account_name: &str) -> Self {
         Self {
             group_name: group_name.to_string(),
+            account_name: account_name.to_string(),
             expected_message_keys: vec![],
             expected_with_reactions: vec![],
             expected_no_reactions: vec![],
@@ -53,11 +55,12 @@ impl TestCase for VerifyInitialMessagesTestCase {
             self.group_name
         );
 
+        let account = context.get_account(&self.account_name)?;
         let group = context.get_group(&self.group_name)?;
 
         let subscription = context
             .whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id, None)
+            .subscribe_to_group_messages(&account.pubkey, &group.mls_group_id, None)
             .await?;
 
         tracing::info!(

@@ -619,7 +619,7 @@ async fn messages_subscribe<W>(
     W: AsyncWriteExt + Unpin,
 {
     // Validate account and group_id
-    let _account = match find_account(wn, account_str).await {
+    let account = match find_account(wn, account_str).await {
         Ok(a) => a,
         Err(resp) => {
             let _ = write_response(writer, &resp).await;
@@ -637,7 +637,10 @@ async fn messages_subscribe<W>(
     };
 
     // Subscribe — gets initial snapshot + broadcast receiver
-    let subscription = match wn.subscribe_to_group_messages(&group_id, limit).await {
+    let subscription = match wn
+        .subscribe_to_group_messages(&account.pubkey, &group_id, limit)
+        .await
+    {
         Ok(sub) => sub,
         Err(e) => {
             let _ = write_response(writer, &Response::err(e.to_string())).await;

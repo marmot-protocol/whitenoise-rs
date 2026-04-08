@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
-    chat_list_streaming::ChatListUpdateTrigger, error::WhitenoiseError,
+    chat_list_streaming::ChatListUpdateTrigger, database::Database, drafts::Draft,
+    error::WhitenoiseError,
 };
 
 /// Represents the relationship between an account and an MLS group.
@@ -56,6 +57,10 @@ pub struct AccountGroup {
     /// - `Some(timestamp)` = muted until that time; use `MUTE_FOREVER` for
     ///   "always muted until manually unmuted"
     pub muted_until: Option<DateTime<Utc>>,
+    /// When this account last cleared the chat's messages.
+    /// - `None` = not cleared (all messages visible)
+    /// - `Some(timestamp)` = messages at or before this time are hidden
+    pub chat_cleared_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -187,6 +192,33 @@ impl AccountGroup {
     /// Returns true if this chat is muted forever (until manually unmuted).
     pub fn is_muted_forever(&self) -> bool {
         self.muted_until >= Some(MUTE_FOREVER)
+    }
+
+    /// Returns true if a message with the given timestamp is visible — i.e., it
+    /// was sent strictly after the chat was last cleared. When the chat has never
+    /// been cleared, every message is visible.
+    pub fn is_message_visible(&self, message_created_at: DateTime<Utc>) -> bool {
+        self.chat_cleared_at
+            .is_none_or(|cleared_at| message_created_at > cleared_at)
+    }
+
+    /// Look up the `chat_cleared_at` timestamp for an account/group pair and convert
+    /// it to milliseconds since the Unix epoch, matching the format used by message
+    /// query filters.
+    ///
+    /// Returns `Ok(None)` when the chat has never been cleared.
+    /// Returns `Err(GroupNotFound)` when the account-group row does not exist.
+    pub(crate) async fn chat_cleared_at_ms(
+        pubkey: &PublicKey,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<Option<i64>, WhitenoiseError> {
+        let account_group = Self::find_by_account_and_group(pubkey, group_id, database)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+        Ok(account_group
+            .chat_cleared_at
+            .map(|dt| dt.timestamp_millis()))
     }
 
     /// Creates or retrieves an AccountGroup for the given account and group.
@@ -682,6 +714,152 @@ impl Whitenoise {
         AccountGroup::find_latest_dm_group_with_peer(self, &account.pubkey, peer_pubkey).await
     }
 
+    /// Clears all messages from this account's view by setting a per-account
+    /// timestamp floor. Messages at or before the current time are hidden.
+    ///
+    /// The group remains in the chat list with no visible messages. This is a
+    /// local-only operation with no protocol-level side effects.
+    ///
+    /// Works correctly in multi-account scenarios: each account's
+    /// `chat_cleared_at` is independent. Messages are only physically deleted
+    /// when all accounts sharing the group have cleared.
+    #[perf_instrument("account_groups")]
+    pub async fn clear_chat(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<(), WhitenoiseError> {
+        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+        account_group
+            .clear_chat_state(Utc::now(), &self.database)
+            .await?;
+
+        if let Err(e) = Draft::delete(&account.pubkey, group_id, &self.database).await {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                "Failed to delete draft during clear_chat: {}",
+                e
+            );
+        }
+
+        if let Err(e) = self.database.try_cleanup_cleared_messages(group_id).await {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                "Failed to cleanup cleared messages: {}",
+                e
+            );
+        }
+
+        match self.create_mdk_for_account(account.pubkey) {
+            Ok(mdk) => {
+                if let Err(e) = mdk.delete_messages_for_group(group_id) {
+                    tracing::warn!(
+                        target: "whitenoise::accounts_groups",
+                        "Failed to delete MDK messages during clear_chat: {}",
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::accounts_groups",
+                    "Failed to create MDK for clear_chat message cleanup: {}",
+                    e
+                );
+            }
+        }
+
+        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::ChatCleared)
+            .await;
+
+        Ok(())
+    }
+
+    /// Deletes all local data for a group from this account's perspective.
+    ///
+    /// The chat disappears from the account's chat list entirely. This is a
+    /// local-only operation -- no MLS proposals or Nostr events are published.
+    ///
+    /// If all accounts on this device have deleted the group, all shared data
+    /// (group_information, aggregated_messages, etc.) is also physically removed.
+    ///
+    /// **Warning**: If the account has not left the MLS group first
+    /// (`removed_at.is_none()`), they remain a member in the protocol -- other
+    /// members continue encrypting messages for them, and their key packages
+    /// remain published. The recommended flow is `leave_group` -> `delete_chat`.
+    #[perf_instrument("account_groups")]
+    pub async fn delete_chat(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<(), WhitenoiseError> {
+        // 1. Verify the AccountGroup exists
+        let Some(_account_group) = AccountGroup::get(self, &account.pubkey, group_id).await? else {
+            return Err(WhitenoiseError::GroupNotFound);
+        };
+
+        // 2. Pre-build the ChatListItem while data still exists
+        //    (MDK state and DB data are needed for build_chat_list_item)
+        let chat_list_item = self.build_chat_list_item(account, group_id).await;
+
+        // 3. Delete all DB data in a transaction (fallible — must run before
+        //    non-rollbackable MDK cleanup so a DB failure leaves state intact)
+        self.database
+            .delete_chat_data(&account.pubkey, group_id)
+            .await?;
+
+        // 4. Delete MDK group state for this account (best-effort)
+        match self.create_mdk_for_account(account.pubkey) {
+            Ok(mdk) => {
+                if let Err(e) = mdk.delete_group(group_id) {
+                    tracing::warn!(
+                        target: "whitenoise::accounts_groups",
+                        "Failed to delete MDK group during delete_chat: {}",
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::accounts_groups",
+                    "Failed to create MDK for delete_chat group cleanup: {}",
+                    e
+                );
+            }
+        }
+
+        // 5. Clean up orphaned media files from disk
+        let media_files =
+            crate::whitenoise::media_files::MediaFiles::new(&self.storage, &self.database);
+        if let Err(e) = media_files.cleanup_orphaned_files().await {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                "Failed to cleanup orphaned media files: {}",
+                e
+            );
+        }
+
+        // 6. Emit ChatDeleted with pre-built item
+        if let Ok(Some(item)) = chat_list_item {
+            let update = crate::whitenoise::chat_list_streaming::ChatListUpdate {
+                trigger: ChatListUpdateTrigger::ChatDeleted,
+                item,
+            };
+            self.chat_list_stream_manager
+                .emit(&account.pubkey, update.clone());
+            self.archived_chat_list_stream_manager
+                .emit(&account.pubkey, update);
+        }
+
+        // 7. Refresh relay subscriptions
+        self.background_refresh_account_group_subscriptions(account);
+
+        Ok(())
+    }
+
     /// Backfills the `dm_peer_pubkey` column for existing DM groups that are
     /// missing it.
     ///
@@ -744,7 +922,7 @@ impl Whitenoise {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::whitenoise::group_information::GroupType;
+    use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     #[tokio::test]
@@ -1159,10 +1337,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_message_read_advances_forward() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-        use chrono::Utc;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[100; 32]);
@@ -1225,10 +1399,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_message_read_does_not_regress() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-        use chrono::Utc;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[101; 32]);
@@ -1292,10 +1462,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_message_read_equal_timestamp_is_noop() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-        use chrono::Utc;
-
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[102; 32]);
@@ -1855,6 +2021,8 @@ mod tests {
             self_removed: false,
             // Expired 10 seconds ago
             muted_until: Some(Utc::now() - chrono::Duration::seconds(10)),
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2026,6 +2194,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2181,6 +2351,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2278,5 +2450,372 @@ mod tests {
             removed.self_removed,
             "self_removed must survive mark_as_removed no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn test_clear_chat_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[140; 32]);
+
+        let result = whitenoise.clear_chat(&account, &group_id).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_chat_cleared_at_ms_returns_group_not_found_for_missing_row() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[141; 32]);
+
+        // No AccountGroup row exists for this pubkey/group_id
+        let result =
+            AccountGroup::chat_cleared_at_ms(&account.pubkey, &group_id, &whitenoise.database)
+                .await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_clear_chat_sets_timestamp() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[142; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        let before = Utc::now();
+        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+        let after = Utc::now();
+
+        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let cleared_at = ag.chat_cleared_at.expect("chat_cleared_at must be set");
+        // Allow 1s tolerance for millisecond truncation in the database layer
+        let tolerance = chrono::Duration::seconds(1);
+        assert!(
+            cleared_at >= before - tolerance && cleared_at <= after + tolerance,
+            "chat_cleared_at should be approximately between before and after timestamps"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_chat_resets_last_read_message_id() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[143; 32]);
+
+        // Setup: create group_information (FK constraint) and account_group
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Create a message and mark it as read
+        let msg_id = EventId::from_hex(&format!("{:0>64}", "aab")).unwrap();
+        AggregatedMessage::create_for_test(
+            msg_id,
+            group_id.clone(),
+            account.pubkey,
+            Utc::now(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let ag = whitenoise
+            .mark_message_read(&account, &msg_id)
+            .await
+            .unwrap();
+        assert_eq!(ag.last_read_message_id, Some(msg_id));
+
+        // Clear the chat
+        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+
+        // Verify last_read_message_id is reset
+        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ag.last_read_message_id.is_none(),
+            "last_read_message_id must be None after clear_chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_chat_idempotent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[144; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // First clear
+        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_cleared_at = ag1.chat_cleared_at.unwrap();
+
+        // Second clear should also succeed
+        whitenoise.clear_chat(&account, &group_id).await.unwrap();
+        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second_cleared_at = ag2.chat_cleared_at.unwrap();
+
+        assert!(
+            second_cleared_at >= first_cleared_at,
+            "second clear_chat must set a timestamp >= the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_nonexistent_group_returns_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[150; 32]);
+
+        let result = whitenoise.delete_chat(&account, &group_id).await;
+
+        assert!(matches!(result, Err(WhitenoiseError::GroupNotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_removes_account_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[152; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        whitenoise.delete_chat(&account, &group_id).await.unwrap();
+
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ag.is_none(),
+            "account_group row must be gone after delete_chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_hidden_from_visible_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[153; 32]);
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        whitenoise.delete_chat(&account, &group_id).await.unwrap();
+
+        let visible = AccountGroup::visible_for_account(&whitenoise, &account.pubkey)
+            .await
+            .unwrap();
+        let group_ids: Vec<_> = visible.iter().map(|ag| ag.mls_group_id.clone()).collect();
+        assert!(
+            !group_ids.contains(&group_id),
+            "deleted group must not appear in visible groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_sole_account_removes_shared_data() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[154; 32]);
+
+        // Create group_information (required FK) and account_group
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        whitenoise.delete_chat(&account, &group_id).await.unwrap();
+
+        // group_information must be deleted by delete_chat_data
+        let gi_result =
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+        assert!(
+            gi_result.is_err(),
+            "group_information must be deleted when sole account deletes"
+        );
+
+        // accounts_groups row must also be physically deleted
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ag.is_none(),
+            "account_group row must be deleted when sole account deletes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_multi_account_preserves_shared_data() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account_a = whitenoise.create_identity().await.unwrap();
+        let account_b = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[155; 32]);
+
+        // Create group_information and both account_groups
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account_a, &group_id, None)
+            .await
+            .unwrap();
+        whitenoise
+            .get_or_create_account_group(&account_b, &group_id, None)
+            .await
+            .unwrap();
+
+        // Account A deletes
+        whitenoise.delete_chat(&account_a, &group_id).await.unwrap();
+
+        // A's account_group row must be gone
+        let ag_a = AccountGroup::find_by_account_and_group(
+            &account_a.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(ag_a.is_none(), "A's row must be deleted");
+
+        // B's account_group must be unchanged
+        let ag_b = AccountGroup::find_by_account_and_group(
+            &account_b.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(ag_b.is_some(), "B's row must still exist");
+
+        // Shared data must still exist
+        let gi = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+        assert!(
+            gi.is_ok(),
+            "group_information must persist while B still has the group"
+        );
+
+        // Account B deletes
+        whitenoise.delete_chat(&account_b, &group_id).await.unwrap();
+
+        // Now everything should be cleaned up
+        let gi_after =
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+        assert!(
+            gi_after.is_err(),
+            "group_information must be deleted after all accounts delete"
+        );
+
+        let ag_a_after = AccountGroup::find_by_account_and_group(
+            &account_a.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ag_a_after.is_none(),
+            "A's row must be deleted after cleanup"
+        );
+
+        let ag_b_after = AccountGroup::find_by_account_and_group(
+            &account_b.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ag_b_after.is_none(),
+            "B's row must be deleted after cleanup"
+        );
+    }
+
+    #[test]
+    fn test_is_message_visible() {
+        let cleared_at = Utc::now();
+        let before = cleared_at - chrono::Duration::seconds(10);
+        let after = cleared_at + chrono::Duration::seconds(10);
+
+        let mut ag = AccountGroup {
+            id: None,
+            account_pubkey: Keys::generate().public_key(),
+            mls_group_id: GroupId::from_slice(&[0; 32]),
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: None,
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            self_removed: false,
+            muted_until: None,
+            chat_cleared_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // No cleared-at: all messages visible
+        assert!(ag.is_message_visible(before));
+        assert!(ag.is_message_visible(cleared_at));
+        assert!(ag.is_message_visible(after));
+
+        // With cleared-at: only messages strictly after are visible
+        ag.chat_cleared_at = Some(cleared_at);
+        assert!(!ag.is_message_visible(before));
+        assert!(!ag.is_message_visible(cleared_at));
+        assert!(ag.is_message_visible(after));
     }
 }

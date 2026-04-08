@@ -292,7 +292,7 @@ async fn publish_push_group_message_with(
 ) -> Result<()> {
     let mdk = Account::create_mdk(account.pubkey, &config.data_dir, &config.keyring_service_id)?;
     let relay_urls = Whitenoise::ensure_group_relays(&mdk, group_id)?;
-    let event = mdk.create_message(group_id, rumor)?;
+    let event = mdk.create_message(group_id, rumor, None)?;
 
     relay_control
         .publish_event_to(event, &account.pubkey, &relay_urls)

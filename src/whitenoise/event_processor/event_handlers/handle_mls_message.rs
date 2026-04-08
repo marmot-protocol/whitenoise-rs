@@ -11,6 +11,7 @@ use crate::{
     whitenoise::{
         Whitenoise,
         accounts::Account,
+        accounts_groups::AccountGroup,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
         error::{Result, WhitenoiseError},
@@ -25,6 +26,22 @@ use crate::{
     relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream},
     types::EventSource,
 };
+
+/// Extracts the group ID from a `MessageProcessingResult`, if present.
+///
+/// Every variant except `PreviouslyFailed` carries an `mls_group_id`.
+fn extract_group_id(result: &MessageProcessingResult) -> Option<&GroupId> {
+    match result {
+        MessageProcessingResult::ApplicationMessage(msg) => Some(&msg.mls_group_id),
+        MessageProcessingResult::Commit { mls_group_id }
+        | MessageProcessingResult::PendingProposal { mls_group_id }
+        | MessageProcessingResult::ExternalJoinProposal { mls_group_id }
+        | MessageProcessingResult::Unprocessable { mls_group_id } => Some(mls_group_id),
+        MessageProcessingResult::IgnoredProposal { mls_group_id, .. } => Some(mls_group_id),
+        MessageProcessingResult::Proposal(update_result) => Some(&update_result.mls_group_id),
+        MessageProcessingResult::PreviouslyFailed => None,
+    }
+}
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
@@ -69,6 +86,27 @@ impl Whitenoise {
             }
         };
         drop(_mls_proc);
+
+        // Guard: skip outcome handling if no AccountGroup exists for this group.
+        // MDK has already processed the message (updating MLS state), but we
+        // must not write application-level data for a group the user deleted.
+        if let Some(group_id) = extract_group_id(&outcome.result) {
+            let has_account_group =
+                AccountGroup::find_by_account_and_group(&account.pubkey, group_id, &self.database)
+                    .await?
+                    .is_some();
+
+            if !has_account_group {
+                tracing::info!(
+                    target: "whitenoise::event_handlers::handle_mls_message",
+                    group_id = %hex::encode(group_id.as_slice()),
+                    account = %account.pubkey.to_hex(),
+                    "Skipping outcome handling: no AccountGroup exists \
+                     (group may have been deleted)"
+                );
+                return Ok(());
+            }
+        }
 
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
             self.handle_application_message_outcome(
@@ -805,6 +843,7 @@ mod tests {
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
         build_token_removal_rumor, build_token_request_rumor,
     };
+    use mdk_core::prelude::UpdateGroupResult;
 
     use super::*;
     use crate::whitenoise::{
@@ -869,7 +908,7 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        let message_event = mdk.create_message(group_id, inner).unwrap();
+        let message_event = mdk.create_message(group_id, inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -892,7 +931,7 @@ mod tests {
             "👍".to_string(),
         );
         reaction_inner.ensure_id();
-        let reaction_event = mdk.create_message(group_id, reaction_inner).unwrap();
+        let reaction_event = mdk.create_message(group_id, reaction_inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -919,7 +958,7 @@ mod tests {
             String::new(),
         );
         deletion_inner.ensure_id();
-        let deletion_event = mdk.create_message(group_id, deletion_inner).unwrap();
+        let deletion_event = mdk.create_message(group_id, deletion_inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, deletion_event)
@@ -967,7 +1006,8 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        mdk.create_message(&group.mls_group_id, inner).unwrap();
+        mdk.create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         let message = mdk
             .get_message(&group.mls_group_id, &message_id)
@@ -1040,7 +1080,9 @@ mod tests {
             "Valid message".to_string(),
         );
         inner.ensure_id();
-        let valid_event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let valid_event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // Corrupt the event by changing its kind (MLS processing should fail)
         let mut bad_event = valid_event;
@@ -1094,7 +1136,9 @@ mod tests {
             "+".to_string(), // Use simple emoji that won't be normalized
         );
         orphaned_reaction.ensure_id();
-        let reaction_event = mdk.create_message(group_id, orphaned_reaction).unwrap();
+        let reaction_event = mdk
+            .create_message(group_id, orphaned_reaction, None)
+            .unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -1124,7 +1168,7 @@ mod tests {
             "Late message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        let message_event = mdk.create_message(group_id, actual_message).unwrap();
+        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -1194,7 +1238,7 @@ mod tests {
             "👍".to_string(),
         );
         valid_reaction.ensure_id();
-        let valid_event = mdk.create_message(group_id, valid_reaction).unwrap();
+        let valid_event = mdk.create_message(group_id, valid_reaction, None).unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, valid_event)
@@ -1210,7 +1254,9 @@ mod tests {
             "".to_string(), // Empty content is invalid
         );
         invalid_reaction.ensure_id();
-        let invalid_event = mdk.create_message(group_id, invalid_reaction).unwrap();
+        let invalid_event = mdk
+            .create_message(group_id, invalid_reaction, None)
+            .unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, invalid_event)
@@ -1226,7 +1272,7 @@ mod tests {
             "Target message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        let message_event = mdk.create_message(group_id, actual_message).unwrap();
+        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -1373,7 +1419,9 @@ mod tests {
                 format!("Message {}", i),
             );
             inner.ensure_id();
-            let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+            let event = mdk
+                .create_message(&group.mls_group_id, inner, None)
+                .unwrap();
 
             whitenoise
                 .handle_mls_message(&creator_account, event)
@@ -1382,10 +1430,13 @@ mod tests {
         }
 
         // Verify all messages are in cache
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(messages.len(), 3, "All messages should be cached");
         let mut contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
@@ -1427,7 +1478,7 @@ mod tests {
             vec![token_tag.clone()],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, request).unwrap();
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1452,7 +1503,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1495,7 +1546,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, response).unwrap();
+        let event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1523,7 +1574,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1559,7 +1610,7 @@ mod tests {
         .unwrap();
 
         let removal = build_token_removal_rumor(admin_account.pubkey, Timestamp::now());
-        let event = admin_mdk.create_message(&group_id, removal).unwrap();
+        let event = admin_mdk.create_message(&group_id, removal, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1576,7 +1627,7 @@ mod tests {
         assert!(stored.is_empty());
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1602,7 +1653,7 @@ mod tests {
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
                 .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request).unwrap();
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1647,7 +1698,7 @@ mod tests {
         )
         .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let request_event = admin_mdk.create_message(&group_id, request).unwrap();
+        let request_event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, request_event)
@@ -1670,7 +1721,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let response_event = admin_mdk.create_message(&group_id, response).unwrap();
+        let response_event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, response_event)
@@ -1844,7 +1895,9 @@ mod tests {
             "Test message".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // First processing: should succeed
         let first = whitenoise
@@ -1917,7 +1970,9 @@ mod tests {
             "Unprocessable test".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
         let event_id = event.id;
 
         // Build a relay-plane source context for this account.
@@ -2013,11 +2068,126 @@ mod tests {
         );
         inner.ensure_id();
 
-        let message_event = admin_mdk.create_message(&group_id, inner);
+        let message_event = admin_mdk.create_message(&group_id, inner, None);
         assert!(
             message_event.is_ok(),
             "Admin should be able to create messages after auto-committed removal: {:?}",
             message_event.err()
+        );
+    }
+
+    /// Verify `extract_group_id` returns the correct group ID for every variant
+    /// that carries one, and `None` for `PreviouslyFailed`.
+    #[test]
+    fn test_extract_group_id_returns_correct_id_for_each_variant() {
+        let group_id = GroupId::from_slice(&[0xAB; 32]);
+        let pubkey = nostr_sdk::Keys::generate().public_key();
+
+        // ApplicationMessage
+        let mut inner_event = UnsignedEvent::new(
+            pubkey,
+            Timestamp::now(),
+            Kind::Custom(9),
+            vec![],
+            "test".to_string(),
+        );
+        inner_event.ensure_id();
+        let message = mdk_core::prelude::message_types::Message {
+            id: inner_event.id.unwrap(),
+            pubkey,
+            created_at: Timestamp::now(),
+            processed_at: Timestamp::now(),
+            kind: Kind::Custom(9),
+            tags: Tags::new(),
+            content: "test".to_string(),
+            mls_group_id: group_id.clone(),
+            event: inner_event,
+            wrapper_event_id: EventId::all_zeros(),
+            epoch: None,
+            state: mdk_core::prelude::message_types::MessageState::Processed,
+        };
+        let result = MessageProcessingResult::ApplicationMessage(message);
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "ApplicationMessage should return group_id"
+        );
+
+        // Commit
+        let result = MessageProcessingResult::Commit {
+            mls_group_id: group_id.clone(),
+        };
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "Commit should return group_id"
+        );
+
+        // PendingProposal
+        let result = MessageProcessingResult::PendingProposal {
+            mls_group_id: group_id.clone(),
+        };
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "PendingProposal should return group_id"
+        );
+
+        // IgnoredProposal
+        let result = MessageProcessingResult::IgnoredProposal {
+            mls_group_id: group_id.clone(),
+            reason: "test reason".to_string(),
+        };
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "IgnoredProposal should return group_id"
+        );
+
+        // ExternalJoinProposal
+        let result = MessageProcessingResult::ExternalJoinProposal {
+            mls_group_id: group_id.clone(),
+        };
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "ExternalJoinProposal should return group_id"
+        );
+
+        // Unprocessable
+        let result = MessageProcessingResult::Unprocessable {
+            mls_group_id: group_id.clone(),
+        };
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "Unprocessable should return group_id"
+        );
+
+        // Proposal (auto-committed) - requires constructing UpdateGroupResult with a
+        // signed Event; use a throwaway key to produce a valid one.
+        let keys = nostr_sdk::Keys::generate();
+        let dummy_event = nostr_sdk::EventBuilder::text_note("dummy")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let update_result = UpdateGroupResult {
+            evolution_event: dummy_event,
+            welcome_rumors: None,
+            mls_group_id: group_id.clone(),
+        };
+        let result = MessageProcessingResult::Proposal(update_result);
+        assert_eq!(
+            extract_group_id(&result),
+            Some(&group_id),
+            "Proposal should return group_id"
+        );
+
+        // PreviouslyFailed
+        let result = MessageProcessingResult::PreviouslyFailed;
+        assert_eq!(
+            extract_group_id(&result),
+            None,
+            "PreviouslyFailed should return None"
         );
     }
 }

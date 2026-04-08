@@ -25,6 +25,15 @@ pub enum ChatListUpdateTrigger {
     /// or deletes it. The item's `removed_at` and `self_removed` fields are set.
     /// Routing: same as RemovedFromGroup — active or archived based on archive status.
     LeftGroup,
+    /// All messages were cleared from this chat.
+    /// The group remains in the chat list with no messages.
+    /// Consumers should reset their message list to empty.
+    ChatCleared,
+    /// The chat was permanently deleted by this account.
+    /// Consumers must remove the item from their list.
+    /// Emitted to both active and archived channels since the group
+    /// could be in either state at the time of deletion.
+    ChatDeleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +71,8 @@ mod tests {
             ChatListUpdateTrigger::RemovedFromGroup,
             ChatListUpdateTrigger::ChatMuteChanged,
             ChatListUpdateTrigger::LeftGroup,
+            ChatListUpdateTrigger::ChatCleared,
+            ChatListUpdateTrigger::ChatDeleted,
         ];
 
         for trigger in triggers {
@@ -94,5 +105,11 @@ mod tests {
 
         let debug_str = format!("{:?}", ChatListUpdateTrigger::LeftGroup);
         assert!(debug_str.contains("LeftGroup"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatCleared);
+        assert!(debug_str.contains("ChatCleared"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatDeleted);
+        assert!(debug_str.contains("ChatDeleted"));
     }
 }
