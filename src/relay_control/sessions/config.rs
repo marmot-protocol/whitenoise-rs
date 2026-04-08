@@ -21,13 +21,6 @@ pub(crate) enum RelaySessionReconnectPolicy {
     Disabled,
 }
 
-/// Session-level relay membership policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub(crate) enum RelaySessionRelayPolicy {
-    #[default]
-    Dynamic,
-}
-
 /// Shared session configuration reused by all future relay planes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RelaySessionConfig {
@@ -35,7 +28,6 @@ pub(crate) struct RelaySessionConfig {
     pub(crate) telemetry_account_pubkey: Option<PublicKey>,
     pub(crate) auth_policy: RelaySessionAuthPolicy,
     pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
-    pub(crate) relay_policy: RelaySessionRelayPolicy,
     pub(crate) connect_timeout: Duration,
     /// Minimum number of relays that must be connected before proceeding.
     /// When set, `prepare_relay_urls` returns as soon as this threshold is
@@ -52,7 +44,6 @@ impl RelaySessionConfig {
             telemetry_account_pubkey: None,
             auth_policy: RelaySessionAuthPolicy::Disabled,
             reconnect_policy: RelaySessionReconnectPolicy::Disabled,
-            relay_policy: RelaySessionRelayPolicy::Dynamic,
             connect_timeout: Duration::from_secs(5),
             min_connected_relays: None,
         }

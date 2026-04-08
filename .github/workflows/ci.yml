@@ -92,6 +92,7 @@ jobs:
     if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +100,7 @@ jobs:
       - name: Check for allow(dead_code) annotations
         id: check
         run: |
-          matches=$(grep -rn '#\[allow(dead_code)\]' src/ --include='*.rs' || true)
+          matches=$(grep -rn -E 'allow\s*\(\s*([^)]*,\s*)?dead_code\s*(,\s*[^)]*)?\)' src/ --include='*.rs' || true)
           if [ -n "$matches" ]; then
             {
               echo "body<<EOF"

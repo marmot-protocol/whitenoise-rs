@@ -2,9 +2,11 @@
 
 set -euo pipefail
 
-echo "🔍 Checking for #[allow(dead_code)] annotations..."
+echo "🔍 Checking for allow(dead_code) annotations..."
 
-matches=$(grep -rn '#\[allow(dead_code)\]' src/ --include='*.rs' || true)
+# Matches all forms: #[allow(dead_code)], #![allow(dead_code)],
+# #[cfg_attr(..., allow(dead_code))], #[allow(unused, dead_code)], etc.
+matches=$(grep -rn -E 'allow\s*\(\s*([^)]*,\s*)?dead_code\s*(,\s*[^)]*)?\)' src/ --include='*.rs' || true)
 
 if [ -n "$matches" ]; then
     echo "❌ Found #[allow(dead_code)] annotations:"

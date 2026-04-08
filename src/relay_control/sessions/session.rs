@@ -89,12 +89,9 @@ impl RelaySession {
         session
     }
 
+    #[cfg(test)]
     pub(crate) fn client(&self) -> &Client {
         &self.client
-    }
-
-    pub(crate) fn config(&self) -> &RelaySessionConfig {
-        &self.config
     }
 
     pub(crate) fn telemetry(&self) -> broadcast::Receiver<RelayTelemetry> {
@@ -839,22 +836,6 @@ impl RelaySession {
         self.client.shutdown().await;
     }
 
-    #[perf_instrument("relay")]
-    pub(crate) async fn unsubscribe_all(&self) {
-        let subscription_ids: Vec<SubscriptionId> = self
-            .state
-            .subscription_relays
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect();
-
-        for subscription_id in subscription_ids {
-            self.unsubscribe(&subscription_id).await;
-        }
-        self.client.unsubscribe_all().await;
-    }
 
     pub(crate) async fn snapshot(&self, known_relays: &[RelayUrl]) -> RelaySessionStateSnapshot {
         let notification_handler_registered = self.notification_handler_registered();
