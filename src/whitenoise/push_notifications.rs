@@ -823,7 +823,34 @@ impl Whitenoise {
         request_event_id: EventId,
     ) {
         let key = (account.pubkey, group_id.clone(), request_event_id);
-        self.pending_push_token_responses.insert(key, ());
+
+        // If the key was already present, an identical request is already in-flight.
+        // Inserting again is a no-op (value is `()`), so we use the return value to
+        // detect duplicates atomically before touching the semaphore.
+        if self
+            .pending_push_token_responses
+            .insert(key.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+
+        // Key is freshly owned by us; now enforce the concurrency cap.
+        let permit = match self.token_response_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    request_event_id = %request_event_id.to_hex(),
+                    "Dropping MIP-05 token-list response task: concurrency limit reached"
+                );
+                // Safe to remove: we are the ones who inserted this key above.
+                self.pending_push_token_responses.remove(&key);
+                return;
+            }
+        };
 
         let context = PendingTokenResponseContext {
             config: self.config.clone(),
@@ -849,6 +876,8 @@ impl Whitenoise {
                     "Failed to send delayed MIP-05 token-list response"
                 );
             }
+
+            drop(permit);
         });
     }
 
