@@ -839,14 +839,12 @@ mod tests {
         first.unwrap();
         second.unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
-                if user.metadata_is_known() {
-                    break user;
+                if whitenoise.user_resolution_run_count_for_testing(&pubkey) >= 1 {
+                    break;
                 }
-
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         })
         .await

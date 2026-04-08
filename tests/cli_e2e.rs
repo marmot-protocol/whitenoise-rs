@@ -19,7 +19,7 @@ use std::{path::PathBuf, time::Duration};
 #[path = "support/cli.rs"]
 mod cli_support;
 
-use cli_support::{Daemon, group_id_hex, poll_until, wait_for_group, wait_for_message, wn};
+use cli_support::{Daemon, group_id_hex, poll_until, wait_for_group, wait_for_message, wn, wn_try};
 
 async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
     let msg = format!("did not see a valid key package for {pubkey} within 30s");
@@ -30,6 +30,41 @@ async fn wait_for_key_package(socket: &PathBuf, pubkey: &str) {
             == Some("valid")
     })
     .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+async fn ensure_key_package_on_relays(socket: &PathBuf, pubkey: &str) {
+    wait_for_key_package(socket, pubkey).await;
+    wn(socket, &["--account", pubkey, "keys", "publish"]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+}
+
+async fn create_group_with_retry(
+    socket: &PathBuf,
+    account_pubkey: &str,
+    group_name: &str,
+    member_pubkey: &str,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let args = [
+        "--account",
+        account_pubkey,
+        "groups",
+        "create",
+        group_name,
+        member_pubkey,
+    ];
+    loop {
+        match wn_try(socket, &args) {
+            Ok(result) => return result,
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("timed out creating group after retries: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +148,7 @@ async fn follows_lifecycle() {
         .as_str()
         .unwrap()
         .to_string();
+    ensure_key_package_on_relays(&alice.socket, &alice_pk).await;
     let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
         .as_str()
         .unwrap()
@@ -169,23 +205,14 @@ async fn group_metadata_and_membership() {
         .as_str()
         .unwrap()
         .to_string();
+    wait_for_key_package(&alice.socket, &alice_pk).await;
     let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
         .as_str()
         .unwrap()
         .to_string();
-    wait_for_key_package(&bob.socket, &bob_pk).await;
+    ensure_key_package_on_relays(&bob.socket, &bob_pk).await;
 
-    let group = wn(
-        &alice.socket,
-        &[
-            "--account",
-            &alice_pk,
-            "groups",
-            "create",
-            "Metadata Test",
-            &bob_pk,
-        ],
-    );
+    let group = create_group_with_retry(&alice.socket, &alice_pk, "Metadata Test", &bob_pk).await;
     let gid = group_id_hex(&group);
 
     wait_for_group(&bob.socket, &bob_pk).await;
@@ -260,23 +287,14 @@ async fn cross_daemon_group_messaging() {
         .as_str()
         .unwrap()
         .to_string();
+    ensure_key_package_on_relays(&alice.socket, &alice_pk).await;
     let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
         .as_str()
         .unwrap()
         .to_string();
-    wait_for_key_package(&bob.socket, &bob_pk).await;
+    ensure_key_package_on_relays(&bob.socket, &bob_pk).await;
 
-    let group = wn(
-        &alice.socket,
-        &[
-            "--account",
-            &alice_pk,
-            "groups",
-            "create",
-            "E2E Test Group",
-            &bob_pk,
-        ],
-    );
+    let group = create_group_with_retry(&alice.socket, &alice_pk, "E2E Test Group", &bob_pk).await;
     let gid = group_id_hex(&group);
 
     wait_for_group(&bob.socket, &bob_pk).await;
@@ -330,24 +348,16 @@ async fn second_identity_does_not_break_first_account_messaging() {
         .as_str()
         .unwrap()
         .to_string();
+    ensure_key_package_on_relays(&alice.socket, &alice_pk1).await;
     let bob_pk = wn(&bob.socket, &["create-identity"])["pubkey"]
         .as_str()
         .unwrap()
         .to_string();
-    wait_for_key_package(&bob.socket, &bob_pk).await;
+    ensure_key_package_on_relays(&bob.socket, &bob_pk).await;
 
     // Establish a working chat with account 1
-    let group = wn(
-        &alice.socket,
-        &[
-            "--account",
-            &alice_pk1,
-            "groups",
-            "create",
-            "Multi-Account Test",
-            &bob_pk,
-        ],
-    );
+    let group =
+        create_group_with_retry(&alice.socket, &alice_pk1, "Multi-Account Test", &bob_pk).await;
     let gid = group_id_hex(&group);
     wait_for_group(&bob.socket, &bob_pk).await;
     tokio::time::sleep(Duration::from_secs(5)).await;

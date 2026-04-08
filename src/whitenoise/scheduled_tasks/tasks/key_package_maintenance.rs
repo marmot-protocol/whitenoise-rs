@@ -470,9 +470,18 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
-        // Create account (this publishes a valid key package automatically)
+        // Normalize to a single deterministic valid key package.
         let account = whitenoise.create_identity().await.unwrap();
         let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
+        whitenoise
+            .delete_all_key_packages_for_account(&account, true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        whitenoise
+            .create_and_publish_key_package(&account, &kp_relays)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Also publish an outdated key package (missing encoding tag)
@@ -581,6 +590,16 @@ mod tests {
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
+        let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
+        whitenoise
+            .delete_all_key_packages_for_account(&account, true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        whitenoise
+            .create_and_publish_key_package(&account, &kp_relays)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise

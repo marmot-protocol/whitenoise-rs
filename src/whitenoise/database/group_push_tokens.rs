@@ -150,6 +150,28 @@ impl GroupPushToken {
     }
 
     #[perf_instrument("db::group_push_tokens")]
+    pub(crate) async fn delete_by_member_pubkey_and_leaf_index(
+        account_pubkey: &PublicKey,
+        mls_group_id: &GroupId,
+        member_pubkey: &PublicKey,
+        leaf_index: u32,
+        database: &Database,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM group_push_tokens
+             WHERE account_pubkey = ? AND mls_group_id = ? AND member_pubkey = ? AND leaf_index = ?",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(mls_group_id.as_slice())
+        .bind(member_pubkey.to_hex())
+        .bind(i64::from(leaf_index))
+        .execute(&database.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[perf_instrument("db::group_push_tokens")]
     pub(crate) async fn delete_by_member_pubkey(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
@@ -448,6 +470,63 @@ mod tests {
         .await
         .unwrap();
         assert!(stored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_group_push_tokens_delete_by_member_pubkey_and_leaf_index_removes_one_leaf() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mls_group_id = make_group_id(12);
+        let member_pubkey = Keys::generate().public_key();
+        let first_server = Keys::generate().public_key();
+        let second_server = Keys::generate().public_key();
+
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &first_server,
+            None,
+            "ciphertext-leaf-3",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            7,
+            &second_server,
+            None,
+            "ciphertext-leaf-7",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let deleted = GroupPushToken::delete_by_member_pubkey_and_leaf_index(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(deleted);
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].leaf_index, 7);
+        assert_eq!(stored[0].encrypted_token, "ciphertext-leaf-7");
     }
 
     #[tokio::test]

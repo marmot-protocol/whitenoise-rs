@@ -94,7 +94,11 @@ impl Whitenoise {
     ///
     /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
     /// preflight status checks and actual group creation use the same fallback chain.
-    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+    async fn resolve_member_key_package(
+        &self,
+        pk: &PublicKey,
+        creator_account: &Account,
+    ) -> Result<(User, Event)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
         if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
@@ -105,13 +109,49 @@ impl Whitenoise {
             );
         }
 
+        let mut relay_urls = user.key_package_relay_urls(self).await?;
+        let has_key_package_relays = !user
+            .relays(RelayType::KeyPackage, &self.database)
+            .await?
+            .is_empty();
+        let has_nip65_relays = !user
+            .relays(RelayType::Nip65, &self.database)
+            .await?
+            .is_empty();
+
+        if !has_key_package_relays && !has_nip65_relays {
+            let fallback_relays = creator_account.nip65_relays(self).await?;
+            if !fallback_relays.is_empty() {
+                tracing::warn!(
+                    target: "whitenoise::accounts::groups::create_group",
+                    "User {} has no key package or NIP-65 relays, using creator {} NIP-65 relays",
+                    user.pubkey,
+                    creator_account.pubkey
+                );
+                relay_urls = Relay::urls(&fallback_relays);
+            }
+        }
+
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let some_event = user.key_package_event(self).await?;
+        let mut event = None;
+        let max_attempts = 10;
+        for attempt in 0..max_attempts {
+            event = self
+                .relay_control
+                .fetch_user_key_package(user.pubkey, &relay_urls)
+                .await?;
+            if event.is_some() {
+                break;
+            }
+            if attempt + 1 < max_attempts {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
         drop(_kp_fetch);
 
-        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-        ))?;
+        let event = event.ok_or(WhitenoiseError::MdkCoreError(mdk_core::Error::KeyPackage(
+            "Does not exist".to_owned(),
+        )))?;
 
         Self::validate_fetched_member_key_package(&event, pk)?;
 
@@ -317,7 +357,7 @@ impl Whitenoise {
         // Resolve members and fetch key packages concurrently
         let member_futures = member_pubkeys
             .iter()
-            .map(|pk| self.resolve_member_key_package(pk));
+            .map(|pk| self.resolve_member_key_package(pk, creator_account));
         let resolved_members = try_join_all(member_futures).await?;
         let (members, key_package_events): (Vec<User>, Vec<Event>) =
             resolved_members.into_iter().unzip();

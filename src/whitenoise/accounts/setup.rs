@@ -167,21 +167,21 @@ impl Whitenoise {
         }
 
         if needs_publish {
-            match self
+            let publish_result = self
                 .create_key_package_and_background_publish(account, key_package_relays)
-                .await
-            {
-                Ok(()) => {
-                    tracing::debug!(target: "whitenoise::accounts", "Key package created");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::accounts",
-                        "Key package creation failed, scheduler will retry: {}",
-                        e
-                    );
-                }
-            }
+                .await;
+
+            match publish_result {
+                Ok(()) => tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Key package material created; relay publish runs in background"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "whitenoise::accounts",
+                    "Key package creation failed, scheduler will retry: {}",
+                    e
+                ),
+            };
         }
 
         Ok(())

@@ -624,6 +624,13 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
     Ok(())
 }
 
+/// Updates cached [`GroupPushToken`] rows for the local account in one MLS group.
+enum LocalGroupPushTokenCacheOp<'a> {
+    Upsert(&'a TokenTag),
+    RemoveCurrentLeafOnly,
+    RemoveAllMemberLeaves,
+}
+
 impl Whitenoise {
     /// Returns the locally stored push registration for `account`, if present.
     #[perf_instrument("push_notifications")]
@@ -970,9 +977,14 @@ impl Whitenoise {
             .await
             .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
 
-        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
-            .await
-            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
+        self.sync_local_group_push_token_cache(
+            mdk,
+            account,
+            group_id,
+            LocalGroupPushTokenCacheOp::Upsert(token_tag),
+        )
+        .await
+        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
     }
 
     #[perf_instrument("push_notifications")]
@@ -1063,8 +1075,13 @@ impl Whitenoise {
             vec![token_tag.clone()],
         )?;
         publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor).await?;
-        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
-            .await
+        self.sync_local_group_push_token_cache(
+            mdk,
+            account,
+            group_id,
+            LocalGroupPushTokenCacheOp::Upsert(token_tag),
+        )
+        .await
     }
 
     #[perf_instrument("push_notifications")]
@@ -1159,7 +1176,12 @@ impl Whitenoise {
 
         // Always run cache sync regardless of publish outcome.
         let cache_err = self
-            .sync_local_group_push_token_cache(mdk, account, group_id, None)
+            .sync_local_group_push_token_cache(
+                mdk,
+                account,
+                group_id,
+                LocalGroupPushTokenCacheOp::RemoveAllMemberLeaves,
+            )
             .await
             .err()
             .map(|e| format!("{group_id_hex}: {e}"));
@@ -1212,8 +1234,13 @@ impl Whitenoise {
             );
         }
 
-        self.sync_local_group_push_token_cache(&mdk, account, group_id, None)
-            .await
+        self.sync_local_group_push_token_cache(
+            &mdk,
+            account,
+            group_id,
+            LocalGroupPushTokenCacheOp::RemoveCurrentLeafOnly,
+        )
+        .await
     }
 
     #[perf_instrument("push_notifications")]
@@ -1293,12 +1320,11 @@ impl Whitenoise {
         mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         group_id: &GroupId,
-        token_tag: Option<&TokenTag>,
+        op: LocalGroupPushTokenCacheOp<'_>,
     ) -> Result<()> {
-        let leaf_index = mdk.own_leaf_index(group_id)?;
-
-        match token_tag {
-            Some(token_tag) => {
+        match op {
+            LocalGroupPushTokenCacheOp::Upsert(token_tag) => {
+                let leaf_index = mdk.own_leaf_index(group_id)?;
                 GroupPushToken::upsert(
                     &account.pubkey,
                     group_id,
@@ -1311,9 +1337,25 @@ impl Whitenoise {
                 )
                 .await?;
             }
-            None => {
-                GroupPushToken::delete(&account.pubkey, group_id, leaf_index, &self.database)
-                    .await?;
+            LocalGroupPushTokenCacheOp::RemoveCurrentLeafOnly => {
+                let leaf_index = mdk.own_leaf_index(group_id)?;
+                GroupPushToken::delete_by_member_pubkey_and_leaf_index(
+                    &account.pubkey,
+                    group_id,
+                    &account.pubkey,
+                    leaf_index,
+                    &self.database,
+                )
+                .await?;
+            }
+            LocalGroupPushTokenCacheOp::RemoveAllMemberLeaves => {
+                GroupPushToken::delete_by_member_pubkey(
+                    &account.pubkey,
+                    group_id,
+                    &account.pubkey,
+                    &self.database,
+                )
+                .await?;
             }
         }
 
@@ -2650,12 +2692,10 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::pause();
         let settings = whitenoise
             .update_notifications_enabled(&admin_account, false)
             .await
             .unwrap();
-        tokio::time::resume();
         assert!(!settings.notifications_enabled);
 
         let cached_after_disable = GroupPushToken::find_by_account_and_group(
@@ -3014,6 +3054,21 @@ mod tests {
             &member_account,
         )
         .await;
+
+        let key_package_relays = member_account
+            .key_package_relays(&whitenoise)
+            .await
+            .unwrap();
+        whitenoise
+            .delete_all_key_packages_for_account(&member_account, true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        whitenoise
+            .create_and_publish_key_package(&member_account, &key_package_relays)
+            .await
+            .unwrap();
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Create a pending group (welcome finalized but not accepted by member).
         let pending_group_id = setup_two_member_group_with_welcome_finalization(
