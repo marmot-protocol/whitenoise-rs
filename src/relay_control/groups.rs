@@ -16,25 +16,6 @@ use crate::{
     types::{GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ProcessableEvent},
 };
 
-/// Configuration for the long-lived group-message plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct GroupPlaneConfig {
-    pub(crate) relays: Vec<RelayUrl>,
-    pub(crate) group_ids: Vec<String>,
-    pub(crate) reconnect_policy: RelaySessionReconnectPolicy,
-}
-
-impl Default for GroupPlaneConfig {
-    fn default() -> Self {
-        Self {
-            relays: Vec::new(),
-            group_ids: Vec::new(),
-            reconnect_policy: RelaySessionReconnectPolicy::FreshnessBiased,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GroupSubscriptionSpec {
     pub(crate) group_id: String,
@@ -196,7 +177,6 @@ impl GroupPlane {
             .map(|state| state.groups.clone())
     }
 
-    #[allow(dead_code)]
     #[perf_instrument("relay")]
     pub(crate) async fn has_account(&self, pubkey: &PublicKey) -> bool {
         self.accounts.read().await.contains_key(pubkey)
@@ -399,17 +379,6 @@ mod tests {
     use super::*;
     use futures::future::join_all;
     use tokio::sync::mpsc;
-
-    #[test]
-    fn test_default_uses_explicit_group_reconnect_policy() {
-        let config = GroupPlaneConfig::default();
-        assert_eq!(config.relays, Vec::<RelayUrl>::new());
-        assert_eq!(config.group_ids, Vec::<String>::new());
-        assert_eq!(
-            config.reconnect_policy,
-            RelaySessionReconnectPolicy::FreshnessBiased
-        );
-    }
 
     #[tokio::test]
     async fn test_group_plane_hash_is_stable_for_account() {

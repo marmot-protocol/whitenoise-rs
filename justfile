@@ -332,17 +332,22 @@ fmt:
 check-docs:
     @bash scripts/check-docs.sh
 
+# Check for #[allow(dead_code)] annotations
+check-dead-code-allows:
+    @bash scripts/check-dead-code-allows.sh
+
 # Check all (fast checks before running tests)
 check:
     @bash scripts/check-all.sh
 
 # Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
 precommit:
-    @just _run-quiet "check-fmt"    "fmt"
-    @just _run-quiet "check-docs"   "docs"
-    @just _run-quiet "check-clippy" "clippy"
-    @just _run-quiet "test"         "tests"
-    @just _run-quiet "int-test"     "integration tests"
+    @just _run-quiet "check-fmt"                "fmt"
+    @just _run-quiet "check-docs"               "docs"
+    @just _run-quiet "check-clippy"             "clippy"
+    @just _run-quiet "check-dead-code-allows"   "dead_code"
+    @just _run-quiet "test"                     "tests"
+    @just _run-quiet "int-test"                 "integration tests"
     @echo "PRECOMMIT PASSED"
 
 # Pre-commit checks with verbose output (shows all command output)
@@ -350,10 +355,11 @@ precommit-verbose: check test int-test
 
 # Quick pre-commit: quiet mode, skip integration tests (recommended for agents/CI)
 precommit-quick:
-    @just _run-quiet "check-fmt"    "fmt"
-    @just _run-quiet "check-docs"   "docs"
-    @just _run-quiet "check-clippy" "clippy"
-    @just _run-quiet "test-unit"    "tests"
+    @just _run-quiet "check-fmt"                "fmt"
+    @just _run-quiet "check-docs"               "docs"
+    @just _run-quiet "check-clippy"             "clippy"
+    @just _run-quiet "check-dead-code-allows"   "dead_code"
+    @just _run-quiet "test-unit"                "tests"
     @echo "PRECOMMIT PASSED"
 
 # Unit tests only (no integration-tests feature, no e2e binaries).

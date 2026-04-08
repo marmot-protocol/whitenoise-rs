@@ -107,7 +107,6 @@ impl RelayStatusRecord {
         }
     }
 
-    #[allow(dead_code)]
     #[perf_instrument("db::relay_status")]
     pub(crate) async fn find(
         relay_url: &RelayUrl,

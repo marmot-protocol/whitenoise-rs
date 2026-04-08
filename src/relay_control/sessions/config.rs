@@ -10,8 +10,6 @@ pub(crate) enum RelaySessionAuthPolicy {
     #[default]
     Disabled,
     Allowed,
-    #[allow(dead_code)]
-    Required,
 }
 
 /// Session-level reconnect policy.
@@ -28,8 +26,6 @@ pub(crate) enum RelaySessionReconnectPolicy {
 pub(crate) enum RelaySessionRelayPolicy {
     #[default]
     Dynamic,
-    #[allow(dead_code)]
-    ExplicitOnly,
 }
 
 /// Shared session configuration reused by all future relay planes.

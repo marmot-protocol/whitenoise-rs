@@ -148,7 +148,6 @@ pub struct Whitenoise {
     database: Arc<Database>,
     event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
     content_parser: crate::nostr_manager::parser::ContentParser,
-    #[allow(dead_code)]
     relay_control: Arc<RelayControlPlane>,
     secrets_store: SecretsStore,
     storage: storage::Storage,

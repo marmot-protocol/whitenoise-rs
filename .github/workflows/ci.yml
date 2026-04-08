@@ -86,6 +86,51 @@ jobs:
       - name: Clippy check
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings -A clippy::uninlined_format_args
 
+  dead-code-allows:
+    name: Flag allow(dead_code)
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for allow(dead_code) annotations
+        id: check
+        run: |
+          matches=$(grep -rn '#\[allow(dead_code)\]' src/ --include='*.rs' || true)
+          if [ -n "$matches" ]; then
+            {
+              echo "body<<EOF"
+              echo "## ⚠️ \`#[allow(dead_code)]\` detected"
+              echo ""
+              echo "The following files contain \`#[allow(dead_code)]\` annotations. Please remove them and either delete the dead code or gate it with \`#[cfg(test)]\`."
+              echo ""
+              echo '```'
+              echo "$matches"
+              echo '```'
+              echo EOF
+            } >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on PR
+        if: steps.check.outputs.found == 'true'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: dead-code-allows
+          message: ${{ steps.check.outputs.body }}
+
+      - name: Remove comment if clean
+        if: steps.check.outputs.found == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: dead-code-allows
+          delete: true
+
   docs:
     name: Documentation
     needs: changes

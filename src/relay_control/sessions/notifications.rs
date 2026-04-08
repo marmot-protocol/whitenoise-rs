@@ -20,15 +20,6 @@ pub(crate) enum RelayNotification {
         challenge: String,
         failure_category: Option<RelayFailureCategory>,
     },
-    #[allow(dead_code)]
-    Connected { relay_url: RelayUrl },
-    #[allow(dead_code)]
-    Disconnected {
-        relay_url: RelayUrl,
-        failure_category: Option<RelayFailureCategory>,
-    },
-    #[allow(dead_code)]
-    Shutdown,
 }
 
 impl RelayNotification {

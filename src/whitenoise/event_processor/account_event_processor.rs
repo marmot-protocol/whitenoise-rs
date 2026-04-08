@@ -228,20 +228,6 @@ impl Whitenoise {
     #[perf_instrument("event_processor")]
     async fn account_from_event_source(&self, source: &EventSource) -> Result<Account> {
         let target_pubkey = match source {
-            EventSource::LegacySubscriptionId(Some(subscription_id)) => self
-                .extract_pubkey_from_subscription_id(subscription_id)
-                .await
-                .map_err(|_| {
-                    WhitenoiseError::InvalidEvent(format!(
-                        "Cannot extract pubkey from subscription ID: {}",
-                        subscription_id
-                    ))
-                })?,
-            EventSource::LegacySubscriptionId(None) => {
-                return Err(WhitenoiseError::InvalidEvent(
-                    "Cannot resolve account for missing legacy subscription ID".to_string(),
-                ));
-            }
             EventSource::RelaySubscription(context) => {
                 context.account_pubkey.ok_or(WhitenoiseError::InvalidEvent(
                     "Relay subscription context missing account pubkey".to_string(),

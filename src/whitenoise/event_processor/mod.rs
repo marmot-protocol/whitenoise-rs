@@ -77,40 +77,20 @@ impl Whitenoise {
                                     return;
                                 }
 
-                                match &source {
-                                    EventSource::LegacySubscriptionId(subscription_id) => {
-                                        let Some(sub_id) = subscription_id.clone() else {
-                                            tracing::warn!(
-                                                target: "whitenoise::event_processor::process_events",
-                                                "Event received without subscription ID, skipping"
-                                            );
-                                            return;
-                                        };
-
-                                        if whitenoise.is_event_global(&sub_id) {
-                                            whitenoise
-                                                .process_global_event(event, source, retry_info)
-                                                .await;
-                                        } else {
-                                            whitenoise
-                                                .process_account_event(event, source, retry_info)
-                                                .await;
-                                        }
+                                let EventSource::RelaySubscription(context) = &source;
+                                match context.stream {
+                                    SubscriptionStream::DiscoveryUserData => {
+                                        whitenoise
+                                            .process_global_event(event, source, retry_info)
+                                            .await;
                                     }
-                                    EventSource::RelaySubscription(context) => match context.stream {
-                                        SubscriptionStream::DiscoveryUserData => {
-                                            whitenoise
-                                                .process_global_event(event, source, retry_info)
-                                                .await;
-                                        }
-                                        SubscriptionStream::DiscoveryFollowLists
-                                        | SubscriptionStream::GroupMessages
-                                        | SubscriptionStream::AccountInboxGiftwraps => {
-                                            whitenoise
-                                                .process_account_event(event, source, retry_info)
-                                                .await;
-                                        }
-                                    },
+                                    SubscriptionStream::DiscoveryFollowLists
+                                    | SubscriptionStream::GroupMessages
+                                    | SubscriptionStream::AccountInboxGiftwraps => {
+                                        whitenoise
+                                            .process_account_event(event, source, retry_info)
+                                            .await;
+                                    }
                                 }
                             }
                             ProcessableEvent::RelayMessage(relay_url, message) => {
@@ -155,6 +135,7 @@ impl Whitenoise {
         );
     }
 
+    #[cfg(test)]
     fn is_event_global(&self, subscription_id: &str) -> bool {
         subscription_id.starts_with("global_users_")
     }
@@ -206,6 +187,7 @@ mod tests {
     use nostr_sdk::prelude::*;
 
     use crate::nostr_manager::utils::is_event_timestamp_valid;
+    use crate::relay_control::{RelayPlane, SubscriptionContext, SubscriptionStream};
     use crate::types::{EventSource, RetryInfo};
     use crate::whitenoise::error::WhitenoiseError;
     use crate::whitenoise::test_utils::*;
@@ -294,7 +276,13 @@ mod tests {
         // Should not panic; spawns a delayed re-queue task
         whitenoise.schedule_retry(
             event,
-            EventSource::LegacySubscriptionId(Some("global_users_abc123_0".to_string())),
+            EventSource::RelaySubscription(SubscriptionContext {
+                plane: RelayPlane::Discovery,
+                account_pubkey: None,
+                relay_url: RelayUrl::parse("wss://relay.example.com").unwrap(),
+                stream: SubscriptionStream::DiscoveryUserData,
+                group_ids: vec![],
+            }),
             retry_info,
             error,
         );
@@ -323,7 +311,13 @@ mod tests {
         // Should not spawn any task since retries are exhausted
         whitenoise.schedule_retry(
             event,
-            EventSource::LegacySubscriptionId(Some("global_users_abc123_0".to_string())),
+            EventSource::RelaySubscription(SubscriptionContext {
+                plane: RelayPlane::Discovery,
+                account_pubkey: None,
+                relay_url: RelayUrl::parse("wss://relay.example.com").unwrap(),
+                stream: SubscriptionStream::DiscoveryUserData,
+                group_ids: vec![],
+            }),
             retry_info,
             error,
         );

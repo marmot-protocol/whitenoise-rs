@@ -229,7 +229,7 @@ impl RelayTelemetry {
         self
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn with_occurred_at(mut self, occurred_at: DateTime<Utc>) -> Self {
         self.occurred_at = occurred_at;
         self
@@ -302,11 +302,6 @@ impl RelayObservability {
         Self { config }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn config(&self) -> &RelayObservabilityConfig {
-        &self.config
-    }
-
     #[perf_instrument("relay")]
     pub(crate) async fn record(
         &self,
@@ -357,37 +352,6 @@ impl RelayObservability {
         RelayStatusRecord::upsert_from_telemetry(telemetry, database).await?;
 
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    #[perf_instrument("relay")]
-    pub(crate) async fn status(
-        &self,
-        database: &Database,
-        relay_url: &RelayUrl,
-        plane: RelayPlane,
-        account_pubkey: Option<PublicKey>,
-    ) -> Result<Option<RelayStatusRecord>, DatabaseError> {
-        RelayStatusRecord::find(relay_url, plane, account_pubkey, database).await
-    }
-
-    #[allow(dead_code)]
-    #[perf_instrument("relay")]
-    pub(crate) async fn recent_events(
-        &self,
-        database: &Database,
-        relay_url: &RelayUrl,
-        plane: RelayPlane,
-        account_pubkey: Option<PublicKey>,
-    ) -> Result<Vec<RelayEventRecord>, DatabaseError> {
-        RelayEventRecord::list_recent_for_scope(
-            relay_url,
-            plane,
-            account_pubkey,
-            self.config.recent_event_limit,
-            database,
-        )
-        .await
     }
 }
 
