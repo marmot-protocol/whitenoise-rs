@@ -184,8 +184,7 @@ pub struct Whitenoise {
     /// In-memory coordination for delayed MIP-05 token-list responses.
     pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
     /// Bounds the number of concurrently-active delayed MIP-05 token-list response tasks.
-    /// Tasks that cannot acquire a permit are dropped; the deduplication map ensures the
-    /// requester can retry via a subsequent request event.
+    /// See [`push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS`] for the cap value.
     token_response_semaphore: Arc<Semaphore>,
 }
 
@@ -271,7 +270,9 @@ impl Whitenoise {
             pending_logins: DashMap::new(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),
-            token_response_semaphore: Arc::new(Semaphore::new(10)),
+            token_response_semaphore: Arc::new(Semaphore::new(
+                push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
+            )),
         }
     }
 
