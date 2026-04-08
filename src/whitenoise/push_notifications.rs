@@ -8,6 +8,7 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(not(test))]
 use ::rand::Rng;
 use chrono::{DateTime, Utc};
 use mdk_core::mip05::{
@@ -128,6 +129,11 @@ impl fmt::Debug for GroupPushToken {
             .finish()
     }
 }
+
+/// Maximum number of concurrently-active delayed MIP-05 token-list response tasks.
+/// Tasks that cannot acquire a permit are dropped; the requester can retry via a
+/// subsequent token request event.
+pub(crate) const MAX_CONCURRENT_TOKEN_RESPONSE_TASKS: usize = 10;
 
 const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
     mdk_core::mip05::TOKEN_REQUEST_KIND,
@@ -795,7 +801,7 @@ impl Whitenoise {
     pub(crate) fn exhaust_token_response_semaphore(&self) -> tokio::sync::OwnedSemaphorePermit {
         self.token_response_semaphore
             .clone()
-            .try_acquire_many_owned(10)
+            .try_acquire_many_owned(MAX_CONCURRENT_TOKEN_RESPONSE_TASKS as u32)
             .expect("semaphore should be fully available at start of test")
     }
 
@@ -859,7 +865,10 @@ impl Whitenoise {
         }
 
         // Key is freshly owned by us; now enforce the concurrency cap.
-        let _permit = match self.token_response_semaphore.clone().try_acquire_owned() {
+        // The permit is moved into the spawned task and held for the full
+        // duration (sleep + dispatch) so the cap applies to in-flight tasks,
+        // not just to the moment of scheduling.
+        let permit = match self.token_response_semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::warn!(
@@ -881,7 +890,10 @@ impl Whitenoise {
             pending_push_token_responses: Arc::clone(&self.pending_push_token_responses),
             relay_control: Arc::clone(&self.relay_control),
         };
+        #[cfg(not(test))]
         let delay_ms = ::rand::rng().random_range(1_000..=3_000);
+        #[cfg(test)]
+        let delay_ms = 0u64;
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -899,6 +911,10 @@ impl Whitenoise {
                     "Failed to send delayed MIP-05 token-list response"
                 );
             }
+
+            // Permit is held across the sleep + dispatch and released here,
+            // freeing a slot for the next waiting task.
+            drop(permit);
         });
     }
 

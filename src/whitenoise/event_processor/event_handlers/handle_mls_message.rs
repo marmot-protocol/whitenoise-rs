@@ -839,6 +839,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
         build_token_removal_rumor, build_token_request_rumor,
@@ -2101,6 +2103,55 @@ mod tests {
         );
 
         let _ = admin_account;
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_token_response_task_runs_and_clears_pending_entry() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let token_tag = make_token_tag(22);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        // In tests the spawn delay is 0ms; wait for the spawned task to clear the entry.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !whitenoise.has_pending_token_response(
+                    &member_account.pubkey,
+                    &group_id,
+                    &request_event_id,
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for spawned token-response task to complete");
     }
 
     #[tokio::test]
