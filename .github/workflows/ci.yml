@@ -120,14 +120,14 @@ jobs:
 
       - name: Comment on PR
         if: steps.check.outputs.found == 'true'
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@159c67730ed0a9748d0d480c02879eaf352efd8e # v3
         with:
           header: dead-code-allows
           message: ${{ steps.check.outputs.body }}
 
       - name: Remove comment if clean
         if: steps.check.outputs.found == 'false'
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@159c67730ed0a9748d0d480c02879eaf352efd8e # v3
         with:
           header: dead-code-allows
           delete: true
