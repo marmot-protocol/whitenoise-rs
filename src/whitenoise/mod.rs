@@ -555,6 +555,7 @@ impl Whitenoise {
             Arc::new(scheduled_tasks::RelayListMaintenance),
             Arc::new(scheduled_tasks::SubscriptionHealthCheck),
             Arc::new(scheduled_tasks::MuteExpiryCleanup),
+            Arc::new(scheduled_tasks::DisappearingMessageCleanup),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
             whitenoise_ref,
@@ -1047,6 +1048,7 @@ pub mod test_utils {
             Some([2u8; 12]), // 12-byte nonce
             vec![RelayUrl::parse("ws://localhost:8080/").unwrap()],
             admins,
+            None, // disappearing_message_duration_secs
         )
     }
 
@@ -1574,6 +1576,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             let msg2 = message_aggregator::ChatMessage {
                 id: format!("{:0>64x}", 2),
@@ -1589,6 +1592,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
 
             aggregated_message::AggregatedMessage::insert_message(
@@ -1650,6 +1654,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
 
             // Emit an update (will be caught by subscriber during drain phase)
@@ -1702,6 +1707,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             aggregated_message::AggregatedMessage::insert_message(
                 &msg,
@@ -1990,6 +1996,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             whitenoise.message_stream_manager.emit(
                 &group_id,
@@ -2079,6 +2086,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             whitenoise.message_stream_manager.emit(
                 &group_id,
@@ -2137,6 +2145,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             whitenoise.message_stream_manager.emit(
                 &group_id,
@@ -2190,6 +2199,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             whitenoise.message_stream_manager.emit(
                 &group_a,
@@ -2366,6 +2376,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             let new_msg_b = message_aggregator::ChatMessage {
                 id: format!("{:0>64x}", 202u8),
@@ -2381,6 +2392,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
 
             whitenoise.message_stream_manager.emit(
@@ -2566,6 +2578,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             whitenoise.message_stream_manager.emit(
                 &group_id,
@@ -3172,6 +3185,7 @@ mod tests {
                     kind: 9,
                     media_attachments: vec![],
                     delivery_status: None,
+                    expires_at: None,
                 };
                 aggregated_message::AggregatedMessage::insert_message(
                     &msg,

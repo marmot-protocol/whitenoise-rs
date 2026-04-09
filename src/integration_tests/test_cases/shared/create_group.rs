@@ -59,6 +59,7 @@ impl TestCase for CreateGroupTestCase {
                     None, // image_nonce
                     context.test_relays(),
                     admin_pubkeys,
+                    None, // disappearing_message_duration_secs
                 ),
                 None,
             )

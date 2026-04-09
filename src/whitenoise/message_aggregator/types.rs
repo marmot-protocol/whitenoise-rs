@@ -67,6 +67,10 @@ pub struct ChatMessage {
     /// Delivery status for outgoing messages.
     /// `None` for incoming messages, `Some(status)` for messages sent by the current user.
     pub delivery_status: Option<DeliveryStatus>,
+
+    /// Expiration timestamp in Unix milliseconds, set when the group has
+    /// disappearing messages enabled.  `None` means the message persists forever.
+    pub expires_at: Option<Timestamp>,
 }
 
 /// A search result wrapping a matched message with token highlight spans.

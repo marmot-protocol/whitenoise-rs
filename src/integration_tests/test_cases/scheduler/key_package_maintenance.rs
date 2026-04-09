@@ -218,7 +218,7 @@ async fn publish_backdated_key_package(
     days_old: u64,
 ) -> Result<EventId, WhitenoiseError> {
     // Get the encoded key package and tags
-    let (encoded_key_package, tags, hash_ref) = context
+    let kp_data = context
         .whitenoise
         .encoded_key_package(account, relays)
         .await?;
@@ -232,8 +232,8 @@ async fn publish_backdated_key_package(
     let backdated = Timestamp::now() - Duration::from_secs(days_old * 24 * 60 * 60);
 
     // Build and sign the event with custom timestamp
-    let event = EventBuilder::new(Kind::MlsKeyPackage, &encoded_key_package)
-        .tags(tags.to_vec())
+    let event = EventBuilder::new(Kind::MlsKeyPackage, &kp_data.content)
+        .tags(kp_data.tags_443.to_vec())
         .custom_created_at(backdated)
         .sign_with_keys(&keys)
         .map_err(|e| WhitenoiseError::Other(e.into()))?;
@@ -248,7 +248,11 @@ async fn publish_backdated_key_package(
 
     context
         .whitenoise
-        .track_published_key_package_for_testing(&account.pubkey, &hash_ref, &event_id.to_hex())
+        .track_published_key_package_for_testing(
+            &account.pubkey,
+            &kp_data.hash_ref,
+            &event_id.to_hex(),
+        )
         .await?;
 
     tracing::debug!(

@@ -57,6 +57,9 @@ struct AggregatedMessageRow {
     pub reactions: ReactionSummary,
     pub media_attachments: Vec<MediaFile>,
     pub delivery_status: Option<DeliveryStatus>,
+    /// Expiration timestamp (Unix milliseconds).  `None` means the message
+    /// does not expire.  Set when the group has disappearing messages enabled.
+    pub expires_at: Option<DateTime<Utc>>,
     /// Position of this message within the group (0 = newest).
     /// Only populated by search queries that include a ROW_NUMBER window.
     pub position: Option<i64>,
@@ -169,6 +172,23 @@ where
                 Err(e) => return Err(e),
             };
 
+        // Optional expires_at column — only present when the migration has been
+        // applied and the column was included in the SELECT.
+        let expires_at: Option<DateTime<Utc>> = match row.try_get::<Option<i64>, _>("expires_at") {
+            Ok(Some(ms)) => {
+                let dt = DateTime::from_timestamp_millis(ms).ok_or_else(|| {
+                    sqlx::Error::ColumnDecode {
+                        index: "expires_at".to_string(),
+                        source: "timestamp out of range".into(),
+                    }
+                })?;
+                Some(dt)
+            }
+            Ok(None) => None,
+            Err(sqlx::Error::ColumnNotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
         // Optional position column — only present in search queries that use
         // a ROW_NUMBER window function.
         let position: Option<i64> = match row.try_get::<Option<i64>, _>("position") {
@@ -192,6 +212,7 @@ where
             reactions,
             media_attachments,
             delivery_status,
+            expires_at,
             position,
         })
     }
@@ -717,11 +738,13 @@ impl AggregatedMessage {
 
         let mut tx = database.pool.begin().await?;
 
+        let expires_at_ms = message.expires_at.map(|ts| ts.as_secs() as i64 * 1000);
+
         sqlx::query(
             "INSERT INTO aggregated_messages
              (message_id, mls_group_id, author, created_at, kind, content, content_normalized,
-              tags, reply_to_id, content_tokens, reactions, media_attachments)
-             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?)
+              tags, reply_to_id, content_tokens, reactions, media_attachments, expires_at)
+             VALUES (?, ?, ?, ?, 9, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(message_id, mls_group_id) DO UPDATE SET
                content = excluded.content,
                content_normalized = excluded.content_normalized,
@@ -729,7 +752,8 @@ impl AggregatedMessage {
                reply_to_id = excluded.reply_to_id,
                content_tokens = excluded.content_tokens,
                reactions = excluded.reactions,
-               media_attachments = excluded.media_attachments",
+               media_attachments = excluded.media_attachments,
+               expires_at = excluded.expires_at",
         )
         .bind(&message.id)
         .bind(group_id.as_slice())
@@ -744,6 +768,7 @@ impl AggregatedMessage {
         .bind(serde_json::to_string(&message.content_tokens)?)
         .bind(serde_json::to_string(&message.reactions)?)
         .bind(serde_json::to_string(&message.media_attachments)?)
+        .bind(expires_at_ms)
         .execute(&mut *tx)
         .await?;
 
@@ -1060,6 +1085,47 @@ impl AggregatedMessage {
             .execute(&database.pool)
             .await?;
         Ok(())
+    }
+
+    /// Delete all messages whose `expires_at` timestamp has passed.
+    ///
+    /// Returns the set of group IDs that had messages removed so callers
+    /// can emit stream updates for those groups.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn delete_expired(now_ms: i64, database: &Database) -> Result<Vec<GroupId>> {
+        // First collect the distinct groups that have expired messages
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT DISTINCT mls_group_id
+             FROM aggregated_messages
+             WHERE expires_at IS NOT NULL AND expires_at <= ?",
+        )
+        .bind(now_ms)
+        .fetch_all(&database.pool)
+        .await?;
+
+        let affected_groups: Vec<GroupId> = rows
+            .into_iter()
+            .map(|(bytes,)| GroupId::from_slice(&bytes))
+            .collect();
+
+        if !affected_groups.is_empty() {
+            let deleted = sqlx::query(
+                "DELETE FROM aggregated_messages
+                 WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            )
+            .bind(now_ms)
+            .execute(&database.pool)
+            .await?;
+
+            tracing::info!(
+                target: "whitenoise::disappearing_messages",
+                "Deleted {} expired message(s) across {} group(s)",
+                deleted.rows_affected(),
+                affected_groups.len(),
+            );
+        }
+
+        Ok(affected_groups)
     }
 
     /// Find a cached message by ID (for updating with reactions/deletions)
@@ -1404,6 +1470,10 @@ impl AggregatedMessage {
         // Convert DateTime<Utc> to Timestamp (seconds)
         let created_at = Timestamp::from(row.created_at.timestamp() as u64);
 
+        let expires_at = row
+            .expires_at
+            .map(|dt| Timestamp::from(dt.timestamp() as u64));
+
         Ok(ChatMessage {
             id: row.message_id.to_string(),
             author: row.author,
@@ -1418,6 +1488,7 @@ impl AggregatedMessage {
             kind: row.kind.as_u16(),
             media_attachments: row.media_attachments,
             delivery_status: row.delivery_status,
+            expires_at,
         })
     }
 
@@ -1492,6 +1563,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         }
     }
 
@@ -2720,6 +2792,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg, group_id, database)
             .await
@@ -4050,6 +4123,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: Some(DeliveryStatus::Retried),
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&retried_msg, &group_id, &whitenoise.database)
             .await
@@ -4096,6 +4170,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         }
     }
 
@@ -4274,6 +4349,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
                 .await
@@ -4301,5 +4377,267 @@ mod tests {
         assert_eq!(results[0].position, 0);
         assert_eq!(results[1].position, 1);
         assert_eq!(results[2].position, 2);
+    }
+
+    // ======================== Disappearing messages ========================
+
+    #[tokio::test]
+    async fn test_insert_message_with_expires_at_round_trips() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[0xDA; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let mut message = create_test_chat_message(1, author);
+        let expires_at_secs = message.created_at.as_secs() + 3600; // 1 hour
+        message.expires_at = Some(Timestamp::from(expires_at_secs));
+
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let retrieved = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .expect("message should exist");
+
+        assert_eq!(
+            retrieved.expires_at.map(|t| t.as_secs()),
+            Some(expires_at_secs),
+            "expires_at should round-trip through the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insert_message_without_expires_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[0xDB; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let message = create_test_chat_message(1, author);
+        assert!(message.expires_at.is_none(), "precondition: no expires_at");
+
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let retrieved = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .expect("message should exist");
+
+        assert_eq!(
+            retrieved.expires_at, None,
+            "permanent message should have no expires_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_removes_only_expired_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[0xDC; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let now_secs = Timestamp::now().as_secs();
+
+        // Message 1: already expired (1 hour ago)
+        let mut expired_msg = create_test_chat_message(1, author);
+        expired_msg.expires_at = Some(Timestamp::from(now_secs - 3600));
+        AggregatedMessage::insert_message(&expired_msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Message 2: expires in the future (1 hour from now)
+        let mut future_msg = create_test_chat_message(2, author);
+        future_msg.expires_at = Some(Timestamp::from(now_secs + 3600));
+        AggregatedMessage::insert_message(&future_msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Message 3: permanent (no expires_at)
+        let permanent_msg = create_test_chat_message(3, author);
+        AggregatedMessage::insert_message(&permanent_msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Verify all 3 exist
+        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Run cleanup
+        let now_ms = now_secs as i64 * 1000;
+        let affected = AggregatedMessage::delete_expired(now_ms, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Only 1 group should be affected
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].as_slice(), group_id.as_slice());
+
+        // Only 2 messages remain (future + permanent)
+        let remaining = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2, "only the expired message should be deleted");
+
+        // Verify which messages survive
+        let expired_lookup =
+            AggregatedMessage::find_by_id(&expired_msg.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(expired_lookup.is_none(), "expired message should be gone");
+
+        let future_lookup =
+            AggregatedMessage::find_by_id(&future_msg.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(future_lookup.is_some(), "future message should survive");
+
+        let permanent_lookup =
+            AggregatedMessage::find_by_id(&permanent_msg.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(
+            permanent_lookup.is_some(),
+            "permanent message should survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_returns_all_affected_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_a = GroupId::from_slice(&[0xA0; 32]);
+        let group_b = GroupId::from_slice(&[0xB0; 32]);
+        let group_c = GroupId::from_slice(&[0xC0; 32]);
+        setup_group(&group_a, &whitenoise.database).await;
+        setup_group(&group_b, &whitenoise.database).await;
+        setup_group(&group_c, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let now_secs = Timestamp::now().as_secs();
+
+        // Group A: has an expired message
+        let mut msg_a = create_test_chat_message(1, author);
+        msg_a.expires_at = Some(Timestamp::from(now_secs - 100));
+        AggregatedMessage::insert_message(&msg_a, &group_a, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Group B: has an expired message
+        let mut msg_b = create_test_chat_message(2, author);
+        msg_b.expires_at = Some(Timestamp::from(now_secs - 200));
+        AggregatedMessage::insert_message(&msg_b, &group_b, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Group C: only has a permanent message (no expiry)
+        let msg_c = create_test_chat_message(3, author);
+        AggregatedMessage::insert_message(&msg_c, &group_c, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let now_ms = now_secs as i64 * 1000;
+        let mut affected = AggregatedMessage::delete_expired(now_ms, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Sort for deterministic comparison
+        affected.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+
+        assert_eq!(
+            affected.len(),
+            2,
+            "only groups A and B have expired messages"
+        );
+
+        let mut expected = vec![group_a.as_slice().to_vec(), group_b.as_slice().to_vec()];
+        expected.sort();
+        let actual: Vec<Vec<u8>> = affected.iter().map(|g| g.as_slice().to_vec()).collect();
+        assert_eq!(actual, expected);
+
+        // Group C's message should still exist
+        let c_count = AggregatedMessage::count_by_group(&group_c, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(c_count, 1, "group C's permanent message should survive");
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_with_no_expired_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[0xDD; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+
+        // Only permanent messages
+        let msg = create_test_chat_message(1, author);
+        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let now_ms = Timestamp::now().as_secs() as i64 * 1000;
+        let affected = AggregatedMessage::delete_expired(now_ms, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(affected.is_empty(), "no groups should be affected");
+
+        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "permanent message should not be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_on_empty_table() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let now_ms = Timestamp::now().as_secs() as i64 * 1000;
+        let affected = AggregatedMessage::delete_expired(now_ms, &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(affected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_insert_message_upsert_preserves_expires_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[0xDE; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let now_secs = Timestamp::now().as_secs();
+
+        // Insert with an expiry
+        let mut message = create_test_chat_message(1, author);
+        message.expires_at = Some(Timestamp::from(now_secs + 3600));
+        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Upsert the same message with updated content but same expiry
+        let mut updated = message.clone();
+        updated.content = "Updated content".to_string();
+        AggregatedMessage::insert_message(&updated, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let retrieved = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
+            .await
+            .unwrap()
+            .expect("message should exist");
+
+        assert_eq!(retrieved.content, "Updated content");
+        assert_eq!(
+            retrieved.expires_at.map(|t| t.as_secs()),
+            Some(now_secs + 3600),
+            "expires_at should be preserved through upsert"
+        );
     }
 }

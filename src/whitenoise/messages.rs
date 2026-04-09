@@ -64,8 +64,23 @@ impl Whitenoise {
             return Err(WhitenoiseError::GroupMissingRelays);
         }
 
+        // Look up the group's disappearing message setting before creating the
+        // MLS message so we can attach a NIP-40 expiration tag to the outer event.
+        let disappearing_duration_secs = mdk
+            .get_group(group_id)
+            .ok()
+            .flatten()
+            .and_then(|g| g.disappearing_message_duration_secs);
+
+        let outer_tags = disappearing_duration_secs.map(|duration| {
+            let expires_at_secs = Timestamp::now().as_secs() + duration;
+            vec![mdk_core::messages::EventTag::expiration(Timestamp::from(
+                expires_at_secs,
+            ))]
+        });
+
         let _mls_span = perf_span!("messages::mls_create_message");
-        let message_event = mdk.create_message(group_id, inner_event)?;
+        let message_event = mdk.create_message(group_id, inner_event, outer_tags)?;
         let mdk_message =
             mdk.get_message(group_id, &event_id)?
                 .ok_or(WhitenoiseError::MdkCoreError(
@@ -77,13 +92,14 @@ impl Whitenoise {
         let tokens = self.content_parser.parse(&mdk_message.content);
         drop(_parse_span);
 
-        // Proactive caching + delivery tracking for all outgoing event kinds.
-        // Kind 9 (chat): full message processing + NewMessage emission
-        // Kind 7/5 (reaction/deletion): insert event + apply aggregated effect on parent
         match kind {
             9 => {
-                self.process_and_emit_outgoing_message(&mdk_message, group_id)
-                    .await?;
+                self.process_and_emit_outgoing_message(
+                    &mdk_message,
+                    group_id,
+                    disappearing_duration_secs,
+                )
+                .await?;
             }
             7 => {
                 self.cache_and_apply_outgoing_reaction(&mdk_message, group_id)
@@ -177,6 +193,7 @@ impl Whitenoise {
         &self,
         mdk_message: &Message,
         group_id: &GroupId,
+        disappearing_duration_secs: Option<u64>,
     ) -> Result<()> {
         let chat_message = self
             .message_aggregator
@@ -188,6 +205,10 @@ impl Whitenoise {
             .await
             .map(|mut msg| {
                 msg.delivery_status = Some(DeliveryStatus::Sending);
+                if let Some(duration) = disappearing_duration_secs {
+                    let expires_at_secs = msg.created_at.as_secs() + duration;
+                    msg.expires_at = Some(Timestamp::from(expires_at_secs));
+                }
                 msg
             })
             .map_err(|e| {

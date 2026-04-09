@@ -13,6 +13,7 @@ mod tasks;
 
 pub(crate) use self::tasks::CachedGraphUserCleanup;
 pub(crate) use self::tasks::ConsumedKeyPackageCleanup;
+pub(crate) use self::tasks::DisappearingMessageCleanup;
 pub(crate) use self::tasks::KeyPackageMaintenance;
 pub(crate) use self::tasks::MuteExpiryCleanup;
 pub(crate) use self::tasks::RelayListMaintenance;

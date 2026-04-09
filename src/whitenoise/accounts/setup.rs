@@ -1192,6 +1192,7 @@ mod tests {
             None,
             vec![relay1.clone(), relay2.clone()],
             vec![creator_account.pubkey],
+            None, // disappearing_message_duration_secs
         );
 
         let group = whitenoise
@@ -1490,6 +1491,7 @@ mod tests {
             None,
             vec![relay_url.clone()],
             vec![creator_account.pubkey],
+            None, // disappearing_message_duration_secs
         );
 
         whitenoise
@@ -1524,6 +1526,7 @@ mod tests {
             None,
             vec![relay_url.clone()],
             vec![creator_account.pubkey],
+            None, // disappearing_message_duration_secs
         );
 
         whitenoise

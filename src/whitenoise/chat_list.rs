@@ -1027,6 +1027,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg1, &group1.mls_group_id, &whitenoise.database)
             .await
@@ -1046,6 +1047,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg2, &group2.mls_group_id, &whitenoise.database)
             .await
@@ -1210,6 +1212,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
             .await
@@ -1272,6 +1275,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg, &group1.mls_group_id, &whitenoise.database)
             .await
@@ -1361,6 +1365,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
         AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
             .await
@@ -1653,6 +1658,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             };
             AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
                 .await

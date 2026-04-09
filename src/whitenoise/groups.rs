@@ -781,6 +781,41 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Updates the disappearing message duration for a group.
+    ///
+    /// Only group admins can change this setting. The change is distributed
+    /// to all group members via an MLS commit (group data update).
+    ///
+    /// # Arguments
+    /// * `account` - The account performing the update (must be group admin)
+    /// * `group_id` - The MLS group ID
+    /// * `duration_secs` - `Some(n)` to enable (messages expire after `n` seconds),
+    ///   `None` to disable (messages persist forever). `Some(0)` is rejected.
+    #[perf_instrument("groups")]
+    pub async fn set_disappearing_messages(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+        duration_secs: Option<u64>,
+    ) -> Result<()> {
+        let update = NostrGroupDataUpdate::new().disappearing_message_duration_secs(duration_secs);
+        self.update_group_data(account, group_id, update).await
+    }
+
+    /// Returns the disappearing message duration for a group.
+    ///
+    /// Returns `None` when disappearing messages are disabled (messages persist
+    /// forever), or `Some(seconds)` when enabled.
+    #[perf_instrument("groups")]
+    pub async fn get_disappearing_message_duration(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<Option<u64>> {
+        let group = self.group(account, group_id).await?;
+        Ok(group.disappearing_message_duration_secs)
+    }
+
     /// Removes the caller from the group's `admin_pubkeys` list.
     ///
     /// This is a prerequisite for `leave_group()` — the MIP-03 protocol requires
@@ -1320,6 +1355,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
 
         let update_result = whitenoise
@@ -1384,6 +1420,7 @@ mod tests {
             admins: Some(vec![new_admin_pubkey]),
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
         whitenoise
             .update_group_data(
@@ -1437,6 +1474,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
         let update_result = whitenoise
             .update_group_data(&creator_account, &group.mls_group_id, update)
@@ -2069,6 +2107,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
 
         let update_result = whitenoise
@@ -2209,6 +2248,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
 
         whitenoise
@@ -2454,6 +2494,7 @@ mod tests {
             admins: None,
             relays: Some(unreachable_urls),
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
         whitenoise
             .update_group_data(&creator, &group.mls_group_id, relay_swap)
@@ -2552,6 +2593,7 @@ mod tests {
             admins: None,
             relays: None,
             nostr_group_id: None,
+            disappearing_message_duration_secs: None,
         };
         let result = whitenoise
             .update_group_data(&creator, group_id, new_data)

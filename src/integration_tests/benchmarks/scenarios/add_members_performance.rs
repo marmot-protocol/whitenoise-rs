@@ -81,6 +81,7 @@ impl BenchmarkScenario for AddMembersPerformanceBenchmark {
             None,
             context.test_relays(),
             vec![admin.pubkey],
+            None, // disappearing_message_duration_secs
         );
 
         let group = context

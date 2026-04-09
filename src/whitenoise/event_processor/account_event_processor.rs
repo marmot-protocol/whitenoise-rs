@@ -494,7 +494,7 @@ mod tests {
             "shared group relay event".to_string(),
         );
         inner.ensure_id();
-        let event = admin_mdk.create_message(&group_id, inner).unwrap();
+        let event = admin_mdk.create_message(&group_id, inner, None).unwrap();
         let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
 
         for account in [&admin_account, &member_account] {
