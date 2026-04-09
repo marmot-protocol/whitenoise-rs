@@ -1160,23 +1160,25 @@ impl Whitenoise {
         leaf_index: u32,
         request: mdk_core::mip05::TokenRequest,
     ) -> Result<()> {
-        let Some(token) = request.tokens.into_iter().next() else {
+        if request.tokens.is_empty() {
             return Err(WhitenoiseError::InvalidEvent(
                 "MIP-05 token request must include at least one token".to_string(),
             ));
-        };
+        }
 
-        GroupPushToken::upsert(
-            &account.pubkey,
-            mls_group_id,
-            &member_pubkey,
-            leaf_index,
-            &token.server_pubkey,
-            Some(&token.relay_hint),
-            &token.encrypted_token.to_base64(),
-            &self.database,
-        )
-        .await?;
+        for token in request.tokens {
+            GroupPushToken::upsert(
+                &account.pubkey,
+                mls_group_id,
+                &member_pubkey,
+                leaf_index,
+                &token.server_pubkey,
+                Some(&token.relay_hint),
+                &token.encrypted_token.to_base64(),
+                &self.database,
+            )
+            .await?;
+        }
 
         Ok(())
     }
@@ -1879,6 +1881,64 @@ mod tests {
         .await
         .unwrap();
         assert!(cached_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_merge_token_request_upserts_all_tokens() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[11; 32]);
+        let member_pubkey = Keys::generate().public_key();
+        let first_server = Keys::generate().public_key();
+        let second_server = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+        let first_token = encrypt_push_token(
+            &first_server,
+            &PushTokenPlaintext::new(NotificationPlatform::Fcm, b"device-a".to_vec()).unwrap(),
+        )
+        .unwrap();
+        let second_token = encrypt_push_token(
+            &second_server,
+            &PushTokenPlaintext::new(NotificationPlatform::Apns, vec![7; 32]).unwrap(),
+        )
+        .unwrap();
+        let request = mdk_core::mip05::TokenRequest {
+            tokens: vec![
+                TokenTag {
+                    encrypted_token: first_token,
+                    server_pubkey: first_server,
+                    relay_hint: relay_hint.clone(),
+                },
+                TokenTag {
+                    encrypted_token: second_token,
+                    server_pubkey: second_server,
+                    relay_hint,
+                },
+            ],
+        };
+
+        whitenoise
+            .merge_token_request(&account, &group_id, member_pubkey, 5, request)
+            .await
+            .unwrap();
+
+        let cached_tokens = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let cached_servers: std::collections::HashSet<PublicKey> = cached_tokens
+            .iter()
+            .map(|token| token.server_pubkey)
+            .collect();
+
+        assert_eq!(cached_tokens.len(), 2);
+        assert_eq!(
+            cached_servers,
+            std::collections::HashSet::from([first_server, second_server])
+        );
     }
 
     #[tokio::test]
@@ -2615,12 +2675,10 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::pause();
         let settings = whitenoise
             .update_notifications_enabled(&admin_account, false)
             .await
             .unwrap();
-        tokio::time::resume();
         assert!(!settings.notifications_enabled);
 
         let cached_after_disable = GroupPushToken::find_by_account_and_group(

@@ -151,9 +151,8 @@ impl GroupPushToken {
                  updated_at
              )
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+             ON CONFLICT(account_pubkey, mls_group_id, leaf_index, server_pubkey) DO UPDATE SET
                  member_pubkey = excluded.member_pubkey,
-                 server_pubkey = excluded.server_pubkey,
                  relay_hint = excluded.relay_hint,
                  encrypted_token = excluded.encrypted_token,
                  updated_at = excluded.updated_at
@@ -284,9 +283,8 @@ impl GroupPushToken {
                      updated_at
                  )
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index) DO UPDATE SET
+                 ON CONFLICT(account_pubkey, mls_group_id, leaf_index, server_pubkey) DO UPDATE SET
                      member_pubkey = excluded.member_pubkey,
-                     server_pubkey = excluded.server_pubkey,
                      relay_hint = excluded.relay_hint,
                      encrypted_token = excluded.encrypted_token,
                      updated_at = excluded.updated_at",
@@ -324,12 +322,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_group_push_tokens_insert_replace_delete() {
+    async fn test_group_push_tokens_insert_update_delete() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let mls_group_id = make_group_id(1);
-        let first_server = Keys::generate().public_key();
-        let second_server = Keys::generate().public_key();
+        let server_pubkey = Keys::generate().public_key();
         let member_pubkey = Keys::generate().public_key();
         let relay_hint = RelayUrl::parse("wss://server.example.com/").unwrap();
 
@@ -338,7 +335,7 @@ mod tests {
             &mls_group_id,
             &member_pubkey,
             7,
-            &first_server,
+            &server_pubkey,
             Some(&relay_hint),
             "ciphertext-one",
             &whitenoise.database,
@@ -346,26 +343,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(created.leaf_index, 7);
-        assert_eq!(created.server_pubkey, first_server);
+        assert_eq!(created.server_pubkey, server_pubkey);
         assert_eq!(created.encrypted_token, "ciphertext-one");
 
-        let replaced = GroupPushToken::upsert(
+        let updated = GroupPushToken::upsert(
             &account.pubkey,
             &mls_group_id,
             &member_pubkey,
             7,
-            &second_server,
+            &server_pubkey,
             None,
             "ciphertext-two",
             &whitenoise.database,
         )
         .await
         .unwrap();
-        assert_eq!(replaced.leaf_index, 7);
-        assert_eq!(replaced.server_pubkey, second_server);
-        assert_eq!(replaced.relay_hint, None);
-        assert_eq!(replaced.encrypted_token, "ciphertext-two");
-        assert!(replaced.updated_at >= created.updated_at);
+        assert_eq!(updated.leaf_index, 7);
+        assert_eq!(updated.server_pubkey, server_pubkey);
+        assert_eq!(updated.relay_hint, None);
+        assert_eq!(updated.encrypted_token, "ciphertext-two");
+        assert!(updated.updated_at >= created.updated_at);
 
         let stored = GroupPushToken::find_by_account_and_group(
             &account.pubkey,
@@ -374,7 +371,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(stored, vec![replaced.clone()]);
+        assert_eq!(stored, vec![updated.clone()]);
 
         let deleted =
             GroupPushToken::delete(&account.pubkey, &mls_group_id, 7, &whitenoise.database)
@@ -438,6 +435,56 @@ mod tests {
         assert_eq!(second_leaf.server_pubkey, second_server);
         assert!(stored.iter().any(|token| token.leaf_index == 3));
         assert!(stored.iter().any(|token| token == &second_leaf));
+    }
+
+    #[tokio::test]
+    async fn test_group_push_tokens_upsert_allows_multiple_servers_for_same_leaf() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mls_group_id = make_group_id(8);
+        let member_pubkey = Keys::generate().public_key();
+        let first_server = Keys::generate().public_key();
+        let second_server = Keys::generate().public_key();
+
+        GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &first_server,
+            None,
+            "ciphertext-one",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let second_server_token = GroupPushToken::upsert(
+            &account.pubkey,
+            &mls_group_id,
+            &member_pubkey,
+            3,
+            &second_server,
+            None,
+            "ciphertext-two",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let stored = GroupPushToken::find_by_account_and_group(
+            &account.pubkey,
+            &mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored
+                .iter()
+                .any(|token| token.server_pubkey == first_server)
+        );
+        assert!(stored.iter().any(|token| token == &second_server_token));
     }
 
     #[tokio::test]
@@ -583,8 +630,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let mls_group_id = make_group_id(33);
-        let first_server = Keys::generate().public_key();
-        let second_server = Keys::generate().public_key();
+        let server_pubkey = Keys::generate().public_key();
         let member_pubkey = Keys::generate().public_key();
 
         GroupPushToken::upsert(
@@ -592,7 +638,7 @@ mod tests {
             &mls_group_id,
             &member_pubkey,
             4,
-            &first_server,
+            &server_pubkey,
             None,
             "ciphertext-one",
             &whitenoise.database,
@@ -621,7 +667,7 @@ mod tests {
             &mls_group_id,
             &member_pubkey,
             4,
-            &second_server,
+            &server_pubkey,
             None,
             "ciphertext-two",
             &whitenoise.database,
@@ -630,7 +676,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(updated.created_at, expected_created_at);
-        assert_eq!(updated.server_pubkey, second_server);
+        assert_eq!(updated.server_pubkey, server_pubkey);
         assert_eq!(updated.encrypted_token, "ciphertext-two");
     }
 
