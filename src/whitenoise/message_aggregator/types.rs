@@ -73,6 +73,34 @@ pub struct ChatMessage {
     pub expires_at: Option<Timestamp>,
 }
 
+impl ChatMessage {
+    /// Build a minimal placeholder used when emitting `MessageExpired` updates.
+    ///
+    /// The message row has already been deleted, so only the `id` field is
+    /// meaningful — subscribers use it to remove the message from the UI.
+    pub fn expired_placeholder(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            author: PublicKey::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .expect("hardcoded placeholder pubkey is valid"),
+            content: String::new(),
+            created_at: Timestamp::from(0),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: true,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+            expires_at: None,
+        }
+    }
+}
+
 /// A search result wrapping a matched message with token highlight spans.
 ///
 /// Each entry in `highlight_spans` is a `[start, end]` pair of **char indices**

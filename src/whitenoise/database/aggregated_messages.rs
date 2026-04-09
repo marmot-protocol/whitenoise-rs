@@ -1087,6 +1087,27 @@ impl AggregatedMessage {
         Ok(())
     }
 
+    /// Find all kind-9 messages whose `expires_at` timestamp has passed.
+    ///
+    /// Returns `(message_id_hex, mls_group_id)` pairs so callers can emit
+    /// per-message stream updates before the rows are deleted.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn find_expired(now_ms: i64, database: &Database) -> Result<Vec<(String, GroupId)>> {
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT message_id, mls_group_id
+             FROM aggregated_messages
+             WHERE expires_at IS NOT NULL AND expires_at <= ? AND kind = 9",
+        )
+        .bind(now_ms)
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, group)| (id, GroupId::from_slice(&group)))
+            .collect())
+    }
+
     /// Delete all messages whose `expires_at` timestamp has passed.
     ///
     /// Returns the set of group IDs that had messages removed so callers

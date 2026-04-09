@@ -29,6 +29,11 @@ pub enum UpdateTrigger {
     /// The delivery status of an outgoing message changed (e.g. Sending → Sent or Failed).
     /// The message stays in its current position in the chat.
     DeliveryStatusChanged,
+
+    /// The message expired due to the group's disappearing-messages setting.
+    /// The message has been deleted from the database — only the `id` field
+    /// in the accompanying [`MessageUpdate`] is meaningful.
+    MessageExpired,
 }
 
 /// Represents a single update to be sent to subscribers.
@@ -80,6 +85,7 @@ mod tests {
             UpdateTrigger::ReactionRemoved,
             UpdateTrigger::MessageDeleted,
             UpdateTrigger::DeliveryStatusChanged,
+            UpdateTrigger::MessageExpired,
         ];
 
         for trigger in triggers {
