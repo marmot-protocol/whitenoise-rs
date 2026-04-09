@@ -700,7 +700,6 @@ impl SubscriptionStream {
     }
 }
 
-
 pub(crate) fn hash_pubkey_for_subscription_id(
     session_salt: &[u8; 16],
     pubkey: &PublicKey,
@@ -756,7 +755,6 @@ mod tests {
             "account_mute_list"
         );
     }
-
 
     async fn setup_test_db() -> Database {
         let pool = SqlitePoolOptions::new()
