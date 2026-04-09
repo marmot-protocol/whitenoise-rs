@@ -207,6 +207,7 @@ impl PendingTokenResponseContext {
     }
 }
 
+#[perf_instrument("push_notifications")]
 async fn group_push_token_tags_for_response_with(
     account_pubkey: &PublicKey,
     group_id: &GroupId,
@@ -282,6 +283,7 @@ async fn group_push_token_tags_for_response_with(
     Ok(response_tokens)
 }
 
+#[perf_instrument("push_notifications")]
 async fn publish_push_group_message_with(
     mdk: &MDK<MdkSqliteStorage>,
     relay_control: &RelayControlPlane,
