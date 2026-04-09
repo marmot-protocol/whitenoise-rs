@@ -15,7 +15,7 @@ use mdk_core::mip05::{
     TokenTag, build_notification_batches, build_token_list_response_rumor,
     build_token_removal_rumor, build_token_request_rumor, encrypt_push_token, parse_group_message,
 };
-use mdk_core::prelude::{GroupId, group_types::GroupState};
+use mdk_core::prelude::{GroupId, MDK, group_types::GroupState};
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::{EventId, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
@@ -203,8 +203,7 @@ impl PendingTokenResponseContext {
             request_event_id,
             token_tags,
         )?;
-        publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
-            .await
+        publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor).await
     }
 }
 
@@ -212,7 +211,7 @@ async fn group_push_token_tags_for_response_with(
     account_pubkey: &PublicKey,
     group_id: &GroupId,
     database: &Database,
-    mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+    mdk: &MDK<MdkSqliteStorage>,
 ) -> Result<Vec<LeafTokenTag>> {
     let tokens =
         GroupPushToken::find_by_account_and_group(account_pubkey, group_id, database).await?;
@@ -284,14 +283,13 @@ async fn group_push_token_tags_for_response_with(
 }
 
 async fn publish_push_group_message_with(
-    config: &WhitenoiseConfig,
+    mdk: &MDK<MdkSqliteStorage>,
     relay_control: &RelayControlPlane,
     account: &Account,
     group_id: &GroupId,
     rumor: nostr_sdk::UnsignedEvent,
 ) -> Result<()> {
-    let mdk = Account::create_mdk(account.pubkey, &config.data_dir, &config.keyring_service_id)?;
-    let relay_urls = Whitenoise::ensure_group_relays(&mdk, group_id)?;
+    let relay_urls = Whitenoise::ensure_group_relays(mdk, group_id)?;
     let event = mdk.create_message(group_id, rumor, None)?;
 
     relay_control
@@ -903,9 +901,14 @@ impl Whitenoise {
                 nostr_sdk::Timestamp::now(),
                 vec![token_tag.clone()],
             )?;
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
+            if let Err(error) = publish_push_group_message_with(
+                &mdk,
+                &self.relay_control,
+                account,
+                &group.mls_group_id,
+                rumor,
+            )
+            .await
             {
                 publish_failures.push(format!(
                     "{}: {error}",
@@ -915,7 +918,12 @@ impl Whitenoise {
             }
 
             if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, Some(token_tag))
+                .sync_local_group_push_token_cache(
+                    &mdk,
+                    account,
+                    &group.mls_group_id,
+                    Some(token_tag),
+                )
                 .await
             {
                 publish_failures.push(format!(
@@ -1012,6 +1020,7 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     async fn share_push_token_to_group(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         group_id: &GroupId,
         token_tag: &TokenTag,
@@ -1021,9 +1030,8 @@ impl Whitenoise {
             nostr_sdk::Timestamp::now(),
             vec![token_tag.clone()],
         )?;
-        self.publish_push_group_message(account, group_id, rumor)
-            .await?;
-        self.sync_local_group_push_token_cache(account, group_id, Some(token_tag))
+        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor).await?;
+        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
             .await
     }
 
@@ -1056,7 +1064,7 @@ impl Whitenoise {
             return Ok(());
         };
 
-        self.share_push_token_to_group(account, group_id, &token_tag)
+        self.share_push_token_to_group(&mdk, account, group_id, &token_tag)
             .await
     }
 
@@ -1075,9 +1083,14 @@ impl Whitenoise {
             }
 
             let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
+            if let Err(error) = publish_push_group_message_with(
+                &mdk,
+                &self.relay_control,
+                account,
+                &group.mls_group_id,
+                rumor,
+            )
+            .await
             {
                 publish_failures.push(format!(
                     "{}: {error}",
@@ -1086,7 +1099,7 @@ impl Whitenoise {
             }
 
             if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, None)
+                .sync_local_group_push_token_cache(&mdk, account, &group.mls_group_id, None)
                 .await
             {
                 publish_failures.push(format!(
@@ -1134,9 +1147,9 @@ impl Whitenoise {
         }
 
         let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-        if let Err(error) = self
-            .publish_push_group_message(account, group_id, rumor)
-            .await
+        if let Err(error) =
+            publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor)
+                .await
         {
             tracing::warn!(
                 target: "whitenoise::push_notifications",
@@ -1147,7 +1160,7 @@ impl Whitenoise {
             );
         }
 
-        self.sync_local_group_push_token_cache(account, group_id, None)
+        self.sync_local_group_push_token_cache(&mdk, account, group_id, None)
             .await
     }
 
@@ -1211,9 +1224,14 @@ impl Whitenoise {
         group_id: &GroupId,
         request_event_id: EventId,
     ) -> Result<()> {
-        let token_tags = self
-            .group_push_token_tags_for_response(account, group_id)
-            .await?;
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let token_tags = group_push_token_tags_for_response_with(
+            &account.pubkey,
+            group_id,
+            &self.database,
+            &mdk,
+        )
+        .await?;
 
         if token_tags.is_empty() {
             return Ok(());
@@ -1225,29 +1243,17 @@ impl Whitenoise {
             request_event_id,
             token_tags,
         )?;
-        self.publish_push_group_message(account, group_id, rumor)
-            .await
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn group_push_token_tags_for_response(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Vec<LeafTokenTag>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        group_push_token_tags_for_response_with(&account.pubkey, group_id, &self.database, &mdk)
-            .await
+        publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor).await
     }
 
     #[perf_instrument("push_notifications")]
     async fn sync_local_group_push_token_cache(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         group_id: &GroupId,
         token_tag: Option<&TokenTag>,
     ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let leaf_index = mdk.own_leaf_index(group_id)?;
 
         match token_tag {
@@ -1280,17 +1286,6 @@ impl Whitenoise {
         };
 
         registration.token_tag()
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn publish_push_group_message(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        rumor: nostr_sdk::UnsignedEvent,
-    ) -> Result<()> {
-        publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
-            .await
     }
 }
 
