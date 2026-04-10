@@ -185,25 +185,15 @@ impl PendingTokenResponseContext {
             &self.config.data_dir,
             &self.config.keyring_service_id,
         )?;
-        let token_tags = group_push_token_tags_for_response_with(
-            &account.pubkey,
-            group_id,
-            &self.database,
+        respond_to_token_request_with(
             &mdk,
-        )
-        .await?;
-
-        if token_tags.is_empty() {
-            return Ok(());
-        }
-
-        let rumor = build_token_list_response_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
+            &self.database,
+            &self.relay_control,
+            account,
+            group_id,
             request_event_id,
-            token_tags,
-        )?;
-        publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor).await
+        )
+        .await
     }
 }
 
@@ -298,6 +288,31 @@ async fn publish_push_group_message_with(
         .publish_event_to(event, &account.pubkey, &relay_urls)
         .await?;
     Ok(())
+}
+
+#[perf_instrument("push_notifications")]
+async fn respond_to_token_request_with(
+    mdk: &MDK<MdkSqliteStorage>,
+    database: &Database,
+    relay_control: &RelayControlPlane,
+    account: &Account,
+    group_id: &GroupId,
+    request_event_id: EventId,
+) -> Result<()> {
+    let token_tags =
+        group_push_token_tags_for_response_with(&account.pubkey, group_id, database, mdk).await?;
+
+    if token_tags.is_empty() {
+        return Ok(());
+    }
+
+    let rumor = build_token_list_response_rumor(
+        account.pubkey,
+        nostr_sdk::Timestamp::now(),
+        request_event_id,
+        token_tags,
+    )?;
+    publish_push_group_message_with(mdk, relay_control, account, group_id, rumor).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +726,7 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     pub(crate) async fn handle_received_push_group_message(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         message: &mdk_core::prelude::message_types::Message,
         sender_leaf_index: Option<u32>,
@@ -748,7 +764,7 @@ impl Whitenoise {
             }
             Mip05GroupMessage::TokenListResponse(response) => {
                 let request_event_id = response.request_event_id;
-                self.merge_token_list_response(account, &message.mls_group_id, response)
+                self.merge_token_list_response(mdk, account, &message.mls_group_id, response)
                     .await?;
                 self.clear_pending_token_response(
                     &account.pubkey,
@@ -1199,13 +1215,12 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     async fn merge_token_list_response(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         mls_group_id: &GroupId,
         response: mdk_core::mip05::TokenListResponse,
     ) -> Result<()> {
-        let active_leaf_map = self
-            .create_mdk_for_account(account.pubkey)?
-            .group_leaf_map(mls_group_id)?;
+        let active_leaf_map = mdk.group_leaf_map(mls_group_id)?;
 
         GroupPushToken::upsert_active_token_list_response(
             &account.pubkey,
@@ -1227,25 +1242,15 @@ impl Whitenoise {
         request_event_id: EventId,
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let token_tags = group_push_token_tags_for_response_with(
-            &account.pubkey,
-            group_id,
-            &self.database,
+        respond_to_token_request_with(
             &mdk,
-        )
-        .await?;
-
-        if token_tags.is_empty() {
-            return Ok(());
-        }
-
-        let rumor = build_token_list_response_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
+            &self.database,
+            &self.relay_control,
+            account,
+            group_id,
             request_event_id,
-            token_tags,
-        )?;
-        publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor).await
+        )
+        .await
     }
 
     #[perf_instrument("push_notifications")]

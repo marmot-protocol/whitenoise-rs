@@ -138,7 +138,7 @@ impl Whitenoise {
     ) -> Result<()> {
         if is_push_group_message_kind(message.kind) {
             if let Err(error) = self
-                .handle_push_application_message(account, outcome, &message)
+                .handle_push_application_message(mdk, account, outcome, &message)
                 .await
             {
                 tracing::warn!(
@@ -160,11 +160,13 @@ impl Whitenoise {
 
     async fn handle_push_application_message(
         &self,
+        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         account: &Account,
         outcome: &MessageProcessingOutcome,
         message: &Message,
     ) -> Result<()> {
         self.handle_received_push_group_message(
+            mdk,
             account,
             message,
             outcome.context.sender_leaf_index,
