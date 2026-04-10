@@ -411,8 +411,6 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::*;
-    use crate::whitenoise::accounts_groups::MUTE_FOREVER;
-    use serde_json::json;
 
     /// Unit variants must serialize without a "params" key.
     #[test]
