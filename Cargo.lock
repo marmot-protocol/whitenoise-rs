@@ -2552,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=00be14876ea534145155f70b904b1fd758426430#00be14876ea534145155f70b904b1fd758426430"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e589c8488c7a8bbc7992fbc72ce0e4b8a297170c#e589c8488c7a8bbc7992fbc72ce0e4b8a297170c"
 dependencies = [
  "base64",
  "blurhash",
@@ -2580,12 +2580,12 @@ dependencies = [
 [[package]]
 name = "mdk-macros"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=00be14876ea534145155f70b904b1fd758426430#00be14876ea534145155f70b904b1fd758426430"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e589c8488c7a8bbc7992fbc72ce0e4b8a297170c#e589c8488c7a8bbc7992fbc72ce0e4b8a297170c"
 
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=00be14876ea534145155f70b904b1fd758426430#00be14876ea534145155f70b904b1fd758426430"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e589c8488c7a8bbc7992fbc72ce0e4b8a297170c#e589c8488c7a8bbc7992fbc72ce0e4b8a297170c"
 dependencies = [
  "getrandom 0.4.2",
  "hex",
@@ -2606,7 +2606,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=00be14876ea534145155f70b904b1fd758426430#00be14876ea534145155f70b904b1fd758426430"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e589c8488c7a8bbc7992fbc72ce0e4b8a297170c#e589c8488c7a8bbc7992fbc72ce0e4b8a297170c"
 dependencies = [
  "nostr",
  "openmls",

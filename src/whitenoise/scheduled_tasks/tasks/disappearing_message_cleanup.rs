@@ -1,12 +1,15 @@
 //! Scheduled task to delete expired disappearing messages.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use nostr_sdk::{EventId, PublicKey};
 
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
+use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
 use crate::whitenoise::error::WhitenoiseError;
@@ -41,16 +44,83 @@ impl Task for DisappearingMessageCleanup {
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
         let now_ms = Utc::now().timestamp_millis();
 
-        // Collect expired message IDs before deletion so we can notify subscribers.
+        // Collect expired message IDs before deletion so we can notify subscribers
+        // and delete them from each member's MDK storage.
         let expired_messages =
             AggregatedMessage::find_expired(now_ms, &whitenoise.database).await?;
 
-        let affected_groups =
-            AggregatedMessage::delete_expired(now_ms, &whitenoise.database).await?;
-
-        if affected_groups.is_empty() {
+        if expired_messages.is_empty() {
             return Ok(());
         }
+
+        // Resolve which accounts hold MDK storage for each affected group. A
+        // group is typically joined by one local account, but the codebase
+        // supports multiple accounts on the same device, so we union them.
+        let mut group_members: HashMap<Vec<u8>, HashSet<PublicKey>> = HashMap::new();
+        for (_, group_id) in &expired_messages {
+            let key = group_id.as_slice().to_vec();
+            if group_members.contains_key(&key) {
+                continue;
+            }
+            let account_groups =
+                AccountGroup::find_by_group(group_id, &whitenoise.database).await?;
+            let members: HashSet<PublicKey> = account_groups
+                .into_iter()
+                .map(|ag| ag.account_pubkey)
+                .collect();
+            group_members.insert(key, members);
+        }
+
+        // Delete each expired message from every member account's MDK
+        // storage. We do this before the aggregated-messages DELETE so that a
+        // crash mid-cleanup leaves the DB consistent with MDK (the task will
+        // retry next tick). Failures are logged but do not abort the pass —
+        // one bad account shouldn't hold the whole cleanup hostage.
+        for (message_id_hex, group_id) in &expired_messages {
+            let event_id = match EventId::from_hex(message_id_hex) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::disappearing_messages",
+                        "Skipping expired message with unparseable id {}: {}",
+                        message_id_hex,
+                        e,
+                    );
+                    continue;
+                }
+            };
+
+            let Some(members) = group_members.get(group_id.as_slice()) else {
+                continue;
+            };
+
+            for account_pubkey in members {
+                let mdk = match whitenoise.create_mdk_for_account(*account_pubkey) {
+                    Ok(mdk) => mdk,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "whitenoise::disappearing_messages",
+                            "Failed to open MDK for account {} while cleaning group: {}",
+                            account_pubkey.to_hex(),
+                            e,
+                        );
+                        continue;
+                    }
+                };
+
+                if let Err(e) = mdk.delete_message(group_id, &event_id) {
+                    tracing::warn!(
+                        target: "whitenoise::disappearing_messages",
+                        "MDK delete_message failed for {} in group: {}",
+                        message_id_hex,
+                        e,
+                    );
+                }
+            }
+        }
+
+        let affected_groups =
+            AggregatedMessage::delete_expired(now_ms, &whitenoise.database).await?;
 
         // Emit per-message updates so open conversation views can remove them.
         for (message_id, group_id) in &expired_messages {
