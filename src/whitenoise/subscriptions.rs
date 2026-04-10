@@ -322,14 +322,12 @@ impl Whitenoise {
         // quickly causes connection failures.
         discovery.start().await.map_err(WhitenoiseError::from)?;
 
-        let (users_result, follows_result, mute_result) = tokio::join!(
+        tokio::try_join!(
             discovery.sync_watched_users(&watched_users, public_since),
             discovery.sync_follow_lists(&follow_list_accounts),
             discovery.sync_mute_lists(&account_pubkeys),
-        );
-        users_result.map_err(WhitenoiseError::from)?;
-        follows_result.map_err(WhitenoiseError::from)?;
-        mute_result.map_err(WhitenoiseError::from)?;
+        )
+        .map_err(WhitenoiseError::from)?;
 
         Ok(())
     }
