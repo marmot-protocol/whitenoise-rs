@@ -94,17 +94,6 @@ impl Whitenoise {
         }
         sub_result?;
 
-        // Eagerly populate the local mute list cache from relays as a
-        // fire-and-forget background task. The `request_rebuild()` call above
-        // eventually creates a live `AccountMuteList` subscription on the
-        // discovery plane, but that subscription only delivers events *after*
-        // the relay connection is established and the relay pushes them —
-        // which can take several seconds on a fresh activation. This explicit
-        // one-shot fetch via the ephemeral plane fills the cache immediately
-        // so that blocked-user enforcement is active right away, without
-        // waiting for the live subscription to fire.
-        self.background_sync_mute_list(account);
-
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
     }
@@ -123,11 +112,6 @@ impl Whitenoise {
 
         self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
-
-        // Same rationale as activate_account: eagerly populate the mute list
-        // cache so blocked-user enforcement is active immediately, without
-        // waiting for the live discovery subscription to deliver events.
-        self.background_sync_mute_list(account);
 
         // Note: We skip key package setup for external signer accounts.
         // Key packages need to be published separately with the external signer.
@@ -686,39 +670,6 @@ impl Whitenoise {
             Ok::<(), WhitenoiseError>(())
         });
         Ok(())
-    }
-
-    /// Spawns a fire-and-forget background task that fetches the account's
-    /// kind 10000 mute list from relays and populates the local cache.
-    ///
-    /// This is intentionally non-blocking: activation completes immediately
-    /// and the sync happens in the background. If the sync fails (e.g. relay
-    /// unavailable) the live `AccountMuteList` subscription will deliver the
-    /// event once connected.
-    pub(crate) fn background_sync_mute_list(&self, account: &Account) {
-        let account_clone = account.clone();
-        tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::accounts",
-                        account_pubkey = %account_clone.pubkey,
-                        "background_sync_mute_list: failed to get Whitenoise instance: {}",
-                        e,
-                    );
-                    return;
-                }
-            };
-            if let Err(e) = whitenoise.sync_mute_list(&account_clone).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts",
-                    account_pubkey = %account_clone.pubkey,
-                    "Mute list startup sync failed, live subscription will recover: {}",
-                    e,
-                );
-            }
-        });
     }
 
     /// Returns the number of active groups in MDK for an account.

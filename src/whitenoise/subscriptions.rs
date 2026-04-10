@@ -316,18 +316,20 @@ impl Whitenoise {
 
         let account_pubkeys: Vec<_> = accounts.iter().map(|a| a.pubkey).collect();
 
-        discovery
-            .sync_watched_users(&watched_users, public_since)
-            .await
-            .map_err(WhitenoiseError::from)?;
-        discovery
-            .sync_follow_lists(&follow_list_accounts)
-            .await
-            .map_err(WhitenoiseError::from)?;
-        discovery
-            .sync_mute_lists(&account_pubkeys)
-            .await
-            .map_err(WhitenoiseError::from)?;
+        // Ensure the discovery session is connected before running the syncs
+        // concurrently — each sync has its own `start()` guard, but racing
+        // three concurrent `start()` calls against test relays that shut down
+        // quickly causes connection failures.
+        discovery.start().await.map_err(WhitenoiseError::from)?;
+
+        let (users_result, follows_result, mute_result) = tokio::join!(
+            discovery.sync_watched_users(&watched_users, public_since),
+            discovery.sync_follow_lists(&follow_list_accounts),
+            discovery.sync_mute_lists(&account_pubkeys),
+        );
+        users_result.map_err(WhitenoiseError::from)?;
+        follows_result.map_err(WhitenoiseError::from)?;
+        mute_result.map_err(WhitenoiseError::from)?;
 
         Ok(())
     }
