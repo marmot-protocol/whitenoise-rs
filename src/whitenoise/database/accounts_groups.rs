@@ -24,6 +24,7 @@ struct AccountGroupRow {
     removed_at: Option<DateTime<Utc>>,
     self_removed: bool,
     muted_until: Option<DateTime<Utc>>,
+    chat_cleared_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -78,6 +79,7 @@ where
         let self_removed_int: i64 = row.try_get("self_removed")?;
         let self_removed = self_removed_int != 0;
         let muted_until = parse_optional_timestamp(row, "muted_until")?;
+        let chat_cleared_at = parse_optional_timestamp(row, "chat_cleared_at")?;
 
         // Parse pubkey from hex string
         let account_pubkey =
@@ -123,6 +125,7 @@ where
             removed_at,
             self_removed,
             muted_until,
+            chat_cleared_at,
             created_at,
             updated_at,
         })
@@ -144,6 +147,7 @@ impl From<AccountGroupRow> for AccountGroup {
             removed_at: row.removed_at,
             self_removed: row.self_removed,
             muted_until: row.muted_until,
+            chat_cleared_at: row.chat_cleared_at,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
@@ -211,7 +215,8 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
-             WHERE account_pubkey = ? AND (user_confirmation IS NULL OR user_confirmation = 1)",
+             WHERE account_pubkey = ?
+               AND (user_confirmation IS NULL OR user_confirmation = 1)",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
@@ -230,7 +235,9 @@ impl AccountGroup {
         let rows = sqlx::query_as::<_, AccountGroupRow>(
             "SELECT *
              FROM accounts_groups
-             WHERE account_pubkey = ? AND user_confirmation IS NULL AND removed_at IS NULL",
+             WHERE account_pubkey = ?
+               AND user_confirmation IS NULL
+               AND removed_at IS NULL",
         )
         .bind(account_pubkey.to_hex())
         .fetch_all(&database.pool)
@@ -399,6 +406,86 @@ impl AccountGroup {
              RETURNING *",
         )
         .bind(muted_until.map(|dt| dt.timestamp_millis()))
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Updates the chat_cleared_at timestamp for this AccountGroup.
+    ///
+    /// - `Some(timestamp)` = messages at or before this time are hidden
+    /// - `None` = not cleared (all messages visible)
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn update_chat_cleared_at(
+        &self,
+        chat_cleared_at: Option<DateTime<Utc>>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET chat_cleared_at = ?, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(chat_cleared_at.map(|dt| dt.timestamp_millis()))
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Clears the last_read_message_id for this AccountGroup.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn reset_last_read_message_id(
+        &self,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET last_read_message_id = NULL, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(now_ms)
+        .bind(id)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Sets `chat_cleared_at` and resets `last_read_message_id` in a single atomic write.
+    ///
+    /// Used by `clear_chat` to ensure both fields are updated together, preventing
+    /// a race with `mark_message_read` that could leave a stale read marker.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn clear_chat_state(
+        &self,
+        chat_cleared_at: DateTime<Utc>,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let id = self.id.expect("AccountGroup must be persisted");
+        let now_ms = Utc::now().timestamp_millis();
+        let cleared_ms = chat_cleared_at.timestamp_millis();
+
+        let row = sqlx::query_as::<_, AccountGroupRow>(
+            "UPDATE accounts_groups
+             SET chat_cleared_at = ?, last_read_message_id = NULL, updated_at = ?
+             WHERE id = ?
+             RETURNING *",
+        )
+        .bind(cleared_ms)
         .bind(now_ms)
         .bind(id)
         .fetch_one(&database.pool)
@@ -965,6 +1052,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1000,6 +1089,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1022,6 +1113,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1065,6 +1158,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1716,6 +1811,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1904,6 +2001,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1958,5 +2057,106 @@ mod tests {
         );
         // A declined+removed group stays hidden
         assert!(!removed.is_visible());
+    }
+
+    #[tokio::test]
+    async fn test_update_chat_cleared_at_sets_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[90; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        assert!(ag.chat_cleared_at.is_none());
+
+        let now = Utc::now();
+        let updated = ag
+            .update_chat_cleared_at(Some(now), &whitenoise.database)
+            .await
+            .unwrap();
+
+        assert!(updated.chat_cleared_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_chat_cleared_at_clears_value() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[91; 32]);
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        let cleared = ag
+            .update_chat_cleared_at(Some(Utc::now()), &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(cleared.chat_cleared_at.is_some());
+
+        let uncleared = cleared
+            .update_chat_cleared_at(None, &whitenoise.database)
+            .await
+            .unwrap();
+        assert!(uncleared.chat_cleared_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reset_last_read_message_id() {
+        use crate::whitenoise::aggregated_message::AggregatedMessage;
+        use crate::whitenoise::group_information::{GroupInformation, GroupType};
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[94; 32]);
+
+        GroupInformation::find_or_create_by_mls_group_id(
+            &group_id,
+            Some(GroupType::Group),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let message_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
+        let message_time = Utc::now();
+
+        AggregatedMessage::create_for_test(
+            message_id,
+            group_id.clone(),
+            account.pubkey,
+            message_time,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let (ag, _) =
+            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Set the read marker first
+        let with_marker = ag
+            .update_last_read_if_newer(
+                &message_id,
+                message_time.timestamp_millis(),
+                &whitenoise.database,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_marker.last_read_message_id, Some(message_id));
+
+        // Reset
+        let reset = with_marker
+            .reset_last_read_message_id(&whitenoise.database)
+            .await
+            .unwrap();
+        assert!(reset.last_read_message_id.is_none());
     }
 }

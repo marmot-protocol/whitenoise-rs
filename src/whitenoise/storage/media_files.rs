@@ -129,7 +129,6 @@ impl MediaFileStorage {
     }
 
     /// Returns the cache directory path
-    #[cfg(test)]
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }

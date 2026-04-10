@@ -166,11 +166,11 @@ impl Whitenoise {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
-        let result = mdk
+        let data = mdk
             .create_key_package_for_event(&account.pubkey, key_package_relay_urls)
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
-        Ok(result)
+        Ok((data.content, data.tags_30443, data.hash_ref))
     }
 
     /// Publishes the MLS key package for the given account to its key package relays.

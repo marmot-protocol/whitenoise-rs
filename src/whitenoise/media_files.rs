@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use mdk_core::{
@@ -348,6 +349,80 @@ impl<'a> MediaFiles<'a> {
         }
 
         (blurhash, thumbhash)
+    }
+
+    /// Deletes media files from disk that have no database references.
+    ///
+    /// Scans the media cache directory and removes files not referenced by any
+    /// `media_files` row. This reclaims disk space after operations like
+    /// `delete_chat` that remove DB records but leave files on disk.
+    ///
+    /// Files are content-addressed and may be shared across groups -- a file
+    /// is only deleted when zero DB records reference it.
+    ///
+    /// Returns the number of files deleted.
+    #[perf_instrument("media_files")]
+    pub(crate) async fn cleanup_orphaned_files(&self) -> Result<u64> {
+        // 1. Get all distinct file paths referenced in the database
+        let referenced_paths: Vec<String> =
+            MediaFile::all_referenced_file_paths(self.database).await?;
+
+        let referenced: HashSet<PathBuf> =
+            referenced_paths.into_iter().map(PathBuf::from).collect();
+
+        // 2. Scan the cache directory
+        let cache_dir = self.storage.media_files.cache_dir();
+        if !cache_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut entries = tokio::fs::read_dir(cache_dir).await.map_err(|e| {
+            WhitenoiseError::MediaCache(format!("Failed to read cache directory: {}", e))
+        })?;
+
+        // 3. Delete files not referenced by any DB record
+        let mut deleted = 0u64;
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            WhitenoiseError::MediaCache(format!("Failed to read directory entry: {}", e))
+        })? {
+            let path = entry.path();
+
+            // Skip directories (media_cache should be flat, but be defensive)
+            if !path.is_file() {
+                continue;
+            }
+
+            if !referenced.contains(&path) {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        tracing::debug!(
+                            target: "whitenoise::media_files",
+                            "Deleted orphaned media file: {}",
+                            path.display()
+                        );
+                        deleted += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "whitenoise::media_files",
+                            "Failed to delete orphaned file {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        if deleted > 0 {
+            tracing::info!(
+                target: "whitenoise::media_files",
+                "Cleaned up {} orphaned media file(s)",
+                deleted
+            );
+        }
+
+        Ok(deleted)
     }
 
     /// Stores parsed media references to the database
@@ -703,5 +778,162 @@ mod tests {
         let (blurhash, thumbhash) = MediaFiles::extract_hashes_from_tag(&tag);
         assert!(blurhash.is_none());
         assert!(thumbhash.is_none());
+    }
+
+    /// Helper: creates a user + account row so media_files FK constraints pass
+    async fn create_test_account(db: &Database, pubkey: &PublicKey) {
+        sqlx::query("INSERT INTO users (pubkey, created_at, updated_at) VALUES (?, ?, ?)")
+            .bind(pubkey.to_hex())
+            .bind(chrono::Utc::now().timestamp())
+            .bind(chrono::Utc::now().timestamp())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE pubkey = ?")
+            .bind(pubkey.to_hex())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(pubkey.to_hex())
+        .bind(user_id)
+        .bind(chrono::Utc::now().timestamp())
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_files_deletes_unreferenced() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+        let storage = Storage::new(temp_dir.path()).await.unwrap();
+
+        // Put a file on disk with no DB record
+        storage
+            .media_files
+            .store_file("orphan.jpg", b"orphan data")
+            .await
+            .unwrap();
+
+        let media_files = MediaFiles::new(&storage, &db);
+        let deleted = media_files.cleanup_orphaned_files().await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(
+            storage
+                .media_files
+                .find_file_with_prefix("orphan")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_files_keeps_referenced() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+        let storage = Storage::new(temp_dir.path()).await.unwrap();
+
+        let group_id = GroupId::from_slice(&[1u8; 8]);
+        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        create_test_account(&db, &pubkey).await;
+
+        let media_files = MediaFiles::new(&storage, &db);
+
+        // Store file and record it in DB
+        let upload = MediaFileUpload {
+            data: b"referenced data",
+            original_file_hash: None,
+            encrypted_file_hash: [3u8; 32],
+            mime_type: "image/jpeg",
+            media_type: "test_media",
+            blossom_url: None,
+            nostr_key: None,
+            file_metadata: None,
+            nonce: None,
+            scheme_version: None,
+        };
+        let record = media_files
+            .store_and_record(&pubkey, &group_id, "referenced.jpg", upload)
+            .await
+            .unwrap();
+
+        let deleted = media_files.cleanup_orphaned_files().await.unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(record.file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_files_mixed() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+        let storage = Storage::new(temp_dir.path()).await.unwrap();
+
+        let group_id = GroupId::from_slice(&[1u8; 8]);
+        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        create_test_account(&db, &pubkey).await;
+
+        let media_files = MediaFiles::new(&storage, &db);
+
+        // Store a referenced file (has DB record)
+        let upload = MediaFileUpload {
+            data: b"keep me",
+            original_file_hash: None,
+            encrypted_file_hash: [4u8; 32],
+            mime_type: "image/png",
+            media_type: "test_media",
+            blossom_url: None,
+            nostr_key: None,
+            file_metadata: None,
+            nonce: None,
+            scheme_version: None,
+        };
+        let kept = media_files
+            .store_and_record(&pubkey, &group_id, "keep.png", upload)
+            .await
+            .unwrap();
+
+        // Store an orphan file (no DB record)
+        storage
+            .media_files
+            .store_file("orphan.png", b"delete me")
+            .await
+            .unwrap();
+
+        let deleted = media_files.cleanup_orphaned_files().await.unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(kept.file_path.exists());
+        assert!(
+            storage
+                .media_files
+                .find_file_with_prefix("orphan")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_orphaned_files_empty_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+        let storage = Storage::new(temp_dir.path()).await.unwrap();
+
+        let media_files = MediaFiles::new(&storage, &db);
+        let deleted = media_files.cleanup_orphaned_files().await.unwrap();
+
+        assert_eq!(deleted, 0);
     }
 }

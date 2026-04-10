@@ -482,6 +482,19 @@ impl MediaFile {
         Ok(row.into())
     }
 
+    /// Returns all distinct non-empty file paths referenced by media_files records.
+    #[perf_instrument("db::media_files")]
+    pub(crate) async fn all_referenced_file_paths(
+        database: &Database,
+    ) -> Result<Vec<String>, WhitenoiseError> {
+        let paths: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT file_path FROM media_files WHERE file_path != ''")
+                .fetch_all(&database.pool)
+                .await
+                .map_err(DatabaseError::Sqlx)?;
+        Ok(paths)
+    }
+
     /// Check if this media file is an image
     pub fn is_image(&self) -> bool {
         self.mime_type.starts_with("image/")

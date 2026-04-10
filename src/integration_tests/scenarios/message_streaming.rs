@@ -123,7 +123,7 @@ impl MessageStreamingScenario {
     async fn phase3_verify_initial_snapshot(&mut self) -> Result<(), WhitenoiseError> {
         tracing::info!("=== Phase 3: Verify initial message snapshot ===");
 
-        VerifyInitialMessagesTestCase::new(Self::GROUP_NAME)
+        VerifyInitialMessagesTestCase::new(Self::GROUP_NAME, "stream_creator")
             .expect_messages(vec![
                 "msg_plain",
                 "msg_with_reaction",
@@ -143,9 +143,12 @@ impl MessageStreamingScenario {
 
         // Test 1: NewMessage trigger
         tracing::info!("--- Testing NewMessage update ---");
-        let new_msg_verifier =
-            VerifyStreamUpdateTestCase::new(Self::GROUP_NAME, UpdateTrigger::NewMessage)
-                .expect_message_key("msg_stream_new");
+        let new_msg_verifier = VerifyStreamUpdateTestCase::new(
+            Self::GROUP_NAME,
+            "stream_creator",
+            UpdateTrigger::NewMessage,
+        )
+        .expect_message_key("msg_stream_new");
         new_msg_verifier.subscribe(&self.context).await?;
 
         SendMessageTestCase::basic()
@@ -164,10 +167,13 @@ impl MessageStreamingScenario {
 
         // Test 2: ReactionAdded trigger
         tracing::info!("--- Testing ReactionAdded update ---");
-        let reaction_verifier =
-            VerifyStreamUpdateTestCase::new(Self::GROUP_NAME, UpdateTrigger::ReactionAdded)
-                .expect_message_key("msg_stream_new")
-                .expect_has_reactions(true);
+        let reaction_verifier = VerifyStreamUpdateTestCase::new(
+            Self::GROUP_NAME,
+            "stream_creator",
+            UpdateTrigger::ReactionAdded,
+        )
+        .expect_message_key("msg_stream_new")
+        .expect_has_reactions(true);
         reaction_verifier.subscribe(&self.context).await?;
 
         let msg_stream_new_id = self.context.get_message_id("msg_stream_new")?.clone();
@@ -187,10 +193,13 @@ impl MessageStreamingScenario {
 
         // Test 3: ReactionRemoved trigger
         tracing::info!("--- Testing ReactionRemoved update ---");
-        let reaction_removed_verifier =
-            VerifyStreamUpdateTestCase::new(Self::GROUP_NAME, UpdateTrigger::ReactionRemoved)
-                .expect_message_key("msg_stream_new")
-                .expect_has_reactions(false);
+        let reaction_removed_verifier = VerifyStreamUpdateTestCase::new(
+            Self::GROUP_NAME,
+            "stream_creator",
+            UpdateTrigger::ReactionRemoved,
+        )
+        .expect_message_key("msg_stream_new")
+        .expect_has_reactions(false);
         reaction_removed_verifier.subscribe(&self.context).await?;
 
         DeleteMessageTestCase::new("stream_member", Self::GROUP_NAME, "reaction_stream")
@@ -217,10 +226,13 @@ impl MessageStreamingScenario {
         // Increased delay to handle CI timing variations
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        let delete_verifier =
-            VerifyStreamUpdateTestCase::new(Self::GROUP_NAME, UpdateTrigger::MessageDeleted)
-                .expect_message_key("msg_to_delete_stream")
-                .expect_deleted();
+        let delete_verifier = VerifyStreamUpdateTestCase::new(
+            Self::GROUP_NAME,
+            "stream_creator",
+            UpdateTrigger::MessageDeleted,
+        )
+        .expect_message_key("msg_to_delete_stream")
+        .expect_deleted();
         delete_verifier.subscribe(&self.context).await?;
 
         DeleteMessageTestCase::new("stream_creator", Self::GROUP_NAME, "msg_to_delete_stream")
