@@ -87,6 +87,16 @@ pub enum MessagesCmd {
         limit: Option<u32>,
     },
 
+    /// Search messages across all groups
+    SearchAll {
+        /// Search query (forward-order substring matching)
+        query: String,
+
+        /// Maximum number of results (default: 50, max: 200)
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+
     /// Subscribe to live messages in a group
     Subscribe {
         /// MLS group ID (hex)
@@ -160,6 +170,9 @@ impl MessagesCmd {
                 query,
                 limit,
             } => search(socket, json, account_flag, group_id, query, limit).await,
+            Self::SearchAll { query, limit } => {
+                search_all(socket, json, account_flag, query, limit).await
+            }
             Self::Subscribe { group_id, limit } => {
                 subscribe(socket, json, account_flag, group_id, limit).await
             }
@@ -226,6 +239,26 @@ async fn search(
         &Request::SearchMessages {
             account: pubkey,
             group_id,
+            query,
+            limit,
+        },
+    )
+    .await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn search_all(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    query: String,
+    limit: Option<u32>,
+) -> anyhow::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::SearchAllMessages {
+            account: pubkey,
             query,
             limit,
         },

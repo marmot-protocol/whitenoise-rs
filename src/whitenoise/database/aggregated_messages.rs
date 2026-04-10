@@ -583,6 +583,86 @@ impl AggregatedMessage {
         .fetch_all(&database.pool)
         .await?;
 
+        Self::rows_to_search_results(rows, query)
+    }
+
+    /// Search messages across **all visible** groups belonging to an account.
+    ///
+    /// Behaves identically to [`search_messages_in_group`](Self::search_messages_in_group)
+    /// except that it removes the single-group filter and scopes results to groups
+    /// the account is a member of (via `accounts_groups`). Declined groups
+    /// (`user_confirmation = 0`) are excluded to match the visibility semantics
+    /// of `find_visible_for_account`. Each result carries its `mls_group_id` so
+    /// Flutter can group them by conversation.
+    ///
+    /// # Position semantics
+    ///
+    /// `position` is computed per-group via `PARTITION BY mls_group_id` so the
+    /// frontend can still jump to the correct page within each conversation.
+    /// The window intentionally includes deleted tombstones so that positions
+    /// match the pagination ordering used by `find_messages_by_group_paginated`;
+    /// the `deletion_event_id IS NULL` filter is applied in the outer SELECT
+    /// instead. Do not push deletion filtering into the CTE or positions will
+    /// silently drift from pagination offsets.
+    ///
+    /// # Performance
+    ///
+    /// Unlike the single-group variant, the window evaluation here is
+    /// O(sum of all group sizes) rather than O(single_group_size). The covering
+    /// index from migration 0043 still drives each per-partition scan, but users
+    /// with many large groups will pay proportionally more.
+    pub async fn search_messages(
+        pubkey: &PublicKey,
+        query: &str,
+        limit: u32,
+        database: &Database,
+    ) -> Result<Vec<SearchResult>> {
+        let limit_val = i64::from(limit.min(200));
+        let like_pattern = super::content_search::query_to_like_pattern(query);
+
+        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
+            "WITH ranked AS (
+               SELECT am.*,
+                      mds.status AS delivery_status,
+                      (ROW_NUMBER() OVER (
+                         PARTITION BY am.mls_group_id
+                         ORDER BY am.created_at DESC, am.message_id DESC
+                      )) - 1 AS position
+               FROM aggregated_messages am
+               JOIN accounts_groups ag
+                 ON ag.mls_group_id = am.mls_group_id
+               LEFT JOIN message_delivery_status mds
+                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               WHERE am.kind = 9
+                 AND ag.account_pubkey = ?1
+                 AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)
+                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
+             )
+             SELECT * FROM ranked
+             WHERE deletion_event_id IS NULL
+               AND content_normalized LIKE ?2
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT ?3",
+        )
+        .bind(pubkey.to_hex())
+        .bind(&like_pattern)
+        .bind(limit_val)
+        .fetch_all(&database.pool)
+        .await?;
+
+        Self::rows_to_search_results(rows, query)
+    }
+
+    /// Convert search query rows into [`SearchResult`]s with highlight spans
+    /// and validated positions.
+    ///
+    /// Shared by both [`search_messages_in_group`](Self::search_messages_in_group)
+    /// and [`search_messages`](Self::search_messages) to avoid drift between the
+    /// two row-mapping paths.
+    fn rows_to_search_results(
+        rows: Vec<AggregatedMessageRow>,
+        query: &str,
+    ) -> Result<Vec<SearchResult>> {
         rows.into_iter()
             .map(|row| {
                 let position_i64 =
@@ -595,11 +675,13 @@ impl AggregatedMessage {
                         message_id: row.message_id.to_string(),
                     }
                 })?;
+                let mls_group_id = row.mls_group_id.clone();
                 let message = Self::row_to_chat_message(row)?;
                 let highlight_spans =
                     super::content_search::find_highlight_spans(&message.content, query);
                 Ok(SearchResult {
                     message,
+                    mls_group_id,
                     highlight_spans,
                     position,
                 })
@@ -4301,5 +4383,153 @@ mod tests {
         assert_eq!(results[0].position, 0);
         assert_eq!(results[1].position, 1);
         assert_eq!(results[2].position, 2);
+    }
+
+    /// Test cross-group search: finds messages across multiple groups,
+    /// returns per-group positions, and excludes declined groups.
+    #[tokio::test]
+    async fn test_search_messages_cross_group() {
+        use crate::whitenoise::accounts_groups::AccountGroup;
+        use chrono::Utc;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let pubkey = account.pubkey;
+
+        // Set up three groups with messages
+        let group_a = GroupId::from_slice(&[10; 32]);
+        let group_b = GroupId::from_slice(&[11; 32]);
+        let group_declined = GroupId::from_slice(&[12; 32]);
+
+        for gid in [&group_a, &group_b, &group_declined] {
+            setup_group(gid, &whitenoise.database).await;
+        }
+
+        // Link account to groups: A = accepted, B = pending (null), C = declined
+        let now = Utc::now();
+        for (gid, confirmation) in [
+            (&group_a, Some(true)),
+            (&group_b, None),
+            (&group_declined, Some(false)),
+        ] {
+            let ag = AccountGroup {
+                id: None,
+                account_pubkey: pubkey,
+                mls_group_id: gid.clone(),
+                user_confirmation: confirmation,
+                welcomer_pubkey: None,
+                last_read_message_id: None,
+                pin_order: None,
+                dm_peer_pubkey: None,
+                archived_at: None,
+                removed_at: None,
+                self_removed: false,
+                muted_until: None,
+                created_at: now,
+                updated_at: now,
+            };
+            ag.save(&whitenoise.database).await.unwrap();
+        }
+
+        let author = Keys::generate().public_key();
+
+        // Insert messages: "marmot" in all three groups
+        let msg_a = create_test_chat_message_with_content(1, author, "marmot in group A");
+        AggregatedMessage::insert_message(&msg_a, &group_a, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let msg_b = create_test_chat_message_with_content(2, author, "marmot in group B");
+        AggregatedMessage::insert_message(&msg_b, &group_b, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let msg_declined =
+            create_test_chat_message_with_content(3, author, "marmot in declined group");
+        AggregatedMessage::insert_message(&msg_declined, &group_declined, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Also add a second message in group A to verify per-group positions
+        let msg_a2 = create_test_chat_message_with_content(4, author, "another marmot in group A");
+        AggregatedMessage::insert_message(&msg_a2, &group_a, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Cross-group search for "marmot"
+        let results =
+            AggregatedMessage::search_messages(&pubkey, "marmot", 50, &whitenoise.database)
+                .await
+                .unwrap();
+
+        // Should find 3 results (groups A and B), NOT the declined group
+        assert_eq!(
+            results.len(),
+            3,
+            "declined group messages must be excluded from cross-group search"
+        );
+
+        // Verify no result comes from the declined group
+        for r in &results {
+            assert_ne!(
+                r.mls_group_id, group_declined,
+                "declined group must not appear in results"
+            );
+        }
+
+        // Verify mls_group_id is populated correctly on each result
+        let group_ids: Vec<&GroupId> = results.iter().map(|r| &r.mls_group_id).collect();
+        assert!(group_ids.contains(&&group_a));
+        assert!(group_ids.contains(&&group_b));
+
+        // Verify per-group positions: group A has 2 messages, newest (seed 4) = position 0
+        let group_a_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.mls_group_id == group_a)
+            .collect();
+        assert_eq!(group_a_results.len(), 2);
+        // Newest message (seed 4, ts 1_700_000_004) should have position 0
+        let newest = group_a_results
+            .iter()
+            .find(|r| r.message.content == "another marmot in group A")
+            .expect("should find second group A message");
+        assert_eq!(newest.position, 0);
+        // Older message (seed 1, ts 1_700_000_001) should have position 1
+        let older = group_a_results
+            .iter()
+            .find(|r| r.message.content == "marmot in group A")
+            .expect("should find first group A message");
+        assert_eq!(older.position, 1);
+
+        // Group B has 1 message, position 0
+        let group_b_result = results
+            .iter()
+            .find(|r| r.mls_group_id == group_b)
+            .expect("should find group B result");
+        assert_eq!(group_b_result.position, 0);
+
+        // Empty query returns all non-declined messages
+        let all_results = AggregatedMessage::search_messages(&pubkey, "", 50, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(
+            all_results.len(),
+            3,
+            "empty query should match all visible messages"
+        );
+
+        // Limit is respected
+        let limited =
+            AggregatedMessage::search_messages(&pubkey, "marmot", 1, &whitenoise.database)
+                .await
+                .unwrap();
+        assert_eq!(limited.len(), 1, "limit should cap results");
+
+        // No match returns empty
+        let no_match =
+            AggregatedMessage::search_messages(&pubkey, "nonexistent", 50, &whitenoise.database)
+                .await
+                .unwrap();
+        assert!(no_match.is_empty(), "no match should return empty");
     }
 }

@@ -243,6 +243,14 @@ pub enum Request {
         limit: Option<u32>,
     },
 
+    #[serde(rename = "search_all_messages")]
+    SearchAllMessages {
+        account: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+
     // Media
     #[serde(rename = "upload_media")]
     UploadMedia {
