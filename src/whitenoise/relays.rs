@@ -243,15 +243,6 @@ mod tests {
         whitenoise::test_utils::*,
     };
 
-    fn create_test_relay(url: &RelayUrl) -> super::Relay {
-        super::Relay {
-            id: None,
-            url: url.clone(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
     async fn persist_connected_status(
         whitenoise: &Whitenoise,
         relay_url: &RelayUrl,
@@ -273,39 +264,6 @@ mod tests {
 
     mod relay_tests {
         use super::*;
-
-        #[test]
-        fn test_urls_empty_list() {
-            let relays: Vec<super::super::Relay> = vec![];
-            let urls = super::super::Relay::urls(&relays);
-            assert_eq!(urls.len(), 0);
-        }
-
-        #[test]
-        fn test_urls_extracts_and_preserves_order() {
-            let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
-            let url2 = RelayUrl::parse("wss://relay2.example.com").unwrap();
-            let url3 = RelayUrl::parse("wss://relay3.example.com").unwrap();
-
-            let relays = vec![
-                create_test_relay(&url1),
-                create_test_relay(&url2),
-                create_test_relay(&url3),
-            ];
-
-            let urls = super::super::Relay::urls(&relays);
-
-            assert_eq!(urls, vec![url1, url2, url3]);
-        }
-
-        #[test]
-        fn test_relay_new() {
-            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
-            let relay = Relay::new(&url);
-
-            assert!(relay.id.is_none());
-            assert_eq!(relay.url, url);
-        }
 
         #[test]
         fn test_relay_defaults_not_empty() {

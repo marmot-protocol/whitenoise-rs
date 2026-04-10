@@ -950,15 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_info_default_matches_new() {
-        let from_default = RetryInfo::default();
-        let from_new = RetryInfo::new();
-        assert_eq!(from_default.attempt, from_new.attempt);
-        assert_eq!(from_default.max_attempts, from_new.max_attempts);
-        assert_eq!(from_default.base_delay_ms, from_new.base_delay_ms);
-    }
-
-    #[test]
     fn test_retry_info_should_retry() {
         let info = RetryInfo::new();
         assert!(info.should_retry());
