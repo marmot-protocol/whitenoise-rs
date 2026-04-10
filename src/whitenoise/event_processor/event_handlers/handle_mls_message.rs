@@ -154,9 +154,17 @@ impl Whitenoise {
             .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
             .await?;
 
+        let disappearing_duration_secs = mdk
+            .get_group(&group_id)
+            .ok()
+            .flatten()
+            .and_then(|g| g.disappearing_message_duration_secs);
+
         match message.kind {
             Kind::ChatMessage => {
-                let msg = self.cache_chat_message(&group_id, &message).await?;
+                let msg = self
+                    .cache_chat_message(&group_id, &message, disappearing_duration_secs)
+                    .await?;
                 let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
                 Whitenoise::spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
@@ -426,11 +434,15 @@ impl Whitenoise {
     ///
     /// Processes the message through the aggregator, inserts into database,
     /// and applies any orphaned reactions/deletions that arrived before this message.
+    ///
+    /// `disappearing_duration_secs` is the group's configured disappearing message
+    /// TTL. When `Some(n)`, `expires_at` is set to `created_at + n` on the message.
     #[perf_instrument("event_handlers")]
     async fn cache_chat_message(
         &self,
         group_id: &GroupId,
         message: &Message,
+        disappearing_duration_secs: Option<u64>,
     ) -> Result<ChatMessage> {
         let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
 
@@ -438,6 +450,12 @@ impl Whitenoise {
             .message_aggregator
             .process_single_message(message, &self.content_parser, media_files)
             .await?;
+
+        // Set expiration based on the group's disappearing message setting
+        if let Some(duration) = disappearing_duration_secs {
+            let expires_at_secs = chat_message.created_at.as_secs() + duration;
+            chat_message.expires_at = Some(Timestamp::from(expires_at_secs));
+        }
 
         // Preserve existing delivery status for relay echoes of locally-sent messages.
         // This keeps stream payloads aligned with the latest DB state instead of
@@ -869,7 +887,7 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        let message_event = mdk.create_message(group_id, inner).unwrap();
+        let message_event = mdk.create_message(group_id, inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -892,7 +910,7 @@ mod tests {
             "👍".to_string(),
         );
         reaction_inner.ensure_id();
-        let reaction_event = mdk.create_message(group_id, reaction_inner).unwrap();
+        let reaction_event = mdk.create_message(group_id, reaction_inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -919,7 +937,7 @@ mod tests {
             String::new(),
         );
         deletion_inner.ensure_id();
-        let deletion_event = mdk.create_message(group_id, deletion_inner).unwrap();
+        let deletion_event = mdk.create_message(group_id, deletion_inner, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, deletion_event)
@@ -967,7 +985,8 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        mdk.create_message(&group.mls_group_id, inner).unwrap();
+        mdk.create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         let message = mdk
             .get_message(&group.mls_group_id, &message_id)
@@ -976,7 +995,7 @@ mod tests {
 
         // Initial cache pass creates the row without delivery status.
         let first = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&group.mls_group_id, &message, None)
             .await
             .unwrap();
         assert_eq!(first.delivery_status, None);
@@ -993,7 +1012,7 @@ mod tests {
 
         // Relay echo reprocess should preserve the existing status.
         let second = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&group.mls_group_id, &message, None)
             .await
             .unwrap();
         assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
@@ -1040,7 +1059,9 @@ mod tests {
             "Valid message".to_string(),
         );
         inner.ensure_id();
-        let valid_event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let valid_event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // Corrupt the event by changing its kind (MLS processing should fail)
         let mut bad_event = valid_event;
@@ -1094,7 +1115,9 @@ mod tests {
             "+".to_string(), // Use simple emoji that won't be normalized
         );
         orphaned_reaction.ensure_id();
-        let reaction_event = mdk.create_message(group_id, orphaned_reaction).unwrap();
+        let reaction_event = mdk
+            .create_message(group_id, orphaned_reaction, None)
+            .unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -1124,7 +1147,7 @@ mod tests {
             "Late message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        let message_event = mdk.create_message(group_id, actual_message).unwrap();
+        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -1194,7 +1217,7 @@ mod tests {
             "👍".to_string(),
         );
         valid_reaction.ensure_id();
-        let valid_event = mdk.create_message(group_id, valid_reaction).unwrap();
+        let valid_event = mdk.create_message(group_id, valid_reaction, None).unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, valid_event)
@@ -1210,7 +1233,9 @@ mod tests {
             "".to_string(), // Empty content is invalid
         );
         invalid_reaction.ensure_id();
-        let invalid_event = mdk.create_message(group_id, invalid_reaction).unwrap();
+        let invalid_event = mdk
+            .create_message(group_id, invalid_reaction, None)
+            .unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, invalid_event)
@@ -1226,7 +1251,7 @@ mod tests {
             "Target message".to_string(),
         );
         actual_message.id = Some(future_message_id);
-        let message_event = mdk.create_message(group_id, actual_message).unwrap();
+        let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, message_event)
@@ -1373,7 +1398,9 @@ mod tests {
                 format!("Message {}", i),
             );
             inner.ensure_id();
-            let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+            let event = mdk
+                .create_message(&group.mls_group_id, inner, None)
+                .unwrap();
 
             whitenoise
                 .handle_mls_message(&creator_account, event)
@@ -1427,7 +1454,7 @@ mod tests {
             vec![token_tag.clone()],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, request).unwrap();
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1495,7 +1522,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let event = admin_mdk.create_message(&group_id, response).unwrap();
+        let event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1559,7 +1586,7 @@ mod tests {
         .unwrap();
 
         let removal = build_token_removal_rumor(admin_account.pubkey, Timestamp::now());
-        let event = admin_mdk.create_message(&group_id, removal).unwrap();
+        let event = admin_mdk.create_message(&group_id, removal, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1602,7 +1629,7 @@ mod tests {
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
                 .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request).unwrap();
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)
@@ -1647,7 +1674,7 @@ mod tests {
         )
         .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let request_event = admin_mdk.create_message(&group_id, request).unwrap();
+        let request_event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, request_event)
@@ -1670,7 +1697,7 @@ mod tests {
             }],
         )
         .unwrap();
-        let response_event = admin_mdk.create_message(&group_id, response).unwrap();
+        let response_event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, response_event)
@@ -1844,7 +1871,9 @@ mod tests {
             "Test message".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // First processing: should succeed
         let first = whitenoise
@@ -1917,7 +1946,9 @@ mod tests {
             "Unprocessable test".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
         let event_id = event.id;
 
         // Build a relay-plane source context for this account.
@@ -2013,7 +2044,7 @@ mod tests {
         );
         inner.ensure_id();
 
-        let message_event = admin_mdk.create_message(&group_id, inner);
+        let message_event = admin_mdk.create_message(&group_id, inner, None);
         assert!(
             message_event.is_ok(),
             "Admin should be able to create messages after auto-committed removal: {:?}",

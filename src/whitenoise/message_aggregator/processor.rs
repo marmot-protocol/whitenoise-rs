@@ -168,6 +168,7 @@ pub(crate) async fn process_regular_message(
         kind: u16::from(message.kind),
         media_attachments,
         delivery_status: None,
+        expires_at: None,
     })
 }
 
@@ -585,6 +586,7 @@ mod tests {
                 kind: 9,
                 media_attachments: vec![],
                 delivery_status: None,
+                expires_at: None,
             },
         );
 

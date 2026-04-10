@@ -183,6 +183,7 @@ mod tests {
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         }
     }
 

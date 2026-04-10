@@ -82,6 +82,7 @@ mod tests {
             kind: 9,
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         }
     }
 

@@ -943,6 +943,7 @@ async fn create_group(
         None, // image_nonce
         cli_group_relay_urls(),
         vec![account.pubkey], // admins — creator only
+        None,                 // disappearing_message_duration_secs
     );
 
     let group = wn

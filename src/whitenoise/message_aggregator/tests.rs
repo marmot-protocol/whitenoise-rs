@@ -230,6 +230,7 @@ mod integration_tests {
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
 
         // Test serialization
@@ -260,6 +261,7 @@ mod integration_tests {
             kind: 9, // Default to MLS group chat
             media_attachments: vec![],
             delivery_status: None,
+            expires_at: None,
         };
 
         let message2 = message1.clone();
@@ -306,5 +308,70 @@ mod integration_tests {
         let target_ids = super::super::processor::extract_deletion_target_ids(&tags);
         assert_eq!(target_ids.len(), 1);
         assert_eq!(target_ids[0], "test_id");
+    }
+
+    #[test]
+    fn test_chat_message_expires_at_serialization() {
+        let keys = Keys::generate();
+        let expires = Timestamp::from(1_700_000_000u64);
+
+        let chat_message = ChatMessage {
+            id: "expiring_msg".to_string(),
+            author: keys.public_key(),
+            content: "This will disappear".to_string(),
+            created_at: Timestamp::from(1_699_996_400u64),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+            expires_at: Some(expires),
+        };
+
+        let json = serde_json::to_string(&chat_message).unwrap();
+        let deserialized: ChatMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.expires_at,
+            Some(expires),
+            "expires_at should survive JSON round-trip"
+        );
+
+        // Also verify None round-trips
+        let mut permanent = chat_message.clone();
+        permanent.expires_at = None;
+        let json2 = serde_json::to_string(&permanent).unwrap();
+        let deserialized2: ChatMessage = serde_json::from_str(&json2).unwrap();
+        assert_eq!(deserialized2.expires_at, None);
+    }
+
+    #[test]
+    fn test_chat_message_equality_considers_expires_at() {
+        let keys = Keys::generate();
+        let base = ChatMessage {
+            id: "eq_test".to_string(),
+            author: keys.public_key(),
+            content: "same".to_string(),
+            created_at: Timestamp::from(1000),
+            tags: Tags::new(),
+            is_reply: false,
+            reply_to_id: None,
+            is_deleted: false,
+            content_tokens: vec![],
+            reactions: ReactionSummary::default(),
+            kind: 9,
+            media_attachments: vec![],
+            delivery_status: None,
+            expires_at: None,
+        };
+
+        let mut with_expiry = base.clone();
+        with_expiry.expires_at = Some(Timestamp::from(2000));
+
+        assert_ne!(base, with_expiry, "different expires_at should be unequal");
     }
 }
