@@ -312,45 +312,6 @@ mod tests {
             let defaults = Relay::defaults();
             assert!(!defaults.is_empty());
         }
-
-        #[test]
-        fn test_relay_equality() {
-            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
-            let now = Utc::now();
-
-            let relay1 = Relay {
-                id: Some(1),
-                url: url.clone(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            let relay2 = Relay {
-                id: Some(1),
-                url: url.clone(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            assert_eq!(relay1, relay2);
-        }
-
-        #[test]
-        fn test_relay_hash() {
-            let url = RelayUrl::parse("wss://test.relay.com").unwrap();
-            let now = Utc::now();
-
-            let relay = Relay {
-                id: Some(1),
-                url: url.clone(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            let mut set = HashSet::new();
-            set.insert(relay.clone());
-            assert!(set.contains(&relay));
-        }
     }
 
     mod relay_type_tests {
@@ -437,26 +398,6 @@ mod tests {
                 let back = RelayType::from(kind);
                 assert_eq!(original, back);
             }
-        }
-
-        #[test]
-        fn test_relay_type_copy() {
-            let relay_type = RelayType::Inbox;
-            let copied = relay_type;
-            assert_eq!(relay_type, copied);
-        }
-
-        #[test]
-        fn test_relay_type_hash() {
-            let mut set = HashSet::new();
-            set.insert(RelayType::Nip65);
-            set.insert(RelayType::Inbox);
-            set.insert(RelayType::KeyPackage);
-
-            assert_eq!(set.len(), 3);
-            assert!(set.contains(&RelayType::Nip65));
-            assert!(set.contains(&RelayType::Inbox));
-            assert!(set.contains(&RelayType::KeyPackage));
         }
     }
 

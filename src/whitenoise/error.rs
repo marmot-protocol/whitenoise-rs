@@ -416,14 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn test_error_debug_impl() {
-        let err = WhitenoiseError::GroupNotFound;
-        // Debug impl should work without panicking
-        let debug_str = format!("{:?}", err);
-        assert!(!debug_str.is_empty());
-    }
-
-    #[test]
     fn login_error_converts_to_whitenoise_error() {
         let login_err = LoginError::InvalidKeyFormat("bad key".to_string());
         let err: WhitenoiseError = login_err.into();

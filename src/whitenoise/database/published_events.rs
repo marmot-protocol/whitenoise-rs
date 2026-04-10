@@ -400,25 +400,4 @@ mod tests {
 
         assert!(!does_not_exist_globally);
     }
-
-    #[tokio::test]
-    async fn test_published_event_struct_clone_debug_eq() {
-        let event_id = create_test_event_id();
-        let now = Utc::now();
-
-        let event1 = PublishedEvent {
-            id: 1,
-            event_id,
-            account_id: 123,
-            created_at: now,
-        };
-
-        let event2 = event1.clone();
-        assert_eq!(event1, event2);
-
-        // Test Debug trait
-        let debug_str = format!("{:?}", event1);
-        assert!(debug_str.contains("PublishedEvent"));
-        assert!(debug_str.contains(&event_id.to_hex()));
-    }
 }

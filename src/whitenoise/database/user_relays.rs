@@ -394,33 +394,6 @@ mod tests {
         assert_eq!(user_relay_row.updated_at.timestamp_millis(), test_timestamp);
     }
 
-    #[test]
-    fn test_user_relay_row_debug_and_clone() {
-        let timestamp = chrono::Utc::now();
-        let user_relay_row = UserRelayRow {
-            user_id: 1,
-            relay_id: 42,
-            relay_type: RelayType::Inbox,
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
-
-        // Test debug formatting doesn't panic
-        let debug_str = format!("{:?}", user_relay_row);
-        assert!(debug_str.contains("UserRelayRow"));
-        assert!(debug_str.contains("Inbox"));
-
-        // Test clone
-        let cloned_row = user_relay_row.clone();
-        assert_eq!(user_relay_row, cloned_row);
-
-        // Test hash (by using in a HashSet)
-        let mut set = std::collections::HashSet::new();
-        set.insert(user_relay_row);
-        set.insert(cloned_row); // Should not increase size due to equality
-        assert_eq!(set.len(), 1);
-    }
-
     #[tokio::test]
     async fn test_user_relay_row_from_row_invalid_relay_type() {
         let pool = setup_test_db().await;

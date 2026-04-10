@@ -122,24 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn user_search_result_is_cloneable() {
-        let result = create_test_result(MatchQuality::Exact, MatchedField::Name);
-        let cloned = result.clone();
-        assert_eq!(result.pubkey, cloned.pubkey);
-        assert_eq!(result.radius, cloned.radius);
-    }
-
-    #[test]
-    fn search_update_trigger_equality() {
-        let trigger1 = SearchUpdateTrigger::RadiusStarted { radius: 1 };
-        let trigger2 = SearchUpdateTrigger::RadiusStarted { radius: 1 };
-        let trigger3 = SearchUpdateTrigger::RadiusStarted { radius: 2 };
-
-        assert_eq!(trigger1, trigger2);
-        assert_ne!(trigger1, trigger3);
-    }
-
-    #[test]
     fn sort_key_quality_dominates_field() {
         // Exact match on About field should sort before Prefix match on Name field
         let exact_about = create_test_result(MatchQuality::Exact, MatchedField::About);

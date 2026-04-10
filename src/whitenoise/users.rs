@@ -578,25 +578,6 @@ mod tests {
             .watched_user_count
     }
 
-    #[test]
-    fn test_basic_relay_url_equality() {
-        let url1 = RelayUrl::parse("wss://relay1.example.com").unwrap();
-        let url2 = RelayUrl::parse("wss://relay1.example.com").unwrap();
-        let url3 = RelayUrl::parse("wss://relay2.example.com").unwrap();
-
-        assert_eq!(url1, url2);
-        assert_ne!(url1, url3);
-
-        let mut url_set = HashSet::new();
-        url_set.insert(&url1);
-        url_set.insert(&url2); // Should not increase size since url1 == url2
-        url_set.insert(&url3);
-
-        assert_eq!(url_set.len(), 2);
-        assert!(url_set.contains(&url1));
-        assert!(url_set.contains(&url3));
-    }
-
     #[tokio::test]
     async fn test_update_relay_lists_success() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

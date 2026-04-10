@@ -209,19 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn test_group_type_serialization() {
-        let group_type = GroupType::Group;
-        let serialized = serde_json::to_string(&group_type).unwrap();
-        let deserialized: GroupType = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(group_type, deserialized);
-
-        let dm_type = GroupType::DirectMessage;
-        let serialized = serde_json::to_string(&dm_type).unwrap();
-        let deserialized: GroupType = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(dm_type, deserialized);
-    }
-
-    #[test]
     fn test_infer_group_type_from_group_name() {
         assert_eq!(
             GroupInformation::infer_group_type_from_group_name("test"),

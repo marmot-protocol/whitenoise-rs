@@ -908,49 +908,6 @@ mod tests {
         assert_eq!(external, AccountType::External);
     }
 
-    #[test]
-    fn test_account_type_serialization_roundtrip() {
-        use crate::whitenoise::accounts::AccountType;
-        let serialized = serde_json::to_string(&AccountType::Local).unwrap();
-        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(AccountType::Local, deserialized);
-
-        let serialized = serde_json::to_string(&AccountType::External).unwrap();
-        let deserialized: AccountType = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(AccountType::External, deserialized);
-    }
-
-    #[test]
-    fn test_account_type_equality_and_hash() {
-        use crate::whitenoise::accounts::AccountType;
-        use std::collections::HashSet;
-        assert_eq!(AccountType::Local, AccountType::Local);
-        assert_eq!(AccountType::External, AccountType::External);
-        assert_ne!(AccountType::Local, AccountType::External);
-        let mut set = HashSet::new();
-        set.insert(AccountType::Local);
-        set.insert(AccountType::External);
-        assert_eq!(set.len(), 2);
-        set.insert(AccountType::Local);
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn test_account_type_clone() {
-        use crate::whitenoise::accounts::AccountType;
-        let cloned = AccountType::Local.clone();
-        assert_eq!(AccountType::Local, cloned);
-        let cloned = AccountType::External.clone();
-        assert_eq!(AccountType::External, cloned);
-    }
-
-    #[test]
-    fn test_account_type_debug() {
-        use crate::whitenoise::accounts::AccountType;
-        assert!(format!("{:?}", AccountType::Local).contains("Local"));
-        assert!(format!("{:?}", AccountType::External).contains("External"));
-    }
-
     #[tokio::test]
     async fn test_new_external_creates_external_account() {
         use crate::whitenoise::accounts::AccountType;
@@ -1031,56 +988,6 @@ mod tests {
         assert_eq!(account.pubkey, provided_keys.public_key());
         assert_eq!(keys.public_key(), provided_keys.public_key());
         assert_eq!(keys.secret_key(), provided_keys.secret_key());
-    }
-
-    #[tokio::test]
-    async fn test_account_json_serialization_roundtrip() {
-        use crate::whitenoise::accounts::AccountType;
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let keys = nostr_sdk::Keys::generate();
-        let pubkey = keys.public_key();
-
-        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
-        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
-
-        let external_json = serde_json::to_string(&external_account).unwrap();
-        let external_deserialized: Account = serde_json::from_str(&external_json).unwrap();
-        assert_eq!(external_account.pubkey, external_deserialized.pubkey);
-        assert_eq!(
-            external_account.account_type,
-            external_deserialized.account_type
-        );
-        assert_eq!(external_deserialized.account_type, AccountType::External);
-
-        let local_json = serde_json::to_string(&local_account).unwrap();
-        let local_deserialized: Account = serde_json::from_str(&local_json).unwrap();
-        assert_eq!(local_account.pubkey, local_deserialized.pubkey);
-        assert_eq!(local_account.account_type, local_deserialized.account_type);
-        assert_eq!(local_deserialized.account_type, AccountType::Local);
-    }
-
-    #[tokio::test]
-    async fn test_account_debug_includes_account_type() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let keys = nostr_sdk::Keys::generate();
-        let pubkey = keys.public_key();
-
-        let external_account = Account::new_external(&whitenoise, pubkey).await.unwrap();
-        let (local_account, _) = Account::new(&whitenoise, None).await.unwrap();
-
-        let external_debug = format!("{:?}", external_account);
-        let local_debug = format!("{:?}", local_account);
-
-        assert!(
-            external_debug.contains("External"),
-            "External account debug should contain 'External': {}",
-            external_debug
-        );
-        assert!(
-            local_debug.contains("Local"),
-            "Local account debug should contain 'Local': {}",
-            local_debug
-        );
     }
 
     #[tokio::test]

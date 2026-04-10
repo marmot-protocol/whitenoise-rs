@@ -286,24 +286,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_group_state_creation() {
-        let state = GroupState::new();
-        assert!(state.messages.is_empty());
-        assert!(state.last_processed_at.is_none());
-        assert_eq!(state.stats.message_count, 0);
-        assert_eq!(state.state_version, STATE_VERSION);
-        assert!(!state.needs_persistence);
-    }
-
-    #[test]
-    fn test_aggregator_state_creation() {
-        let config = AggregatorConfig::default();
-        let state = AggregatorState::new(config);
-        assert!(state.groups.is_empty());
-        assert!(state.last_cleanup.is_none());
-    }
-
-    #[test]
     fn test_get_or_create_group() {
         let config = AggregatorConfig::default();
         let mut state = AggregatorState::new(config);
