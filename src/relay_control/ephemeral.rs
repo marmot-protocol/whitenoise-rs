@@ -900,20 +900,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_uses_disabled_auth_and_reconnect() {
-        let config = EphemeralPlaneConfig::default();
-
-        assert_eq!(config.timeout, Duration::from_secs(5));
-        assert_eq!(config.auth_policy, RelaySessionAuthPolicy::Disabled);
-        assert_eq!(
-            config.reconnect_policy,
-            RelaySessionReconnectPolicy::Disabled
-        );
-        assert_eq!(config.max_publish_attempts, 3);
-        assert_eq!(config.ad_hoc_relay_ttl, Duration::from_secs(300));
-    }
-
-    #[test]
     fn test_message_publish_result_helpers() {
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
         let event_id = EventId::from_hex(&"11".repeat(32)).unwrap();

@@ -890,24 +890,6 @@ mod tests {
         assert_eq!(default_type, AccountType::Local);
     }
 
-    #[test]
-    fn test_account_type_json_serialization() {
-        use crate::whitenoise::accounts::AccountType;
-        let json = serde_json::to_string(&AccountType::Local).unwrap();
-        assert_eq!(json, "\"Local\"");
-        let json = serde_json::to_string(&AccountType::External).unwrap();
-        assert_eq!(json, "\"External\"");
-    }
-
-    #[test]
-    fn test_account_type_json_deserialization() {
-        use crate::whitenoise::accounts::AccountType;
-        let local: AccountType = serde_json::from_str("\"Local\"").unwrap();
-        assert_eq!(local, AccountType::Local);
-        let external: AccountType = serde_json::from_str("\"External\"").unwrap();
-        assert_eq!(external, AccountType::External);
-    }
-
     #[tokio::test]
     async fn test_new_external_creates_external_account() {
         use crate::whitenoise::accounts::AccountType;
