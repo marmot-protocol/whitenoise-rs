@@ -1008,7 +1008,8 @@ mod tests {
         );
         inner.ensure_id();
         let message_id = inner.id.unwrap();
-        mdk.create_message(&group.mls_group_id, inner, None).unwrap();
+        mdk.create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         let message = mdk
             .get_message(&group.mls_group_id, &message_id)
@@ -1081,7 +1082,9 @@ mod tests {
             "Valid message".to_string(),
         );
         inner.ensure_id();
-        let valid_event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
+        let valid_event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // Corrupt the event by changing its kind (MLS processing should fail)
         let mut bad_event = valid_event;
@@ -1135,7 +1138,9 @@ mod tests {
             "+".to_string(), // Use simple emoji that won't be normalized
         );
         orphaned_reaction.ensure_id();
-        let reaction_event = mdk.create_message(group_id, orphaned_reaction, None).unwrap();
+        let reaction_event = mdk
+            .create_message(group_id, orphaned_reaction, None)
+            .unwrap();
 
         let result = whitenoise
             .handle_mls_message(&creator_account, reaction_event)
@@ -1251,7 +1256,9 @@ mod tests {
             "".to_string(), // Empty content is invalid
         );
         invalid_reaction.ensure_id();
-        let invalid_event = mdk.create_message(group_id, invalid_reaction, None).unwrap();
+        let invalid_event = mdk
+            .create_message(group_id, invalid_reaction, None)
+            .unwrap();
 
         whitenoise
             .handle_mls_message(&creator_account, invalid_event)
@@ -1414,7 +1421,9 @@ mod tests {
                 format!("Message {}", i),
             );
             inner.ensure_id();
-            let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
+            let event = mdk
+                .create_message(&group.mls_group_id, inner, None)
+                .unwrap();
 
             whitenoise
                 .handle_mls_message(&creator_account, event)
@@ -1423,10 +1432,13 @@ mod tests {
         }
 
         // Verify all messages are in cache
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(messages.len(), 3, "All messages should be cached");
         let mut contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
@@ -1493,7 +1505,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1564,7 +1576,7 @@ mod tests {
         );
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1617,7 +1629,7 @@ mod tests {
         assert!(stored.is_empty());
 
         let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
                 .await
                 .unwrap();
         assert!(cached_messages.is_empty());
@@ -1885,7 +1897,9 @@ mod tests {
             "Test message".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
 
         // First processing: should succeed
         let first = whitenoise
@@ -1958,7 +1972,9 @@ mod tests {
             "Unprocessable test".to_string(),
         );
         inner.ensure_id();
-        let event = mdk.create_message(&group.mls_group_id, inner, None).unwrap();
+        let event = mdk
+            .create_message(&group.mls_group_id, inner, None)
+            .unwrap();
         let event_id = event.id;
 
         // Build a relay-plane source context for this account.
@@ -2065,16 +2081,18 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_token_request_does_not_create_second_task() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
+        let _admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
         let fake_event_id = EventId::all_zeros();
         let fake_group_id = GroupId::from_slice(&[1u8; 32]);
 
-        // First schedule: inserts the key.
-        whitenoise.schedule_token_response_for_test(
-            member_account.clone(),
+        // Pre-insert the key to simulate an in-flight task holding it. This
+        // avoids the race where a spawned task with delay_ms=0 could clear the
+        // key before the assertion runs.
+        whitenoise.insert_pending_token_response_for_test(
+            member_account.pubkey,
             fake_group_id.clone(),
             fake_event_id,
         );
@@ -2085,7 +2103,7 @@ mod tests {
             &fake_event_id,
         ));
 
-        // Second schedule with the same key hits the duplicate-dedup early-return;
+        // Schedule with the same key hits the duplicate-dedup early-return;
         // the existing entry must remain intact.
         whitenoise.schedule_token_response_for_test(
             member_account.clone(),
@@ -2101,8 +2119,6 @@ mod tests {
             ),
             "pending entry should still be present after duplicate request"
         );
-
-        let _ = admin_account;
     }
 
     #[tokio::test]
@@ -2124,7 +2140,7 @@ mod tests {
             build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
                 .unwrap();
         let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request).unwrap();
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
             .handle_mls_message(&member_account, event)

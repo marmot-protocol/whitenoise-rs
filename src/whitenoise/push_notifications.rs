@@ -805,6 +805,19 @@ impl Whitenoise {
             .expect("semaphore should be fully available at start of test")
     }
 
+    /// Directly inserts a key into the pending token response map without
+    /// spawning a task. Used in tests to simulate an in-flight request.
+    #[cfg(test)]
+    pub(crate) fn insert_pending_token_response_for_test(
+        &self,
+        account_pubkey: PublicKey,
+        group_id: GroupId,
+        request_event_id: EventId,
+    ) {
+        self.pending_push_token_responses
+            .insert((account_pubkey, group_id, request_event_id), ());
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending_token_response(
         &self,
