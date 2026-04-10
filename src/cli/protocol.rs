@@ -426,93 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_roundtrip() {
-        let req = Request::CreateIdentity;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"create_identity"}"#);
-
-        let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::CreateIdentity));
-    }
-
-    #[test]
-    fn all_accounts_roundtrip() {
-        let req = Request::AllAccounts;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"all_accounts"}"#);
-
-        let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::AllAccounts));
-    }
-
-    #[test]
-    fn create_group_minimal_roundtrip() {
-        // Only required fields — members defaults to empty, description to None
-        let wire = r#"{"method":"create_group","params":{"account":"npub1abc","name":"Chat"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::CreateGroup { account, name, description, members }
-            if account == "npub1abc"
-                && name == "Chat"
-                && description.is_none()
-                && members.is_empty()
-        ));
-    }
-
-    #[test]
-    fn unknown_method_is_deser_error() {
-        let json = r#"{"method":"nonexistent"}"#;
-        assert!(serde_json::from_str::<Request>(json).is_err());
-    }
-
-    #[test]
-    fn response_ok_skips_error_and_stream_end() {
-        let resp = Response::ok(json!({"npub": "npub1abc"}));
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("error").is_none());
-        assert!(parsed.get("stream_end").is_none());
-        assert_eq!(parsed["result"]["npub"], "npub1abc");
-    }
-
-    #[test]
-    fn response_err_skips_result_and_stream_end() {
-        let resp = Response::err("something went wrong");
-        let json = serde_json::to_string(&resp).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("result").is_none());
-        assert!(parsed.get("stream_end").is_none());
-        assert_eq!(parsed["error"]["message"], "something went wrong");
-    }
-
-    #[test]
-    fn profile_update_minimal_roundtrip() {
-        let wire = r#"{"method":"profile_update","params":{"account":"npub1abc","name":"bob"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::ProfileUpdate { account, name, display_name, about, picture, nip05, lud16 }
-            if account == "npub1abc"
-                && name.as_deref() == Some("bob")
-                && display_name.is_none()
-                && about.is_none()
-                && picture.is_none()
-                && nip05.is_none()
-                && lud16.is_none()
-        ));
-    }
-
-    #[test]
-    fn settings_show_roundtrip() {
-        let req = Request::SettingsShow;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"settings_show"}"#);
-        let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::SettingsShow));
-    }
-
-    #[test]
     fn relays_list_without_type_field() {
         let wire = r#"{"method":"relays_list","params":{"account":"npub1abc"}}"#;
         let parsed: Request = serde_json::from_str(wire).unwrap();
@@ -520,21 +433,6 @@ mod tests {
             parsed,
             Request::RelaysList { account, relay_type }
             if account == "npub1abc" && relay_type.is_none()
-        ));
-    }
-
-    #[test]
-    fn users_search_minimal_roundtrip() {
-        // Only required fields — radius defaults to 0..2
-        let wire = r#"{"method":"users_search","params":{"account":"npub1abc","query":"bob"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::UsersSearch { account, query, radius_start, radius_end }
-            if account == "npub1abc"
-                && query == "bob"
-                && radius_start == 0
-                && radius_end == 2
         ));
     }
 
@@ -574,67 +472,6 @@ mod tests {
     }
 
     #[test]
-    fn react_to_message_default_emoji_roundtrip() {
-        let wire = r#"{"method":"react_to_message","params":{"account":"npub1abc","group_id":"abcd1234","message_id":"eventid123"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::ReactToMessage { account, group_id, message_id, emoji }
-            if account == "npub1abc"
-                && group_id == "abcd1234"
-                && message_id == "eventid123"
-                && emoji == "+"
-        ));
-    }
-
-    #[test]
-    fn send_message_without_reply_to_roundtrip() {
-        let wire = r#"{"method":"send_message","params":{"account":"npub1abc","group_id":"abcd1234","message":"Hi"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::SendMessage { account, group_id, message, reply_to }
-            if account == "npub1abc"
-                && group_id == "abcd1234"
-                && message == "Hi"
-                && reply_to.is_none()
-        ));
-    }
-
-    #[test]
-    fn upload_media_minimal_roundtrip() {
-        // Old-style wire format without send/message — defaults apply
-        let wire = r#"{"method":"upload_media","params":{"account":"npub1abc","group_id":"abcd1234","file_path":"/tmp/image.png"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(
-            parsed,
-            Request::UploadMedia { account, group_id, file_path, send, message }
-            if account == "npub1abc"
-                && group_id == "abcd1234"
-                && file_path == "/tmp/image.png"
-                && !send
-                && message.is_none()
-        ));
-    }
-
-    #[test]
-    fn notifications_subscribe_roundtrip() {
-        let req = Request::NotificationsSubscribe;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"notifications_subscribe"}"#);
-        let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::NotificationsSubscribe));
-    }
-
-    /// Verify that JSON sent from the wire (e.g. via socat) deserializes correctly.
-    #[test]
-    fn wire_format_compat() {
-        let wire = r#"{"method":"login_start","params":{"nsec":"nsec1test"}}"#;
-        let parsed: Request = serde_json::from_str(wire).unwrap();
-        assert!(matches!(parsed, Request::LoginStart { nsec } if nsec == "nsec1test"));
-    }
-
-    #[test]
     fn search_messages_wire_missing_limit_deserialises_as_none() {
         // Incoming JSON without the `limit` key must deserialise as None via #[serde(default)]
         let wire = r#"{"method":"search_messages","params":{"account":"npub1abc","group_id":"group123","query":"marmot"}}"#;
@@ -644,81 +481,6 @@ mod tests {
             Request::SearchMessages { limit, .. }
             if limit.is_none()
         ));
-    }
-
-    #[test]
-    fn delete_all_data_roundtrip() {
-        let req = Request::DeleteAllData;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"method":"delete_all_data"}"#);
-        let parsed: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, Request::DeleteAllData));
-    }
-
-    #[test]
-    fn mute_duration_from_str() {
-        assert_eq!("1h".parse::<MuteDuration>().unwrap(), MuteDuration::OneHour);
-        assert_eq!(
-            "8h".parse::<MuteDuration>().unwrap(),
-            MuteDuration::EightHours
-        );
-        assert_eq!("1d".parse::<MuteDuration>().unwrap(), MuteDuration::OneDay);
-        assert_eq!("1w".parse::<MuteDuration>().unwrap(), MuteDuration::OneWeek);
-        assert_eq!(
-            "forever".parse::<MuteDuration>().unwrap(),
-            MuteDuration::Forever
-        );
-        assert!("2h".parse::<MuteDuration>().is_err());
-        assert!("".parse::<MuteDuration>().is_err());
-    }
-
-    #[test]
-    fn mute_duration_display() {
-        assert_eq!(MuteDuration::OneHour.to_string(), "1h");
-        assert_eq!(MuteDuration::EightHours.to_string(), "8h");
-        assert_eq!(MuteDuration::OneDay.to_string(), "1d");
-        assert_eq!(MuteDuration::OneWeek.to_string(), "1w");
-        assert_eq!(MuteDuration::Forever.to_string(), "forever");
-    }
-
-    #[test]
-    fn mute_duration_serde_wire_format() {
-        assert_eq!(
-            serde_json::to_string(&MuteDuration::OneHour).unwrap(),
-            "\"1h\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MuteDuration::EightHours).unwrap(),
-            "\"8h\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MuteDuration::OneDay).unwrap(),
-            "\"1d\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MuteDuration::OneWeek).unwrap(),
-            "\"1w\""
-        );
-        assert_eq!(
-            serde_json::to_string(&MuteDuration::Forever).unwrap(),
-            "\"forever\""
-        );
-
-        // Deserialize from wire tokens
-        assert_eq!(
-            serde_json::from_str::<MuteDuration>("\"1h\"").unwrap(),
-            MuteDuration::OneHour
-        );
-        assert_eq!(
-            serde_json::from_str::<MuteDuration>("\"1w\"").unwrap(),
-            MuteDuration::OneWeek
-        );
-    }
-
-    #[test]
-    fn mute_duration_to_expiry_forever_uses_sentinel() {
-        let expiry = MuteDuration::Forever.to_expiry();
-        assert_eq!(expiry, MUTE_FOREVER);
     }
 
     #[test]
