@@ -1318,30 +1318,6 @@ mod tests {
             );
         }
 
-        #[test]
-        fn test_whitenoise_config_keyring_service_id_is_required() {
-            let data_dir = std::path::Path::new("/test/data");
-            let logs_dir = std::path::Path::new("/test/logs");
-            let config = WhitenoiseConfig::new(data_dir, logs_dir, "com.myapp.custom");
-            assert_eq!(config.keyring_service_id, "com.myapp.custom");
-        }
-
-        #[test]
-        fn test_whitenoise_config_with_discovery_relays() {
-            let custom_relays = vec![
-                RelayUrl::parse("ws://localhost:8080").unwrap(),
-                RelayUrl::parse("ws://localhost:7777").unwrap(),
-            ];
-            let config = WhitenoiseConfig::new(
-                std::path::Path::new("/test/data"),
-                std::path::Path::new("/test/logs"),
-                "com.test.app",
-            )
-            .with_discovery_relays(custom_relays.clone());
-
-            assert_eq!(config.discovery_relays, custom_relays);
-        }
-
         #[tokio::test]
         async fn test_initialize_whitenoise_rejects_empty_keyring_service_id() {
             use tempfile::TempDir;

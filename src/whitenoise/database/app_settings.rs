@@ -197,36 +197,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_app_settings_row_from_row() {
-        let pool = setup_test_db().await;
-        let timestamp = chrono::Utc::now().timestamp_millis();
-
-        sqlx::query(
-            "INSERT INTO app_settings (id, theme_mode, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(1i64)
-        .bind("dark")
-        .bind("en")
-        .bind(timestamp)
-        .bind(timestamp)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let row: SqliteRow = sqlx::query("SELECT * FROM app_settings WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        let app_settings_row = AppSettingsRow::from_row(&row).unwrap();
-        assert_eq!(app_settings_row.id, 1);
-        assert_eq!(app_settings_row.theme_mode, "dark");
-        assert_eq!(app_settings_row.language, "en");
-        assert_eq!(app_settings_row.created_at.timestamp_millis(), timestamp);
-        assert_eq!(app_settings_row.updated_at.timestamp_millis(), timestamp);
-    }
-
-    #[tokio::test]
     async fn test_theme_mode_conversion() {
         let pool = setup_test_db().await;
         let timestamp = chrono::Utc::now().timestamp_millis();

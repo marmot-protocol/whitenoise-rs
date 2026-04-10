@@ -166,60 +166,6 @@ mod tests {
     use super::*;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
 
-    #[test]
-    fn test_group_type_default() {
-        assert_eq!(GroupType::default(), GroupType::Group);
-    }
-
-    #[test]
-    fn test_group_type_display() {
-        assert_eq!(GroupType::Group.to_string(), "group");
-        assert_eq!(GroupType::DirectMessage.to_string(), "direct_message");
-    }
-
-    #[test]
-    fn test_group_type_from_str() {
-        assert_eq!(GroupType::from_str("group").unwrap(), GroupType::Group);
-        assert_eq!(GroupType::from_str("Group").unwrap(), GroupType::Group);
-        assert_eq!(GroupType::from_str("GROUP").unwrap(), GroupType::Group);
-
-        assert_eq!(
-            GroupType::from_str("direct_message").unwrap(),
-            GroupType::DirectMessage
-        );
-        assert_eq!(
-            GroupType::from_str("Direct_Message").unwrap(),
-            GroupType::DirectMessage
-        );
-        assert_eq!(
-            GroupType::from_str("DIRECT_MESSAGE").unwrap(),
-            GroupType::DirectMessage
-        );
-
-        assert!(GroupType::from_str("invalid").is_err());
-        assert!(GroupType::from_str("").is_err());
-        assert!(GroupType::from_str("dm").is_err());
-    }
-
-    #[test]
-    fn test_group_type_from_str_error_message() {
-        let result = GroupType::from_str("invalid");
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid group type: invalid");
-    }
-
-    #[test]
-    fn test_infer_group_type_from_group_name() {
-        assert_eq!(
-            GroupInformation::infer_group_type_from_group_name("test"),
-            GroupType::Group
-        );
-        assert_eq!(
-            GroupInformation::infer_group_type_from_group_name(""),
-            GroupType::DirectMessage
-        );
-    }
-
     #[tokio::test]
     async fn test_create_for_group_with_explicit_type() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

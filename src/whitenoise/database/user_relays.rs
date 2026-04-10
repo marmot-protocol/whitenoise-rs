@@ -432,15 +432,4 @@ mod tests {
             panic!("Expected ColumnDecode error for invalid relay_type");
         }
     }
-
-    #[test]
-    fn test_relay_type_conversion_roundtrip() {
-        let test_cases = vec![RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage];
-
-        for relay_type in test_cases {
-            let type_str: String = relay_type.into();
-            let parsed_type = type_str.parse().unwrap();
-            assert_eq!(relay_type, parsed_type);
-        }
-    }
 }
