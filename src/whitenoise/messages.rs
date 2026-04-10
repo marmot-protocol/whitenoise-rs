@@ -773,6 +773,23 @@ impl Whitenoise {
         )
     }
 
+    /// Search messages across all groups the account belongs to.
+    ///
+    /// Like [`search_messages_in_group`](Self::search_messages_in_group) but without
+    /// a group filter. Each result includes `mls_group_id` so callers can group
+    /// results by conversation.
+    pub async fn search_messages(
+        &self,
+        pubkey: &PublicKey,
+        query: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<SearchResult>> {
+        Account::find_by_pubkey(pubkey, &self.database).await?;
+
+        let limit_val = limit.unwrap_or(50);
+        Ok(AggregatedMessage::search_messages(pubkey, query, limit_val, &self.database).await?)
+    }
+
     /// Creates an unsigned nostr event with the given parameters
     fn create_unsigned_nostr_event(
         &self,
