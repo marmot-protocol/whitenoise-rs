@@ -144,6 +144,18 @@ impl Whitenoise {
             }
         }
 
+        // Reject welcomes from blocked users before any MLS processing.
+        // Using `rumor.pubkey` (the Nostr identity of the sender) avoids
+        // allocating MDK group state or writing any DB rows for blocked senders.
+        if self.is_user_blocked(&account.pubkey, &rumor.pubkey).await? {
+            tracing::info!(
+                target: "whitenoise::event_processor::process_welcome",
+                "Dropping welcome from blocked user {}",
+                rumor.pubkey,
+            );
+            return Ok(());
+        }
+
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         // Process the welcome to get group info (but don't accept yet)
@@ -155,36 +167,6 @@ impl Whitenoise {
         let group_id = welcome.mls_group_id.clone();
         let group_name = welcome.group_name.clone();
         let welcomer_pubkey = welcome.welcomer;
-
-        // Auto-decline welcome from blocked users — persist the declined state before returning
-        if self
-            .is_user_blocked(&account.pubkey, &welcomer_pubkey)
-            .await?
-        {
-            tracing::info!(
-                target: "whitenoise::event_processor::process_welcome",
-                "Auto-declining welcome from blocked user {}",
-                welcomer_pubkey,
-            );
-            let declined_group = AccountGroup {
-                id: None,
-                account_pubkey: account.pubkey,
-                mls_group_id: group_id.clone(),
-                user_confirmation: Some(false),
-                welcomer_pubkey: Some(welcomer_pubkey),
-                last_read_message_id: None,
-                pin_order: None,
-                dm_peer_pubkey: None,
-                archived_at: None,
-                removed_at: None,
-                self_removed: false,
-                muted_until: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            };
-            declined_group.save(&self.database).await?;
-            return Ok(());
-        }
 
         // For DM groups (empty name), the welcomer is the other participant.
         // In the Marmot protocol, DM welcomes are always sent by the initiator,

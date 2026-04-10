@@ -686,9 +686,9 @@ pub(crate) enum SubscriptionStream {
     AccountMuteList,
 }
 
+#[cfg(test)]
 impl SubscriptionStream {
-    /// Stable identifier used only within White Noise.
-    #[allow(dead_code)]
+    /// Stable string identifier, used only in tests to assert subscription names.
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Self::DiscoveryUserData => "discovery_user_data",

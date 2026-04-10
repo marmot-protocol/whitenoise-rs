@@ -161,6 +161,12 @@ impl MuteListEntry {
             .execute(&mut *txn)
             .await?;
 
+        // INSERT OR IGNORE: if the same pubkey appears more than once in the
+        // event (e.g. in both the public tags and the encrypted private section)
+        // the first occurrence wins and the duplicate is silently skipped.
+        // The `is_private` value of the first entry is therefore what gets
+        // stored; callers should be aware that public-tag entries are inserted
+        // before private-section entries in `parse_mute_list_entries`.
         for (muted_pubkey, is_private) in entries {
             sqlx::query(
                 "INSERT OR IGNORE INTO mute_list (account_pubkey, muted_pubkey, is_private, created_at)

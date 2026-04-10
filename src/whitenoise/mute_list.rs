@@ -25,6 +25,11 @@ impl Whitenoise {
     /// retry the full operation cleanly.
     #[perf_instrument("mute_list")]
     pub async fn block_user(&self, account: &Account, target_pubkey: &PublicKey) -> Result<()> {
+        // Guard: a user cannot block themselves.
+        if account.pubkey == *target_pubkey {
+            return Ok(());
+        }
+
         // Fast path: if already blocked locally no sync or publish is needed.
         if MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
             return Ok(());
@@ -81,6 +86,12 @@ impl Whitenoise {
         // Fail fast — same data-loss risk as block_user if we proceed with
         // a stale cache after a failed sync.
         self.sync_mute_list(account).await?;
+
+        // Re-check after sync: another device may have already removed this
+        // block while we were fetching the latest list.
+        if !MuteListEntry::exists(&account.pubkey, target_pubkey, &self.database).await? {
+            return Ok(());
+        }
 
         // Capture is_private before deleting so the rollback re-inserts the
         // entry exactly as it was.
