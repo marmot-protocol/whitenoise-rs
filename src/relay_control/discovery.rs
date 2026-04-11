@@ -525,11 +525,20 @@ impl DiscoveryPlane {
             .collect::<Vec<_>>();
         follow_list_subscription_ids.sort_unstable();
 
+        let mut mute_list_subscription_ids = state
+            .mute_list_subscription_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        mute_list_subscription_ids.sort_unstable();
+
         DiscoveryPlaneStateSnapshot {
             watched_user_count: state.watched_user_count,
             follow_list_subscription_count: state.follow_list_account_count,
+            mute_list_subscription_count: state.mute_list_account_count,
             public_subscription_ids,
             follow_list_subscription_ids,
+            mute_list_subscription_ids,
             session: self.session.snapshot(&self.config.relays).await,
         }
     }

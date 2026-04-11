@@ -98,7 +98,7 @@ impl Whitenoise {
 
             if !has_account_group {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::event_handlers::handle_mls_message",
                     group_id = %hex::encode(group_id.as_slice()),
                     account = %account.pubkey.to_hex(),
                     "Skipping outcome handling: no AccountGroup exists \

@@ -95,12 +95,14 @@ impl Whitenoise {
 
         // Capture is_private before deleting so the rollback re-inserts the
         // entry exactly as it was.
-        let entries = MuteListEntry::find_by_account(&account.pubkey, &self.database).await?;
-        let is_private = entries
-            .iter()
-            .find(|e| e.muted_pubkey == *target_pubkey)
-            .map(|e| e.is_private)
-            .unwrap_or(true);
+        let is_private = MuteListEntry::find_by_account_and_target(
+            &account.pubkey,
+            target_pubkey,
+            &self.database,
+        )
+        .await?
+        .map(|e| e.is_private)
+        .unwrap_or(true);
 
         MuteListEntry::delete(&account.pubkey, target_pubkey, &self.database).await?;
 

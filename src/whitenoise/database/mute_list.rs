@@ -127,6 +127,26 @@ impl MuteListEntry {
         Ok(rows.into_iter().map(Self::from).collect())
     }
 
+    /// Returns the mute list entry for a specific account + target pair, if any.
+    #[perf_instrument("mute_list")]
+    pub async fn find_by_account_and_target(
+        account_pubkey: &PublicKey,
+        muted_pubkey: &PublicKey,
+        db: &Database,
+    ) -> std::result::Result<Option<Self>, DatabaseError> {
+        let row: Option<MuteListRow> = sqlx::query_as(
+            "SELECT id, account_pubkey, muted_pubkey, is_private, created_at
+             FROM mute_list
+             WHERE account_pubkey = ? AND muted_pubkey = ?",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(muted_pubkey.to_hex())
+        .fetch_optional(&db.pool)
+        .await?;
+
+        Ok(row.map(Self::from))
+    }
+
     /// Returns `true` if the given pubkey is on the account's mute list.
     #[perf_instrument("mute_list")]
     pub async fn exists(
