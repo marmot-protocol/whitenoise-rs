@@ -81,12 +81,10 @@ impl TestCase for VerifySelfUpdateTestCase {
                         if current_group.epoch >= min_epoch {
                             Ok(current_group.epoch)
                         } else {
-                            Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            Err(WhitenoiseError::Internal(format!(
                                 "{} epoch is {} but expected >= {} \
                                  (self-update not yet applied)",
-                                account_name,
-                                current_group.epoch,
-                                min_epoch
+                                account_name, current_group.epoch, min_epoch
                             )))
                         }
                     }

@@ -23,7 +23,7 @@ pub async fn wait_for_relay_list_indexed(
             if events.iter().next().is_some() {
                 Ok(())
             } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
+                Err(WhitenoiseError::Internal(format!(
                     "Relay-list event is not yet queryable for {}",
                     pubkey
                 )))
@@ -57,7 +57,7 @@ pub async fn wait_for_latest_metadata_event(
             if events.iter().any(|event| event.id == expected_event_id) {
                 Ok(())
             } else {
-                Err(WhitenoiseError::Other(anyhow::anyhow!(
+                Err(WhitenoiseError::Internal(format!(
                     "Latest metadata query does not yet return expected event {}",
                     expected_event_id.to_hex()
                 )))

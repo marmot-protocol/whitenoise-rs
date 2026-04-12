@@ -1019,7 +1019,7 @@ impl Whitenoise {
     ) -> Result<Option<PublishedKeyPackage>> {
         PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.database)
             .await
-            .map_err(|e| WhitenoiseError::Other(e.into()))
+            .map_err(WhitenoiseError::from)
     }
 
     /// Records a published key package in the lifecycle tracking table.
@@ -1036,7 +1036,7 @@ impl Whitenoise {
     ) -> Result<()> {
         PublishedKeyPackage::create(account_pubkey, hash_ref, event_id, &self.database)
             .await
-            .map_err(|e| WhitenoiseError::Other(e.into()))
+            .map_err(WhitenoiseError::from)
     }
 
     /// Backdates the `consumed_at` timestamp for a published key package.

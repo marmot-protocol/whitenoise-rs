@@ -46,7 +46,7 @@ impl ProfileCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::Show => show(socket, json, account_flag).await,
             Self::Update {
@@ -74,7 +74,7 @@ impl ProfileCmd {
     }
 }
 
-async fn show(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn show(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::ProfileShow { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -91,7 +91,7 @@ async fn update(
     picture: Option<String>,
     nip05: Option<String>,
     lud16: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

@@ -98,7 +98,7 @@ impl TestCase for RemoveGroupMembersTestCase {
                     // Verify each removed member is no longer in the group
                     for pubkey in &self.member_pubkeys_to_remove {
                         if members.contains(pubkey) {
-                            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            return Err(WhitenoiseError::Internal(format!(
                                 "Removed member {} still in group",
                                 &pubkey.to_hex()[..8]
                             )));
@@ -106,7 +106,7 @@ impl TestCase for RemoveGroupMembersTestCase {
                     }
                     Ok(members)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Expected {} members, found {}",
                         expected_count,
                         members.len()

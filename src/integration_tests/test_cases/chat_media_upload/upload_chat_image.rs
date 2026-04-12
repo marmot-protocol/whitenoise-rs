@@ -29,16 +29,13 @@ impl UploadChatImageTestCase {
 
     /// Create a temporary test image file using NamedTempFile
     fn create_test_image(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
         let img = ::image::RgbaImage::from_pixel(100, 100, ::image::Rgba([0u8, 255, 0, 255]));
 
         img.save_with_format(temp_file.path(), ::image::ImageFormat::Png)
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to save test image: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to save test image: {}", e)))?;
 
         Ok(temp_file)
     }
@@ -61,7 +58,7 @@ impl TestCase for UploadChatImageTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         // Read the file data and compute expected hash
         let test_image_data = tokio::fs::read(temp_path).await?;

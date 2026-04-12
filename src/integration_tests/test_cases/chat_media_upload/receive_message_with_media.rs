@@ -49,9 +49,8 @@ impl ReceiveMessageWithMediaTestCase {
             format!("v mip04-v2"),
         ];
 
-        Tag::parse(parts).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create imeta tag: {}", e))
-        })
+        Tag::parse(parts)
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create imeta tag: {}", e)))
     }
 }
 
@@ -151,9 +150,9 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
                     .collect();
 
                 if matching.is_empty() {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Media reference not yet created for receiver"
-                    )));
+                    return Err(WhitenoiseError::Internal(
+                        "Media reference not yet created for receiver".to_string(),
+                    ));
                 }
 
                 Ok(matching)
@@ -172,9 +171,10 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
         // Verify original_file_hash is populated (from imeta 'x' field)
         let receiver_original_hash =
             receiver_media.original_file_hash.as_ref().ok_or_else(|| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(
                     "Receiver's MediaFile should have original_file_hash from imeta 'x' field"
-                ))
+                        .to_string(),
+                )
             })?;
 
         assert_eq!(

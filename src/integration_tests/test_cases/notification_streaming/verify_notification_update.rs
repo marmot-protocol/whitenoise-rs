@@ -79,7 +79,7 @@ impl VerifyNotificationUpdateTestCase {
         let mut guard = self
             .receiver
             .try_lock()
-            .map_err(|_| WhitenoiseError::Other(anyhow::anyhow!("Failed to acquire lock")))?;
+            .map_err(|_| WhitenoiseError::Internal("Failed to acquire lock".to_string()))?;
         *guard = Some(subscription.updates);
 
         tracing::info!(
@@ -95,24 +95,25 @@ impl TestCase for VerifyNotificationUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::Internal(
                 "VerifyNotificationUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the notification, then call execute()."
-            ))
+                    .to_string(),
+            )
         })?;
 
         // Wait for the update with timeout
         let update = tokio::time::timeout(tokio::time::Duration::from_secs(10), receiver.recv())
             .await
             .map_err(|_| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(format!(
                     "Timeout waiting for {:?} notification",
                     self.expected_trigger
                 ))
             })?
             .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to receive notification: {}", e))
+                WhitenoiseError::Internal(format!("Failed to receive notification: {}", e))
             })?;
 
         // Verify trigger type

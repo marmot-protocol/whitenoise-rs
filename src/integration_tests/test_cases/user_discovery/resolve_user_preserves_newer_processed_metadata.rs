@@ -83,7 +83,7 @@ impl TestCase for ResolveUserPreservesNewerProcessedMetadataTestCase {
                 if user.metadata.name == self.newer_metadata.name {
                     Ok(user)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Expected newer metadata to be processed first, got {:?}",
                         user.metadata.name
                     )))

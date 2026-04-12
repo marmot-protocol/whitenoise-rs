@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::rand::RngCore;
 
-use anyhow::Context;
 use dashmap::DashMap;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
@@ -446,12 +445,12 @@ impl Whitenoise {
         let logs_dir = &config.logs_dir;
 
         // Setup directories
-        std::fs::create_dir_all(data_dir)
-            .with_context(|| format!("Failed to create data directory: {:?}", data_dir))
-            .map_err(WhitenoiseError::from)?;
-        std::fs::create_dir_all(logs_dir)
-            .with_context(|| format!("Failed to create logs directory: {:?}", logs_dir))
-            .map_err(WhitenoiseError::from)?;
+        std::fs::create_dir_all(data_dir).map_err(|e| {
+            WhitenoiseError::Internal(format!("Failed to create data directory: {data_dir:?}: {e}"))
+        })?;
+        std::fs::create_dir_all(logs_dir).map_err(|e| {
+            WhitenoiseError::Internal(format!("Failed to create logs directory: {logs_dir:?}: {e}"))
+        })?;
 
         // Only initialize tracing once
         init_tracing(logs_dir);

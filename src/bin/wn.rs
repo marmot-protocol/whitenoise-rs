@@ -123,7 +123,7 @@ enum Cmd {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> whitenoise::cli::Result<()> {
     let args = Args::parse();
     let config = Config::resolve(None, None);
     let socket = args.socket.unwrap_or_else(|| config.socket_path());
@@ -150,9 +150,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Keys(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Reset { confirm } => {
             if !confirm {
-                anyhow::bail!(
-                    "this will delete ALL data (database, MLS state, logs). Pass --confirm to proceed."
-                );
+                return Err(whitenoise::cli::CliError::msg(
+                    "this will delete ALL data (database, MLS state, logs). Pass --confirm to proceed.",
+                ));
             }
             let resp = client::send(&socket, &Request::DeleteAllData).await?;
             output::print_and_exit(&resp, args.json)

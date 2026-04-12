@@ -540,12 +540,12 @@ impl Account {
         let descriptor = tokio::time::timeout(Whitenoise::BLOSSOM_TIMEOUT, upload_future)
             .await
             .map_err(|_| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(format!(
                     "Upload timed out after {} seconds",
                     Whitenoise::BLOSSOM_TIMEOUT.as_secs()
                 ))
             })?
-            .map_err(|err| WhitenoiseError::Other(anyhow::anyhow!(err)))?;
+            .map_err(|err| WhitenoiseError::Internal(err.to_string()))?;
 
         Whitenoise::require_https(&descriptor.url)?;
 

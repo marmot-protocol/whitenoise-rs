@@ -52,9 +52,9 @@ impl VerifyLastSyncedTimestampTestCase {
                 match (before, account.last_synced_at) {
                     (None, Some(_)) => Ok(()),
                     (Some(before_time), Some(after_time)) if after_time > before_time => Ok(()),
-                    _ => Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "last_synced_at not advanced yet"
-                    ))),
+                    _ => Err(WhitenoiseError::Internal(
+                        "last_synced_at not advanced yet".to_string(),
+                    )),
                 }
             },
             description,
@@ -77,9 +77,9 @@ impl VerifyLastSyncedTimestampTestCase {
                 if account.last_synced_at == before {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "last_synced_at advanced on global-only event"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "last_synced_at advanced on global-only event".to_string(),
+                    ))
                 }
             },
             description,
@@ -104,7 +104,7 @@ impl VerifyLastSyncedTimestampTestCase {
             .tags(tags)
             .custom_created_at(event_timestamp)
             .sign_with_keys(&keys)
-            .map_err(|e| WhitenoiseError::Other(e.into()))?;
+            .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
 
         client.send_event(&event).await?;
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -127,7 +127,7 @@ impl VerifyLastSyncedTimestampTestCase {
         let event = EventBuilder::metadata(&metadata)
             .custom_created_at(event_timestamp)
             .sign_with_keys(&keys)
-            .map_err(|e| WhitenoiseError::Other(e.into()))?;
+            .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
 
         client.send_event(&event).await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;

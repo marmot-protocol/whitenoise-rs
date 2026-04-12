@@ -16,7 +16,7 @@ use super::protocol::{Request, Response};
 /// Start the daemon: bind the socket, accept connections, dispatch requests.
 ///
 /// Returns when a shutdown signal is received or the listener fails.
-pub async fn run(config: &Config) -> anyhow::Result<()> {
+pub async fn run(config: &Config) -> crate::cli::Result<()> {
     let socket_path = config.socket_path();
     let pid_path = config.pid_path();
 
@@ -107,16 +107,16 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
 }
 
 /// If a socket file exists but the process that created it is dead, remove it.
-fn clean_stale_socket(socket_path: &Path, pid_path: &Path) -> anyhow::Result<()> {
+fn clean_stale_socket(socket_path: &Path, pid_path: &Path) -> crate::cli::Result<()> {
     if !socket_path.exists() {
         return Ok(());
     }
 
     if let Some(pid) = read_pid(pid_path).filter(|&p| is_process_alive(p)) {
-        anyhow::bail!(
+        return Err(crate::cli::error::CliError::msg(format!(
             "daemon already running (pid {pid}). \
              Stop it with: wn daemon stop"
-        );
+        )));
     }
 
     // Stale socket — previous process died without cleanup
@@ -126,19 +126,19 @@ fn clean_stale_socket(socket_path: &Path, pid_path: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
-fn write_pid_file(path: &Path) -> anyhow::Result<()> {
+fn write_pid_file(path: &Path) -> crate::cli::Result<()> {
     fs::write(path, std::process::id().to_string())?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_socket_permissions(path: &Path) -> anyhow::Result<()> {
+fn set_socket_permissions(path: &Path) -> crate::cli::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_socket_permissions(_path: &Path) -> anyhow::Result<()> {
+fn set_socket_permissions(_path: &Path) -> crate::cli::Result<()> {
     Ok(())
 }
 
@@ -178,11 +178,14 @@ pub fn is_daemon_running(config: &Config) -> Option<u32> {
 /// Stop the daemon by sending SIGTERM to the PID in the pidfile.
 ///
 /// Waits up to 5 seconds for the process to exit after sending the signal.
-pub fn stop_daemon(config: &Config) -> anyhow::Result<()> {
+pub fn stop_daemon(config: &Config) -> crate::cli::Result<()> {
+    use crate::cli::error::CliError;
     match is_daemon_running(config) {
         Some(pid) => {
             if !send_sigterm(pid) {
-                anyhow::bail!("failed to send SIGTERM to pid {pid}");
+                return Err(CliError::msg(format!(
+                    "failed to send SIGTERM to pid {pid}"
+                )));
             }
             for _ in 0..100 {
                 if !is_process_alive(pid) {
@@ -191,11 +194,11 @@ pub fn stop_daemon(config: &Config) -> anyhow::Result<()> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            anyhow::bail!("daemon (pid {pid}) did not exit within 5s after SIGTERM");
+            Err(CliError::msg(format!(
+                "daemon (pid {pid}) did not exit within 5s after SIGTERM"
+            )))
         }
-        None => {
-            anyhow::bail!("daemon not running");
-        }
+        None => Err(CliError::msg("daemon not running")),
     }
 }
 

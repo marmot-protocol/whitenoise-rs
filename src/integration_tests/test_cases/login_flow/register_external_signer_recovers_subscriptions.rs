@@ -40,9 +40,9 @@ impl TestCase for RegisterExternalSignerRecoversSubscriptionsTestCase {
                 {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "External account subscriptions are not yet operational"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "External account subscriptions are not yet operational".to_string(),
+                    ))
                 }
             },
             "wait initial external account subscriptions to become operational",
@@ -84,9 +84,10 @@ impl TestCase for RegisterExternalSignerRecoversSubscriptionsTestCase {
                 {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(
                         "register_external_signer did not recover account subscriptions"
-                    )))
+                            .to_string(),
+                    ))
                 }
             },
             "wait account subscriptions to recover after signer re-registration",

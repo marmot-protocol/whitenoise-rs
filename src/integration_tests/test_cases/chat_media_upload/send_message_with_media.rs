@@ -37,7 +37,7 @@ impl SendMessageWithMediaTestCase {
             &format!("x {}", hash_hex),
             "v mip04-v1",
         ])
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Failed to create imeta tag: {}", e)))
+        .map_err(|e| WhitenoiseError::Internal(format!("Failed to create imeta tag: {}", e)))
     }
 }
 
@@ -108,14 +108,14 @@ impl TestCase for SendMessageWithMediaTestCase {
                     .await?;
 
                 if messages.is_empty() {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "No messages found yet"
-                    )));
+                    return Err(WhitenoiseError::Internal(
+                        "No messages found yet".to_string(),
+                    ));
                 }
 
                 // Verify our specific message is in the cache
                 if !messages.iter().any(|msg| msg.id == sent_message_id) {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Sent message {} not found in aggregated messages yet",
                         sent_message_id
                     )));

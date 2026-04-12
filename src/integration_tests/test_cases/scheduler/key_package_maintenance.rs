@@ -197,7 +197,7 @@ where
                 if predicate(&key_packages) {
                     Ok(key_packages)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Observed {} key package(s) while waiting for {}",
                         key_packages.len(),
                         description,
@@ -225,7 +225,8 @@ async fn publish_backdated_key_package(
 
     // Get the account's secret key via public API
     let nsec = context.whitenoise.export_account_nsec(account).await?;
-    let secret_key = SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Other(e.into()))?;
+    let secret_key =
+        SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
     let keys = Keys::new(secret_key);
 
     // Calculate the backdated timestamp
@@ -236,7 +237,7 @@ async fn publish_backdated_key_package(
         .tags(key_package_data.tags_443.to_vec())
         .custom_created_at(backdated)
         .sign_with_keys(&keys)
-        .map_err(|e| WhitenoiseError::Other(e.into()))?;
+        .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
 
     let event_id = event.id;
 

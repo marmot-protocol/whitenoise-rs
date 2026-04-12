@@ -392,10 +392,10 @@ impl Whitenoise {
         signer: &impl NostrSigner,
     ) -> crate::whitenoise::error::Result<()> {
         let signer_pubkey = signer.get_public_key().await.map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to get signer pubkey: {}", e))
+            WhitenoiseError::Internal(format!("Failed to get signer pubkey: {}", e))
         })?;
         if signer_pubkey != *expected_pubkey {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "External signer pubkey mismatch: expected {}, got {}",
                 expected_pubkey.to_hex(),
                 signer_pubkey.to_hex()

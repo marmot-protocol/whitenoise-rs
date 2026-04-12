@@ -97,9 +97,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
         whitenoise
             .follow_user(searcher, &target_pubkey)
             .await
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to follow target: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to follow target: {}", e)))?;
 
         // Clear perf samples accumulated during setup/follow so only
         // actual search timings appear in the breakdown.

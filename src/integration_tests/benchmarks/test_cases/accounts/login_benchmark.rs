@@ -44,7 +44,7 @@ impl BenchmarkTestCase for LoginBenchmark {
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = context.tests_count as usize;
         if iteration >= self.prepared_keys.len() {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Login benchmark iteration {} exceeds prepared keys count ({})",
                 iteration,
                 self.prepared_keys.len()

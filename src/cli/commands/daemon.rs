@@ -1,9 +1,9 @@
 use std::process::Command;
 
-use anyhow::Context;
 use clap::Subcommand;
 
 use crate::cli::config::Config;
+use crate::cli::error::CliError;
 use crate::cli::server;
 
 #[derive(Debug, Subcommand)]
@@ -17,7 +17,7 @@ pub enum DaemonCmd {
 }
 
 impl DaemonCmd {
-    pub async fn run(self, config: &Config) -> anyhow::Result<()> {
+    pub async fn run(self, config: &Config) -> crate::cli::Result<()> {
         match self {
             Self::Start => start(config).await,
             Self::Stop => server::stop_daemon(config),
@@ -26,7 +26,7 @@ impl DaemonCmd {
     }
 }
 
-async fn start(config: &Config) -> anyhow::Result<()> {
+async fn start(config: &Config) -> crate::cli::Result<()> {
     // When invoked via `wn daemon start`, spawn `wnd` as a detached child
     // and return immediately. When invoked directly as `wnd`, this path
     // isn't used — wnd.rs calls server::run() directly.
@@ -37,12 +37,13 @@ async fn start(config: &Config) -> anyhow::Result<()> {
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    cmd.spawn().context("failed to start daemon")?;
+    cmd.spawn()
+        .map_err(|e| CliError::msg(format!("failed to start daemon: {e}")))?;
     println!("daemon started");
     Ok(())
 }
 
-fn status(config: &Config) -> anyhow::Result<()> {
+fn status(config: &Config) -> crate::cli::Result<()> {
     match server::is_daemon_running(config) {
         Some(pid) => {
             println!("daemon running (pid {pid})");
@@ -55,7 +56,7 @@ fn status(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn which_wnd() -> anyhow::Result<std::path::PathBuf> {
+fn which_wnd() -> crate::cli::Result<std::path::PathBuf> {
     // Look next to the current executable first (cargo install puts both binaries together)
     if let Ok(current) = std::env::current_exe() {
         let sibling = current.parent().unwrap_or(current.as_ref()).join("wnd");
@@ -71,5 +72,5 @@ fn which_wnd() -> anyhow::Result<std::path::PathBuf> {
                 candidate.is_file().then_some(candidate)
             })
         })
-        .ok_or_else(|| anyhow::anyhow!("wnd not found. Ensure it's installed and on your PATH."))
+        .ok_or_else(|| CliError::msg("wnd not found. Ensure it's installed and on your PATH."))
 }

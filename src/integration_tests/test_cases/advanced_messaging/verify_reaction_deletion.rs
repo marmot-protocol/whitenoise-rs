@@ -61,7 +61,7 @@ impl TestCase for VerifyReactionDeletionTestCase {
                     .iter()
                     .find(|msg| msg.id == *target_message_id)
                     .ok_or_else(|| {
-                        WhitenoiseError::Other(anyhow::anyhow!(
+                        WhitenoiseError::Internal(format!(
                             "Target message {} not found in aggregated messages",
                             target_message_id
                         ))
@@ -74,7 +74,7 @@ impl TestCase for VerifyReactionDeletionTestCase {
                     .any(|r| r.user == reactor_account.pubkey);
 
                 if reactor_has_reaction {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Reaction from {} still present on message {}",
                         &reactor_account.pubkey.to_hex()[..8],
                         target_message_id

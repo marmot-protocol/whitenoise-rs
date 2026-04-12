@@ -47,7 +47,7 @@ impl BenchmarkTestCase for AddMembersBenchmark {
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = self.next_set.fetch_add(1, Ordering::Relaxed);
         if iteration >= self.member_sets.len() {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Add members benchmark iteration {} exceeds prepared member sets ({})",
                 iteration,
                 self.member_sets.len()

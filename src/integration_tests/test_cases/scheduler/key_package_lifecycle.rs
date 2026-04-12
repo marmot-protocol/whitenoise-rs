@@ -107,9 +107,9 @@ impl TestCase for KeyPackageLifecycleTestCase {
 
                     match pkg {
                         Some(p) if p.consumed_at.is_some() => Ok(()),
-                        _ => Err(WhitenoiseError::Other(anyhow::anyhow!(
-                            "KP not yet marked as consumed"
-                        ))),
+                        _ => Err(WhitenoiseError::Internal(
+                            "KP not yet marked as consumed".to_string(),
+                        )),
                     }
                 }
             },

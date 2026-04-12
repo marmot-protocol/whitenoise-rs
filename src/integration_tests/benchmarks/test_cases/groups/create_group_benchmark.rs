@@ -41,7 +41,7 @@ impl BenchmarkTestCase for CreateGroupBenchmark {
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = context.tests_count as usize;
         if iteration >= self.member_sets.len() {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Create group benchmark iteration {} exceeds prepared member sets ({})",
                 iteration,
                 self.member_sets.len()

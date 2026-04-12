@@ -85,11 +85,12 @@ impl TestCase for VerifyStreamUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::Internal(
                 "VerifyStreamUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the update, then call execute()."
-            ))
+                    .to_string(),
+            )
         })?;
 
         // Pre-resolve the expected message ID to avoid borrow issues in async block
@@ -130,12 +131,12 @@ impl TestCase for VerifyStreamUpdateTestCase {
         })
         .await
         .map_err(|_| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::Internal(format!(
                 "Timeout waiting for {:?} update",
                 self.expected_trigger
             ))
         })?
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Failed to receive update: {}", e)))?;
+        .map_err(|e| WhitenoiseError::Internal(format!("Failed to receive update: {}", e)))?;
 
         // Verify trigger type
         assert_eq!(

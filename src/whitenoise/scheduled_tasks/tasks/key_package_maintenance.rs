@@ -436,7 +436,7 @@ mod tests {
 
         let nsec = whitenoise.export_account_nsec(account).await?;
         let secret_key =
-            SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Other(e.into()))?;
+            SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
         let keys = Keys::new(secret_key);
 
         // Filter out the encoding tag to simulate an outdated key package
@@ -449,7 +449,7 @@ mod tests {
         let event = EventBuilder::new(Kind::MlsKeyPackage, &key_package_data.content)
             .tags(tags_without_encoding)
             .sign_with_keys(&keys)
-            .map_err(|e| WhitenoiseError::Other(e.into()))?;
+            .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
 
         let event_id = event.id;
 

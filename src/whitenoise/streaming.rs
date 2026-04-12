@@ -63,7 +63,7 @@ impl Whitenoise {
             )
             .await
             .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
+                WhitenoiseError::Internal(format!("Failed to read cached messages: {}", e))
             })?;
 
         // 3. Build a map keyed by message ID for deduplication.
@@ -104,16 +104,16 @@ impl Whitenoise {
                         target: "whitenoise::mod",
                         "subscription drain lagged by {n} messages, snapshot may be incomplete"
                     );
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Message stream lagged by {} messages during subscription initialization, retry needed",
                         n
                     )));
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     // Channel closed unexpectedly — unreachable while we hold a receiver.
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Message stream closed unexpectedly during subscription"
-                    )));
+                    return Err(WhitenoiseError::Internal(
+                        "Message stream closed unexpectedly during subscription".to_string(),
+                    ));
                 }
             }
         }
@@ -174,9 +174,9 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "User stream closed unexpectedly during subscription"
-                    )));
+                    return Err(WhitenoiseError::Internal(
+                        "User stream closed unexpectedly during subscription".to_string(),
+                    ));
                 }
             }
         }
@@ -223,9 +223,9 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Chat list stream closed unexpectedly during subscription"
-                    )));
+                    return Err(WhitenoiseError::Internal(
+                        "Chat list stream closed unexpectedly during subscription".to_string(),
+                    ));
                 }
             }
         }
@@ -277,9 +277,10 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(
                         "Archived chat list stream closed unexpectedly during subscription"
-                    )));
+                            .to_string(),
+                    ));
                 }
             }
         }

@@ -95,7 +95,7 @@ impl Whitenoise {
                     .await?;
             }
             other => {
-                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                return Err(WhitenoiseError::Internal(format!(
                     "Unsupported outgoing event kind: {other}"
                 )));
             }
@@ -191,15 +191,11 @@ impl Whitenoise {
                 msg.delivery_status = Some(DeliveryStatus::Sending);
                 msg
             })
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to process message: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to process message: {}", e)))?;
 
         AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to cache message: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache message: {}", e)))?;
 
         // Emit NewMessage so the UI shows it immediately (optimistic)
         self.message_stream_manager.emit(
@@ -227,9 +223,7 @@ impl Whitenoise {
         // Insert the reaction event row
         AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database)
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to cache reaction: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache reaction: {}", e)))?;
 
         // Track delivery status for the reaction event (direct insert, not full
         // update_delivery_status which opens a transaction that can contend with
@@ -242,10 +236,7 @@ impl Whitenoise {
         )
         .await
         .map_err(|e| {
-            WhitenoiseError::from(anyhow::anyhow!(
-                "Failed to set reaction delivery status: {}",
-                e,
-            ))
+            WhitenoiseError::Internal(format!("Failed to set reaction delivery status: {}", e,))
         })?;
 
         // Apply reaction to the target kind-9 message (if e-tag is present and target cached)
@@ -257,7 +248,7 @@ impl Whitenoise {
                 &mdk_message.content,
                 self.message_aggregator.config().normalize_emoji,
             )
-            .map_err(|e| WhitenoiseError::from(anyhow::anyhow!("Invalid reaction emoji: {}", e)))?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Invalid reaction emoji: {}", e)))?;
 
             reaction_handler::add_reaction_to_message(
                 &mut target,
@@ -301,9 +292,7 @@ impl Whitenoise {
         // Insert the deletion event row
         AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database)
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to cache deletion: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache deletion: {}", e)))?;
 
         // Track delivery status for the deletion event (direct insert, not full
         // update_delivery_status which opens a transaction that can contend with
@@ -316,10 +305,7 @@ impl Whitenoise {
         )
         .await
         .map_err(|e| {
-            WhitenoiseError::from(anyhow::anyhow!(
-                "Failed to set deletion delivery status: {}",
-                e,
-            ))
+            WhitenoiseError::Internal(format!("Failed to set deletion delivery status: {}", e,))
         })?;
 
         // Capture the last message ID *before* applying deletions so we can
@@ -559,22 +545,21 @@ impl Whitenoise {
                     cached
                 }
                 Ok(Some(cached)) => {
-                    return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Can only retry messages with Failed delivery status, got {:?}",
                         cached.delivery_status
                     )));
                 }
                 Ok(None) => {
-                    return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Cannot retry message {}: not found in cache for group",
                         event_id_str
                     )));
                 }
                 Err(e) => {
-                    return Err(WhitenoiseError::from(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Cannot retry message {}: failed to query cache: {}",
-                        event_id_str,
-                        e
+                        event_id_str, e
                     )));
                 }
             };
@@ -690,7 +675,7 @@ impl Whitenoise {
                 WhitenoiseError::InvalidCursor { reason }
             }
             other => {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", other))
+                WhitenoiseError::Internal(format!("Failed to read cached messages: {}", other))
             }
         })
     }
@@ -755,9 +740,7 @@ impl Whitenoise {
 
         AggregatedMessage::find_by_id(message_id, group_id, &self.database)
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached message: {}", e))
-            })
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to read cached message: {}", e)))
     }
 
     /// Search messages within a group by content.
@@ -894,7 +877,7 @@ impl Whitenoise {
         let cached_count = AggregatedMessage::count_by_group(group_id, &self.database)
             .await
             .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to count cached events: {}", e))
+                WhitenoiseError::Internal(format!("Failed to count cached events: {}", e))
             })?;
 
         if mdk_messages.len() != cached_count {
@@ -928,7 +911,7 @@ impl Whitenoise {
         let cached_ids = AggregatedMessage::get_all_event_ids_by_group(group_id, &self.database)
             .await
             .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to get cached event IDs: {}", e))
+                WhitenoiseError::Internal(format!("Failed to get cached event IDs: {}", e))
             })?;
 
         let new_events: Vec<Message> = mdk_messages
@@ -966,14 +949,12 @@ impl Whitenoise {
                 media_files,
             )
             .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Message aggregation failed: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Message aggregation failed: {}", e)))?;
 
         AggregatedMessage::save_events(new_events, processed_messages, group_id, &self.database)
             .await
             .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to save events to cache: {}", e))
+                WhitenoiseError::Internal(format!("Failed to save events to cache: {}", e))
             })?;
 
         tracing::debug!(

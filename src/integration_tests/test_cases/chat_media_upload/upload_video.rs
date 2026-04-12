@@ -21,9 +21,8 @@ impl UploadVideoTestCase {
     fn create_test_video(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
         use std::io::Write;
 
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let mut temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
         // MP4 magic bytes (ftyp box signature)
         // This is a minimal valid MP4 file structure
@@ -38,13 +37,13 @@ impl UploadVideoTestCase {
             0x00, 0x00, 0x00, 0x00, // padding
         ];
 
-        temp_file.write_all(mp4_header).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to write MP4 data: {}", e))
-        })?;
+        temp_file
+            .write_all(mp4_header)
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to write MP4 data: {}", e)))?;
 
-        temp_file.flush().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to flush temp file: {}", e))
-        })?;
+        temp_file
+            .flush()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to flush temp file: {}", e)))?;
 
         Ok(temp_file)
     }
@@ -66,7 +65,7 @@ impl TestCase for UploadVideoTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         // Read the file data and compute expected hash
         let test_video_data = tokio::fs::read(temp_path).await?;

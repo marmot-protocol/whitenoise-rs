@@ -245,7 +245,7 @@ impl Whitenoise {
                 &options.unwrap_or_default(),
             )
             .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to prepare group image: {}", e))
+                WhitenoiseError::Internal(format!("Failed to prepare group image: {}", e))
             })?;
 
         let blossom_server_url = blossom_server_url.unwrap_or(Self::default_blossom_url());
@@ -319,7 +319,7 @@ impl Whitenoise {
         let original_filename = std::path::Path::new(file_path)
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid file path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid file path".to_string()))?;
 
         let prepared = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
@@ -333,7 +333,7 @@ impl Whitenoise {
                     &options.unwrap_or_default(),
                 )
                 .map_err(|e| {
-                    WhitenoiseError::Other(anyhow::anyhow!("Failed to encrypt chat media: {}", e))
+                    WhitenoiseError::Internal(format!("Failed to encrypt chat media: {}", e))
                 })?
         };
 
@@ -702,7 +702,7 @@ impl Whitenoise {
 
         let secret_key = Secret::new(*image_key);
         let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
+            WhitenoiseError::Internal(format!("Failed to derive upload keypair: {}", e))
         })?;
 
         let upload = MediaFileUpload {
@@ -930,7 +930,7 @@ impl Whitenoise {
         let decrypted = media_manager
             .decrypt_from_download(&encrypted_data, &reference)
             .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to decrypt chat media: {}", e))
+                WhitenoiseError::Internal(format!("Failed to decrypt chat media: {}", e))
             })?;
 
         // MIP-04 requires an explicit SHA-256 check on the plaintext after decryption.
@@ -964,7 +964,7 @@ impl Whitenoise {
         let hash_hex = hex::encode(image_hash);
         let filename = format!("{}.{}", hash_hex, image_type.extension());
         let blossom_url = blossom_server.join(&hash_hex).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to construct Blossom URL: {}", e))
+            WhitenoiseError::Internal(format!("Failed to construct Blossom URL: {}", e))
         })?;
 
         let mut hasher = Sha256::new();
@@ -973,7 +973,7 @@ impl Whitenoise {
 
         let secret_key = Secret::new(*image_key);
         let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to derive upload keypair: {}", e))
+            WhitenoiseError::Internal(format!("Failed to derive upload keypair: {}", e))
         })?;
 
         let upload = MediaFileUpload {
@@ -1021,14 +1021,14 @@ impl Whitenoise {
             .sign(upload_keypair)
             .await
             .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to sign Blossom auth event: {}", e))
+                WhitenoiseError::Internal(format!("Failed to sign Blossom auth event: {}", e))
             })?;
         let auth_json = auth_event.as_json();
         let auth_header_value = format!("Nostr {}", Base64::encode_string(auth_json.as_bytes()));
 
-        let upload_url = blossom_server_url.join("upload").map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to build upload URL: {}", e))
-        })?;
+        let upload_url = blossom_server_url
+            .join("upload")
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to build upload URL: {}", e)))?;
 
         let upload_future = async {
             let response = BLOSSOM_HTTP_CLIENT
@@ -1039,11 +1039,11 @@ impl Whitenoise {
                 .send()
                 .await
                 .map_err(|e| {
-                    WhitenoiseError::Other(anyhow::anyhow!("Upload HTTP request failed: {}", e))
+                    WhitenoiseError::Internal(format!("Upload HTTP request failed: {}", e))
                 })?;
 
             if !response.status().is_success() {
-                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                return Err(WhitenoiseError::Internal(format!(
                     "Upload failed with status {}",
                     response.status()
                 )));
@@ -1053,17 +1053,14 @@ impl Whitenoise {
                 .json::<nostr_blossom::bud02::BlobDescriptor>()
                 .await
                 .map_err(|e| {
-                    WhitenoiseError::Other(anyhow::anyhow!(
-                        "Failed to parse upload response: {}",
-                        e
-                    ))
+                    WhitenoiseError::Internal(format!("Failed to parse upload response: {}", e))
                 })
         };
 
         let descriptor = tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
             .await
             .map_err(|_| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(format!(
                     "Upload timed out after {} seconds",
                     Self::BLOSSOM_TIMEOUT.as_secs()
                 ))

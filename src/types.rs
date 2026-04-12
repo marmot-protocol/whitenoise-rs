@@ -5,6 +5,7 @@ use crate::{
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Serialize;
+use thiserror::Error;
 
 /// Retry information for failed event processing
 #[derive(Debug, Clone)]
@@ -210,6 +211,34 @@ impl MessageWithTokens {
     }
 }
 
+/// Errors returned by [`ImageType`] detection and MIME type parsing.
+#[derive(Debug, Error)]
+pub enum ImageTypeError {
+    /// The `image` crate failed to detect a valid format from the raw bytes.
+    #[error("Failed to detect image format: {source}. Supported formats: {supported}")]
+    DetectFailed {
+        #[source]
+        source: ::image::ImageError,
+        supported: String,
+    },
+    /// The detected format is not one of the supported image types.
+    #[error("Unsupported image format: {format}. Supported formats: {supported}")]
+    UnsupportedFormat { format: String, supported: String },
+    /// The image bytes could not be decoded as the detected format.
+    #[error("Invalid or corrupted {mime_type} image: {source}")]
+    InvalidImage {
+        mime_type: &'static str,
+        #[source]
+        source: ::image::ImageError,
+    },
+    /// The provided MIME type is not one of the supported image types.
+    #[error("Unsupported image MIME type: {mime_type}. Supported types: {supported}")]
+    UnsupportedMimeType {
+        mime_type: String,
+        supported: String,
+    },
+}
+
 /// Supported image types for group images
 ///
 /// This enum represents the allowed image formats that can be uploaded
@@ -255,7 +284,7 @@ impl ImageType {
     ///
     /// # Returns
     /// * `Ok(ImageType)` - The detected and validated image type
-    /// * `Err(anyhow::Error)` - If the format is unsupported, unrecognized, or invalid
+    /// * `Err(ImageTypeError)` - If the format is unsupported, unrecognized, or invalid
     ///
     /// # Example
     /// ```ignore
@@ -263,18 +292,11 @@ impl ImageType {
     /// let image_type = ImageType::detect(&image_data)?;
     /// assert_eq!(image_type, ImageType::Jpeg);
     /// ```
-    pub fn detect(data: &[u8]) -> Result<Self, anyhow::Error> {
+    pub fn detect(data: &[u8]) -> Result<Self, ImageTypeError> {
         // Use the image crate to detect format - it's more reliable than magic bytes
-        let format = ::image::guess_format(data).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to detect image format: {}. Supported formats: {}",
-                e,
-                Self::all()
-                    .iter()
-                    .map(|t| t.mime_type())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+        let format = ::image::guess_format(data).map_err(|e| ImageTypeError::DetectFailed {
+            source: e,
+            supported: Self::supported_mime_types(),
         })?;
 
         // Map the detected format to our ImageType enum
@@ -284,28 +306,30 @@ impl ImageType {
             ::image::ImageFormat::Gif => ImageType::Gif,
             ::image::ImageFormat::WebP => ImageType::Webp,
             other => {
-                return Err(anyhow::anyhow!(
-                    "Unsupported image format: {:?}. Supported formats: {}",
-                    other,
-                    Self::all()
-                        .iter()
-                        .map(|t| t.mime_type())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                return Err(ImageTypeError::UnsupportedFormat {
+                    format: format!("{other:?}"),
+                    supported: Self::supported_mime_types(),
+                });
             }
         };
 
         // Validate the image can actually be decoded
         ::image::load_from_memory_with_format(data, format).map_err(|e| {
-            anyhow::anyhow!(
-                "Invalid or corrupted {} image: {}",
-                image_type.mime_type(),
-                e
-            )
+            ImageTypeError::InvalidImage {
+                mime_type: image_type.mime_type(),
+                source: e,
+            }
         })?;
 
         Ok(image_type)
+    }
+
+    fn supported_mime_types() -> String {
+        Self::all()
+            .iter()
+            .map(|t| t.mime_type())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// All supported image types as a slice
@@ -326,7 +350,7 @@ impl From<ImageType> for String {
 }
 
 impl TryFrom<String> for ImageType {
-    type Error = anyhow::Error;
+    type Error = ImageTypeError;
 
     fn try_from(mime_type: String) -> Result<Self, Self::Error> {
         Self::try_from(mime_type.as_str())
@@ -334,7 +358,7 @@ impl TryFrom<String> for ImageType {
 }
 
 impl TryFrom<&str> for ImageType {
-    type Error = anyhow::Error;
+    type Error = ImageTypeError;
 
     fn try_from(mime_type: &str) -> Result<Self, Self::Error> {
         match mime_type {
@@ -342,15 +366,10 @@ impl TryFrom<&str> for ImageType {
             "image/png" => Ok(ImageType::Png),
             "image/gif" => Ok(ImageType::Gif),
             "image/webp" => Ok(ImageType::Webp),
-            _ => Err(anyhow::anyhow!(
-                "Unsupported image MIME type: {}. Supported types: {}",
-                mime_type,
-                ImageType::all()
-                    .iter()
-                    .map(|t| t.mime_type())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            _ => Err(ImageTypeError::UnsupportedMimeType {
+                mime_type: mime_type.to_string(),
+                supported: ImageType::supported_mime_types(),
+            }),
         }
     }
 }

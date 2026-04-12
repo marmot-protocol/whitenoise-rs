@@ -137,7 +137,7 @@ impl MessagesCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List {
                 group_id,
@@ -207,7 +207,7 @@ async fn list(
     after: Option<u64>,
     after_message_id: Option<String>,
     limit: Option<u32>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -232,7 +232,7 @@ async fn search(
     group_id: String,
     query: String,
     limit: Option<u32>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -253,7 +253,7 @@ async fn search_all(
     account_flag: Option<&str>,
     query: String,
     limit: Option<u32>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -273,7 +273,7 @@ async fn subscribe(
     account_flag: Option<&str>,
     group_id: String,
     limit: Option<u32>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let req = Request::MessagesSubscribe {
         account: pubkey,
@@ -302,7 +302,7 @@ async fn send(
     group_id: String,
     message: String,
     reply_to: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -323,7 +323,7 @@ async fn delete(
     account_flag: Option<&str>,
     group_id: String,
     message_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -343,7 +343,7 @@ async fn retry(
     account_flag: Option<&str>,
     group_id: String,
     event_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -364,7 +364,7 @@ async fn react(
     group_id: String,
     message_id: String,
     emoji: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -385,7 +385,7 @@ async fn unreact(
     account_flag: Option<&str>,
     group_id: String,
     message_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

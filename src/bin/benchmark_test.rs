@@ -150,12 +150,10 @@ fn save_keyring_sidecar(
 ) -> Result<(), WhitenoiseError> {
     let db_key_id = format!("mdk.db.key.{pubkey_hex}");
     let entry = Entry::new(KEYRING_SERVICE, &db_key_id)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("keyring entry error: {e}")))?;
+        .map_err(|e| WhitenoiseError::Internal(format!("keyring entry error: {e}")))?;
 
     let secret = entry.get_secret().map_err(|e| {
-        WhitenoiseError::Other(anyhow::anyhow!(
-            "failed to read MDK DB key from keyring: {e}"
-        ))
+        WhitenoiseError::Internal(format!("failed to read MDK DB key from keyring: {e}"))
     })?;
 
     let hex_secret = hex::encode(&secret);
@@ -175,16 +173,16 @@ fn save_keyring_sidecar(
             .mode(0o600)
             .open(&path)
             .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("failed to create keyring sidecar: {e}"))
+                WhitenoiseError::Internal(format!("failed to create keyring sidecar: {e}"))
             })?;
         file.write_all(line.as_bytes()).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("failed to write keyring sidecar: {e}"))
+            WhitenoiseError::Internal(format!("failed to write keyring sidecar: {e}"))
         })?;
     }
     #[cfg(not(unix))]
     {
         std::fs::write(&path, &line).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("failed to write keyring sidecar: {e}"))
+            WhitenoiseError::Internal(format!("failed to write keyring sidecar: {e}"))
         })?;
     }
 
@@ -208,10 +206,10 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
 
     // Re-seed the Nostr private key.
     let keys = Keys::parse(nsec)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Invalid --seed-nsec value: {e}")))?;
+        .map_err(|e| WhitenoiseError::Internal(format!("Invalid --seed-nsec value: {e}")))?;
     SecretsStore::new(KEYRING_SERVICE)
         .store_private_key(&keys)
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Failed to re-seed Nostr key: {e}")))?;
+        .map_err(|e| WhitenoiseError::Internal(format!("Failed to re-seed Nostr key: {e}")))?;
     tracing::info!(
         "Re-seeded Nostr key for pubkey {}",
         keys.public_key().to_hex()
@@ -220,7 +218,7 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
     // Restore MDK DB encryption keys from the sidecar.
     let path = data_dir.join(KEYRING_SIDECAR);
     let content = std::fs::read_to_string(&path).map_err(|e| {
-        WhitenoiseError::Other(anyhow::anyhow!(
+        WhitenoiseError::Internal(format!(
             "Failed to read keyring sidecar {}: {} — run --login first",
             path.display(),
             e
@@ -233,18 +231,15 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
             continue;
         }
         let (key_id, hex_secret) = line.split_once(' ').ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!("Malformed keyring sidecar line: {line:?}"))
+            WhitenoiseError::Internal(format!("Malformed keyring sidecar line: {line:?}"))
         })?;
-        let secret = hex::decode(hex_secret).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Hex decode error in sidecar: {e}"))
-        })?;
+        let secret = hex::decode(hex_secret)
+            .map_err(|e| WhitenoiseError::Internal(format!("Hex decode error in sidecar: {e}")))?;
 
         let entry = Entry::new(KEYRING_SERVICE, key_id)
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("keyring entry error: {e}")))?;
+            .map_err(|e| WhitenoiseError::Internal(format!("keyring entry error: {e}")))?;
         entry.set_secret(&secret).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!(
-                "Failed to restore keyring entry {key_id}: {e}"
-            ))
+            WhitenoiseError::Internal(format!("Failed to restore keyring entry {key_id}: {e}"))
         })?;
 
         tracing::info!("Restored keyring entry: {key_id}");
@@ -332,9 +327,9 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     if let Some(ref trace_path) = args.chrome_trace {
         if !args.detailed {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                "--chrome-trace requires --detailed; re-run with both flags"
-            )));
+            return Err(WhitenoiseError::Internal(
+                "--chrome-trace requires --detailed; re-run with both flags".to_string(),
+            ));
         }
         write_perfetto_trace(trace_path, &results)?;
     }
