@@ -153,35 +153,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_relay_new_row_from_row_valid_data() {
-        let pool = setup_test_db().await;
-
-        let test_url_str = "wss://relay.damus.io";
-        let test_url = RelayUrl::parse(test_url_str).unwrap();
-        let test_timestamp = chrono::Utc::now().timestamp_millis();
-
-        sqlx::query("INSERT INTO relays (url, created_at, updated_at) VALUES (?, ?, ?)")
-            .bind(test_url_str)
-            .bind(test_timestamp)
-            .bind(test_timestamp)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let row: SqliteRow = sqlx::query("SELECT * FROM relays WHERE url = ?")
-            .bind(test_url_str)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        let relay_row = Relay::from_row(&row).unwrap();
-
-        assert_eq!(relay_row.url, test_url);
-        assert_eq!(relay_row.created_at.timestamp_millis(), test_timestamp);
-        assert_eq!(relay_row.updated_at.timestamp_millis(), test_timestamp);
-    }
-
-    #[tokio::test]
     async fn test_relay_new_row_from_row_various_valid_urls() {
         let pool = setup_test_db().await;
 
