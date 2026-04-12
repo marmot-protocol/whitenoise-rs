@@ -75,7 +75,7 @@ impl Account {
     /// Returns a [`WhitenoiseError`] if the database query fails.
     #[perf_instrument("db::accounts")]
     pub(crate) async fn all(database: &Database) -> Result<Vec<Account>, WhitenoiseError> {
-        let accounts = sqlx::query_as::<_, Account>("SELECT * FROM accounts")
+        let accounts = sqlx::query_as::<_, Self>("SELECT * FROM accounts")
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
@@ -100,7 +100,7 @@ impl Account {
     /// Test-only: production code resolves accounts explicitly by pubkey.
     #[cfg(test)]
     pub(crate) async fn first(database: &Database) -> Result<Option<Account>, WhitenoiseError> {
-        let account = sqlx::query_as::<_, Account>(
+        let account = sqlx::query_as::<_, Self>(
             "SELECT * FROM accounts ORDER BY created_at ASC, id ASC LIMIT 1",
         )
         .fetch_optional(&database.pool)
@@ -129,7 +129,7 @@ impl Account {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Account, WhitenoiseError> {
-        let account = sqlx::query_as::<_, Account>("SELECT * FROM accounts WHERE pubkey = ?")
+        let account = sqlx::query_as::<_, Self>("SELECT * FROM accounts WHERE pubkey = ?")
             .bind(pubkey.to_hex().as_str())
             .fetch_one(&database.pool)
             .await
@@ -382,7 +382,7 @@ impl Account {
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
     pub(crate) async fn save(&self, database: &Database) -> Result<Account, WhitenoiseError> {
-        let account = sqlx::query_as::<_, Account>(
+        let account = sqlx::query_as::<_, Self>(
             "INSERT INTO accounts (pubkey, user_id, account_type, last_synced_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE

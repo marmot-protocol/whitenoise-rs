@@ -57,7 +57,7 @@ impl Relay {
         database: &Database,
     ) -> Result<Relay, WhitenoiseError> {
         let normalized_url = normalize_relay_url(url);
-        let relay = sqlx::query_as::<_, Relay>("SELECT * FROM relays WHERE url = ?")
+        let relay = sqlx::query_as::<_, Self>("SELECT * FROM relays WHERE url = ?")
             .bind(normalized_url)
             .fetch_one(&database.pool)
             .await
@@ -114,7 +114,7 @@ impl Relay {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        let inserted_relay = sqlx::query_as::<_, Relay>("SELECT * FROM relays WHERE url = ?")
+        let inserted_relay = sqlx::query_as::<_, Self>("SELECT * FROM relays WHERE url = ?")
             .bind(&normalized_url)
             .fetch_one(&mut *tx)
             .await

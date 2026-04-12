@@ -58,7 +58,7 @@ where
 impl User {
     #[cfg(test)]
     pub(crate) async fn all(database: &Database) -> Result<Vec<User>, WhitenoiseError> {
-        let users = sqlx::query_as::<_, User>("SELECT * FROM users")
+        let users = sqlx::query_as::<_, Self>("SELECT * FROM users")
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
@@ -188,7 +188,7 @@ impl User {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<User, WhitenoiseError> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE pubkey = ?")
+        let user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(pubkey.to_hex().as_str())
             .fetch_one(&database.pool)
             .await
@@ -234,7 +234,7 @@ impl User {
         sep.push_unseparated(")");
 
         let users = qb
-            .build_query_as::<User>()
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
@@ -323,7 +323,7 @@ impl User {
         .map_err(WhitenoiseError::Database)?;
 
         // Get the user by pubkey to return the updated record
-        let updated_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE pubkey = ?")
+        let updated_user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(self.pubkey.to_hex().as_str())
             .fetch_one(&mut *tx)
             .await
@@ -353,7 +353,7 @@ impl User {
         pubkey: &PublicKey,
         tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
     ) -> Result<User, WhitenoiseError> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE pubkey = ?")
+        let user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(pubkey.to_hex().as_str())
             .fetch_one(&mut **tx)
             .await
@@ -410,7 +410,7 @@ impl User {
         .map_err(WhitenoiseError::Database)?;
 
         // Get the user by pubkey to return the updated record
-        let updated_user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE pubkey = ?")
+        let updated_user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(self.pubkey.to_hex().as_str())
             .fetch_one(&mut **tx)
             .await

@@ -93,7 +93,7 @@ impl GroupPushToken {
     ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
-        let token = sqlx::query_as::<_, GroupPushToken>(
+        let token = sqlx::query_as::<_, Self>(
             "INSERT INTO group_push_tokens (
                  account_pubkey,
                  mls_group_id,
@@ -175,7 +175,7 @@ impl GroupPushToken {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let tokens = sqlx::query_as::<_, GroupPushToken>(
+        let tokens = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM group_push_tokens
              WHERE account_pubkey = ? AND mls_group_id = ?

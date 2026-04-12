@@ -120,7 +120,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ? AND mls_group_id = ?",
@@ -170,7 +170,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroup>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ?
@@ -190,7 +190,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroup>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ?
@@ -210,7 +210,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroup>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM accounts_groups
              WHERE mls_group_id = ?",
@@ -234,7 +234,7 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
         let confirmation_int: i64 = if user_confirmation { 1 } else { 0 };
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET user_confirmation = ?, updated_at = ?
              WHERE id = ?
@@ -257,7 +257,7 @@ impl AccountGroup {
     pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, dm_peer_pubkey, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
@@ -304,7 +304,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET pin_order = ?, updated_at = ?
              WHERE id = ?
@@ -329,7 +329,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET archived_at = ?, updated_at = ?
              WHERE id = ?
@@ -357,7 +357,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET muted_until = ?, updated_at = ?
              WHERE id = ?
@@ -385,7 +385,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, updated_at = ?
              WHERE id = ?
@@ -409,7 +409,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -437,7 +437,7 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
         let cleared_ms = chat_cleared_at.timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -459,7 +459,7 @@ impl AccountGroup {
     pub(crate) async fn clear_expired_mutes(database: &Database) -> Result<Vec<Self>, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let rows = sqlx::query_as::<_, AccountGroup>(
+        let rows = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET muted_until = NULL, updated_at = ?
              WHERE muted_until IS NOT NULL AND muted_until <= ?
@@ -487,7 +487,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET removed_at = ?, self_removed = 1, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -513,7 +513,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET removed_at = ?, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -548,7 +548,7 @@ impl AccountGroup {
         // Atomic compare-and-update: only update if the new message is newer
         // than the current read marker. Uses a subquery to get the current
         // marker's timestamp from aggregated_messages, scoped to the same group.
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE accounts_groups
              SET last_read_message_id = ?, updated_at = ?
              WHERE id = ?
@@ -703,7 +703,7 @@ impl AccountGroup {
     ) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroup>(
+        let row = sqlx::query_as::<_, Self>(
             "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, dm_peer_pubkey, created_at, updated_at)
              VALUES (?, ?, NULL, ?, ?, ?, ?)
              RETURNING *",

@@ -92,7 +92,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
-        let row = sqlx::query_as::<_, PublishedKeyPackage>(
+        let row = sqlx::query_as::<_, Self>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ? AND event_id = ?",
@@ -144,7 +144,7 @@ impl PublishedKeyPackage {
         quiet_period_secs: i64,
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
-        let rows = sqlx::query_as::<_, PublishedKeyPackage>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ?

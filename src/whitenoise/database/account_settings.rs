@@ -50,7 +50,7 @@ impl AccountSettings {
         let _span = perf_span!("db::account_settings_find_or_create");
         let now = Utc::now().timestamp_millis();
 
-        match sqlx::query_as::<_, AccountSettings>(
+        match sqlx::query_as::<_, Self>(
             "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
              VALUES (?, 1, ?, ?)
              RETURNING *",
@@ -63,7 +63,7 @@ impl AccountSettings {
         {
             Ok(settings) => Ok(settings),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                let settings = sqlx::query_as::<_, AccountSettings>(
+                let settings = sqlx::query_as::<_, Self>(
                     "SELECT * FROM account_settings WHERE account_pubkey = ?",
                 )
                 .bind(pubkey.to_hex())
@@ -103,7 +103,7 @@ impl AccountSettings {
         let now = Utc::now().timestamp_millis();
         let enabled_int: i64 = if enabled { 1 } else { 0 };
 
-        let settings = sqlx::query_as::<_, AccountSettings>(
+        let settings = sqlx::query_as::<_, Self>(
             "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(account_pubkey) DO UPDATE SET

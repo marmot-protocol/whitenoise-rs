@@ -189,7 +189,7 @@ impl MediaFile {
     ) -> Result<Option<Self>, WhitenoiseError> {
         let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
 
-        let row_opt = sqlx::query_as::<_, MediaFile>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -243,7 +243,7 @@ impl MediaFile {
 
         let account_pubkey_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, MediaFile>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "INSERT INTO media_files (
                 mls_group_id, account_pubkey, file_path,
                 original_file_hash, encrypted_file_hash,
@@ -280,7 +280,7 @@ impl MediaFile {
         }
 
         // Conflict occurred - select existing row
-        let existing = sqlx::query_as::<_, MediaFile>(
+        let existing = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -312,7 +312,7 @@ impl MediaFile {
         database: &Database,
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let rows = sqlx::query_as::<_, MediaFile>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -369,7 +369,7 @@ impl MediaFile {
         let hash_hex = hex::encode(original_file_hash);
         let account_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, MediaFile>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -419,7 +419,7 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
-        let row = sqlx::query_as::<_, MediaFile>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE media_files
              SET file_path = ?
              WHERE id = ?

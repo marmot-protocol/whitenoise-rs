@@ -90,7 +90,7 @@ impl Draft {
                 source: Box::new(e),
             })?;
 
-        let draft = sqlx::query_as::<_, Draft>(
+        let draft = sqlx::query_as::<_, Self>(
             "INSERT INTO drafts
                  (account_pubkey, mls_group_id, content, reply_to_id,
                   media_attachments, created_at, updated_at)
@@ -123,7 +123,7 @@ impl Draft {
         database: &Database,
     ) -> Result<Option<Self>, WhitenoiseError> {
         let _span = perf_span!("db::draft_find");
-        let draft = sqlx::query_as::<_, Draft>(
+        let draft = sqlx::query_as::<_, Self>(
             "SELECT * FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?",
         )
         .bind(account_pubkey.to_hex())

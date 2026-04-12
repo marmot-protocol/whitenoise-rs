@@ -78,7 +78,7 @@ impl PushRegistration {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let registration = sqlx::query_as::<_, PushRegistration>(
+        let registration = sqlx::query_as::<_, Self>(
             "SELECT *
              FROM push_registrations
              WHERE account_pubkey = ?",
@@ -101,7 +101,7 @@ impl PushRegistration {
     ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
-        let registration = sqlx::query_as::<_, PushRegistration>(
+        let registration = sqlx::query_as::<_, Self>(
             "INSERT INTO push_registrations (
                  account_pubkey,
                  platform,

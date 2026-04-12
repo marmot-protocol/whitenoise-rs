@@ -64,7 +64,7 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
-        let group_information = sqlx::query_as::<_, GroupInformation>(
+        let group_information = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, group_type, created_at, updated_at FROM group_information WHERE mls_group_id = ?",
         )
         .bind(mls_group_id.as_slice())
@@ -143,7 +143,7 @@ impl GroupInformation {
         sep.push_unseparated(")");
 
         let rows = qb
-            .build_query_as::<GroupInformation>()
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await?;
 
@@ -159,7 +159,7 @@ impl GroupInformation {
     ) -> Result<Self, WhitenoiseError> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let group_information = sqlx::query_as::<_, GroupInformation>(
+        let group_information = sqlx::query_as::<_, Self>(
             "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
              VALUES (?, ?, ?, ?)
              RETURNING id, mls_group_id, group_type, created_at, updated_at",

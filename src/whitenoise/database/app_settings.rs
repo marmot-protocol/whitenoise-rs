@@ -51,7 +51,7 @@ impl AppSettings {
         database: &Database,
     ) -> Result<AppSettings, WhitenoiseError> {
         let _span = perf_span!("db::app_settings_find_or_create");
-        match sqlx::query_as::<_, AppSettings>("SELECT * FROM app_settings WHERE id = 1")
+        match sqlx::query_as::<_, Self>("SELECT * FROM app_settings WHERE id = 1")
             .fetch_one(&database.pool)
             .await
         {
