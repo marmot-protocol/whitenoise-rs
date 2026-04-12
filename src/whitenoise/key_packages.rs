@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use base64ct::{Base64, Encoding};
+use mdk_core::key_packages::KeyPackageEventData;
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
@@ -155,14 +156,14 @@ pub(crate) fn filter_key_package_events_for_account(
 impl Whitenoise {
     /// Helper method to create and encode a key package for the given account.
     ///
-    /// Returns `(encoded_content, tags, hash_ref_bytes)` where `hash_ref_bytes`
-    /// is the serialized hash_ref of the key package for lifecycle tracking.
+    /// Returns a [`KeyPackageEventData`] containing the encoded content, tags
+    /// for both event kinds, and the hash_ref for lifecycle tracking.
     #[perf_instrument("key_packages")]
     pub(crate) async fn encoded_key_package(
         &self,
         account: &Account,
         key_package_relays: &[Relay],
-    ) -> Result<(String, Vec<Tag>, Vec<u8>)> {
+    ) -> Result<KeyPackageEventData> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         let key_package_relay_urls = Relay::urls(key_package_relays);
@@ -170,7 +171,7 @@ impl Whitenoise {
             .create_key_package_for_event(&account.pubkey, key_package_relay_urls)
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
 
-        Ok((data.content, data.tags_30443, data.hash_ref))
+        Ok(data)
     }
 
     /// Publishes the MLS key package for the given account to its key package relays.
@@ -188,8 +189,7 @@ impl Whitenoise {
         }
 
         // Create the key package once — retries below only re-publish the same payload
-        let (encoded_key_package, tags, hash_ref) =
-            self.encoded_key_package(account, &relays).await?;
+        let key_package_data = self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
         let signer = self.get_signer_for_account(account)?;
 
@@ -210,16 +210,20 @@ impl Whitenoise {
 
             match self
                 .publish_key_package_to_relays(
-                    &encoded_key_package,
+                    &key_package_data.content,
                     &relay_urls,
-                    &tags,
+                    &key_package_data.tags_443,
                     signer.clone(),
                 )
                 .await
             {
                 Ok(event_id) => {
-                    self.track_published_key_package(account, &hash_ref, &event_id)
-                        .await;
+                    self.track_published_key_package(
+                        account,
+                        &key_package_data.hash_ref,
+                        &event_id,
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -257,18 +261,17 @@ impl Whitenoise {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
-        let (encoded_key_package, tags, hash_ref) =
-            self.encoded_key_package(account, &relays).await?;
+        let key_package_data = self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
         let event_id = self
             .publish_key_package_to_relays(
-                &encoded_key_package,
+                &key_package_data.content,
                 &relay_urls,
-                &tags,
+                &key_package_data.tags_443,
                 std::sync::Arc::new(signer),
             )
             .await?;
-        self.track_published_key_package(account, &hash_ref, &event_id)
+        self.track_published_key_package(account, &key_package_data.hash_ref, &event_id)
             .await;
         Ok(())
     }
@@ -284,14 +287,18 @@ impl Whitenoise {
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let (encoded_key_package, tags, hash_ref) =
-            self.encoded_key_package(account, relays).await?;
+        let key_package_data = self.encoded_key_package(account, relays).await?;
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
         let event_id = self
-            .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+            .publish_key_package_to_relays(
+                &key_package_data.content,
+                &relay_urls,
+                &key_package_data.tags_443,
+                signer,
+            )
             .await?;
-        self.track_published_key_package(account, &hash_ref, &event_id)
+        self.track_published_key_package(account, &key_package_data.hash_ref, &event_id)
             .await;
         Ok(())
     }
@@ -311,8 +318,7 @@ impl Whitenoise {
         account: &Account,
         relays: &[Relay],
     ) -> Result<()> {
-        let (encoded_key_package, tags, hash_ref) =
-            self.encoded_key_package(account, relays).await?;
+        let key_package_data = self.encoded_key_package(account, relays).await?;
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
@@ -331,12 +337,21 @@ impl Whitenoise {
                     }
                 };
                 match wn
-                    .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                    .publish_key_package_to_relays(
+                        &key_package_data.content,
+                        &relay_urls,
+                        &key_package_data.tags_443,
+                        signer,
+                    )
                     .await
                 {
                     Ok(event_id) => {
-                        wn.track_published_key_package(&account, &hash_ref, &event_id)
-                            .await;
+                        wn.track_published_key_package(
+                            &account,
+                            &key_package_data.hash_ref,
+                            &event_id,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -350,12 +365,21 @@ impl Whitenoise {
         } else {
             // Synchronous fallback (unit tests or pre-initialization).
             match self
-                .publish_key_package_to_relays(&encoded_key_package, &relay_urls, &tags, signer)
+                .publish_key_package_to_relays(
+                    &key_package_data.content,
+                    &relay_urls,
+                    &key_package_data.tags_443,
+                    signer,
+                )
                 .await
             {
                 Ok(event_id) => {
-                    self.track_published_key_package(account, &hash_ref, &event_id)
-                        .await;
+                    self.track_published_key_package(
+                        account,
+                        &key_package_data.hash_ref,
+                        &event_id,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(
