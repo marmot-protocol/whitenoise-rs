@@ -190,12 +190,9 @@ impl Whitenoise {
             .map(|mut msg| {
                 msg.delivery_status = Some(DeliveryStatus::Sending);
                 msg
-            })
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to process message: {}", e)))?;
+            })?;
 
-        AggregatedMessage::insert_message(&chat_message, group_id, &self.database)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache message: {}", e)))?;
+        AggregatedMessage::insert_message(&chat_message, group_id, &self.database).await?;
 
         // Emit NewMessage so the UI shows it immediately (optimistic)
         self.message_stream_manager.emit(
@@ -221,9 +218,7 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<()> {
         // Insert the reaction event row
-        AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache reaction: {}", e)))?;
+        AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database).await?;
 
         // Track delivery status for the reaction event (direct insert, not full
         // update_delivery_status which opens a transaction that can contend with
@@ -234,10 +229,7 @@ impl Whitenoise {
             &DeliveryStatus::Sending,
             &self.database,
         )
-        .await
-        .map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to set reaction delivery status: {}", e,))
-        })?;
+        .await?;
 
         // Apply reaction to the target kind-9 message (if e-tag is present and target cached)
         if let Ok(target_id) = Self::extract_reaction_target_id(&mdk_message.tags)
@@ -247,8 +239,7 @@ impl Whitenoise {
             let emoji = emoji_utils::validate_and_normalize_reaction(
                 &mdk_message.content,
                 self.message_aggregator.config().normalize_emoji,
-            )
-            .map_err(|e| WhitenoiseError::Internal(format!("Invalid reaction emoji: {}", e)))?;
+            )?;
 
             reaction_handler::add_reaction_to_message(
                 &mut target,
@@ -290,9 +281,7 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<()> {
         // Insert the deletion event row
-        AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to cache deletion: {}", e)))?;
+        AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database).await?;
 
         // Track delivery status for the deletion event (direct insert, not full
         // update_delivery_status which opens a transaction that can contend with
@@ -303,10 +292,7 @@ impl Whitenoise {
             &DeliveryStatus::Sending,
             &self.database,
         )
-        .await
-        .map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to set deletion delivery status: {}", e,))
-        })?;
+        .await?;
 
         // Capture the last message ID *before* applying deletions so we can
         // detect if the deletion removed it and emit a chat-list update.
@@ -537,32 +523,22 @@ impl Whitenoise {
     ) -> Result<()> {
         // Guard: only retry messages that are in Failed state to prevent duplicate publishes
         let event_id_str = event_id.to_string();
-        let original =
-            match AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database).await {
-                Ok(Some(cached))
-                    if matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_))) =>
-                {
-                    cached
-                }
-                Ok(Some(cached)) => {
-                    return Err(WhitenoiseError::Internal(format!(
-                        "Can only retry messages with Failed delivery status, got {:?}",
-                        cached.delivery_status
-                    )));
-                }
-                Ok(None) => {
-                    return Err(WhitenoiseError::Internal(format!(
-                        "Cannot retry message {}: not found in cache for group",
-                        event_id_str
-                    )));
-                }
-                Err(e) => {
-                    return Err(WhitenoiseError::Internal(format!(
-                        "Cannot retry message {}: failed to query cache: {}",
-                        event_id_str, e
-                    )));
-                }
-            };
+        let original = match AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database)
+            .await?
+        {
+            Some(cached) if matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_))) => {
+                cached
+            }
+            Some(cached) => {
+                return Err(WhitenoiseError::Internal(format!(
+                    "Can only retry messages with Failed delivery status, got {:?}",
+                    cached.delivery_status
+                )));
+            }
+            None => {
+                return Err(WhitenoiseError::MessageNotFound);
+            }
+        };
 
         // Create the new message FIRST — if this fails, the original stays visible as Failed
         // rather than being hidden with no replacement.
@@ -738,9 +714,7 @@ impl Whitenoise {
     ) -> Result<Option<ChatMessage>> {
         Account::find_by_pubkey(pubkey, &self.database).await?;
 
-        AggregatedMessage::find_by_id(message_id, group_id, &self.database)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to read cached message: {}", e)))
+        Ok(AggregatedMessage::find_by_id(message_id, group_id, &self.database).await?)
     }
 
     /// Search messages within a group by content.
@@ -874,11 +848,7 @@ impl Whitenoise {
             return Ok(false);
         }
 
-        let cached_count = AggregatedMessage::count_by_group(group_id, &self.database)
-            .await
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to count cached events: {}", e))
-            })?;
+        let cached_count = AggregatedMessage::count_by_group(group_id, &self.database).await?;
 
         if mdk_messages.len() != cached_count {
             tracing::debug!(
@@ -908,11 +878,8 @@ impl Whitenoise {
             return Ok(());
         }
 
-        let cached_ids = AggregatedMessage::get_all_event_ids_by_group(group_id, &self.database)
-            .await
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to get cached event IDs: {}", e))
-            })?;
+        let cached_ids =
+            AggregatedMessage::get_all_event_ids_by_group(group_id, &self.database).await?;
 
         let new_events: Vec<Message> = mdk_messages
             .into_iter()
@@ -948,14 +915,10 @@ impl Whitenoise {
                 &self.content_parser,
                 media_files,
             )
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Message aggregation failed: {}", e)))?;
+            .await?;
 
         AggregatedMessage::save_events(new_events, processed_messages, group_id, &self.database)
-            .await
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to save events to cache: {}", e))
-            })?;
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::cache",

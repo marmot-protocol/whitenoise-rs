@@ -46,6 +46,7 @@ pub mod secrets_store;
 mod signer;
 pub mod storage;
 mod streaming;
+pub mod streaming_error;
 mod subscriptions;
 pub mod user_search;
 pub mod user_streaming;

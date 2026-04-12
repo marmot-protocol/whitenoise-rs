@@ -20,6 +20,7 @@ use crate::{
     },
 };
 
+pub mod blossom_error;
 mod media;
 mod membership;
 mod publish;

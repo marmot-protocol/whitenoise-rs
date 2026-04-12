@@ -6,8 +6,10 @@ use crate::{
     whitenoise::{
         accounts::{AccountError, LoginError},
         database::DatabaseError,
+        groups::blossom_error::BlossomError,
         message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
+        streaming_error::StreamingError,
     },
 };
 
@@ -143,6 +145,18 @@ pub enum WhitenoiseError {
 
     #[error("Message aggregation error: {0}")]
     MessageAggregation(#[from] ProcessingError),
+
+    #[error("Streaming error: {0}")]
+    Streaming(#[from] StreamingError),
+
+    #[error("Blossom error: {0}")]
+    Blossom(#[from] BlossomError),
+
+    #[error("MDK group image error: {0}")]
+    MdkGroupImage(#[from] mdk_core::extension::GroupImageError),
+
+    #[error("MDK encrypted media error: {0}")]
+    MdkEncryptedMedia(#[from] mdk_core::encrypted_media::EncryptedMediaError),
 
     #[error("Internal error: {0}")]
     Internal(String),

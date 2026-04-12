@@ -25,6 +25,7 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::media_files::{FileMetadata, MediaFile};
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::groups::blossom_error::BlossomError;
 use crate::whitenoise::media_files::MediaFileUpload;
 
 /// Shared HTTP client for Blossom blob downloads.
@@ -243,10 +244,7 @@ impl Whitenoise {
                 &image_data,
                 image_type.mime_type(),
                 &options.unwrap_or_default(),
-            )
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to prepare group image: {}", e))
-            })?;
+            )?;
 
         let blossom_server_url = blossom_server_url.unwrap_or(Self::default_blossom_url());
         let descriptor = Self::upload_encrypted_blob_to_blossom(
@@ -325,16 +323,12 @@ impl Whitenoise {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let media_manager = mdk.media_manager(group_id.clone());
 
-            media_manager
-                .encrypt_for_upload_with_options(
-                    &file_data,
-                    media_detection.mime_type(),
-                    original_filename,
-                    &options.unwrap_or_default(),
-                )
-                .map_err(|e| {
-                    WhitenoiseError::Internal(format!("Failed to encrypt chat media: {}", e))
-                })?
+            media_manager.encrypt_for_upload_with_options(
+                &file_data,
+                media_detection.mime_type(),
+                original_filename,
+                &options.unwrap_or_default(),
+            )?
         };
 
         let blossom_server_url = blossom_server_url.unwrap_or_else(Self::default_blossom_url);
@@ -701,9 +695,7 @@ impl Whitenoise {
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         let secret_key = Secret::new(*image_key);
-        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to derive upload keypair: {}", e))
-        })?;
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2)?;
 
         let upload = MediaFileUpload {
             data: &[],
@@ -927,11 +919,7 @@ impl Whitenoise {
             nonce,
         };
 
-        let decrypted = media_manager
-            .decrypt_from_download(&encrypted_data, &reference)
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to decrypt chat media: {}", e))
-            })?;
+        let decrypted = media_manager.decrypt_from_download(&encrypted_data, &reference)?;
 
         // MIP-04 requires an explicit SHA-256 check on the plaintext after decryption.
         // ChaCha20-Poly1305 authenticates the ciphertext, but does not guarantee the
@@ -963,18 +951,14 @@ impl Whitenoise {
     ) -> Result<MediaFile> {
         let hash_hex = hex::encode(image_hash);
         let filename = format!("{}.{}", hash_hex, image_type.extension());
-        let blossom_url = blossom_server.join(&hash_hex).map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to construct Blossom URL: {}", e))
-        })?;
+        let blossom_url = blossom_server.join(&hash_hex).map_err(BlossomError::from)?;
 
         let mut hasher = Sha256::new();
         hasher.update(decrypted_data);
         let original_hash: [u8; 32] = hasher.finalize().into();
 
         let secret_key = Secret::new(*image_key);
-        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2).map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to derive upload keypair: {}", e))
-        })?;
+        let upload_keypair = group_image::derive_upload_keypair(&secret_key, 2)?;
 
         let upload = MediaFileUpload {
             data: decrypted_data,
@@ -1020,15 +1004,13 @@ impl Whitenoise {
         let auth_event = EventBuilder::blossom_auth(auth)
             .sign(upload_keypair)
             .await
-            .map_err(|e| {
-                WhitenoiseError::Internal(format!("Failed to sign Blossom auth event: {}", e))
-            })?;
+            .map_err(BlossomError::from)?;
         let auth_json = auth_event.as_json();
         let auth_header_value = format!("Nostr {}", Base64::encode_string(auth_json.as_bytes()));
 
         let upload_url = blossom_server_url
             .join("upload")
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to build upload URL: {}", e)))?;
+            .map_err(BlossomError::from)?;
 
         let upload_future = async {
             let response = BLOSSOM_HTTP_CLIENT
@@ -1038,33 +1020,21 @@ impl Whitenoise {
                 .body(encrypted_data)
                 .send()
                 .await
-                .map_err(|e| {
-                    WhitenoiseError::Internal(format!("Upload HTTP request failed: {}", e))
-                })?;
+                .map_err(BlossomError::from)?;
 
             if !response.status().is_success() {
-                return Err(WhitenoiseError::Internal(format!(
-                    "Upload failed with status {}",
-                    response.status()
-                )));
+                return Err(BlossomError::UploadStatus(response.status()).into());
             }
 
             response
                 .json::<nostr_blossom::bud02::BlobDescriptor>()
                 .await
-                .map_err(|e| {
-                    WhitenoiseError::Internal(format!("Failed to parse upload response: {}", e))
-                })
+                .map_err(|e| WhitenoiseError::from(BlossomError::ResponseBody(e)))
         };
 
         let descriptor = tokio::time::timeout(Self::BLOSSOM_TIMEOUT, upload_future)
             .await
-            .map_err(|_| {
-                WhitenoiseError::Internal(format!(
-                    "Upload timed out after {} seconds",
-                    Self::BLOSSOM_TIMEOUT.as_secs()
-                ))
-            })??;
+            .map_err(|_| BlossomError::Timeout(Self::BLOSSOM_TIMEOUT))??;
 
         Self::require_https(&descriptor.url)?;
 

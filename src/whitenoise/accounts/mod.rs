@@ -18,6 +18,7 @@ use crate::nostr_manager::NostrManagerError;
 use crate::perf_instrument;
 use crate::types::ImageType;
 use crate::whitenoise::error::Result;
+use crate::whitenoise::groups::blossom_error::BlossomError;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::secrets_store::SecretsStoreError;
 use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
@@ -539,13 +540,8 @@ impl Account {
 
         let descriptor = tokio::time::timeout(Whitenoise::BLOSSOM_TIMEOUT, upload_future)
             .await
-            .map_err(|_| {
-                WhitenoiseError::Internal(format!(
-                    "Upload timed out after {} seconds",
-                    Whitenoise::BLOSSOM_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|err| WhitenoiseError::Internal(err.to_string()))?;
+            .map_err(|_| BlossomError::Timeout(Whitenoise::BLOSSOM_TIMEOUT))?
+            .map_err(BlossomError::client)?;
 
         Whitenoise::require_https(&descriptor.url)?;
 
