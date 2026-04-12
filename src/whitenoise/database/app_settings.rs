@@ -36,7 +36,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(AppSettings {
+        Ok(Self {
             id,
             theme_mode,
             language,

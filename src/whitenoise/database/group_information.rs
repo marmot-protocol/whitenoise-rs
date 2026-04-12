@@ -34,7 +34,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(GroupInformation {
+        Ok(Self {
             id: Some(id),
             mls_group_id,
             group_type,

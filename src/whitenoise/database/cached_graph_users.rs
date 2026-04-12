@@ -97,7 +97,7 @@ where
             })
             .transpose()?;
 
-        Ok(CachedGraphUser {
+        Ok(Self {
             id: Some(id),
             pubkey,
             metadata,

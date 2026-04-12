@@ -30,7 +30,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(AccountSettings {
+        Ok(Self {
             id: Some(id),
             account_pubkey,
             notifications_enabled,

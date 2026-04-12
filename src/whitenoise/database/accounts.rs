@@ -47,7 +47,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(Account {
+        Ok(Self {
             id: Some(id),
             pubkey,
             user_id,

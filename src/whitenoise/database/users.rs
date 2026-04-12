@@ -44,7 +44,7 @@ where
         let metadata_known_at = parse_optional_timestamp(row, "metadata_known_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(User {
+        Ok(Self {
             id: Some(id),
             pubkey,
             metadata,

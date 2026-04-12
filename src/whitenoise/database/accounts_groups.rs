@@ -92,7 +92,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(AccountGroup {
+        Ok(Self {
             id: Some(id),
             account_pubkey,
             mls_group_id,

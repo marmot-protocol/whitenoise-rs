@@ -43,7 +43,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(UserRelay {
+        Ok(Self {
             user_id,
             relay_id,
             relay_type,

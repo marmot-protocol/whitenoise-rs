@@ -38,7 +38,7 @@ where
         let key_material_deleted: bool = row.try_get("key_material_deleted")?;
         let created_at: i64 = row.try_get("created_at")?;
 
-        Ok(PublishedKeyPackage {
+        Ok(Self {
             id,
             account_pubkey,
             key_package_hash_ref,
