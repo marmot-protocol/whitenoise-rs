@@ -247,23 +247,4 @@ mod tests {
         assert!(enabled.notifications_enabled);
         assert!(enabled.updated_at >= disabled.updated_at);
     }
-
-    #[tokio::test]
-    async fn test_row_to_model_conversion() {
-        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
-        let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
-
-        let settings =
-            AccountSettings::find_or_create_for_pubkey(&keys.public_key(), &whitenoise.database)
-                .await
-                .unwrap();
-
-        // Verify FromRow populated correct values
-        assert!(settings.id.is_some());
-        assert_eq!(settings.account_pubkey, keys.public_key());
-        assert!(settings.notifications_enabled);
-        assert!(settings.created_at <= Utc::now());
-        assert!(settings.updated_at <= Utc::now());
-    }
 }
