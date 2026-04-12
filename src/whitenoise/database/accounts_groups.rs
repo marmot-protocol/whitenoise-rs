@@ -9,27 +9,7 @@ use super::{
 use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 
-/// Internal database row representation for accounts_groups table
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct AccountGroupRow {
-    id: i64,
-    account_pubkey: PublicKey,
-    mls_group_id: GroupId,
-    user_confirmation: Option<bool>,
-    welcomer_pubkey: Option<PublicKey>,
-    last_read_message_id: Option<EventId>,
-    pin_order: Option<i64>,
-    dm_peer_pubkey: Option<PublicKey>,
-    archived_at: Option<DateTime<Utc>>,
-    removed_at: Option<DateTime<Utc>>,
-    self_removed: bool,
-    muted_until: Option<DateTime<Utc>>,
-    chat_cleared_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for AccountGroupRow
+impl<'r, R> sqlx::FromRow<'r, R> for AccountGroup
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -112,8 +92,8 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(Self {
-            id,
+        Ok(AccountGroup {
+            id: Some(id),
             account_pubkey,
             mls_group_id,
             user_confirmation,
@@ -132,28 +112,6 @@ where
     }
 }
 
-impl From<AccountGroupRow> for AccountGroup {
-    fn from(row: AccountGroupRow) -> Self {
-        Self {
-            id: Some(row.id),
-            account_pubkey: row.account_pubkey,
-            mls_group_id: row.mls_group_id,
-            user_confirmation: row.user_confirmation,
-            welcomer_pubkey: row.welcomer_pubkey,
-            last_read_message_id: row.last_read_message_id,
-            pin_order: row.pin_order,
-            dm_peer_pubkey: row.dm_peer_pubkey,
-            archived_at: row.archived_at,
-            removed_at: row.removed_at,
-            self_removed: row.self_removed,
-            muted_until: row.muted_until,
-            chat_cleared_at: row.chat_cleared_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
-
 impl AccountGroup {
     /// Finds an AccountGroup by account pubkey and MLS group ID.
     #[perf_instrument("db::accounts_groups")]
@@ -162,7 +120,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ? AND mls_group_id = ?",
@@ -172,7 +130,7 @@ impl AccountGroup {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row)
     }
 
     /// Finds or creates an AccountGroup for the given account and group.
@@ -212,7 +170,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroupRow>(
+        let rows = sqlx::query_as::<_, AccountGroup>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ?
@@ -222,7 +180,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Finds all pending AccountGroups for a given account.
@@ -232,7 +190,7 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroupRow>(
+        let rows = sqlx::query_as::<_, AccountGroup>(
             "SELECT *
              FROM accounts_groups
              WHERE account_pubkey = ?
@@ -243,7 +201,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Finds all AccountGroups for a specific MLS group.
@@ -252,7 +210,7 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, AccountGroupRow>(
+        let rows = sqlx::query_as::<_, AccountGroup>(
             "SELECT *
              FROM accounts_groups
              WHERE mls_group_id = ?",
@@ -261,7 +219,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
@@ -276,7 +234,7 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
         let confirmation_int: i64 = if user_confirmation { 1 } else { 0 };
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET user_confirmation = ?, updated_at = ?
              WHERE id = ?
@@ -288,7 +246,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Saves the AccountGroup to the database (upsert).
@@ -299,7 +257,7 @@ impl AccountGroup {
     pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, dm_peer_pubkey, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
@@ -333,7 +291,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Updates the pin_order for this AccountGroup.
@@ -346,7 +304,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET pin_order = ?, updated_at = ?
              WHERE id = ?
@@ -358,7 +316,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Updates the archived_at timestamp for this AccountGroup.
@@ -371,7 +329,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET archived_at = ?, updated_at = ?
              WHERE id = ?
@@ -383,7 +341,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Updates the muted_until timestamp for this AccountGroup.
@@ -399,7 +357,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET muted_until = ?, updated_at = ?
              WHERE id = ?
@@ -411,7 +369,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Updates the chat_cleared_at timestamp for this AccountGroup.
@@ -427,7 +385,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, updated_at = ?
              WHERE id = ?
@@ -439,7 +397,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Clears the last_read_message_id for this AccountGroup.
@@ -451,7 +409,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -462,7 +420,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Sets `chat_cleared_at` and resets `last_read_message_id` in a single atomic write.
@@ -479,7 +437,7 @@ impl AccountGroup {
         let now_ms = Utc::now().timestamp_millis();
         let cleared_ms = chat_cleared_at.timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -491,7 +449,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Clears `muted_until` for all rows whose mute has expired.
@@ -501,7 +459,7 @@ impl AccountGroup {
     pub(crate) async fn clear_expired_mutes(database: &Database) -> Result<Vec<Self>, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let rows = sqlx::query_as::<_, AccountGroupRow>(
+        let rows = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET muted_until = NULL, updated_at = ?
              WHERE muted_until IS NOT NULL AND muted_until <= ?
@@ -512,7 +470,7 @@ impl AccountGroup {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        Ok(rows)
     }
 
     /// Atomically marks this AccountGroup as voluntarily departed
@@ -529,7 +487,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET removed_at = ?, self_removed = 1, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -541,7 +499,7 @@ impl AccountGroup {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row)
     }
 
     /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
@@ -555,7 +513,7 @@ impl AccountGroup {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET removed_at = ?, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -567,7 +525,7 @@ impl AccountGroup {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row)
     }
 
     /// Atomically updates last_read_message_id only if the new message is newer.
@@ -590,7 +548,7 @@ impl AccountGroup {
         // Atomic compare-and-update: only update if the new message is newer
         // than the current read marker. Uses a subquery to get the current
         // marker's timestamp from aggregated_messages, scoped to the same group.
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "UPDATE accounts_groups
              SET last_read_message_id = ?, updated_at = ?
              WHERE id = ?
@@ -612,7 +570,7 @@ impl AccountGroup {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(Into::into))
+        Ok(row)
     }
 
     /// Finds the most recently created visible DM group between an account and a peer.
@@ -745,7 +703,7 @@ impl AccountGroup {
     ) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, AccountGroupRow>(
+        let row = sqlx::query_as::<_, AccountGroup>(
             "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, dm_peer_pubkey, created_at, updated_at)
              VALUES (?, ?, NULL, ?, ?, ?, ?)
              RETURNING *",
@@ -759,7 +717,7 @@ impl AccountGroup {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(row)
     }
 }
 

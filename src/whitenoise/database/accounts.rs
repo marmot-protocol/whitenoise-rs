@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use nostr_sdk::PublicKey;
 use sqlx::Row;
 use std::collections::HashSet;
@@ -9,30 +9,11 @@ use crate::{
     WhitenoiseError, perf_instrument,
     whitenoise::{
         accounts::{Account, AccountType},
-        database::users::UserRow,
         users::User,
     },
 };
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct AccountRow {
-    // id is the primary key
-    id: i64,
-    // pubkey is the hex encoded nostr public key
-    pubkey: PublicKey,
-    // user_id is the foreign key to the users table
-    user_id: i64,
-    // account_type is 'local' or 'external' (for external signer accounts)
-    account_type: AccountType,
-    // last_synced_at is the timestamp of the last sync (using the background fetch)
-    last_synced_at: Option<DateTime<Utc>>,
-    // created_at is the timestamp of the account creation
-    created_at: DateTime<Utc>,
-    // updated_at is the timestamp of the last update
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for AccountRow
+impl<'r, R> sqlx::FromRow<'r, R> for Account
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -66,29 +47,14 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(AccountRow {
-            id,
+        Ok(Account {
+            id: Some(id),
             pubkey,
             user_id,
             account_type,
             last_synced_at,
             created_at,
             updated_at,
-        })
-    }
-}
-
-impl AccountRow {
-    /// Converts an AccountRow to an Account by creating the required NostrMls instance.
-    pub(crate) fn into_account(self) -> Result<Account, WhitenoiseError> {
-        Ok(Account {
-            id: Some(self.id),
-            pubkey: self.pubkey,
-            user_id: self.user_id,
-            account_type: self.account_type,
-            last_synced_at: self.last_synced_at,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
         })
     }
 }
@@ -109,15 +75,12 @@ impl Account {
     /// Returns a [`WhitenoiseError`] if the database query fails.
     #[perf_instrument("db::accounts")]
     pub(crate) async fn all(database: &Database) -> Result<Vec<Account>, WhitenoiseError> {
-        let account_rows = sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts")
+        let accounts = sqlx::query_as::<_, Account>("SELECT * FROM accounts")
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        account_rows
-            .into_iter()
-            .map(|row| row.into_account())
-            .collect::<Result<Vec<Account>, WhitenoiseError>>()
+        Ok(accounts)
     }
 
     /// Gets the oldest account from the database.
@@ -137,14 +100,14 @@ impl Account {
     /// Test-only: production code resolves accounts explicitly by pubkey.
     #[cfg(test)]
     pub(crate) async fn first(database: &Database) -> Result<Option<Account>, WhitenoiseError> {
-        let row_opt = sqlx::query_as::<_, AccountRow>(
+        let account = sqlx::query_as::<_, Account>(
             "SELECT * FROM accounts ORDER BY created_at ASC, id ASC LIMIT 1",
         )
         .fetch_optional(&database.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        row_opt.map(|row| row.into_account()).transpose()
+        Ok(account)
     }
 
     /// Finds an account by its public key.
@@ -166,25 +129,16 @@ impl Account {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Account, WhitenoiseError> {
-        let account_row =
-            sqlx::query_as::<_, AccountRow>("SELECT * FROM accounts WHERE pubkey = ?")
-                .bind(pubkey.to_hex().as_str())
-                .fetch_one(&database.pool)
-                .await
-                .map_err(|e| match e {
-                    sqlx::Error::RowNotFound => WhitenoiseError::AccountNotFound,
-                    other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
-                })?;
+        let account = sqlx::query_as::<_, Account>("SELECT * FROM accounts WHERE pubkey = ?")
+            .bind(pubkey.to_hex().as_str())
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::RowNotFound => WhitenoiseError::AccountNotFound,
+                other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
+            })?;
 
-        Ok(Account {
-            id: Some(account_row.id),
-            user_id: account_row.user_id,
-            pubkey: account_row.pubkey,
-            account_type: account_row.account_type,
-            last_synced_at: account_row.last_synced_at,
-            created_at: account_row.created_at,
-            updated_at: account_row.updated_at,
-        })
+        Ok(account)
     }
 
     /// Gets the user associated with this account.
@@ -202,7 +156,7 @@ impl Account {
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the associated user is not found.
     #[perf_instrument("db::accounts")]
     pub(crate) async fn user(&self, database: &Database) -> Result<User, WhitenoiseError> {
-        let user_row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = ?")
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(self.user_id)
             .fetch_one(&database.pool)
             .await
@@ -210,7 +164,7 @@ impl Account {
                 sqlx::Error::RowNotFound => WhitenoiseError::MissingUserReference,
                 other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
             })?;
-        Ok(user_row.into())
+        Ok(user)
     }
 
     /// Gets all users that this account follows.
@@ -228,7 +182,7 @@ impl Account {
     /// Returns a [`WhitenoiseError::AccountNotFound`] if the database query fails.
     #[perf_instrument("db::accounts")]
     pub(crate) async fn follows(&self, database: &Database) -> Result<Vec<User>, WhitenoiseError> {
-        let user_rows = sqlx::query_as::<_, UserRow>(
+        let users = sqlx::query_as::<_, User>(
             "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.metadata_known_at, u.updated_at
              FROM account_follows af
              JOIN users u ON af.user_id = u.id
@@ -238,18 +192,6 @@ impl Account {
         .fetch_all(&database.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
-
-        let users = user_rows
-            .into_iter()
-            .map(|row| User {
-                id: Some(row.id),
-                pubkey: row.pubkey,
-                metadata: row.metadata,
-                created_at: row.created_at,
-                metadata_known_at: row.metadata_known_at,
-                updated_at: row.updated_at,
-            })
-            .collect();
 
         Ok(users)
     }
@@ -440,7 +382,7 @@ impl Account {
     ///
     /// Returns a [`WhitenoiseError`] if the database operation fails.
     pub(crate) async fn save(&self, database: &Database) -> Result<Account, WhitenoiseError> {
-        let account_row = sqlx::query_as::<_, AccountRow>(
+        let account = sqlx::query_as::<_, Account>(
             "INSERT INTO accounts (pubkey, user_id, account_type, last_synced_at, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE
@@ -461,7 +403,7 @@ impl Account {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        account_row.into_account()
+        Ok(account)
     }
 
     /// Deletes this account from the database.
@@ -626,7 +568,7 @@ mod tests {
             .await
             .unwrap();
 
-        let account_row = AccountRow::from_row(&row).unwrap();
+        let account_row = Account::from_row(&row).unwrap();
 
         assert_eq!(account_row.pubkey, test_pubkey);
         assert_eq!(account_row.user_id, test_user_id);
@@ -665,7 +607,7 @@ mod tests {
             .await
             .unwrap();
 
-        let account_row = AccountRow::from_row(&row).unwrap();
+        let account_row = Account::from_row(&row).unwrap();
 
         assert_eq!(account_row.pubkey, test_pubkey);
         assert_eq!(account_row.user_id, test_user_id);
@@ -709,7 +651,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = AccountRow::from_row(&row);
+            let result = Account::from_row(&row);
             assert!(result.is_err());
 
             if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -755,7 +697,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AccountRow::from_row(&row);
+        let result = Account::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -788,7 +730,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AccountRow::from_row(&row);
+        let result = Account::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -821,7 +763,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AccountRow::from_row(&row);
+        let result = Account::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {

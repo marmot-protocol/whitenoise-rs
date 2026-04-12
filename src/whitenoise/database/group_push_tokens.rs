@@ -1,9 +1,8 @@
 //! Database operations for cached per-group push tokens.
 
-use core::fmt;
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{PublicKey, RelayUrl};
 
@@ -11,35 +10,7 @@ use super::{Database, utils::parse_timestamp};
 use crate::perf_instrument;
 use crate::whitenoise::push_notifications::GroupPushToken;
 
-struct GroupPushTokenRow {
-    account_pubkey: PublicKey,
-    mls_group_id: GroupId,
-    member_pubkey: PublicKey,
-    leaf_index: u32,
-    server_pubkey: PublicKey,
-    relay_hint: Option<RelayUrl>,
-    encrypted_token: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl fmt::Debug for GroupPushTokenRow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GroupPushTokenRow")
-            .field("account_pubkey", &self.account_pubkey)
-            .field("mls_group_id", &self.mls_group_id)
-            .field("member_pubkey", &self.member_pubkey)
-            .field("leaf_index", &self.leaf_index)
-            .field("server_pubkey", &self.server_pubkey)
-            .field("relay_hint", &self.relay_hint)
-            .field("encrypted_token", &"<redacted>")
-            .field("created_at", &self.created_at)
-            .field("updated_at", &self.updated_at)
-            .finish()
-    }
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for GroupPushTokenRow
+impl<'r, R> sqlx::FromRow<'r, R> for GroupPushToken
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -108,22 +79,6 @@ where
     }
 }
 
-impl From<GroupPushTokenRow> for GroupPushToken {
-    fn from(row: GroupPushTokenRow) -> Self {
-        Self {
-            account_pubkey: row.account_pubkey,
-            mls_group_id: row.mls_group_id,
-            member_pubkey: row.member_pubkey,
-            leaf_index: row.leaf_index,
-            server_pubkey: row.server_pubkey,
-            relay_hint: row.relay_hint,
-            encrypted_token: row.encrypted_token,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
-    }
-}
-
 impl GroupPushToken {
     #[perf_instrument("db::group_push_tokens")]
     pub(crate) async fn upsert(
@@ -138,7 +93,7 @@ impl GroupPushToken {
     ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, GroupPushTokenRow>(
+        let token = sqlx::query_as::<_, GroupPushToken>(
             "INSERT INTO group_push_tokens (
                  account_pubkey,
                  mls_group_id,
@@ -171,7 +126,7 @@ impl GroupPushToken {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(token)
     }
 
     #[perf_instrument("db::group_push_tokens")]
@@ -220,7 +175,7 @@ impl GroupPushToken {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, GroupPushTokenRow>(
+        let tokens = sqlx::query_as::<_, GroupPushToken>(
             "SELECT *
              FROM group_push_tokens
              WHERE account_pubkey = ? AND mls_group_id = ?
@@ -231,7 +186,7 @@ impl GroupPushToken {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(tokens)
     }
 
     #[perf_instrument("db::group_push_tokens")]
@@ -314,6 +269,7 @@ impl GroupPushToken {
 
 #[cfg(test)]
 mod tests {
+    use chrono::DateTime;
     use nostr_sdk::{Keys, RelayUrl};
 
     use super::*;
@@ -660,8 +616,8 @@ mod tests {
     }
 
     #[test]
-    fn test_group_push_token_row_debug_redacts_encrypted_token() {
-        let row = GroupPushTokenRow {
+    fn test_group_push_token_debug_redacts_encrypted_token() {
+        let token = GroupPushToken {
             account_pubkey: Keys::generate().public_key(),
             mls_group_id: make_group_id(55),
             member_pubkey: Keys::generate().public_key(),
@@ -673,7 +629,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let debug_output = format!("{row:?}");
+        let debug_output = format!("{token:?}");
 
         assert!(debug_output.contains("<redacted>"));
         assert!(!debug_output.contains("ciphertext-value"));

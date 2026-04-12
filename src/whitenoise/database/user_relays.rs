@@ -1,10 +1,14 @@
+#[cfg(test)]
 use chrono::{DateTime, Utc};
 
+#[cfg(test)]
 use super::utils::parse_timestamp;
+#[cfg(test)]
 use crate::whitenoise::relays::RelayType;
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct UserRelayRow {
+pub(crate) struct UserRelay {
     // user_id is the ID of the user
     pub user_id: i64,
     // relay_id is the ID of the relay
@@ -17,7 +21,8 @@ pub struct UserRelayRow {
     pub updated_at: DateTime<Utc>,
 }
 
-impl<'r, R> sqlx::FromRow<'r, R> for UserRelayRow
+#[cfg(test)]
+impl<'r, R> sqlx::FromRow<'r, R> for UserRelay
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -38,7 +43,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(UserRelayRow {
+        Ok(UserRelay {
             user_id,
             relay_id,
             relay_type,
@@ -110,7 +115,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
 
         assert_eq!(user_relay_row.user_id, test_user_id);
         assert_eq!(user_relay_row.relay_id, test_relay_id);
@@ -159,7 +164,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+            let user_relay_row = UserRelay::from_row(&row).unwrap();
 
             assert_eq!(user_relay_row.user_id, test_user_id);
             assert_eq!(user_relay_row.relay_id, test_relay_id);
@@ -200,7 +205,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let result = UserRelayRow::from_row(&row);
+        let result = UserRelay::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -237,7 +242,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let result = UserRelayRow::from_row(&row);
+        let result = UserRelay::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -273,7 +278,7 @@ mod tests {
             .await
             .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
         assert_eq!(user_relay_row.created_at.timestamp_millis(), 0);
         assert_eq!(user_relay_row.updated_at.timestamp_millis(), 0);
         assert_eq!(user_relay_row.relay_type, RelayType::Inbox);
@@ -305,7 +310,7 @@ mod tests {
             .await
             .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
         assert_eq!(
             user_relay_row.created_at.timestamp_millis(),
             future_timestamp
@@ -346,7 +351,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
 
         assert_eq!(user_relay_row.user_id, test_user_id);
         assert_eq!(user_relay_row.relay_id, test_relay_id);
@@ -385,7 +390,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
 
         assert_eq!(user_relay_row.user_id, test_user_id);
         assert_eq!(user_relay_row.relay_id, test_relay_id);
@@ -397,7 +402,7 @@ mod tests {
     #[test]
     fn test_user_relay_row_debug_and_clone() {
         let timestamp = chrono::Utc::now();
-        let user_relay_row = UserRelayRow {
+        let user_relay_row = UserRelay {
             user_id: 1,
             relay_id: 42,
             relay_type: RelayType::Inbox,
@@ -407,7 +412,7 @@ mod tests {
 
         // Test debug formatting doesn't panic
         let debug_str = format!("{:?}", user_relay_row);
-        assert!(debug_str.contains("UserRelayRow"));
+        assert!(debug_str.contains("UserRelay"));
         assert!(debug_str.contains("Inbox"));
 
         // Test clone
@@ -450,7 +455,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let result = UserRelayRow::from_row(&row);
+        let result = UserRelay::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {

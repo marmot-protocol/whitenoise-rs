@@ -9,21 +9,7 @@ use crate::{
     whitenoise::cached_graph_user::{CachedGraphUser, DEFAULT_CACHE_TTL_HOURS},
 };
 
-/// Internal row type for database mapping.
-#[derive(Debug)]
-struct CachedGraphUserRow {
-    id: i64,
-    pubkey: PublicKey,
-    metadata: Option<Metadata>,
-    follows: Option<Vec<PublicKey>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    metadata_updated_at: Option<DateTime<Utc>>,
-    metadata_expires_at: Option<DateTime<Utc>>,
-    follows_updated_at: Option<DateTime<Utc>>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for CachedGraphUserRow
+impl<'r, R> sqlx::FromRow<'r, R> for CachedGraphUser
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -111,8 +97,8 @@ where
             })
             .transpose()?;
 
-        Ok(Self {
-            id,
+        Ok(CachedGraphUser {
+            id: Some(id),
             pubkey,
             metadata,
             follows,
@@ -122,22 +108,6 @@ where
             metadata_expires_at,
             follows_updated_at,
         })
-    }
-}
-
-impl From<CachedGraphUserRow> for CachedGraphUser {
-    fn from(row: CachedGraphUserRow) -> Self {
-        Self {
-            id: Some(row.id),
-            pubkey: row.pubkey,
-            metadata: row.metadata,
-            follows: row.follows,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            metadata_updated_at: row.metadata_updated_at,
-            metadata_expires_at: row.metadata_expires_at,
-            follows_updated_at: row.follows_updated_at,
-        }
     }
 }
 
@@ -169,12 +139,12 @@ impl CachedGraphUser {
         qb.push_bind(now);
 
         let rows = qb
-            .build_query_as::<CachedGraphUserRow>()
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        Ok(rows.into_iter().map(Self::from).collect())
+        Ok(rows)
     }
 
     /// Find cached users with fresh follows by pubkeys.
@@ -225,12 +195,12 @@ impl CachedGraphUser {
         qb.push_bind(cutoff);
 
         let rows = qb
-            .build_query_as::<CachedGraphUserRow>()
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        Ok(rows.into_iter().map(Self::from).collect())
+        Ok(rows)
     }
 
     /// Find fresh cached users by pubkeys using general `updated_at` timestamp.
@@ -276,7 +246,7 @@ impl CachedGraphUser {
         let metadata_expires_at = self.metadata_expires_at.map(|dt| dt.timestamp_millis());
         let follows_updated_at = self.follows.as_ref().map(|_| now);
 
-        let row = sqlx::query_as::<_, CachedGraphUserRow>(
+        let row = sqlx::query_as::<_, Self>(
             "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, metadata_expires_at, follows_updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
@@ -300,7 +270,7 @@ impl CachedGraphUser {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Upsert only metadata, preserving existing follows.
@@ -324,7 +294,7 @@ impl CachedGraphUser {
         let now = Utc::now().timestamp_millis();
         let expires_at = now + ttl_ms;
 
-        let row = sqlx::query_as::<_, CachedGraphUserRow>(
+        let row = sqlx::query_as::<_, Self>(
             "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, metadata_expires_at, follows_updated_at)
              VALUES (?, ?, NULL, ?, ?, ?, ?, NULL)
              ON CONFLICT(pubkey) DO UPDATE SET
@@ -344,7 +314,7 @@ impl CachedGraphUser {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Upsert only follows, preserving existing metadata.
@@ -363,7 +333,7 @@ impl CachedGraphUser {
             serde_json::to_string(&follows_hex).map_err(DatabaseError::Serialization)?;
         let now = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, CachedGraphUserRow>(
+        let row = sqlx::query_as::<_, Self>(
             "INSERT INTO cached_graph_users (pubkey, metadata, follows, created_at, updated_at, metadata_updated_at, follows_updated_at)
              VALUES (?, NULL, ?, ?, ?, NULL, ?)
              ON CONFLICT(pubkey) DO UPDATE SET
@@ -381,7 +351,7 @@ impl CachedGraphUser {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Remove stale cache entries using default TTL (24 hours).

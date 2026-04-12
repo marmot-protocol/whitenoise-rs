@@ -1,6 +1,6 @@
 //! Database operations for message drafts.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 
@@ -10,20 +10,7 @@ use crate::whitenoise::drafts::Draft;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::media_files::MediaFile;
 
-/// Internal database row representation for the drafts table.
-#[derive(Debug)]
-struct DraftRow {
-    id: i64,
-    account_pubkey: PublicKey,
-    mls_group_id: GroupId,
-    content: String,
-    reply_to_id: Option<EventId>,
-    media_attachments: Vec<MediaFile>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for DraftRow
+impl<'r, R> sqlx::FromRow<'r, R> for Draft
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -31,7 +18,7 @@ where
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
-    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let id: i64 = row.try_get("id")?;
 
         let account_pubkey_str: String = row.try_get("account_pubkey")?;
@@ -67,8 +54,8 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(Self {
-            id,
+        Ok(Draft {
+            id: Some(id),
             account_pubkey,
             mls_group_id,
             content,
@@ -77,21 +64,6 @@ where
             created_at,
             updated_at,
         })
-    }
-}
-
-impl From<DraftRow> for Draft {
-    fn from(row: DraftRow) -> Self {
-        Self {
-            id: Some(row.id),
-            account_pubkey: row.account_pubkey,
-            mls_group_id: row.mls_group_id,
-            content: row.content,
-            reply_to_id: row.reply_to_id,
-            media_attachments: row.media_attachments,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
     }
 }
 
@@ -118,7 +90,7 @@ impl Draft {
                 source: Box::new(e),
             })?;
 
-        let row = sqlx::query_as::<_, DraftRow>(
+        let draft = sqlx::query_as::<_, Draft>(
             "INSERT INTO drafts
                  (account_pubkey, mls_group_id, content, reply_to_id,
                   media_attachments, created_at, updated_at)
@@ -141,7 +113,7 @@ impl Draft {
         .await
         .map_err(DatabaseError::from)?;
 
-        Ok(row.into())
+        Ok(draft)
     }
 
     /// Fetches the draft for (account, group), returning `None` if absent.
@@ -151,7 +123,7 @@ impl Draft {
         database: &Database,
     ) -> Result<Option<Self>, WhitenoiseError> {
         let _span = perf_span!("db::draft_find");
-        let row = sqlx::query_as::<_, DraftRow>(
+        let draft = sqlx::query_as::<_, Draft>(
             "SELECT * FROM drafts WHERE account_pubkey = ? AND mls_group_id = ?",
         )
         .bind(account_pubkey.to_hex())
@@ -160,7 +132,7 @@ impl Draft {
         .await
         .map_err(DatabaseError::from)?;
 
-        Ok(row.map(Into::into))
+        Ok(draft)
     }
 
     /// Deletes the draft for (account, group). A no-op if no draft exists.

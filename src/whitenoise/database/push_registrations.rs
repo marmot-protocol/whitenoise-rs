@@ -1,9 +1,8 @@
 //! Database operations for local push registrations.
 
-use core::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::{
@@ -13,33 +12,7 @@ use super::{
 use crate::perf_instrument;
 use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 
-struct PushRegistrationRow {
-    account_pubkey: PublicKey,
-    platform: PushPlatform,
-    raw_token: String,
-    server_pubkey: PublicKey,
-    relay_hint: Option<RelayUrl>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    last_shared_at: Option<DateTime<Utc>>,
-}
-
-impl fmt::Debug for PushRegistrationRow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PushRegistrationRow")
-            .field("account_pubkey", &self.account_pubkey)
-            .field("platform", &self.platform)
-            .field("raw_token", &"<redacted>")
-            .field("server_pubkey", &self.server_pubkey)
-            .field("relay_hint", &self.relay_hint)
-            .field("created_at", &self.created_at)
-            .field("updated_at", &self.updated_at)
-            .field("last_shared_at", &self.last_shared_at)
-            .finish()
-    }
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for PushRegistrationRow
+impl<'r, R> sqlx::FromRow<'r, R> for PushRegistration
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -48,7 +21,7 @@ where
     Option<String>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
-    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let account_pubkey_str: String = row.try_get("account_pubkey")?;
         let account_pubkey =
             PublicKey::parse(&account_pubkey_str).map_err(|error| sqlx::Error::ColumnDecode {
@@ -99,28 +72,13 @@ where
     }
 }
 
-impl From<PushRegistrationRow> for PushRegistration {
-    fn from(row: PushRegistrationRow) -> Self {
-        Self {
-            account_pubkey: row.account_pubkey,
-            platform: row.platform,
-            raw_token: row.raw_token,
-            server_pubkey: row.server_pubkey,
-            relay_hint: row.relay_hint,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            last_shared_at: row.last_shared_at,
-        }
-    }
-}
-
 impl PushRegistration {
     #[perf_instrument("db::push_registrations")]
     pub(crate) async fn find_by_account_pubkey(
         account_pubkey: &PublicKey,
         database: &Database,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let row = sqlx::query_as::<_, PushRegistrationRow>(
+        let registration = sqlx::query_as::<_, PushRegistration>(
             "SELECT *
              FROM push_registrations
              WHERE account_pubkey = ?",
@@ -129,7 +87,7 @@ impl PushRegistration {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(Into::into))
+        Ok(registration)
     }
 
     #[perf_instrument("db::push_registrations")]
@@ -143,7 +101,7 @@ impl PushRegistration {
     ) -> Result<Self, sqlx::Error> {
         let now = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, PushRegistrationRow>(
+        let registration = sqlx::query_as::<_, PushRegistration>(
             "INSERT INTO push_registrations (
                  account_pubkey,
                  platform,
@@ -188,7 +146,7 @@ impl PushRegistration {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(registration)
     }
 
     #[perf_instrument("db::push_registrations")]
@@ -446,24 +404,5 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, sqlx::Error::Database(_)));
-    }
-
-    #[test]
-    fn test_push_registration_row_debug_redacts_raw_token() {
-        let row = PushRegistrationRow {
-            account_pubkey: Keys::generate().public_key(),
-            platform: PushPlatform::Apns,
-            raw_token: "super-secret-token".to_string(),
-            server_pubkey: Keys::generate().public_key(),
-            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_shared_at: None,
-        };
-
-        let debug_output = format!("{row:?}");
-
-        assert!(debug_output.contains("<redacted>"));
-        assert!(!debug_output.contains("super-secret-token"));
     }
 }
