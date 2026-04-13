@@ -56,8 +56,7 @@ impl Whitenoise {
 
     #[perf_instrument("event_handlers")]
     async fn acquire_contact_list_guard(&self, account: &Account) -> Result<OwnedSemaphorePermit> {
-        let semaphore = self
-            .account_manager
+        self.account_manager
             .get_session(&account.pubkey)
             .ok_or_else(|| {
                 WhitenoiseError::ContactList(format!(
@@ -65,14 +64,8 @@ impl Whitenoise {
                     account.pubkey.to_hex()
                 ))
             })?
-            .contact_list_guard
-            .clone();
-
-        semaphore.acquire_owned().await.map_err(|_| {
-            WhitenoiseError::ContactList(
-                "Failed to acquire contact list processing permit".to_string(),
-            )
-        })
+            .acquire_contact_list_permit()
+            .await
     }
 
     #[perf_instrument("event_handlers")]
@@ -129,7 +122,7 @@ impl Whitenoise {
         let cancel_rx = self
             .account_manager
             .get_session(account_pubkey)
-            .map(|s| s.cancellation.subscribe());
+            .map(|s| s.subscribe_cancellation());
 
         let tid = crate::perf::current_trace_id();
         tokio::spawn(crate::perf::with_trace_id(tid, async move {

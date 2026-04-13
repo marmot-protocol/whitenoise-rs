@@ -195,11 +195,14 @@ impl Whitenoise {
                 Vec::new()
             });
 
+        // Signal cancellation first so in-flight handlers (e.g. contact-list
+        // guard) see the flag, but keep the session visible until subscription
+        // teardown completes — handlers that check get_session() during teardown
+        // need the entry to exist.
         if let Some(session) = self.account_manager.get_session(pubkey) {
-            let _ = session.cancellation.send(true);
+            session.cancel();
         }
 
-        // Unsubscribe from account-specific subscriptions before logout
         self.relay_control
             .deactivate_account_subscriptions(pubkey)
             .await;
@@ -584,8 +587,7 @@ mod tests {
             .account_manager
             .get_session(&account.pubkey)
             .expect("session should exist after login")
-            .cancellation
-            .subscribe();
+            .subscribe_cancellation();
 
         assert!(
             !*cancel_rx.borrow(),

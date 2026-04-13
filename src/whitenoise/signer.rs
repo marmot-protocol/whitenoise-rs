@@ -125,7 +125,7 @@ impl Whitenoise {
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
         if let Some(session) = self.account_manager.get_session(&account.pubkey)
-            && let Some(signer) = session.signer.try_read().ok().and_then(|g| g.clone())
+            && let Some(signer) = session.get_signer()
         {
             tracing::debug!(
                 target: "whitenoise::signer",

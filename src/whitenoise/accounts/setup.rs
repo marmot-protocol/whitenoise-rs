@@ -20,15 +20,9 @@ use super::{Account, ExternalSignerRelaySetup};
 impl Whitenoise {
     fn insert_account_session(&self, account: &Account) -> Result<()> {
         if let Some(old_session) = self.account_manager.get_session(&account.pubkey) {
-            let _ = old_session.cancellation.send(true);
+            old_session.cancel();
         }
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let signer = if account.has_local_key() {
-            Some(self.get_signer_for_account(account)?)
-        } else {
-            None
-        };
-        let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer));
+        let session = Arc::new(AccountSession::from_account(account, self)?);
         self.account_manager.insert_session(session);
         Ok(())
     }
@@ -785,7 +779,7 @@ impl Whitenoise {
         let cancel_rx = self
             .account_manager
             .get_session(&account.pubkey)
-            .map(|s| s.cancellation.subscribe());
+            .map(|s| s.subscribe_cancellation());
         if cancel_rx.is_none() {
             tracing::debug!(
                 target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
@@ -1021,7 +1015,7 @@ mod tests {
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
         whitenoise.external_signers.clear();
         whitenoise.account_manager.clear_sessions();
-        whitenoise.account_manager.pending_logins.clear();
+        whitenoise.account_manager.clear_pending_logins();
         whitenoise.reset_nostr_client().await.unwrap();
         whitenoise.wipe_database().await.unwrap();
     }
