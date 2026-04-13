@@ -1051,6 +1051,7 @@ mod tests {
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
         whitenoise.background_task_cancellation.clear();
         whitenoise.external_signers.clear();
+        whitenoise.account_manager.clear_sessions();
         whitenoise.account_manager.pending_logins.clear();
         whitenoise.reset_nostr_client().await.unwrap();
         whitenoise.wipe_database().await.unwrap();

@@ -85,6 +85,11 @@ impl AccountManager {
         removed
     }
 
+    /// Remove all active sessions.
+    pub fn clear_sessions(&self) {
+        self.sessions.clear();
+    }
+
     /// Restore sessions for all persisted accounts at startup.
     ///
     /// External-signer accounts get `signer: None` until re-registered.
