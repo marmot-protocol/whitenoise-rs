@@ -198,12 +198,13 @@ impl Whitenoise {
         if let Some(session) = self.account_manager.get_session(pubkey) {
             let _ = session.cancellation.send(true);
         }
-        self.account_manager.remove_session(pubkey);
 
         // Unsubscribe from account-specific subscriptions before logout
         self.relay_control
             .deactivate_account_subscriptions(pubkey)
             .await;
+
+        self.account_manager.remove_session(pubkey);
 
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
