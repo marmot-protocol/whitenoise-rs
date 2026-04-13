@@ -37,8 +37,9 @@ pub mod test_fixtures;
 // Core types
 pub use types::{
     AccountInboxPlaneStateSnapshot, AccountInboxPlanesStateSnapshot, DiscoveryPlaneStateSnapshot,
-    GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ImageType, MessageWithTokens,
-    RelayControlStateSnapshot, RelaySessionRelayStateSnapshot, RelaySessionStateSnapshot,
+    GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ImageType, ImageTypeError,
+    MessageWithTokens, RelayControlStateSnapshot, RelaySessionRelayStateSnapshot,
+    RelaySessionStateSnapshot,
 };
 pub use whitenoise::{Whitenoise, WhitenoiseConfig};
 

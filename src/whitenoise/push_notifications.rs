@@ -993,15 +993,22 @@ impl Whitenoise {
         // Drive groups concurrently with a bounded cap so relay connections
         // are not overwhelmed. RTTs for independent groups overlap while
         // total in-flight publishes stay within a reasonable limit.
-        let failures: Vec<String> = stream::iter(groups.iter())
+        let failures: Vec<String> = stream::iter(groups)
             .map(|group| {
-                self.share_token_to_single_group(
-                    &mdk,
-                    account,
-                    &group.mls_group_id,
-                    group.state,
-                    token_tag,
-                )
+                let group_state = group.state;
+                let group_id = group.mls_group_id;
+                let mdk = &mdk;
+
+                async move {
+                    self.share_token_to_single_group(
+                        mdk,
+                        account,
+                        &group_id,
+                        group_state,
+                        token_tag,
+                    )
+                    .await
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
             .filter_map(|r| async move { r.err() })
@@ -1190,9 +1197,16 @@ impl Whitenoise {
         // Drive groups concurrently with a bounded cap so relay connections
         // are not overwhelmed. RTTs for independent groups overlap while
         // total in-flight publishes stay within a reasonable limit.
-        let failures: Vec<String> = stream::iter(groups.iter())
+        let failures: Vec<String> = stream::iter(groups)
             .map(|group| {
-                self.remove_token_from_single_group(&mdk, account, &group.mls_group_id, group.state)
+                let group_state = group.state;
+                let group_id = group.mls_group_id;
+                let mdk = &mdk;
+
+                async move {
+                    self.remove_token_from_single_group(mdk, account, &group_id, group_state)
+                        .await
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
             .filter_map(|r| async move { r.err() })
