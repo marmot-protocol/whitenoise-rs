@@ -1,8 +1,9 @@
+use async_trait::async_trait;
+use tokio::sync::{Mutex, broadcast};
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::whitenoise::notification_streaming::{NotificationTrigger, NotificationUpdate};
-use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast};
 
 /// Test case that verifies a real-time notification update is received correctly.
 ///
