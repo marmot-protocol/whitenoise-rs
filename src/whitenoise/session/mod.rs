@@ -119,7 +119,19 @@ impl AccountManager {
             match wn.create_mdk_for_account(account.pubkey) {
                 Ok(mdk) => {
                     let signer: Option<Arc<dyn NostrSigner>> = if account.has_local_key() {
-                        wn.get_signer_for_account(account).ok()
+                        match wn.get_signer_for_account(account) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "whitenoise::session",
+                                    "Failed to get signer for local account {}: {}",
+                                    account.pubkey.to_hex(),
+                                    e
+                                );
+                                err_count += 1;
+                                continue;
+                            }
+                        }
                     } else {
                         None
                     };

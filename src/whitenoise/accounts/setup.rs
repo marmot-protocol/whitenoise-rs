@@ -23,7 +23,11 @@ impl Whitenoise {
             let _ = old_session.cancellation.send(true);
         }
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let signer = self.get_signer_for_account(account).ok();
+        let signer = if account.has_local_key() {
+            Some(self.get_signer_for_account(account)?)
+        } else {
+            None
+        };
         let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer));
         self.account_manager.insert_session(session);
         Ok(())
