@@ -548,24 +548,57 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
-        // If this reaction already has a delivery status, it was sent by us and already
-        // applied to the parent — skip re-applying to avoid unnecessary DB writes and
-        // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(
-            account_pubkey,
+        // Check if this reaction was sent locally (by any account on this device).
+        // The sending account already applied it optimistically to the shared
+        // aggregated_messages table and emitted to its own stream.
+        let sent_locally = AggregatedMessage::has_delivery_status_any_account(
             &message.id.to_string(),
             group_id,
             &self.database,
         )
-        .await?
-        {
+        .await?;
+
+        if sent_locally {
+            // The sending account already applied this reaction to the DB.
+            // Skip DB writes but still return the current target message state
+            // so the caller can emit to THIS account's stream (which didn't
+            // receive the original optimistic emit).
+            if AggregatedMessage::has_delivery_status(
+                account_pubkey,
+                &message.id.to_string(),
+                group_id,
+                &self.database,
+            )
+            .await?
+            {
+                // This IS the sending account's echo — fully skip (already emitted).
+                tracing::debug!(
+                    target: "whitenoise::cache",
+                    "Skipping echo of own reaction {} in group {}",
+                    message.id,
+                    hex::encode(group_id.as_slice())
+                );
+                return Ok(None);
+            }
+
+            // Another local account sent this reaction — skip DB writes but
+            // return the target message so the caller emits to this account.
             tracing::debug!(
                 target: "whitenoise::cache",
-                "Skipping echo of outgoing reaction {} in group {}",
+                "Re-emitting locally-sent reaction {} to account {} in group {}",
                 message.id,
+                account_pubkey.to_hex(),
                 hex::encode(group_id.as_slice())
             );
-            return Ok(None);
+            let target_id = Self::extract_reaction_target_id(&message.tags)?;
+            return AggregatedMessage::find_by_id(
+                account_pubkey,
+                &target_id,
+                group_id,
+                &self.database,
+            )
+            .await
+            .map_err(Into::into);
         }
 
         AggregatedMessage::insert_reaction(message, group_id, &self.database).await?;
@@ -646,24 +679,73 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
-        // If this deletion already has a delivery status, it was sent by us and already
-        // applied to targets — skip re-applying to avoid unnecessary DB writes and
-        // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(
-            account_pubkey,
+        // Check if this deletion was sent locally (by any account on this device).
+        let sent_locally = AggregatedMessage::has_delivery_status_any_account(
             &message.id.to_string(),
             group_id,
             &self.database,
         )
-        .await?
-        {
+        .await?;
+
+        if sent_locally {
+            if AggregatedMessage::has_delivery_status(
+                account_pubkey,
+                &message.id.to_string(),
+                group_id,
+                &self.database,
+            )
+            .await?
+            {
+                // This IS the sending account's echo — fully skip.
+                tracing::debug!(
+                    target: "whitenoise::cache",
+                    "Skipping echo of own deletion {} in group {}",
+                    message.id,
+                    hex::encode(group_id.as_slice())
+                );
+                return Ok(Vec::new());
+            }
+
+            // Another local account sent this deletion — skip DB writes but
+            // return the affected messages so the caller emits to this account.
             tracing::debug!(
                 target: "whitenoise::cache",
-                "Skipping echo of outgoing deletion {} in group {}",
+                "Re-emitting locally-sent deletion {} to account {} in group {}",
                 message.id,
+                account_pubkey.to_hex(),
                 hex::encode(group_id.as_slice())
             );
-            return Ok(Vec::new());
+            let target_ids = Self::extract_deletion_target_ids(&message.tags);
+            let mut updates = Vec::with_capacity(target_ids.len());
+            for target_id in target_ids {
+                // Check if target is a reaction — if so, find its parent message
+                if let Some(reaction) =
+                    AggregatedMessage::find_reaction_by_id(&target_id, group_id, &self.database)
+                        .await?
+                {
+                    if let Ok(parent_id) = Self::extract_reaction_target_id(&reaction.tags)
+                        && let Some(parent) = AggregatedMessage::find_by_id(
+                            account_pubkey,
+                            &parent_id,
+                            group_id,
+                            &self.database,
+                        )
+                        .await?
+                    {
+                        updates.push((UpdateTrigger::ReactionRemoved, parent));
+                    }
+                } else if let Some(msg) = AggregatedMessage::find_by_id(
+                    account_pubkey,
+                    &target_id,
+                    group_id,
+                    &self.database,
+                )
+                .await?
+                {
+                    updates.push((UpdateTrigger::MessageDeleted, msg));
+                }
+            }
+            return Ok(updates);
         }
 
         AggregatedMessage::insert_deletion(message, group_id, &self.database).await?;

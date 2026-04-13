@@ -1174,7 +1174,7 @@ impl AggregatedMessage {
         Ok(())
     }
 
-    /// Check whether an event has a delivery status row (i.e. was sent by us).
+    /// Check whether an event has a delivery status row for a specific account.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn has_delivery_status(
         account_pubkey: &PublicKey,
@@ -1187,6 +1187,30 @@ impl AggregatedMessage {
              WHERE account_pubkey = ? AND message_id = ? AND mls_group_id = ?)",
         )
         .bind(account_pubkey.to_hex())
+        .bind(message_id)
+        .bind(group_id.as_slice())
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(exists)
+    }
+
+    /// Check whether an event has a delivery status row for **any** local account.
+    ///
+    /// Used for echo detection in the event processor: when a relay echo arrives
+    /// for an event that was sent locally (by any account on this device), the
+    /// optimistic cache update has already been applied and reprocessing must be
+    /// skipped regardless of which account is currently handling the echo.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn has_delivery_status_any_account(
+        message_id: &str,
+        group_id: &GroupId,
+        database: &Database,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM message_delivery_status
+             WHERE message_id = ? AND mls_group_id = ?)",
+        )
         .bind(message_id)
         .bind(group_id.as_slice())
         .fetch_one(&database.pool)
