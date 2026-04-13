@@ -29,21 +29,6 @@ phase in this refactor after #740 lands; instead, rebase and adjust any new code
 
 **Validation:** #740 validation.
 
-### Prerequisite B: `message_delivery_status` account scope fix
-
-**Status:** in progress separately, no PR yet.
-
-This fixes the known sender-local delivery-status leak before the larger refactor starts. The expected final state for
-this plan is:
-- `message_delivery_status` includes `account_pubkey` in its key.
-- delivery-status reads/writes carry account identity explicitly.
-- backfill avoids over-associating status rows with every account in an `accounts_groups` row for a group. Prefer
-  sender-owned evidence where possible, such as `aggregated_messages.author == account_pubkey`, and document any rows
-  that cannot be safely attributed.
-- a two-local-account same-group regression test covers the isolation bug.
-
-**Validation:** `just precommit-quick`, `just int-test basic-messaging`, two-account isolation test.
-
 ## Phases
 
 ### Phase 1: AccountSession scaffolding + startup restore + MDK caching (~700 LOC)
@@ -195,13 +180,26 @@ current shared `Database`.
 
 **Validation:** `just precommit-quick`, message read/search tests.
 
-### Phase 7: Migrate message send/retry/projection write path (~800 LOC)
+### Phase 7: Migrate message send/retry/projection write path + delivery-status scope fix (~1000 LOC)
 
 **Methods to move to `MessageOps`:**
 - `send_message_to_group`
 - `retry_message_publish`
 - optimistic outgoing cache helpers
-- delivery-status update helpers that are account-scoped after the prerequisite fix
+- delivery-status update helpers
+
+**Delivery-status scope fix (GitHub issue #739):**
+This phase also fixes the `message_delivery_status` account scope bug. The table is currently keyed by
+`(message_id, mls_group_id)` with no `account_pubkey`, so sender-local delivery state bleeds across accounts in the
+same group. As part of migrating the write path:
+- Add `account_pubkey` to the `message_delivery_status` primary key via a new migration.
+- Backfill existing rows using sender-owned evidence (`aggregated_messages.author == account_pubkey`) where possible;
+  document any rows that cannot be safely attributed.
+- Update all delivery-status reads/writes to carry account identity.
+- Add a two-local-account same-group regression test covering the isolation bug.
+
+This is the natural place for the fix because the delivery-status write path is being migrated to session-scoped ops
+in the same phase.
 
 **Guidance:**
 - Use `session.mdk` instead of `create_mdk_for_account()`.
@@ -209,7 +207,8 @@ current shared `Database`.
 - Keep stream emission in the writer/builder path.
 - Do not put the account-scoped `MessageProjectionBuilder` under `SharedServices`.
 
-**Validation:** `just precommit-quick`, `just int-test basic-messaging`, `just int-test reactions`.
+**Validation:** `just precommit-quick`, `just int-test basic-messaging`, `just int-test reactions`, two-account
+delivery-status isolation test.
 
 ### Phase 8: Migrate group read operations (~500 LOC)
 
