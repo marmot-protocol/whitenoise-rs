@@ -75,8 +75,7 @@ Consider what happens when an MLS group message is accepted:
 
 ```
 handle_mls_message (event handler, the builder)
-  → MessageProjectionBuilder::accept_message(...)
-      → writes to aggregated_messages table
+  → writes to aggregated_messages table (account-scoped projection)
   → message_stream_manager.emit(group_id, NewMessage)
       → UI receives stream update
       → UI calls MessageService::fetch() (the reader)
@@ -105,7 +104,7 @@ service fetches from both and assembles the result.
 
 | Projection          | Builder                                    | Reader                                                                              | Scope          | Stored? | Rebuildable?      |
 | ------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------- | -------------- | ------- | ----------------- |
-| Aggregated messages | Event handler → `MessageProjectionBuilder` | `MessageService`                                                                    | Account-scoped | Yes     | Yes (from MDK)    |
+| Aggregated messages | Event handler → account-scoped projection builder | `MessageService`                                                              | Account-scoped | Yes     | Yes (from MDK)    |
 | Message delivery    | Send pipeline                              | `MessageService`                                                                    | Account-scoped | Yes     | Partially         |
 | Chat list           | Stream emissions from handlers             | `ChatListService` (computes from joins)                                             | Account-scoped | No      | N/A               |
 | User directory      | `handle_metadata`, `handle_relay_list`     | `UserDirectoryService`                                                              | Shared         | Yes     | Yes (from relays) |
@@ -123,9 +122,8 @@ Whitenoise (thin app facade — constructed, NOT a singleton)
 │   ├── user_directory: UserDirectoryService
 │   ├── search: UserSearchService
 │   ├── app_settings: AppSettingsService
-│   ├── media_cache: MediaCacheService
+│   ├── media_cache: MediaCacheService             (shared blob cache)
 │   ├── relay_observability: RelayObservabilityService
-│   ├── message_projection: MessageProjectionBuilder
 │   ├── event_tracker: Arc<dyn EventTracker>
 │   ├── discovery_sync_worker: DiscoverySyncWorker
 │   ├── secrets_store: SecretsStore
@@ -284,7 +282,7 @@ data/
 │   ├── processed_events             (global dedup)
 │   ├── relay_status
 │   ├── relay_events
-│   └── media_files                  (shared blob registry)
+│   └── media_blobs                  (shared blob cache: hash, file path, Blossom URL, MIME)
 │
 ├── account_<hex_pubkey_1>.sqlite    (account-scoped state)
 │   ├── account_settings
@@ -297,6 +295,7 @@ data/
 │   ├── published_events
 │   ├── aggregated_messages           (account-scoped message projection)
 │   ├── message_delivery_status
+│   ├── media_references             (per-account/group media associations, encryption refs)
 │   └── processed_events             (account-scoped dedup)
 │
 ├── account_<hex_pubkey_2>.sqlite
@@ -831,8 +830,9 @@ Tests run in parallel. No shared state. No flaky failures from singleton content
 | `published_events`           | Account      | account.sqlite | Session publishing                          |
 | `processed_events` (global)  | Shared       | shared.sqlite  | EventTracker                                |
 | `processed_events` (account) | Account      | account.sqlite | Session idempotency                         |
-| `aggregated_messages`        | Account      | account.sqlite | Session messages / MessageProjectionBuilder |
+| `aggregated_messages`        | Account      | account.sqlite | Session messages                            |
 | `message_delivery_status`    | Account      | account.sqlite | Session messages                            |
-| `media_files`                | Shared       | shared.sqlite  | MediaCacheService                           |
+| `media_blobs`                | Shared       | shared.sqlite  | MediaCacheService                           |
+| `media_references`           | Account      | account.sqlite | Session media                               |
 | `relay_status`               | Operational  | shared.sqlite  | RelayObservabilityService                   |
 | `relay_events`               | Operational  | shared.sqlite  | RelayObservabilityService                   |

@@ -44,34 +44,6 @@ this plan is:
 
 **Validation:** `just precommit-quick`, `just int-test basic-messaging`, two-account isolation test.
 
-## Design Adjustments From Review
-
-### Message projection ownership
-
-The architecture doc currently sketches `message_projection: MessageProjectionBuilder` under `SharedServices`, but
-aggregated messages and delivery status are account-scoped projections. The implementation should either:
-- put the builder on `AccountSession`, or
-- make it a stateless helper that receives account-scoped repos explicitly.
-
-Do not let a shared service write directly to account-scoped projection tables.
-
-### Media storage split
-
-Keep a single shared blob cache so media bytes are not double-stored, but split account/group references into
-account-scoped state:
-- shared DB: `media_blobs` (encrypted blob hash, shared file path, Blossom URL, MIME/type metadata that is safe to
-  share across local accounts)
-- account DB: `media_references` (account pubkey implied by DB file, MLS group id, original/plaintext hash if needed,
-  nonce/scheme/key reference, per-message/per-group association, local UI metadata)
-
-This replaces the current one-table shape where `media_files` is shared-ish but still carries `account_pubkey` and
-`mls_group_id`.
-
-### Phase size rule
-
-If a phase starts to exceed ~1k changed LOC, split by call-site family rather than pushing through. Prefer landing
-mechanical scaffolding, then one migrated domain or call path at a time.
-
 ## Phases
 
 ### Phase 1: AccountSession scaffolding + startup restore + MDK caching (~700 LOC)
