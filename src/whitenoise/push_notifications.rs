@@ -37,11 +37,18 @@ use crate::{
     relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
 };
 
-/// Minimum interval between accepted MIP-05 token requests from the same
-/// `(group_id, sender_leaf_index)` pair.  Requests that arrive before the
-/// cooldown expires are silently dropped.  Normal usage is ≤5 requests per
-/// hour, so 30 seconds is generous while blocking sustained spam.
+/// Minimum interval between accepted MIP-05 token messages of the same kind
+/// from the same `(account, group_id, sender_leaf_index)` tuple.  Messages
+/// that arrive before the cooldown expires are silently dropped.  Normal usage
+/// is ≤5 requests per hour, so 30 seconds is generous while blocking spam.
 const TOKEN_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Discriminator so token requests and removals have independent cooldowns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TokenRateKind {
+    Request,
+    Removal,
+}
 
 /// Maximum number of groups to publish push token events to concurrently.
 /// Caps relay connection pressure while still parallelising the bulk of the
@@ -767,6 +774,7 @@ impl Whitenoise {
                     &account.pubkey,
                     &message.mls_group_id,
                     leaf_index,
+                    TokenRateKind::Request,
                 ) {
                     tracing::debug!(
                         target: "whitenoise::push_notifications",
@@ -815,6 +823,7 @@ impl Whitenoise {
                     &account.pubkey,
                     &message.mls_group_id,
                     leaf_index,
+                    TokenRateKind::Removal,
                 ) {
                     tracing::debug!(
                         target: "whitenoise::push_notifications",
@@ -888,17 +897,19 @@ impl Whitenoise {
         ))
     }
 
-    /// Returns `true` if the MIP-05 message from `(account, group_id, leaf_index)`
-    /// is allowed, i.e. no request from that sender has been accepted within the
-    /// [`TOKEN_REQUEST_COOLDOWN`] window. On acceptance the timestamp is updated
-    /// via the `entry()` API to hold the shard lock for the full check-and-update.
+    /// Returns `true` if the MIP-05 message from `(account, group_id, leaf_index, kind)`
+    /// is allowed, i.e. no message of the same kind from that sender has been accepted
+    /// within the [`TOKEN_REQUEST_COOLDOWN`] window. On acceptance the timestamp is
+    /// updated via the `entry()` API to hold the shard lock for the full
+    /// check-and-update.
     fn check_token_request_rate(
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
         leaf_index: u32,
+        kind: TokenRateKind,
     ) -> bool {
-        let key = (*account_pubkey, group_id.clone(), leaf_index);
+        let key = (*account_pubkey, group_id.clone(), leaf_index, kind);
         let now = Instant::now();
 
         match self.token_request_timestamps.entry(key) {
@@ -3343,7 +3354,7 @@ mod tests {
         let group_id = GroupId::from_slice(&[42; 32]);
 
         assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request),
             "first request from a sender must be allowed"
         );
     }
@@ -3354,9 +3365,9 @@ mod tests {
         let acct = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[42; 32]);
 
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
         assert!(
-            !whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            !whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,),
             "immediate second request from the same sender must be rejected"
         );
     }
@@ -3367,9 +3378,9 @@ mod tests {
         let acct = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[42; 32]);
 
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
         assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 1),
+            whitenoise.check_token_request_rate(&acct, &group_id, 1, TokenRateKind::Request,),
             "request from a different leaf index must be allowed"
         );
     }
@@ -3381,9 +3392,9 @@ mod tests {
         let group_a = GroupId::from_slice(&[42; 32]);
         let group_b = GroupId::from_slice(&[43; 32]);
 
-        assert!(whitenoise.check_token_request_rate(&acct, &group_a, 0));
+        assert!(whitenoise.check_token_request_rate(&acct, &group_a, 0, TokenRateKind::Request,));
         assert!(
-            whitenoise.check_token_request_rate(&acct, &group_b, 0),
+            whitenoise.check_token_request_rate(&acct, &group_b, 0, TokenRateKind::Request,),
             "same leaf index in a different group must be allowed"
         );
     }
@@ -3395,10 +3406,25 @@ mod tests {
         let acct_b = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[42; 32]);
 
-        assert!(whitenoise.check_token_request_rate(&acct_a, &group_id, 0));
         assert!(
-            whitenoise.check_token_request_rate(&acct_b, &group_id, 0),
+            whitenoise.check_token_request_rate(&acct_a, &group_id, 0, TokenRateKind::Request,)
+        );
+        assert!(
+            whitenoise.check_token_request_rate(&acct_b, &group_id, 0, TokenRateKind::Request,),
             "same group+leaf from a different account must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_request_does_not_suppress_removal() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
+        assert!(
+            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Removal,),
+            "a request must not suppress a removal from the same sender"
         );
     }
 
@@ -3500,17 +3526,17 @@ mod tests {
         let acct = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[42; 32]);
 
-        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,));
 
         // Backdate the stored timestamp beyond the cooldown window.
-        let key = (acct, group_id.clone(), 0u32);
+        let key = (acct, group_id.clone(), 0u32, TokenRateKind::Request);
         let backdated = Instant::now()
             .checked_sub(TOKEN_REQUEST_COOLDOWN + Duration::from_millis(1))
             .expect("system uptime must exceed cooldown window");
         whitenoise.token_request_timestamps.insert(key, backdated);
 
         assert!(
-            whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            whitenoise.check_token_request_rate(&acct, &group_id, 0, TokenRateKind::Request,),
             "request after cooldown has elapsed must be allowed"
         );
     }

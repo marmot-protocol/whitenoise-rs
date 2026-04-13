@@ -187,8 +187,10 @@ pub struct Whitenoise {
     /// See [`push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS`] for the cap value.
     token_response_semaphore: Arc<Semaphore>,
     /// Per-sender rate limiter for inbound MIP-05 token requests and removals.
-    /// Maps `(account_pubkey, GroupId, sender_leaf_index)` → last accepted `Instant`.
-    token_request_timestamps: DashMap<(PublicKey, GroupId, u32), std::time::Instant>,
+    /// Maps `(account_pubkey, GroupId, sender_leaf_index, kind)` → last accepted
+    /// `Instant`.  Requests and removals have independent cooldown buckets.
+    token_request_timestamps:
+        DashMap<(PublicKey, GroupId, u32, push_notifications::TokenRateKind), std::time::Instant>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
