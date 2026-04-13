@@ -311,7 +311,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
 
         assert_eq!(user_relay_row.user_id, test_user_id);
         assert_eq!(user_relay_row.relay_id, test_relay_id);
@@ -350,7 +350,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let user_relay_row = UserRelayRow::from_row(&row).unwrap();
+        let user_relay_row = UserRelay::from_row(&row).unwrap();
 
         assert_eq!(user_relay_row.user_id, test_user_id);
         assert_eq!(user_relay_row.relay_id, test_relay_id);
