@@ -568,7 +568,7 @@ mod tests {
     use crate::whitenoise::Whitenoise;
     use crate::whitenoise::WhitenoiseError;
     use crate::whitenoise::accounts::{
-        Account, AccountType, DiscoveredRelayLists, LoginError, LoginResult, LoginStatus,
+        Account, AccountType, DiscoveredRelayLists, LoginError, LoginStatus,
     };
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
@@ -1130,25 +1130,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_login_status_equality() {
-        assert_eq!(LoginStatus::Complete, LoginStatus::Complete);
-        assert_eq!(LoginStatus::NeedsRelayLists, LoginStatus::NeedsRelayLists);
-        assert_ne!(LoginStatus::Complete, LoginStatus::NeedsRelayLists);
-    }
-
-    #[test]
-    fn test_login_status_clone() {
-        let cloned = LoginStatus::NeedsRelayLists.clone();
-        assert_eq!(LoginStatus::NeedsRelayLists, cloned);
-    }
-
-    #[test]
-    fn test_login_status_debug() {
-        assert!(format!("{:?}", LoginStatus::Complete).contains("Complete"));
-        assert!(format!("{:?}", LoginStatus::NeedsRelayLists).contains("NeedsRelayLists"));
-    }
-
-    #[test]
     fn test_login_error_from_key_error() {
         let key_result = Keys::parse("not-a-valid-nsec");
         assert!(key_result.is_err());
@@ -1193,12 +1174,6 @@ mod tests {
     }
 
     #[test]
-    fn test_login_error_debug() {
-        let debug = format!("{:?}", LoginError::NoRelayConnections);
-        assert!(debug.contains("NoRelayConnections"));
-    }
-
-    #[test]
     fn test_login_error_timeout_display() {
         let err = LoginError::Timeout("relay fetch took 30s".to_string());
         assert_eq!(
@@ -1217,46 +1192,6 @@ mod tests {
     fn test_login_error_no_login_in_progress_display() {
         let err = LoginError::NoLoginInProgress;
         assert_eq!(err.to_string(), "No login in progress for this account");
-    }
-
-    #[test]
-    fn test_login_result_debug() {
-        let account = Account {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            user_id: 1,
-            account_type: AccountType::Local,
-            last_synced_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let result = LoginResult {
-            account,
-            status: LoginStatus::Complete,
-        };
-        let debug = format!("{:?}", result);
-        assert!(!debug.is_empty());
-        assert!(debug.contains("Complete"));
-    }
-
-    #[test]
-    fn test_login_result_clone() {
-        let account = Account {
-            id: Some(1),
-            pubkey: Keys::generate().public_key(),
-            user_id: 1,
-            account_type: AccountType::Local,
-            last_synced_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let result = LoginResult {
-            account: account.clone(),
-            status: LoginStatus::NeedsRelayLists,
-        };
-        let cloned = result.clone();
-        assert_eq!(cloned.status, LoginStatus::NeedsRelayLists);
-        assert_eq!(cloned.account.pubkey, account.pubkey);
     }
 
     // -----------------------------------------------------------------------

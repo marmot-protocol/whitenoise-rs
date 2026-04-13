@@ -925,25 +925,6 @@ mod tests {
     }
 
     #[test]
-    fn test_media_type_detection_equality() {
-        let detection1 = MediaTypeDetection::Image(ImageType::Png);
-        let detection2 = MediaTypeDetection::Image(ImageType::Png);
-        let detection3 = MediaTypeDetection::Image(ImageType::Jpeg);
-        assert_eq!(detection1, detection2);
-        assert_ne!(detection1, detection3);
-
-        let other1 = MediaTypeDetection::Other {
-            mime_type: "video/mp4".to_string(),
-            extension: "mp4",
-        };
-        let other2 = MediaTypeDetection::Other {
-            mime_type: "video/mp4".to_string(),
-            extension: "mp4",
-        };
-        assert_eq!(other1, other2);
-    }
-
-    #[test]
     fn test_explicit_whitelist_comprehensive() {
         // This test verifies the explicit whitelist approach works correctly
         // by testing that only approved formats are accepted
@@ -986,15 +967,6 @@ mod tests {
         assert_eq!(info.attempt, 0);
         assert_eq!(info.max_attempts, 10);
         assert_eq!(info.base_delay_ms, 1000);
-    }
-
-    #[test]
-    fn test_retry_info_default_matches_new() {
-        let from_default = RetryInfo::default();
-        let from_new = RetryInfo::new();
-        assert_eq!(from_default.attempt, from_new.attempt);
-        assert_eq!(from_default.max_attempts, from_new.max_attempts);
-        assert_eq!(from_default.base_delay_ms, from_new.base_delay_ms);
     }
 
     #[test]

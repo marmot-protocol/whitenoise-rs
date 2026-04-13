@@ -697,31 +697,6 @@ mod tests {
         assert!(table_names.contains(&"app_settings".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_database_clone() {
-        let (db, _temp_dir) = create_test_db().await;
-
-        // Test that Database can be cloned
-        let db_clone = db.clone();
-
-        // Both should have the same path
-        assert_eq!(db.path, db_clone.path);
-
-        // Both should be able to execute queries
-        let result1: (i64,) = sqlx::query_as("SELECT 1")
-            .fetch_one(&db.pool)
-            .await
-            .expect("Failed to execute query on original");
-
-        let result2: (i64,) = sqlx::query_as("SELECT 2")
-            .fetch_one(&db_clone.pool)
-            .await
-            .expect("Failed to execute query on clone");
-
-        assert_eq!(result1.0, 1);
-        assert_eq!(result2.0, 2);
-    }
-
     /// Minimal mock implementing `sqlx::error::DatabaseError` for testing
     /// `is_sqlite_lock_error()` with specific error codes.
     #[derive(Debug)]

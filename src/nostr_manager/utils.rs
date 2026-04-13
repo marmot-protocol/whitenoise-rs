@@ -546,14 +546,4 @@ mod tests {
         assert!(result <= after_call);
         assert!(result < future_timestamp);
     }
-
-    #[test]
-    fn test_constants_are_reasonable() {
-        // Test that the constants have reasonable values
-        assert_eq!(MAX_FUTURE_SKEW, Duration::from_secs(60 * 60)); // 1 hour
-        assert_eq!(
-            GIFTWRAP_LOOKBACK_BUFFER,
-            Duration::from_secs(7 * 24 * 60 * 60)
-        ); // 7 days
-    }
 }

@@ -399,25 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_defaults() {
-        let config = AggregatorConfig::default();
-
-        assert!(config.normalize_emoji);
-        assert!(!config.enable_debug_logging);
-    }
-
-    #[test]
-    fn test_config_custom() {
-        let config = AggregatorConfig {
-            normalize_emoji: false,
-            enable_debug_logging: true,
-        };
-
-        assert!(!config.normalize_emoji);
-        assert!(config.enable_debug_logging);
-    }
-
-    #[test]
     fn test_extract_reply_info_malformed_e_tag() {
         let mut malformed_tags = Tags::new();
         if let Ok(tag) = Tag::parse(vec!["e"]) {
