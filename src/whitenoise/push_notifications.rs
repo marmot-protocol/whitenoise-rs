@@ -10,6 +10,7 @@ use std::{
 
 use ::rand::Rng;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use mdk_core::mip05::{
     EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
     TokenTag, build_notification_batches, build_token_list_response_rumor,
@@ -34,6 +35,11 @@ use crate::{
     perf_instrument,
     relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
 };
+
+/// Maximum number of groups to publish push token events to concurrently.
+/// Caps relay connection pressure while still parallelising the bulk of the
+/// per-group relay round-trips.
+const MAX_CONCURRENT_GROUP_PUBLISHES: usize = 10;
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -904,61 +910,69 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if !self
-                .is_push_gossip_eligible(account, &group.mls_group_id, group.state)
-                .await
-            {
-                continue;
-            }
-
-            let rumor = build_token_request_rumor(
-                account.pubkey,
-                nostr_sdk::Timestamp::now(),
-                vec![token_tag.clone()],
-            )?;
-            if let Err(error) = publish_push_group_message_with(
-                &mdk,
-                &self.relay_control,
-                account,
-                &group.mls_group_id,
-                rumor,
-            )
-            .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-                continue;
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(
+        // Drive groups concurrently with a bounded cap so relay connections
+        // are not overwhelmed. RTTs for independent groups overlap while
+        // total in-flight publishes stay within a reasonable limit.
+        let failures: Vec<String> = stream::iter(groups.iter())
+            .map(|group| {
+                self.share_token_to_single_group(
                     &mdk,
                     account,
                     &group.mls_group_id,
-                    Some(token_tag),
+                    group.state,
+                    token_tag,
                 )
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
+            .filter_map(|r| async move { r.err() })
+            .collect()
+            .await;
 
-        if publish_failures.is_empty() {
+        if failures.is_empty() {
             Ok(())
         } else {
             Err(WhitenoiseError::Configuration(format!(
                 "failed to share push token to one or more groups: {}",
-                publish_failures.join(", ")
+                failures.join(", ")
             )))
         }
+    }
+
+    /// Publishes a push token request to a single group and updates the local
+    /// cache. Returns `Ok(())` if the group is ineligible (treated as a no-op)
+    /// or if both operations succeed. Returns `Err` with a descriptive message
+    /// on publish or cache-sync failure.
+    #[perf_instrument("push_notifications")]
+    async fn share_token_to_single_group(
+        &self,
+        mdk: &MDK<MdkSqliteStorage>,
+        account: &Account,
+        group_id: &GroupId,
+        group_state: GroupState,
+        token_tag: &TokenTag,
+    ) -> std::result::Result<(), String> {
+        if !self
+            .is_push_gossip_eligible(account, group_id, group_state)
+            .await
+        {
+            return Ok(());
+        }
+
+        let rumor = build_token_request_rumor(
+            account.pubkey,
+            nostr_sdk::Timestamp::now(),
+            vec![token_tag.clone()],
+        )
+        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
+
+        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
+            .await
+            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
+
+        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
+            .await
+            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
     }
 
     #[perf_instrument("push_notifications")]
@@ -1093,47 +1107,67 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if group.state != GroupState::Active {
-                continue;
-            }
+        // Drive groups concurrently with a bounded cap so relay connections
+        // are not overwhelmed. RTTs for independent groups overlap while
+        // total in-flight publishes stay within a reasonable limit.
+        let failures: Vec<String> = stream::iter(groups.iter())
+            .map(|group| {
+                self.remove_token_from_single_group(&mdk, account, &group.mls_group_id, group.state)
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
+            .filter_map(|r| async move { r.err() })
+            .collect()
+            .await;
 
-            let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-            if let Err(error) = publish_push_group_message_with(
-                &mdk,
-                &self.relay_control,
-                account,
-                &group.mls_group_id,
-                rumor,
-            )
-            .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(&mdk, account, &group.mls_group_id, None)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
-
-        if publish_failures.is_empty() {
+        if failures.is_empty() {
             Ok(())
         } else {
             Err(WhitenoiseError::Configuration(format!(
                 "failed to remove push token from one or more groups: {}",
-                publish_failures.join(", ")
+                failures.join(", ")
             )))
+        }
+    }
+
+    /// Publishes a push token removal to a single active group and clears the
+    /// local cache entry. Inactive groups are skipped silently.
+    ///
+    /// Cache sync is always attempted even when publishing fails — clearing
+    /// local state is best-effort cleanup that should not be blocked by a
+    /// relay error. Both failure messages are surfaced if both steps fail.
+    #[perf_instrument("push_notifications")]
+    async fn remove_token_from_single_group(
+        &self,
+        mdk: &MDK<MdkSqliteStorage>,
+        account: &Account,
+        group_id: &GroupId,
+        group_state: GroupState,
+    ) -> std::result::Result<(), String> {
+        if group_state != GroupState::Active {
+            return Ok(());
+        }
+
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
+
+        let publish_err =
+            publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
+                .await
+                .err()
+                .map(|e| format!("{group_id_hex}: {e}"));
+
+        // Always run cache sync regardless of publish outcome.
+        let cache_err = self
+            .sync_local_group_push_token_cache(mdk, account, group_id, None)
+            .await
+            .err()
+            .map(|e| format!("{group_id_hex}: {e}"));
+
+        match (publish_err, cache_err) {
+            (None, None) => Ok(()),
+            (Some(e), None) | (None, Some(e)) => Err(e),
+            (Some(e1), Some(e2)) => Err(format!("{e1}, {e2}")),
         }
     }
 
