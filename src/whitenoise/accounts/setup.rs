@@ -60,6 +60,10 @@ impl Whitenoise {
     ) -> Result<()> {
         self.discovery_sync_worker.request_rebuild();
 
+        // Session must exist before subscriptions so that event handlers
+        // (e.g. contact-list guard) can look it up immediately.
+        self.insert_account_session(account)?;
+
         // Subscriptions and key package setup operate on disjoint relay
         // sessions (group/inbox plane vs ephemeral plane) with no shared
         // mutable state, so they run concurrently.  Key package setup is
@@ -77,8 +81,6 @@ impl Whitenoise {
         }
         sub_result?;
 
-        self.insert_account_session(account)?;
-
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
     }
@@ -93,14 +95,16 @@ impl Whitenoise {
     ) -> Result<()> {
         self.discovery_sync_worker.request_rebuild();
 
+        // Session must exist before subscriptions so that event handlers
+        // (e.g. contact-list guard) can look it up immediately.
+        self.insert_account_session(account)?;
+
         self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");
 
         // Note: We skip key package setup for external signer accounts.
         // Key packages need to be published separately with the external signer.
         tracing::debug!(target: "whitenoise::accounts", "Skipping key package setup (external signer)");
-
-        self.insert_account_session(account)?;
 
         Ok(())
     }
