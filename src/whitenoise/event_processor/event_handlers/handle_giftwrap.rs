@@ -144,6 +144,18 @@ impl Whitenoise {
             }
         }
 
+        // Reject welcomes from blocked users before any MLS processing.
+        // Using `rumor.pubkey` (the Nostr identity of the sender) avoids
+        // allocating MDK group state or writing any DB rows for blocked senders.
+        if self.is_user_blocked(&account.pubkey, &rumor.pubkey).await? {
+            tracing::info!(
+                target: "whitenoise::event_processor::process_welcome",
+                "Dropping welcome from blocked user {}",
+                rumor.pubkey,
+            );
+            return Ok(());
+        }
+
         let mdk = self.create_mdk_for_account(account.pubkey)?;
 
         // Process the welcome to get group info (but don't accept yet)

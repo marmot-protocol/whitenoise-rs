@@ -314,14 +314,20 @@ impl Whitenoise {
             })
             .collect();
 
-        discovery
-            .sync_watched_users(&watched_users, public_since)
-            .await
-            .map_err(WhitenoiseError::from)?;
-        discovery
-            .sync_follow_lists(&follow_list_accounts)
-            .await
-            .map_err(WhitenoiseError::from)?;
+        let account_pubkeys: Vec<_> = accounts.iter().map(|a| a.pubkey).collect();
+
+        // Ensure the discovery session is connected before running the syncs
+        // concurrently — each sync has its own `start()` guard, but racing
+        // three concurrent `start()` calls against test relays that shut down
+        // quickly causes connection failures.
+        discovery.start().await.map_err(WhitenoiseError::from)?;
+
+        tokio::try_join!(
+            discovery.sync_watched_users(&watched_users, public_since),
+            discovery.sync_follow_lists(&follow_list_accounts),
+            discovery.sync_mute_lists(&account_pubkeys),
+        )
+        .map_err(WhitenoiseError::from)?;
 
         Ok(())
     }
@@ -334,5 +340,21 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
         self.relay_control.discovery().relays().to_vec()
+    }
+
+    /// Returns the NIP-65 relay URLs for the given account, falling back to
+    /// discovery plane relays when no NIP-65 relays are stored.
+    ///
+    /// Use this for publishing or fetching the account's own replaceable events
+    /// (e.g. kind 10000 mute list, kind 10002 relay list).
+    #[perf_instrument("whitenoise")]
+    pub(crate) async fn account_relay_urls(
+        &self,
+        account: &crate::whitenoise::accounts::Account,
+    ) -> Vec<RelayUrl> {
+        match account.nip65_relays(self).await {
+            Ok(relays) if !relays.is_empty() => crate::whitenoise::relays::Relay::urls(&relays),
+            _ => self.fallback_relay_urls().await,
+        }
     }
 }

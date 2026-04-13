@@ -154,6 +154,14 @@ pub enum Request {
         radius_end: u8,
     },
 
+    // Block / Unblock
+    #[serde(rename = "block_user")]
+    BlockUser { account: String, pubkey: String },
+    #[serde(rename = "unblock_user")]
+    UnblockUser { account: String, pubkey: String },
+    #[serde(rename = "blocked_users")]
+    BlockedUsers { account: String },
+
     // Relays
     #[serde(rename = "relays_list")]
     RelaysList {
@@ -513,5 +521,39 @@ mod tests {
         let serialized = serde_json::to_string(&duration).unwrap();
         let deserialized: MuteDuration = serde_json::from_str(&serialized).unwrap();
         assert_eq!(duration, deserialized);
+    }
+
+    #[test]
+    fn block_user_roundtrip() {
+        let req = Request::BlockUser {
+            account: "npub1abc".to_string(),
+            pubkey: "npub1xyz".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::BlockUser { account, pubkey }
+                if account == "npub1abc" && pubkey == "npub1xyz"));
+    }
+
+    #[test]
+    fn unblock_user_roundtrip() {
+        let req = Request::UnblockUser {
+            account: "npub1abc".to_string(),
+            pubkey: "npub1xyz".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::UnblockUser { account, pubkey }
+                if account == "npub1abc" && pubkey == "npub1xyz"));
+    }
+
+    #[test]
+    fn blocked_users_roundtrip() {
+        let req = Request::BlockedUsers {
+            account: "npub1abc".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::BlockedUsers { account } if account == "npub1abc"));
     }
 }

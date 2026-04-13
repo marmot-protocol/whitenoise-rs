@@ -93,6 +93,7 @@ impl Whitenoise {
             );
         }
         sub_result?;
+
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
     }

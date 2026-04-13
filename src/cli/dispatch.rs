@@ -401,6 +401,22 @@ pub async fn dispatch(req: Request) -> Response {
             Err(resp) => resp,
         },
 
+        Request::BlockUser { account, pubkey } => match block_user(wn, &account, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UnblockUser { account, pubkey } => match unblock_user(wn, &account, &pubkey).await
+        {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::BlockedUsers { account } => match blocked_users(wn, &account).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
         Request::ListMessages {
             account,
             group_id,
@@ -1262,6 +1278,55 @@ async fn follows_check(
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "following": following })))
+}
+
+#[perf_instrument("dispatch")]
+async fn block_user(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    wn.block_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+#[perf_instrument("dispatch")]
+async fn unblock_user(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    wn.unblock_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+#[perf_instrument("dispatch")]
+async fn blocked_users(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let entries = wn
+        .get_blocked_users(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "pubkey": entry.muted_pubkey.to_hex(),
+                "is_private": entry.is_private,
+            })
+        })
+        .collect();
+
+    Ok(Response::ok(serde_json::json!({ "blocked_users": list })))
 }
 
 #[perf_instrument("dispatch")]

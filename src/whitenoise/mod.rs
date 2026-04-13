@@ -38,6 +38,7 @@ pub mod media_files;
 pub mod message_aggregator;
 pub mod message_streaming;
 pub mod messages;
+pub mod mute_list;
 pub mod notification_streaming;
 pub mod push_notifications;
 pub mod relays;

@@ -95,7 +95,7 @@ impl Whitenoise {
 
                 // Advance account sync timestamp only for account-scoped events
                 match event.kind {
-                    Kind::ContactList | Kind::MlsGroupMessage => {
+                    Kind::ContactList | Kind::MlsGroupMessage | Kind::MuteList => {
                         // Cap timestamp to prevent future corruption
                         let safe_timestamp = cap_timestamp_to_now(event.created_at);
                         let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
@@ -321,6 +321,7 @@ impl Whitenoise {
                 self.handle_relay_list(event.clone()).await
             }
             Kind::ContactList => self.handle_contact_list(account, event.clone()).await,
+            Kind::MuteList => self.handle_mute_list(account, event.clone()).await,
             _ => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::route_event_for_processing",
@@ -528,6 +529,55 @@ mod tests {
                 .await
                 .unwrap(),
             "member account should process the same wire event under its own account context"
+        );
+    }
+
+    /// Verifies that events arriving on the `AccountMuteList` subscription
+    /// stream are dispatched to `process_account_event` (i.e. they end up in
+    /// the account-scoped handler pipeline).  We use a `Kind::MuteList` event
+    /// authored and signed by the account so it passes the author guard inside
+    /// `handle_mute_list`, and we confirm the event ID is recorded in the
+    /// processed-events tracker after the call returns.
+    #[tokio::test]
+    async fn test_account_mute_list_stream_routes_to_account_event_processor() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+
+        // Build a syntactically valid but empty mute list event.
+        let event = EventBuilder::new(Kind::MuteList, "")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::AccountInbox,
+                    account_pubkey: Some(account.pubkey),
+                    relay_url: relay_url.clone(),
+                    stream: SubscriptionStream::AccountMuteList,
+                    group_ids: vec![],
+                }),
+                Default::default(),
+            )
+            .await;
+
+        // The event must have been processed (not dropped or mis-routed).
+        let was_processed = whitenoise
+            .event_tracker
+            .already_processed_account_event(&event.id, &account.pubkey)
+            .await
+            .unwrap();
+        assert!(
+            was_processed,
+            "AccountMuteList stream event should be tracked as processed"
         );
     }
 

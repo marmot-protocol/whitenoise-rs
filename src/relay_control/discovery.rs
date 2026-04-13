@@ -125,6 +125,11 @@ struct DiscoveryPlaneState {
     follow_list_subscription_ids: Vec<SubscriptionId>,
     follow_list_account_count: usize,
     previous_follow_set_hash: Option<u64>,
+
+    // Mute-list subscriptions (one per account, kind 10000)
+    mute_list_subscription_ids: Vec<SubscriptionId>,
+    mute_list_account_count: usize,
+    previous_mute_list_set_hash: Option<u64>,
 }
 
 impl DiscoveryPlane {
@@ -368,6 +373,79 @@ impl DiscoveryPlane {
         Ok(())
     }
 
+    // ── Mute-list subscriptions ──────────────────────────────────────────
+
+    /// Syncs kind 10000 mute list subscriptions for each account on the
+    /// discovery relays. Skips relay work when the account set is unchanged.
+    ///
+    /// Unlike follow-list subscriptions, no `since` filter is applied because
+    /// `Kind::MuteList` is a replaceable event — relays always return the
+    /// latest version regardless of timestamp.
+    ///
+    /// Events arrive via `SubscriptionStream::AccountMuteList` and are
+    /// dispatched to `process_account_event` → `handle_mute_list`.
+    #[perf_instrument("relay")]
+    pub(crate) async fn sync_mute_lists(&self, account_pubkeys: &[PublicKey]) -> Result<()> {
+        let mut sorted = account_pubkeys.to_vec();
+        sorted.sort_unstable_by_key(|pk| pk.to_hex());
+        sorted.dedup();
+
+        let set_hash = hash_pubkey_slice(&sorted);
+
+        let hash_unchanged = {
+            let state = self.state.read().await;
+            state.previous_mute_list_set_hash == Some(set_hash)
+        };
+
+        if hash_unchanged {
+            tracing::debug!(
+                target: "whitenoise::relay_control::discovery",
+                accounts = sorted.len(),
+                "Mute list sync skipped (account set unchanged)"
+            );
+            return Ok(());
+        }
+
+        if !self
+            .session
+            .has_any_relay_connected(&self.config.relays)
+            .await
+        {
+            self.start().await?;
+        }
+
+        let mut new_ids = Vec::new();
+        for (index, account_pubkey) in sorted.iter().enumerate() {
+            let filter = Filter::new().kind(Kind::MuteList).author(*account_pubkey);
+
+            let subscription_id = SubscriptionId::new(format!("discovery_mute_list_{index}"));
+            self.session
+                .subscribe_with_id_to(
+                    &self.config.relays,
+                    subscription_id.clone(),
+                    filter,
+                    SubscriptionStream::AccountMuteList,
+                    Some(*account_pubkey),
+                    &[],
+                )
+                .await?;
+            new_ids.push(subscription_id);
+        }
+
+        let stale = {
+            let mut state = self.state.write().await;
+            let old_ids = std::mem::replace(&mut state.mute_list_subscription_ids, new_ids);
+            state.mute_list_account_count = sorted.len();
+            state.previous_mute_list_set_hash = Some(set_hash);
+            stale_ids(old_ids, &state.mute_list_subscription_ids)
+        };
+        for id in stale {
+            self.session.unsubscribe(&id).await;
+        }
+
+        Ok(())
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     /// Tears down all discovery subscriptions and resets state.
@@ -378,6 +456,7 @@ impl DiscoveryPlane {
             .public_subscription_ids
             .into_iter()
             .chain(old.follow_list_subscription_ids)
+            .chain(old.mute_list_subscription_ids)
         {
             self.session.unsubscribe(&id).await;
         }
@@ -418,7 +497,9 @@ impl DiscoveryPlane {
 
     pub(crate) async fn has_subscriptions(&self) -> bool {
         let state = self.state.read().await;
-        !state.public_subscription_ids.is_empty() || !state.follow_list_subscription_ids.is_empty()
+        !state.public_subscription_ids.is_empty()
+            || !state.follow_list_subscription_ids.is_empty()
+            || !state.mute_list_subscription_ids.is_empty()
     }
 
     pub(crate) async fn has_connected_relay(&self) -> bool {
@@ -444,11 +525,20 @@ impl DiscoveryPlane {
             .collect::<Vec<_>>();
         follow_list_subscription_ids.sort_unstable();
 
+        let mut mute_list_subscription_ids = state
+            .mute_list_subscription_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        mute_list_subscription_ids.sort_unstable();
+
         DiscoveryPlaneStateSnapshot {
             watched_user_count: state.watched_user_count,
             follow_list_subscription_count: state.follow_list_account_count,
+            mute_list_subscription_count: state.mute_list_account_count,
             public_subscription_ids,
             follow_list_subscription_ids,
+            mute_list_subscription_ids,
             session: self.session.snapshot(&self.config.relays).await,
         }
     }
