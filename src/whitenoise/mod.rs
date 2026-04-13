@@ -186,6 +186,9 @@ pub struct Whitenoise {
     /// Bounds the number of concurrently-active delayed MIP-05 token-list response tasks.
     /// See [`push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS`] for the cap value.
     token_response_semaphore: Arc<Semaphore>,
+    /// Per-sender rate limiter for inbound MIP-05 token requests and removals.
+    /// Maps `(account_pubkey, GroupId, sender_leaf_index)` → last accepted `Instant`.
+    token_request_timestamps: DashMap<(PublicKey, GroupId, u32), std::time::Instant>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -224,6 +227,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("scheduler_handles", &"<REDACTED>")
             .field("pending_push_token_responses", &"<REDACTED>")
             .field("token_response_semaphore", &"<REDACTED>")
+            .field("token_request_timestamps", &"<REDACTED>")
             .finish()
     }
 }
@@ -273,6 +277,7 @@ impl Whitenoise {
             token_response_semaphore: Arc::new(Semaphore::new(
                 push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
             )),
+            token_request_timestamps: DashMap::new(),
         }
     }
 

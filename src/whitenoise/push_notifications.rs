@@ -2,7 +2,7 @@
 
 use core::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeMap, HashSet},
     str::FromStr,
@@ -36,6 +36,12 @@ use crate::{
     perf_instrument,
     relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
 };
+
+/// Minimum interval between accepted MIP-05 token requests from the same
+/// `(group_id, sender_leaf_index)` pair.  Requests that arrive before the
+/// cooldown expires are silently dropped.  Normal usage is ≤5 requests per
+/// hour, so 30 seconds is generous while blocking sustained spam.
+const TOKEN_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Maximum number of groups to publish push token events to concurrently.
 /// Caps relay connection pressure while still parallelising the bulk of the
@@ -757,6 +763,20 @@ impl Whitenoise {
                     )
                 })?;
 
+                if !self.check_token_request_rate(
+                    &account.pubkey,
+                    &message.mls_group_id,
+                    leaf_index,
+                ) {
+                    tracing::debug!(
+                        target: "whitenoise::push_notifications",
+                        group_id = %hex::encode(message.mls_group_id.as_slice()),
+                        leaf_index,
+                        "Dropping rate-limited MIP-05 token request"
+                    );
+                    return Ok(true);
+                }
+
                 self.merge_token_request(
                     account,
                     &message.mls_group_id,
@@ -790,6 +810,20 @@ impl Whitenoise {
                         "MIP-05 token removal missing sender leaf index".to_string(),
                     )
                 })?;
+
+                if !self.check_token_request_rate(
+                    &account.pubkey,
+                    &message.mls_group_id,
+                    leaf_index,
+                ) {
+                    tracing::debug!(
+                        target: "whitenoise::push_notifications",
+                        group_id = %hex::encode(message.mls_group_id.as_slice()),
+                        leaf_index,
+                        "Dropping rate-limited MIP-05 token removal"
+                    );
+                    return Ok(true);
+                }
 
                 GroupPushToken::delete(
                     &account.pubkey,
@@ -852,6 +886,35 @@ impl Whitenoise {
             group_id.clone(),
             *request_event_id,
         ))
+    }
+
+    /// Returns `true` if the MIP-05 message from `(account, group_id, leaf_index)`
+    /// is allowed, i.e. no request from that sender has been accepted within the
+    /// [`TOKEN_REQUEST_COOLDOWN`] window. On acceptance the timestamp is updated
+    /// via the `entry()` API to hold the shard lock for the full check-and-update.
+    fn check_token_request_rate(
+        &self,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+        leaf_index: u32,
+    ) -> bool {
+        let key = (*account_pubkey, group_id.clone(), leaf_index);
+        let now = Instant::now();
+
+        match self.token_request_timestamps.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if now.duration_since(*entry.get()) < TOKEN_REQUEST_COOLDOWN {
+                    false
+                } else {
+                    entry.insert(now);
+                    true
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
+            }
+        }
     }
 
     pub(crate) fn clear_pending_token_response(
@@ -1469,8 +1532,9 @@ impl PushRegistration {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use mdk_core::mip05::parse_notification_request_rumor;
+    use mdk_core::mip05::{EncryptedToken, TokenTag, parse_notification_request_rumor};
     use mdk_core::prelude::NostrGroupDataUpdate;
+    use mdk_core::prelude::message_types::MessageState;
     use nostr_sdk::{Filter, Keys, Kind, RelayUrl, Tag, nips::nip59};
 
     use super::*;
@@ -3269,6 +3333,185 @@ mod tests {
                 .iter()
                 .any(|token| token.member_pubkey == member_account.pubkey),
             "declining a group should remove any cached push token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_first_request() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(
+            whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            "first request from a sender must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_blocks_rapid_duplicate() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+        assert!(
+            !whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            "immediate second request from the same sender must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_different_senders() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+        assert!(
+            whitenoise.check_token_request_rate(&acct, &group_id, 1),
+            "request from a different leaf index must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_different_groups() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_a = GroupId::from_slice(&[42; 32]);
+        let group_b = GroupId::from_slice(&[43; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct, &group_a, 0));
+        assert!(
+            whitenoise.check_token_request_rate(&acct, &group_b, 0),
+            "same leaf index in a different group must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_different_accounts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct_a = Keys::generate().public_key();
+        let acct_b = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct_a, &group_id, 0));
+        assert!(
+            whitenoise.check_token_request_rate(&acct_b, &group_id, 0),
+            "same group+leaf from a different account must be allowed"
+        );
+    }
+
+    /// Builds a minimal valid `TokenRequest` [`Message`] for use in push
+    /// notification handler tests. The `UnsignedEvent` inside carries a
+    /// properly-formatted `token` tag so that `parse_group_message` succeeds.
+    fn make_token_request_message(
+        sender: &Keys,
+        group_id: GroupId,
+    ) -> mdk_core::prelude::message_types::Message {
+        let token_tag = TokenTag {
+            encrypted_token: EncryptedToken::from_slice(&[0u8; 1084]).unwrap(),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: RelayUrl::parse("wss://push.example.com").unwrap(),
+        };
+        let rumor = build_token_request_rumor(
+            sender.public_key(),
+            nostr_sdk::Timestamp::now(),
+            vec![token_tag],
+        )
+        .unwrap();
+
+        mdk_core::prelude::message_types::Message {
+            id: rumor.id.unwrap_or(nostr_sdk::EventId::all_zeros()),
+            pubkey: sender.public_key(),
+            kind: rumor.kind,
+            mls_group_id: group_id,
+            created_at: rumor.created_at,
+            processed_at: nostr_sdk::Timestamp::now(),
+            content: rumor.content.clone(),
+            tags: rumor.tags.clone(),
+            event: rumor,
+            wrapper_event_id: nostr_sdk::EventId::all_zeros(),
+            epoch: None,
+            state: MessageState::Processed,
+        }
+    }
+
+    /// Verifies the rate check is wired into the message handler, not just
+    /// that `check_token_request_rate` works in isolation.
+    ///
+    /// Two distinct `TokenRequest` messages from the same `(group, leaf_index)`
+    /// arrive back-to-back. Only the first should schedule a pending response;
+    /// the second must be silently dropped by the rate limiter.
+    #[tokio::test]
+    async fn test_rate_limiter_wires_into_message_handler() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
+
+        let sender = Keys::generate();
+        let group_id = GroupId::from_slice(&[77; 32]);
+        let leaf_index: u32 = 3;
+
+        // Two different messages from the same sender+group+leaf.
+        let msg1 = make_token_request_message(&sender, group_id.clone());
+        let msg2 = make_token_request_message(&sender, group_id.clone());
+        let event_id_1 = msg1.event.id;
+        let event_id_2 = msg2.event.id;
+
+        // First call — must be accepted.
+        let handled1 = whitenoise
+            .handle_received_push_group_message(&mdk, &account, &msg1, Some(leaf_index))
+            .await
+            .unwrap();
+        assert!(handled1, "first token request must be handled");
+
+        // Second call — must be rate-limited (same group+leaf within cooldown).
+        let handled2 = whitenoise
+            .handle_received_push_group_message(&mdk, &account, &msg2, Some(leaf_index))
+            .await
+            .unwrap();
+        assert!(
+            handled2,
+            "rate-limited request still returns true (it is a push message)"
+        );
+
+        // The first request must have scheduled a pending response.
+        if let Some(eid) = event_id_1 {
+            assert!(
+                whitenoise.has_pending_token_response(&account.pubkey, &group_id, &eid),
+                "first request must have a pending response scheduled"
+            );
+        }
+
+        // The second request must NOT have scheduled a pending response — it
+        // was dropped before `schedule_pending_token_response` was reached.
+        if let Some(eid) = event_id_2 {
+            assert!(
+                !whitenoise.has_pending_token_response(&account.pubkey, &group_id, &eid),
+                "rate-limited request must not schedule a pending response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_allows_after_cooldown() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let acct = Keys::generate().public_key();
+        let group_id = GroupId::from_slice(&[42; 32]);
+
+        assert!(whitenoise.check_token_request_rate(&acct, &group_id, 0));
+
+        // Backdate the stored timestamp beyond the cooldown window.
+        let key = (acct, group_id.clone(), 0u32);
+        let backdated = Instant::now()
+            .checked_sub(TOKEN_REQUEST_COOLDOWN + Duration::from_millis(1))
+            .expect("system uptime must exceed cooldown window");
+        whitenoise.token_request_timestamps.insert(key, backdated);
+
+        assert!(
+            whitenoise.check_token_request_rate(&acct, &group_id, 0),
+            "request after cooldown has elapsed must be allowed"
         );
     }
 }
