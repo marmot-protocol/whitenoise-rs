@@ -19,6 +19,7 @@ pub mod accounts;
 pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
+pub mod background_notifications;
 pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
@@ -639,6 +640,26 @@ impl Whitenoise {
         GLOBAL_WHITENOISE
             .get()
             .ok_or(WhitenoiseError::Initialization)
+    }
+
+    /// Ensures the global Whitenoise singleton is initialized, returning a reference to it.
+    ///
+    /// If Whitenoise is already running (warm start), returns the existing instance immediately.
+    /// If not yet initialized (cold start), performs full initialization first.
+    ///
+    /// This is the primary entry point for contexts where the caller does not know whether
+    /// Whitenoise has already been started — for example, iOS background push handlers that
+    /// may fire when the app process is still alive or after a full cold launch.
+    ///
+    /// Unlike calling [`initialize_whitenoise`] directly, this method is safe to call
+    /// repeatedly — it will never start duplicate event processors or background tasks.
+    ///
+    /// [`initialize_whitenoise`]: Self::initialize_whitenoise
+    pub async fn ensure_initialized(config: WhitenoiseConfig) -> Result<&'static Self> {
+        if GLOBAL_WHITENOISE.get().is_none() {
+            Self::initialize_whitenoise(config).await?;
+        }
+        Self::get_instance()
     }
 
     /// Gracefully shuts down all background tasks without deleting data.

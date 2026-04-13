@@ -17,6 +17,7 @@ pub(crate) mod relay_control;
 // Crate-private because the macro expands to `crate::perf_span!(...)` which
 // only resolves inside this crate.
 pub(crate) use whitenoise_macros::perf_instrument;
+pub mod ffi;
 pub mod mdk;
 mod types;
 pub mod whitenoise;
@@ -91,6 +92,11 @@ pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTri
 // Notification streaming
 pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
+};
+
+// Background notification collection (iOS silent push)
+pub use whitenoise::background_notifications::{
+    BackgroundNotificationResult, BackgroundNotificationStatus,
 };
 pub use whitenoise::push_notifications::{
     GroupPushDebugInfo, GroupPushToken, PushPlatform, PushRegistration,
