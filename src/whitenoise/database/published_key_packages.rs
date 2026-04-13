@@ -20,18 +20,7 @@ pub struct PublishedKeyPackage {
     pub created_at: i64,
 }
 
-/// Internal row type for database mapping.
-struct PublishedKeyPackageRow {
-    id: i64,
-    account_pubkey: String,
-    key_package_hash_ref: Vec<u8>,
-    event_id: String,
-    consumed_at: Option<i64>,
-    key_material_deleted: bool,
-    created_at: i64,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for PublishedKeyPackageRow
+impl<'r, R> sqlx::FromRow<'r, R> for PublishedKeyPackage
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -58,20 +47,6 @@ where
             key_material_deleted,
             created_at,
         })
-    }
-}
-
-impl From<PublishedKeyPackageRow> for PublishedKeyPackage {
-    fn from(row: PublishedKeyPackageRow) -> Self {
-        Self {
-            id: row.id,
-            account_pubkey: row.account_pubkey,
-            key_package_hash_ref: row.key_package_hash_ref,
-            event_id: row.event_id,
-            consumed_at: row.consumed_at,
-            key_material_deleted: row.key_material_deleted,
-            created_at: row.created_at,
-        }
     }
 }
 
@@ -117,7 +92,7 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
-        let row = sqlx::query_as::<_, PublishedKeyPackageRow>(
+        let row = sqlx::query_as::<_, Self>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ? AND event_id = ?",
@@ -127,7 +102,7 @@ impl PublishedKeyPackage {
         .fetch_optional(&database.pool)
         .await?;
 
-        Ok(row.map(PublishedKeyPackage::from))
+        Ok(row)
     }
 
     /// Marks a published key package as consumed (used by a Welcome).
@@ -169,7 +144,7 @@ impl PublishedKeyPackage {
         quiet_period_secs: i64,
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
-        let rows = sqlx::query_as::<_, PublishedKeyPackageRow>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ?
@@ -189,7 +164,7 @@ impl PublishedKeyPackage {
         .fetch_all(&database.pool)
         .await?;
 
-        Ok(rows.into_iter().map(PublishedKeyPackage::from).collect())
+        Ok(rows)
     }
 
     /// Marks a published key package's key material as deleted.

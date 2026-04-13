@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use mdk_core::prelude::GroupId;
 
 use super::{Database, utils::parse_timestamp};
@@ -10,17 +10,7 @@ use crate::whitenoise::{
     group_information::{GroupInformation, GroupType},
 };
 
-/// Internal database row representation for group_information table
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct GroupInformationRow {
-    id: i64,
-    mls_group_id: GroupId,
-    group_type: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for GroupInformationRow
+impl<'r, R> sqlx::FromRow<'r, R> for GroupInformation
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -28,40 +18,28 @@ where
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
-    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let id: i64 = row.try_get("id")?;
         let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
-        let group_type: String = row.try_get("group_type")?;
+        let group_type_str: String = row.try_get("group_type")?;
 
         let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
+
+        let group_type =
+            GroupType::from_str(&group_type_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "group_type".to_string(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            })?;
+
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
         Ok(Self {
-            id,
+            id: Some(id),
             mls_group_id,
             group_type,
             created_at,
             updated_at,
-        })
-    }
-}
-
-impl GroupInformationRow {
-    fn into_group_information(self) -> Result<GroupInformation, WhitenoiseError> {
-        let group_type = GroupType::from_str(&self.group_type).map_err(|e| {
-            WhitenoiseError::Configuration(format!(
-                "Invalid group type '{}': {}",
-                self.group_type, e
-            ))
-        })?;
-
-        Ok(GroupInformation {
-            id: Some(self.id),
-            mls_group_id: self.mls_group_id,
-            group_type,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
         })
     }
 }
@@ -86,14 +64,14 @@ impl GroupInformation {
         mls_group_id: &GroupId,
         database: &Database,
     ) -> Result<Self, WhitenoiseError> {
-        let group_information_row = sqlx::query_as::<_, GroupInformationRow>(
+        let group_information = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, group_type, created_at, updated_at FROM group_information WHERE mls_group_id = ?",
         )
         .bind(mls_group_id.as_slice())
         .fetch_one(&database.pool)
         .await?;
 
-        group_information_row.into_group_information()
+        Ok(group_information)
     }
 
     /// Finds an existing GroupInformation by MLS group ID or creates a new one if not found.
@@ -165,13 +143,11 @@ impl GroupInformation {
         sep.push_unseparated(")");
 
         let rows = qb
-            .build_query_as::<GroupInformationRow>()
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await?;
 
-        rows.into_iter()
-            .map(|row| row.into_group_information())
-            .collect::<Result<Vec<_>, _>>()
+        Ok(rows)
     }
 
     // Private helper method for creating and persisting new records
@@ -183,7 +159,7 @@ impl GroupInformation {
     ) -> Result<Self, WhitenoiseError> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, GroupInformationRow>(
+        let group_information = sqlx::query_as::<_, Self>(
             "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
              VALUES (?, ?, ?, ?)
              RETURNING id, mls_group_id, group_type, created_at, updated_at",
@@ -195,7 +171,7 @@ impl GroupInformation {
         .fetch_one(&database.pool)
         .await?;
 
-        row.into_group_information()
+        Ok(group_information)
     }
 }
 
@@ -406,5 +382,37 @@ mod tests {
 
         assert_eq!(found_dm.group_type, GroupType::DirectMessage);
         assert_eq!(found_dm.id, dm_group_info.id);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_group_type_returns_column_decode_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[99; 32]);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Insert a row with a malformed group_type value directly, bypassing
+        // GroupType's Display so we can exercise the decode error path.
+        sqlx::query(
+            "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(group_id.as_slice())
+        .bind("not_a_real_group_type")
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let err = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database)
+            .await
+            .unwrap_err();
+
+        match err {
+            WhitenoiseError::SqlxError(sqlx::Error::ColumnDecode { index, .. }) => {
+                assert_eq!(index, "group_type");
+            }
+            other => panic!("expected ColumnDecode for group_type, got {:?}", other),
+        }
     }
 }

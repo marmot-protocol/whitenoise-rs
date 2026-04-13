@@ -59,10 +59,25 @@ impl FileMetadata {
     }
 }
 
-/// Internal database row representation for media_files table
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct MediaFileRow {
-    pub id: i64,
+/// Parameters for saving a media file
+#[derive(Debug, Clone)]
+pub struct MediaFileParams<'a> {
+    pub file_path: &'a Path,
+    pub original_file_hash: Option<&'a [u8; 32]>, // SHA-256 of decrypted content (for chat_media with MDK)
+    pub encrypted_file_hash: &'a [u8; 32],        // SHA-256 of encrypted blob (for Blossom)
+    pub mime_type: &'a str,
+    pub media_type: &'a str,
+    pub blossom_url: Option<&'a str>,
+    pub nostr_key: Option<&'a str>,
+    pub file_metadata: Option<&'a FileMetadata>,
+    pub nonce: Option<&'a str>, // Encryption nonce (hex-encoded, for chat_media)
+    pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
+}
+
+/// Represents a cached media file
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFile {
+    pub id: Option<i64>,
     pub mls_group_id: GroupId,
     pub account_pubkey: PublicKey,
     pub file_path: PathBuf,
@@ -78,7 +93,7 @@ pub(crate) struct MediaFileRow {
     pub created_at: DateTime<Utc>,
 }
 
-impl<'r, R> sqlx::FromRow<'r, R> for MediaFileRow
+impl<'r, R> sqlx::FromRow<'r, R> for MediaFile
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -136,7 +151,7 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
 
         Ok(Self {
-            id,
+            id: Some(id),
             mls_group_id,
             account_pubkey,
             file_path,
@@ -151,61 +166,6 @@ where
             scheme_version,
             created_at,
         })
-    }
-}
-
-/// Parameters for saving a media file
-#[derive(Debug, Clone)]
-pub struct MediaFileParams<'a> {
-    pub file_path: &'a Path,
-    pub original_file_hash: Option<&'a [u8; 32]>, // SHA-256 of decrypted content (for chat_media with MDK)
-    pub encrypted_file_hash: &'a [u8; 32],        // SHA-256 of encrypted blob (for Blossom)
-    pub mime_type: &'a str,
-    pub media_type: &'a str,
-    pub blossom_url: Option<&'a str>,
-    pub nostr_key: Option<&'a str>,
-    pub file_metadata: Option<&'a FileMetadata>,
-    pub nonce: Option<&'a str>, // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<&'a str>, // Encryption version (e.g., "mip04-v2", for chat_media)
-}
-
-/// Represents a cached media file
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MediaFile {
-    pub id: Option<i64>,
-    pub mls_group_id: GroupId,
-    pub account_pubkey: PublicKey,
-    pub file_path: PathBuf,
-    pub original_file_hash: Option<Vec<u8>>, // SHA-256 of decrypted content (MIP-04 x field, MDK key derivation)
-    pub encrypted_file_hash: Vec<u8>,        // SHA-256 of encrypted blob (Blossom verification)
-    pub mime_type: String,
-    pub media_type: String,
-    pub blossom_url: Option<String>,
-    pub nostr_key: Option<String>,
-    pub file_metadata: Option<FileMetadata>,
-    pub nonce: Option<String>, // Encryption nonce (hex-encoded, for chat_media)
-    pub scheme_version: Option<String>, // Encryption version (e.g., "mip04-v2", for chat_media)
-    pub created_at: DateTime<Utc>,
-}
-
-impl From<MediaFileRow> for MediaFile {
-    fn from(val: MediaFileRow) -> Self {
-        Self {
-            id: Some(val.id),
-            mls_group_id: val.mls_group_id,
-            account_pubkey: val.account_pubkey,
-            file_path: val.file_path,
-            original_file_hash: val.original_file_hash,
-            encrypted_file_hash: val.encrypted_file_hash,
-            mime_type: val.mime_type,
-            media_type: val.media_type,
-            blossom_url: val.blossom_url,
-            nostr_key: val.nostr_key,
-            file_metadata: val.file_metadata,
-            nonce: val.nonce,
-            scheme_version: val.scheme_version,
-            created_at: val.created_at,
-        }
     }
 }
 
@@ -229,7 +189,7 @@ impl MediaFile {
     ) -> Result<Option<Self>, WhitenoiseError> {
         let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
 
-        let row_opt = sqlx::query_as::<_, MediaFileRow>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -243,7 +203,7 @@ impl MediaFile {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row_opt.map(Into::into))
+        Ok(row_opt)
     }
 
     /// Saves a cached media file to the database
@@ -283,7 +243,7 @@ impl MediaFile {
 
         let account_pubkey_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, MediaFileRow>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "INSERT INTO media_files (
                 mls_group_id, account_pubkey, file_path,
                 original_file_hash, encrypted_file_hash,
@@ -316,11 +276,11 @@ impl MediaFile {
         .map_err(DatabaseError::Sqlx)?;
 
         if let Some(row) = row_opt {
-            return Ok(row.into());
+            return Ok(row);
         }
 
         // Conflict occurred - select existing row
-        let existing = sqlx::query_as::<_, MediaFileRow>(
+        let existing = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -336,7 +296,7 @@ impl MediaFile {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(existing.into())
+        Ok(existing)
     }
 
     /// Finds all media files for a specific MLS group
@@ -352,7 +312,7 @@ impl MediaFile {
         database: &Database,
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let rows = sqlx::query_as::<_, MediaFileRow>(
+        let rows = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -365,7 +325,7 @@ impl MediaFile {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(rows)
     }
 
     /// Finds a media file by original hash, group ID, and account (MIP-04 compliant lookup)
@@ -409,7 +369,7 @@ impl MediaFile {
         let hash_hex = hex::encode(original_file_hash);
         let account_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, MediaFileRow>(
+        let row_opt = sqlx::query_as::<_, Self>(
             "SELECT id, mls_group_id, account_pubkey, file_path,
                     original_file_hash, encrypted_file_hash,
                     mime_type, media_type, blossom_url, nostr_key,
@@ -425,7 +385,7 @@ impl MediaFile {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row_opt.map(Into::into))
+        Ok(row_opt)
     }
 
     /// Updates the file_path for an existing media file record
@@ -459,7 +419,7 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
-        let row = sqlx::query_as::<_, MediaFileRow>(
+        let row = sqlx::query_as::<_, Self>(
             "UPDATE media_files
              SET file_path = ?
              WHERE id = ?
@@ -479,7 +439,7 @@ impl MediaFile {
             _ => DatabaseError::Sqlx(e).into(),
         })?;
 
-        Ok(row.into())
+        Ok(row)
     }
 
     /// Returns all distinct non-empty file paths referenced by media_files records.
