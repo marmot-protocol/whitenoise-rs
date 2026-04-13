@@ -37,7 +37,7 @@ impl FollowsCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json, account_flag).await,
             Self::Add { pubkey } => add(socket, json, account_flag, pubkey).await,
@@ -47,7 +47,7 @@ impl FollowsCmd {
     }
 }
 
-async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::FollowsList { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -58,7 +58,7 @@ async fn add(
     json: bool,
     account_flag: Option<&str>,
     pubkey: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let account = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::FollowsAdd { account, pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -69,7 +69,7 @@ async fn remove(
     json: bool,
     account_flag: Option<&str>,
     pubkey: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let account = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::FollowsRemove { account, pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -80,7 +80,7 @@ async fn check(
     json: bool,
     account_flag: Option<&str>,
     pubkey: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let account = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::FollowsCheck { account, pubkey }).await?;
     output::print_and_exit(&resp, json)

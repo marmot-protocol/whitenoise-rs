@@ -1,7 +1,10 @@
-use crate::WhitenoiseError;
-use crate::integration_tests::core::*;
+use std::io::Write;
+
 use async_trait::async_trait;
 use nostr_sdk::Url;
+
+use crate::WhitenoiseError;
+use crate::integration_tests::core::*;
 
 /// Test case for uploading PDF documents
 pub struct UploadPdfTestCase {
@@ -19,22 +22,13 @@ impl UploadPdfTestCase {
 
     /// Create a temporary PDF file with valid magic bytes
     fn create_test_pdf(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        use std::io::Write;
-
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let mut temp_file = tempfile::NamedTempFile::new()?;
 
         // Minimal valid PDF header
         let pdf_header: &[u8] = b"%PDF-1.4\n";
 
-        temp_file.write_all(pdf_header).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to write PDF data: {}", e))
-        })?;
-
-        temp_file.flush().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to flush temp file: {}", e))
-        })?;
+        temp_file.write_all(pdf_header)?;
+        temp_file.flush()?;
 
         Ok(temp_file)
     }
@@ -56,7 +50,7 @@ impl TestCase for UploadPdfTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         // Read the file data and compute expected hash
         let test_pdf_data = tokio::fs::read(temp_path).await?;

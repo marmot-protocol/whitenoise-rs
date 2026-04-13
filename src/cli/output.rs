@@ -6,7 +6,7 @@ use nostr_sdk::{PublicKey, ToBech32};
 use super::protocol::Response;
 
 /// Print a response and return a non-zero exit code on error.
-pub fn print_and_exit(response: &Response, json: bool) -> anyhow::Result<()> {
+pub fn print_and_exit(response: &Response, json: bool) -> crate::cli::Result<()> {
     print_response(response, json);
     if response.error.is_some() {
         std::process::exit(1);

@@ -96,8 +96,7 @@ impl User {
 
         for (pubkey_hex, relay_url) in rows {
             if current_pubkey.as_ref() != Some(&pubkey_hex) {
-                let pk =
-                    PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
+                let pk = PublicKey::parse(&pubkey_hex).map_err(WhitenoiseError::from)?;
                 result.push((pk, Vec::new()));
                 current_pubkey = Some(pubkey_hex);
             }
@@ -126,9 +125,7 @@ impl User {
         .map_err(DatabaseError::Sqlx)?;
 
         rows.into_iter()
-            .map(|pubkey_hex| {
-                PublicKey::parse(&pubkey_hex).map_err(|error| WhitenoiseError::Other(error.into()))
-            })
+            .map(|pubkey_hex| PublicKey::parse(&pubkey_hex).map_err(WhitenoiseError::from))
             .collect()
     }
 

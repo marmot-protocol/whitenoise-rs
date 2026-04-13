@@ -5,12 +5,12 @@ use crate::cli::client;
 use crate::cli::output;
 use crate::cli::protocol::{Request, Response};
 
-pub async fn create_identity(socket: &Path, json: bool) -> anyhow::Result<()> {
+pub async fn create_identity(socket: &Path, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::CreateIdentity).await?;
     output::print_and_exit(&resp, json)
 }
 
-pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::Result<()> {
+pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> crate::cli::Result<()> {
     let nsec = read_nsec()?;
     let resp = client::send(socket, &Request::LoginStart { nsec }).await?;
 
@@ -41,7 +41,9 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
         .and_then(|v| v.get("account"))
         .and_then(|v| v.get("pubkey"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("unexpected login response: missing pubkey"))?
+        .ok_or_else(|| {
+            crate::cli::error::CliError::msg("unexpected login response: missing pubkey")
+        })?
         .to_string();
 
     let relay_resp = match relay {
@@ -86,7 +88,7 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
                 if url.is_empty() {
                     // User bailed — cancel the pending login
                     let _ = client::send(socket, &Request::LoginCancel { pubkey }).await;
-                    anyhow::bail!("login cancelled");
+                    return Err(crate::cli::error::CliError::msg("login cancelled"));
                 }
 
                 client::send(
@@ -114,7 +116,7 @@ pub async fn login(socket: &Path, json: bool, relay: Option<String>) -> anyhow::
     Ok(())
 }
 
-pub async fn logout(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<()> {
+pub async fn logout(socket: &Path, pubkey: &str, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(
         socket,
         &Request::Logout {
@@ -125,7 +127,7 @@ pub async fn logout(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<(
     output::print_and_exit(&resp, json)
 }
 
-pub async fn whoami(socket: &Path, json: bool) -> anyhow::Result<()> {
+pub async fn whoami(socket: &Path, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::AllAccounts).await?;
     if json {
         output::print_response(&resp, true);
@@ -148,7 +150,7 @@ pub async fn whoami(socket: &Path, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> anyhow::Result<()> {
+pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(
         socket,
         &Request::ExportNsec {
@@ -159,7 +161,7 @@ pub async fn export_nsec(socket: &Path, pubkey: &str, json: bool) -> anyhow::Res
     output::print_and_exit(&resp, json)
 }
 
-fn read_nsec() -> anyhow::Result<String> {
+fn read_nsec() -> crate::cli::Result<String> {
     let nsec = if io::stdin().is_terminal() {
         eprint!("Enter nsec: ");
         io::stderr().flush()?;
@@ -173,7 +175,7 @@ fn read_nsec() -> anyhow::Result<String> {
     };
     let nsec = nsec.trim().to_string();
     if nsec.is_empty() {
-        anyhow::bail!("no nsec provided");
+        return Err(crate::cli::error::CliError::msg("no nsec provided"));
     }
     Ok(nsec)
 }

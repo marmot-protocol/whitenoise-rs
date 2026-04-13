@@ -94,7 +94,7 @@ impl TestCase for VerifyInitialMessagesTestCase {
                 .iter()
                 .find(|m| &m.id == msg_id)
                 .ok_or_else(|| {
-                    WhitenoiseError::Other(anyhow::anyhow!(
+                    WhitenoiseError::Internal(format!(
                         "Message '{}' not found for reaction check",
                         key
                     ))
@@ -120,7 +120,7 @@ impl TestCase for VerifyInitialMessagesTestCase {
                 .iter()
                 .find(|m| &m.id == msg_id)
                 .ok_or_else(|| {
-                    WhitenoiseError::Other(anyhow::anyhow!(
+                    WhitenoiseError::Internal(format!(
                         "Message '{}' not found for no-reaction check",
                         key
                     ))

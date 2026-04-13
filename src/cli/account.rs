@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::cli::client;
+use crate::cli::error::CliError;
 use crate::cli::protocol::Request;
 
 /// Resolve which account to use for a command.
@@ -10,7 +11,7 @@ use crate::cli::protocol::Request;
 /// 2. `WN_ACCOUNT` environment variable
 /// 3. If exactly one account is logged in, use it
 /// 4. Error with guidance
-pub async fn resolve_account(socket: &Path, explicit: Option<&str>) -> anyhow::Result<String> {
+pub async fn resolve_account(socket: &Path, explicit: Option<&str>) -> crate::cli::Result<String> {
     // 1. Explicit flag
     if let Some(pubkey) = explicit {
         return Ok(pubkey.to_string());
@@ -28,7 +29,7 @@ pub async fn resolve_account(socket: &Path, explicit: Option<&str>) -> anyhow::R
     let resp = client::send(socket, &Request::AllAccounts).await?;
 
     if let Some(error) = &resp.error {
-        anyhow::bail!("{}", error.message);
+        return Err(CliError::msg(error.message.clone()));
     }
 
     let pubkeys = extract_pubkeys(&resp.result);
@@ -36,20 +37,20 @@ pub async fn resolve_account(socket: &Path, explicit: Option<&str>) -> anyhow::R
 }
 
 /// Pure resolution logic over a list of pubkeys, separated for testability.
-fn resolve_from_list(pubkeys: &[String]) -> anyhow::Result<String> {
+fn resolve_from_list(pubkeys: &[String]) -> crate::cli::Result<String> {
     match pubkeys.len() {
-        0 => anyhow::bail!(
-            "no accounts logged in\n\n  Create one with: wn create-identity\n  Or log in with:  wn login"
-        ),
+        0 => Err(CliError::msg(
+            "no accounts logged in\n\n  Create one with: wn create-identity\n  Or log in with:  wn login",
+        )),
         1 => Ok(pubkeys[0].clone()),
-        _ => anyhow::bail!(
+        _ => Err(CliError::msg(format!(
             "multiple accounts logged in. Specify --account <npub> or set WN_ACCOUNT\n\n  Accounts:\n{}",
             pubkeys
                 .iter()
                 .map(|p| format!("    {p}"))
                 .collect::<Vec<_>>()
                 .join("\n")
-        ),
+        ))),
     }
 }
 

@@ -197,9 +197,10 @@ impl PublishSubscriptionUpdateTestCase {
                     {
                         Ok(())
                     } else {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        Err(WhitenoiseError::Internal(
                             "Account subscription-driven metadata update not yet applied"
-                        )))
+                                .to_string(),
+                        ))
                     }
                 },
                 "account subscription metadata update",
@@ -222,9 +223,10 @@ impl PublishSubscriptionUpdateTestCase {
                     {
                         Ok(())
                     } else {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        Err(WhitenoiseError::Internal(
                             "External user subscription-driven metadata update not yet applied"
-                        )))
+                                .to_string(),
+                        ))
                     }
                 },
                 &format!(
@@ -271,11 +273,9 @@ impl PublishSubscriptionUpdateTestCase {
                     if has_new_relay {
                         Ok(())
                     } else {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        Err(WhitenoiseError::Internal(format!(
                             "{} NIP-65 relays missing subscription-updated relay: {}, got: {:?}",
-                            user_type,
-                            expected_relay_url,
-                            nip65_relays
+                            user_type, expected_relay_url, nip65_relays
                         )))
                     }
                 },
@@ -300,11 +300,9 @@ impl PublishSubscriptionUpdateTestCase {
                     if has_new_relay {
                         Ok(())
                     } else {
-                        Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        Err(WhitenoiseError::Internal(format!(
                             "{} NIP-65 relays missing subscription-updated relay: {}, got: {:?}",
-                            user_type,
-                            expected_relay_url,
-                            nip65_relays
+                            user_type, expected_relay_url, nip65_relays
                         )))
                     }
                 },
@@ -347,7 +345,7 @@ impl PublishSubscriptionUpdateTestCase {
                 if actual == expected {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Account follows do not match expected follows. Missing: {:?}, Extra: {:?}",
                         expected.difference(&actual).collect::<Vec<_>>(),
                         actual.difference(&expected).collect::<Vec<_>>()

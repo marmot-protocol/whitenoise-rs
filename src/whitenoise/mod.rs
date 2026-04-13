@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::rand::RngCore;
 
-use anyhow::Context;
 use dashmap::DashMap;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
@@ -47,6 +46,7 @@ pub mod secrets_store;
 mod signer;
 pub mod storage;
 mod streaming;
+pub mod streaming_error;
 mod subscriptions;
 pub mod user_search;
 pub mod user_streaming;
@@ -445,13 +445,25 @@ impl Whitenoise {
         let data_dir = &config.data_dir;
         let logs_dir = &config.logs_dir;
 
-        // Setup directories
-        std::fs::create_dir_all(data_dir)
-            .with_context(|| format!("Failed to create data directory: {:?}", data_dir))
-            .map_err(WhitenoiseError::from)?;
-        std::fs::create_dir_all(logs_dir)
-            .with_context(|| format!("Failed to create logs directory: {:?}", logs_dir))
-            .map_err(WhitenoiseError::from)?;
+        // Setup directories. Path context is preserved via tracing; the
+        // io::Error itself flows through `WhitenoiseError::Filesystem` so
+        // callers can distinguish filesystem failures.
+        std::fs::create_dir_all(data_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?data_dir,
+                error = %e,
+                "Failed to create data directory"
+            );
+        })?;
+        std::fs::create_dir_all(logs_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?logs_dir,
+                error = %e,
+                "Failed to create logs directory"
+            );
+        })?;
 
         // Only initialize tracing once
         init_tracing(logs_dir);

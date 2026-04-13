@@ -76,7 +76,7 @@ impl ResolveUserBlockingTestCase {
         let metadata = self
             .test_metadata
             .as_ref()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Missing test metadata")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Missing test metadata".to_string()))?;
         tracing::info!(target: LOG_TARGET, "Publishing test metadata for test pubkey");
         let event_id = *test_client
             .send_event_builder(nostr_sdk::EventBuilder::metadata(metadata))

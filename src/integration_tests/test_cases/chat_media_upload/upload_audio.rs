@@ -21,9 +21,8 @@ impl UploadAudioTestCase {
     fn create_test_audio(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
         use std::io::Write;
 
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let mut temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
         // MP3 magic bytes (ID3v2 header)
         let mp3_header: &[u8] = &[
@@ -33,13 +32,13 @@ impl UploadAudioTestCase {
             0x00, 0x00, 0x00, 0x00, // size (syncsafe integer)
         ];
 
-        temp_file.write_all(mp3_header).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to write MP3 data: {}", e))
-        })?;
+        temp_file
+            .write_all(mp3_header)
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to write MP3 data: {}", e)))?;
 
-        temp_file.flush().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to flush temp file: {}", e))
-        })?;
+        temp_file
+            .flush()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to flush temp file: {}", e)))?;
 
         Ok(temp_file)
     }
@@ -61,7 +60,7 @@ impl TestCase for UploadAudioTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         // Read the file data and compute expected hash
         let test_audio_data = tokio::fs::read(temp_path).await?;

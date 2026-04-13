@@ -25,7 +25,7 @@ pub enum SettingsCmd {
 }
 
 impl SettingsCmd {
-    pub async fn run(self, socket: &Path, json: bool) -> anyhow::Result<()> {
+    pub async fn run(self, socket: &Path, json: bool) -> crate::cli::Result<()> {
         match self {
             Self::Show => show(socket, json).await,
             Self::Theme { mode } => theme(socket, json, &mode).await,
@@ -34,17 +34,17 @@ impl SettingsCmd {
     }
 }
 
-async fn show(socket: &Path, json: bool) -> anyhow::Result<()> {
+async fn show(socket: &Path, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::SettingsShow).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn theme(socket: &Path, json: bool, mode: &str) -> anyhow::Result<()> {
+async fn theme(socket: &Path, json: bool, mode: &str) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::SettingsTheme { theme: mode.into() }).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn language(socket: &Path, json: bool, lang: &str) -> anyhow::Result<()> {
+async fn language(socket: &Path, json: bool, lang: &str) -> crate::cli::Result<()> {
     let resp = client::send(
         socket,
         &Request::SettingsLanguage {

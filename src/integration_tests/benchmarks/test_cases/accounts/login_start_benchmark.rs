@@ -37,7 +37,7 @@ impl BenchmarkTestCase for LoginStartBenchmark {
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = context.tests_count as usize;
         if iteration >= self.prepared_keys.len() {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Login start benchmark iteration {} exceeds prepared keys count ({})",
                 iteration,
                 self.prepared_keys.len()
@@ -50,12 +50,11 @@ impl BenchmarkTestCase for LoginStartBenchmark {
         let result = context
             .whitenoise
             .login_start(keys.secret_key().to_secret_hex())
-            .await
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("{}", e)))?;
+            .await?;
         let duration = start.elapsed();
 
         if result.status != LoginStatus::Complete {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Expected LoginStatus::Complete but got {:?}",
                 result.status
             )));

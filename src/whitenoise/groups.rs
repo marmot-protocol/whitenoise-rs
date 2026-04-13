@@ -20,6 +20,7 @@ use crate::{
     },
 };
 
+pub mod blossom_error;
 mod media;
 mod membership;
 mod publish;
@@ -125,9 +126,9 @@ impl Whitenoise {
         key_package_events: &[Event],
     ) -> Result<Vec<(UnsignedEvent, User, PublicKey)>> {
         if welcome_rumors.len() != members.len() {
-            return Err(WhitenoiseError::Other(anyhow::Error::msg(
-                "Welcome rumours are missing for some of the members",
-            )));
+            return Err(WhitenoiseError::Internal(
+                "Welcome rumours are missing for some of the members".to_string(),
+            ));
         }
 
         let kp_pubkey_by_event_id: HashMap<EventId, PublicKey> = key_package_events
@@ -143,18 +144,18 @@ impl Whitenoise {
         welcome_rumors
             .into_iter()
             .map(|rumor| {
-                let kp_event_id = rumor.tags.event_ids().next().ok_or(WhitenoiseError::Other(
-                    anyhow::anyhow!("No event ID found in welcome rumor"),
-                ))?;
+                let kp_event_id = rumor.tags.event_ids().next().ok_or_else(|| {
+                    WhitenoiseError::Internal("No event ID found in welcome rumor".to_string())
+                })?;
                 let member_pubkey = kp_pubkey_by_event_id.get(kp_event_id).copied().ok_or(
-                    WhitenoiseError::Other(anyhow::anyhow!(
-                        "No public key found in key package event"
-                    )),
+                    WhitenoiseError::Internal(
+                        "No public key found in key package event".to_string(),
+                    ),
                 )?;
                 let member =
                     members_by_pubkey
                         .remove(&member_pubkey)
-                        .ok_or(WhitenoiseError::Other(anyhow::anyhow!(
+                        .ok_or(WhitenoiseError::Internal(format!(
                             "No member record found for welcome target {}",
                             member_pubkey
                         )))?;
@@ -645,9 +646,9 @@ impl Whitenoise {
         };
 
         if welcome_rumors.len() != users.len() {
-            return Err(WhitenoiseError::Other(anyhow::Error::msg(
-                "Welcome rumours are missing for some of the members",
-            )));
+            return Err(WhitenoiseError::Internal(
+                "Welcome rumours are missing for some of the members".to_string(),
+            ));
         }
 
         self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
@@ -662,17 +663,17 @@ impl Whitenoise {
                     .tags
                     .event_ids()
                     .next()
-                    .ok_or(WhitenoiseError::Other(anyhow::anyhow!(
-                        "No event ID found in welcome rumor"
-                    )))?;
+                    .ok_or(WhitenoiseError::Internal(
+                        "No event ID found in welcome rumor".to_string(),
+                    ))?;
 
             let member_pubkey = key_package_events
                 .iter()
                 .find(|event| event.id == *key_package_event_id)
                 .map(|event| event.pubkey)
-                .ok_or(WhitenoiseError::Other(anyhow::anyhow!(
-                    "No public key found in key package event"
-                )))?;
+                .ok_or(WhitenoiseError::Internal(
+                    "No public key found in key package event".to_string(),
+                ))?;
 
             // Create a timestamp 1 month in the future
             let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);

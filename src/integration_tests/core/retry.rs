@@ -54,11 +54,9 @@ where
                         retry_count,
                         e
                     );
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Operation '{}' failed after {} retries: {}",
-                        description,
-                        retry_count,
-                        e
+                        description, retry_count, e
                     )));
                 }
 

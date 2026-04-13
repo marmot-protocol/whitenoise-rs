@@ -6,8 +6,10 @@ use crate::{
     whitenoise::{
         accounts::{AccountError, LoginError},
         database::DatabaseError,
+        groups::blossom_error::BlossomError,
         message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
+        streaming_error::StreamingError,
     },
 };
 
@@ -144,8 +146,20 @@ pub enum WhitenoiseError {
     #[error("Message aggregation error: {0}")]
     MessageAggregation(#[from] ProcessingError),
 
-    #[error("Other error: {0}")]
-    Other(#[from] anyhow::Error),
+    #[error("Streaming error: {0}")]
+    Streaming(#[from] StreamingError),
+
+    #[error("Blossom error: {0}")]
+    Blossom(#[from] BlossomError),
+
+    #[error("MDK group image error: {0}")]
+    MdkGroupImage(#[from] mdk_core::extension::GroupImageError),
+
+    #[error("MDK encrypted media error: {0}")]
+    MdkEncryptedMedia(#[from] mdk_core::encrypted_media::EncryptedMediaError),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
@@ -221,7 +235,7 @@ pub enum WhitenoiseError {
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        WhitenoiseError::Other(anyhow::anyhow!(err.to_string()))
+        Self::Internal(err.to_string())
     }
 }
 
@@ -240,10 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn boxed_errors_map_to_other_variant() {
+    fn boxed_errors_map_to_internal_variant() {
         let boxed: Box<dyn std::error::Error + Send + Sync> = std::io::Error::other("boom").into();
         let err = WhitenoiseError::from(boxed);
-        assert!(matches!(err, WhitenoiseError::Other(_)));
+        assert!(matches!(err, WhitenoiseError::Internal(_)));
         assert!(format!("{err}").contains("boom"));
     }
 

@@ -20,17 +20,14 @@ impl DownloadChatMediaTestCase {
 
     /// Create a temporary test image file
     fn create_test_image(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        let temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
         // Create a distinctive 100x100 blue image for testing
         let img = ::image::RgbaImage::from_pixel(100, 100, ::image::Rgba([0u8, 0, 255, 255]));
 
         img.save_with_format(temp_file.path(), ::image::ImageFormat::Png)
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to save test image: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to save test image: {}", e)))?;
 
         Ok(temp_file)
     }
@@ -53,7 +50,7 @@ impl TestCase for DownloadChatMediaTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         // Read original file data for later comparison
         let original_file_data = tokio::fs::read(temp_path).await?;
@@ -117,7 +114,7 @@ impl TestCase for DownloadChatMediaTestCase {
         );
 
         tokio::fs::remove_file(&cached_path).await.map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to delete cached file: {}", e))
+            WhitenoiseError::Internal(format!("Failed to delete cached file: {}", e))
         })?;
 
         tracing::info!(
@@ -137,7 +134,7 @@ impl TestCase for DownloadChatMediaTestCase {
             .unwrap()
             .as_slice()
             .try_into()
-            .map_err(|_| WhitenoiseError::Other(anyhow::anyhow!("Invalid hash length")))?;
+            .map_err(|_| WhitenoiseError::Internal("Invalid hash length".to_string()))?;
 
         // Step 5: Call download_chat_media with original hash
         tracing::info!(

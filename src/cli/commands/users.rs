@@ -32,7 +32,7 @@ impl UsersCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::Show { pubkey } => show(socket, json, &pubkey).await,
             Self::Search { query, radius } => {
@@ -59,7 +59,7 @@ fn parse_radius(s: &str) -> Result<(u8, u8), String> {
     Ok((start, end))
 }
 
-async fn show(socket: &Path, json: bool, pubkey: &str) -> anyhow::Result<()> {
+async fn show(socket: &Path, json: bool, pubkey: &str) -> crate::cli::Result<()> {
     let resp = client::send(
         socket,
         &Request::UsersShow {
@@ -77,7 +77,7 @@ async fn search(
     query: &str,
     radius_start: u8,
     radius_end: u8,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let req = Request::UsersSearch {
         account: pubkey,

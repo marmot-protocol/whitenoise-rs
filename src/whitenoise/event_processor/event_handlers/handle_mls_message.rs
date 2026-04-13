@@ -748,7 +748,7 @@ impl Whitenoise {
         tags.iter()
             .find(|tag| tag.kind() == nostr_sdk::TagKind::e())
             .and_then(|tag| tag.content().map(|s| s.to_string()))
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Reaction missing e-tag")))
+            .ok_or_else(|| WhitenoiseError::InvalidEvent("Reaction missing e-tag".to_string()))
     }
 
     pub(crate) fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {

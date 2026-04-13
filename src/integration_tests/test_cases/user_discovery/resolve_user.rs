@@ -102,9 +102,9 @@ impl TestCase for ResolveUserTestCase {
                 if u.metadata != nostr_sdk::Metadata::default() {
                     Ok(u)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Background metadata fetch not yet complete"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "Background metadata fetch not yet complete".to_string(),
+                    ))
                 }
             },
             &format!(

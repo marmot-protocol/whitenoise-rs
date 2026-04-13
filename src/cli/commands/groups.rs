@@ -132,7 +132,7 @@ impl GroupsCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json, account_flag).await,
             Self::Create {
@@ -177,7 +177,7 @@ async fn create(
     name: String,
     members: Vec<String>,
     description: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -197,7 +197,7 @@ async fn show(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -216,7 +216,7 @@ async fn add_members(
     account_flag: Option<&str>,
     group_id: String,
     members: Vec<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -236,7 +236,7 @@ async fn remove_members(
     account_flag: Option<&str>,
     group_id: String,
     members: Vec<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -255,7 +255,7 @@ async fn members(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -273,7 +273,7 @@ async fn admins(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -291,7 +291,7 @@ async fn relays(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -309,7 +309,7 @@ async fn leave(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -328,7 +328,7 @@ async fn rename(
     account_flag: Option<&str>,
     group_id: String,
     name: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -342,13 +342,13 @@ async fn rename(
     output::print_and_exit(&resp, json)
 }
 
-async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::VisibleGroups { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn invites(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn invites(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::GroupInvites { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -359,7 +359,7 @@ async fn accept(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -377,7 +377,7 @@ async fn decline(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -396,7 +396,7 @@ async fn promote(
     account_flag: Option<&str>,
     group_id: String,
     pubkey: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let account = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -416,7 +416,7 @@ async fn demote(
     account_flag: Option<&str>,
     group_id: String,
     pubkey: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let account = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -435,7 +435,7 @@ async fn self_demote(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

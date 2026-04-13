@@ -43,7 +43,7 @@ impl RelaysCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List { relay_type } => list(socket, json, account_flag, relay_type).await,
             Self::Add { url, relay_type } => add(socket, json, account_flag, url, relay_type).await,
@@ -59,7 +59,7 @@ async fn list(
     json: bool,
     account_flag: Option<&str>,
     relay_type: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -78,7 +78,7 @@ async fn add(
     account_flag: Option<&str>,
     url: String,
     relay_type: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -98,7 +98,7 @@ async fn remove(
     account_flag: Option<&str>,
     url: String,
     relay_type: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

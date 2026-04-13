@@ -41,16 +41,16 @@ impl KeysCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json, account_flag).await,
             Self::Publish => publish(socket, json, account_flag).await,
             Self::Delete { event_id } => delete(socket, json, account_flag, event_id).await,
             Self::DeleteAll { confirm } => {
                 if !confirm {
-                    anyhow::bail!(
-                        "this will delete ALL published key packages. Pass --confirm to proceed."
-                    );
+                    return Err(crate::cli::error::CliError::msg(
+                        "this will delete ALL published key packages. Pass --confirm to proceed.",
+                    ));
                 }
                 delete_all(socket, json, account_flag).await
             }
@@ -59,13 +59,13 @@ impl KeysCmd {
     }
 }
 
-async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::KeysList { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn publish(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn publish(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::KeysPublish { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -76,7 +76,7 @@ async fn delete(
     json: bool,
     account_flag: Option<&str>,
     event_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -89,13 +89,17 @@ async fn delete(
     output::print_and_exit(&resp, json)
 }
 
-async fn delete_all(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn delete_all(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::KeysDeleteAll { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn check(socket: &Path, json: bool, pubkey: &str) -> anyhow::Result<()> {
+async fn check(socket: &Path, json: bool, pubkey: &str) -> crate::cli::Result<()> {
     let resp = client::send(
         socket,
         &Request::KeysCheck {

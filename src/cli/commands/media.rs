@@ -48,7 +48,7 @@ impl MediaCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::Upload {
                 group_id,
@@ -84,7 +84,7 @@ async fn upload(
     file_path: String,
     send: bool,
     message: Option<String>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     // --message implies --send
     let send = send || message.is_some();
@@ -102,7 +102,7 @@ async fn upload(
     output::print_and_exit(&resp, json)
 }
 
-async fn list(socket: &Path, json: bool, group_id: String) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool, group_id: String) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::ListMedia { group_id }).await?;
     output::print_and_exit(&resp, json)
 }
@@ -113,7 +113,7 @@ async fn download(
     account_flag: Option<&str>,
     group_id: String,
     file_hash: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

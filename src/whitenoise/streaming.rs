@@ -8,7 +8,8 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
-use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::error::Result;
+use crate::whitenoise::streaming_error::{StreamKind, StreamingError};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{
     aggregated_message, chat_list, chat_list_streaming, media_files, message_aggregator,
@@ -61,10 +62,7 @@ impl Whitenoise {
                 limit,
                 cleared_at_ms,
             )
-            .await
-            .map_err(|e| {
-                WhitenoiseError::from(anyhow::anyhow!("Failed to read cached messages: {}", e))
-            })?;
+            .await?;
 
         // 3. Build a map keyed by message ID for deduplication.
         let mut messages_map: HashMap<String, message_aggregator::ChatMessage> = fetched_messages
@@ -104,16 +102,18 @@ impl Whitenoise {
                         target: "whitenoise::mod",
                         "subscription drain lagged by {n} messages, snapshot may be incomplete"
                     );
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Message stream lagged by {} messages during subscription initialization, retry needed",
-                        n
-                    )));
+                    return Err(StreamingError::Lagged {
+                        stream: StreamKind::Message,
+                        missed: n,
+                    }
+                    .into());
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     // Channel closed unexpectedly — unreachable while we hold a receiver.
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Message stream closed unexpectedly during subscription"
-                    )));
+                    return Err(StreamingError::Closed {
+                        stream: StreamKind::Message,
+                    }
+                    .into());
                 }
             }
         }
@@ -174,9 +174,10 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "User stream closed unexpectedly during subscription"
-                    )));
+                    return Err(StreamingError::Closed {
+                        stream: StreamKind::User,
+                    }
+                    .into());
                 }
             }
         }
@@ -223,9 +224,10 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Chat list stream closed unexpectedly during subscription"
-                    )));
+                    return Err(StreamingError::Closed {
+                        stream: StreamKind::ChatList,
+                    }
+                    .into());
                 }
             }
         }
@@ -277,9 +279,10 @@ impl Whitenoise {
                     continue;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Archived chat list stream closed unexpectedly during subscription"
-                    )));
+                    return Err(StreamingError::Closed {
+                        stream: StreamKind::ArchivedChatList,
+                    }
+                    .into());
                 }
             }
         }

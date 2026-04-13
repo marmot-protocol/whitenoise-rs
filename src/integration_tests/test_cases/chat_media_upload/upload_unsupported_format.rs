@@ -21,20 +21,19 @@ impl UnsupportedFormatTestCase {
     fn create_test_bmp(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
         use std::io::Write;
 
-        let mut temp_file = tempfile::NamedTempFile::new().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create temp file: {}", e))
-        })?;
+        let mut temp_file = tempfile::NamedTempFile::new()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
 
         // BMP magic bytes
         let bmp_header: &[u8] = &[0x42, 0x4D]; // 'BM'
 
-        temp_file.write_all(bmp_header).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to write BMP data: {}", e))
-        })?;
+        temp_file
+            .write_all(bmp_header)
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to write BMP data: {}", e)))?;
 
-        temp_file.flush().map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to flush temp file: {}", e))
-        })?;
+        temp_file
+            .flush()
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to flush temp file: {}", e)))?;
 
         Ok(temp_file)
     }
@@ -56,7 +55,7 @@ impl TestCase for UnsupportedFormatTestCase {
         let temp_path = temp_file
             .path()
             .to_str()
-            .ok_or_else(|| WhitenoiseError::Other(anyhow::anyhow!("Invalid temp path")))?;
+            .ok_or_else(|| WhitenoiseError::Internal("Invalid temp path".to_string()))?;
 
         let blossom_url = if cfg!(debug_assertions) {
             Some(Url::parse("http://localhost:3000").unwrap())
@@ -81,15 +80,15 @@ impl TestCase for UnsupportedFormatTestCase {
                 );
             }
             Err(e) => {
-                return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                return Err(WhitenoiseError::Internal(format!(
                     "Expected UnsupportedMediaFormat error, got: {:?}",
                     e
                 )));
             }
             Ok(_) => {
-                return Err(WhitenoiseError::Other(anyhow::anyhow!(
-                    "Expected upload to fail for unsupported format"
-                )));
+                return Err(WhitenoiseError::Internal(
+                    "Expected upload to fail for unsupported format".to_string(),
+                ));
             }
         }
 
