@@ -1,11 +1,10 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 #[cfg(test)]
 use nostr_sdk::RelayUrl;
 use nostr_sdk::{Metadata, PublicKey};
 
 use super::{
     Database, DatabaseError,
-    relays::RelayRow,
     utils::{parse_optional_timestamp, parse_timestamp},
 };
 use crate::{
@@ -16,23 +15,7 @@ use crate::{
     },
 };
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub(crate) struct UserRow {
-    // id is the primary key
-    pub id: i64,
-    // pubkey is the hex encoded nostr public key
-    pub pubkey: PublicKey,
-    // metadata is the JSONB column that stores the user metadata
-    pub metadata: Metadata,
-    // created_at is the timestamp of the user creation
-    pub created_at: DateTime<Utc>,
-    // metadata_known_at records when metadata resolution completed, including valid blank metadata
-    pub metadata_known_at: Option<DateTime<Utc>>,
-    // updated_at is the timestamp of the last update
-    pub updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for UserRow
+impl<'r, R> sqlx::FromRow<'r, R> for User
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -61,8 +44,8 @@ where
         let metadata_known_at = parse_optional_timestamp(row, "metadata_known_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(UserRow {
-            id,
+        Ok(Self {
+            id: Some(id),
             pubkey,
             metadata,
             created_at,
@@ -72,28 +55,15 @@ where
     }
 }
 
-impl From<UserRow> for User {
-    fn from(val: UserRow) -> Self {
-        User {
-            id: Some(val.id),
-            pubkey: val.pubkey,
-            metadata: val.metadata,
-            created_at: val.created_at,
-            metadata_known_at: val.metadata_known_at,
-            updated_at: val.updated_at,
-        }
-    }
-}
-
 impl User {
     #[cfg(test)]
     pub(crate) async fn all(database: &Database) -> Result<Vec<User>, WhitenoiseError> {
-        let user_rows = sqlx::query_as::<_, UserRow>("SELECT * FROM users")
+        let users = sqlx::query_as::<_, Self>("SELECT * FROM users")
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        Ok(user_rows.into_iter().map(Self::from).collect())
+        Ok(users)
     }
 
     /// Fetches all users with their NIP-65 relay URLs in a single query.
@@ -126,8 +96,7 @@ impl User {
 
         for (pubkey_hex, relay_url) in rows {
             if current_pubkey.as_ref() != Some(&pubkey_hex) {
-                let pk =
-                    PublicKey::parse(&pubkey_hex).map_err(|e| WhitenoiseError::Other(e.into()))?;
+                let pk = PublicKey::parse(&pubkey_hex).map_err(WhitenoiseError::from)?;
                 result.push((pk, Vec::new()));
                 current_pubkey = Some(pubkey_hex);
             }
@@ -156,9 +125,7 @@ impl User {
         .map_err(DatabaseError::Sqlx)?;
 
         rows.into_iter()
-            .map(|pubkey_hex| {
-                PublicKey::parse(&pubkey_hex).map_err(|error| WhitenoiseError::Other(error.into()))
-            })
+            .map(|pubkey_hex| PublicKey::parse(&pubkey_hex).map_err(WhitenoiseError::from))
             .collect()
     }
 
@@ -218,7 +185,7 @@ impl User {
         pubkey: &PublicKey,
         database: &Database,
     ) -> Result<User, WhitenoiseError> {
-        let user_row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE pubkey = ?")
+        let user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(pubkey.to_hex().as_str())
             .fetch_one(&database.pool)
             .await
@@ -227,7 +194,7 @@ impl User {
                 other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
             })?;
 
-        Ok(user_row.into())
+        Ok(user)
     }
 
     /// Fetches multiple users by their public keys in a single query.
@@ -263,13 +230,13 @@ impl User {
         }
         sep.push_unseparated(")");
 
-        let rows = qb
-            .build_query_as::<UserRow>()
+        let users = qb
+            .build_query_as::<Self>()
             .fetch_all(&database.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        Ok(rows.into_iter().map(User::from).collect())
+        Ok(users)
     }
 
     /// Gets all relays of a specific type associated with this user.
@@ -295,7 +262,7 @@ impl User {
         let user_id = self.id.ok_or(WhitenoiseError::UserNotPersisted)?;
         let relay_type_str = String::from(relay_type);
 
-        let relay_rows = sqlx::query_as::<_, RelayRow>(
+        let relays = sqlx::query_as::<_, Relay>(
             "SELECT r.id, r.url, r.created_at, r.updated_at
              FROM relays r
              INNER JOIN user_relays ur ON r.id = ur.relay_id
@@ -307,16 +274,6 @@ impl User {
         .await
         .map_err(DatabaseError::Sqlx)
         .map_err(WhitenoiseError::Database)?;
-
-        let relays = relay_rows
-            .into_iter()
-            .map(|row| Relay {
-                id: Some(row.id),
-                url: row.url,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-            })
-            .collect();
 
         Ok(relays)
     }
@@ -363,7 +320,7 @@ impl User {
         .map_err(WhitenoiseError::Database)?;
 
         // Get the user by pubkey to return the updated record
-        let updated_user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE pubkey = ?")
+        let updated_user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(self.pubkey.to_hex().as_str())
             .fetch_one(&mut *tx)
             .await
@@ -371,7 +328,7 @@ impl User {
 
         tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
-        Ok(updated_user.into())
+        Ok(updated_user)
     }
 
     /// Transaction-aware version of find_by_pubkey that accepts a database transaction.
@@ -393,7 +350,7 @@ impl User {
         pubkey: &PublicKey,
         tx: &mut sqlx::Transaction<'a, sqlx::Sqlite>,
     ) -> Result<User, WhitenoiseError> {
-        let user_row = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE pubkey = ?")
+        let user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(pubkey.to_hex().as_str())
             .fetch_one(&mut **tx)
             .await
@@ -402,7 +359,7 @@ impl User {
                 _ => WhitenoiseError::Database(DatabaseError::Sqlx(err)),
             })?;
 
-        Ok(user_row.into())
+        Ok(user)
     }
 
     /// Transaction-aware version of save that accepts a database transaction.
@@ -450,13 +407,13 @@ impl User {
         .map_err(WhitenoiseError::Database)?;
 
         // Get the user by pubkey to return the updated record
-        let updated_user = sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE pubkey = ?")
+        let updated_user = sqlx::query_as::<_, Self>("SELECT * FROM users WHERE pubkey = ?")
             .bind(self.pubkey.to_hex().as_str())
             .fetch_one(&mut **tx)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        Ok(updated_user.into())
+        Ok(updated_user)
     }
 
     /// Transaction-aware version of find_or_create_by_pubkey that accepts a database transaction.
@@ -690,79 +647,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_user_row_from_row_valid_data() {
-        let pool = setup_test_db().await;
-
-        // Create valid test data
-        let test_pubkey = nostr_sdk::Keys::generate().public_key();
-        let test_metadata = Metadata::new()
-            .name("Test User")
-            .display_name("Test Display Name")
-            .about("Test about section");
-        let test_metadata_json = serde_json::to_string(&test_metadata).unwrap();
-        let test_timestamp = chrono::Utc::now().timestamp_millis();
-
-        // Insert test data
-        sqlx::query(
-            "INSERT INTO users (pubkey, metadata, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(test_pubkey.to_hex())
-        .bind(test_metadata_json)
-        .bind(test_timestamp)
-        .bind(test_timestamp)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Test from_row implementation
-        let row: SqliteRow = sqlx::query("SELECT * FROM users WHERE pubkey = ?")
-            .bind(test_pubkey.to_hex())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        let user_row = UserRow::from_row(&row).unwrap();
-
-        assert_eq!(user_row.pubkey, test_pubkey);
-        assert_eq!(user_row.metadata.name, test_metadata.name);
-        assert_eq!(user_row.metadata.display_name, test_metadata.display_name);
-        assert_eq!(user_row.metadata.about, test_metadata.about);
-        assert_eq!(user_row.created_at.timestamp_millis(), test_timestamp);
-        assert_eq!(user_row.updated_at.timestamp_millis(), test_timestamp);
-    }
-
-    #[tokio::test]
-    async fn test_user_row_from_row_minimal_metadata() {
-        let pool = setup_test_db().await;
-
-        let test_pubkey = nostr_sdk::Keys::generate().public_key();
-        let test_metadata = Metadata::new(); // Minimal metadata
-        let test_metadata_json = serde_json::to_string(&test_metadata).unwrap();
-        let test_timestamp = chrono::Utc::now().timestamp_millis();
-
-        sqlx::query(
-            "INSERT INTO users (pubkey, metadata, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(test_pubkey.to_hex())
-        .bind(test_metadata_json)
-        .bind(test_timestamp)
-        .bind(test_timestamp)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let row: SqliteRow = sqlx::query("SELECT * FROM users WHERE pubkey = ?")
-            .bind(test_pubkey.to_hex())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        let user_row = UserRow::from_row(&row).unwrap();
-        assert_eq!(user_row.pubkey, test_pubkey);
-        assert_eq!(user_row.metadata.name, None);
-    }
-
-    #[tokio::test]
     async fn test_user_row_from_row_invalid_pubkey() {
         let pool = setup_test_db().await;
 
@@ -788,7 +672,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = UserRow::from_row(&row);
+        let result = User::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -823,7 +707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = UserRow::from_row(&row);
+        let result = User::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -859,7 +743,7 @@ mod tests {
             .await
             .unwrap();
 
-        let user_row = UserRow::from_row(&row).unwrap();
+        let user_row = User::from_row(&row).unwrap();
         assert_eq!(user_row.created_at.timestamp_millis(), 0);
         assert_eq!(user_row.updated_at.timestamp_millis(), 0);
     }
@@ -892,7 +776,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = UserRow::from_row(&row);
+        let result = User::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -925,7 +809,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = UserRow::from_row(&row);
+        let result = User::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {

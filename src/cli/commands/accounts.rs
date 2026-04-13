@@ -13,14 +13,14 @@ pub enum AccountsCmd {
 }
 
 impl AccountsCmd {
-    pub async fn run(self, socket: &Path, json: bool) -> anyhow::Result<()> {
+    pub async fn run(self, socket: &Path, json: bool) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json).await,
         }
     }
 }
 
-async fn list(socket: &Path, json: bool) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::AllAccounts).await?;
     output::print_and_exit(&resp, json)
 }

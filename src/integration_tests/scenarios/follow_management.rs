@@ -1,10 +1,13 @@
+use std::time::Duration;
+
+use async_trait::async_trait;
+use nostr_sdk::Keys;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{follow_management::*, shared::*},
 };
 use crate::{Whitenoise, WhitenoiseError};
-use async_trait::async_trait;
-use nostr_sdk::Keys;
 
 pub struct FollowManagementScenario {
     context: ScenarioContext,
@@ -39,10 +42,18 @@ impl Scenario for FollowManagementScenario {
             .execute(&mut self.context)
             .await?;
 
+        // Allow background ContactList publish to reach relay before next mutation.
+        // Without this, rapid follow/unfollow can produce ContactList events with
+        // identical second-precision timestamps, causing the relay to reject the
+        // newer event ("replaced: have newer event") and leaving stale state.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
         // Test following a second user
         FollowUserTestCase::new("follow_mgmt_follower", test_contact2)
             .execute(&mut self.context)
             .await?;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // Test unfollowing the first user
         UnfollowUserTestCase::new("follow_mgmt_follower", test_contact1)

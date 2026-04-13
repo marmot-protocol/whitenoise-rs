@@ -28,7 +28,7 @@ impl DebugCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::RelayControlState => relay_control_state(socket, json).await,
             Self::Health => health(socket, json, account_flag).await,
@@ -39,12 +39,12 @@ impl DebugCmd {
     }
 }
 
-async fn relay_control_state(socket: &Path, json: bool) -> anyhow::Result<()> {
+async fn relay_control_state(socket: &Path, json: bool) -> crate::cli::Result<()> {
     let resp = client::send(socket, &Request::DebugRelayControlState).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn health(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn health(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::DebugHealth { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -55,7 +55,7 @@ async fn ratchet_tree(
     json: bool,
     account_flag: Option<&str>,
     group_id: String,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

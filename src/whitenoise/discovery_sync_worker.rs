@@ -35,9 +35,9 @@ impl DiscoverySyncWorker {
         let current = *rx.borrow_and_update();
         self.notify.notify_one();
         rx.wait_for(|g| *g > current).await.map_err(|_| {
-            crate::whitenoise::error::WhitenoiseError::Other(anyhow::anyhow!(
-                "Discovery sync worker stopped"
-            ))
+            crate::whitenoise::error::WhitenoiseError::Internal(
+                "Discovery sync worker stopped".to_string(),
+            )
         })?;
         Ok(())
     }
@@ -289,8 +289,8 @@ mod tests {
                         let call = c.fetch_add(1, Ordering::SeqCst);
                         if call == 0 {
                             // First call fails
-                            Err(crate::whitenoise::error::WhitenoiseError::Other(
-                                anyhow::anyhow!("simulated failure"),
+                            Err(crate::whitenoise::error::WhitenoiseError::Internal(
+                                "simulated failure".to_string(),
                             ))
                         } else {
                             Ok(())

@@ -34,9 +34,10 @@ impl TestCase for DeleteMessageTestCase {
         let target_message_id = context.get_message_id(&self.target_message_id_key)?;
 
         // Create delete tags targeting the specific message
-        let delete_tags = vec![Tag::parse(vec!["e", target_message_id]).map_err(|e| {
-            WhitenoiseError::Other(anyhow::anyhow!("Failed to create e-tag: {}", e))
-        })?];
+        let delete_tags =
+            vec![Tag::parse(vec!["e", target_message_id]).map_err(|e| {
+                WhitenoiseError::Internal(format!("Failed to create e-tag: {}", e))
+            })?];
 
         // Send delete message (kind 5 with empty content)
         let delete_result = context

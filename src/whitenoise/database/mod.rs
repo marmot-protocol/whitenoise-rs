@@ -248,6 +248,136 @@ impl Database {
 
         Ok(())
     }
+
+    /// Deletes aggregated messages that all accounts have cleared.
+    ///
+    /// Only deletes messages whose `created_at` is at or before the minimum
+    /// `chat_cleared_at` across all accounts in the group, and only when
+    /// every account has set a `chat_cleared_at` value.
+    ///
+    /// Returns the number of rows deleted.
+    pub(crate) async fn try_cleanup_cleared_messages(
+        &self,
+        mls_group_id: &mdk_core::prelude::GroupId,
+    ) -> Result<u64, DatabaseError> {
+        retry_on_lock(|| self.try_cleanup_cleared_messages_inner(mls_group_id)).await
+    }
+
+    async fn try_cleanup_cleared_messages_inner(
+        &self,
+        mls_group_id: &mdk_core::prelude::GroupId,
+    ) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            "DELETE FROM aggregated_messages
+             WHERE mls_group_id = ?
+               AND created_at <= (
+                 SELECT MIN(chat_cleared_at) FROM accounts_groups
+                 WHERE mls_group_id = ?
+                 HAVING COUNT(*) = COUNT(chat_cleared_at)
+               )",
+        )
+        .bind(mls_group_id.as_slice())
+        .bind(mls_group_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Delete all data for an account's association with a group.
+    ///
+    /// Removes the per-account row and data (accounts_groups, drafts, push tokens,
+    /// media files). If no other accounts reference this group after the deletion,
+    /// also removes shared data (group_information, which cascades to
+    /// aggregated_messages and drafts).
+    ///
+    /// Returns `true` if shared group data was also deleted (i.e., this was the
+    /// last account).
+    pub(crate) async fn delete_chat_data(
+        &self,
+        account_pubkey: &nostr_sdk::prelude::PublicKey,
+        mls_group_id: &mdk_core::prelude::GroupId,
+    ) -> Result<bool, DatabaseError> {
+        retry_on_lock(|| self.delete_chat_data_inner(account_pubkey, mls_group_id)).await
+    }
+
+    async fn delete_chat_data_inner(
+        &self,
+        account_pubkey: &nostr_sdk::prelude::PublicKey,
+        mls_group_id: &mdk_core::prelude::GroupId,
+    ) -> Result<bool, DatabaseError> {
+        let mut txn = self.pool.begin().await?;
+        let pubkey_hex = account_pubkey.to_hex();
+
+        // 1. Delete per-account data
+        sqlx::query(
+            "DELETE FROM accounts_groups
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pubkey_hex)
+        .bind(mls_group_id.as_slice())
+        .execute(&mut *txn)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM drafts
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pubkey_hex)
+        .bind(mls_group_id.as_slice())
+        .execute(&mut *txn)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM group_push_tokens
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pubkey_hex)
+        .bind(mls_group_id.as_slice())
+        .execute(&mut *txn)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM media_files
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pubkey_hex)
+        .bind(mls_group_id.as_slice())
+        .execute(&mut *txn)
+        .await?;
+
+        // 2. Check if any other accounts still reference this group
+        let (remaining,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM accounts_groups WHERE mls_group_id = ?")
+                .bind(mls_group_id.as_slice())
+                .fetch_one(&mut *txn)
+                .await?;
+
+        let last_account = remaining == 0;
+
+        if last_account {
+            // 3. Delete shared data (group_information cascades to
+            //    aggregated_messages and drafts via FK)
+            sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
+                .bind(mls_group_id.as_slice())
+                .execute(&mut *txn)
+                .await?;
+
+            sqlx::query("DELETE FROM group_push_tokens WHERE mls_group_id = ?")
+                .bind(mls_group_id.as_slice())
+                .execute(&mut *txn)
+                .await?;
+
+            sqlx::query("DELETE FROM media_files WHERE mls_group_id = ?")
+                .bind(mls_group_id.as_slice())
+                .execute(&mut *txn)
+                .await?;
+        }
+
+        txn.commit().await?;
+
+        Ok(last_account)
+    }
 }
 
 /// Retry an async database operation on transient SQLite lock errors.
@@ -722,5 +852,314 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Sets up a group_information row so FK constraints are satisfied.
+    async fn setup_group(db: &Database, group_id: &mdk_core::prelude::GroupId) {
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
+             VALUES (?, 'group', ?, ?)",
+        )
+        .bind(group_id.as_slice())
+        .bind(now)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Sets up an account (user + account rows) so FK constraints are satisfied.
+    async fn setup_account(db: &Database, pubkey_hex: &str) {
+        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
+            .bind(pubkey_hex)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
+            .bind(pubkey_hex)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
+            .bind(pubkey_hex)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    /// Creates an accounts_groups row.
+    async fn setup_account_group(
+        db: &Database,
+        pubkey_hex: &str,
+        group_id: &mdk_core::prelude::GroupId,
+    ) -> i64 {
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO accounts_groups
+             (account_pubkey, mls_group_id, user_confirmation, created_at, updated_at)
+             VALUES (?, ?, 1, ?, ?)",
+        )
+        .bind(pubkey_hex)
+        .bind(group_id.as_slice())
+        .bind(now)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (id,): (i64,) = sqlx::query_as(
+            "SELECT id FROM accounts_groups WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(pubkey_hex)
+        .bind(group_id.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Inserts a minimal aggregated_messages row.
+    async fn setup_message(
+        db: &Database,
+        group_id: &mdk_core::prelude::GroupId,
+        message_id_hex: &str,
+        created_at_ms: i64,
+    ) {
+        let author_hex = "aa".repeat(32); // valid 64-char hex pubkey
+        sqlx::query(
+            "INSERT INTO aggregated_messages
+             (message_id, mls_group_id, author, created_at, kind, content, tags,
+              content_tokens, reactions, media_attachments)
+             VALUES (?, ?, ?, ?, 9, '', '[]', '[]', '{}', '[]')",
+        )
+        .bind(message_id_hex)
+        .bind(group_id.as_slice())
+        .bind(&author_hex)
+        .bind(created_at_ms)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Returns the message count for a group.
+    async fn message_count(db: &Database, group_id: &mdk_core::prelude::GroupId) -> i64 {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM aggregated_messages WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        count
+    }
+
+    #[tokio::test]
+    async fn test_try_cleanup_cleared_messages_deletes_when_all_accounts_cleared() {
+        let (db, _temp) = create_test_db().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[1; 32]);
+        let pk1 = "aa".repeat(32);
+        let pk2 = "bb".repeat(32);
+
+        setup_group(&db, &group_id).await;
+        setup_account(&db, &pk1).await;
+        setup_account(&db, &pk2).await;
+        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
+        let ag2_id = setup_account_group(&db, &pk2, &group_id).await;
+
+        // Insert messages at times 100 and 200
+        setup_message(&db, &group_id, &format!("{:0>64}", "1"), 100).await;
+        setup_message(&db, &group_id, &format!("{:0>64}", "2"), 200).await;
+
+        // Both accounts clear at 150 -- should delete only the message at 100
+        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
+            .bind(150_i64)
+            .bind(ag1_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
+            .bind(150_i64)
+            .bind(ag2_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
+        assert_eq!(deleted, 1, "only the message at t=100 should be deleted");
+        assert_eq!(message_count(&db, &group_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_try_cleanup_cleared_messages_respects_min() {
+        let (db, _temp) = create_test_db().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[2; 32]);
+        let pk1 = "cc".repeat(32);
+        let pk2 = "dd".repeat(32);
+
+        setup_group(&db, &group_id).await;
+        setup_account(&db, &pk1).await;
+        setup_account(&db, &pk2).await;
+        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
+        let ag2_id = setup_account_group(&db, &pk2, &group_id).await;
+
+        // Messages at 100, 200, 300
+        setup_message(&db, &group_id, &format!("{:0>64}", "a"), 100).await;
+        setup_message(&db, &group_id, &format!("{:0>64}", "b"), 200).await;
+        setup_message(&db, &group_id, &format!("{:0>64}", "c"), 300).await;
+
+        // Account 1 clears at 250, account 2 clears at 150
+        // MIN = 150, so only message at 100 should be deleted
+        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
+            .bind(250_i64)
+            .bind(ag1_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
+            .bind(150_i64)
+            .bind(ag2_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(message_count(&db, &group_id).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_try_cleanup_cleared_messages_noop_when_not_all_cleared() {
+        let (db, _temp) = create_test_db().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[3; 32]);
+        let pk1 = "ee".repeat(32);
+        let pk2 = "ff".repeat(32);
+
+        setup_group(&db, &group_id).await;
+        setup_account(&db, &pk1).await;
+        setup_account(&db, &pk2).await;
+        let ag1_id = setup_account_group(&db, &pk1, &group_id).await;
+        setup_account_group(&db, &pk2, &group_id).await;
+
+        setup_message(&db, &group_id, &format!("{:0>64}", "d"), 100).await;
+
+        // Only account 1 clears -- account 2 still has chat_cleared_at = NULL
+        sqlx::query("UPDATE accounts_groups SET chat_cleared_at = ? WHERE id = ?")
+            .bind(200_i64)
+            .bind(ag1_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let deleted = db.try_cleanup_cleared_messages(&group_id).await.unwrap();
+        assert_eq!(
+            deleted, 0,
+            "must not delete when some accounts have not cleared"
+        );
+        assert_eq!(message_count(&db, &group_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_data_sole_account() {
+        let (db, _temp) = create_test_db().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[4; 32]);
+        let pk1 = "11".repeat(32);
+
+        setup_group(&db, &group_id).await;
+        setup_account(&db, &pk1).await;
+        setup_account_group(&db, &pk1, &group_id).await;
+        setup_message(&db, &group_id, &format!("{:0>64}", "e"), 100).await;
+
+        let pubkey = nostr_sdk::prelude::PublicKey::parse(&pk1).unwrap();
+        let was_last = db.delete_chat_data(&pubkey, &group_id).await.unwrap();
+        assert!(was_last, "sole account should return true");
+
+        // Verify everything is gone
+        let (gi_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(gi_count, 0);
+
+        let (ag_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM accounts_groups WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(ag_count, 0);
+
+        // Messages cascade from group_information delete
+        assert_eq!(message_count(&db, &group_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_chat_data_multi_account() {
+        let (db, _temp) = create_test_db().await;
+        let group_id = mdk_core::prelude::GroupId::from_slice(&[5; 32]);
+        let pk1 = "33".repeat(32);
+        let pk2 = "44".repeat(32);
+
+        setup_group(&db, &group_id).await;
+        setup_account(&db, &pk1).await;
+        setup_account(&db, &pk2).await;
+        setup_account_group(&db, &pk1, &group_id).await;
+        setup_account_group(&db, &pk2, &group_id).await;
+        setup_message(&db, &group_id, &format!("{:0>64}", "f"), 100).await;
+
+        let pubkey1 = nostr_sdk::prelude::PublicKey::parse(&pk1).unwrap();
+        let pubkey2 = nostr_sdk::prelude::PublicKey::parse(&pk2).unwrap();
+
+        // Account 1 deletes -- shared data should remain
+        let was_last = db.delete_chat_data(&pubkey1, &group_id).await.unwrap();
+        assert!(!was_last, "first account should return false");
+
+        // A's row gone
+        let (ag1_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM accounts_groups
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pk1)
+        .bind(group_id.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ag1_count, 0, "A's account_group must be deleted");
+
+        // B's row intact
+        let (ag2_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM accounts_groups
+             WHERE account_pubkey = ? AND mls_group_id = ?",
+        )
+        .bind(&pk2)
+        .bind(group_id.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(ag2_count, 1, "B's account_group must still exist");
+
+        // Shared data preserved
+        let (gi_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(gi_count, 1);
+        assert_eq!(message_count(&db, &group_id).await, 1);
+
+        // Account 2 deletes -- everything should be gone
+        let was_last = db.delete_chat_data(&pubkey2, &group_id).await.unwrap();
+        assert!(was_last, "last account should return true");
+
+        let (gi_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM group_information WHERE mls_group_id = ?")
+                .bind(group_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(gi_count, 0);
+        assert_eq!(message_count(&db, &group_id).await, 0);
     }
 }

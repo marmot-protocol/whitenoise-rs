@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use super::{Database, utils::parse_timestamp};
 use crate::perf_span;
@@ -9,16 +9,7 @@ use crate::whitenoise::{
     error::WhitenoiseError,
 };
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-struct AppSettingsRow {
-    id: i64,
-    theme_mode: String,
-    language: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for AppSettingsRow
+impl<'r, R> sqlx::FromRow<'r, R> for AppSettings
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -26,13 +17,26 @@ where
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
     fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
-        let id = row.try_get("id")?;
-        let theme_mode = row.try_get("theme_mode")?;
-        let language = row.try_get("language")?;
+        let id: i64 = row.try_get("id")?;
+        let theme_mode_str: String = row.try_get("theme_mode")?;
+        let language_str: String = row.try_get("language")?;
+
+        let theme_mode =
+            ThemeMode::from_str(&theme_mode_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "theme_mode".to_string(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            })?;
+
+        let language =
+            Language::from_str(&language_str).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "language".to_string(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            })?;
+
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(AppSettingsRow {
+        Ok(Self {
             id,
             theme_mode,
             language,
@@ -42,35 +46,16 @@ where
     }
 }
 
-impl AppSettingsRow {
-    /// Converts an AppSettingsRow to AppSettings
-    fn into_app_settings(self) -> Result<AppSettings, WhitenoiseError> {
-        let theme_mode = ThemeMode::from_str(&self.theme_mode)
-            .map_err(|e| WhitenoiseError::Configuration(format!("Invalid theme mode: {}", e)))?;
-
-        let language = Language::from_str(&self.language)
-            .map_err(|e| WhitenoiseError::Configuration(format!("Invalid language: {}", e)))?;
-
-        Ok(AppSettings {
-            id: self.id,
-            theme_mode,
-            language,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        })
-    }
-}
-
 impl AppSettings {
     pub(crate) async fn find_or_create_default(
         database: &Database,
     ) -> Result<AppSettings, WhitenoiseError> {
         let _span = perf_span!("db::app_settings_find_or_create");
-        match sqlx::query_as::<_, AppSettingsRow>("SELECT * FROM app_settings WHERE id = 1")
+        match sqlx::query_as::<_, Self>("SELECT * FROM app_settings WHERE id = 1")
             .fetch_one(&database.pool)
             .await
         {
-            Ok(settings_row) => Ok(settings_row.into_app_settings()?),
+            Ok(settings) => Ok(settings),
             Err(e) => match e {
                 sqlx::Error::RowNotFound => {
                     let settings = AppSettings::default();
@@ -229,10 +214,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let app_settings = AppSettingsRow::from_row(&row)
-                .unwrap()
-                .into_app_settings()
-                .unwrap();
+            let app_settings = AppSettings::from_row(&row).unwrap();
             assert_eq!(app_settings.theme_mode, expected_theme);
         }
     }
@@ -258,42 +240,66 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AppSettingsRow::from_row(&row);
+        let result = AppSettings::from_row(&row);
         assert!(matches!(result, Err(sqlx::Error::ColumnDecode { .. })));
     }
 
-    #[test]
-    fn test_invalid_theme_mode_error() {
-        let timestamp = chrono::Utc::now();
-        let app_settings_row = AppSettingsRow {
-            id: 1,
-            theme_mode: "invalid_theme".to_string(),
-            language: "en".to_string(),
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
+    #[tokio::test]
+    async fn test_invalid_theme_mode_error() {
+        let pool = setup_test_db().await;
+        let timestamp = chrono::Utc::now().timestamp_millis();
 
-        let result = app_settings_row.into_app_settings();
-        assert!(
-            matches!(result, Err(WhitenoiseError::Configuration(msg)) if msg.contains("Invalid theme mode"))
-        );
+        sqlx::query(
+            "INSERT INTO app_settings (id, theme_mode, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(1i64)
+        .bind("invalid_theme")
+        .bind("en")
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row: SqliteRow = sqlx::query("SELECT * FROM app_settings WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let err = AppSettings::from_row(&row).unwrap_err();
+        match err {
+            sqlx::Error::ColumnDecode { index, .. } => assert_eq!(index, "theme_mode"),
+            other => panic!("expected ColumnDecode for theme_mode, got {:?}", other),
+        }
     }
 
-    #[test]
-    fn test_invalid_language_error() {
-        let timestamp = chrono::Utc::now();
-        let app_settings_row = AppSettingsRow {
-            id: 1,
-            theme_mode: "light".to_string(),
-            language: "invalid_lang".to_string(),
-            created_at: timestamp,
-            updated_at: timestamp,
-        };
+    #[tokio::test]
+    async fn test_invalid_language_error() {
+        let pool = setup_test_db().await;
+        let timestamp = chrono::Utc::now().timestamp_millis();
 
-        let result = app_settings_row.into_app_settings();
-        assert!(
-            matches!(result, Err(WhitenoiseError::Configuration(msg)) if msg.contains("Invalid language"))
-        );
+        sqlx::query(
+            "INSERT INTO app_settings (id, theme_mode, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(1i64)
+        .bind("light")
+        .bind("invalid_lang")
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row: SqliteRow = sqlx::query("SELECT * FROM app_settings WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let err = AppSettings::from_row(&row).unwrap_err();
+        match err {
+            sqlx::Error::ColumnDecode { index, .. } => assert_eq!(index, "language"),
+            other => panic!("expected ColumnDecode for language, got {:?}", other),
+        }
     }
 
     #[tokio::test]

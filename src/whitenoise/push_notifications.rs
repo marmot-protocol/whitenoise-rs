@@ -10,12 +10,13 @@ use std::{
 
 use ::rand::Rng;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use mdk_core::mip05::{
     EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
     TokenTag, build_notification_batches, build_token_list_response_rumor,
     build_token_removal_rumor, build_token_request_rumor, encrypt_push_token, parse_group_message,
 };
-use mdk_core::prelude::{GroupId, group_types::GroupState};
+use mdk_core::prelude::{GroupId, MDK, group_types::GroupState};
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::{EventId, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,11 @@ use crate::{
     perf_instrument,
     relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
 };
+
+/// Maximum number of groups to publish push token events to concurrently.
+/// Caps relay connection pressure while still parallelising the bulk of the
+/// per-group relay round-trips.
+const MAX_CONCURRENT_GROUP_PUBLISHES: usize = 10;
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -185,34 +191,24 @@ impl PendingTokenResponseContext {
             &self.config.data_dir,
             &self.config.keyring_service_id,
         )?;
-        let token_tags = group_push_token_tags_for_response_with(
-            &account.pubkey,
-            group_id,
-            &self.database,
+        respond_to_token_request_with(
             &mdk,
-        )
-        .await?;
-
-        if token_tags.is_empty() {
-            return Ok(());
-        }
-
-        let rumor = build_token_list_response_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
+            &self.database,
+            &self.relay_control,
+            account,
+            group_id,
             request_event_id,
-            token_tags,
-        )?;
-        publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
-            .await
+        )
+        .await
     }
 }
 
+#[perf_instrument("push_notifications")]
 async fn group_push_token_tags_for_response_with(
     account_pubkey: &PublicKey,
     group_id: &GroupId,
     database: &Database,
-    mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
+    mdk: &MDK<MdkSqliteStorage>,
 ) -> Result<Vec<LeafTokenTag>> {
     let tokens =
         GroupPushToken::find_by_account_and_group(account_pubkey, group_id, database).await?;
@@ -283,21 +279,46 @@ async fn group_push_token_tags_for_response_with(
     Ok(response_tokens)
 }
 
+#[perf_instrument("push_notifications")]
 async fn publish_push_group_message_with(
-    config: &WhitenoiseConfig,
+    mdk: &MDK<MdkSqliteStorage>,
     relay_control: &RelayControlPlane,
     account: &Account,
     group_id: &GroupId,
     rumor: nostr_sdk::UnsignedEvent,
 ) -> Result<()> {
-    let mdk = Account::create_mdk(account.pubkey, &config.data_dir, &config.keyring_service_id)?;
-    let relay_urls = Whitenoise::ensure_group_relays(&mdk, group_id)?;
-    let event = mdk.create_message(group_id, rumor)?;
+    let relay_urls = Whitenoise::ensure_group_relays(mdk, group_id)?;
+    let event = mdk.create_message(group_id, rumor, None)?;
 
     relay_control
         .publish_event_to(event, &account.pubkey, &relay_urls)
         .await?;
     Ok(())
+}
+
+#[perf_instrument("push_notifications")]
+async fn respond_to_token_request_with(
+    mdk: &MDK<MdkSqliteStorage>,
+    database: &Database,
+    relay_control: &RelayControlPlane,
+    account: &Account,
+    group_id: &GroupId,
+    request_event_id: EventId,
+) -> Result<()> {
+    let token_tags =
+        group_push_token_tags_for_response_with(&account.pubkey, group_id, database, mdk).await?;
+
+    if token_tags.is_empty() {
+        return Ok(());
+    }
+
+    let rumor = build_token_list_response_rumor(
+        account.pubkey,
+        nostr_sdk::Timestamp::now(),
+        request_event_id,
+        token_tags,
+    )?;
+    publish_push_group_message_with(mdk, relay_control, account, group_id, rumor).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +732,7 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     pub(crate) async fn handle_received_push_group_message(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         message: &mdk_core::prelude::message_types::Message,
         sender_leaf_index: Option<u32>,
@@ -748,7 +770,7 @@ impl Whitenoise {
             }
             Mip05GroupMessage::TokenListResponse(response) => {
                 let request_event_id = response.request_event_id;
-                self.merge_token_list_response(account, &message.mls_group_id, response)
+                self.merge_token_list_response(mdk, account, &message.mls_group_id, response)
                     .await?;
                 self.clear_pending_token_response(
                     &account.pubkey,
@@ -888,51 +910,69 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if !self
-                .is_push_gossip_eligible(account, &group.mls_group_id, group.state)
-                .await
-            {
-                continue;
-            }
+        // Drive groups concurrently with a bounded cap so relay connections
+        // are not overwhelmed. RTTs for independent groups overlap while
+        // total in-flight publishes stay within a reasonable limit.
+        let failures: Vec<String> = stream::iter(groups.iter())
+            .map(|group| {
+                self.share_token_to_single_group(
+                    &mdk,
+                    account,
+                    &group.mls_group_id,
+                    group.state,
+                    token_tag,
+                )
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
+            .filter_map(|r| async move { r.err() })
+            .collect()
+            .await;
 
-            let rumor = build_token_request_rumor(
-                account.pubkey,
-                nostr_sdk::Timestamp::now(),
-                vec![token_tag.clone()],
-            )?;
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-                continue;
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, Some(token_tag))
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
-
-        if publish_failures.is_empty() {
+        if failures.is_empty() {
             Ok(())
         } else {
             Err(WhitenoiseError::Configuration(format!(
                 "failed to share push token to one or more groups: {}",
-                publish_failures.join(", ")
+                failures.join(", ")
             )))
         }
+    }
+
+    /// Publishes a push token request to a single group and updates the local
+    /// cache. Returns `Ok(())` if the group is ineligible (treated as a no-op)
+    /// or if both operations succeed. Returns `Err` with a descriptive message
+    /// on publish or cache-sync failure.
+    #[perf_instrument("push_notifications")]
+    async fn share_token_to_single_group(
+        &self,
+        mdk: &MDK<MdkSqliteStorage>,
+        account: &Account,
+        group_id: &GroupId,
+        group_state: GroupState,
+        token_tag: &TokenTag,
+    ) -> std::result::Result<(), String> {
+        if !self
+            .is_push_gossip_eligible(account, group_id, group_state)
+            .await
+        {
+            return Ok(());
+        }
+
+        let rumor = build_token_request_rumor(
+            account.pubkey,
+            nostr_sdk::Timestamp::now(),
+            vec![token_tag.clone()],
+        )
+        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
+
+        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
+            .await
+            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
+
+        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
+            .await
+            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
     }
 
     #[perf_instrument("push_notifications")]
@@ -1012,6 +1052,7 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     async fn share_push_token_to_group(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         group_id: &GroupId,
         token_tag: &TokenTag,
@@ -1021,9 +1062,8 @@ impl Whitenoise {
             nostr_sdk::Timestamp::now(),
             vec![token_tag.clone()],
         )?;
-        self.publish_push_group_message(account, group_id, rumor)
-            .await?;
-        self.sync_local_group_push_token_cache(account, group_id, Some(token_tag))
+        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor).await?;
+        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
             .await
     }
 
@@ -1056,7 +1096,7 @@ impl Whitenoise {
             return Ok(());
         };
 
-        self.share_push_token_to_group(account, group_id, &token_tag)
+        self.share_push_token_to_group(&mdk, account, group_id, &token_tag)
             .await
     }
 
@@ -1067,42 +1107,67 @@ impl Whitenoise {
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let groups = mdk.get_groups()?;
-        let mut publish_failures = Vec::new();
 
-        for group in groups {
-            if group.state != GroupState::Active {
-                continue;
-            }
+        // Drive groups concurrently with a bounded cap so relay connections
+        // are not overwhelmed. RTTs for independent groups overlap while
+        // total in-flight publishes stay within a reasonable limit.
+        let failures: Vec<String> = stream::iter(groups.iter())
+            .map(|group| {
+                self.remove_token_from_single_group(&mdk, account, &group.mls_group_id, group.state)
+            })
+            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
+            .filter_map(|r| async move { r.err() })
+            .collect()
+            .await;
 
-            let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-            if let Err(error) = self
-                .publish_push_group_message(account, &group.mls_group_id, rumor)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-
-            if let Err(error) = self
-                .sync_local_group_push_token_cache(account, &group.mls_group_id, None)
-                .await
-            {
-                publish_failures.push(format!(
-                    "{}: {error}",
-                    hex::encode(group.mls_group_id.as_slice())
-                ));
-            }
-        }
-
-        if publish_failures.is_empty() {
+        if failures.is_empty() {
             Ok(())
         } else {
             Err(WhitenoiseError::Configuration(format!(
                 "failed to remove push token from one or more groups: {}",
-                publish_failures.join(", ")
+                failures.join(", ")
             )))
+        }
+    }
+
+    /// Publishes a push token removal to a single active group and clears the
+    /// local cache entry. Inactive groups are skipped silently.
+    ///
+    /// Cache sync is always attempted even when publishing fails — clearing
+    /// local state is best-effort cleanup that should not be blocked by a
+    /// relay error. Both failure messages are surfaced if both steps fail.
+    #[perf_instrument("push_notifications")]
+    async fn remove_token_from_single_group(
+        &self,
+        mdk: &MDK<MdkSqliteStorage>,
+        account: &Account,
+        group_id: &GroupId,
+        group_state: GroupState,
+    ) -> std::result::Result<(), String> {
+        if group_state != GroupState::Active {
+            return Ok(());
+        }
+
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
+
+        let publish_err =
+            publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
+                .await
+                .err()
+                .map(|e| format!("{group_id_hex}: {e}"));
+
+        // Always run cache sync regardless of publish outcome.
+        let cache_err = self
+            .sync_local_group_push_token_cache(mdk, account, group_id, None)
+            .await
+            .err()
+            .map(|e| format!("{group_id_hex}: {e}"));
+
+        match (publish_err, cache_err) {
+            (None, None) => Ok(()),
+            (Some(e), None) | (None, Some(e)) => Err(e),
+            (Some(e1), Some(e2)) => Err(format!("{e1}, {e2}")),
         }
     }
 
@@ -1134,9 +1199,9 @@ impl Whitenoise {
         }
 
         let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-        if let Err(error) = self
-            .publish_push_group_message(account, group_id, rumor)
-            .await
+        if let Err(error) =
+            publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor)
+                .await
         {
             tracing::warn!(
                 target: "whitenoise::push_notifications",
@@ -1147,7 +1212,7 @@ impl Whitenoise {
             );
         }
 
-        self.sync_local_group_push_token_cache(account, group_id, None)
+        self.sync_local_group_push_token_cache(&mdk, account, group_id, None)
             .await
     }
 
@@ -1184,13 +1249,12 @@ impl Whitenoise {
     #[perf_instrument("push_notifications")]
     async fn merge_token_list_response(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         mls_group_id: &GroupId,
         response: mdk_core::mip05::TokenListResponse,
     ) -> Result<()> {
-        let active_leaf_map = self
-            .create_mdk_for_account(account.pubkey)?
-            .group_leaf_map(mls_group_id)?;
+        let active_leaf_map = mdk.group_leaf_map(mls_group_id)?;
 
         GroupPushToken::upsert_active_token_list_response(
             &account.pubkey,
@@ -1211,43 +1275,26 @@ impl Whitenoise {
         group_id: &GroupId,
         request_event_id: EventId,
     ) -> Result<()> {
-        let token_tags = self
-            .group_push_token_tags_for_response(account, group_id)
-            .await?;
-
-        if token_tags.is_empty() {
-            return Ok(());
-        }
-
-        let rumor = build_token_list_response_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
-            request_event_id,
-            token_tags,
-        )?;
-        self.publish_push_group_message(account, group_id, rumor)
-            .await
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn group_push_token_tags_for_response(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<Vec<LeafTokenTag>> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-        group_push_token_tags_for_response_with(&account.pubkey, group_id, &self.database, &mdk)
-            .await
+        respond_to_token_request_with(
+            &mdk,
+            &self.database,
+            &self.relay_control,
+            account,
+            group_id,
+            request_event_id,
+        )
+        .await
     }
 
     #[perf_instrument("push_notifications")]
     async fn sync_local_group_push_token_cache(
         &self,
+        mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         group_id: &GroupId,
         token_tag: Option<&TokenTag>,
     ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
         let leaf_index = mdk.own_leaf_index(group_id)?;
 
         match token_tag {
@@ -1281,17 +1328,6 @@ impl Whitenoise {
 
         registration.token_tag()
     }
-
-    #[perf_instrument("push_notifications")]
-    async fn publish_push_group_message(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        rumor: nostr_sdk::UnsignedEvent,
-    ) -> Result<()> {
-        publish_push_group_message_with(&self.config, &self.relay_control, account, group_id, rumor)
-            .await
-    }
 }
 
 fn validate_raw_token(raw_token: &str) -> Result<()> {
@@ -1323,21 +1359,20 @@ impl PushRegistration {
     fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
         match self.platform {
             PushPlatform::Apns => {
-                // iOS tokens are 32 raw bytes, but some app layers surface them as
-                // 64-character hex strings, so accept either representation.
-                let token_bytes = if self.raw_token.len() == 64 {
-                    hex::decode(&self.raw_token).map_err(|error| {
-                        WhitenoiseError::InvalidInput(format!(
-                            "invalid APNs token hex encoding: {error}"
-                        ))
-                    })?
-                } else if self.raw_token.len() == 32 {
-                    self.raw_token.as_bytes().to_vec()
-                } else {
+                // Apple push notification tokens are variable-length opaque data.
+                // The app layer surfaces them as hex-encoded strings, so decode
+                // from hex and pass the raw bytes through.
+                let token_bytes = hex::decode(&self.raw_token).map_err(|error| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "invalid APNs token hex encoding: {error}"
+                    ))
+                })?;
+
+                if token_bytes.is_empty() {
                     return Err(WhitenoiseError::InvalidInput(
-                        "APNs token must be 32 raw bytes or 64 hex characters".to_string(),
+                        "APNs token must not be empty".to_string(),
                     ));
-                };
+                }
 
                 PushTokenPlaintext::new(NotificationPlatform::Apns, token_bytes)
                     .map_err(WhitenoiseError::from)
@@ -2847,11 +2882,11 @@ mod tests {
     }
 
     #[test]
-    fn test_push_registration_push_token_plaintext_rejects_invalid_apns_length() {
+    fn test_push_registration_push_token_plaintext_rejects_non_hex_apns_token() {
         let registration = PushRegistration {
             account_pubkey: Keys::generate().public_key(),
             platform: PushPlatform::Apns,
-            raw_token: "too-short".to_string(),
+            raw_token: "not-valid-hex!!".to_string(),
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
             created_at: Utc::now(),
@@ -2864,7 +2899,29 @@ mod tests {
         assert!(matches!(
             error,
             WhitenoiseError::InvalidInput(message)
-            if message == "APNs token must be 32 raw bytes or 64 hex characters"
+            if message.contains("invalid APNs token hex encoding")
+        ));
+    }
+
+    #[test]
+    fn test_push_registration_push_token_plaintext_rejects_empty_apns_token() {
+        let registration = PushRegistration {
+            account_pubkey: Keys::generate().public_key(),
+            platform: PushPlatform::Apns,
+            raw_token: String::new(),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_shared_at: None,
+        };
+
+        let error = registration.push_token_plaintext().unwrap_err();
+
+        assert!(matches!(
+            error,
+            WhitenoiseError::InvalidInput(message)
+            if message.contains("must not be empty")
         ));
     }
 

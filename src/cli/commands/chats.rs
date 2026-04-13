@@ -54,7 +54,7 @@ impl ChatsCmd {
         socket: &Path,
         json: bool,
         account_flag: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json, account_flag).await,
             Self::Subscribe => subscribe(socket, json, account_flag).await,
@@ -70,13 +70,17 @@ impl ChatsCmd {
     }
 }
 
-async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::ChatsList { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
 }
 
-async fn subscribe(socket: &Path, json: bool, account_flag: Option<&str>) -> anyhow::Result<()> {
+async fn subscribe(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let req = Request::ChatsSubscribe { account: pubkey };
     let mut had_error = false;
@@ -99,7 +103,7 @@ async fn archive(
     json: bool,
     account_flag: Option<&str>,
     group_id: &str,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -117,7 +121,7 @@ async fn unarchive(
     json: bool,
     account_flag: Option<&str>,
     group_id: &str,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,
@@ -134,7 +138,7 @@ async fn list_archived(
     socket: &Path,
     json: bool,
     account_flag: Option<&str>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::ArchivedChatsList { account: pubkey }).await?;
     output::print_and_exit(&resp, json)
@@ -144,7 +148,7 @@ async fn subscribe_archived(
     socket: &Path,
     json: bool,
     account_flag: Option<&str>,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let req = Request::ArchivedChatsSubscribe { account: pubkey };
     let mut had_error = false;
@@ -168,11 +172,11 @@ async fn mute(
     account_flag: Option<&str>,
     group_id: &str,
     duration: &str,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let duration = duration
         .parse::<MuteDuration>()
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(crate::cli::error::CliError::msg)?;
     let resp = client::send(
         socket,
         &Request::MuteChat {
@@ -190,7 +194,7 @@ async fn unmute(
     json: bool,
     account_flag: Option<&str>,
     group_id: &str,
-) -> anyhow::Result<()> {
+) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(
         socket,

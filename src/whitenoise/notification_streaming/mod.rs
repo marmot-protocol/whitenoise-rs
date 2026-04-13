@@ -597,6 +597,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -627,6 +629,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -672,6 +676,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -743,6 +749,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -782,6 +790,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -833,6 +843,8 @@ mod tests {
             removed_at: None,
             self_removed: false,
             muted_until: None,
+            chat_cleared_at: None,
+
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

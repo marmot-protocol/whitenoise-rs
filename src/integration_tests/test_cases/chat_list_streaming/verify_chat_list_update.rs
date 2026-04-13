@@ -79,25 +79,24 @@ impl TestCase for VerifyChatListUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::Internal(
                 "VerifyChatListUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the update, then call execute()."
-            ))
+                    .to_string(),
+            )
         })?;
 
         // Wait for the update with timeout
         let update = tokio::time::timeout(tokio::time::Duration::from_secs(10), receiver.recv())
             .await
             .map_err(|_| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(format!(
                     "Timeout waiting for {:?} update",
                     self.expected_trigger
                 ))
             })?
-            .map_err(|e| {
-                WhitenoiseError::Other(anyhow::anyhow!("Failed to receive update: {}", e))
-            })?;
+            .map_err(|e| WhitenoiseError::Internal(format!("Failed to receive update: {}", e)))?;
 
         // Verify trigger type
         assert_eq!(
@@ -121,7 +120,7 @@ impl TestCase for VerifyChatListUpdateTestCase {
         // Verify last message content if expected
         if let Some(expected_content) = &self.expected_last_message_content {
             let last_msg = update.item.last_message.as_ref().ok_or_else(|| {
-                WhitenoiseError::Other(anyhow::anyhow!(
+                WhitenoiseError::Internal(format!(
                     "Expected last message with content '{}' but no last message in update",
                     expected_content
                 ))

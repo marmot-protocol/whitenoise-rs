@@ -13,13 +13,14 @@ use tokio::sync::{Mutex, broadcast};
 ///
 /// Usage:
 /// ```ignore
-/// let verifier = VerifyStreamUpdateTestCase::new("group", UpdateTrigger::NewMessage);
+/// let verifier = VerifyStreamUpdateTestCase::new("group", "account", UpdateTrigger::NewMessage);
 /// verifier.subscribe(&context).await?;
 /// // ... perform action that triggers the update ...
 /// verifier.execute(&mut context).await?;
 /// ```
 pub struct VerifyStreamUpdateTestCase {
     group_name: String,
+    account_name: String,
     expected_trigger: UpdateTrigger,
     expected_message_key: Option<String>,
     expected_deleted: bool,
@@ -28,9 +29,10 @@ pub struct VerifyStreamUpdateTestCase {
 }
 
 impl VerifyStreamUpdateTestCase {
-    pub fn new(group_name: &str, expected_trigger: UpdateTrigger) -> Self {
+    pub fn new(group_name: &str, account_name: &str, expected_trigger: UpdateTrigger) -> Self {
         Self {
             group_name: group_name.to_string(),
+            account_name: account_name.to_string(),
             expected_trigger,
             expected_message_key: None,
             expected_deleted: false,
@@ -59,10 +61,11 @@ impl VerifyStreamUpdateTestCase {
 
     /// Subscribe to the group. Must be called before `execute()`.
     pub async fn subscribe(&self, context: &ScenarioContext) -> Result<(), WhitenoiseError> {
+        let account = context.get_account(&self.account_name)?;
         let group = context.get_group(&self.group_name)?;
         let subscription = context
             .whitenoise
-            .subscribe_to_group_messages(&group.mls_group_id, None)
+            .subscribe_to_group_messages(&account.pubkey, &group.mls_group_id, None)
             .await?;
 
         let mut guard = self.receiver.lock().await;
@@ -82,11 +85,12 @@ impl TestCase for VerifyStreamUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::InvalidInput(
                 "VerifyStreamUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the update, then call execute()."
-            ))
+                    .to_string(),
+            )
         })?;
 
         // Pre-resolve the expected message ID to avoid borrow issues in async block
@@ -127,12 +131,12 @@ impl TestCase for VerifyStreamUpdateTestCase {
         })
         .await
         .map_err(|_| {
-            WhitenoiseError::Other(anyhow::anyhow!(
+            WhitenoiseError::Internal(format!(
                 "Timeout waiting for {:?} update",
                 self.expected_trigger
             ))
         })?
-        .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("Failed to receive update: {}", e)))?;
+        .map_err(|e| WhitenoiseError::Internal(format!("Failed to receive update: {}", e)))?;
 
         // Verify trigger type
         assert_eq!(

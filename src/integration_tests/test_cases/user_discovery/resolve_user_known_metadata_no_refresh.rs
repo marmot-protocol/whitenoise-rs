@@ -68,9 +68,9 @@ impl TestCase for ResolveUserKnownMetadataNoRefreshTestCase {
                 if user.metadata.name == self.initial_metadata.name {
                     Ok(user)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Initial metadata has not been resolved yet"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "Initial metadata has not been resolved yet".to_string(),
+                    ))
                 }
             },
             &format!(

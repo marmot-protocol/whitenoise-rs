@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::rand::RngCore;
 
-use anyhow::Context;
 use dashmap::DashMap;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
@@ -47,6 +46,7 @@ pub mod secrets_store;
 mod signer;
 pub mod storage;
 mod streaming;
+pub mod streaming_error;
 mod subscriptions;
 pub mod user_search;
 pub mod user_streaming;
@@ -445,13 +445,25 @@ impl Whitenoise {
         let data_dir = &config.data_dir;
         let logs_dir = &config.logs_dir;
 
-        // Setup directories
-        std::fs::create_dir_all(data_dir)
-            .with_context(|| format!("Failed to create data directory: {:?}", data_dir))
-            .map_err(WhitenoiseError::from)?;
-        std::fs::create_dir_all(logs_dir)
-            .with_context(|| format!("Failed to create logs directory: {:?}", logs_dir))
-            .map_err(WhitenoiseError::from)?;
+        // Setup directories. Path context is preserved via tracing; the
+        // io::Error itself flows through `WhitenoiseError::Filesystem` so
+        // callers can distinguish filesystem failures.
+        std::fs::create_dir_all(data_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?data_dir,
+                error = %e,
+                "Failed to create data directory"
+            );
+        })?;
+        std::fs::create_dir_all(logs_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?logs_dir,
+                error = %e,
+                "Failed to create logs directory"
+            );
+        })?;
 
         // Only initialize tracing once
         init_tracing(logs_dir);
@@ -1479,7 +1491,7 @@ mod tests {
             // Non-existent group ID
             let group_id = GroupId::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
-            // Fetching messages for a non-existent group should return empty list (no error)
+            // Fetching messages for a non-existent group should return GroupNotFound
             let result = whitenoise
                 .fetch_aggregated_messages_for_group(
                     &account.pubkey,
@@ -1489,12 +1501,10 @@ mod tests {
                 )
                 .await;
 
-            assert!(result.is_ok(), "Should succeed with empty list");
-            let messages = result.unwrap();
-            assert_eq!(
-                messages.len(),
-                0,
-                "Should return empty list for non-existent group"
+            assert!(
+                matches!(result, Err(error::WhitenoiseError::GroupNotFound)),
+                "Should return GroupNotFound for non-existent group, got: {:?}",
+                result
             );
         }
 
@@ -1512,6 +1522,8 @@ mod tests {
             )
             .await
             .unwrap();
+
+            setup_account_group(&test_pubkey, &group_id, &whitenoise).await;
 
             // Setup: Insert test messages into the cache
             let msg1 = message_aggregator::ChatMessage {
@@ -1562,7 +1574,7 @@ mod tests {
 
             // Test: Subscribe and verify initial messages
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&test_pubkey, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1587,6 +1599,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let group_id = GroupId::from_slice(&[42; 32]);
             let test_pubkey = nostr_sdk::Keys::generate().public_key();
+            setup_group(&group_id, &whitenoise).await;
+            setup_account_group(&test_pubkey, &group_id, &whitenoise).await;
 
             // First emit an update before subscribing (simulates concurrent update scenario)
             // This tests the merge logic path
@@ -1618,7 +1632,7 @@ mod tests {
             // Subscribe - the drain loop should find the channel empty (no subscriber existed)
             // This test verifies the deduplication logic path compiles and runs
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&test_pubkey, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1678,6 +1692,56 @@ mod tests {
             .unwrap();
         }
 
+        /// Create the minimal user + account + accounts_groups rows for a
+        /// raw pubkey so that `chat_cleared_at_ms` (and similar methods) can
+        /// find the account-group association.
+        async fn setup_account_group(
+            pubkey: &nostr_sdk::PublicKey,
+            group_id: &GroupId,
+            whitenoise: &Whitenoise,
+        ) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let hex = pubkey.to_hex();
+            // user row (FK target for accounts)
+            sqlx::query(
+                "INSERT OR IGNORE INTO users (pubkey, created_at, updated_at) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&hex)
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(&whitenoise.database.pool)
+            .await
+            .unwrap();
+            let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE pubkey = ?")
+                .bind(&hex)
+                .fetch_one(&whitenoise.database.pool)
+                .await
+                .unwrap();
+            // account row (FK target for accounts_groups)
+            sqlx::query(
+                "INSERT OR IGNORE INTO accounts \
+                 (pubkey, user_id, account_type, created_at, updated_at) \
+                 VALUES (?, ?, 'local', ?, ?)",
+            )
+            .bind(&hex)
+            .bind(user_id)
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(&whitenoise.database.pool)
+            .await
+            .unwrap();
+            // accounts_groups row
+            accounts_groups::AccountGroup::find_or_create(
+                pubkey,
+                group_id,
+                None,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
+        }
+
         // ── limit parameter ───────────────────────────────────────────────────
 
         /// `limit=Some(N)` caps the initial snapshot to the N newest messages.
@@ -1687,6 +1751,7 @@ mod tests {
             let group_id = GroupId::from_slice(&[110; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
             let base: u64 = 1_710_000_000;
 
             // Insert 10 messages with distinct timestamps (seeds 1–10)
@@ -1695,7 +1760,7 @@ mod tests {
             }
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(3))
+                .subscribe_to_group_messages(&author, &group_id, Some(3))
                 .await
                 .unwrap();
 
@@ -1723,6 +1788,7 @@ mod tests {
             let group_id = GroupId::from_slice(&[111; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
             let base: u64 = 1_711_000_000;
 
             for i in 1u8..=5 {
@@ -1730,7 +1796,7 @@ mod tests {
             }
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(200))
+                .subscribe_to_group_messages(&author, &group_id, Some(200))
                 .await
                 .unwrap();
 
@@ -1749,6 +1815,7 @@ mod tests {
             let group_id = GroupId::from_slice(&[112; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
             let base: u64 = 1_712_000_000;
 
             // Insert exactly 50 messages
@@ -1757,7 +1824,7 @@ mod tests {
             }
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1776,6 +1843,7 @@ mod tests {
             let group_id = GroupId::from_slice(&[113; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
             let base: u64 = 1_713_000_000;
 
             for i in 1u8..=60 {
@@ -1783,7 +1851,7 @@ mod tests {
             }
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1811,6 +1879,7 @@ mod tests {
             let group_id = GroupId::from_slice(&[114; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
             let base: u64 = 1_714_000_000;
 
             // Insert in reverse order to confirm sorting is not dependent on insertion order
@@ -1819,7 +1888,7 @@ mod tests {
             }
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1859,12 +1928,13 @@ mod tests {
             let group_id = GroupId::from_slice(&[115; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             insert_msg_at(1, author, 1_715_000_001, &group_id, &whitenoise).await;
 
             // No updates are emitted — the drain must exit via the Empty arm immediately
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1891,12 +1961,13 @@ mod tests {
             let group_id = GroupId::from_slice(&[116; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             // Insert a message into the DB — this is the "stale" row
             insert_msg_at(1, author, 1_716_000_001, &group_id, &whitenoise).await;
 
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1923,9 +1994,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[117; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             let mut subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -1974,12 +2046,13 @@ mod tests {
             let group_id = GroupId::from_slice(&[118; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             insert_msg_at(1, author, 1_718_000_001, &group_id, &whitenoise).await;
             insert_msg_at(2, author, 1_718_000_002, &group_id, &whitenoise).await;
 
             let mut subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -2007,9 +2080,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[119; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             let mut subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(10))
+                .subscribe_to_group_messages(&author, &group_id, Some(10))
                 .await
                 .unwrap();
 
@@ -2059,16 +2133,17 @@ mod tests {
             let group_id = GroupId::from_slice(&[120; 32]);
             setup_group(&group_id, &whitenoise).await;
             let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_id, &whitenoise).await;
 
             insert_msg_at(1, author, 1_720_000_001, &group_id, &whitenoise).await;
 
             // Two independent subscriptions
             let mut sub_a = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
             let mut sub_b = whitenoise
-                .subscribe_to_group_messages(&group_id, None)
+                .subscribe_to_group_messages(&author, &group_id, None)
                 .await
                 .unwrap();
 
@@ -2122,14 +2197,16 @@ mod tests {
             let group_b = GroupId::from_slice(&[122; 32]);
             setup_group(&group_a, &whitenoise).await;
             setup_group(&group_b, &whitenoise).await;
+            let author = nostr_sdk::Keys::generate().public_key();
+            setup_account_group(&author, &group_a, &whitenoise).await;
+            setup_account_group(&author, &group_b, &whitenoise).await;
 
             let mut sub_b = whitenoise
-                .subscribe_to_group_messages(&group_b, None)
+                .subscribe_to_group_messages(&author, &group_b, None)
                 .await
                 .unwrap();
 
             // Emit an update for group A only
-            let author = nostr_sdk::Keys::generate().public_key();
             let msg_a = message_aggregator::ChatMessage {
                 id: format!("{:0>64x}", 91u8),
                 author,
@@ -2203,6 +2280,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[130; 32]);
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
+            whitenoise
+                .get_or_create_account_group(&account, &group_id, None)
+                .await
+                .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
 
             // History: 10 messages at t+1 … t+10 (oldest → newest)
@@ -2214,7 +2295,7 @@ mod tests {
             // ── Step 1: open chat ─────────────────────────────────────────────
             // Subscribe with limit=5 → snapshot contains the 5 newest (seeds 6–10).
             let mut subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(5))
+                .subscribe_to_group_messages(&account.pubkey, &group_id, Some(5))
                 .await
                 .unwrap();
 
@@ -2397,6 +2478,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[131; 32]);
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
+            whitenoise
+                .get_or_create_account_group(&account, &group_id, None)
+                .await
+                .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
 
             // Exactly 10 messages, page size 5 — two full pages, then nothing
@@ -2407,7 +2492,7 @@ mod tests {
 
             // Page 1 (initial snapshot): seeds 6–10
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(5))
+                .subscribe_to_group_messages(&account.pubkey, &group_id, Some(5))
                 .await
                 .unwrap();
             assert_eq!(subscription.initial_messages.len(), 5);
@@ -2459,6 +2544,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[132; 32]);
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
+            whitenoise
+                .get_or_create_account_group(&account, &group_id, None)
+                .await
+                .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
 
             let base: u64 = 1_732_000_000;
@@ -2468,7 +2557,7 @@ mod tests {
 
             // Subscribe (snapshot = seeds 11–15)
             let mut subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(5))
+                .subscribe_to_group_messages(&account.pubkey, &group_id, Some(5))
                 .await
                 .unwrap();
 
@@ -2560,6 +2649,10 @@ mod tests {
             let group_id = GroupId::from_slice(&[133; 32]);
             setup_group(&group_id, &whitenoise).await;
             let account = create_db_account(&whitenoise).await;
+            whitenoise
+                .get_or_create_account_group(&account, &group_id, None)
+                .await
+                .unwrap();
             let author = nostr_sdk::Keys::generate().public_key();
 
             // 8 messages: seeds 1–6 all at the same second (tie), seed 7 earlier, seed 8 later
@@ -2572,7 +2665,7 @@ mod tests {
 
             // Subscribe with limit=3 → snapshot is the 3 newest
             let subscription = whitenoise
-                .subscribe_to_group_messages(&group_id, Some(3))
+                .subscribe_to_group_messages(&account.pubkey, &group_id, Some(3))
                 .await
                 .unwrap();
             assert_eq!(subscription.initial_messages.len(), 3);

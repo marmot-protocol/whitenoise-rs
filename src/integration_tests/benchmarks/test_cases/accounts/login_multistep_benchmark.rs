@@ -48,7 +48,7 @@ impl BenchmarkTestCase for LoginMultistepBenchmark {
     ) -> Result<Duration, WhitenoiseError> {
         let iteration = self.next_key.fetch_add(1, Ordering::Relaxed);
         if iteration >= self.prepared_keys.len() {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Login multistep benchmark iteration {} exceeds prepared keys count ({})",
                 iteration,
                 self.prepared_keys.len()
@@ -62,11 +62,10 @@ impl BenchmarkTestCase for LoginMultistepBenchmark {
         let result = context
             .whitenoise
             .login_start(keys.secret_key().to_secret_hex())
-            .await
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("{}", e)))?;
+            .await?;
 
         if result.status != LoginStatus::NeedsRelayLists {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Expected LoginStatus::NeedsRelayLists but got {:?}",
                 result.status
             )));
@@ -75,13 +74,12 @@ impl BenchmarkTestCase for LoginMultistepBenchmark {
         let final_result = context
             .whitenoise
             .login_publish_default_relays(&result.account.pubkey)
-            .await
-            .map_err(|e| WhitenoiseError::Other(anyhow::anyhow!("{}", e)))?;
+            .await?;
 
         let duration = start.elapsed();
 
         if final_result.status != LoginStatus::Complete {
-            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+            return Err(WhitenoiseError::Internal(format!(
                 "Expected LoginStatus::Complete after publish_default_relays but got {:?}",
                 final_result.status
             )));

@@ -17,7 +17,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> whitenoise::cli::Result<()> {
     let args = Args::parse();
     let config = Config::resolve(args.data_dir.as_ref(), args.logs_dir.as_ref());
 

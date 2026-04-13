@@ -4,21 +4,28 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::error::CliError;
 use super::protocol::{Request, Response};
 
+fn connection_error(err: std::io::Error) -> CliError {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    ) {
+        CliError::DaemonUnavailable(
+            "daemon not running\n\n  Start it with: wn daemon start\n  Check status:  wn daemon status"
+                .to_string(),
+        )
+    } else {
+        CliError::msg(format!("failed to connect to daemon: {err}"))
+    }
+}
+
 /// Send a single request to the daemon and return a response.
-pub async fn send(socket_path: &Path, request: &Request) -> anyhow::Result<Response> {
-    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound
-        {
-            anyhow::anyhow!(
-                "daemon not running\n\n  Start it with: wn daemon start\n  Check status:  wn daemon status"
-            )
-        } else {
-            anyhow::anyhow!("failed to connect to daemon: {e}")
-        }
-    })?;
+pub async fn send(socket_path: &Path, request: &Request) -> crate::cli::Result<Response> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(connection_error)?;
 
     let (reader, mut writer) = stream.into_split();
 
@@ -30,9 +37,9 @@ pub async fn send(socket_path: &Path, request: &Request) -> anyhow::Result<Respo
     let mut lines = BufReader::new(reader).lines();
     match tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await {
         Ok(Ok(Some(line))) => Ok(serde_json::from_str(&line)?),
-        Ok(Ok(None)) => anyhow::bail!("daemon closed connection without responding"),
+        Ok(Ok(None)) => Err(CliError::msg("daemon closed connection without responding")),
         Ok(Err(e)) => Err(e.into()),
-        Err(_) => anyhow::bail!("daemon did not respond within 30s"),
+        Err(_) => Err(CliError::msg("daemon did not respond within 30s")),
     }
 }
 
@@ -45,18 +52,10 @@ pub async fn stream(
     socket_path: &Path,
     request: &Request,
     mut handler: impl FnMut(&Response) -> bool,
-) -> anyhow::Result<()> {
-    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::ConnectionRefused
-            || e.kind() == std::io::ErrorKind::NotFound
-        {
-            anyhow::anyhow!(
-                "daemon not running\n\n  Start it with: wn daemon start\n  Check status:  wn daemon status"
-            )
-        } else {
-            anyhow::anyhow!("failed to connect to daemon: {e}")
-        }
-    })?;
+) -> crate::cli::Result<()> {
+    let stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(connection_error)?;
 
     let (reader, mut writer) = stream.into_split();
 

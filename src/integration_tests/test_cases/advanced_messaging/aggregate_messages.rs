@@ -56,7 +56,7 @@ impl TestCase for AggregateMessagesTestCase {
                 if messages.len() >= self.expected_min_messages {
                     Ok(messages)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Found {} messages, need at least {}",
                         messages.len(),
                         self.expected_min_messages

@@ -259,6 +259,7 @@ impl AggregatedMessage {
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group(
         group_id: &GroupId,
+        chat_cleared_at_ms: Option<i64>,
         database: &Database,
     ) -> Result<Vec<ChatMessage>> {
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
@@ -267,10 +268,12 @@ impl AggregatedMessage {
              LEFT JOIN message_delivery_status mds
                ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9 AND am.mls_group_id = ?
+               AND am.created_at > COALESCE(?, 0)
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at",
         )
         .bind(group_id.as_slice())
+        .bind(chat_cleared_at_ms)
         .fetch_all(&database.pool)
         .await?;
 
@@ -307,6 +310,7 @@ impl AggregatedMessage {
         database: &Database,
         options: &PaginationOptions,
         limit: Option<u32>,
+        chat_cleared_at_ms: Option<i64>,
     ) -> Result<Vec<ChatMessage>> {
         // Clamp limit: default 50, max 200.
         let limit_val = i64::from(limit.unwrap_or(50).min(200));
@@ -395,12 +399,14 @@ impl AggregatedMessage {
                      LEFT JOIN message_delivery_status mds
                        ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
                      WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND am.created_at > COALESCE(?, 0)
                        AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
                        AND (mds.status IS NULL OR mds.status != '\"Retried\"')
                      ORDER BY am.created_at DESC, am.message_id DESC
                      LIMIT ?",
                 )
                 .bind(group_id.as_slice())
+                .bind(chat_cleared_at_ms)
                 .bind(cursor_ms)
                 .bind(cursor_ms)
                 .bind(&cursor_id_str)
@@ -415,12 +421,14 @@ impl AggregatedMessage {
                      LEFT JOIN message_delivery_status mds
                        ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
                      WHERE am.kind = 9 AND am.mls_group_id = ?
+                       AND am.created_at > COALESCE(?, 0)
                        AND (am.created_at > ? OR (am.created_at = ? AND am.message_id > ?))
                        AND (mds.status IS NULL OR mds.status != '\"Retried\"')
                      ORDER BY am.created_at ASC, am.message_id ASC
                      LIMIT ?",
                 )
                 .bind(group_id.as_slice())
+                .bind(chat_cleared_at_ms)
                 .bind(cursor_ms)
                 .bind(cursor_ms)
                 .bind(&cursor_id_str)
@@ -466,6 +474,7 @@ impl AggregatedMessage {
         read_marker: Option<&EventId>,
         minimum: u32,
         database: &Database,
+        chat_cleared_at_ms: Option<i64>,
     ) -> Result<Vec<ChatMessage>> {
         let minimum_val = i64::from(minimum.min(200));
 
@@ -501,6 +510,7 @@ impl AggregatedMessage {
                     WHERE message_id = ? AND mls_group_id = ?),
                    0
                  )
+                 AND am.created_at > COALESCE(?, 0)
              )
              SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
@@ -509,6 +519,7 @@ impl AggregatedMessage {
               AND am.mls_group_id = mds.mls_group_id
              WHERE am.kind = 9
                AND am.mls_group_id = ?
+               AND am.created_at > COALESCE(?, 0)
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT MAX((SELECT cnt FROM unread_count), ?)",
@@ -516,7 +527,9 @@ impl AggregatedMessage {
         .bind(group_id.as_slice()) // unread CTE: mls_group_id
         .bind(marker_hex.as_deref()) // unread CTE: read marker message_id (NULL = no marker)
         .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
+        .bind(chat_cleared_at_ms) // unread CTE: chat_cleared_at floor
         .bind(group_id.as_slice()) // outer SELECT: mls_group_id
+        .bind(chat_cleared_at_ms) // outer SELECT: chat_cleared_at floor
         .bind(minimum_val) // MAX(cnt, minimum)
         .fetch_all(&database.pool)
         .await?;
@@ -555,6 +568,7 @@ impl AggregatedMessage {
         query: &str,
         limit: u32,
         database: &Database,
+        chat_cleared_at_ms: Option<i64>,
     ) -> Result<Vec<SearchResult>> {
         let limit_val = i64::from(limit.min(200));
         let like_pattern = super::content_search::query_to_like_pattern(query);
@@ -569,15 +583,17 @@ impl AggregatedMessage {
                  ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
                WHERE am.kind = 9
                  AND am.mls_group_id = ?1
+                 AND am.created_at > COALESCE(?2, 0)
                  AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              )
              SELECT * FROM ranked
              WHERE deletion_event_id IS NULL
-               AND content_normalized LIKE ?2
+               AND content_normalized LIKE ?3
              ORDER BY created_at DESC, message_id DESC
-             LIMIT ?3",
+             LIMIT ?4",
         )
         .bind(group_id.as_slice())
+        .bind(chat_cleared_at_ms)
         .bind(&like_pattern)
         .bind(limit_val)
         .fetch_all(&database.pool)
@@ -1191,6 +1207,7 @@ impl AggregatedMessage {
         group_id: &GroupId,
         read_marker: Option<&EventId>,
         database: &Database,
+        chat_cleared_at_ms: Option<i64>,
     ) -> Result<usize> {
         let count: i64 = match read_marker {
             Some(message_id) => {
@@ -1204,11 +1221,13 @@ impl AggregatedMessage {
                            (SELECT created_at FROM aggregated_messages
                             WHERE message_id = ? AND mls_group_id = ?),
                            0
-                       )",
+                       )
+                       AND am.created_at > COALESCE(?, 0)",
                 )
                 .bind(group_id.as_slice())
                 .bind(message_id.to_hex())
                 .bind(group_id.as_slice())
+                .bind(chat_cleared_at_ms)
                 .fetch_one(&database.pool)
                 .await?
             }
@@ -1216,9 +1235,13 @@ impl AggregatedMessage {
                 // No read marker = all messages are unread
                 sqlx::query_scalar(
                     "SELECT COUNT(*) FROM aggregated_messages
-                     WHERE mls_group_id = ? AND kind = 9 AND deletion_event_id IS NULL",
+                     WHERE mls_group_id = ?
+                       AND kind = 9
+                       AND deletion_event_id IS NULL
+                       AND created_at > COALESCE(?, 0)",
                 )
                 .bind(group_id.as_slice())
+                .bind(chat_cleared_at_ms)
                 .fetch_one(&database.pool)
                 .await?
             }
@@ -1229,11 +1252,13 @@ impl AggregatedMessage {
 
     /// Count unread messages for multiple groups in a single batch query.
     ///
-    /// Takes a slice of (group_id, optional_read_marker) pairs and returns a map
-    /// of group_id -> unread_count. Groups with no messages return 0.
+    /// Takes a slice of `(group_id, optional_read_marker, optional_chat_cleared_at_ms)`
+    /// tuples and returns a map of group_id -> unread_count. Groups with no messages
+    /// return 0. When `chat_cleared_at_ms` is provided, only messages created after
+    /// that timestamp are considered.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn count_unread_for_groups(
-        group_markers: &[(GroupId, Option<EventId>)],
+        group_markers: &[(GroupId, Option<EventId>, Option<i64>)],
         database: &Database,
     ) -> Result<HashMap<GroupId, usize>> {
         use sqlx::Row;
@@ -1244,10 +1269,16 @@ impl AggregatedMessage {
 
         let groups_with_markers: Vec<_> = group_markers
             .iter()
-            .filter_map(|(gid, marker)| marker.as_ref().map(|m| (gid, m)))
+            .filter_map(|(gid, marker, _)| marker.as_ref().map(|m| (gid, m)))
             .collect();
 
-        let all_group_ids: Vec<Vec<u8>> = group_markers.iter().map(|(g, _)| g.to_vec()).collect();
+        let groups_with_cleared: Vec<_> = group_markers
+            .iter()
+            .filter_map(|(gid, _, cleared)| cleared.map(|c| (gid, c)))
+            .collect();
+
+        let all_group_ids: Vec<Vec<u8>> =
+            group_markers.iter().map(|(g, _, _)| g.to_vec()).collect();
 
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
             sqlx::QueryBuilder::new("WITH marker_input AS (");
@@ -1268,6 +1299,23 @@ impl AggregatedMessage {
             }
         }
 
+        // Build cleared_input CTE for chat_cleared_at timestamps
+        qb.push("), cleared_input AS (");
+        if groups_with_cleared.is_empty() {
+            qb.push("SELECT NULL AS group_id, NULL AS cleared_at WHERE 0");
+        } else {
+            for (i, (group_id, cleared_at)) in groups_with_cleared.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" UNION ALL ");
+                }
+                qb.push("SELECT ");
+                qb.push_bind(group_id.as_slice());
+                qb.push(" AS group_id, ");
+                qb.push_bind(*cleared_at);
+                qb.push(" AS cleared_at");
+            }
+        }
+
         qb.push(
             "), marker_timestamps AS ( \
                  SELECT mi.group_id, am.created_at \
@@ -1279,6 +1327,7 @@ impl AggregatedMessage {
              SELECT am.mls_group_id, COUNT(*) as count \
              FROM aggregated_messages am \
              LEFT JOIN marker_timestamps mt ON am.mls_group_id = mt.group_id \
+             LEFT JOIN cleared_input ct ON am.mls_group_id = ct.group_id \
              WHERE am.mls_group_id IN (",
         );
 
@@ -1290,6 +1339,7 @@ impl AggregatedMessage {
             ") AND am.kind = 9 \
              AND am.deletion_event_id IS NULL \
              AND am.created_at > COALESCE(mt.created_at, 0) \
+             AND am.created_at > COALESCE(ct.cleared_at, 0) \
              GROUP BY am.mls_group_id",
         );
 
@@ -1305,7 +1355,7 @@ impl AggregatedMessage {
         }
 
         // Ensure all input groups are represented (groups with no messages get 0)
-        for (group_id, _) in group_markers {
+        for (group_id, _, _) in group_markers {
             results.entry(group_id.clone()).or_insert(0);
         }
 
@@ -1604,9 +1654,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert!(messages.is_empty());
     }
 
@@ -1631,9 +1682,10 @@ mod tests {
         assert_eq!(count, 1);
 
         // Verify we can retrieve it
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, message.id);
         assert_eq!(messages[0].content, message.content);
@@ -1664,9 +1716,10 @@ mod tests {
         assert_eq!(count, 3);
 
         // Verify we can retrieve all messages
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 3);
 
         // Verify event IDs
@@ -1717,9 +1770,10 @@ mod tests {
         assert_eq!(count_after, 1);
 
         // But the message should have deletion_event_id set
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_deleted);
     }
@@ -1766,9 +1820,10 @@ mod tests {
         assert_eq!(count_after, 0);
 
         // No messages should be found
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert!(messages.is_empty());
 
         // No event IDs should be found
@@ -1854,9 +1909,10 @@ mod tests {
         .unwrap();
 
         // Verify reactions were updated
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].reactions.by_emoji.len(), 1);
         assert!(messages[0].reactions.by_emoji.contains_key("👍"));
@@ -2085,7 +2141,7 @@ mod tests {
         }
 
         let count =
-            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database)
+            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database, None)
                 .await
                 .unwrap();
 
@@ -2115,6 +2171,7 @@ mod tests {
             &group_id,
             Some(&read_marker_id),
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -2149,7 +2206,7 @@ mod tests {
         .unwrap();
 
         let count =
-            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database)
+            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database, None)
                 .await
                 .unwrap();
 
@@ -2200,9 +2257,9 @@ mod tests {
         // Group 3: no messages
 
         let input = vec![
-            (group1.clone(), None),
-            (group2.clone(), None),
-            (group3.clone(), None),
+            (group1.clone(), None, None),
+            (group2.clone(), None, None),
+            (group3.clone(), None, None),
         ];
 
         let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
@@ -2253,8 +2310,8 @@ mod tests {
         let marker2 = EventId::from_hex(&group2_messages[2].id).unwrap();
 
         let input = vec![
-            (group1.clone(), Some(marker1)),
-            (group2.clone(), Some(marker2)),
+            (group1.clone(), Some(marker1), None),
+            (group2.clone(), Some(marker2), None),
         ];
 
         let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
@@ -2301,9 +2358,9 @@ mod tests {
         }
 
         let input = vec![
-            (group_with_marker.clone(), Some(marker)),
-            (group_without_marker.clone(), None),
-            (group_empty.clone(), None),
+            (group_with_marker.clone(), Some(marker), None),
+            (group_without_marker.clone(), None, None),
+            (group_empty.clone(), None, None),
         ];
 
         let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
@@ -2425,9 +2482,10 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 2);
 
         let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
@@ -2490,9 +2548,10 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
 
         // Only normal and failed messages should appear, not retried
         assert_eq!(messages.len(), 2);
@@ -2530,7 +2589,7 @@ mod tests {
         .await
         .unwrap();
 
-        let input = vec![(group_id.clone(), None)];
+        let input = vec![(group_id.clone(), None, None)];
         let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
             .await
             .unwrap();
@@ -2646,9 +2705,10 @@ mod tests {
             .unwrap();
 
         // Both should have is_deleted=true
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert!(
             messages.iter().all(|m| m.is_deleted),
             "All messages should be marked as deleted"
@@ -2659,9 +2719,10 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         assert_eq!(messages.len(), 2, "Both messages should still be present");
         assert!(
             messages.iter().all(|m| !m.is_deleted),
@@ -2700,9 +2761,10 @@ mod tests {
             .await
             .unwrap();
 
-        let messages = AggregatedMessage::find_messages_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let messages =
+            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
+                .await
+                .unwrap();
         let not_deleted: Vec<_> = messages.iter().filter(|m| !m.is_deleted).collect();
         assert_eq!(not_deleted.len(), 1, "Only msg1 should be un-deleted");
         assert_eq!(not_deleted[0].id, msg1.id);
@@ -2819,6 +2881,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2851,6 +2914,7 @@ mod tests {
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
+            None,
             None,
         )
         .await
@@ -2913,6 +2977,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2951,6 +3016,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -2995,6 +3061,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             Some(u32::MAX),
+            None,
         )
         .await
         .unwrap();
@@ -3029,6 +3096,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             Some(5),
+            None,
         )
         .await
         .unwrap();
@@ -3046,6 +3114,7 @@ mod tests {
                 ..Default::default()
             },
             Some(5),
+            None,
         )
         .await
         .unwrap();
@@ -3073,6 +3142,7 @@ mod tests {
                 ..Default::default()
             },
             Some(5),
+            None,
         )
         .await
         .unwrap();
@@ -3110,6 +3180,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3127,6 +3198,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3144,6 +3216,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3165,6 +3238,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3213,6 +3287,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -3231,6 +3306,7 @@ mod tests {
                 ),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3257,6 +3333,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -3274,6 +3351,7 @@ mod tests {
                 before_message_id: Some("00000000000000000000000000000001".to_string()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3318,6 +3396,7 @@ mod tests {
                 after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3365,6 +3444,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3410,6 +3490,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3426,6 +3507,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3442,6 +3524,7 @@ mod tests {
                 ..Default::default()
             },
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3490,6 +3573,7 @@ mod tests {
                 after_message_id: Some(id.to_string()),
             },
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -3514,6 +3598,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -3532,6 +3617,7 @@ mod tests {
                 ),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3573,6 +3659,7 @@ mod tests {
                 after_message_id: Some(cursor_id.clone()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3625,6 +3712,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3632,6 +3720,7 @@ mod tests {
             &group_b,
             &whitenoise.database,
             &PaginationOptions::default(),
+            None,
             None,
         )
         .await
@@ -3683,6 +3772,7 @@ mod tests {
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
+            None,
             None,
         )
         .await
@@ -3743,6 +3833,7 @@ mod tests {
             None,
             3,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -3806,6 +3897,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3861,6 +3953,7 @@ mod tests {
                 ..Default::default()
             },
             None,
+            None,
         )
         .await
         .expect("uppercase cursor ID should be accepted and canonicalized");
@@ -3893,6 +3986,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3912,6 +4006,7 @@ mod tests {
                 before_message_id: Some(page1[0].id.clone()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -3949,6 +4044,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3967,6 +4063,7 @@ mod tests {
                 before_message_id: Some(page1[0].id.clone()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -4018,6 +4115,7 @@ mod tests {
                 &whitenoise.database,
                 &opts,
                 Some(1),
+                None,
             )
             .await
             .unwrap();
@@ -4077,6 +4175,7 @@ mod tests {
             &whitenoise.database,
             &PaginationOptions::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -4092,6 +4191,7 @@ mod tests {
                 before_message_id: Some(oldest.id.clone()),
                 ..Default::default()
             },
+            None,
             None,
         )
         .await
@@ -4141,6 +4241,7 @@ mod tests {
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
+            None,
             None,
         )
         .await
@@ -4214,6 +4315,7 @@ mod tests {
             "hello",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4228,6 +4330,7 @@ mod tests {
             "big plans",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4240,10 +4343,15 @@ mod tests {
         assert_eq!(results[0].position, 3);
 
         // Substring matching ("big" matches "bigger")
-        let results =
-            AggregatedMessage::search_messages_in_group(&group_id, "big", 50, &whitenoise.database)
-                .await
-                .unwrap();
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "big",
+            50,
+            &whitenoise.database,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 1);
 
         // Case insensitive
@@ -4252,6 +4360,7 @@ mod tests {
             "MARMOT",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4264,6 +4373,7 @@ mod tests {
             "日本語",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4276,6 +4386,7 @@ mod tests {
             "привет",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4287,6 +4398,7 @@ mod tests {
             "नमस्ते",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4299,25 +4411,36 @@ mod tests {
             "nonexistent",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
         assert!(results.is_empty());
 
         // Empty query matches all — positions are sequential newest-first
-        let results =
-            AggregatedMessage::search_messages_in_group(&group_id, "", 50, &whitenoise.database)
-                .await
-                .unwrap();
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "",
+            50,
+            &whitenoise.database,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 6);
         let positions: Vec<u64> = results.iter().map(|r| r.position).collect();
         assert_eq!(positions, vec![0, 1, 2, 3, 4, 5]);
 
         // Limit is respected
-        let results =
-            AggregatedMessage::search_messages_in_group(&group_id, "", 2, &whitenoise.database)
-                .await
-                .unwrap();
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "",
+            2,
+            &whitenoise.database,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -4368,6 +4491,7 @@ mod tests {
             "same-ts",
             50,
             &whitenoise.database,
+            None,
         )
         .await
         .unwrap();
@@ -4425,6 +4549,7 @@ mod tests {
                 removed_at: None,
                 self_removed: false,
                 muted_until: None,
+                chat_cleared_at: None,
                 created_at: now,
                 updated_at: now,
             };
@@ -4531,5 +4656,176 @@ mod tests {
                 .await
                 .unwrap();
         assert!(no_match.is_empty(), "no match should return empty");
+    }
+
+    // ── chat_cleared_at_ms filtering ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_find_messages_respects_chat_cleared_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[240; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_700_000_000;
+
+        // Insert 5 messages at known timestamps (seconds)
+        for i in 1u8..=5 {
+            insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+        }
+
+        // cleared_at = message 3's timestamp in millis → messages 4, 5 survive
+        let cleared_at_ms = (base_ts + 3) as i64 * 1000;
+
+        // find_messages_by_group
+        let messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            Some(cleared_at_ms),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 2, "only messages after cleared_at");
+        assert_eq!(messages[0].content, "message 4");
+        assert_eq!(messages[1].content, "message 5");
+
+        // find_messages_by_group_paginated
+        let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &group_id,
+            &whitenoise.database,
+            &PaginationOptions::default(),
+            None,
+            Some(cleared_at_ms),
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        // find_messages_with_unread_minimum
+        let messages = AggregatedMessage::find_messages_with_unread_minimum(
+            &group_id,
+            None,
+            50,
+            &whitenoise.database,
+            Some(cleared_at_ms),
+        )
+        .await
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_count_unread_respects_chat_cleared_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[241; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_700_000_000;
+
+        let mut messages = Vec::new();
+        for i in 1u8..=5 {
+            let msg = insert_message_at(
+                i,
+                author,
+                base_ts + u64::from(i),
+                &group_id,
+                &whitenoise.database,
+            )
+            .await;
+            messages.push(msg);
+        }
+
+        // cleared_at = message 2's timestamp → messages 3, 4, 5 are visible
+        let cleared_at_ms = (base_ts + 2) as i64 * 1000;
+
+        // count_unread_for_group with no read marker: 3 visible messages
+        let count = AggregatedMessage::count_unread_for_group(
+            &group_id,
+            None,
+            &whitenoise.database,
+            Some(cleared_at_ms),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 3);
+
+        // count_unread_for_group with read marker at msg 3: messages 4, 5 unread
+        let marker = EventId::from_hex(&messages[2].id).unwrap();
+        let count = AggregatedMessage::count_unread_for_group(
+            &group_id,
+            Some(&marker),
+            &whitenoise.database,
+            Some(cleared_at_ms),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+
+        // count_unread_for_groups batch API
+        let input = vec![(group_id.clone(), None, Some(cleared_at_ms))];
+        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
+            .await
+            .unwrap();
+        assert_eq!(result[&group_id], 3);
+    }
+
+    #[tokio::test]
+    async fn test_search_respects_chat_cleared_at() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[242; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let base_ts: u64 = 1_700_000_000;
+
+        // Insert messages with searchable content at known timestamps
+        let contents = ["alpha hello", "bravo hello", "charlie hello", "delta hello"];
+        for (i, content) in contents.iter().enumerate() {
+            let msg = ChatMessage {
+                id: format!("{:0>64}", format!("{:x}", (i + 1) as u8)),
+                author,
+                content: content.to_string(),
+                created_at: Timestamp::from(base_ts + (i as u64) + 1),
+                tags: Tags::new(),
+                is_reply: false,
+                reply_to_id: None,
+                is_deleted: false,
+                content_tokens: vec![],
+                reactions: ReactionSummary::default(),
+                kind: 9,
+                media_attachments: vec![],
+                delivery_status: None,
+            };
+            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+                .await
+                .unwrap();
+        }
+
+        // cleared_at = message 2's timestamp → messages 3, 4 visible
+        let cleared_at_ms = (base_ts + 2) as i64 * 1000;
+
+        let results = AggregatedMessage::search_messages_in_group(
+            &group_id,
+            "hello",
+            50,
+            &whitenoise.database,
+            Some(cleared_at_ms),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        let found_contents: Vec<&str> =
+            results.iter().map(|r| r.message.content.as_str()).collect();
+        assert!(found_contents.contains(&"charlie hello"));
+        assert!(found_contents.contains(&"delta hello"));
     }
 }

@@ -46,9 +46,9 @@ impl TestCase for UnfollowUserTestCase {
                 if !is_following {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Follow relationship still exists after unfollow"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "Follow relationship still exists after unfollow".to_string(),
+                    ))
                 }
             },
             &format!(

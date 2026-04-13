@@ -1,30 +1,20 @@
 //! Database operations for account settings.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use nostr_sdk::PublicKey;
 
 use super::{Database, utils::parse_timestamp};
 use crate::perf_span;
 use crate::whitenoise::account_settings::AccountSettings;
 
-/// Internal database row representation for account_settings table.
-#[derive(Debug)]
-struct AccountSettingsRow {
-    id: i64,
-    account_pubkey: PublicKey,
-    notifications_enabled: bool,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for AccountSettingsRow
+impl<'r, R> sqlx::FromRow<'r, R> for AccountSettings
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
     String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
-    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let id: i64 = row.try_get("id")?;
 
         let account_pubkey_str: String = row.try_get("account_pubkey")?;
@@ -41,24 +31,12 @@ where
         let updated_at = parse_timestamp(row, "updated_at")?;
 
         Ok(Self {
-            id,
+            id: Some(id),
             account_pubkey,
             notifications_enabled,
             created_at,
             updated_at,
         })
-    }
-}
-
-impl From<AccountSettingsRow> for AccountSettings {
-    fn from(row: AccountSettingsRow) -> Self {
-        Self {
-            id: Some(row.id),
-            account_pubkey: row.account_pubkey,
-            notifications_enabled: row.notifications_enabled,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
     }
 }
 
@@ -72,7 +50,7 @@ impl AccountSettings {
         let _span = perf_span!("db::account_settings_find_or_create");
         let now = Utc::now().timestamp_millis();
 
-        match sqlx::query_as::<_, AccountSettingsRow>(
+        match sqlx::query_as::<_, Self>(
             "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
              VALUES (?, 1, ?, ?)
              RETURNING *",
@@ -83,15 +61,15 @@ impl AccountSettings {
         .fetch_one(&database.pool)
         .await
         {
-            Ok(row) => Ok(row.into()),
+            Ok(settings) => Ok(settings),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                let row = sqlx::query_as::<_, AccountSettingsRow>(
+                let settings = sqlx::query_as::<_, Self>(
                     "SELECT * FROM account_settings WHERE account_pubkey = ?",
                 )
                 .bind(pubkey.to_hex())
                 .fetch_one(&database.pool)
                 .await?;
-                Ok(row.into())
+                Ok(settings)
             }
             Err(e) => Err(e),
         }
@@ -125,7 +103,7 @@ impl AccountSettings {
         let now = Utc::now().timestamp_millis();
         let enabled_int: i64 = if enabled { 1 } else { 0 };
 
-        let row = sqlx::query_as::<_, AccountSettingsRow>(
+        let settings = sqlx::query_as::<_, Self>(
             "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
              VALUES (?, ?, ?, ?)
              ON CONFLICT(account_pubkey) DO UPDATE SET
@@ -140,7 +118,7 @@ impl AccountSettings {
         .fetch_one(&database.pool)
         .await?;
 
-        Ok(row.into())
+        Ok(settings)
     }
 }
 
@@ -268,24 +246,5 @@ mod tests {
         .unwrap();
         assert!(enabled.notifications_enabled);
         assert!(enabled.updated_at >= disabled.updated_at);
-    }
-
-    #[tokio::test]
-    async fn test_row_to_model_conversion() {
-        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
-        let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
-
-        let settings =
-            AccountSettings::find_or_create_for_pubkey(&keys.public_key(), &whitenoise.database)
-                .await
-                .unwrap();
-
-        // Verify From<AccountSettingsRow> produced correct values
-        assert!(settings.id.is_some());
-        assert_eq!(settings.account_pubkey, keys.public_key());
-        assert!(settings.notifications_enabled);
-        assert!(settings.created_at <= Utc::now());
-        assert!(settings.updated_at <= Utc::now());
     }
 }

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use nostr_sdk::RelayUrl;
 
 use super::{
@@ -7,19 +7,7 @@ use super::{
 };
 use crate::{WhitenoiseError, perf_instrument, whitenoise::relays::Relay};
 
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub(crate) struct RelayRow {
-    // id is the primary key
-    pub id: i64,
-    // url is the URL of the relay
-    pub url: RelayUrl,
-    // created_at is the timestamp of the relay creation
-    pub created_at: DateTime<Utc>,
-    // updated_at is the timestamp of the last update
-    pub updated_at: DateTime<Utc>,
-}
-
-impl<'r, R> sqlx::FromRow<'r, R> for RelayRow
+impl<'r, R> sqlx::FromRow<'r, R> for Relay
 where
     R: sqlx::Row,
     &'r str: sqlx::ColumnIndex<R>,
@@ -39,23 +27,12 @@ where
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
-        Ok(RelayRow {
-            id,
+        Ok(Self {
+            id: Some(id),
             url,
             created_at,
             updated_at,
         })
-    }
-}
-
-impl From<RelayRow> for Relay {
-    fn from(val: RelayRow) -> Self {
-        Relay {
-            id: Some(val.id),
-            url: val.url,
-            created_at: val.created_at,
-            updated_at: val.updated_at,
-        }
     }
 }
 
@@ -80,7 +57,7 @@ impl Relay {
         database: &Database,
     ) -> Result<Relay, WhitenoiseError> {
         let normalized_url = normalize_relay_url(url);
-        let relay_row = sqlx::query_as::<_, RelayRow>("SELECT * FROM relays WHERE url = ?")
+        let relay = sqlx::query_as::<_, Self>("SELECT * FROM relays WHERE url = ?")
             .bind(normalized_url)
             .fetch_one(&database.pool)
             .await
@@ -89,12 +66,7 @@ impl Relay {
                 other => WhitenoiseError::Database(DatabaseError::Sqlx(other)),
             })?;
 
-        Ok(Relay {
-            id: Some(relay_row.id),
-            url: relay_row.url,
-            created_at: relay_row.created_at,
-            updated_at: relay_row.updated_at,
-        })
+        Ok(relay)
     }
 
     #[perf_instrument("db::relays")]
@@ -142,7 +114,7 @@ impl Relay {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        let inserted_relay = sqlx::query_as::<_, RelayRow>("SELECT * FROM relays WHERE url = ?")
+        let inserted_relay = sqlx::query_as::<_, Self>("SELECT * FROM relays WHERE url = ?")
             .bind(&normalized_url)
             .fetch_one(&mut *tx)
             .await
@@ -150,7 +122,7 @@ impl Relay {
 
         tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
-        Ok(inserted_relay.into())
+        Ok(inserted_relay)
     }
 }
 
@@ -178,35 +150,6 @@ mod tests {
         .unwrap();
 
         pool
-    }
-
-    #[tokio::test]
-    async fn test_relay_new_row_from_row_valid_data() {
-        let pool = setup_test_db().await;
-
-        let test_url_str = "wss://relay.damus.io";
-        let test_url = RelayUrl::parse(test_url_str).unwrap();
-        let test_timestamp = chrono::Utc::now().timestamp_millis();
-
-        sqlx::query("INSERT INTO relays (url, created_at, updated_at) VALUES (?, ?, ?)")
-            .bind(test_url_str)
-            .bind(test_timestamp)
-            .bind(test_timestamp)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let row: SqliteRow = sqlx::query("SELECT * FROM relays WHERE url = ?")
-            .bind(test_url_str)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        let relay_row = RelayRow::from_row(&row).unwrap();
-
-        assert_eq!(relay_row.url, test_url);
-        assert_eq!(relay_row.created_at.timestamp_millis(), test_timestamp);
-        assert_eq!(relay_row.updated_at.timestamp_millis(), test_timestamp);
     }
 
     #[tokio::test]
@@ -240,7 +183,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let relay_row = RelayRow::from_row(&row).unwrap();
+            let relay_row = Relay::from_row(&row).unwrap();
             let expected_url = RelayUrl::parse(url_str).unwrap();
             assert_eq!(relay_row.url, expected_url);
 
@@ -285,7 +228,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = RelayRow::from_row(&row);
+            let result = Relay::from_row(&row);
             assert!(
                 result.is_err(),
                 "Expected error for invalid URL: {}",
@@ -327,7 +270,7 @@ mod tests {
             .await
             .unwrap();
 
-        let relay_row = RelayRow::from_row(&row).unwrap();
+        let relay_row = Relay::from_row(&row).unwrap();
         assert_eq!(relay_row.created_at.timestamp_millis(), 0);
         assert_eq!(relay_row.updated_at.timestamp_millis(), 0);
 
@@ -354,7 +297,7 @@ mod tests {
             .await
             .unwrap();
 
-        let relay_row = RelayRow::from_row(&row).unwrap();
+        let relay_row = Relay::from_row(&row).unwrap();
         assert_eq!(relay_row.created_at.timestamp_millis(), future_timestamp);
         assert_eq!(relay_row.updated_at.timestamp_millis(), future_timestamp);
     }
@@ -380,7 +323,7 @@ mod tests {
             .await
             .unwrap();
 
-        let relay_row = RelayRow::from_row(&row).unwrap();
+        let relay_row = Relay::from_row(&row).unwrap();
         let expected_url = RelayUrl::parse(test_url_str).unwrap();
         assert_eq!(relay_row.url, expected_url);
     }
@@ -406,7 +349,7 @@ mod tests {
             .await
             .unwrap();
 
-        let relay_row = RelayRow::from_row(&row).unwrap();
+        let relay_row = Relay::from_row(&row).unwrap();
         let expected_url = RelayUrl::parse(test_url_str).unwrap();
         assert_eq!(relay_row.url, expected_url);
     }
@@ -634,7 +577,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = RelayRow::from_row(&row);
+        let result = Relay::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {
@@ -664,7 +607,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = RelayRow::from_row(&row);
+        let result = Relay::from_row(&row);
         assert!(result.is_err());
 
         if let Err(sqlx::Error::ColumnDecode { index, .. }) = result {

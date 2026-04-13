@@ -53,7 +53,7 @@ impl TestCase for WaitForWelcomeTestCase {
                         if groups.iter().any(|g| g.mls_group_id == group_id) {
                             Ok(())
                         } else {
-                            Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            Err(WhitenoiseError::Internal(format!(
                                 "{} has not yet processed the welcome for the group",
                                 account_name
                             )))

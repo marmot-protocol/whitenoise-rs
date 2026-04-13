@@ -46,9 +46,9 @@ impl TestCase for FollowUserTestCase {
                 if is_following {
                     Ok(())
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
-                        "Follow relationship not yet established"
-                    )))
+                    Err(WhitenoiseError::Internal(
+                        "Follow relationship not yet established".to_string(),
+                    ))
                 }
             },
             &format!(

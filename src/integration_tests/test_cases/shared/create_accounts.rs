@@ -45,7 +45,7 @@ impl TestCase for CreateAccountsTestCase {
                         .await?;
 
                     if key_packages.is_empty() {
-                        return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                        return Err(WhitenoiseError::Internal(format!(
                             "Key package not yet published for account '{}' ({})",
                             name,
                             account.pubkey.to_hex()

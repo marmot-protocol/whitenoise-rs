@@ -3,6 +3,9 @@ pub mod client;
 pub mod commands;
 pub mod config;
 pub mod dispatch;
+pub mod error;
 pub mod output;
 pub mod protocol;
 pub mod server;
+
+pub use error::{CliError, Result};

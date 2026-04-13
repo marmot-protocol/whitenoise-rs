@@ -196,13 +196,19 @@ fn assemble_chat_list_items(
                 }
             };
 
-            let last_message = last_message_map.get(&group.mls_group_id).map(|summary| {
-                let mut msg = summary.clone();
-                msg.author_display_name = resolve_display_name(users_by_pubkey.get(&msg.author));
-                msg
-            });
-
             let account_group = membership_map.get(&group.mls_group_id)?;
+
+            let last_message = last_message_map
+                .get(&group.mls_group_id)
+                .and_then(|summary| {
+                    if !account_group.is_message_visible(summary.created_at) {
+                        return None;
+                    }
+                    let mut msg = summary.clone();
+                    msg.author_display_name =
+                        resolve_display_name(users_by_pubkey.get(&msg.author));
+                    Some(msg)
+                });
             let pending_confirmation = account_group.is_pending();
             let welcomer_pubkey = account_group.welcomer_pubkey;
             let unread_count = *unread_counts.get(&group.mls_group_id).unwrap_or(&0);
@@ -307,7 +313,10 @@ impl Whitenoise {
 
         let group_markers: Vec<_> = membership_map
             .iter()
-            .map(|(gid, ag)| (gid.clone(), ag.last_read_message_id))
+            .map(|(gid, ag)| {
+                let cleared_ms = ag.chat_cleared_at.map(|dt| dt.timestamp_millis());
+                (gid.clone(), ag.last_read_message_id, cleared_ms)
+            })
             .collect();
         let unread_counts =
             AggregatedMessage::count_unread_for_groups(&group_markers, &self.database).await?;
@@ -387,7 +396,11 @@ impl Whitenoise {
         .await?;
         let last_message_summary = last_message_summaries.into_iter().next();
 
-        // 6. Lookup message author metadata and build final last_message
+        // 6. Lookup message author metadata and build final last_message.
+        //    Filter out messages at or before chat_cleared_at so the chat list
+        //    preview does not show a message the user explicitly cleared.
+        let last_message_summary = last_message_summary
+            .filter(|summary| account_group.is_message_visible(summary.created_at));
         let last_message = if let Some(mut summary) = last_message_summary {
             let author_user = User::find_by_pubkey(&summary.author, &self.database)
                 .await
@@ -419,10 +432,14 @@ impl Whitenoise {
         };
 
         // 8. Compute unread count
+        let cleared_ms = account_group
+            .chat_cleared_at
+            .map(|dt| dt.timestamp_millis());
         let unread_count = AggregatedMessage::count_unread_for_group(
             group_id,
             account_group.last_read_message_id.as_ref(),
             &self.database,
+            cleared_ms,
         )
         .await?;
 
@@ -558,8 +575,9 @@ impl Whitenoise {
             Ok(Some(item)) => {
                 let update = ChatListUpdate { trigger, item };
                 match trigger {
-                    ChatListUpdateTrigger::ChatArchiveChanged => {
-                        // Item is moving between lists — notify both channels
+                    ChatListUpdateTrigger::ChatArchiveChanged
+                    | ChatListUpdateTrigger::ChatDeleted => {
+                        // Item is moving between lists or being removed — notify both channels
                         if has_active {
                             self.chat_list_stream_manager.emit(pubkey, update.clone());
                         }

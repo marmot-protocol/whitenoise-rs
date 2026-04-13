@@ -63,7 +63,7 @@ impl TestCase for AddGroupMembersTestCase {
         if self.expect_failure {
             match add_result {
                 Ok(_) => {
-                    return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    return Err(WhitenoiseError::Internal(format!(
                         "Expected adding {} members to fail, but it succeeded",
                         self.new_member_pubkeys.len()
                     )));
@@ -97,7 +97,7 @@ impl TestCase for AddGroupMembersTestCase {
                     // Verify each new member is in the group
                     for pubkey in &self.new_member_pubkeys {
                         if !members.contains(pubkey) {
-                            return Err(WhitenoiseError::Other(anyhow::anyhow!(
+                            return Err(WhitenoiseError::Internal(format!(
                                 "New member {} not yet in group",
                                 &pubkey.to_hex()[..8]
                             )));
@@ -105,7 +105,7 @@ impl TestCase for AddGroupMembersTestCase {
                     }
                     Ok(members)
                 } else {
-                    Err(WhitenoiseError::Other(anyhow::anyhow!(
+                    Err(WhitenoiseError::Internal(format!(
                         "Expected {} members, found {}",
                         expected_count,
                         members.len()
