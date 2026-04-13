@@ -50,8 +50,7 @@ impl BenchmarkTestCase for LoginStartBenchmark {
         let result = context
             .whitenoise
             .login_start(keys.secret_key().to_secret_hex())
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("{}", e)))?;
+            .await?;
         let duration = start.elapsed();
 
         if result.status != LoginStatus::Complete {

@@ -445,12 +445,24 @@ impl Whitenoise {
         let data_dir = &config.data_dir;
         let logs_dir = &config.logs_dir;
 
-        // Setup directories
-        std::fs::create_dir_all(data_dir).map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to create data directory: {data_dir:?}: {e}"))
+        // Setup directories. Path context is preserved via tracing; the
+        // io::Error itself flows through `WhitenoiseError::Filesystem` so
+        // callers can distinguish filesystem failures.
+        std::fs::create_dir_all(data_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?data_dir,
+                error = %e,
+                "Failed to create data directory"
+            );
         })?;
-        std::fs::create_dir_all(logs_dir).map_err(|e| {
-            WhitenoiseError::Internal(format!("Failed to create logs directory: {logs_dir:?}: {e}"))
+        std::fs::create_dir_all(logs_dir).inspect_err(|e| {
+            tracing::error!(
+                target: "whitenoise::initialize_whitenoise",
+                ?logs_dir,
+                error = %e,
+                "Failed to create logs directory"
+            );
         })?;
 
         // Only initialize tracing once

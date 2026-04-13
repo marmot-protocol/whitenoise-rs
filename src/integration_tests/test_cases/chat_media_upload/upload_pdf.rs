@@ -1,7 +1,10 @@
-use crate::WhitenoiseError;
-use crate::integration_tests::core::*;
+use std::io::Write;
+
 use async_trait::async_trait;
 use nostr_sdk::Url;
+
+use crate::WhitenoiseError;
+use crate::integration_tests::core::*;
 
 /// Test case for uploading PDF documents
 pub struct UploadPdfTestCase {
@@ -19,21 +22,13 @@ impl UploadPdfTestCase {
 
     /// Create a temporary PDF file with valid magic bytes
     fn create_test_pdf(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        use std::io::Write;
-
-        let mut temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
+        let mut temp_file = tempfile::NamedTempFile::new()?;
 
         // Minimal valid PDF header
         let pdf_header: &[u8] = b"%PDF-1.4\n";
 
-        temp_file
-            .write_all(pdf_header)
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to write PDF data: {}", e)))?;
-
-        temp_file
-            .flush()
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to flush temp file: {}", e)))?;
+        temp_file.write_all(pdf_header)?;
+        temp_file.flush()?;
 
         Ok(temp_file)
     }

@@ -206,7 +206,7 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
 
     // Re-seed the Nostr private key.
     let keys = Keys::parse(nsec)
-        .map_err(|e| WhitenoiseError::Internal(format!("Invalid --seed-nsec value: {e}")))?;
+        .map_err(|e| WhitenoiseError::InvalidInput(format!("Invalid --seed-nsec value: {e}")))?;
     SecretsStore::new(KEYRING_SERVICE)
         .store_private_key(&keys)
         .map_err(|e| WhitenoiseError::Internal(format!("Failed to re-seed Nostr key: {e}")))?;
@@ -327,7 +327,7 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     if let Some(ref trace_path) = args.chrome_trace {
         if !args.detailed {
-            return Err(WhitenoiseError::Internal(
+            return Err(WhitenoiseError::InvalidInput(
                 "--chrome-trace requires --detailed; re-run with both flags".to_string(),
             ));
         }

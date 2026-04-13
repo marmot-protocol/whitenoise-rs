@@ -1762,11 +1762,10 @@ mod tests {
             "Should reject retry for uncached message"
         );
 
-        let err_msg = retry_result.unwrap_err().to_string();
+        let err = retry_result.unwrap_err();
         assert!(
-            err_msg.contains("not found in cache"),
-            "Error should mention message not found, got: {}",
-            err_msg
+            matches!(err, WhitenoiseError::MessageNotFound),
+            "Expected MessageNotFound for uncached retry, got: {err:?}"
         );
     }
 

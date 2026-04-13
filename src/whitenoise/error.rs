@@ -235,7 +235,7 @@ pub enum WhitenoiseError {
 
 impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
     fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
-        WhitenoiseError::Internal(err.to_string())
+        Self::Internal(err.to_string())
     }
 }
 

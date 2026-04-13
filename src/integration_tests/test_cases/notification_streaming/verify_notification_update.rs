@@ -95,7 +95,7 @@ impl TestCase for VerifyNotificationUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Internal(
+            WhitenoiseError::InvalidInput(
                 "VerifyNotificationUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the notification, then call execute()."

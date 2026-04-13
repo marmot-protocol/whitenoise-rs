@@ -94,10 +94,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             .map_err(|e| WhitenoiseError::InvalidInput(format!("Invalid searcher npub: {}", e)))?;
 
         // Follow the target so their social graph becomes our radius 1
-        whitenoise
-            .follow_user(searcher, &target_pubkey)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to follow target: {}", e)))?;
+        whitenoise.follow_user(searcher, &target_pubkey).await?;
 
         // Clear perf samples accumulated during setup/follow so only
         // actual search timings appear in the breakdown.

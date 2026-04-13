@@ -62,8 +62,7 @@ impl BenchmarkTestCase for LoginMultistepBenchmark {
         let result = context
             .whitenoise
             .login_start(keys.secret_key().to_secret_hex())
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("{}", e)))?;
+            .await?;
 
         if result.status != LoginStatus::NeedsRelayLists {
             return Err(WhitenoiseError::Internal(format!(
@@ -75,8 +74,7 @@ impl BenchmarkTestCase for LoginMultistepBenchmark {
         let final_result = context
             .whitenoise
             .login_publish_default_relays(&result.account.pubkey)
-            .await
-            .map_err(|e| WhitenoiseError::Internal(format!("{}", e)))?;
+            .await?;
 
         let duration = start.elapsed();
 

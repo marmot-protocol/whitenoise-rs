@@ -1,11 +1,12 @@
-use crate::{
-    nostr_manager::parser::SerializableToken, relay_control::SubscriptionContext,
-    whitenoise::error::WhitenoiseError,
-};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Serialize;
 use thiserror::Error;
+
+use crate::{
+    nostr_manager::parser::SerializableToken, relay_control::SubscriptionContext,
+    whitenoise::error::WhitenoiseError,
+};
 
 /// Retry information for failed event processing
 #[derive(Debug, Clone)]
@@ -368,7 +369,7 @@ impl TryFrom<&str> for ImageType {
             "image/webp" => Ok(ImageType::Webp),
             _ => Err(ImageTypeError::UnsupportedMimeType {
                 mime_type: mime_type.to_string(),
-                supported: ImageType::supported_mime_types(),
+                supported: Self::supported_mime_types(),
             }),
         }
     }

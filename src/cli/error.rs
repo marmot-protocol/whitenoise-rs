@@ -35,7 +35,7 @@ pub enum CliError {
 
 impl CliError {
     /// Convenience constructor for ad-hoc CLI errors.
-    pub fn msg(message: impl Into<String>) -> Self {
-        Self::Message(message.into())
+    pub fn msg(message: impl ToString) -> Self {
+        Self::Message(message.to_string())
     }
 }

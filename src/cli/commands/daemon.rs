@@ -37,8 +37,7 @@ async fn start(config: &Config) -> crate::cli::Result<()> {
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
-    cmd.spawn()
-        .map_err(|e| CliError::msg(format!("failed to start daemon: {e}")))?;
+    cmd.spawn()?;
     println!("daemon started");
     Ok(())
 }

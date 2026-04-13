@@ -85,7 +85,7 @@ impl TestCase for VerifyStreamUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let mut guard = self.receiver.lock().await;
         let receiver = guard.as_mut().ok_or_else(|| {
-            WhitenoiseError::Internal(
+            WhitenoiseError::InvalidInput(
                 "VerifyStreamUpdateTestCase: subscribe() must be called before run(). \
                  The scenario should first call subscribe(), then perform the action \
                  that triggers the update, then call execute()."

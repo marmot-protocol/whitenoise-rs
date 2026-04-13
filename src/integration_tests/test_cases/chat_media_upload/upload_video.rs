@@ -1,7 +1,10 @@
-use crate::WhitenoiseError;
-use crate::integration_tests::core::*;
+use std::io::Write;
+
 use async_trait::async_trait;
 use nostr_sdk::Url;
+
+use crate::WhitenoiseError;
+use crate::integration_tests::core::*;
 
 /// Test case for uploading video files (MP4)
 pub struct UploadVideoTestCase {
@@ -19,10 +22,7 @@ impl UploadVideoTestCase {
 
     /// Create a temporary MP4 video file with valid magic bytes
     fn create_test_video(&self) -> Result<tempfile::NamedTempFile, WhitenoiseError> {
-        use std::io::Write;
-
-        let mut temp_file = tempfile::NamedTempFile::new()
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to create temp file: {}", e)))?;
+        let mut temp_file = tempfile::NamedTempFile::new()?;
 
         // MP4 magic bytes (ftyp box signature)
         // This is a minimal valid MP4 file structure
@@ -37,13 +37,8 @@ impl UploadVideoTestCase {
             0x00, 0x00, 0x00, 0x00, // padding
         ];
 
-        temp_file
-            .write_all(mp4_header)
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to write MP4 data: {}", e)))?;
-
-        temp_file
-            .flush()
-            .map_err(|e| WhitenoiseError::Internal(format!("Failed to flush temp file: {}", e)))?;
+        temp_file.write_all(mp4_header)?;
+        temp_file.flush()?;
 
         Ok(temp_file)
     }

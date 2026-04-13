@@ -11,6 +11,7 @@ use crate::Whitenoise;
 
 use super::config::Config;
 use super::dispatch;
+use super::error::CliError;
 use super::protocol::{Request, Response};
 
 /// Start the daemon: bind the socket, accept connections, dispatch requests.
@@ -113,7 +114,7 @@ fn clean_stale_socket(socket_path: &Path, pid_path: &Path) -> crate::cli::Result
     }
 
     if let Some(pid) = read_pid(pid_path).filter(|&p| is_process_alive(p)) {
-        return Err(crate::cli::error::CliError::msg(format!(
+        return Err(CliError::msg(format!(
             "daemon already running (pid {pid}). \
              Stop it with: wn daemon stop"
         )));
@@ -179,7 +180,6 @@ pub fn is_daemon_running(config: &Config) -> Option<u32> {
 ///
 /// Waits up to 5 seconds for the process to exit after sending the signal.
 pub fn stop_daemon(config: &Config) -> crate::cli::Result<()> {
-    use crate::cli::error::CliError;
     match is_daemon_running(config) {
         Some(pid) => {
             if !send_sigterm(pid) {
