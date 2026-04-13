@@ -68,6 +68,10 @@ where
                 source: Box::new(e),
             })?;
 
+        // `mls_group_id_bytes` is length-checked by the database schema
+        // (see the `group_information.mls_group_id` CHECK constraint), so
+        // `GroupId::from_slice` is safe here without an additional length
+        // check in this decoder.
         let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
 
         // Validate user_confirmation: only 0, 1, or NULL are valid

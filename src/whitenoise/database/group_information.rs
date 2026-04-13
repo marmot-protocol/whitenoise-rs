@@ -383,4 +383,36 @@ mod tests {
         assert_eq!(found_dm.group_type, GroupType::DirectMessage);
         assert_eq!(found_dm.id, dm_group_info.id);
     }
+
+    #[tokio::test]
+    async fn test_invalid_group_type_returns_column_decode_error() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[99; 32]);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Insert a row with a malformed group_type value directly, bypassing
+        // GroupType's Display so we can exercise the decode error path.
+        sqlx::query(
+            "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(group_id.as_slice())
+        .bind("not_a_real_group_type")
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&whitenoise.database.pool)
+        .await
+        .unwrap();
+
+        let err = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database)
+            .await
+            .unwrap_err();
+
+        match err {
+            WhitenoiseError::SqlxError(sqlx::Error::ColumnDecode { index, .. }) => {
+                assert_eq!(index, "group_type");
+            }
+            other => panic!("expected ColumnDecode for group_type, got {:?}", other),
+        }
+    }
 }

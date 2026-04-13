@@ -266,8 +266,11 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AppSettings::from_row(&row);
-        assert!(matches!(result, Err(sqlx::Error::ColumnDecode { .. })));
+        let err = AppSettings::from_row(&row).unwrap_err();
+        match err {
+            sqlx::Error::ColumnDecode { index, .. } => assert_eq!(index, "theme_mode"),
+            other => panic!("expected ColumnDecode for theme_mode, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -292,8 +295,11 @@ mod tests {
             .await
             .unwrap();
 
-        let result = AppSettings::from_row(&row);
-        assert!(matches!(result, Err(sqlx::Error::ColumnDecode { .. })));
+        let err = AppSettings::from_row(&row).unwrap_err();
+        match err {
+            sqlx::Error::ColumnDecode { index, .. } => assert_eq!(index, "language"),
+            other => panic!("expected ColumnDecode for language, got {:?}", other),
+        }
     }
 
     #[tokio::test]
