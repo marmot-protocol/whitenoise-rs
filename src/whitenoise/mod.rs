@@ -1670,6 +1670,7 @@ mod tests {
 
             // Emit an update (will be caught by subscriber during drain phase)
             whitenoise.message_stream_manager.emit(
+                &test_pubkey,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2067,6 +2068,7 @@ mod tests {
                 delivery_status: None,
             };
             whitenoise.message_stream_manager.emit(
+                &author,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2158,6 +2160,7 @@ mod tests {
                 delivery_status: None,
             };
             whitenoise.message_stream_manager.emit(
+                &author,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2217,6 +2220,7 @@ mod tests {
                 delivery_status: None,
             };
             whitenoise.message_stream_manager.emit(
+                &author,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2272,6 +2276,7 @@ mod tests {
                 delivery_status: None,
             };
             whitenoise.message_stream_manager.emit(
+                &author,
                 &group_a,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2468,6 +2473,7 @@ mod tests {
             };
 
             whitenoise.message_stream_manager.emit(
+                &account.pubkey,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2475,6 +2481,7 @@ mod tests {
                 },
             );
             whitenoise.message_stream_manager.emit(
+                &account.pubkey,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2660,6 +2667,7 @@ mod tests {
                 delivery_status: None,
             };
             whitenoise.message_stream_manager.emit(
+                &account.pubkey,
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,

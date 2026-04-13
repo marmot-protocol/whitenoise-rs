@@ -203,7 +203,12 @@ impl Whitenoise {
                 Whitenoise::spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
                 );
-                self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
+                self.emit_message_update(
+                    &account.pubkey,
+                    &group_id,
+                    UpdateTrigger::NewMessage,
+                    msg,
+                );
                 self.emit_chat_list_update(
                     account,
                     &group_id,
@@ -216,7 +221,12 @@ impl Whitenoise {
                     .cache_reaction(&account.pubkey, &group_id, &message)
                     .await?
                 {
-                    self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
+                    self.emit_message_update(
+                        &account.pubkey,
+                        &group_id,
+                        UpdateTrigger::ReactionAdded,
+                        target,
+                    );
                 }
             }
             Kind::EventDeletion => {
@@ -243,7 +253,7 @@ impl Whitenoise {
             .cache_deletion(account_pubkey, group_id, message)
             .await?
         {
-            self.emit_message_update(group_id, trigger, msg);
+            self.emit_message_update(account_pubkey, group_id, trigger, msg);
         }
 
         // Check if the deleted message was the last message.
@@ -454,12 +464,16 @@ impl Whitenoise {
     /// Emit a message update to all subscribers of a group.
     fn emit_message_update(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         trigger: UpdateTrigger,
         message: ChatMessage,
     ) {
-        self.message_stream_manager
-            .emit(group_id, MessageUpdate { trigger, message });
+        self.message_stream_manager.emit(
+            account_pubkey,
+            group_id,
+            MessageUpdate { trigger, message },
+        );
     }
 
     /// Gets the ID of the last message in a group (if any).

@@ -47,7 +47,9 @@ impl Whitenoise {
         limit: Option<u32>,
     ) -> Result<message_streaming::GroupMessageSubscription> {
         // 1. Subscribe FIRST to capture any concurrent updates that arrive during the fetch.
-        let mut updates = self.message_stream_manager.subscribe(group_id);
+        let mut updates = self
+            .message_stream_manager
+            .subscribe(account_pubkey, group_id);
 
         // 2. Fetch the most-recent `limit` messages using the paginated query so the initial
         //    snapshot honours the same page size the Flutter side will use for further loads.

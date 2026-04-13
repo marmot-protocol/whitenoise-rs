@@ -199,6 +199,7 @@ impl Whitenoise {
 
         // Emit NewMessage so the UI shows it immediately (optimistic)
         self.message_stream_manager.emit(
+            account_pubkey,
             group_id,
             MessageUpdate {
                 trigger: UpdateTrigger::NewMessage,
@@ -264,6 +265,7 @@ impl Whitenoise {
             .await?;
 
             self.message_stream_manager.emit(
+                account_pubkey,
                 group_id,
                 MessageUpdate {
                     trigger: UpdateTrigger::ReactionAdded,
@@ -341,6 +343,7 @@ impl Whitenoise {
                     .await?;
 
                     self.message_stream_manager.emit(
+                        account_pubkey,
                         group_id,
                         MessageUpdate {
                             trigger: UpdateTrigger::ReactionRemoved,
@@ -374,6 +377,7 @@ impl Whitenoise {
             {
                 msg.is_deleted = true;
                 self.message_stream_manager.emit(
+                    account_pubkey,
                     group_id,
                     MessageUpdate {
                         trigger: UpdateTrigger::MessageDeleted,
@@ -461,6 +465,7 @@ impl Whitenoise {
                 match result {
                     Ok(Some(parent)) => {
                         stream_manager.emit(
+                            account_pubkey,
                             group_id,
                             MessageUpdate {
                                 trigger: UpdateTrigger::ReactionRemoved,
@@ -512,6 +517,7 @@ impl Whitenoise {
                     .await
                     {
                         stream_manager.emit(
+                            account_pubkey,
                             group_id,
                             MessageUpdate {
                                 trigger: UpdateTrigger::DeliveryStatusChanged,
@@ -597,6 +603,7 @@ impl Whitenoise {
         {
             Ok(updated_original) => {
                 self.message_stream_manager.emit(
+                    &account.pubkey,
                     group_id,
                     MessageUpdate {
                         trigger: UpdateTrigger::DeliveryStatusChanged,

@@ -700,6 +700,7 @@ impl EphemeralPlane {
         {
             Ok(updated_msg) => {
                 stream_manager.emit(
+                    account_pubkey,
                     group_id,
                     MessageUpdate {
                         trigger: UpdateTrigger::DeliveryStatusChanged,
