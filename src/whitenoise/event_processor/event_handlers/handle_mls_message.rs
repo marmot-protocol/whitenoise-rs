@@ -1561,15 +1561,15 @@ mod tests {
             token_tag.encrypted_token.to_base64()
         );
 
-        let cached_messages = AggregatedMessage::find_messages_by_group(
-            &admin_account.pubkey,
+        let receiver_cached_messages = AggregatedMessage::find_messages_by_group(
+            &member_account.pubkey,
             &group_id,
             None,
             &whitenoise.database,
         )
         .await
         .unwrap();
-        assert!(cached_messages.is_empty());
+        assert!(receiver_cached_messages.is_empty());
     }
 
     #[tokio::test]

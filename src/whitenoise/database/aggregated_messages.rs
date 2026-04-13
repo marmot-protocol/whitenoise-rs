@@ -2695,6 +2695,78 @@ mod tests {
         assert!(!ids.contains(&msg_retried.id.as_str()));
     }
 
+    /// Verify that delivery status is fully isolated per account: a status
+    /// inserted for one account must not be visible when querying as another.
+    #[tokio::test]
+    async fn test_delivery_status_isolated_per_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[240; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let author = Keys::generate().public_key();
+        let other_account = Keys::generate().public_key();
+
+        // Insert a message authored by `author`
+        let message = create_test_chat_message(240, author);
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Insert delivery status scoped to `author`
+        AggregatedMessage::insert_delivery_status(
+            &author,
+            &message.id,
+            &group_id,
+            &DeliveryStatus::Sending,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        // Author should see the delivery status
+        assert!(
+            AggregatedMessage::has_delivery_status(
+                &author,
+                &message.id,
+                &group_id,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap()
+        );
+        let found_by_author =
+            AggregatedMessage::find_by_id(&author, &message.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            found_by_author.delivery_status,
+            Some(DeliveryStatus::Sending)
+        );
+
+        // Other account should NOT see the delivery status
+        assert!(
+            !AggregatedMessage::has_delivery_status(
+                &other_account,
+                &message.id,
+                &group_id,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap()
+        );
+        let found_by_other = AggregatedMessage::find_by_id(
+            &other_account,
+            &message.id,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(found_by_other.delivery_status, None);
+    }
+
     #[tokio::test]
     async fn test_count_unread_for_groups_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
