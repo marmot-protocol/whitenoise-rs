@@ -1046,9 +1046,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg1, &group1.mls_group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &creator.pubkey,
+            &msg1,
+            &group1.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let msg2 = ChatMessage {
             id: format!("{:0>64}", "2"),
@@ -1065,9 +1070,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg2, &group2.mls_group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &creator.pubkey,
+            &msg2,
+            &group2.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
 
@@ -1229,9 +1239,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &creator.pubkey,
+            &msg,
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
 
@@ -1291,9 +1306,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg, &group1.mls_group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &creator.pubkey,
+            &msg,
+            &group1.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let chat_list = whitenoise.get_chat_list(&creator).await.unwrap();
 
@@ -1380,9 +1400,14 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &creator.pubkey,
+            &msg,
+            &group.mls_group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let result = whitenoise
             .build_chat_list_item(&creator, &group.mls_group_id)
@@ -1672,9 +1697,14 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(&msg, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &creator.pubkey,
+                &msg,
+                &group.mls_group_id,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
         }
 
         // Order should be stable when timestamps are identical

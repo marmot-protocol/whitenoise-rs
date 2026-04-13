@@ -258,6 +258,7 @@ impl AggregatedMessage {
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group(
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         chat_cleared_at_ms: Option<i64>,
         database: &Database,
@@ -266,12 +267,15 @@ impl AggregatedMessage {
             "SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
              LEFT JOIN message_delivery_status mds
-               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               ON am.message_id = mds.message_id
+              AND am.mls_group_id = mds.mls_group_id
+              AND mds.account_pubkey = ?
              WHERE am.kind = 9 AND am.mls_group_id = ?
                AND am.created_at > COALESCE(?, 0)
                AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              ORDER BY am.created_at",
         )
+        .bind(account_pubkey.to_hex())
         .bind(group_id.as_slice())
         .bind(chat_cleared_at_ms)
         .fetch_all(&database.pool)
@@ -306,6 +310,7 @@ impl AggregatedMessage {
     /// Query uses covering index: idx_aggregated_messages_kind_group(kind, mls_group_id, created_at)
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_by_group_paginated(
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         database: &Database,
         options: &PaginationOptions,
@@ -391,13 +396,17 @@ impl AggregatedMessage {
             },
         };
 
+        let account_hex = account_pubkey.to_hex();
+
         let rows: Vec<AggregatedMessageRow> = match direction {
             Direction::Before => {
                 sqlx::query_as(
                     "SELECT am.*, mds.status AS delivery_status
                      FROM aggregated_messages am
                      LEFT JOIN message_delivery_status mds
-                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                       ON am.message_id = mds.message_id
+                      AND am.mls_group_id = mds.mls_group_id
+                      AND mds.account_pubkey = ?
                      WHERE am.kind = 9 AND am.mls_group_id = ?
                        AND am.created_at > COALESCE(?, 0)
                        AND (am.created_at < ? OR (am.created_at = ? AND am.message_id < ?))
@@ -405,6 +414,7 @@ impl AggregatedMessage {
                      ORDER BY am.created_at DESC, am.message_id DESC
                      LIMIT ?",
                 )
+                .bind(&account_hex)
                 .bind(group_id.as_slice())
                 .bind(chat_cleared_at_ms)
                 .bind(cursor_ms)
@@ -419,7 +429,9 @@ impl AggregatedMessage {
                     "SELECT am.*, mds.status AS delivery_status
                      FROM aggregated_messages am
                      LEFT JOIN message_delivery_status mds
-                       ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                       ON am.message_id = mds.message_id
+                      AND am.mls_group_id = mds.mls_group_id
+                      AND mds.account_pubkey = ?
                      WHERE am.kind = 9 AND am.mls_group_id = ?
                        AND am.created_at > COALESCE(?, 0)
                        AND (am.created_at > ? OR (am.created_at = ? AND am.message_id > ?))
@@ -427,6 +439,7 @@ impl AggregatedMessage {
                      ORDER BY am.created_at ASC, am.message_id ASC
                      LIMIT ?",
                 )
+                .bind(&account_hex)
                 .bind(group_id.as_slice())
                 .bind(chat_cleared_at_ms)
                 .bind(cursor_ms)
@@ -470,6 +483,7 @@ impl AggregatedMessage {
     /// Messages in oldest-first order (same as `find_messages_by_group_paginated`).
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_messages_with_unread_minimum(
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         read_marker: Option<&EventId>,
         minimum: u32,
@@ -493,6 +507,7 @@ impl AggregatedMessage {
         // render "message deleted" placeholders — matching the tombstone contract
         // in `find_messages_by_group_paginated`.
         let marker_hex = read_marker.map(EventId::to_hex);
+        let account_hex = account_pubkey.to_hex();
 
         let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
             "WITH unread_count AS (
@@ -501,6 +516,7 @@ impl AggregatedMessage {
                LEFT JOIN message_delivery_status mds
                  ON am.message_id = mds.message_id
                 AND am.mls_group_id = mds.mls_group_id
+                AND mds.account_pubkey = ?
                WHERE am.mls_group_id = ?
                  AND am.kind = 9
                  AND am.deletion_event_id IS NULL
@@ -517,6 +533,7 @@ impl AggregatedMessage {
              LEFT JOIN message_delivery_status mds
                ON am.message_id = mds.message_id
               AND am.mls_group_id = mds.mls_group_id
+              AND mds.account_pubkey = ?
              WHERE am.kind = 9
                AND am.mls_group_id = ?
                AND am.created_at > COALESCE(?, 0)
@@ -524,10 +541,12 @@ impl AggregatedMessage {
              ORDER BY am.created_at DESC, am.message_id DESC
              LIMIT MAX((SELECT cnt FROM unread_count), ?)",
         )
+        .bind(&account_hex) // unread CTE: account_pubkey for mds join
         .bind(group_id.as_slice()) // unread CTE: mls_group_id
         .bind(marker_hex.as_deref()) // unread CTE: read marker message_id (NULL = no marker)
         .bind(group_id.as_slice()) // unread CTE: mls_group_id for marker lookup
         .bind(chat_cleared_at_ms) // unread CTE: chat_cleared_at floor
+        .bind(&account_hex) // outer SELECT: account_pubkey for mds join
         .bind(group_id.as_slice()) // outer SELECT: mls_group_id
         .bind(chat_cleared_at_ms) // outer SELECT: chat_cleared_at floor
         .bind(minimum_val) // MAX(cnt, minimum)
@@ -564,6 +583,7 @@ impl AggregatedMessage {
     /// `(kind, mls_group_id, deletion_event_id, created_at DESC, message_id DESC)`
     /// so the window scan uses an index walk instead of a temp B-tree sort.
     pub async fn search_messages_in_group(
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         query: &str,
         limit: u32,
@@ -580,18 +600,21 @@ impl AggregatedMessage {
                       (ROW_NUMBER() OVER (ORDER BY am.created_at DESC, am.message_id DESC)) - 1 AS position
                FROM aggregated_messages am
                LEFT JOIN message_delivery_status mds
-                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                 ON am.message_id = mds.message_id
+                AND am.mls_group_id = mds.mls_group_id
+                AND mds.account_pubkey = ?1
                WHERE am.kind = 9
-                 AND am.mls_group_id = ?1
-                 AND am.created_at > COALESCE(?2, 0)
+                 AND am.mls_group_id = ?2
+                 AND am.created_at > COALESCE(?3, 0)
                  AND (mds.status IS NULL OR mds.status != '\"Retried\"')
              )
              SELECT * FROM ranked
              WHERE deletion_event_id IS NULL
-               AND content_normalized LIKE ?3
+               AND content_normalized LIKE ?4
              ORDER BY created_at DESC, message_id DESC
-             LIMIT ?4",
+             LIMIT ?5",
         )
+        .bind(account_pubkey.to_hex())
         .bind(group_id.as_slice())
         .bind(chat_cleared_at_ms)
         .bind(&like_pattern)
@@ -648,7 +671,9 @@ impl AggregatedMessage {
                JOIN accounts_groups ag
                  ON ag.mls_group_id = am.mls_group_id
                LEFT JOIN message_delivery_status mds
-                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+                 ON am.message_id = mds.message_id
+                AND am.mls_group_id = mds.mls_group_id
+                AND mds.account_pubkey = ?1
                WHERE am.kind = 9
                  AND ag.account_pubkey = ?1
                  AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)
@@ -803,6 +828,7 @@ impl AggregatedMessage {
     /// Used by event processor for real-time caching
     #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_message(
+        account_pubkey: &PublicKey,
         message: &ChatMessage,
         group_id: &GroupId,
         database: &Database,
@@ -847,10 +873,13 @@ impl AggregatedMessage {
 
         if let Some(status) = &message.delivery_status {
             sqlx::query(
-                "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+                "INSERT INTO message_delivery_status
+                   (account_pubkey, message_id, mls_group_id, status)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(account_pubkey, message_id, mls_group_id)
+                   DO UPDATE SET status = excluded.status",
             )
+            .bind(account_pubkey.to_hex())
             .bind(&message.id)
             .bind(group_id.as_slice())
             .bind(serde_json::to_string(status)?)
@@ -1015,6 +1044,7 @@ impl AggregatedMessage {
     /// Returns an error if no matching message was found.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn update_delivery_status(
+        account_pubkey: &PublicKey,
         message_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
@@ -1038,10 +1068,13 @@ impl AggregatedMessage {
 
         // Upsert delivery status
         sqlx::query(
-            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
-             VALUES (?, ?, ?)
-             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+            "INSERT INTO message_delivery_status
+               (account_pubkey, message_id, mls_group_id, status)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_pubkey, message_id, mls_group_id)
+               DO UPDATE SET status = excluded.status",
         )
+        .bind(account_pubkey.to_hex())
         .bind(message_id)
         .bind(group_id.as_slice())
         .bind(serde_json::to_string(status)?)
@@ -1053,9 +1086,12 @@ impl AggregatedMessage {
             "SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
              LEFT JOIN message_delivery_status mds
-               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               ON am.message_id = mds.message_id
+              AND am.mls_group_id = mds.mls_group_id
+              AND mds.account_pubkey = ?
              WHERE am.message_id = ? AND am.mls_group_id = ?",
         )
+        .bind(account_pubkey.to_hex())
         .bind(message_id)
         .bind(group_id.as_slice())
         .fetch_optional(&mut *tx)
@@ -1071,6 +1107,7 @@ impl AggregatedMessage {
 
     #[perf_instrument("db::aggregated_messages")]
     pub async fn update_delivery_status_with_retry(
+        account_pubkey: &PublicKey,
         message_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
@@ -1081,7 +1118,15 @@ impl AggregatedMessage {
             .copied()
             .enumerate()
         {
-            match Self::update_delivery_status(message_id, group_id, status, database).await {
+            match Self::update_delivery_status(
+                account_pubkey,
+                message_id,
+                group_id,
+                status,
+                database,
+            )
+            .await
+            {
                 Ok(message) => return Ok(message),
                 Err(error) if Self::is_database_lock_error(&error) => {
                     tracing::debug!(
@@ -1096,7 +1141,7 @@ impl AggregatedMessage {
             }
         }
 
-        Self::update_delivery_status(message_id, group_id, status, database).await
+        Self::update_delivery_status(account_pubkey, message_id, group_id, status, database).await
     }
 
     /// Insert an initial delivery status row for an outgoing event.
@@ -1106,16 +1151,20 @@ impl AggregatedMessage {
     /// Only suitable when the parent `aggregated_messages` row was just inserted.
     #[perf_instrument("db::aggregated_messages")]
     pub async fn insert_delivery_status(
+        account_pubkey: &PublicKey,
         message_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
         database: &Database,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO message_delivery_status (message_id, mls_group_id, status)
-             VALUES (?, ?, ?)
-             ON CONFLICT(message_id, mls_group_id) DO UPDATE SET status = excluded.status",
+            "INSERT INTO message_delivery_status
+               (account_pubkey, message_id, mls_group_id, status)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_pubkey, message_id, mls_group_id)
+               DO UPDATE SET status = excluded.status",
         )
+        .bind(account_pubkey.to_hex())
         .bind(message_id)
         .bind(group_id.as_slice())
         .bind(serde_json::to_string(status)?)
@@ -1128,14 +1177,16 @@ impl AggregatedMessage {
     /// Check whether an event has a delivery status row (i.e. was sent by us).
     #[perf_instrument("db::aggregated_messages")]
     pub async fn has_delivery_status(
+        account_pubkey: &PublicKey,
         message_id: &str,
         group_id: &GroupId,
         database: &Database,
     ) -> Result<bool> {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM message_delivery_status
-             WHERE message_id = ? AND mls_group_id = ?)",
+             WHERE account_pubkey = ? AND message_id = ? AND mls_group_id = ?)",
         )
+        .bind(account_pubkey.to_hex())
         .bind(message_id)
         .bind(group_id.as_slice())
         .fetch_one(&database.pool)
@@ -1163,6 +1214,7 @@ impl AggregatedMessage {
     /// Find a cached message by ID (for updating with reactions/deletions)
     #[perf_instrument("db::aggregated_messages")]
     pub async fn find_by_id(
+        account_pubkey: &PublicKey,
         message_id: &str,
         group_id: &GroupId,
         database: &Database,
@@ -1171,9 +1223,12 @@ impl AggregatedMessage {
             "SELECT am.*, mds.status AS delivery_status
              FROM aggregated_messages am
              LEFT JOIN message_delivery_status mds
-               ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
+               ON am.message_id = mds.message_id
+              AND am.mls_group_id = mds.mls_group_id
+              AND mds.account_pubkey = ?
              WHERE am.message_id = ? AND am.mls_group_id = ? AND am.kind = 9",
         )
+        .bind(account_pubkey.to_hex())
         .bind(message_id)
         .bind(group_id.as_slice())
         .fetch_optional(&database.pool)
@@ -1653,11 +1708,16 @@ mod tests {
     async fn test_find_messages_by_group_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
+        let test_pubkey = Keys::generate().public_key();
 
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &test_pubkey,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(messages.is_empty());
     }
 
@@ -1672,7 +1732,8 @@ mod tests {
 
         // Insert message
         let result =
-            AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database).await;
+            AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
+                .await;
         assert!(result.is_ok());
 
         // Verify it was inserted
@@ -1682,10 +1743,14 @@ mod tests {
         assert_eq!(count, 1);
 
         // Verify we can retrieve it
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, message.id);
         assert_eq!(messages[0].content, message.content);
@@ -1704,7 +1769,7 @@ mod tests {
         for i in 1..=3 {
             let message = create_test_chat_message(i, author);
             message_ids.push(message.id.clone());
-            AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -1716,10 +1781,14 @@ mod tests {
         assert_eq!(count, 3);
 
         // Verify we can retrieve all messages
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 3);
 
         // Verify event IDs
@@ -1743,7 +1812,7 @@ mod tests {
 
         // Insert a message
         let message = create_test_chat_message(10, author);
-        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -1770,10 +1839,14 @@ mod tests {
         assert_eq!(count_after, 1);
 
         // But the message should have deletion_event_id set
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].is_deleted);
     }
@@ -1788,17 +1861,17 @@ mod tests {
 
         // Insert multiple messages
         let message1 = create_test_chat_message(20, author);
-        AggregatedMessage::insert_message(&message1, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message1, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         let message2 = create_test_chat_message(21, author);
-        AggregatedMessage::insert_message(&message2, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message2, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         let message3 = create_test_chat_message(22, author);
-        AggregatedMessage::insert_message(&message3, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message3, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -1820,10 +1893,14 @@ mod tests {
         assert_eq!(count_after, 0);
 
         // No messages should be found
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(messages.is_empty());
 
         // No event IDs should be found
@@ -1846,13 +1923,13 @@ mod tests {
 
         // Insert message in group 1
         let message1 = create_test_chat_message(30, author);
-        AggregatedMessage::insert_message(&message1, &group_id_1, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message1, &group_id_1, &whitenoise.database)
             .await
             .unwrap();
 
         // Insert message in group 2
         let message2 = create_test_chat_message(31, author);
-        AggregatedMessage::insert_message(&message2, &group_id_2, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message2, &group_id_2, &whitenoise.database)
             .await
             .unwrap();
 
@@ -1884,7 +1961,7 @@ mod tests {
 
         // Insert a message with empty reactions
         let message = create_test_chat_message(40, author);
-        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -1909,10 +1986,14 @@ mod tests {
         .unwrap();
 
         // Verify reactions were updated
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].reactions.by_emoji.len(), 1);
         assert!(messages[0].reactions.by_emoji.contains_key("👍"));
@@ -1988,31 +2069,51 @@ mod tests {
                 created_at: chrono::Utc::now(),
             },
         ];
-        AggregatedMessage::insert_message(&msg_with_media, &group_with_media, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &author,
+            &msg_with_media,
+            &group_with_media,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // Group 2: Message without media
         let mut msg_no_media = create_test_chat_message(51, author);
         msg_no_media.content = "Message without media".to_string();
-        AggregatedMessage::insert_message(&msg_no_media, &group_no_media, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &author,
+            &msg_no_media,
+            &group_no_media,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // Group 3: Has deleted newest message, should return older one
         let mut msg_older = create_test_chat_message(52, author);
         msg_older.content = "Older non-deleted".to_string();
         msg_older.created_at = Timestamp::from(1000);
-        AggregatedMessage::insert_message(&msg_older, &group_with_deletion, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &author,
+            &msg_older,
+            &group_with_deletion,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let mut msg_deleted = create_test_chat_message(53, author);
         msg_deleted.content = "Deleted message".to_string();
         msg_deleted.created_at = Timestamp::from(2000);
-        AggregatedMessage::insert_message(&msg_deleted, &group_with_deletion, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &author,
+            &msg_deleted,
+            &group_with_deletion,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         AggregatedMessage::mark_deleted(
             &msg_deleted.id,
             &group_with_deletion,
@@ -2029,6 +2130,7 @@ mod tests {
         msg_first.content = "First message".to_string();
         msg_first.created_at = Timestamp::from(1000);
         AggregatedMessage::insert_message(
+            &author,
             &msg_first,
             &group_multiple_messages,
             &whitenoise.database,
@@ -2040,6 +2142,7 @@ mod tests {
         msg_last.content = "Last message".to_string();
         msg_last.created_at = Timestamp::from(2000);
         AggregatedMessage::insert_message(
+            &author,
             &msg_last,
             &group_multiple_messages,
             &whitenoise.database,
@@ -2099,7 +2202,7 @@ mod tests {
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(70, author);
-        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -2135,7 +2238,7 @@ mod tests {
         let author = Keys::generate().public_key();
         for i in 1..=3 {
             let msg = create_test_chat_message(80 + i, author);
-            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -2159,7 +2262,7 @@ mod tests {
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(90 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
             messages.push(msg);
@@ -2188,10 +2291,10 @@ mod tests {
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(100, author);
         let msg2 = create_test_chat_message(101, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg1, &group_id, &whitenoise.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg2, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -2241,7 +2344,7 @@ mod tests {
         // Group 1: 3 messages
         for i in 1..=3 {
             let msg = create_test_chat_message(110 + i, author);
-            AggregatedMessage::insert_message(&msg, &group1, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group1, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -2249,7 +2352,7 @@ mod tests {
         // Group 2: 5 messages
         for i in 1..=5 {
             let msg = create_test_chat_message(120 + i, author);
-            AggregatedMessage::insert_message(&msg, &group2, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group2, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -2290,7 +2393,7 @@ mod tests {
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(130 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group1, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group1, &whitenoise.database)
                 .await
                 .unwrap();
             group1_messages.push(msg);
@@ -2302,7 +2405,7 @@ mod tests {
         for i in 1..=4u8 {
             let mut msg = create_test_chat_message(140 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group2, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group2, &whitenoise.database)
                 .await
                 .unwrap();
             group2_messages.push(msg);
@@ -2342,9 +2445,14 @@ mod tests {
         for i in 1..=4u8 {
             let mut msg = create_test_chat_message(150 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group_with_marker, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &author,
+                &msg,
+                &group_with_marker,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
             messages.push(msg);
         }
         let marker = EventId::from_hex(&messages[1].id).unwrap();
@@ -2352,9 +2460,14 @@ mod tests {
         // Group without marker: 3 messages
         for i in 1..=3 {
             let msg = create_test_chat_message(160 + i, author);
-            AggregatedMessage::insert_message(&msg, &group_without_marker, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &author,
+                &msg,
+                &group_without_marker,
+                &whitenoise.database,
+            )
+            .await
+            .unwrap();
         }
 
         let input = vec![
@@ -2384,19 +2497,21 @@ mod tests {
         // Insert a message with Sending status
         let mut message = create_test_chat_message(200, author);
         message.delivery_status = Some(DeliveryStatus::Sending);
-        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Verify initial Sending status via find_by_id
-        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
+        let found =
+            AggregatedMessage::find_by_id(&author, &message.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
 
         // Update to Sent(3) — returned message should have the updated status
         let updated = AggregatedMessage::update_delivery_status(
+            &author,
             &message.id,
             &group_id,
             &DeliveryStatus::Sent(3),
@@ -2407,14 +2522,16 @@ mod tests {
         assert_eq!(updated.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Verify via find_by_id as well
-        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
+        let found =
+            AggregatedMessage::find_by_id(&author, &message.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Update to Failed
         let updated = AggregatedMessage::update_delivery_status(
+            &author,
             &message.id,
             &group_id,
             &DeliveryStatus::Failed("timeout".to_string()),
@@ -2432,10 +2549,16 @@ mod tests {
     async fn test_find_by_id_returns_none_for_nonexistent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[201; 32]);
+        let test_pubkey = Keys::generate().public_key();
 
-        let found = AggregatedMessage::find_by_id("nonexistent", &group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let found = AggregatedMessage::find_by_id(
+            &test_pubkey,
+            "nonexistent",
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(found.is_none());
     }
 
@@ -2450,14 +2573,15 @@ mod tests {
         // delivery_status is None (incoming message)
         assert!(message.delivery_status.is_none());
 
-        AggregatedMessage::insert_message(&message, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &message, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
-        let found = AggregatedMessage::find_by_id(&message.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
+        let found =
+            AggregatedMessage::find_by_id(&author, &message.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(found.delivery_status, None);
     }
 
@@ -2471,21 +2595,25 @@ mod tests {
 
         // Insert incoming message (no delivery status)
         let msg_incoming = create_test_chat_message(203, author);
-        AggregatedMessage::insert_message(&msg_incoming, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_incoming, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Insert outgoing message with Sent status
         let mut msg_outgoing = create_test_chat_message(204, author);
         msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
-        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_outgoing, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 2);
 
         let statuses: Vec<_> = messages.iter().map(|m| &m.delivery_status).collect();
@@ -2498,9 +2626,11 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[205; 32]);
         setup_group(&group_id, &whitenoise.database).await;
+        let test_pubkey = Keys::generate().public_key();
 
         // Try to update delivery status for a message that doesn't exist
         let result = AggregatedMessage::update_delivery_status(
+            &test_pubkey,
             &format!("{:0>64}", "ff"),
             &group_id,
             &DeliveryStatus::Sent(1),
@@ -2530,28 +2660,32 @@ mod tests {
 
         // Insert a normal message
         let msg_normal = create_test_chat_message(206, author);
-        AggregatedMessage::insert_message(&msg_normal, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_normal, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Insert a message with Retried status (simulating a retried failed message)
         let mut msg_retried = create_test_chat_message(207, author);
         msg_retried.delivery_status = Some(DeliveryStatus::Retried);
-        AggregatedMessage::insert_message(&msg_retried, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_retried, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Insert a message with Failed status (should still be visible)
         let mut msg_failed = create_test_chat_message(208, author);
         msg_failed.delivery_status = Some(DeliveryStatus::Failed("error".to_string()));
-        AggregatedMessage::insert_message(&msg_failed, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_failed, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // Only normal and failed messages should appear, not retried
         assert_eq!(messages.len(), 2);
@@ -2574,7 +2708,7 @@ mod tests {
         let msg3 = create_test_chat_message(172, author);
 
         for msg in [&msg1, &msg2, &msg3] {
-            AggregatedMessage::insert_message(msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -2605,18 +2739,24 @@ mod tests {
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(180, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Before inserting, has_delivery_status should return false
-        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let has = AggregatedMessage::has_delivery_status(
+            &author,
+            &msg.id,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(!has, "No delivery status should exist yet");
 
         // Insert delivery status
         AggregatedMessage::insert_delivery_status(
+            &author,
             &msg.id,
             &group_id,
             &DeliveryStatus::Sending,
@@ -2626,16 +2766,22 @@ mod tests {
         .unwrap();
 
         // Now has_delivery_status should return true
-        let has = AggregatedMessage::has_delivery_status(&msg.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let has = AggregatedMessage::has_delivery_status(
+            &author,
+            &msg.id,
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(has, "Delivery status should exist after insert");
 
         // Verify it shows up in find_by_id
-        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
+        let found =
+            AggregatedMessage::find_by_id(&author, &msg.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
     }
 
@@ -2647,12 +2793,13 @@ mod tests {
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(181, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         // Insert Sending
         AggregatedMessage::insert_delivery_status(
+            &author,
             &msg.id,
             &group_id,
             &DeliveryStatus::Sending,
@@ -2663,6 +2810,7 @@ mod tests {
 
         // Upsert to Sent — ON CONFLICT should update
         AggregatedMessage::insert_delivery_status(
+            &author,
             &msg.id,
             &group_id,
             &DeliveryStatus::Sent(2),
@@ -2671,10 +2819,11 @@ mod tests {
         .await
         .unwrap();
 
-        let found = AggregatedMessage::find_by_id(&msg.id, &group_id, &whitenoise.database)
-            .await
-            .unwrap()
-            .unwrap();
+        let found =
+            AggregatedMessage::find_by_id(&author, &msg.id, &group_id, &whitenoise.database)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(2)));
     }
 
@@ -2687,10 +2836,10 @@ mod tests {
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(182, author);
         let msg2 = create_test_chat_message(183, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg1, &group_id, &whitenoise.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg2, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -2705,10 +2854,14 @@ mod tests {
             .unwrap();
 
         // Both should have is_deleted=true
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(
             messages.iter().all(|m| m.is_deleted),
             "All messages should be marked as deleted"
@@ -2719,10 +2872,14 @@ mod tests {
             .await
             .unwrap();
 
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(messages.len(), 2, "Both messages should still be present");
         assert!(
             messages.iter().all(|m| !m.is_deleted),
@@ -2739,10 +2896,10 @@ mod tests {
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(184, author);
         let msg2 = create_test_chat_message(185, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg1, &group_id, &whitenoise.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg2, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
@@ -2761,10 +2918,14 @@ mod tests {
             .await
             .unwrap();
 
-        let messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let messages = AggregatedMessage::find_messages_by_group(
+            &author,
+            &group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         let not_deleted: Vec<_> = messages.iter().filter(|m| !m.is_deleted).collect();
         assert_eq!(not_deleted.len(), 1, "Only msg1 should be un-deleted");
         assert_eq!(not_deleted[0].id, msg1.id);
@@ -2831,11 +2992,16 @@ mod tests {
     async fn test_has_delivery_status_returns_false_for_nonexistent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[188; 32]);
+        let test_pubkey = Keys::generate().public_key();
 
-        let has =
-            AggregatedMessage::has_delivery_status("nonexistent", &group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let has = AggregatedMessage::has_delivery_status(
+            &test_pubkey,
+            "nonexistent",
+            &group_id,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(!has);
     }
 
@@ -2865,7 +3031,7 @@ mod tests {
             media_attachments: vec![],
             delivery_status: None,
         };
-        AggregatedMessage::insert_message(&msg, group_id, database)
+        AggregatedMessage::insert_message(&author, &msg, group_id, database)
             .await
             .unwrap();
         msg
@@ -2875,8 +3041,10 @@ mod tests {
     async fn test_paginated_empty_group_returns_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[200; 32]);
+        let test_pubkey = Keys::generate().public_key();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -2911,6 +3079,7 @@ mod tests {
 
         // Default (no cursor) should return the 50 newest
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -2969,6 +3138,7 @@ mod tests {
         let cursor_ts = Timestamp::from(base_ts + 3);
         let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3012,6 +3182,7 @@ mod tests {
         }
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3057,6 +3228,7 @@ mod tests {
 
         // Requesting u32::MAX should be capped to 200
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3092,6 +3264,7 @@ mod tests {
 
         // Page 1: newest 5 (seeds 6–10)
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3106,6 +3279,7 @@ mod tests {
         let cursor_ts = page1[0].created_at;
         let cursor_id = page1[0].id.as_str();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3134,6 +3308,7 @@ mod tests {
         let cursor_ts2 = page2[0].created_at;
         let cursor_id2 = page2[0].id.as_str();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3176,6 +3351,7 @@ mod tests {
         // Total 8 messages. Page size 3 — three pages needed.
         // Page 1: newest 3
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3190,6 +3366,7 @@ mod tests {
         let c1_ts = page1[0].created_at;
         let c1_id = page1[0].id.clone();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3208,6 +3385,7 @@ mod tests {
         let c2_ts = page2[0].created_at;
         let c2_id = page2[0].id.clone();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3230,6 +3408,7 @@ mod tests {
         let c3_ts = page3[0].created_at;
         let c3_id = page3[0].id.clone();
         let page4 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3277,9 +3456,11 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[207; 32]);
         let ts = Timestamp::from(1_700_000_000u64);
+        let test_pubkey = Keys::generate().public_key();
 
         // before=Some, before_message_id=None → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3298,6 +3479,7 @@ mod tests {
 
         // before=None, before_message_id=Some → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3322,9 +3504,11 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[208; 32]);
         let ts = Timestamp::from(1_700_000_000u64);
+        let test_pubkey = Keys::generate().public_key();
 
         // Non-hex string → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3344,6 +3528,7 @@ mod tests {
 
         // Valid hex but wrong length (32 chars instead of 64) → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3389,6 +3574,7 @@ mod tests {
         let cursor_ts = Timestamp::from(base_ts + 2);
         let cursor_id = format!("{:0>64}", format!("{:x}", 2u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3436,6 +3622,7 @@ mod tests {
         let cursor_ts = Timestamp::from(base_ts + 3);
         let cursor_id = format!("{:0>64}", format!("{:x}", 3u8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3482,6 +3669,7 @@ mod tests {
 
         // Page through with limit 3
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3499,6 +3687,7 @@ mod tests {
         let c1_ts = page1.last().unwrap().created_at;
         let c1_id = page1.last().unwrap().id.clone();
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3516,6 +3705,7 @@ mod tests {
         let c2_ts = page2.last().unwrap().created_at;
         let c2_id = page2.last().unwrap().id.clone();
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3562,8 +3752,10 @@ mod tests {
         let group_id = GroupId::from_slice(&[223; 32]);
         let ts = Timestamp::from(1_710_300_000u64);
         let id = "0000000000000000000000000000000000000000000000000000000000000001";
+        let test_pubkey = Keys::generate().public_key();
 
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3588,9 +3780,11 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[224; 32]);
         let ts = Timestamp::from(1_710_400_000u64);
+        let test_pubkey = Keys::generate().public_key();
 
         // after=Some, after_message_id=None → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3609,6 +3803,7 @@ mod tests {
 
         // after=None, after_message_id=Some → InvalidCursor
         let err = AggregatedMessage::find_messages_by_group_paginated(
+            &test_pubkey,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3652,6 +3847,7 @@ mod tests {
         let cursor_ts = Timestamp::from(base_ts + 100);
         let cursor_id = format!("{:0>64}", format!("{:x}", 0xffu8));
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3708,6 +3904,7 @@ mod tests {
         }
 
         let results_a = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_a,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3717,6 +3914,7 @@ mod tests {
         .await
         .unwrap();
         let results_b = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_b,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3769,6 +3967,7 @@ mod tests {
             .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3829,6 +4028,7 @@ mod tests {
         // No read marker → all non-deleted messages are unread (cnt=2), minimum=3
         // LIMIT = MAX(2, 3) = 3, so all 3 rows (including the tombstone) are returned.
         let messages = AggregatedMessage::find_messages_with_unread_minimum(
+            &author,
             &group_id,
             None,
             3,
@@ -3893,6 +4093,7 @@ mod tests {
         .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3945,6 +4146,7 @@ mod tests {
 
         // Should not error — uppercase is valid hex and gets canonicalized internally
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -3982,6 +4184,7 @@ mod tests {
         let msg = insert_message_at(1, author, ts, &group_id, &whitenoise.database).await;
 
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -3999,6 +4202,7 @@ mod tests {
 
         // Cursor from the only message → next page is empty
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -4040,6 +4244,7 @@ mod tests {
         }
 
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -4056,6 +4261,7 @@ mod tests {
 
         // Cursor from the oldest (page1[0]) → no older messages exist
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -4111,6 +4317,7 @@ mod tests {
             };
 
             let page = AggregatedMessage::find_messages_by_group_paginated(
+                &author,
                 &group_id,
                 &whitenoise.database,
                 &opts,
@@ -4171,6 +4378,7 @@ mod tests {
 
         // Full first page
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -4184,6 +4392,7 @@ mod tests {
         // Use the oldest message (page1[0]) as the cursor
         let oldest = &page1[0];
         let next_page = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions {
@@ -4233,11 +4442,12 @@ mod tests {
             media_attachments: vec![],
             delivery_status: Some(DeliveryStatus::Retried),
         };
-        AggregatedMessage::insert_message(&retried_msg, &group_id, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &retried_msg, &group_id, &whitenoise.database)
             .await
             .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -4304,13 +4514,14 @@ mod tests {
         ];
 
         for msg in &messages {
-            AggregatedMessage::insert_message(msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
 
         // Basic single-word search
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "hello",
             50,
@@ -4326,6 +4537,7 @@ mod tests {
 
         // Forward-order multi-word search
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "big plans",
             50,
@@ -4344,6 +4556,7 @@ mod tests {
 
         // Substring matching ("big" matches "bigger")
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "big",
             50,
@@ -4356,6 +4569,7 @@ mod tests {
 
         // Case insensitive
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "MARMOT",
             50,
@@ -4369,6 +4583,7 @@ mod tests {
 
         // CJK search
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "日本語",
             50,
@@ -4382,6 +4597,7 @@ mod tests {
 
         // Cyrillic search
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "привет",
             50,
@@ -4394,6 +4610,7 @@ mod tests {
 
         // Devanagari search (with combining marks)
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "नमस्ते",
             50,
@@ -4407,6 +4624,7 @@ mod tests {
 
         // No match
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "nonexistent",
             50,
@@ -4419,6 +4637,7 @@ mod tests {
 
         // Empty query matches all — positions are sequential newest-first
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "",
             50,
@@ -4433,6 +4652,7 @@ mod tests {
 
         // Limit is respected
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "",
             2,
@@ -4480,13 +4700,14 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
 
         // Search for all three: "same-ts" matches every message
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "same-ts",
             50,
@@ -4560,24 +4781,29 @@ mod tests {
 
         // Insert messages: "marmot" in all three groups
         let msg_a = create_test_chat_message_with_content(1, author, "marmot in group A");
-        AggregatedMessage::insert_message(&msg_a, &group_a, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_a, &group_a, &whitenoise.database)
             .await
             .unwrap();
 
         let msg_b = create_test_chat_message_with_content(2, author, "marmot in group B");
-        AggregatedMessage::insert_message(&msg_b, &group_b, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_b, &group_b, &whitenoise.database)
             .await
             .unwrap();
 
         let msg_declined =
             create_test_chat_message_with_content(3, author, "marmot in declined group");
-        AggregatedMessage::insert_message(&msg_declined, &group_declined, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &author,
+            &msg_declined,
+            &group_declined,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // Also add a second message in group A to verify per-group positions
         let msg_a2 = create_test_chat_message_with_content(4, author, "another marmot in group A");
-        AggregatedMessage::insert_message(&msg_a2, &group_a, &whitenoise.database)
+        AggregatedMessage::insert_message(&author, &msg_a2, &group_a, &whitenoise.database)
             .await
             .unwrap();
 
@@ -4686,6 +4912,7 @@ mod tests {
 
         // find_messages_by_group
         let messages = AggregatedMessage::find_messages_by_group(
+            &author,
             &group_id,
             Some(cleared_at_ms),
             &whitenoise.database,
@@ -4698,6 +4925,7 @@ mod tests {
 
         // find_messages_by_group_paginated
         let messages = AggregatedMessage::find_messages_by_group_paginated(
+            &author,
             &group_id,
             &whitenoise.database,
             &PaginationOptions::default(),
@@ -4710,6 +4938,7 @@ mod tests {
 
         // find_messages_with_unread_minimum
         let messages = AggregatedMessage::find_messages_with_unread_minimum(
+            &author,
             &group_id,
             None,
             50,
@@ -4804,7 +5033,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(&msg, &group_id, &whitenoise.database)
+            AggregatedMessage::insert_message(&author, &msg, &group_id, &whitenoise.database)
                 .await
                 .unwrap();
         }
@@ -4813,6 +5042,7 @@ mod tests {
         let cleared_at_ms = (base_ts + 2) as i64 * 1000;
 
         let results = AggregatedMessage::search_messages_in_group(
+            &author,
             &group_id,
             "hello",
             50,

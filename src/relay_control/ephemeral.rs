@@ -567,6 +567,7 @@ impl EphemeralPlane {
                     let status =
                         DeliveryStatus::Failed("No relay accepted the message".to_string());
                     Self::update_and_emit_delivery_status(
+                        account_pubkey,
                         event_id,
                         group_id,
                         &status,
@@ -579,6 +580,7 @@ impl EphemeralPlane {
 
                 let status = DeliveryStatus::Sent(output.success.len());
                 Self::update_and_emit_delivery_status(
+                    account_pubkey,
                     event_id,
                     group_id,
                     &status,
@@ -607,6 +609,7 @@ impl EphemeralPlane {
                 };
                 let status = DeliveryStatus::Failed(failure_message);
                 Self::update_and_emit_delivery_status(
+                    account_pubkey,
                     event_id,
                     group_id,
                     &status,
@@ -679,6 +682,7 @@ impl EphemeralPlane {
 
     #[perf_instrument("relay")]
     async fn update_and_emit_delivery_status(
+        account_pubkey: &PublicKey,
         event_id: &str,
         group_id: &GroupId,
         status: &DeliveryStatus,
@@ -686,7 +690,11 @@ impl EphemeralPlane {
         stream_manager: &MessageStreamManager,
     ) {
         match AggregatedMessage::update_delivery_status_with_retry(
-            event_id, group_id, status, database,
+            account_pubkey,
+            event_id,
+            group_id,
+            status,
+            database,
         )
         .await
         {

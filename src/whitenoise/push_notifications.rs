@@ -1490,12 +1490,14 @@ mod tests {
 
     async fn wait_for_message_sent_status(
         whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message_id: &EventId,
     ) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let message = AggregatedMessage::find_by_id(
+                    account_pubkey,
                     &message_id.to_string(),
                     group_id,
                     &whitenoise.database,
@@ -2032,7 +2034,13 @@ mod tests {
             )
             .await
             .unwrap();
-        wait_for_message_sent_status(&whitenoise, &group_id, &chat_result.message.id).await;
+        wait_for_message_sent_status(
+            &whitenoise,
+            &admin_account.pubkey,
+            &group_id,
+            &chat_result.message.id,
+        )
+        .await;
 
         let admin_mdk = whitenoise
             .create_mdk_for_account(admin_account.pubkey)
@@ -2193,7 +2201,13 @@ mod tests {
             .await
             .unwrap();
 
-        wait_for_message_sent_status(&whitenoise, &group_id, &send_result.message.id).await;
+        wait_for_message_sent_status(
+            &whitenoise,
+            &creator.pubkey,
+            &group_id,
+            &send_result.message.id,
+        )
+        .await;
 
         let creator_mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let active_leaf_map = creator_mdk.group_leaf_map(&group_id).unwrap();
@@ -2231,6 +2245,7 @@ mod tests {
         .unwrap();
 
         let cached_message = AggregatedMessage::find_by_id(
+            &creator.pubkey,
             &send_result.message.id.to_string(),
             &group_id,
             &whitenoise.database,

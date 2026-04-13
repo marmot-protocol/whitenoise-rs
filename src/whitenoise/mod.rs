@@ -1604,6 +1604,7 @@ mod tests {
             };
 
             aggregated_message::AggregatedMessage::insert_message(
+                &test_pubkey,
                 &msg1,
                 &group_id,
                 &whitenoise.database,
@@ -1611,6 +1612,7 @@ mod tests {
             .await
             .unwrap();
             aggregated_message::AggregatedMessage::insert_message(
+                &test_pubkey,
                 &msg2,
                 &group_id,
                 &whitenoise.database,
@@ -1718,6 +1720,7 @@ mod tests {
                 delivery_status: None,
             };
             aggregated_message::AggregatedMessage::insert_message(
+                &author,
                 &msg,
                 group_id,
                 &whitenoise.database,
@@ -3267,6 +3270,7 @@ mod tests {
                     delivery_status: None,
                 };
                 aggregated_message::AggregatedMessage::insert_message(
+                    &creator.pubkey,
                     &msg,
                     &group.mls_group_id,
                     &whitenoise.database,

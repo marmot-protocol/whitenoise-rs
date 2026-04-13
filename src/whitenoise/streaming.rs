@@ -56,6 +56,7 @@ impl Whitenoise {
 
         let fetched_messages =
             aggregated_message::AggregatedMessage::find_messages_by_group_paginated(
+                account_pubkey,
                 group_id,
                 &self.database,
                 &PaginationOptions::default(),
