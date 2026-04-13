@@ -77,7 +77,9 @@ impl Whitenoise {
                 discovered.found(RelayType::Inbox),
                 discovered.found(RelayType::KeyPackage),
             );
-            self.pending_logins.insert(pubkey, discovered);
+            self.account_manager
+                .pending_logins
+                .insert(pubkey, discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -98,6 +100,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
     ) -> core::result::Result<LoginResult, LoginError> {
         let discovered = self
+            .account_manager
             .pending_logins
             .get(pubkey)
             .ok_or(LoginError::NoLoginInProgress)?
@@ -178,7 +181,7 @@ impl Whitenoise {
         )
         .await?;
 
-        self.pending_logins.remove(pubkey);
+        self.account_manager.pending_logins.remove(pubkey);
         tracing::info!(
             target: "whitenoise::accounts",
             "Login complete for {}",
@@ -197,7 +200,7 @@ impl Whitenoise {
         pubkey: &PublicKey,
         relay_url: RelayUrl,
     ) -> core::result::Result<LoginResult, LoginError> {
-        if !self.pending_logins.contains_key(pubkey) {
+        if !self.account_manager.pending_logins.contains_key(pubkey) {
             return Err(LoginError::NoLoginInProgress);
         }
 
@@ -230,7 +233,7 @@ impl Whitenoise {
             self.sync_discovered_relay_lists(&account, &merged).await?;
             self.complete_external_signer_login(&account, merged.relays(RelayType::Inbox), signer)
                 .await?;
-            self.pending_logins.remove(pubkey);
+            self.account_manager.pending_logins.remove(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Login complete for {} (found lists on {})",

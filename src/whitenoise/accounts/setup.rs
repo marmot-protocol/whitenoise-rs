@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
 use mdk_core::prelude::group_types::GroupState;
@@ -11,6 +12,7 @@ use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
+use crate::whitenoise::session::AccountSession;
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
@@ -46,6 +48,33 @@ impl Whitenoise {
                 );
             }
         }
+    }
+
+    /// Create and insert an `AccountSession` into the `AccountManager`.
+    ///
+    /// Requires the global singleton for the `&'static Whitenoise` back-reference.
+    /// In unit tests (where the singleton is not set) this is a no-op.
+    fn insert_account_session(&self, account: &Account) -> Result<()> {
+        let wn = match Self::get_instance() {
+            Ok(wn) => wn,
+            Err(_) => {
+                tracing::debug!(
+                    target: "whitenoise::accounts",
+                    "Skipping session insertion (global singleton not available, likely in tests)"
+                );
+                return Ok(());
+            }
+        };
+
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+
+        // Resolve the signer: for local accounts, load from secrets store.
+        // For external accounts, check the external signers map.
+        let signer = self.get_signer_for_account(account).ok();
+
+        let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer, wn));
+        self.account_manager.insert_session(session);
+        Ok(())
     }
 
     #[perf_instrument("accounts")]
@@ -93,6 +122,9 @@ impl Whitenoise {
             );
         }
         sub_result?;
+
+        self.insert_account_session(account)?;
+
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
     }
@@ -115,6 +147,8 @@ impl Whitenoise {
         // Note: We skip key package setup for external signer accounts.
         // Key packages need to be published separately with the external signer.
         tracing::debug!(target: "whitenoise::accounts", "Skipping key package setup (external signer)");
+
+        self.insert_account_session(account)?;
 
         Ok(())
     }
@@ -1036,7 +1070,7 @@ mod tests {
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
         whitenoise.background_task_cancellation.clear();
         whitenoise.external_signers.clear();
-        whitenoise.pending_logins.clear();
+        whitenoise.account_manager.pending_logins.clear();
         whitenoise.reset_nostr_client().await.unwrap();
         whitenoise.wipe_database().await.unwrap();
     }

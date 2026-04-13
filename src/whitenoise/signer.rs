@@ -46,6 +46,14 @@ impl Whitenoise {
         }
         self.insert_external_signer(pubkey, signer).await?;
 
+        // Update the session's signer slot so that operations going through
+        // AccountSession can use the newly registered signer.
+        if let Some(session) = self.account_manager.get_session(&pubkey)
+            && let Ok(signer_arc) = self.get_signer_for_account(&account)
+        {
+            session.set_signer(signer_arc).await;
+        }
+
         // On app restore, external accounts may exist before their signer is
         // re-registered. Startup subscription setup can fail in that gap.
         // Rebuild account subscriptions now that signing/decryption is available.

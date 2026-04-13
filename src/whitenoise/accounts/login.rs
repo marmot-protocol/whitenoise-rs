@@ -195,6 +195,8 @@ impl Whitenoise {
                 Vec::new()
             });
 
+        self.account_manager.remove_session(pubkey);
+
         // Cancel any running background tasks (contact list user fetches, etc.)
         // before tearing down subscriptions and relay connections.
         if let Some((_, cancel_tx)) = self.background_task_cancellation.remove(pubkey) {

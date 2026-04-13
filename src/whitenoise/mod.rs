@@ -43,6 +43,7 @@ pub mod push_notifications;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
+pub mod session;
 mod signer;
 pub mod storage;
 mod streaming;
@@ -174,11 +175,8 @@ pub struct Whitenoise {
     /// user fetches). Sending `true` tells all background tasks for that account
     /// to stop. A new channel is created on login and signalled on logout.
     background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
-    /// Pubkeys with a login in progress (between login_start and
-    /// login_publish_default_relays / login_with_custom_relay / login_cancel).
-    /// The value holds whichever relay lists were already discovered on the
-    /// network so that step 2a can publish defaults only for the missing ones.
-    pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
+    /// Per-account session manager. Holds active sessions and pending logins.
+    pub(crate) account_manager: session::AccountManager,
     /// Debounced worker that coalesces discovery subscription rebuilds.
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
     /// In-memory coordination for delayed MIP-05 token-list responses.
@@ -220,6 +218,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .field("pending_push_token_responses", &"<REDACTED>")
+            .field("account_manager", &"<REDACTED>")
             .finish()
     }
 }
@@ -263,7 +262,7 @@ impl Whitenoise {
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
-            pending_logins: DashMap::new(),
+            account_manager: session::AccountManager::new(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),
         }
@@ -589,6 +588,15 @@ impl Whitenoise {
         }
 
         init_timing::record("background_tasks");
+
+        // Restore account sessions for all persisted accounts before setting up
+        // subscriptions so that each account has an MDK instance ready.
+        whitenoise_ref
+            .account_manager
+            .restore_sessions(whitenoise_ref)
+            .await;
+
+        init_timing::record("session_restore");
 
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
