@@ -50,29 +50,10 @@ impl Whitenoise {
         }
     }
 
-    /// Create and insert an `AccountSession` into the `AccountManager`.
-    ///
-    /// Requires the global singleton for the `&'static Whitenoise` back-reference.
-    /// In unit tests (where the singleton is not set) this is a no-op.
     fn insert_account_session(&self, account: &Account) -> Result<()> {
-        let wn = match Self::get_instance() {
-            Ok(wn) => wn,
-            Err(_) => {
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    "Skipping session insertion (global singleton not available, likely in tests)"
-                );
-                return Ok(());
-            }
-        };
-
         let mdk = self.create_mdk_for_account(account.pubkey)?;
-
-        // Resolve the signer: for local accounts, load from secrets store.
-        // For external accounts, check the external signers map.
         let signer = self.get_signer_for_account(account).ok();
-
-        let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer, wn));
+        let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer));
         self.account_manager.insert_session(session);
         Ok(())
     }

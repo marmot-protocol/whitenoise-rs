@@ -262,7 +262,7 @@ impl Whitenoise {
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
             background_task_cancellation: DashMap::new(),
-            account_manager: session::AccountManager::new(),
+            account_manager: session::AccountManager::default(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),
         }

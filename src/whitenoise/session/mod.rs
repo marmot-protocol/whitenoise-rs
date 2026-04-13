@@ -8,7 +8,7 @@ use nostr_sdk::prelude::NostrSigner;
 use tokio::sync::RwLock;
 
 use crate::whitenoise::Whitenoise;
-use crate::whitenoise::accounts::{AccountError, DiscoveredRelayLists};
+use crate::whitenoise::accounts::DiscoveredRelayLists;
 
 /// A per-account session holding the account's MDK instance and signer.
 ///
@@ -20,8 +20,6 @@ pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
     pub signer: RwLock<Option<Arc<dyn NostrSigner>>>,
-    /// Transitional back-reference until singleton removal.
-    _wn: &'static Whitenoise,
 }
 
 impl AccountSession {
@@ -29,13 +27,11 @@ impl AccountSession {
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         signer: Option<Arc<dyn NostrSigner>>,
-        wn: &'static Whitenoise,
     ) -> Self {
         Self {
             account_pubkey,
             mdk: Arc::new(mdk),
             signer: RwLock::new(signer),
-            _wn: wn,
         }
     }
 
@@ -43,20 +39,13 @@ impl AccountSession {
     pub async fn set_signer(&self, signer: Arc<dyn NostrSigner>) {
         *self.signer.write().await = Some(signer);
     }
-
-    /// Returns the current signer, if one is registered.
-    pub async fn get_signer(&self) -> Option<Arc<dyn NostrSigner>> {
-        self.signer.read().await.clone()
-    }
 }
 
 /// Manages active account sessions and pending logins.
 pub struct AccountManager {
     sessions: DashMap<PublicKey, Arc<AccountSession>>,
-    /// Pubkeys with a login in progress (between login_start and
-    /// login_publish_default_relays / login_with_custom_relay / login_cancel).
-    /// The value holds whichever relay lists were already discovered on the
-    /// network so that step 2a can publish defaults only for the missing ones.
+    /// Pubkeys with a login in progress. The value holds whichever relay lists
+    /// were already discovered so step 2a can publish defaults only for missing ones.
     pub(crate) pending_logins: DashMap<PublicKey, DiscoveredRelayLists>,
 }
 
@@ -70,11 +59,6 @@ impl Default for AccountManager {
 }
 
 impl AccountManager {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Insert or replace a session for the given account.
     pub fn insert_session(&self, session: Arc<AccountSession>) {
         let pubkey = session.account_pubkey;
         self.sessions.insert(pubkey, session);
@@ -85,12 +69,10 @@ impl AccountManager {
         );
     }
 
-    /// Look up an active session by public key.
     pub fn get_session(&self, pubkey: &PublicKey) -> Option<Arc<AccountSession>> {
         self.sessions.get(pubkey).map(|r| r.clone())
     }
 
-    /// Remove the session for the given public key.
     pub fn remove_session(&self, pubkey: &PublicKey) -> Option<Arc<AccountSession>> {
         let removed = self.sessions.remove(pubkey).map(|(_, s)| s);
         if removed.is_some() {
@@ -103,31 +85,11 @@ impl AccountManager {
         removed
     }
 
-    /// Returns true if a session exists for the given public key.
-    pub fn has_session(&self, pubkey: &PublicKey) -> bool {
-        self.sessions.contains_key(pubkey)
-    }
-
-    /// Returns the number of active sessions.
-    pub fn session_count(&self) -> usize {
-        self.sessions.len()
-    }
-
-    /// Returns all active session public keys.
-    pub fn session_pubkeys(&self) -> Vec<PublicKey> {
-        self.sessions.iter().map(|r| *r.key()).collect()
-    }
-
-    /// Restore sessions for all persisted accounts.
+    /// Restore sessions for all persisted accounts at startup.
     ///
-    /// Creates an `AccountSession` (with MDK but no signer) for each account
-    /// in the database. External-signer accounts will have `signer: None`
-    /// until `register_external_signer()` fills the slot. Local accounts get
-    /// their signer from the secrets store.
-    pub async fn restore_sessions(
-        &self,
-        wn: &'static Whitenoise,
-    ) -> Vec<(PublicKey, Result<(), AccountError>)> {
+    /// External-signer accounts get `signer: None` until re-registered.
+    /// Local accounts load their signer from the secrets store.
+    pub async fn restore_sessions(&self, wn: &'static Whitenoise) {
         let accounts = match crate::whitenoise::accounts::Account::all(&wn.database).await {
             Ok(accounts) => accounts,
             Err(e) => {
@@ -136,38 +98,24 @@ impl AccountManager {
                     "Failed to load accounts for session restore: {}",
                     e
                 );
-                return Vec::new();
+                return;
             }
         };
 
-        let mut results = Vec::with_capacity(accounts.len());
+        let mut ok_count = 0usize;
+        let mut err_count = 0usize;
 
         for account in &accounts {
-            let mdk_result = wn.create_mdk_for_account(account.pubkey);
-            match mdk_result {
+            match wn.create_mdk_for_account(account.pubkey) {
                 Ok(mdk) => {
-                    // For local accounts, try to load the signer from secrets store.
-                    // For external accounts, signer is None until re-registered.
                     let signer: Option<Arc<dyn NostrSigner>> = if account.has_local_key() {
-                        match wn.get_signer_for_account(account) {
-                            Ok(s) => Some(s),
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "whitenoise::session",
-                                    "Failed to load signer for local account {}: {}",
-                                    account.pubkey.to_hex(),
-                                    e
-                                );
-                                None
-                            }
-                        }
+                        wn.get_signer_for_account(account).ok()
                     } else {
                         None
                     };
-
-                    let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer, wn));
+                    let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer));
                     self.insert_session(session);
-                    results.push((account.pubkey, Ok(())));
+                    ok_count += 1;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -176,7 +124,7 @@ impl AccountManager {
                         account.pubkey.to_hex(),
                         e
                     );
-                    results.push((account.pubkey, Err(e)));
+                    err_count += 1;
                 }
             }
         }
@@ -184,11 +132,9 @@ impl AccountManager {
         tracing::info!(
             target: "whitenoise::session",
             "Restored {} sessions ({} failed)",
-            results.iter().filter(|(_, r)| r.is_ok()).count(),
-            results.iter().filter(|(_, r)| r.is_err()).count(),
+            ok_count,
+            err_count,
         );
-
-        results
     }
 }
 

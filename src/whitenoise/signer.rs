@@ -46,10 +46,8 @@ impl Whitenoise {
         }
         self.insert_external_signer(pubkey, signer).await?;
 
-        // Update the session's signer slot so that operations going through
-        // AccountSession can use the newly registered signer.
         if let Some(session) = self.account_manager.get_session(&pubkey)
-            && let Ok(signer_arc) = self.get_signer_for_account(&account)
+            && let Some(signer_arc) = self.get_external_signer(&pubkey)
         {
             session.set_signer(signer_arc).await;
         }
