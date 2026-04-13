@@ -841,6 +841,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
         build_token_removal_rumor, build_token_request_rumor,
@@ -2075,6 +2077,138 @@ mod tests {
             message_event.is_ok(),
             "Admin should be able to create messages after auto-committed removal: {:?}",
             message_event.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_token_request_does_not_create_second_task() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let _admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let fake_event_id = EventId::all_zeros();
+        let fake_group_id = GroupId::from_slice(&[1u8; 32]);
+
+        // Pre-insert the key to simulate an in-flight task holding it. This
+        // avoids the race where a spawned task with delay_ms=0 could clear the
+        // key before the assertion runs.
+        whitenoise.insert_pending_token_response_for_test(
+            member_account.pubkey,
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &fake_group_id,
+            &fake_event_id,
+        ));
+
+        // Schedule with the same key hits the duplicate-dedup early-return;
+        // the existing entry must remain intact.
+        whitenoise.schedule_token_response_for_test(
+            member_account.clone(),
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(
+            whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &fake_group_id,
+                &fake_event_id,
+            ),
+            "pending entry should still be present after duplicate request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_token_response_task_runs_and_clears_pending_entry() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let token_tag = make_token_tag(22);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        // In tests the spawn delay is 0ms; wait for the spawned task to clear the entry.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !whitenoise.has_pending_token_response(
+                    &member_account.pubkey,
+                    &group_id,
+                    &request_event_id,
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for spawned token-response task to complete");
+    }
+
+    #[tokio::test]
+    async fn test_token_request_dropped_when_semaphore_exhausted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        // Hold all semaphore permits so the next scheduled response task is dropped.
+        let _guard = whitenoise.exhaust_token_response_semaphore();
+
+        let token_tag = make_token_tag(20);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+
+        whitenoise
+            .handle_mls_message(&member_account, event)
+            .await
+            .unwrap();
+
+        // The task should have been dropped; no pending entry should remain.
+        assert!(
+            !whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &group_id,
+                &request_event_id,
+            ),
+            "pending entry should be removed when the concurrency cap is reached"
         );
     }
 

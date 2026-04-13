@@ -8,6 +8,7 @@ use std::{
     str::FromStr,
 };
 
+#[cfg(not(test))]
 use ::rand::Rng;
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
@@ -134,6 +135,11 @@ impl fmt::Debug for GroupPushToken {
             .finish()
     }
 }
+
+/// Maximum number of concurrently-active delayed MIP-05 token-list response tasks.
+/// Tasks that cannot acquire a permit are dropped; the requester can retry via a
+/// subsequent token request event.
+pub(crate) const MAX_CONCURRENT_TOKEN_RESPONSE_TASKS: usize = 10;
 
 const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
     mdk_core::mip05::TOKEN_REQUEST_KIND,
@@ -798,6 +804,42 @@ impl Whitenoise {
         Ok(true)
     }
 
+    /// Calls `schedule_pending_token_response` directly. Used in tests to exercise
+    /// the scheduling logic without going through the full MLS message pipeline.
+    #[cfg(test)]
+    pub(crate) fn schedule_token_response_for_test(
+        &self,
+        account: Account,
+        group_id: GroupId,
+        request_event_id: EventId,
+    ) {
+        self.schedule_pending_token_response(account, group_id, request_event_id);
+    }
+
+    /// Acquires all permits from the token-response semaphore and returns the
+    /// owned guard. Dropping the guard releases the permits. Used in tests to
+    /// simulate a fully-saturated semaphore.
+    #[cfg(test)]
+    pub(crate) fn exhaust_token_response_semaphore(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.token_response_semaphore
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_TOKEN_RESPONSE_TASKS as u32)
+            .expect("semaphore should be fully available at start of test")
+    }
+
+    /// Directly inserts a key into the pending token response map without
+    /// spawning a task. Used in tests to simulate an in-flight request.
+    #[cfg(test)]
+    pub(crate) fn insert_pending_token_response_for_test(
+        &self,
+        account_pubkey: PublicKey,
+        group_id: GroupId,
+        request_event_id: EventId,
+    ) {
+        self.pending_push_token_responses
+            .insert((account_pubkey, group_id, request_event_id), ());
+    }
+
     #[cfg(test)]
     pub(crate) fn has_pending_token_response(
         &self,
@@ -845,7 +887,37 @@ impl Whitenoise {
         request_event_id: EventId,
     ) {
         let key = (account.pubkey, group_id.clone(), request_event_id);
-        self.pending_push_token_responses.insert(key, ());
+
+        // If the key was already present, an identical request is already in-flight.
+        // Inserting again is a no-op (value is `()`), so we use the return value to
+        // detect duplicates atomically before touching the semaphore.
+        if self
+            .pending_push_token_responses
+            .insert(key.clone(), ())
+            .is_some()
+        {
+            return;
+        }
+
+        // Key is freshly owned by us; now enforce the concurrency cap.
+        // The permit is moved into the spawned task and held for the full
+        // duration (sleep + dispatch) so the cap applies to in-flight tasks,
+        // not just to the moment of scheduling.
+        let permit = match self.token_response_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account.pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    request_event_id = %request_event_id.to_hex(),
+                    "Dropping MIP-05 token-list response task: concurrency limit reached"
+                );
+                // Safe to remove: we are the ones who inserted this key above.
+                self.pending_push_token_responses.remove(&key);
+                return;
+            }
+        };
 
         let context = PendingTokenResponseContext {
             config: self.config.clone(),
@@ -853,7 +925,10 @@ impl Whitenoise {
             pending_push_token_responses: Arc::clone(&self.pending_push_token_responses),
             relay_control: Arc::clone(&self.relay_control),
         };
+        #[cfg(not(test))]
         let delay_ms = ::rand::rng().random_range(1_000..=3_000);
+        #[cfg(test)]
+        let delay_ms = 0u64;
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -871,6 +946,10 @@ impl Whitenoise {
                     "Failed to send delayed MIP-05 token-list response"
                 );
             }
+
+            // Permit is held across the sleep + dispatch and released here,
+            // freeing a slot for the next waiting task.
+            drop(permit);
         });
     }
 
