@@ -124,7 +124,18 @@ impl Whitenoise {
     ///
     /// Returns an error if no signer is available for the account.
     pub(crate) fn get_signer_for_account(&self, account: &Account) -> Result<Arc<dyn NostrSigner>> {
-        // First check for a registered external signer
+        if let Some(session) = self.account_manager.get_session(&account.pubkey)
+            && let Some(signer) = session.signer.try_read().ok().and_then(|g| g.clone())
+        {
+            tracing::debug!(
+                target: "whitenoise::signer",
+                "Using session signer for account {}",
+                account.pubkey.to_hex()
+            );
+            return Ok(signer);
+        }
+
+        // Pre-session login flow: signer arrives before the session exists.
         if let Some(external_signer) = self.get_external_signer(&account.pubkey) {
             tracing::debug!(
                 target: "whitenoise::signer",
@@ -134,7 +145,6 @@ impl Whitenoise {
             return Ok(external_signer);
         }
 
-        // Fall back to local keys from secrets store
         let keys = self
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;

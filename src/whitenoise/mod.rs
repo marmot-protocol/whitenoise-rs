@@ -8,7 +8,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{EventId, PublicKey, RelayUrl};
 use tokio::sync::{
-    Mutex, OnceCell, Semaphore,
+    Mutex, OnceCell,
     mpsc::{self, Sender},
     watch,
 };
@@ -160,8 +160,6 @@ pub struct Whitenoise {
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
-    /// Per-account concurrency guards to prevent race conditions in contact list processing
-    contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
     /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
     user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
@@ -171,10 +169,6 @@ pub struct Whitenoise {
     /// External signers for accounts using NIP-55 (Amber) or similar.
     /// Maps account pubkey to their signer implementation.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
-    /// Per-account cancellation signals for background tasks (e.g. contact list
-    /// user fetches). Sending `true` tells all background tasks for that account
-    /// to stop. A new channel is created on login and signalled on logout.
-    background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
     /// Per-account session manager. Holds active sessions and pending logins.
     pub(crate) account_manager: session::AccountManager,
     /// Debounced worker that coalesces discovery subscription rebuilds.
@@ -213,7 +207,6 @@ impl std::fmt::Debug for Whitenoise {
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
-            .field("contact_list_guards", &"<REDACTED>")
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
@@ -256,12 +249,10 @@ impl Whitenoise {
             ),
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
-            contact_list_guards: DashMap::new(),
             user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
-            background_task_cancellation: DashMap::new(),
             account_manager: session::AccountManager::default(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),

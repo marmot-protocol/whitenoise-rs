@@ -5,7 +5,7 @@ use mdk_core::prelude::MDK;
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::PublicKey;
 use nostr_sdk::prelude::NostrSigner;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore, watch};
 
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::DiscoveredRelayLists;
@@ -20,6 +20,8 @@ pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
     pub signer: RwLock<Option<Arc<dyn NostrSigner>>>,
+    pub contact_list_guard: Arc<Semaphore>,
+    pub cancellation: watch::Sender<bool>,
 }
 
 impl AccountSession {
@@ -28,10 +30,13 @@ impl AccountSession {
         mdk: MDK<MdkSqliteStorage>,
         signer: Option<Arc<dyn NostrSigner>>,
     ) -> Self {
+        let (cancellation, _) = watch::channel(false);
         Self {
             account_pubkey,
             mdk: Arc::new(mdk),
             signer: RwLock::new(signer),
+            contact_list_guard: Arc::new(Semaphore::new(1)),
+            cancellation,
         }
     }
 

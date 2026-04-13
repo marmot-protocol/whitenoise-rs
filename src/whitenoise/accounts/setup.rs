@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use dashmap::mapref::entry::Entry;
 use mdk_core::prelude::group_types::GroupState;
 use nostr_sdk::prelude::*;
 use tokio::sync::watch;
@@ -19,38 +18,10 @@ use crate::whitenoise::{Whitenoise, WhitenoiseError};
 use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
-    fn replace_background_task_cancellation_channel(&self, account_pubkey: PublicKey) {
-        let (cancel_tx, _) = watch::channel(false);
-        let previous_cancel_tx = self
-            .background_task_cancellation
-            .insert(account_pubkey, cancel_tx);
-
-        if let Some(previous_cancel_tx) = previous_cancel_tx {
-            let _ = previous_cancel_tx.send(true);
-            tracing::debug!(
-                target: "whitenoise::accounts",
-                account_pubkey = %account_pubkey,
-                "Replaced background-task cancellation channel and cancelled prior tasks",
-            );
-        }
-    }
-
-    fn ensure_background_task_cancellation_channel(&self, account_pubkey: PublicKey) {
-        match self.background_task_cancellation.entry(account_pubkey) {
-            Entry::Occupied(_) => {}
-            Entry::Vacant(entry) => {
-                let (cancel_tx, _) = watch::channel(false);
-                entry.insert(cancel_tx);
-                tracing::debug!(
-                    target: "whitenoise::accounts",
-                    account_pubkey = %account_pubkey,
-                    "Created missing background-task cancellation channel during subscription setup",
-                );
-            }
-        }
-    }
-
     fn insert_account_session(&self, account: &Account) -> Result<()> {
+        if let Some(old_session) = self.account_manager.get_session(&account.pubkey) {
+            let _ = old_session.cancellation.send(true);
+        }
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let signer = self.get_signer_for_account(account).ok();
         let session = Arc::new(AccountSession::new(account.pubkey, mdk, signer));
@@ -83,8 +54,6 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
-        self.replace_background_task_cancellation_channel(account.pubkey);
-
         self.discovery_sync_worker.request_rebuild();
 
         // Subscriptions and key package setup operate on disjoint relay
@@ -118,8 +87,6 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
-        self.replace_background_task_cancellation_channel(account.pubkey);
-
         self.discovery_sync_worker.request_rebuild();
 
         self.setup_subscriptions(account, inbox_relays).await?;
@@ -808,9 +775,9 @@ impl Whitenoise {
         let account_clone = account.clone();
         let account_pubkey = account.pubkey;
         let cancel_rx = self
-            .background_task_cancellation
-            .get(&account.pubkey)
-            .map(|entry| entry.value().subscribe());
+            .account_manager
+            .get_session(&account.pubkey)
+            .map(|s| s.cancellation.subscribe());
         if cancel_rx.is_none() {
             tracing::debug!(
                 target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
@@ -862,11 +829,6 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
-        // Restored accounts rebuild relay subscriptions at startup without
-        // going through activate_account(), but later group-plane refreshes
-        // depend on this runtime-only channel being present.
-        self.ensure_background_task_cancellation_channel(account.pubkey);
-
         tracing::debug!(
             target: "whitenoise::accounts",
             "Setting up subscriptions for account: {:?}",
@@ -1049,92 +1011,11 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
-        whitenoise.background_task_cancellation.clear();
         whitenoise.external_signers.clear();
         whitenoise.account_manager.clear_sessions();
         whitenoise.account_manager.pending_logins.clear();
         whitenoise.reset_nostr_client().await.unwrap();
         whitenoise.wipe_database().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_ensure_background_task_cancellation_channel_creates_missing_channel() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account_pubkey = Keys::generate().public_key();
-
-        assert!(
-            !whitenoise
-                .background_task_cancellation
-                .contains_key(&account_pubkey)
-        );
-
-        whitenoise.ensure_background_task_cancellation_channel(account_pubkey);
-
-        let cancel_tx = whitenoise
-            .background_task_cancellation
-            .get(&account_pubkey)
-            .expect("missing cancellation channel after ensure");
-        let cancel_rx = cancel_tx.subscribe();
-
-        assert!(
-            !*cancel_rx.borrow(),
-            "new cancellation channel should start in the non-cancelled state"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ensure_background_task_cancellation_channel_preserves_existing_channel() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account_pubkey = Keys::generate().public_key();
-        let (existing_cancel_tx, _) = watch::channel(true);
-
-        whitenoise
-            .background_task_cancellation
-            .insert(account_pubkey, existing_cancel_tx);
-
-        whitenoise.ensure_background_task_cancellation_channel(account_pubkey);
-
-        let cancel_tx = whitenoise
-            .background_task_cancellation
-            .get(&account_pubkey)
-            .expect("missing preserved cancellation channel");
-        let cancel_rx = cancel_tx.subscribe();
-
-        assert!(
-            *cancel_rx.borrow(),
-            "existing cancellation channel should not be replaced"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_replace_background_task_cancellation_channel_cancels_existing_channel() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account_pubkey = Keys::generate().public_key();
-        let (existing_cancel_tx, _) = watch::channel(false);
-        let mut existing_cancel_rx = existing_cancel_tx.subscribe();
-
-        whitenoise
-            .background_task_cancellation
-            .insert(account_pubkey, existing_cancel_tx);
-
-        whitenoise.replace_background_task_cancellation_channel(account_pubkey);
-
-        existing_cancel_rx
-            .changed()
-            .await
-            .expect("existing receiver should observe cancellation");
-        assert!(*existing_cancel_rx.borrow_and_update());
-
-        let cancel_tx = whitenoise
-            .background_task_cancellation
-            .get(&account_pubkey)
-            .expect("missing replacement cancellation channel");
-        let cancel_rx = cancel_tx.subscribe();
-
-        assert!(
-            !*cancel_rx.borrow(),
-            "replacement cancellation channel should start in the non-cancelled state"
-        );
     }
 
     #[tokio::test]
@@ -1251,10 +1132,14 @@ mod tests {
         let member_account = whitenoise.create_identity().await.unwrap();
         wait_for_key_package_publication(whitenoise, &[&member_account]).await;
 
-        // Simulate app restart: runtime-only background-task channels are gone,
+        // Simulate app restart: runtime-only sessions are gone,
         // then startup restores relay subscriptions from persisted accounts.
-        whitenoise.background_task_cancellation.clear();
+        whitenoise.account_manager.clear_sessions();
         whitenoise.reset_nostr_client().await.unwrap();
+        whitenoise
+            .account_manager
+            .restore_sessions(whitenoise)
+            .await;
         Whitenoise::setup_accounts_subscriptions(whitenoise)
             .await
             .unwrap();
@@ -1556,17 +1441,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_background_refresh_account_group_subscriptions_no_channel_noop() {
+    async fn test_background_refresh_account_group_subscriptions_no_session_noop() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = make_stub_account(&whitenoise).await;
 
+        assert!(
+            whitenoise
+                .account_manager
+                .get_session(&account.pubkey)
+                .is_none(),
+            "stub account should not have a session"
+        );
+
         whitenoise.background_refresh_account_group_subscriptions(&account);
         tokio::task::yield_now().await;
-
-        assert!(
-            !whitenoise
-                .background_task_cancellation
-                .contains_key(&account.pubkey)
-        );
     }
 }

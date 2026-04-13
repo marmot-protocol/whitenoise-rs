@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use crate::whitenoise::{
     Whitenoise,
@@ -57,9 +57,15 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn acquire_contact_list_guard(&self, account: &Account) -> Result<OwnedSemaphorePermit> {
         let semaphore = self
-            .contact_list_guards
-            .entry(account.pubkey)
-            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or_else(|| {
+                WhitenoiseError::ContactList(format!(
+                    "No active session for account {}",
+                    account.pubkey.to_hex()
+                ))
+            })?
+            .contact_list_guard
             .clone();
 
         semaphore.acquire_owned().await.map_err(|_| {
@@ -120,12 +126,10 @@ impl Whitenoise {
         let pubkeys = pubkeys.to_vec();
         let total = pubkeys.len();
 
-        // Get a cancellation receiver for this account so the batch stops if
-        // the account logs out.
         let cancel_rx = self
-            .background_task_cancellation
-            .get(account_pubkey)
-            .map(|entry| entry.value().subscribe());
+            .account_manager
+            .get_session(account_pubkey)
+            .map(|s| s.cancellation.subscribe());
 
         let tid = crate::perf::current_trace_id();
         tokio::spawn(crate::perf::with_trace_id(tid, async move {

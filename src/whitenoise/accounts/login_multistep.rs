@@ -55,13 +55,13 @@ impl Whitenoise {
         // Three conditions must hold to short-circuit:
         // 1. Account row exists in the database.
         // 2. No pending multi-step login is in progress (pending_logins).
-        // 3. An active session exists (background_task_cancellation is set
-        //    by activate_account). Without this check, a concurrent second
-        //    call could see the DB row created by a first call that hasn't
-        //    finished activation yet and return Complete prematurely.
+        // 3. An active session exists (created by activate_account). Without
+        //    this check, a concurrent second call could see the DB row created
+        //    by a first call that hasn't finished activation yet and return
+        //    Complete prematurely.
         if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
             && !self.account_manager.pending_logins.contains_key(&pubkey)
-            && self.background_task_cancellation.contains_key(&pubkey)
+            && self.account_manager.get_session(&pubkey).is_some()
         {
             tracing::debug!(
                 target: "whitenoise::accounts",
@@ -1352,11 +1352,7 @@ mod tests {
                 .pending_logins
                 .contains_key(&pubkey)
         );
-        assert!(
-            !whitenoise
-                .background_task_cancellation
-                .contains_key(&pubkey)
-        );
+        assert!(whitenoise.account_manager.get_session(&pubkey).is_none());
 
         let result = whitenoise
             .login_start(keys.secret_key().to_secret_hex())
