@@ -1323,21 +1323,20 @@ impl PushRegistration {
     fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
         match self.platform {
             PushPlatform::Apns => {
-                // iOS tokens are 32 raw bytes, but some app layers surface them as
-                // 64-character hex strings, so accept either representation.
-                let token_bytes = if self.raw_token.len() == 64 {
-                    hex::decode(&self.raw_token).map_err(|error| {
-                        WhitenoiseError::InvalidInput(format!(
-                            "invalid APNs token hex encoding: {error}"
-                        ))
-                    })?
-                } else if self.raw_token.len() == 32 {
-                    self.raw_token.as_bytes().to_vec()
-                } else {
+                // Apple push notification tokens are variable-length opaque data.
+                // The app layer surfaces them as hex-encoded strings, so decode
+                // from hex and pass the raw bytes through.
+                let token_bytes = hex::decode(&self.raw_token).map_err(|error| {
+                    WhitenoiseError::InvalidInput(format!(
+                        "invalid APNs token hex encoding: {error}"
+                    ))
+                })?;
+
+                if token_bytes.is_empty() {
                     return Err(WhitenoiseError::InvalidInput(
-                        "APNs token must be 32 raw bytes or 64 hex characters".to_string(),
+                        "APNs token must not be empty".to_string(),
                     ));
-                };
+                }
 
                 PushTokenPlaintext::new(NotificationPlatform::Apns, token_bytes)
                     .map_err(WhitenoiseError::from)
@@ -2847,11 +2846,11 @@ mod tests {
     }
 
     #[test]
-    fn test_push_registration_push_token_plaintext_rejects_invalid_apns_length() {
+    fn test_push_registration_push_token_plaintext_rejects_non_hex_apns_token() {
         let registration = PushRegistration {
             account_pubkey: Keys::generate().public_key(),
             platform: PushPlatform::Apns,
-            raw_token: "too-short".to_string(),
+            raw_token: "not-valid-hex!!".to_string(),
             server_pubkey: Keys::generate().public_key(),
             relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
             created_at: Utc::now(),
@@ -2864,7 +2863,29 @@ mod tests {
         assert!(matches!(
             error,
             WhitenoiseError::InvalidInput(message)
-            if message == "APNs token must be 32 raw bytes or 64 hex characters"
+            if message.contains("invalid APNs token hex encoding")
+        ));
+    }
+
+    #[test]
+    fn test_push_registration_push_token_plaintext_rejects_empty_apns_token() {
+        let registration = PushRegistration {
+            account_pubkey: Keys::generate().public_key(),
+            platform: PushPlatform::Apns,
+            raw_token: String::new(),
+            server_pubkey: Keys::generate().public_key(),
+            relay_hint: Some(RelayUrl::parse("wss://push.example.com").unwrap()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_shared_at: None,
+        };
+
+        let error = registration.push_token_plaintext().unwrap_err();
+
+        assert!(matches!(
+            error,
+            WhitenoiseError::InvalidInput(message)
+            if message.contains("must not be empty")
         ));
     }
 

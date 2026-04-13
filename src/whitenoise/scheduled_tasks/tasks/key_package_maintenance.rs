@@ -432,8 +432,7 @@ mod tests {
         account: &crate::whitenoise::accounts::Account,
         relays: &[Relay],
     ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
-        let (encoded_key_package, tags, _hash_ref) =
-            whitenoise.encoded_key_package(account, relays).await?;
+        let key_package_data = whitenoise.encoded_key_package(account, relays).await?;
 
         let nsec = whitenoise.export_account_nsec(account).await?;
         let secret_key =
@@ -441,12 +440,13 @@ mod tests {
         let keys = Keys::new(secret_key);
 
         // Filter out the encoding tag to simulate an outdated key package
-        let tags_without_encoding: Vec<Tag> = tags
+        let tags_without_encoding: Vec<Tag> = key_package_data
+            .tags_443
             .into_iter()
             .filter(|tag| tag.kind() != TagKind::Custom("encoding".into()))
             .collect();
 
-        let event = EventBuilder::new(Kind::MlsKeyPackage, &encoded_key_package)
+        let event = EventBuilder::new(Kind::MlsKeyPackage, &key_package_data.content)
             .tags(tags_without_encoding)
             .sign_with_keys(&keys)
             .map_err(|e| WhitenoiseError::Other(e.into()))?;
