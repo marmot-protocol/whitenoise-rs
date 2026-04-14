@@ -197,6 +197,14 @@ pub struct Whitenoise {
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
 
+/// Serializes callers of [`Whitenoise::ensure_initialized`] so two concurrent
+/// invokers cannot both observe an uninitialized singleton and both drive
+/// [`Whitenoise::initialize_whitenoise`]. The mutex is only held across the
+/// check-and-possibly-init; once `GLOBAL_WHITENOISE` is populated, subsequent
+/// callers acquire it, observe the populated singleton, and release it
+/// immediately without doing work.
+static ENSURE_INITIALIZED_LOCK: Mutex<()> = Mutex::const_new(());
+
 struct WhitenoiseComponents {
     event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
     secrets_store: SecretsStore,
@@ -651,11 +659,32 @@ impl Whitenoise {
     /// Whitenoise has already been started — for example, iOS background push handlers that
     /// may fire when the app process is still alive or after a full cold launch.
     ///
-    /// Unlike calling [`initialize_whitenoise`] directly, this method is safe to call
-    /// repeatedly — it will never start duplicate event processors or background tasks.
+    /// # Concurrency
+    ///
+    /// Concurrent callers are serialized through a module-private mutex so that
+    /// exactly one caller drives [`initialize_whitenoise`] on cold start; all others
+    /// observe the populated singleton and return immediately. This guarantees the
+    /// documented "never start duplicate event processors or background tasks"
+    /// contract even when multiple iOS silent-push handlers run concurrently on
+    /// different threads.
+    ///
+    /// Note: this does not protect against a caller invoking [`initialize_whitenoise`]
+    /// directly in parallel with `ensure_initialized`. Outside of this background
+    /// push path, init is expected to be serialized by the caller (e.g. a single
+    /// Flutter cold-start path).
     ///
     /// [`initialize_whitenoise`]: Self::initialize_whitenoise
     pub async fn ensure_initialized(config: WhitenoiseConfig) -> Result<&'static Self> {
+        // Fast path: already initialized. Avoids taking the lock in the warm case,
+        // which is the common case once the app has been running.
+        if let Some(instance) = GLOBAL_WHITENOISE.get() {
+            return Ok(instance);
+        }
+
+        // Cold / contested path: take the lock and re-check under it. Only the
+        // first holder observes `is_none()` and drives initialization; later
+        // holders see the now-populated cell and fall through.
+        let _guard = ENSURE_INITIALIZED_LOCK.lock().await;
         if GLOBAL_WHITENOISE.get().is_none() {
             Self::initialize_whitenoise(config).await?;
         }

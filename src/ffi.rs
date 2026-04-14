@@ -176,13 +176,16 @@ fn result_to_json(result: BackgroundNotificationResult) -> String {
 /// or CString construction fails for any reason, the static fallback JSON is
 /// used instead.
 fn string_to_raw(json: String) -> *mut c_char {
-    // CString::new rejects interior NULs. First try the happy path.
-    if let Ok(cstr) = CString::new(json.clone()) {
-        return cstr.into_raw();
-    }
+    // CString::new rejects interior NULs. First try the happy path. On failure
+    // it hands back the original bytes via NulError::into_vec(), so we can
+    // recover ownership without needing to clone up front.
+    let bytes = match CString::new(json) {
+        Ok(cstr) => return cstr.into_raw(),
+        Err(nul_err) => nul_err.into_vec(),
+    };
 
     // Interior NUL present. Strip NUL bytes and retry.
-    let sanitized: String = json.chars().filter(|c| *c != '\0').collect();
+    let sanitized: Vec<u8> = bytes.into_iter().filter(|b| *b != 0).collect();
     if let Ok(cstr) = CString::new(sanitized) {
         return cstr.into_raw();
     }
