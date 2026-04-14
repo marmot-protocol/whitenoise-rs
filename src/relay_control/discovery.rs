@@ -125,6 +125,11 @@ struct DiscoveryPlaneState {
     follow_list_subscription_ids: Vec<SubscriptionId>,
     follow_list_account_count: usize,
     previous_follow_set_hash: Option<u64>,
+
+    // Mute-list subscriptions (NIP-51 kind 10000)
+    mute_list_subscription_ids: Vec<SubscriptionId>,
+    mute_list_account_count: usize,
+    previous_mute_set_hash: Option<u64>,
 }
 
 impl DiscoveryPlane {
@@ -368,6 +373,78 @@ impl DiscoveryPlane {
         Ok(())
     }
 
+    // ── Mute-list subscriptions (NIP-51) ─────────────────────────────────
+
+    /// Syncs mute-list subscriptions for each account (same `since` policy as follow lists).
+    #[perf_instrument("relay")]
+    pub(crate) async fn sync_mute_lists(
+        &self,
+        mute_list_accounts: &[(PublicKey, Option<Timestamp>)],
+    ) -> Result<()> {
+        let mut mute_pubkeys: Vec<PublicKey> =
+            mute_list_accounts.iter().map(|(pk, _)| *pk).collect();
+        mute_pubkeys.sort_unstable_by_key(|pk| pk.to_hex());
+        mute_pubkeys.dedup();
+
+        let mute_set_hash = hash_pubkey_slice(&mute_pubkeys);
+
+        let hash_unchanged = {
+            let state = self.state.read().await;
+            state.previous_mute_set_hash == Some(mute_set_hash)
+        };
+
+        if hash_unchanged {
+            tracing::debug!(
+                target: "whitenoise::relay_control::discovery",
+                mute_accounts = mute_pubkeys.len(),
+                "Mute list sync skipped (account set unchanged)"
+            );
+            return Ok(());
+        }
+
+        if !self
+            .session
+            .has_any_relay_connected(&self.config.relays)
+            .await
+        {
+            self.start().await?;
+        }
+
+        let mut new_ids = Vec::new();
+        for (index, (account_pubkey, since)) in mute_list_accounts.iter().enumerate() {
+            let mut filter = Filter::new().kind(Kind::MuteList).author(*account_pubkey);
+            if let Some(since) = since {
+                filter = filter.since(*since);
+            }
+
+            let subscription_id = SubscriptionId::new(format!("discovery_mute_{index}"));
+            self.session
+                .subscribe_with_id_to(
+                    &self.config.relays,
+                    subscription_id.clone(),
+                    filter,
+                    SubscriptionStream::DiscoveryMuteLists,
+                    Some(*account_pubkey),
+                    &[],
+                )
+                .await?;
+            new_ids.push(subscription_id);
+        }
+
+        let stale = {
+            let mut state = self.state.write().await;
+            let old_ids = std::mem::replace(&mut state.mute_list_subscription_ids, new_ids);
+            state.mute_list_account_count = mute_list_accounts.len();
+            state.previous_mute_set_hash = Some(mute_set_hash);
+            stale_ids(old_ids, &state.mute_list_subscription_ids)
+        };
+        for id in stale {
+            self.session.unsubscribe(&id).await;
+        }
+
+        Ok(())
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     /// Tears down all discovery subscriptions and resets state.
@@ -378,6 +455,7 @@ impl DiscoveryPlane {
             .public_subscription_ids
             .into_iter()
             .chain(old.follow_list_subscription_ids)
+            .chain(old.mute_list_subscription_ids)
         {
             self.session.unsubscribe(&id).await;
         }
@@ -418,7 +496,9 @@ impl DiscoveryPlane {
 
     pub(crate) async fn has_subscriptions(&self) -> bool {
         let state = self.state.read().await;
-        !state.public_subscription_ids.is_empty() || !state.follow_list_subscription_ids.is_empty()
+        !state.public_subscription_ids.is_empty()
+            || !state.follow_list_subscription_ids.is_empty()
+            || !state.mute_list_subscription_ids.is_empty()
     }
 
     pub(crate) async fn has_connected_relay(&self) -> bool {
@@ -444,11 +524,20 @@ impl DiscoveryPlane {
             .collect::<Vec<_>>();
         follow_list_subscription_ids.sort_unstable();
 
+        let mut mute_list_subscription_ids = state
+            .mute_list_subscription_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        mute_list_subscription_ids.sort_unstable();
+
         DiscoveryPlaneStateSnapshot {
             watched_user_count: state.watched_user_count,
             follow_list_subscription_count: state.follow_list_account_count,
+            mute_list_subscription_count: state.mute_list_account_count,
             public_subscription_ids,
             follow_list_subscription_ids,
+            mute_list_subscription_ids,
             session: self.session.snapshot(&self.config.relays).await,
         }
     }

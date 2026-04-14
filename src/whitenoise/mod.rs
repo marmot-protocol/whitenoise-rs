@@ -161,6 +161,8 @@ pub struct Whitenoise {
     shutdown_sender: Sender<()>,
     /// Per-account concurrency guards to prevent race conditions in contact list processing
     contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
+    /// Per-account concurrency guards for mute list (NIP-51) processing
+    mute_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
     /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
     user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
@@ -216,6 +218,7 @@ impl std::fmt::Debug for Whitenoise {
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("contact_list_guards", &"<REDACTED>")
+            .field("mute_list_guards", &"<REDACTED>")
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
@@ -258,6 +261,7 @@ impl Whitenoise {
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
             contact_list_guards: DashMap::new(),
+            mute_list_guards: DashMap::new(),
             user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
@@ -624,6 +628,16 @@ impl Whitenoise {
         GLOBAL_WHITENOISE
             .get()
             .ok_or(WhitenoiseError::Initialization)
+    }
+
+    /// Returns true when this instance uses the same `Database` handle as the global singleton.
+    ///
+    /// Used to avoid spawning `get_instance()`-based background work from isolated test
+    /// `Whitenoise` instances that would otherwise resolve users against the wrong database.
+    pub(crate) fn shares_global_database(&self) -> bool {
+        Self::get_instance()
+            .ok()
+            .is_some_and(|global| Arc::ptr_eq(&self.database, &global.database))
     }
 
     /// Gracefully shuts down all background tasks without deleting data.
@@ -1022,8 +1036,16 @@ pub mod test_utils {
         }
     }
 
+    static TEST_RELAYS_READY: OnceCell<()> = OnceCell::const_new();
+
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
         static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+
+        TEST_RELAYS_READY
+            .get_or_init(|| async {
+                wait_for_test_relays().await;
+            })
+            .await;
 
         // Singleton-backed tests can spawn background tasks that outlive the
         // helper call, so the temp dirs backing the singleton config must stay
@@ -1087,21 +1109,13 @@ pub mod test_utils {
         whitenoise: &Whitenoise,
         publisher_accounts: &[&Account],
     ) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
             loop {
                 let mut all_available = true;
 
                 for publisher_account in publisher_accounts {
-                    let relay_urls = Relay::urls(
-                        &publisher_account
-                            .key_package_relays(whitenoise)
-                            .await
-                            .unwrap(),
-                    );
-
                     match whitenoise
-                        .relay_control
-                        .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
+                        .fetch_latest_usable_key_package_event(publisher_account)
                         .await
                     {
                         Ok(Some(_)) => {}
@@ -1128,18 +1142,56 @@ pub mod test_utils {
         });
     }
 
+    /// Waits until relays expose at least one semantically valid key package whose
+    /// `published_key_packages` row still has key material (same selection as
+    /// [`Whitenoise::fetch_latest_usable_key_package_event`], used for group creation).
+    ///
+    /// This avoids wedging when `fetch_user_key_package` would pick a relay-only event whose
+    /// local key material was already removed, and it still matches the welcome pre-check in
+    /// `process_welcome` because group creation uses the same event id.
+    pub(crate) async fn wait_for_published_key_package_tracked(
+        whitenoise: &Whitenoise,
+        account: &Account,
+    ) {
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if whitenoise
+                    .fetch_latest_usable_key_package_event(account)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return;
+                }
+
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Timed out waiting for published_key_packages row for {}",
+                account.pubkey.to_hex()
+            )
+        });
+    }
+
     async fn create_group_with_member_welcomes(
         whitenoise: &Whitenoise,
         admin_account: &Account,
         member_accounts: &[&Account],
     ) -> (GroupId, Vec<UnsignedEvent>) {
+        for member_account in member_accounts {
+            wait_for_published_key_package_tracked(whitenoise, member_account).await;
+        }
+
         let mut key_package_events = Vec::with_capacity(member_accounts.len());
         for member_account in member_accounts {
-            let relay_urls =
-                Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
             let key_package_event = whitenoise
-                .relay_control
-                .fetch_user_key_package(member_account.pubkey, &relay_urls)
+                .fetch_latest_usable_key_package_event(member_account)
                 .await
                 .unwrap()
                 .expect("member must have a published key package");
@@ -3210,6 +3262,7 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let creator = whitenoise.create_identity().await.unwrap();
             let member = whitenoise.create_identity().await.unwrap();
+            wait_for_key_package_publication(&whitenoise, &[&member]).await;
 
             let base_timestamp = Utc::now().timestamp() as u64;
             let mut config = create_nostr_group_config_data(vec![creator.pubkey]);

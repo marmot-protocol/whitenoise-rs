@@ -115,8 +115,10 @@ pub struct RelayControlStateSnapshot {
 pub struct DiscoveryPlaneStateSnapshot {
     pub watched_user_count: usize,
     pub follow_list_subscription_count: usize,
+    pub mute_list_subscription_count: usize,
     pub public_subscription_ids: Vec<String>,
     pub follow_list_subscription_ids: Vec<String>,
+    pub mute_list_subscription_ids: Vec<String>,
     pub session: RelaySessionStateSnapshot,
 }
 

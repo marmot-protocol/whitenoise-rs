@@ -27,6 +27,9 @@ where
         let notifications_int: i64 = row.try_get("notifications_enabled")?;
         let notifications_enabled = notifications_int != 0;
 
+        let refuse_int: i64 = row.try_get("refuse_invites_from_muted_users")?;
+        let refuse_invites_from_muted_users = refuse_int != 0;
+
         let created_at = parse_timestamp(row, "created_at")?;
         let updated_at = parse_timestamp(row, "updated_at")?;
 
@@ -34,6 +37,7 @@ where
             id: Some(id),
             account_pubkey,
             notifications_enabled,
+            refuse_invites_from_muted_users,
             created_at,
             updated_at,
         })
@@ -51,8 +55,8 @@ impl AccountSettings {
         let now = Utc::now().timestamp_millis();
 
         match sqlx::query_as::<_, Self>(
-            "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
-             VALUES (?, 1, ?, ?)
+            "INSERT INTO account_settings (account_pubkey, notifications_enabled, refuse_invites_from_muted_users, created_at, updated_at)
+             VALUES (?, 1, 1, ?, ?)
              RETURNING *",
         )
         .bind(pubkey.to_hex())
@@ -92,6 +96,23 @@ impl AccountSettings {
         Ok(row.map(|(v,)| v != 0).unwrap_or(true))
     }
 
+    /// Returns whether invites from muted users are refused for `pubkey`.
+    /// Returns `true` (the default) when no row exists.
+    pub(crate) async fn refuse_invites_from_muted_users_for_pubkey(
+        pubkey: &PublicKey,
+        database: &Database,
+    ) -> Result<bool, sqlx::Error> {
+        let _span = perf_span!("db::account_settings_refuse_muted_invites");
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT refuse_invites_from_muted_users FROM account_settings WHERE account_pubkey = ?",
+        )
+        .bind(pubkey.to_hex())
+        .fetch_optional(&database.pool)
+        .await?;
+
+        Ok(row.map(|(v,)| v != 0).unwrap_or(true))
+    }
+
     /// Sets `notifications_enabled` for `pubkey` and returns the updated settings.
     /// Creates a row if none exists (upsert).
     pub(crate) async fn update_notifications_enabled(
@@ -104,8 +125,8 @@ impl AccountSettings {
         let enabled_int: i64 = if enabled { 1 } else { 0 };
 
         let settings = sqlx::query_as::<_, Self>(
-            "INSERT INTO account_settings (account_pubkey, notifications_enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO account_settings (account_pubkey, notifications_enabled, refuse_invites_from_muted_users, created_at, updated_at)
+             VALUES (?, ?, 1, ?, ?)
              ON CONFLICT(account_pubkey) DO UPDATE SET
                  notifications_enabled = excluded.notifications_enabled,
                  updated_at = excluded.updated_at
@@ -113,6 +134,34 @@ impl AccountSettings {
         )
         .bind(pubkey.to_hex())
         .bind(enabled_int)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&database.pool)
+        .await?;
+
+        Ok(settings)
+    }
+
+    /// Sets `refuse_invites_from_muted_users` for `pubkey` and returns the updated settings.
+    pub(crate) async fn update_refuse_invites_from_muted_users(
+        pubkey: &PublicKey,
+        refuse: bool,
+        database: &Database,
+    ) -> Result<Self, sqlx::Error> {
+        let _span = perf_span!("db::account_settings_update_refuse_muted_invites");
+        let now = Utc::now().timestamp_millis();
+        let refuse_int: i64 = if refuse { 1 } else { 0 };
+
+        let settings = sqlx::query_as::<_, Self>(
+            "INSERT INTO account_settings (account_pubkey, notifications_enabled, refuse_invites_from_muted_users, created_at, updated_at)
+             VALUES (?, 1, ?, ?, ?)
+             ON CONFLICT(account_pubkey) DO UPDATE SET
+                 refuse_invites_from_muted_users = excluded.refuse_invites_from_muted_users,
+                 updated_at = excluded.updated_at
+             RETURNING *",
+        )
+        .bind(pubkey.to_hex())
+        .bind(refuse_int)
         .bind(now)
         .bind(now)
         .fetch_one(&database.pool)
@@ -162,6 +211,7 @@ mod tests {
         assert!(settings.id.is_some());
         assert_eq!(settings.account_pubkey, keys.public_key());
         assert!(settings.notifications_enabled);
+        assert!(settings.refuse_invites_from_muted_users);
     }
 
     #[tokio::test]
@@ -246,5 +296,45 @@ mod tests {
         .unwrap();
         assert!(enabled.notifications_enabled);
         assert!(enabled.updated_at >= disabled.updated_at);
+    }
+
+    #[tokio::test]
+    async fn test_refuse_invites_defaults_to_true_when_no_row() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+
+        let refuse = AccountSettings::refuse_invites_from_muted_users_for_pubkey(
+            &keys.public_key(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        assert!(refuse);
+    }
+
+    #[tokio::test]
+    async fn test_update_refuse_invites_from_muted_users() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+
+        let off = AccountSettings::update_refuse_invites_from_muted_users(
+            &keys.public_key(),
+            false,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(!off.refuse_invites_from_muted_users);
+
+        let on = AccountSettings::update_refuse_invites_from_muted_users(
+            &keys.public_key(),
+            true,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert!(on.refuse_invites_from_muted_users);
     }
 }

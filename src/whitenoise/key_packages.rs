@@ -322,7 +322,12 @@ impl Whitenoise {
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
-        if Whitenoise::get_instance().is_ok() {
+        let publish_via_global_singleton = match Whitenoise::get_instance() {
+            Ok(global) => core::ptr::eq(core::ptr::from_ref(global), core::ptr::from_ref(self)),
+            Err(_) => false,
+        };
+
+        if publish_via_global_singleton {
             let account = account.clone();
             tokio::spawn(async move {
                 let wn = match Whitenoise::get_instance() {
@@ -638,6 +643,39 @@ impl Whitenoise {
         );
 
         Ok(key_package_events)
+    }
+
+    /// Returns the newest semantically valid key package event visible on relays whose key
+    /// material is still tracked locally (`published_key_packages` row with
+    /// `key_material_deleted = 0`).
+    ///
+    /// This can differ from [`crate::relay_control::RelayControlPlane::fetch_user_key_package`]
+    /// when relays still return a timestamp-newer event whose local key material was already
+    /// removed, which would otherwise wedge group setup waiting for a row that never matches.
+    #[perf_instrument("key_packages")]
+    pub(crate) async fn fetch_latest_usable_key_package_event(
+        &self,
+        account: &Account,
+    ) -> Result<Option<Event>> {
+        let mut events = self.fetch_all_key_packages_for_account(account).await?;
+        events.retain(|event| {
+            validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
+        });
+        events.sort_by_key(|event| (event.created_at, event.id));
+
+        for event in events.into_iter().rev() {
+            let tracked = PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &event.id.to_hex(),
+                &self.database,
+            )
+            .await?;
+            if tracked.is_some_and(|pkg| !pkg.key_material_deleted) {
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Deletes all key package events from relays for the given account.

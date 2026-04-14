@@ -470,15 +470,16 @@ impl Whitenoise {
     }
 
     pub(crate) fn start_background_user_resolution_if_unknown(&self, pubkey: PublicKey) {
-        let resolution_guard = self.user_resolution_guard(pubkey);
-        let Ok(resolution_guard) = resolution_guard.try_lock_owned() else {
+        if !self.shares_global_database() {
             tracing::debug!(
                 target: "whitenoise::users::start_background_user_resolution_if_unknown",
-                "User {} resolution already in progress, reusing existing background discovery",
-                pubkey
+                "Skipping background discovery catch-up for user {}: not the global Whitenoise database",
+                pubkey.to_hex()
             );
             return;
-        };
+        }
+
+        let resolution_guard = self.user_resolution_guard(pubkey);
 
         tracing::debug!(
             target: "whitenoise::users::start_background_user_resolution_if_unknown",
@@ -486,8 +487,12 @@ impl Whitenoise {
             pubkey
         );
 
+        // Always spawn and take the per-user mutex inside the task. A prior `try_lock`-only
+        // approach let concurrent `resolve_user` callers drop the second caller entirely; under a
+        // busy test runtime the winning task could be delayed long enough that metadata never
+        // converged before the test's timeout.
         tokio::spawn(async move {
-            let _resolution_guard = resolution_guard;
+            let _resolution_guard = resolution_guard.lock().await;
             let result = async {
                 let whitenoise = Self::get_instance()?;
                 whitenoise.resolve_unknown_user_under_guard(pubkey).await
@@ -509,7 +514,7 @@ impl Whitenoise {
     ///
     /// This is used to simulate legacy rows whose metadata payload exists but
     /// whose known/unknown state has not been backfilled yet.
-    #[cfg(feature = "integration-tests")]
+    #[cfg(any(test, feature = "integration-tests"))]
     pub async fn set_user_metadata_known_at_for_testing(
         &self,
         pubkey: &PublicKey,
@@ -820,42 +825,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_user_dedupes_background_resolution_for_same_unknown_user() {
-        let whitenoise = test_get_whitenoise().await;
-        let keys = Keys::generate();
-        let pubkey = keys.public_key();
-        let metadata = Metadata::new().name("Background Deduped User");
-        publish_metadata_to_discovery(&keys, &metadata).await;
-
-        whitenoise.get_or_create_user_local(&pubkey).await.unwrap();
-
-        whitenoise.reset_user_resolution_run_count_for_testing(&pubkey);
-
-        let (first, second) = tokio::join!(
-            whitenoise.resolve_user(&pubkey),
-            whitenoise.resolve_user(&pubkey),
-        );
-
-        first.unwrap();
-        second.unwrap();
-
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
-                if user.metadata_is_known() {
-                    break user;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(whitenoise.user_resolution_run_count_for_testing(&pubkey), 1);
-    }
-
-    #[tokio::test]
     async fn test_resolve_unknown_user_blocking_if_needed_dedupes_concurrent_calls() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let keys = Keys::generate();
@@ -886,6 +855,66 @@ mod tests {
             whitenoise.user_resolution_run_count_for_testing(&keys.public_key()),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_dedupes_background_resolution_for_same_unknown_user() {
+        // Background resolution uses `Whitenoise::get_instance()` inside `tokio::spawn`, so it
+        // must run against the test singleton (not an isolated `create_mock_whitenoise` instance).
+        let whitenoise = test_get_whitenoise().await;
+        whitenoise.create_identity().await.unwrap();
+        whitenoise.sync_discovery_subscriptions().await.unwrap();
+
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let metadata = Metadata::new().name("Background Deduped User");
+        publish_metadata_to_discovery(&keys, &metadata).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        whitenoise.get_or_create_user_local(&pubkey).await.unwrap();
+        // Discovery may have raced ahead and marked the row known before we exercise concurrent
+        // `resolve_user`; reset the flag so the guarded resolution path (and its run counter)
+        // always runs at least once.
+        whitenoise
+            .set_user_metadata_known_at_for_testing(&pubkey, None)
+            .await
+            .unwrap();
+        whitenoise.reset_user_resolution_run_count_for_testing(&pubkey);
+        assert!(
+            whitenoise
+                .find_user_by_pubkey(&pubkey)
+                .await
+                .unwrap()
+                .metadata_is_unknown()
+        );
+
+        whitenoise.sync_discovery_subscriptions().await.unwrap();
+
+        let (first, second) = tokio::join!(
+            whitenoise.resolve_user(&pubkey),
+            whitenoise.resolve_user(&pubkey),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        tokio::task::yield_now().await;
+
+        // `resolve_unknown_user_under_guard` can return Ok without making metadata known when
+        // targeted discovery fails transiently; under a busy `cargo test` that can take many
+        // seconds to succeed. Wait for the background work (or a later retry) to land in SQLite.
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                let user = whitenoise.find_user_by_pubkey(&pubkey).await.unwrap();
+                if user.metadata_is_known() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("metadata should become known from discovery");
+
+        assert_eq!(whitenoise.user_resolution_run_count_for_testing(&pubkey), 1);
     }
 
     #[tokio::test]

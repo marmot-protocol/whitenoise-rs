@@ -147,10 +147,14 @@ async fn relay_control_snapshot_tracks_seeded_discovery_graph() {
                 .as_u64()
                 .is_some_and(|count| count >= 3)
                 && snapshot["discovery"]["follow_list_subscription_count"].as_u64() == Some(1)
+                && snapshot["discovery"]["mute_list_subscription_count"].as_u64() == Some(1)
                 && snapshot["discovery"]["public_subscription_ids"]
                     .as_array()
                     .is_some_and(|ids| !ids.is_empty())
                 && snapshot["discovery"]["follow_list_subscription_ids"]
+                    .as_array()
+                    .is_some_and(|ids| !ids.is_empty())
+                && snapshot["discovery"]["mute_list_subscription_ids"]
                     .as_array()
                     .is_some_and(|ids| !ids.is_empty())
                 && session_has_live_relay(&snapshot["discovery"]["session"])

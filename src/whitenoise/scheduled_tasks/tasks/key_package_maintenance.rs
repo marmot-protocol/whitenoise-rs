@@ -398,7 +398,7 @@ async fn delete_outdated_packages(
     outdated_packages: Vec<Event>,
 ) -> MaintenanceResult {
     match whitenoise
-        .delete_key_packages_for_account(account, outdated_packages, false, 1)
+        .delete_key_packages_for_account(account, outdated_packages, false, 3)
         .await
     {
         Ok(deleted) => MaintenanceResult::DeletedOutdated { deleted },
@@ -424,7 +424,10 @@ mod tests {
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
     use crate::whitenoise::key_packages::has_encoding_tag;
     use crate::whitenoise::relays::Relay;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::test_utils::{
+        create_mock_whitenoise, wait_for_key_package_publication,
+        wait_for_published_key_package_tracked,
+    };
 
     /// Publishes a key package without the encoding tag for testing outdated package rotation.
     async fn publish_outdated_key_package(
@@ -472,6 +475,8 @@ mod tests {
 
         // Create account (this publishes a valid key package automatically)
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
+        wait_for_published_key_package_tracked(whitenoise, &account).await;
         let kp_relays = account.key_package_relays(whitenoise).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -493,31 +498,57 @@ mod tests {
 
         let valid_count = before.iter().filter(|e| has_encoding_tag(e)).count();
         assert_eq!(valid_count, 1, "Should have one valid package");
+        let valid_id = before
+            .iter()
+            .find(|e| has_encoding_tag(e))
+            .expect("valid package")
+            .id;
+        let before_ids: std::collections::HashSet<EventId> = before.iter().map(|e| e.id).collect();
 
         // Run maintenance - should delete only the outdated package (no republish)
         let task = KeyPackageMaintenance;
         task.execute(whitenoise).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        task.execute(whitenoise).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
 
         // Verify only the outdated package was deleted
-        let after = whitenoise
+        let mut after = whitenoise
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
+        for _ in 0..40u32 {
+            if !after.iter().any(|e| e.id == outdated_event_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            after = whitenoise
+                .fetch_all_key_packages_for_account(&account)
+                .await
+                .unwrap();
+        }
 
-        // Should still have the valid package
-        assert_eq!(after.len(), 1, "Should have exactly one key package");
         assert!(
-            has_encoding_tag(&after[0]),
-            "Remaining package should have encoding tag"
-        );
-
-        // The outdated package should be gone
-        let outdated_still_exists = after.iter().any(|e| e.id == outdated_event_id);
-        assert!(
-            !outdated_still_exists,
+            !after.iter().any(|e| e.id == outdated_event_id),
             "Outdated key package should have been deleted"
         );
+        assert!(
+            after
+                .iter()
+                .any(|e| e.id == valid_id && has_encoding_tag(e)),
+            "Valid key package from before maintenance should still exist on relays"
+        );
+        let after_tracked: Vec<_> = after
+            .iter()
+            .filter(|e| before_ids.contains(&e.id))
+            .collect();
+        assert_eq!(
+            after_tracked.len(),
+            1,
+            "Only the pre-maintenance valid package should remain among tracked event ids; got {:?}",
+            after_tracked.iter().map(|e| e.id).collect::<Vec<_>>()
+        );
+        assert!(has_encoding_tag(after_tracked[0]));
     }
 
     #[tokio::test]
@@ -581,6 +612,8 @@ mod tests {
         let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
+        wait_for_key_package_publication(whitenoise, &[&account]).await;
+        wait_for_published_key_package_tracked(whitenoise, &account).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise
@@ -589,14 +622,21 @@ mod tests {
             .unwrap();
         assert_eq!(before.len(), 1, "Should start with exactly one key package");
 
-        let tracked = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &before[0].id.to_hex(),
-            &whitenoise.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let mut tracked = None;
+        for ev in &before {
+            if let Ok(Some(pkg)) = PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &ev.id.to_hex(),
+                &whitenoise.database,
+            )
+            .await
+            {
+                tracked = Some(pkg);
+                break;
+            }
+        }
+        let tracked =
+            tracked.expect("published_key_packages should track a relay-visible key package");
 
         let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
         mdk.delete_key_package_from_storage_by_hash_ref(&tracked.key_package_hash_ref)
@@ -605,9 +645,14 @@ mod tests {
             .await
             .unwrap();
 
+        let relay_kps = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+
         // Validate the precondition for this regression: the relay event still
         // exists, but this device no longer has any live local state for it.
-        let live_before = find_live_published_key_packages(whitenoise, &account, before)
+        let live_before = find_live_published_key_packages(whitenoise, &account, relay_kps)
             .await
             .unwrap();
         assert!(

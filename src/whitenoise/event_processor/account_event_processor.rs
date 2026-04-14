@@ -95,7 +95,7 @@ impl Whitenoise {
 
                 // Advance account sync timestamp only for account-scoped events
                 match event.kind {
-                    Kind::ContactList | Kind::MlsGroupMessage => {
+                    Kind::ContactList | Kind::MuteList | Kind::MlsGroupMessage => {
                         // Cap timestamp to prevent future corruption
                         let safe_timestamp = cap_timestamp_to_now(event.created_at);
                         let created_ms = (safe_timestamp.as_secs() as i64) * 1000;
@@ -278,6 +278,7 @@ impl Whitenoise {
         let should_skip = match event.kind {
             Kind::MlsGroupMessage => false,
             Kind::GiftWrap => false,
+            Kind::MuteList => false,
             _ => match self
                 .event_tracker
                 .account_published_event(&event.id, &account.pubkey)
@@ -321,6 +322,7 @@ impl Whitenoise {
                 self.handle_relay_list(event.clone()).await
             }
             Kind::ContactList => self.handle_contact_list(account, event.clone()).await,
+            Kind::MuteList => self.handle_mute_list(account, event.clone()).await,
             _ => {
                 tracing::debug!(
                     target: "whitenoise::event_processor::route_event_for_processing",

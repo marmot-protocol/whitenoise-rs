@@ -6,10 +6,13 @@ use crate::{
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
+        account_settings::AccountSettings,
         accounts::Account,
         accounts_groups::AccountGroup,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::published_key_packages::PublishedKeyPackage,
+        database::{
+            account_muted_users::AccountMutedUsers, published_key_packages::PublishedKeyPackage,
+        },
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
     },
@@ -112,35 +115,45 @@ impl Whitenoise {
 
         // Pre-check: do we have this key package and is its key material still available?
         // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
-        match PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &key_package_event_id.to_hex(),
-            &self.database,
-        )
-        .await
-        {
-            Ok(Some(pkg)) if pkg.key_material_deleted => {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::process_welcome",
-                    "Key material already deleted for this key package, skipping Welcome"
-                );
-                return Ok(());
-            }
-            Ok(None) => {
-                tracing::warn!(
-                    target: "whitenoise::event_processor::process_welcome",
-                    "Unknown key package referenced in Welcome, skipping"
-                );
-                return Ok(());
-            }
-            Ok(Some(_)) => {} // Good — KP exists, key material available
-            Err(e) => {
-                tracing::error!(
-                    target: "whitenoise::event_processor::process_welcome",
-                    "Failed to look up key package: {}, rejecting Welcome",
-                    e
-                );
-                return Err(e.into());
+        // The `published_key_packages` row can lag briefly behind the relay-visible event;
+        // retry before treating the Welcome e-tag as untracked.
+        let kp_event_hex = key_package_event_id.to_hex();
+        let mut attempt = 0u32;
+        loop {
+            match PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &kp_event_hex,
+                &self.database,
+            )
+            .await
+            {
+                Ok(Some(pkg)) if pkg.key_material_deleted => {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        "Key material already deleted for this key package, skipping Welcome"
+                    );
+                    return Ok(());
+                }
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if attempt >= 100 {
+                        tracing::warn!(
+                            target: "whitenoise::event_processor::process_welcome",
+                            "Unknown key package referenced in Welcome, skipping"
+                        );
+                        return Ok(());
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "whitenoise::event_processor::process_welcome",
+                        "Failed to look up key package: {}, rejecting Welcome",
+                        e
+                    );
+                    return Err(e.into());
+                }
             }
         }
 
@@ -191,6 +204,28 @@ impl Whitenoise {
         mdk.accept_welcome(&welcome)
             .map_err(WhitenoiseError::MdkCoreError)?;
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
+
+        let refuse = AccountSettings::refuse_invites_from_muted_users_for_pubkey(
+            &account.pubkey,
+            &self.database,
+        )
+        .await
+        .map_err(WhitenoiseError::SqlxError)?;
+        let welcomer_muted =
+            AccountMutedUsers::is_muted(&account.pubkey, &welcomer_pubkey, &self.database)
+                .await
+                .map_err(WhitenoiseError::SqlxError)?;
+
+        if refuse && welcomer_muted {
+            // Decline in the DB only. `decline_account_group` also removes the local push
+            // token from the group, which publishes to relays and can block for a long time
+            // under test / flaky relay conditions. Push tokens are not shared until the user
+            // accepts the invite, so there is nothing to remove on this path.
+            let account_group = AccountGroup::get(self, &account.pubkey, &group_id)
+                .await?
+                .ok_or(WhitenoiseError::GroupNotFound)?;
+            account_group.decline(self).await?;
+        }
 
         // Spawn background task for remaining operations (DB writes, network calls)
         // All operations are idempotent and failures are logged but don't stop other operations
@@ -291,33 +326,60 @@ impl Whitenoise {
             }
         };
 
-        // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
-        let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
-            Self::create_group_info(whitenoise, group_id, group_name),
-            Self::rotate_key_package(whitenoise, account, key_package_event_id),
-            Self::sync_group_image(whitenoise, account, group_id),
-            Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
-        );
+        let skip_invite_ui = AccountGroup::get(whitenoise, &account.pubkey, group_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|ag| ag.is_declined());
 
-        if let Err(e) = group_info_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                group = %hex::encode(group_id.as_slice()),
-                error = %e,
-                "Failed to create GroupInformation"
+        // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
+        let key_rotation_result =
+            Self::rotate_key_package(whitenoise, account, key_package_event_id).await;
+
+        if !skip_invite_ui {
+            let (group_info_result, image_sync_result, welcomer_user_result) = tokio::join!(
+                Self::create_group_info(whitenoise, group_id, group_name),
+                Self::sync_group_image(whitenoise, account, group_id),
+                Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
             );
-        } else {
-            whitenoise
-                .emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewGroup)
-                .await;
-            whitenoise
-                .emit_group_invite_notification_if_enabled(
-                    account,
-                    group_id,
-                    group_name,
-                    welcomer_pubkey,
-                )
-                .await;
+
+            if let Err(e) = group_info_result {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    group = %hex::encode(group_id.as_slice()),
+                    error = %e,
+                    "Failed to create GroupInformation"
+                );
+            } else {
+                whitenoise
+                    .emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewGroup)
+                    .await;
+                whitenoise
+                    .emit_group_invite_notification_if_enabled(
+                        account,
+                        group_id,
+                        group_name,
+                        welcomer_pubkey,
+                    )
+                    .await;
+            }
+
+            if let Err(e) = image_sync_result {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    error = %e,
+                    "Failed to sync group image cache"
+                );
+            }
+
+            if let Err(e) = welcomer_user_result {
+                tracing::error!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    account = %account.pubkey.to_hex(),
+                    error = %e,
+                    "Failed to ensure welcomer user exists"
+                );
+            }
         }
 
         if let Err(e) = key_rotation_result {
@@ -326,23 +388,6 @@ impl Whitenoise {
                 account = %account.pubkey.to_hex(),
                 error = %e,
                 "Failed to rotate key package"
-            );
-        }
-
-        if let Err(e) = image_sync_result {
-            tracing::warn!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                error = %e,
-                "Failed to sync group image cache"
-            );
-        }
-
-        if let Err(e) = welcomer_user_result {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                account = %account.pubkey.to_hex(),
-                error = %e,
-                "Failed to ensure welcomer user exists"
             );
         }
 
@@ -520,25 +565,16 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
-    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
-    // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
+    // Builds a real MLS Welcome rumor for `member_account` by creating a group with `creator_account`
     async fn build_welcome_rumor(
         whitenoise: &Whitenoise,
         creator_account: &Account,
-        member_pubkey: PublicKey,
+        member_account: &Account,
     ) -> UnsignedEvent {
-        // Fetch a real key package event for the member from relays
-        let relays_urls = Relay::urls(
-            &creator_account
-                .key_package_relays(whitenoise)
-                .await
-                .unwrap(),
-        );
         let key_pkg_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(member_pubkey, &relays_urls)
+            .fetch_latest_usable_key_package_event(member_account)
             .await
             .unwrap()
             .expect("member must have a published key package");
@@ -562,13 +598,12 @@ mod tests {
             .clone()
     }
 
-    // Builds a real MLS Welcome rumor for `member_pubkey` by creating a group with `creator_account`
     async fn build_welcome_giftwrap(
         whitenoise: &Whitenoise,
         creator_account: &Account,
-        member_pubkey: PublicKey,
+        member_account: &Account,
     ) -> Event {
-        let welcome_rumor = build_welcome_rumor(whitenoise, creator_account, member_pubkey).await;
+        let welcome_rumor = build_welcome_rumor(whitenoise, creator_account, member_account).await;
 
         // Use the creator's real keys as signer to build the giftwrap
         let creator_signer = whitenoise
@@ -576,9 +611,14 @@ mod tests {
             .get_nostr_keys_for_pubkey(&creator_account.pubkey)
             .unwrap();
 
-        EventBuilder::gift_wrap(&creator_signer, &member_pubkey, welcome_rumor, vec![])
-            .await
-            .unwrap()
+        EventBuilder::gift_wrap(
+            &creator_signer,
+            &member_account.pubkey,
+            welcome_rumor,
+            vec![],
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -588,9 +628,10 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let mut welcome_rumor =
-            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_rumor(&whitenoise, &creator_account, &member_account).await;
         let mut tags_without_e = Tags::new();
         for tag in welcome_rumor.tags.iter() {
             if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
@@ -638,9 +679,10 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         let mut welcome_rumor =
-            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_rumor(&whitenoise, &creator_account, &member_account).await;
         let mut malformed_tags = Tags::new();
         for tag in welcome_rumor.tags.iter() {
             if tag.kind() != TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)) {
@@ -690,10 +732,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
 
         // Member should successfully process welcome
         let result = whitenoise
@@ -710,10 +753,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
 
         // Member processes the welcome
         let result = whitenoise
@@ -904,10 +948,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         // Build and process a real MLS Welcome
         let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
         whitenoise
             .handle_giftwrap(&member_account, giftwrap_event)
             .await
@@ -980,7 +1025,7 @@ mod tests {
 
         // Build and process a real MLS Welcome
         let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
         whitenoise
             .handle_giftwrap(&member_account, giftwrap_event)
             .await
@@ -1075,10 +1120,11 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
-            build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
 
         // Corrupt the database by dropping the published_key_packages table
         sqlx::query("DROP TABLE published_key_packages")
@@ -1094,5 +1140,91 @@ mod tests {
             result.is_err(),
             "Welcome with broken DB should return an error, got Ok"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_muted_welcomer_auto_declines() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        crate::whitenoise::database::account_muted_users::AccountMutedUsers::replace_all_for_account(
+            &member_account.pubkey,
+            &[creator_account.pubkey],
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
+
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
+
+        whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        let group_id = &groups[0].mls_group_id;
+
+        let ag = AccountGroup::get(&whitenoise, &member_account.pubkey, group_id)
+            .await
+            .unwrap()
+            .expect("account group");
+        assert!(ag.is_declined());
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_muted_welcomer_keeps_pending_when_setting_off() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        crate::whitenoise::account_settings::AccountSettings::update_refuse_invites_from_muted_users(
+            &member_account.pubkey,
+            false,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        crate::whitenoise::database::account_muted_users::AccountMutedUsers::replace_all_for_account(
+            &member_account.pubkey,
+            &[creator_account.pubkey],
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        wait_for_key_package_publication(&whitenoise, &[&members[0].0]).await;
+
+        let giftwrap_event =
+            build_welcome_giftwrap(&whitenoise, &creator_account, &member_account).await;
+
+        whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await
+            .unwrap();
+
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        let group_id = &groups[0].mls_group_id;
+
+        let ag = AccountGroup::get(&whitenoise, &member_account.pubkey, group_id)
+            .await
+            .unwrap()
+            .expect("account group");
+        assert!(ag.is_pending());
     }
 }

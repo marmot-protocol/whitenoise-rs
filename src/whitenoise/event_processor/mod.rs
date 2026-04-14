@@ -85,6 +85,7 @@ impl Whitenoise {
                                             .await;
                                     }
                                     SubscriptionStream::DiscoveryFollowLists
+                                    | SubscriptionStream::DiscoveryMuteLists
                                     | SubscriptionStream::GroupMessages
                                     | SubscriptionStream::AccountInboxGiftwraps => {
                                         whitenoise

@@ -681,6 +681,7 @@ impl FromStr for RelayPlane {
 pub(crate) enum SubscriptionStream {
     DiscoveryUserData,
     DiscoveryFollowLists,
+    DiscoveryMuteLists,
     GroupMessages,
     AccountInboxGiftwraps,
 }

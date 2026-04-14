@@ -322,6 +322,10 @@ impl Whitenoise {
             .sync_follow_lists(&follow_list_accounts)
             .await
             .map_err(WhitenoiseError::from)?;
+        discovery
+            .sync_mute_lists(&follow_list_accounts)
+            .await
+            .map_err(WhitenoiseError::from)?;
 
         Ok(())
     }
