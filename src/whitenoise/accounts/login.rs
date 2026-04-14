@@ -201,14 +201,15 @@ impl Whitenoise {
             let _ = cancel_tx.send(true);
         }
 
-        // Evict rate-limiter entries for this account to prevent unbounded growth.
-        self.token_request_timestamps
-            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
-
         // Unsubscribe from account-specific subscriptions before logout
         self.relay_control
             .deactivate_account_subscriptions(pubkey)
             .await;
+
+        // Evict rate-limiter entries for this account to prevent unbounded growth.
+        // Runs after subscription teardown to minimise the repopulation window.
+        self.token_request_timestamps
+            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
 
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
