@@ -129,9 +129,8 @@ impl Whitenoise {
             Ok(None) => {
                 tracing::warn!(
                     target: "whitenoise::event_processor::process_welcome",
-                    "Unknown key package referenced in Welcome, skipping"
+                    "Unknown key package referenced in Welcome; continuing with MDK validation"
                 );
-                return Ok(());
             }
             Ok(Some(_)) => {} // Good — KP exists, key material available
             Err(e) => {
@@ -691,6 +690,74 @@ mod tests {
         assert!(
             groups.is_empty(),
             "Member should not accept Welcome with malformed e-tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_giftwrap_welcome_succeeds_without_tracked_key_package_row() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let welcome_rumor =
+            build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
+        let key_package_event_id = welcome_rumor
+            .tags
+            .iter()
+            .find(|tag| {
+                tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E))
+            })
+            .and_then(|tag| tag.content())
+            .map(EventId::parse)
+            .transpose()
+            .unwrap()
+            .expect("welcome must include key package event id");
+
+        let delete_result = sqlx::query(
+            "DELETE FROM published_key_packages
+             WHERE account_pubkey = ? AND event_id = ?",
+        )
+        .bind(member_account.pubkey.to_hex())
+        .bind(key_package_event_id.to_hex())
+        .execute(&whitenoise.database.pool)
+        .await
+        .expect("delete published_key_packages row for welcome test setup");
+        assert_eq!(
+            delete_result.rows_affected(),
+            1,
+            "expected exactly one published_key_packages row to remove for this member key package"
+        );
+
+        let creator_signer = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&creator_account.pubkey)
+            .unwrap();
+        let giftwrap_event = EventBuilder::gift_wrap(
+            &creator_signer,
+            &member_account.pubkey,
+            welcome_rumor,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = whitenoise
+            .handle_giftwrap(&member_account, giftwrap_event)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Welcome should still be processed successfully"
+        );
+
+        let mdk = whitenoise
+            .create_mdk_for_account(member_account.pubkey)
+            .unwrap();
+        let groups = mdk.get_groups().unwrap();
+        assert!(
+            !groups.is_empty(),
+            "Member should accept Welcome even when tracking row is missing"
         );
     }
 

@@ -800,13 +800,48 @@ impl Whitenoise {
         let accounts = Account::all(&self.database).await?;
 
         for account in accounts {
-            let mdk = self.create_mdk_for_account(account.pubkey)?;
-            let groups = mdk.get_groups()?;
+            let mdk = match self.create_mdk_for_account(account.pubkey) {
+                Ok(mdk) => mdk,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::cache",
+                        "Skipping account {} during startup cache sync: failed to initialize MDK: {}",
+                        account.pubkey.to_hex(),
+                        e
+                    );
+                    continue;
+                }
+            };
+            let groups = match mdk.get_groups() {
+                Ok(groups) => groups,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "whitenoise::cache",
+                        "Skipping account {} during startup cache sync: failed to read groups: {}",
+                        account.pubkey.to_hex(),
+                        error
+                    );
+                    continue;
+                }
+            };
 
             for group_info in groups {
                 total_groups_checked += 1;
+                let group_id_hex = hex::encode(group_info.mls_group_id.as_slice());
 
-                let mdk_messages = mdk.get_messages(&group_info.mls_group_id, None)?;
+                let mdk_messages = match mdk.get_messages(&group_info.mls_group_id, None) {
+                    Ok(mdk_messages) => mdk_messages,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "whitenoise::cache",
+                            "Skipping group {} (account {}) during startup cache sync: failed to read messages: {}",
+                            group_id_hex,
+                            account.pubkey.to_hex(),
+                            error
+                        );
+                        continue;
+                    }
+                };
 
                 if self
                     .cache_needs_sync(&group_info.mls_group_id, &mdk_messages)
@@ -815,17 +850,28 @@ impl Whitenoise {
                     tracing::info!(
                         target: "whitenoise::cache",
                         "Syncing cache for group {} (account {}): {} events",
-                        hex::encode(group_info.mls_group_id.as_slice()),
+                        group_id_hex,
                         account.pubkey.to_hex(),
                         mdk_messages.len()
                     );
 
-                    self.sync_cache_for_group(
-                        &account.pubkey,
-                        &group_info.mls_group_id,
-                        mdk_messages,
-                    )
-                    .await?;
+                    if let Err(error) = self
+                        .sync_cache_for_group(
+                            &account.pubkey,
+                            &group_info.mls_group_id,
+                            mdk_messages,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "whitenoise::cache",
+                            "Skipping group {} (account {}) during startup cache sync: failed to sync cache: {}",
+                            group_id_hex,
+                            account.pubkey.to_hex(),
+                            error
+                        );
+                        continue;
+                    }
 
                     total_synced += 1;
                 }
@@ -1213,7 +1259,13 @@ mod tests {
 
         // Create accounts
         let creator = whitenoise.create_identity().await.unwrap();
-        let member = whitenoise.create_identity().await.unwrap();
+        let member = setup_multiple_test_accounts(&whitenoise, 1)
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+            .0;
+        wait_for_key_package_publication(&whitenoise, &[&member]).await;
 
         // Create a group
         let group = whitenoise
@@ -2237,6 +2289,89 @@ mod tests {
                     .iter()
                     .any(|c| c.contains(&format!("Startup recover {}", i))),
                 "Missing 'Startup recover {}' in recovered messages",
+                i
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_cache_on_startup_skips_corrupt_account() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let healthy = whitenoise.create_identity().await.unwrap();
+        let corrupt = whitenoise.create_identity().await.unwrap();
+
+        let group = whitenoise
+            .create_group(
+                &healthy,
+                vec![corrupt.pubkey],
+                create_nostr_group_config_data(vec![healthy.pubkey]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        for i in 1..=3 {
+            whitenoise
+                .send_message_to_group(
+                    &healthy,
+                    &group.mls_group_id,
+                    format!("Healthy startup sync {}", i),
+                    9,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+            .await
+            .unwrap();
+
+        let corrupt_mls_path = whitenoise
+            .config
+            .data_dir
+            .join("mls")
+            .join(corrupt.pubkey.to_hex());
+        std::fs::create_dir_all(whitenoise.config.data_dir.join("mls")).unwrap();
+        if let Ok(metadata) = std::fs::metadata(&corrupt_mls_path) {
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&corrupt_mls_path).unwrap();
+            } else {
+                std::fs::remove_file(&corrupt_mls_path).unwrap();
+            }
+        }
+        std::fs::write(&corrupt_mls_path, []).unwrap();
+        let _ = whitenoise.create_mdk_for_account(corrupt.pubkey);
+
+        let result = whitenoise.sync_message_cache_on_startup().await;
+        assert!(
+            result.is_ok(),
+            "Startup sync should skip corrupt account and continue: {:?}",
+            result.err()
+        );
+
+        let recovered_messages = AggregatedMessage::find_messages_by_group(
+            &group.mls_group_id,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered_messages.len(),
+            3,
+            "Healthy account messages should still be recovered"
+        );
+        let recovered_contents: Vec<String> = recovered_messages
+            .into_iter()
+            .map(|msg| msg.content)
+            .collect();
+        for i in 1..=3 {
+            assert!(
+                recovered_contents
+                    .iter()
+                    .any(|content| content.contains(&format!("Healthy startup sync {}", i))),
+                "Missing healthy account message {} after startup sync",
                 i
             );
         }

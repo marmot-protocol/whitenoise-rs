@@ -72,35 +72,42 @@ impl Drop for Daemon {
 ///
 /// Panics if the command fails or returns an error response.
 pub(crate) fn wn(socket: &PathBuf, args: &[&str]) -> serde_json::Value {
+    wn_try(socket, args).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// Run `wn --json --socket <socket> <args...>` and return the `result` field.
+///
+/// Returns a stringified error instead of panicking.
+pub(crate) fn wn_try(socket: &PathBuf, args: &[&str]) -> Result<serde_json::Value, String> {
     let output = Command::new(env!("CARGO_BIN_EXE_wn"))
         .arg("--json")
         .arg("--socket")
         .arg(socket)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("failed to run wn {args:?}: {e}"));
+        .map_err(|e| format!("failed to run wn {args:?}: {e}"))?;
 
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
 
     if !output.status.success() {
-        panic!(
+        return Err(format!(
             "wn {args:?} exited with {}:\n{stdout}\n{stderr}",
             output.status
-        );
+        ));
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|_| panic!("invalid JSON from wn {args:?}:\n{stdout}"));
+        .map_err(|_| format!("invalid JSON from wn {args:?}:\n{stdout}"))?;
 
     if let Some(err) = parsed.get("error") {
-        panic!("wn {args:?} returned error: {err}");
+        return Err(format!("wn {args:?} returned error: {err}"));
     }
 
-    parsed
+    Ok(parsed
         .get("result")
         .cloned()
-        .unwrap_or(serde_json::Value::Null)
+        .unwrap_or(serde_json::Value::Null))
 }
 
 /// Extract a hex-encoded MLS group ID from a group JSON response.
