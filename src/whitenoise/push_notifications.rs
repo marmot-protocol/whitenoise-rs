@@ -118,6 +118,13 @@ pub struct GroupPushToken {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Safe push-token cache summary for UI debugging.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GroupPushDebugInfo {
+    pub total_token_count: usize,
+    pub last_token_list_updated_at: Option<DateTime<Utc>>,
+}
+
 impl fmt::Debug for PushRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PushRegistration")
@@ -644,6 +651,24 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
 }
 
 impl Whitenoise {
+    /// Returns a non-sensitive summary of cached push-token state for a group.
+    #[perf_instrument("push_notifications")]
+    pub async fn get_group_push_debug_info(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<GroupPushDebugInfo> {
+        let cached_tokens =
+            GroupPushToken::find_by_account_and_group(&account.pubkey, group_id, &self.database)
+                .await?;
+        let last_token_list_updated_at = cached_tokens.iter().map(|token| token.updated_at).max();
+
+        Ok(GroupPushDebugInfo {
+            total_token_count: cached_tokens.len(),
+            last_token_list_updated_at,
+        })
+    }
+
     /// Returns the locally stored push registration for `account`, if present.
     #[perf_instrument("push_notifications")]
     pub async fn push_registration(&self, account: &Account) -> Result<Option<PushRegistration>> {
@@ -1901,6 +1926,55 @@ mod tests {
         );
 
         assert!(recipient_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_group_push_debug_info_returns_count_and_latest_update_time() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[42; 32]);
+        let server_pubkey = Keys::generate().public_key();
+        let member_one_pubkey = Keys::generate().public_key();
+        let member_two_pubkey = Keys::generate().public_key();
+        let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
+
+        let first_token = GroupPushToken::upsert(
+            &account.pubkey,
+            &group_id,
+            &member_one_pubkey,
+            1,
+            &server_pubkey,
+            Some(&relay_hint),
+            "ciphertext-one",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        let second_token = GroupPushToken::upsert(
+            &account.pubkey,
+            &group_id,
+            &member_two_pubkey,
+            2,
+            &server_pubkey,
+            Some(&relay_hint),
+            "ciphertext-two",
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let debug_info = whitenoise
+            .get_group_push_debug_info(&account, &group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(debug_info.total_token_count, 2);
+        assert_eq!(
+            debug_info.last_token_list_updated_at,
+            [first_token.updated_at, second_token.updated_at]
+                .into_iter()
+                .max()
+        );
     }
 
     #[tokio::test]
