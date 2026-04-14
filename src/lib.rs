@@ -96,7 +96,8 @@ pub use whitenoise::notification_streaming::{
 
 // Background notification collection (iOS silent push)
 pub use whitenoise::background_notifications::{
-    BackgroundNotificationResult, BackgroundNotificationStatus,
+    BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
+    NotificationUserDto,
 };
 pub use whitenoise::push_notifications::{
     GroupPushDebugInfo, GroupPushToken, PushPlatform, PushRegistration,

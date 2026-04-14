@@ -1,11 +1,12 @@
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 use crate::whitenoise::error::Result;
-use crate::whitenoise::notification_streaming::NotificationUpdate;
+use crate::whitenoise::notification_streaming::{NotificationTrigger, NotificationUpdate};
 use crate::whitenoise::{Whitenoise, WhitenoiseConfig};
 
 /// Status of the background notification collection.
@@ -20,11 +21,69 @@ pub enum BackgroundNotificationStatus {
     Failed,
 }
 
+/// A notification user in the DTO payload (pubkey as hex string).
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationUserDto {
+    /// Hex-encoded public key.
+    pub pubkey: String,
+    pub display_name: Option<String>,
+    pub picture_url: Option<String>,
+}
+
+/// A single notification entry in the JSON payload returned to iOS.
+///
+/// This DTO is the stable external contract for the iOS background push
+/// integration. It is intentionally decoupled from `NotificationUpdate` so
+/// the internal broadcast type can evolve without breaking the Swift side.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationDto {
+    /// Trigger as a lowercase string: `"message"` or `"invite"`.
+    pub trigger: &'static str,
+    /// Hex-encoded MLS group id.
+    pub mls_group_id: String,
+    pub group_name: Option<String>,
+    pub is_dm: bool,
+    pub receiver: NotificationUserDto,
+    pub sender: NotificationUserDto,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+impl NotificationDto {
+    fn from_update(update: NotificationUpdate) -> Self {
+        Self {
+            trigger: trigger_value(update.trigger),
+            mls_group_id: hex::encode(update.mls_group_id.as_slice()),
+            group_name: update.group_name,
+            is_dm: update.is_dm,
+            receiver: NotificationUserDto {
+                pubkey: update.receiver.pubkey.to_hex(),
+                display_name: update.receiver.display_name,
+                picture_url: update.receiver.picture_url,
+            },
+            sender: NotificationUserDto {
+                pubkey: update.sender.pubkey.to_hex(),
+                display_name: update.sender.display_name,
+                picture_url: update.sender.picture_url,
+            },
+            content: update.content,
+            timestamp: update.timestamp,
+        }
+    }
+}
+
+fn trigger_value(trigger: NotificationTrigger) -> &'static str {
+    match trigger {
+        NotificationTrigger::NewMessage => "message",
+        NotificationTrigger::GroupInvite => "invite",
+    }
+}
+
 /// Result of a background notification collection pass.
 #[derive(Debug, Clone, Serialize)]
 pub struct BackgroundNotificationResult {
     pub status: BackgroundNotificationStatus,
-    pub notifications: Vec<NotificationUpdate>,
+    pub notifications: Vec<NotificationDto>,
     /// If status is `Failed`, contains the error description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -34,7 +93,10 @@ impl BackgroundNotificationResult {
     fn new_data(notifications: Vec<NotificationUpdate>) -> Self {
         Self {
             status: BackgroundNotificationStatus::NewData,
-            notifications,
+            notifications: notifications
+                .into_iter()
+                .map(NotificationDto::from_update)
+                .collect(),
             error: None,
         }
     }
@@ -47,7 +109,9 @@ impl BackgroundNotificationResult {
         }
     }
 
-    fn failed(error: String) -> Self {
+    /// Public so the FFI layer can construct failure results without
+    /// duplicating the JSON shape.
+    pub fn failed(error: String) -> Self {
         Self {
             status: BackgroundNotificationStatus::Failed,
             notifications: Vec::new(),
@@ -211,7 +275,7 @@ mod tests {
 
         NotificationUpdate {
             trigger,
-            mls_group_id: GroupId::from_slice(&[1, 2, 3, 4]),
+            mls_group_id: GroupId::from_slice(&[0xab, 0xcd, 0xef, 0x01]),
             group_name: Some("Test Group".to_string()),
             is_dm: false,
             receiver: NotificationUser {
@@ -229,53 +293,73 @@ mod tests {
         }
     }
 
+    fn parse(result: &BackgroundNotificationResult) -> serde_json::Value {
+        let json = serde_json::to_string(result).expect("serialization failed");
+        serde_json::from_str(&json).expect("deserialization failed")
+    }
+
     #[test]
-    fn result_new_data_serializes_correctly() {
+    fn result_new_data_shape() {
         let notification = make_test_notification(NotificationTrigger::NewMessage, "Hello world");
         let result = BackgroundNotificationResult::new_data(vec![notification]);
+        let v = parse(&result);
 
-        let json = serde_json::to_string_pretty(&result).expect("serialization failed");
-
-        assert!(json.contains("\"status\": \"new_data\""));
-        assert!(json.contains("\"trigger\": \"NewMessage\""));
-        assert!(json.contains("Hello world"));
-        assert!(!json.contains("\"error\""));
+        assert_eq!(v["status"], "new_data");
+        assert!(v.get("error").is_none());
+        let notifications = v["notifications"].as_array().expect("notifications array");
+        assert_eq!(notifications.len(), 1);
+        let n = &notifications[0];
+        assert_eq!(n["trigger"], "message");
+        assert_eq!(n["mls_group_id"], "abcdef01");
+        assert_eq!(n["group_name"], "Test Group");
+        assert_eq!(n["is_dm"], false);
+        assert_eq!(n["content"], "Hello world");
+        // pubkey is serialized as a hex string (64 chars for 32-byte key).
+        let sender_pubkey = n["sender"]["pubkey"].as_str().expect("sender pubkey");
+        assert_eq!(sender_pubkey.len(), 64);
+        assert!(sender_pubkey.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(n["sender"]["display_name"], "Bob");
+        assert!(n["sender"]["picture_url"].is_null());
     }
 
     #[test]
-    fn result_no_data_serializes_correctly() {
+    fn result_invite_trigger_is_invite() {
+        let notification = make_test_notification(NotificationTrigger::GroupInvite, "");
+        let result = BackgroundNotificationResult::new_data(vec![notification]);
+        let v = parse(&result);
+        assert_eq!(v["notifications"][0]["trigger"], "invite");
+    }
+
+    #[test]
+    fn result_no_data_shape() {
         let result = BackgroundNotificationResult::no_data();
-
-        let json = serde_json::to_string_pretty(&result).expect("serialization failed");
-
-        assert!(json.contains("\"status\": \"no_data\""));
-        assert!(json.contains("\"notifications\": []"));
-        assert!(!json.contains("\"error\""));
+        let v = parse(&result);
+        assert_eq!(v["status"], "no_data");
+        assert_eq!(v["notifications"].as_array().unwrap().len(), 0);
+        assert!(v.get("error").is_none());
     }
 
     #[test]
-    fn result_failed_serializes_correctly() {
+    fn result_failed_shape() {
         let result = BackgroundNotificationResult::failed("something broke".to_string());
-
-        let json = serde_json::to_string_pretty(&result).expect("serialization failed");
-
-        assert!(json.contains("\"status\": \"failed\""));
-        assert!(json.contains("\"error\": \"something broke\""));
-        assert!(json.contains("\"notifications\": []"));
+        let v = parse(&result);
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "something broke");
+        assert_eq!(v["notifications"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn result_multiple_notifications_serializes_correctly() {
+    fn result_multiple_notifications() {
         let n1 = make_test_notification(NotificationTrigger::NewMessage, "msg 1");
         let n2 = make_test_notification(NotificationTrigger::GroupInvite, "");
         let n3 = make_test_notification(NotificationTrigger::NewMessage, "msg 2");
         let result = BackgroundNotificationResult::new_data(vec![n1, n2, n3]);
+        let v = parse(&result);
 
-        let json = serde_json::to_string(&result).expect("serialization failed");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("deserialization failed");
-
-        assert_eq!(parsed["notifications"].as_array().unwrap().len(), 3);
-        assert_eq!(parsed["notifications"][1]["trigger"], "GroupInvite");
+        let notifications = v["notifications"].as_array().unwrap();
+        assert_eq!(notifications.len(), 3);
+        assert_eq!(notifications[0]["trigger"], "message");
+        assert_eq!(notifications[1]["trigger"], "invite");
+        assert_eq!(notifications[2]["trigger"], "message");
     }
 }
