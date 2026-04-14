@@ -201,6 +201,10 @@ impl Whitenoise {
             let _ = cancel_tx.send(true);
         }
 
+        // Evict rate-limiter entries for this account to prevent unbounded growth.
+        self.token_request_timestamps
+            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
+
         // Unsubscribe from account-specific subscriptions before logout
         self.relay_control
             .deactivate_account_subscriptions(pubkey)

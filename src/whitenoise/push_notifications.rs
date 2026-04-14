@@ -911,21 +911,22 @@ impl Whitenoise {
     ) -> bool {
         let key = (*account_pubkey, group_id.clone(), leaf_index, kind);
         let now = Instant::now();
+        let mut allowed = false;
 
-        match self.token_request_timestamps.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                if now.duration_since(*entry.get()) < TOKEN_REQUEST_COOLDOWN {
-                    false
-                } else {
-                    entry.insert(now);
-                    true
+        self.token_request_timestamps
+            .entry(key)
+            .and_modify(|last| {
+                if now.duration_since(*last) >= TOKEN_REQUEST_COOLDOWN {
+                    *last = now;
+                    allowed = true;
                 }
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(now);
-                true
-            }
-        }
+            })
+            .or_insert_with(|| {
+                allowed = true;
+                now
+            });
+
+        allowed
     }
 
     pub(crate) fn clear_pending_token_response(
