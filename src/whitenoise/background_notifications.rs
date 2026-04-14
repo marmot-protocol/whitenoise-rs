@@ -123,6 +123,18 @@ impl BackgroundNotificationResult {
 /// Default quiet window: if no notification arrives within this duration, stop collecting.
 const DEFAULT_QUIET_WINDOW: Duration = Duration::from_millis(1000);
 
+/// Hard ceiling on any caller-provided `max_wait`. iOS gives silent-push
+/// handlers roughly 30 seconds of background execution; we clamp to 25s to
+/// leave a safety margin for init, response serialization, and the native
+/// local-notification scheduling that happens after this returns.
+const IOS_MAX_WAIT: Duration = Duration::from_secs(25);
+
+/// Upper bound on the number of notifications returned in a single collection
+/// pass. Guards against memory growth during relay bursts and matches the UX
+/// reality that a user cannot meaningfully triage dozens of notifications from
+/// a single background wake.
+const MAX_COLLECTED: usize = 50;
+
 /// Collect notification updates after a background push wake.
 ///
 /// This is the core async function that:
@@ -145,6 +157,10 @@ pub async fn collect_notifications_after_push(
     config: WhitenoiseConfig,
     max_wait: Duration,
 ) -> BackgroundNotificationResult {
+    // Clamp caller-provided wait to an iOS-safe ceiling. Protects against
+    // accidental long waits from buggy callers that might otherwise outlive
+    // the iOS background execution budget and get the process killed.
+    let max_wait = max_wait.min(IOS_MAX_WAIT);
     match collect_notifications_inner(config, max_wait).await {
         Ok(result) => result,
         Err(e) => {
@@ -191,9 +207,37 @@ async fn collect_notifications_inner(
         "Subscriptions refreshed, starting collection window"
     );
 
-    // Step 4: Collect notifications with quiet-window + hard deadline.
+    // Step 4: Collect notifications with quiet-window + hard deadline +
+    // size cap (MAX_COLLECTED).
+    let collected = drain_notifications(&mut rx, max_wait).await;
+
+    tracing::info!(
+        target: "whitenoise::background_notifications",
+        count = collected.len(),
+        "Background notification collection complete"
+    );
+
+    if collected.is_empty() {
+        Ok(BackgroundNotificationResult::no_data())
+    } else {
+        Ok(BackgroundNotificationResult::new_data(collected))
+    }
+}
+
+/// Drain notification updates from a receiver until one of the following stops:
+/// * the quiet window expires with no new notification,
+/// * the hard deadline (`max_wait`) is reached,
+/// * `MAX_COLLECTED` notifications have been collected,
+/// * the channel closes.
+///
+/// Extracted so it can be unit-tested against a synthetic
+/// `broadcast::Receiver` without needing a full `Whitenoise` instance.
+async fn drain_notifications(
+    rx: &mut broadcast::Receiver<NotificationUpdate>,
+    max_wait: Duration,
+) -> Vec<NotificationUpdate> {
     let deadline = Instant::now() + max_wait;
-    let mut collected = Vec::new();
+    let mut collected = Vec::with_capacity(MAX_COLLECTED);
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -217,6 +261,14 @@ async fn collect_notifications_inner(
                     "Collected notification"
                 );
                 collected.push(update);
+                if collected.len() >= MAX_COLLECTED {
+                    tracing::warn!(
+                        target: "whitenoise::background_notifications",
+                        cap = MAX_COLLECTED,
+                        "Notification collection cap reached; stopping early"
+                    );
+                    break;
+                }
             }
             Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                 tracing::warn!(
@@ -245,17 +297,7 @@ async fn collect_notifications_inner(
         }
     }
 
-    tracing::info!(
-        target: "whitenoise::background_notifications",
-        count = collected.len(),
-        "Background notification collection complete"
-    );
-
-    if collected.is_empty() {
-        Ok(BackgroundNotificationResult::no_data())
-    } else {
-        Ok(BackgroundNotificationResult::new_data(collected))
-    }
+    collected
 }
 
 #[cfg(test)]
@@ -361,5 +403,57 @@ mod tests {
         assert_eq!(notifications[0]["trigger"], "message");
         assert_eq!(notifications[1]["trigger"], "invite");
         assert_eq!(notifications[2]["trigger"], "message");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_caps_at_max_collected() {
+        // Create a standalone broadcast channel and pre-fill it with more
+        // than MAX_COLLECTED notifications before starting the drain. The
+        // drain must stop at exactly MAX_COLLECTED even though more items
+        // are waiting in the channel and the deadline has not been reached.
+        let flood = MAX_COLLECTED + 25;
+        let (tx, mut rx) = broadcast::channel(flood);
+        for i in 0..flood {
+            let content = format!("msg {i}");
+            tx.send(make_test_notification(
+                NotificationTrigger::NewMessage,
+                &content,
+            ))
+            .expect("send should succeed while rx is alive");
+        }
+
+        // Generous deadline — we want the cap, not the deadline, to stop us.
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+
+        assert_eq!(
+            collected.len(),
+            MAX_COLLECTED,
+            "drain should stop exactly at MAX_COLLECTED"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_quiet_window_stops_below_cap() {
+        // If fewer than MAX_COLLECTED notifications arrive and the channel
+        // goes quiet, the quiet window should trip instead of the cap.
+        let (tx, mut rx) = broadcast::channel(16);
+        for i in 0..5 {
+            let content = format!("msg {i}");
+            tx.send(make_test_notification(
+                NotificationTrigger::NewMessage,
+                &content,
+            ))
+            .expect("send should succeed while rx is alive");
+        }
+
+        let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
+        assert_eq!(collected.len(), 5);
+    }
+
+    #[test]
+    fn ios_max_wait_is_under_ios_budget() {
+        // Sanity check: the clamp must be strictly below the iOS 30s ceiling
+        // so we never outlive the system-provided background budget.
+        assert!(IOS_MAX_WAIT < Duration::from_secs(30));
     }
 }

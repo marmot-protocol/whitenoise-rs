@@ -87,7 +87,16 @@ pub unsafe extern "C" fn wn_collect_notifications_after_push(
         );
         let max_wait = Duration::from_millis(u64::from(max_wait_ms));
 
-        let rt = match tokio::runtime::Runtime::new() {
+        // Use a current-thread runtime: this FFI call is a bounded, single
+        // async operation driven to completion via block_on. A multi-threaded
+        // runtime would spawn worker threads we don't need for a background
+        // iOS push handler. `enable_all()` keeps net + time + the blocking
+        // worker pool available for SQLite and any spawn_blocking callers
+        // down the call stack.
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 return result_to_json(BackgroundNotificationResult::failed(format!(
