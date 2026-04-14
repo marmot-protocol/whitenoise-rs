@@ -38,8 +38,18 @@ pub unsafe extern "C" fn wn_collect_notifications_after_push(
     keyring_service_id: *const c_char,
     max_wait_ms: u32,
 ) -> *mut c_char {
+    // Null-pointer guards: CStr::from_ptr on a null pointer is UB and may not
+    // be caught by catch_unwind. Check before entering the unsafe block.
+    if data_dir.is_null() || logs_dir.is_null() || keyring_service_id.is_null() {
+        let json = r#"{"status":"failed","notifications":[],"error":"null pointer passed to wn_collect_notifications_after_push"}"#;
+        return CString::new(json)
+            .expect("static JSON has no interior NUL")
+            .into_raw();
+    }
+
     let result = std::panic::catch_unwind(|| {
-        // SAFETY: caller guarantees valid NUL-terminated UTF-8 strings.
+        // SAFETY: all three pointers confirmed non-null above; caller
+        // guarantees they are valid NUL-terminated UTF-8 strings.
         let data_dir = unsafe { CStr::from_ptr(data_dir) }
             .to_str()
             .expect("data_dir is not valid UTF-8");

@@ -117,13 +117,10 @@ async fn collect_notifications_inner(
     // Step 3: Refresh relay subscriptions. This reconnects dead relays and
     // fetches missed events using `since` timestamps. The event processor
     // decrypts and processes them, emitting NotificationUpdates.
-    if let Err(e) = whitenoise.ensure_all_subscriptions().await {
-        tracing::warn!(
-            target: "whitenoise::background_notifications",
-            "ensure_all_subscriptions failed (continuing with collection): {}",
-            e
-        );
-    }
+    // Propagate errors here — if subscriptions fail to refresh, no events
+    // will arrive and the caller should receive an explicit failure rather
+    // than a misleading "no_data" result.
+    whitenoise.ensure_all_subscriptions().await?;
 
     tracing::debug!(
         target: "whitenoise::background_notifications",
