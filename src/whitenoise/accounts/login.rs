@@ -206,6 +206,11 @@ impl Whitenoise {
             .deactivate_account_subscriptions(pubkey)
             .await;
 
+        // Evict rate-limiter entries for this account to prevent unbounded growth.
+        // Runs after subscription teardown to minimise the repopulation window.
+        self.token_request_timestamps
+            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
+
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
                 .relay_control
@@ -882,6 +887,71 @@ mod tests {
                 .await
                 .unwrap(),
             "Zero accounts with zero subscriptions should be healthy after logout"
+        );
+    }
+
+    /// Verifies that logging out evicts all rate-limiter entries for that account,
+    /// while preserving entries for other accounts.
+    #[tokio::test]
+    async fn test_logout_evicts_rate_limiter_entries() {
+        use crate::whitenoise::push_notifications::TokenRateKind;
+        use mdk_core::prelude::GroupId;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account_a = whitenoise.create_identity().await.unwrap();
+        let account_b = whitenoise.create_identity().await.unwrap();
+
+        let group_id = GroupId::from_slice(&[1u8; 32]);
+
+        // Seed entries for both accounts
+        whitenoise.token_request_timestamps.insert(
+            (
+                account_a.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request,
+            ),
+            std::time::Instant::now(),
+        );
+        whitenoise.token_request_timestamps.insert(
+            (
+                account_b.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request,
+            ),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(
+            whitenoise.token_request_timestamps.len(),
+            2,
+            "both entries should be present before logout"
+        );
+
+        whitenoise.logout(&account_a.pubkey).await.unwrap();
+
+        // account_a's entry must be gone
+        assert!(
+            !whitenoise.token_request_timestamps.contains_key(&(
+                account_a.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request
+            )),
+            "logout should remove rate-limiter entries for the logged-out account"
+        );
+
+        // account_b's entry must survive
+        assert!(
+            whitenoise.token_request_timestamps.contains_key(&(
+                account_b.pubkey,
+                group_id,
+                0,
+                TokenRateKind::Request
+            )),
+            "logout should not remove rate-limiter entries for other accounts"
         );
     }
 
