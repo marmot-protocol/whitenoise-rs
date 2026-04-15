@@ -963,10 +963,19 @@ impl Whitenoise {
 
         // Warm both scopes concurrently — they use separate relay sessions
         // so there's no contention, and this halves the worst-case timeout.
+        let session = self.session(&account.pubkey);
         let (anon_result, account_result) = tokio::join!(
             self.relay_control.warm_ephemeral_relays(&warm_relays),
-            self.relay_control
-                .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays),
+            async {
+                match &session {
+                    Some(s) => s.ephemeral.warm_relays(&warm_relays).await,
+                    None => {
+                        self.relay_control
+                            .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
+                            .await
+                    }
+                }
+            },
         );
 
         if let Err(error) = anon_result {

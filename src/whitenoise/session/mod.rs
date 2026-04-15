@@ -1,3 +1,5 @@
+pub(crate) mod relay_handles;
+
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -11,6 +13,13 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 
+/// Signer slot shared between `AccountSession` and its relay handles.
+///
+/// `None` for restored external-signer accounts whose platform signer has not
+/// yet been re-registered. Handles that need signing return
+/// [`WhitenoiseError::SignerUnavailable`] until the slot is filled.
+pub(crate) type SharedSigner = Arc<RwLock<Option<Arc<dyn NostrSigner>>>>;
+
 /// A per-account session holding the account's MDK instance and signer.
 ///
 /// `signer` is `None` for restored external-signer accounts whose platform
@@ -20,9 +29,11 @@ use crate::whitenoise::error::{Result, WhitenoiseError};
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
-    signer: RwLock<Option<Arc<dyn NostrSigner>>>,
+    pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
+    pub(crate) ephemeral: relay_handles::AccountEphemeralHandle,
+    pub(crate) group_handle: relay_handles::AccountGroupHandle,
 }
 
 impl AccountSession {
@@ -30,14 +41,25 @@ impl AccountSession {
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         signer: Option<Arc<dyn NostrSigner>>,
+        ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
+        relay_control: Arc<crate::relay_control::RelayControlPlane>,
     ) -> Self {
         let (cancellation, _) = watch::channel(false);
+        let signer: SharedSigner = Arc::new(RwLock::new(signer));
+        let ephemeral = relay_handles::AccountEphemeralHandle::new(
+            account_pubkey,
+            ephemeral_plane,
+            signer.clone(),
+        );
+        let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
         Self {
             account_pubkey,
             mdk: Arc::new(mdk),
-            signer: RwLock::new(signer),
+            signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
+            ephemeral,
+            group_handle,
         }
     }
 
@@ -50,7 +72,13 @@ impl AccountSession {
         } else {
             None
         };
-        Ok(Self::new(account.pubkey, mdk, signer))
+        Ok(Self::new(
+            account.pubkey,
+            mdk,
+            signer,
+            wn.relay_control.ephemeral(),
+            wn.relay_control.clone(),
+        ))
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -243,14 +271,66 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+pub(crate) mod test_helpers {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::relay_control::RelayControlPlane;
+    use crate::relay_control::ephemeral::{EphemeralPlane, EphemeralPlaneConfig};
+    use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
+    use crate::whitenoise::accounts::test_utils::create_mdk;
+    use crate::whitenoise::database::Database;
+
+    pub async fn test_db() -> Arc<Database> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let database = Database {
+            pool,
+            path: PathBuf::from(":memory:"),
+            last_connected: SystemTime::now(),
+        };
+        database.migrate_up().await.unwrap();
+        Arc::new(database)
+    }
+
+    /// Build a minimal `AccountSession` for tests that don't exercise relay handles.
+    pub async fn test_session(pubkey: PublicKey) -> Arc<AccountSession> {
+        let mdk = create_mdk(pubkey);
+        let db = test_db().await;
+        let (event_sender, _) = tokio::sync::mpsc::channel(1);
+        let ephemeral = EphemeralPlane::new(
+            EphemeralPlaneConfig::default(),
+            db.clone(),
+            event_sender.clone(),
+            RelayObservability::new(RelayObservabilityConfig::default()),
+        );
+        let relay_control = Arc::new(RelayControlPlane::new(db, vec![], event_sender, [0u8; 16]));
+        Arc::new(AccountSession::new(
+            pubkey,
+            mdk,
+            None,
+            ephemeral,
+            relay_control,
+        ))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use nostr_sdk::Keys;
 
-    use super::{AccountManager, AccountSession};
+    use super::AccountManager;
+    use super::test_helpers::test_session;
     use crate::whitenoise::accounts::DiscoveredRelayLists;
-    use crate::whitenoise::accounts::test_utils::create_mdk;
 
     fn test_pubkey() -> nostr_sdk::PublicKey {
         Keys::generate().public_key()
@@ -264,18 +344,13 @@ mod tests {
         }
     }
 
-    fn test_session(pubkey: nostr_sdk::PublicKey) -> Arc<AccountSession> {
-        let mdk = create_mdk(pubkey);
-        Arc::new(AccountSession::new(pubkey, mdk, None))
-    }
-
     // ── AccountManager: session CRUD ─────────────────────────────────
 
-    #[test]
-    fn insert_and_get_session() {
+    #[tokio::test]
+    async fn insert_and_get_session() {
         let mgr = AccountManager::default();
         let pk = test_pubkey();
-        let session = test_session(pk);
+        let session = test_session(pk).await;
 
         mgr.insert_session(session.clone());
         let got = mgr.get_session(&pk).expect("session should exist");
@@ -288,11 +363,11 @@ mod tests {
         assert!(mgr.get_session(&test_pubkey()).is_none());
     }
 
-    #[test]
-    fn remove_session_returns_removed() {
+    #[tokio::test]
+    async fn remove_session_returns_removed() {
         let mgr = AccountManager::default();
         let pk = test_pubkey();
-        mgr.insert_session(test_session(pk));
+        mgr.insert_session(test_session(pk).await);
 
         let removed = mgr.remove_session(&pk);
         assert!(removed.is_some());
@@ -305,11 +380,11 @@ mod tests {
         assert!(mgr.remove_session(&test_pubkey()).is_none());
     }
 
-    #[test]
-    fn clear_sessions_empties_all() {
+    #[tokio::test]
+    async fn clear_sessions_empties_all() {
         let mgr = AccountManager::default();
-        mgr.insert_session(test_session(test_pubkey()));
-        mgr.insert_session(test_session(test_pubkey()));
+        mgr.insert_session(test_session(test_pubkey()).await);
+        mgr.insert_session(test_session(test_pubkey()).await);
 
         mgr.clear_sessions();
         // Both are gone — we can only verify via new lookups returning None,
@@ -402,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn set_and_get_signer() {
         let pk = test_pubkey();
-        let session = test_session(pk);
+        let session = test_session(pk).await;
 
         assert!(session.get_signer().is_none(), "starts with no signer");
 
@@ -415,7 +490,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_signals_receivers() {
         let pk = test_pubkey();
-        let session = test_session(pk);
+        let session = test_session(pk).await;
         let mut rx = session.subscribe_cancellation();
 
         assert!(!*rx.borrow(), "not cancelled initially");
@@ -427,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_contact_list_permit_limits_concurrency() {
         let pk = test_pubkey();
-        let session = test_session(pk);
+        let session = test_session(pk).await;
 
         let _permit = session.acquire_contact_list_permit().await.unwrap();
 

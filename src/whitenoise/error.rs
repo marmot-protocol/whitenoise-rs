@@ -83,6 +83,9 @@ pub enum WhitenoiseError {
     #[error("Cannot register external signer for a non-external account")]
     NotExternalSignerAccount,
 
+    #[error("Signer unavailable for account {0} — external signer not yet registered")]
+    SignerUnavailable(PublicKey),
+
     #[error("MDK error: {0}")]
     MdkCoreError(#[from] mdk_core::Error),
 
