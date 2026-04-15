@@ -19,9 +19,6 @@ use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
     fn insert_account_session(&self, account: &Account) -> Result<()> {
-        if let Some(old_session) = self.account_manager.get_session(&account.pubkey) {
-            old_session.cancel();
-        }
         let session = Arc::new(AccountSession::from_account(account, self)?);
         self.account_manager.insert_session(session);
         Ok(())

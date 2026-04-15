@@ -77,7 +77,8 @@ impl Whitenoise {
                 discovered.found(RelayType::Inbox),
                 discovered.found(RelayType::KeyPackage),
             );
-            self.account_manager.stash_pending_login(pubkey, discovered);
+            self.account_manager
+                .stash_pending_login(&pubkey, discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,

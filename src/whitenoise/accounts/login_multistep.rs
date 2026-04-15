@@ -119,7 +119,8 @@ impl Whitenoise {
                 discovered.found(RelayType::Inbox),
                 discovered.found(RelayType::KeyPackage),
             );
-            self.account_manager.stash_pending_login(pubkey, discovered);
+            self.account_manager
+                .stash_pending_login(&pubkey, discovered);
             Ok(LoginResult {
                 account,
                 status: LoginStatus::NeedsRelayLists,
@@ -637,7 +638,7 @@ mod tests {
             .unwrap();
         whitenoise
             .account_manager
-            .stash_pending_login(keys.public_key(), discovered);
+            .stash_pending_login(&keys.public_key(), discovered);
     }
 
     /// Create an external-signer account, register its signer, and insert a
@@ -658,7 +659,7 @@ mod tests {
             .unwrap();
         whitenoise
             .account_manager
-            .stash_pending_login(pubkey, discovered);
+            .stash_pending_login(&pubkey, discovered);
     }
 
     /// Like `setup_partial_pending_login` but also writes relay associations to
@@ -686,7 +687,7 @@ mod tests {
         }
         whitenoise
             .account_manager
-            .stash_pending_login(keys.public_key(), discovered);
+            .stash_pending_login(&keys.public_key(), discovered);
     }
 
     /// Like `setup_partial_pending_login_external_signer` but also writes relay
@@ -716,7 +717,7 @@ mod tests {
         }
         whitenoise
             .account_manager
-            .stash_pending_login(pubkey, discovered);
+            .stash_pending_login(&pubkey, discovered);
     }
 
     // -----------------------------------------------------------------------
@@ -1499,7 +1500,7 @@ mod tests {
             .await
             .unwrap();
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: Some(vec![nip65_relay.clone()]),
                 inbox: None,
@@ -1508,7 +1509,7 @@ mod tests {
         );
 
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1551,7 +1552,7 @@ mod tests {
             .await
             .unwrap();
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1583,7 +1584,7 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1627,7 +1628,7 @@ mod tests {
             .await
             .unwrap();
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -1654,7 +1655,7 @@ mod tests {
             .await
             .unwrap();
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: Some(vec![nip65_relay]),
                 inbox: None,
@@ -2596,7 +2597,7 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -2708,7 +2709,7 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -3109,7 +3110,7 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         whitenoise.account_manager.stash_pending_login(
-            pubkey,
+            &pubkey,
             DiscoveredRelayLists {
                 nip65: None,
                 inbox: None,
@@ -3291,7 +3292,7 @@ mod tests {
             .unwrap();
         whitenoise
             .account_manager
-            .stash_pending_login(pubkey, partial);
+            .stash_pending_login(&pubkey, partial);
 
         assert!(
             whitenoise.account_manager.has_pending_login(&pubkey),
