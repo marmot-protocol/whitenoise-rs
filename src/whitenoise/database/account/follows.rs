@@ -195,6 +195,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_nonexistent_is_noop() {
+        let (wn, _d, _l) = create_mock_whitenoise().await;
+        let keys = Keys::generate();
+        insert_test_account(&wn.database, &keys.public_key()).await;
+        let target_pk = Keys::generate().public_key();
+        let target_user = insert_test_user(&wn.database, &target_pk).await;
+
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        assert!(repo.remove(&target_user).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn repos_for_different_accounts_are_isolated() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys_a = Keys::generate();

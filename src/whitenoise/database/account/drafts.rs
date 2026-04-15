@@ -142,7 +142,9 @@ mod tests {
     async fn find_returns_none_when_no_draft_exists() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
+        insert_test_account(&wn.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
+        insert_test_group(&wn.database, &group_id).await;
 
         let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
         let found = repo.find(&group_id).await.unwrap();
@@ -168,7 +170,9 @@ mod tests {
     async fn delete_nonexistent_is_noop() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
+        insert_test_account(&wn.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
+        insert_test_group(&wn.database, &group_id).await;
 
         let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
         assert!(repo.delete(&group_id).await.is_ok());
