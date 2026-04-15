@@ -5,10 +5,16 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use mdk_core::prelude::MDK;
 use mdk_sqlite_storage::MdkSqliteStorage;
-use nostr_sdk::PublicKey;
 use nostr_sdk::prelude::NostrSigner;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use nostr_sdk::{PublicKey, RelayUrl};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch};
+use tokio::task::JoinHandle;
 
+use crate::nostr_manager::Result as NostrResult;
+use crate::relay_control::RelayControlPlane;
+use crate::relay_control::account_inbox::AccountInboxPlane;
+use crate::relay_control::groups::GroupSubscriptionSpec;
+use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::error::{Result, WhitenoiseError};
@@ -19,6 +25,23 @@ use crate::whitenoise::error::{Result, WhitenoiseError};
 /// yet been re-registered. Handles that need signing return
 /// [`WhitenoiseError::SignerUnavailable`] until the slot is filled.
 pub(crate) type SharedSigner = Arc<RwLock<Option<Arc<dyn NostrSigner>>>>;
+
+/// Owned inbox plane state held by `AccountSession`.
+///
+/// Wraps the plane together with its telemetry persistor task handle so they
+/// share a single lifecycle: when the inbox is deactivated the telemetry task
+/// is aborted and the plane's relay session is shut down.
+struct AccountInboxState {
+    plane: AccountInboxPlane,
+    telemetry_handle: JoinHandle<()>,
+}
+
+impl AccountInboxState {
+    async fn deactivate(self) {
+        self.telemetry_handle.abort();
+        self.plane.deactivate().await;
+    }
+}
 
 /// A per-account session holding the account's MDK instance and signer.
 ///
@@ -34,6 +57,10 @@ pub struct AccountSession {
     cancellation: watch::Sender<bool>,
     pub(crate) ephemeral: relay_handles::AccountEphemeralHandle,
     pub(crate) group_handle: relay_handles::AccountGroupHandle,
+    /// Owned inbox plane, `None` until first activation.
+    inbox: RwLock<Option<AccountInboxState>>,
+    /// Serializes concurrent activate/deactivate operations.
+    activation_lock: Mutex<()>,
 }
 
 impl AccountSession {
@@ -60,6 +87,8 @@ impl AccountSession {
             cancellation,
             ephemeral,
             group_handle,
+            inbox: RwLock::new(None),
+            activation_lock: Mutex::new(()),
         }
     }
 
@@ -117,6 +146,106 @@ impl AccountSession {
                 )
             })
     }
+
+    // ── Inbox plane lifecycle ──────────────────────────────────────
+
+    /// Activate group and inbox subscriptions for this session.
+    ///
+    /// **Atomicity:** Group subscriptions are established first; if inbox
+    /// activation subsequently fails, group subscriptions are rolled back to
+    /// their previous state.
+    pub(crate) async fn activate_subscriptions(
+        &self,
+        relay_control: &RelayControlPlane,
+        inbox_relays: &[RelayUrl],
+        group_specs: &[GroupSubscriptionSpec],
+        since: Option<nostr_sdk::Timestamp>,
+        signer: Arc<dyn NostrSigner>,
+    ) -> NostrResult<()> {
+        let _guard = self.activation_lock.lock().await;
+
+        let previous_group_state = self.group_handle.save_state().await;
+
+        self.group_handle
+            .sync_subscriptions(group_specs, since)
+            .await?;
+
+        let plane =
+            relay_control.create_account_inbox_plane(self.account_pubkey, inbox_relays.to_vec());
+
+        if let Err(error) = plane.activate(inbox_relays, since, signer).await {
+            plane.deactivate().await;
+
+            if let Some(previous_group_specs) = previous_group_state {
+                if let Err(restore_error) = self
+                    .group_handle
+                    .sync_subscriptions(&previous_group_specs, since)
+                    .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::session",
+                        account_pubkey = %self.account_pubkey,
+                        "Failed to restore previous group-plane state after inbox activation error: {restore_error}"
+                    );
+                }
+            } else {
+                self.group_handle.remove().await;
+            }
+
+            return Err(error);
+        }
+
+        let telemetry_receiver = plane.telemetry();
+        let telemetry_handle =
+            relay_control.spawn_account_inbox_telemetry(&self.account_pubkey, telemetry_receiver);
+
+        let previous = self.inbox.write().await.replace(AccountInboxState {
+            plane,
+            telemetry_handle,
+        });
+        if let Some(previous) = previous {
+            previous.deactivate().await;
+        }
+
+        Ok(())
+    }
+
+    /// Deactivate all subscriptions (inbox, group, ephemeral) for this session.
+    pub(crate) async fn deactivate_subscriptions(&self) {
+        let _guard = self.activation_lock.lock().await;
+
+        let state = self.inbox.write().await.take();
+        if let Some(state) = state {
+            state.deactivate().await;
+        }
+
+        self.group_handle.remove().await;
+        self.group_handle.remove_ephemeral_scope().await;
+    }
+
+    /// Deactivate only the inbox plane (used during shutdown).
+    pub(crate) async fn deactivate_inbox(&self) {
+        let state = self.inbox.write().await.take();
+        if let Some(state) = state {
+            state.deactivate().await;
+        }
+    }
+
+    /// Check if the inbox plane has a connected relay.
+    pub(crate) async fn has_inbox_subscription(&self) -> bool {
+        match &*self.inbox.read().await {
+            Some(state) => state.plane.has_connected_relay().await,
+            None => false,
+        }
+    }
+
+    /// Capture a diagnostic snapshot of the inbox plane, if active.
+    pub(crate) async fn inbox_snapshot(&self) -> Option<AccountInboxPlaneStateSnapshot> {
+        match &*self.inbox.read().await {
+            Some(state) => Some(state.plane.snapshot().await),
+            None => None,
+        }
+    }
 }
 
 /// Manages active account sessions and pending logins.
@@ -172,6 +301,26 @@ impl AccountManager {
             entry.value().cancel();
         }
         self.sessions.clear();
+    }
+
+    /// Deactivate all session inbox planes. Called before relay-control shutdown.
+    pub(crate) async fn deactivate_all_inboxes(&self) {
+        let sessions: Vec<_> = self.sessions.iter().map(|e| e.value().clone()).collect();
+        for session in sessions {
+            session.deactivate_inbox().await;
+        }
+    }
+
+    /// Collect inbox snapshots from all active sessions for diagnostics.
+    pub(crate) async fn collect_inbox_snapshots(&self) -> Vec<AccountInboxPlaneStateSnapshot> {
+        let sessions: Vec<_> = self.sessions.iter().map(|e| e.value().clone()).collect();
+        let mut snapshots = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            if let Some(snapshot) = session.inbox_snapshot().await {
+                snapshots.push(snapshot);
+            }
+        }
+        snapshots
     }
 
     /// Record that a multi-step login is in progress for `pubkey`.

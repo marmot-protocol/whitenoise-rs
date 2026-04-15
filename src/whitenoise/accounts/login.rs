@@ -201,11 +201,8 @@ impl Whitenoise {
         // need the entry to exist.
         if let Some(session) = self.account_manager.get_session(pubkey) {
             session.cancel();
+            session.deactivate_subscriptions().await;
         }
-
-        self.relay_control
-            .deactivate_account_subscriptions(pubkey)
-            .await;
 
         self.account_manager.remove_session(pubkey);
 

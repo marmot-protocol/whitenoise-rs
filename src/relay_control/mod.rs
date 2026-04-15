@@ -17,7 +17,7 @@ use std::{
 
 use nostr_sdk::{PublicKey, RelayUrl};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc::Sender};
+use tokio::sync::{Mutex, broadcast, mpsc::Sender};
 use tokio::task::JoinHandle;
 
 pub(crate) mod account_inbox;
@@ -34,40 +34,24 @@ use crate::whitenoise::database::{Database, DatabaseError};
 use crate::{
     RelayType,
     nostr_manager::Result as NostrResult,
-    types::{AccountInboxPlanesStateSnapshot, ProcessableEvent, RelayControlStateSnapshot},
+    types::{
+        AccountInboxPlaneStateSnapshot, AccountInboxPlanesStateSnapshot, ProcessableEvent,
+        RelayControlStateSnapshot,
+    },
 };
 
 /// Top-level relay-control owner hosted by `Whitenoise`.
 ///
 /// This type defines the long-term system boundary described in
-/// `relay-control-plane-rearchitecture.md`. Discovery, group, and account
-/// inbox subscriptions already route through this boundary; remaining query
-/// and publish work still migrates incrementally.
-#[derive(Debug)]
-struct AccountInboxEntry {
-    plane: account_inbox::AccountInboxPlane,
-    telemetry_handle: JoinHandle<()>,
-}
-
-impl AccountInboxEntry {
-    async fn deactivate(self) {
-        self.telemetry_handle.abort();
-        self.plane.deactivate().await;
-    }
-
-    fn plane(&self) -> account_inbox::AccountInboxPlane {
-        self.plane.clone()
-    }
-}
-
+/// `relay-control-plane-rearchitecture.md`. Discovery, group, and ephemeral
+/// subscriptions route through this boundary, and it provides factory methods
+/// for account inbox planes whose ownership lives in `AccountSession`.
 #[derive(Debug)]
 pub(crate) struct RelayControlPlane {
     database: Arc<Database>,
     event_sender: Sender<ProcessableEvent>,
     session_salt: [u8; 16],
     discovery: discovery::DiscoveryPlane,
-    account_inbox_planes: RwLock<HashMap<PublicKey, AccountInboxEntry>>,
-    account_inbox_activation_locks: Mutex<HashMap<PublicKey, Arc<Mutex<()>>>>,
     group_plane: groups::GroupPlane,
     ephemeral: ephemeral::EphemeralPlane,
     observability: observability::RelayObservability,
@@ -104,8 +88,6 @@ impl RelayControlPlane {
             event_sender,
             session_salt,
             discovery,
-            account_inbox_planes: RwLock::new(HashMap::new()),
-            account_inbox_activation_locks: Mutex::new(HashMap::new()),
             group_plane,
             ephemeral,
             observability,
@@ -128,15 +110,6 @@ impl RelayControlPlane {
             .await;
         self.spawn_telemetry_persistor("group", self.group_plane.telemetry())
             .await;
-    }
-
-    async fn account_inbox_activation_lock(&self, account_pubkey: PublicKey) -> Arc<Mutex<()>> {
-        self.account_inbox_activation_locks
-            .lock()
-            .await
-            .entry(account_pubkey)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
 
     /// Structured relay observability configuration and helpers.
@@ -260,81 +233,6 @@ impl RelayControlPlane {
         Ok(())
     }
 
-    /// Activate group and inbox subscriptions for an account.
-    ///
-    /// **Atomicity:** First-time activation is NOT atomic across planes. Group
-    /// subscriptions are established first; if inbox activation subsequently
-    /// fails, group subscriptions may already be active. Refreshing an already
-    /// active account attempts to restore the previous group state on inbox
-    /// activation failure.
-    #[perf_instrument("relay")]
-    pub(crate) async fn activate_account_subscriptions(
-        &self,
-        account_pubkey: PublicKey,
-        inbox_relays: &[RelayUrl],
-        group_specs: &[groups::GroupSubscriptionSpec],
-        since: Option<nostr_sdk::Timestamp>,
-        signer: Arc<dyn nostr_sdk::NostrSigner>,
-    ) -> NostrResult<()> {
-        let account_lock = self.account_inbox_activation_lock(account_pubkey).await;
-        let _account_guard = account_lock.lock().await;
-        let previous_group_state = self.group_plane.account_state(&account_pubkey).await;
-
-        self.group_plane
-            .update_account(account_pubkey, group_specs, since)
-            .await?;
-
-        let plane = account_inbox::AccountInboxPlane::new(
-            account_inbox::AccountInboxPlaneConfig::new(account_pubkey, inbox_relays.to_vec()),
-            self.event_sender.clone(),
-            self.session_salt,
-        );
-
-        if let Err(error) = plane.activate(inbox_relays, since, signer).await {
-            plane.deactivate().await;
-
-            if let Some(previous_group_specs) = previous_group_state {
-                if let Err(restore_error) = self
-                    .group_plane
-                    .update_account(account_pubkey, &previous_group_specs, since)
-                    .await
-                {
-                    tracing::error!(
-                        target: "whitenoise::relay_control",
-                        account_pubkey = %account_pubkey,
-                        "Failed to restore previous group-plane state after inbox activation error: {restore_error}"
-                    );
-                }
-            } else {
-                self.group_plane.remove_account(&account_pubkey).await;
-            }
-
-            return Err(error);
-        }
-
-        let telemetry_receiver = plane.telemetry();
-        let telemetry_handle = self.spawn_telemetry_persistor_task(
-            &format!("account_inbox:{}", account_pubkey.to_hex()),
-            telemetry_receiver,
-        );
-
-        let previous_entry = {
-            let mut map = self.account_inbox_planes.write().await;
-            map.insert(
-                account_pubkey,
-                AccountInboxEntry {
-                    plane,
-                    telemetry_handle,
-                },
-            )
-        };
-        if let Some(previous_entry) = previous_entry {
-            previous_entry.deactivate().await;
-        }
-
-        Ok(())
-    }
-
     /// Returns the number of groups in the group plane for an account.
     pub(crate) async fn group_plane_account_group_count(&self, pubkey: &PublicKey) -> usize {
         self.group_plane.account_group_count(pubkey).await
@@ -352,71 +250,67 @@ impl RelayControlPlane {
             .await
     }
 
-    #[perf_instrument("relay")]
-    pub(crate) async fn deactivate_account_subscriptions(&self, account_pubkey: &PublicKey) {
-        let account_lock = self.account_inbox_activation_lock(*account_pubkey).await;
-        let _account_guard = account_lock.lock().await;
-
-        let entry = {
-            let mut map = self.account_inbox_planes.write().await;
-            map.remove(account_pubkey)
-        };
-        if let Some(entry) = entry {
-            entry.deactivate().await;
-        }
-
-        self.group_plane.remove_account(account_pubkey).await;
-        self.ephemeral.remove_account_scope(account_pubkey).await;
+    /// Snapshot the current group-plane state for an account (for rollback).
+    pub(crate) async fn group_plane_account_state(
+        &self,
+        pubkey: &PublicKey,
+    ) -> Option<Vec<groups::GroupSubscriptionSpec>> {
+        self.group_plane.account_state(pubkey).await
     }
 
-    /// Deactivates all account subscriptions. Called during full data teardown.
+    /// Remove an account from the group plane entirely.
+    pub(crate) async fn remove_account_from_group_plane(&self, pubkey: &PublicKey) {
+        self.group_plane.remove_account(pubkey).await;
+    }
+
+    /// Create an inbox plane for an account. The caller owns the returned plane.
+    pub(crate) fn create_account_inbox_plane(
+        &self,
+        account_pubkey: PublicKey,
+        inbox_relays: Vec<RelayUrl>,
+    ) -> account_inbox::AccountInboxPlane {
+        account_inbox::AccountInboxPlane::new(
+            account_inbox::AccountInboxPlaneConfig::new(account_pubkey, inbox_relays),
+            self.event_sender.clone(),
+            self.session_salt,
+        )
+    }
+
+    /// Spawn a telemetry persistor task for an account inbox plane.
+    /// The caller owns the returned handle and is responsible for aborting it.
+    pub(crate) fn spawn_account_inbox_telemetry(
+        &self,
+        account_pubkey: &PublicKey,
+        receiver: broadcast::Receiver<observability::RelayTelemetry>,
+    ) -> JoinHandle<()> {
+        self.spawn_telemetry_persistor_task(
+            &format!("account_inbox:{}", account_pubkey.to_hex()),
+            receiver,
+        )
+    }
+
+    /// Shut down shared relay infrastructure (group, ephemeral, telemetry).
+    ///
+    /// Account inbox planes are owned by `AccountSession` and must be
+    /// deactivated through the session before calling this method.
     #[perf_instrument("relay")]
     pub(crate) async fn shutdown_all(&self) {
-        let planes: Vec<_> = self
-            .account_inbox_planes
-            .write()
-            .await
-            .drain()
-            .map(|(_, entry)| entry)
-            .collect();
-
-        for entry in planes {
-            entry.deactivate().await;
-        }
-
         self.abort_control_plane_telemetry_persistors().await;
-
-        // Reset group and ephemeral planes independently to ensure any
-        // orphaned entries (e.g. from partial activation failures) are
-        // cleaned up, not just accounts that had inbox planes.
         self.group_plane.reset().await;
         self.ephemeral.remove_all_scopes().await;
-        self.account_inbox_activation_locks.lock().await.clear();
     }
 
+    /// Check if the group plane has an active subscription for this account.
     #[perf_instrument("relay")]
-    pub(crate) async fn has_account_subscriptions(&self, account_pubkey: &PublicKey) -> bool {
-        // Both planes must confirm the account is active. The group plane
-        // keeps an entry even for accounts with zero groups (empty state), so
-        // a missing entry unambiguously means setup never completed or failed.
-        let inbox_healthy = {
-            let plane = self
-                .account_inbox_planes
-                .read()
-                .await
-                .get(account_pubkey)
-                .map(AccountInboxEntry::plane);
-            match plane {
-                Some(plane) => plane.has_connected_relay().await,
-                None => false,
-            }
-        };
+    pub(crate) async fn has_group_subscription(&self, account_pubkey: &PublicKey) -> bool {
+        self.group_plane
+            .has_active_subscription(account_pubkey)
+            .await
+    }
 
-        inbox_healthy
-            && self
-                .group_plane
-                .has_active_subscription(account_pubkey)
-                .await
+    /// Remove an account's ephemeral relay scopes.
+    pub(crate) async fn remove_account_ephemeral_scope(&self, account_pubkey: &PublicKey) {
+        self.ephemeral.remove_account_scope(account_pubkey).await;
     }
 
     #[perf_instrument("relay")]
@@ -585,24 +479,17 @@ impl RelayControlPlane {
             .await
     }
 
+    /// Build a diagnostic snapshot. Inbox snapshots are collected from sessions
+    /// by the caller and passed in, since inbox planes are now session-owned.
     #[perf_instrument("relay")]
-    pub(crate) async fn snapshot(&self) -> RelayControlStateSnapshot {
+    pub(crate) async fn snapshot(
+        &self,
+        mut account_inbox_snapshots: Vec<AccountInboxPlaneStateSnapshot>,
+    ) -> RelayControlStateSnapshot {
         let discovery = self.discovery.snapshot().await;
         let ephemeral = self.ephemeral.snapshot().await;
 
-        let inbox_planes = self
-            .account_inbox_planes
-            .read()
-            .await
-            .iter()
-            .map(|(pubkey, entry)| (*pubkey, entry.plane()))
-            .collect::<Vec<_>>();
-
-        let mut account_snapshots = Vec::with_capacity(inbox_planes.len());
-        for (_, plane) in inbox_planes {
-            account_snapshots.push(plane.snapshot().await);
-        }
-        account_snapshots
+        account_inbox_snapshots
             .sort_unstable_by(|left, right| left.account_pubkey.cmp(&right.account_pubkey));
 
         RelayControlStateSnapshot {
@@ -610,8 +497,8 @@ impl RelayControlPlane {
             discovery,
             ephemeral,
             account_inbox: AccountInboxPlanesStateSnapshot {
-                active_account_count: account_snapshots.len(),
-                accounts: account_snapshots,
+                active_account_count: account_inbox_snapshots.len(),
+                accounts: account_inbox_snapshots,
             },
             group: self.group_plane.snapshot().await,
         }
@@ -620,23 +507,9 @@ impl RelayControlPlane {
     #[cfg(feature = "integration-tests")]
     pub(crate) async fn reset_for_tests(&self) -> NostrResult<()> {
         self.discovery.retire_all().await;
-
-        let inbox_planes = self
-            .account_inbox_planes
-            .write()
-            .await
-            .drain()
-            .map(|(_, entry)| entry)
-            .collect::<Vec<_>>();
-
-        for entry in inbox_planes {
-            entry.deactivate().await;
-        }
-
         self.abort_control_plane_telemetry_persistors().await;
         self.group_plane.reset().await;
         self.ephemeral.remove_all_scopes().await;
-        self.account_inbox_activation_locks.lock().await.clear();
         Ok(())
     }
 }
@@ -872,7 +745,7 @@ mod tests {
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
         let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
 
-        let snapshot = relay_control.snapshot().await;
+        let snapshot = relay_control.snapshot(vec![]).await;
 
         assert_eq!(snapshot.ephemeral.account_scope_count, 0);
         assert!(snapshot.ephemeral.anonymous.is_none());
@@ -959,13 +832,13 @@ mod tests {
             .warm_ephemeral_relays_for_account(account_pubkey, std::slice::from_ref(&account_relay))
             .await;
 
-        let before = relay_control.snapshot().await;
+        let before = relay_control.snapshot(vec![]).await;
         assert!(before.ephemeral.anonymous.is_some());
         assert_eq!(before.ephemeral.account_scope_count, 1);
 
         relay_control.shutdown_all().await;
 
-        let after = relay_control.snapshot().await;
+        let after = relay_control.snapshot(vec![]).await;
         assert!(after.ephemeral.anonymous.is_none());
         assert_eq!(after.ephemeral.account_scope_count, 0);
     }

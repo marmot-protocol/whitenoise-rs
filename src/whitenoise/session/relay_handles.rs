@@ -249,7 +249,6 @@ impl AccountGroupHandle {
         }
     }
 
-    #[expect(dead_code, reason = "used by group migration in later phases")]
     pub(crate) async fn sync_subscriptions(
         &self,
         group_specs: &[GroupSubscriptionSpec],
@@ -260,9 +259,23 @@ impl AccountGroupHandle {
             .await
     }
 
+    /// Snapshot the current group-plane state for rollback during activation.
+    pub(crate) async fn save_state(&self) -> Option<Vec<GroupSubscriptionSpec>> {
+        self.relay_control
+            .group_plane_account_state(&self.account_pubkey)
+            .await
+    }
+
+    /// Remove this account from the group plane entirely.
+    pub(crate) async fn remove(&self) {
+        self.relay_control
+            .remove_account_from_group_plane(&self.account_pubkey)
+            .await;
+    }
+
     pub(crate) async fn has_active_subscription(&self) -> bool {
         self.relay_control
-            .has_account_subscriptions(&self.account_pubkey)
+            .has_group_subscription(&self.account_pubkey)
             .await
     }
 
@@ -270,6 +283,13 @@ impl AccountGroupHandle {
         self.relay_control
             .group_plane_account_group_count(&self.account_pubkey)
             .await
+    }
+
+    /// Remove this account's ephemeral relay scopes.
+    pub(crate) async fn remove_ephemeral_scope(&self) {
+        self.relay_control
+            .remove_account_ephemeral_scope(&self.account_pubkey)
+            .await;
     }
 }
 
