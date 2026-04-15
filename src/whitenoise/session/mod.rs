@@ -467,7 +467,12 @@ pub(crate) mod test_helpers {
             event_sender.clone(),
             RelayObservability::new(RelayObservabilityConfig::default()),
         );
-        let relay_control = Arc::new(RelayControlPlane::new(db.clone(), vec![], event_sender, [0u8; 16]));
+        let relay_control = Arc::new(RelayControlPlane::new(
+            db.clone(),
+            vec![],
+            event_sender,
+            [0u8; 16],
+        ));
         Arc::new(AccountSession::new(
             pubkey,
             mdk,
