@@ -6,9 +6,11 @@
 //!
 //! Because the underlying `account_follows` table is keyed by integer
 //! `account_id`, each operation first loads the [`Account`] row to resolve the
-//! primary key, then delegates to the existing DB methods.
+//! primary key, then delegates to the existing DB methods. The resolved
+//! [`Account`] is cached on first load so subsequent calls within the same
+//! repo instance avoid repeated DB round-trips.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use nostr_sdk::PublicKey;
 
@@ -22,25 +24,38 @@ use crate::whitenoise::users::User;
 pub struct AccountFollowsRepo {
     account_pubkey: PublicKey,
     db: Arc<Database>,
+    /// Cached [`Account`] row. Populated on first use; shared across clones.
+    account_cache: Arc<OnceLock<Account>>,
 }
 
 impl AccountFollowsRepo {
     /// Construct a new [`AccountFollowsRepo`] for `account_pubkey`.
     pub(crate) fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Self {
-        Self { account_pubkey, db }
+        Self {
+            account_pubkey,
+            db,
+            account_cache: Arc::new(OnceLock::new()),
+        }
     }
 
-    /// Load the [`Account`] row for this repo's pubkey.
-    async fn load_account(&self) -> Result<Account> {
-        Account::find_by_pubkey(&self.account_pubkey, &self.db).await
+    /// Load the [`Account`] row for this repo's pubkey, caching the result.
+    ///
+    /// On first call a DB lookup is performed. Subsequent calls return the
+    /// cached value without hitting the database.
+    async fn load_account(&self) -> Result<&Account> {
+        if let Some(account) = self.account_cache.get() {
+            return Ok(account);
+        }
+        let account = Account::find_by_pubkey(&self.account_pubkey, &self.db).await?;
+        // If another task raced us, discard our result and use theirs.
+        Ok(self.account_cache.get_or_init(|| account))
     }
 
     /// Return all users followed by this account.
     ///
     /// Delegates to `Account::follows` with the baked-in account pubkey.
     pub async fn all(&self) -> Result<Vec<User>> {
-        let account = self.load_account().await?;
-        account.follows(&self.db).await
+        self.load_account().await?.follows(&self.db).await
     }
 
     /// Return whether this account follows `target_pubkey`.
@@ -57,16 +72,17 @@ impl AccountFollowsRepo {
             Err(WhitenoiseError::UserNotFound) => return Ok(false),
             Err(e) => return Err(e),
         };
-        let account = self.load_account().await?;
-        account.is_following_user(&user, &self.db).await
+        self.load_account()
+            .await?
+            .is_following_user(&user, &self.db)
+            .await
     }
 
     /// Record that this account follows `user`.
     ///
     /// Delegates to `Account::follow_user` with the baked-in account pubkey.
     pub async fn add(&self, user: &User) -> Result<()> {
-        let account = self.load_account().await?;
-        account.follow_user(user, &self.db).await
+        self.load_account().await?.follow_user(user, &self.db).await
     }
 
     /// Remove the follow relationship between this account and `user`.
@@ -74,8 +90,10 @@ impl AccountFollowsRepo {
     /// Delegates to `Account::unfollow_user` with the baked-in account
     /// pubkey.
     pub async fn remove(&self, user: &User) -> Result<()> {
-        let account = self.load_account().await?;
-        account.unfollow_user(user, &self.db).await
+        self.load_account()
+            .await?
+            .unfollow_user(user, &self.db)
+            .await
     }
 }
 
