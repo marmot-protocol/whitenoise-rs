@@ -969,11 +969,10 @@ impl Whitenoise {
             async {
                 match &session {
                     Some(s) => s.ephemeral.warm_relays(&warm_relays).await,
-                    None => {
-                        self.relay_control
-                            .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
-                            .await
-                    }
+                    None => Ok(self
+                        .relay_control
+                        .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
+                        .await?),
                 }
             },
         );
