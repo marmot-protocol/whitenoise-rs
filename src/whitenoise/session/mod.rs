@@ -285,7 +285,7 @@ pub(crate) mod test_helpers {
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
 
-    async fn test_db() -> Arc<Database> {
+    pub async fn test_db() -> Arc<Database> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")

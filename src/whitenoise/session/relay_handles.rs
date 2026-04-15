@@ -25,7 +25,6 @@ pub(crate) struct AccountEphemeralHandle {
     signer: SharedSigner,
 }
 
-#[expect(dead_code, reason = "signing/fetch helpers used by later phases")]
 impl AccountEphemeralHandle {
     pub(crate) fn new(
         account_pubkey: PublicKey,
@@ -50,6 +49,7 @@ impl AccountEphemeralHandle {
 
     // ── Publish helpers (signer baked in) ───────────────────────────
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_gift_wrap(
         &self,
         receiver: &PublicKey,
@@ -70,6 +70,7 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_metadata(
         &self,
         metadata: &Metadata,
@@ -81,6 +82,7 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 5+")]
     pub(crate) async fn publish_relay_list(
         &self,
         relay_list: &[RelayUrl],
@@ -93,6 +95,7 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 5+")]
     pub(crate) async fn publish_follow_list(
         &self,
         follow_list: &[PublicKey],
@@ -105,6 +108,7 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 14")]
     pub(crate) async fn publish_key_package(
         &self,
         encoded_key_package: &str,
@@ -117,11 +121,17 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_event_deletion(
         &self,
         event_ids: &[EventId],
         relays: &[RelayUrl],
     ) -> NostrResult<Output<EventId>> {
+        if event_ids.is_empty() {
+            return Err(NostrManagerError::WhitenoiseInstance(
+                "Cannot publish event deletion with empty event_ids list".to_string(),
+            ));
+        }
         let signer = self.require_signer().await?;
         if event_ids.len() == 1 {
             self.ephemeral
@@ -136,6 +146,7 @@ impl AccountEphemeralHandle {
 
     // ── Publish helpers (event already signed) ──────────────────────
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_event(
         &self,
         event: Event,
@@ -156,6 +167,7 @@ impl AccountEphemeralHandle {
         }
     }
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_message_event(
         &self,
         event: Event,
@@ -180,6 +192,7 @@ impl AccountEphemeralHandle {
 
     // ── Fetch helpers (anonymous scope, no signer needed) ───────────
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn fetch_metadata(
         &self,
         relays: &[RelayUrl],
@@ -188,6 +201,7 @@ impl AccountEphemeralHandle {
         self.ephemeral.fetch_metadata_from(relays, pubkey).await
     }
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn fetch_user_relays(
         &self,
         pubkey: PublicKey,
@@ -199,6 +213,7 @@ impl AccountEphemeralHandle {
             .await
     }
 
+    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn fetch_user_key_package(
         &self,
         pubkey: PublicKey,
@@ -260,31 +275,14 @@ impl AccountGroupHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::SystemTime;
 
     use nostr_sdk::Keys;
-    use sqlx::sqlite::SqlitePoolOptions;
     use tokio::sync::RwLock;
 
     use super::*;
     use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
-
-    async fn setup_test_db() -> Arc<Database> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let database = Database {
-            pool,
-            path: PathBuf::from(":memory:"),
-            last_connected: SystemTime::now(),
-        };
-        database.migrate_up().await.unwrap();
-        Arc::new(database)
-    }
+    use crate::whitenoise::session::test_helpers::test_db;
 
     fn test_ephemeral_plane(database: Arc<Database>) -> EphemeralPlane {
         let (event_sender, _) = tokio::sync::mpsc::channel(16);
@@ -300,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_handle_require_signer_returns_error_when_none() {
-        let db = setup_test_db().await;
+        let db = test_db().await;
         let plane = test_ephemeral_plane(db);
         let pk = Keys::generate().public_key();
         let signer: SharedSigner = Arc::new(RwLock::new(None));
@@ -313,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_handle_require_signer_returns_signer_when_set() {
-        let db = setup_test_db().await;
+        let db = test_db().await;
         let plane = test_ephemeral_plane(db);
         let keys = Keys::generate();
         let pk = keys.public_key();
@@ -327,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_handle_sees_signer_updates() {
-        let db = setup_test_db().await;
+        let db = test_db().await;
         let plane = test_ephemeral_plane(db);
         let pk = Keys::generate().public_key();
         let signer: SharedSigner = Arc::new(RwLock::new(None));
@@ -348,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_handle_delegates_group_count() {
-        let db = setup_test_db().await;
+        let db = test_db().await;
         let (event_sender, _) = tokio::sync::mpsc::channel(16);
         let relay_control = Arc::new(RelayControlPlane::new(db, vec![], event_sender, [0u8; 16]));
         let pk = Keys::generate().public_key();
