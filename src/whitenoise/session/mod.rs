@@ -17,6 +17,8 @@ use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
+use crate::whitenoise::database::Database;
+use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 
 /// Signer slot shared between `AccountSession` and its relay handles.
@@ -52,6 +54,8 @@ impl AccountInboxState {
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
+    #[expect(dead_code, reason = "used in Phase 5 view-pattern callers")]
+    pub(crate) repos: AccountRepositories,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -70,6 +74,7 @@ impl AccountSession {
         signer: Option<Arc<dyn NostrSigner>>,
         ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
         relay_control: Arc<crate::relay_control::RelayControlPlane>,
+        db: Arc<Database>,
     ) -> Self {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
@@ -80,6 +85,7 @@ impl AccountSession {
         );
         let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
         Self {
+            repos: AccountRepositories::new(account_pubkey, db),
             account_pubkey,
             mdk: Arc::new(mdk),
             signer,
@@ -107,6 +113,7 @@ impl AccountSession {
             signer,
             wn.relay_control.ephemeral(),
             wn.relay_control.clone(),
+            wn.database.clone(),
         ))
     }
 
@@ -460,13 +467,14 @@ pub(crate) mod test_helpers {
             event_sender.clone(),
             RelayObservability::new(RelayObservabilityConfig::default()),
         );
-        let relay_control = Arc::new(RelayControlPlane::new(db, vec![], event_sender, [0u8; 16]));
+        let relay_control = Arc::new(RelayControlPlane::new(db.clone(), vec![], event_sender, [0u8; 16]));
         Arc::new(AccountSession::new(
             pubkey,
             mdk,
             None,
             ephemeral,
             relay_control,
+            db,
         ))
     }
 }
