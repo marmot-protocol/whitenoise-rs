@@ -195,16 +195,19 @@ impl Whitenoise {
                 Vec::new()
             });
 
-        // Cancel any running background tasks (contact list user fetches, etc.)
-        // before tearing down subscriptions and relay connections.
-        if let Some((_, cancel_tx)) = self.background_task_cancellation.remove(pubkey) {
-            let _ = cancel_tx.send(true);
+        // Signal cancellation first so in-flight handlers (e.g. contact-list
+        // guard) see the flag, but keep the session visible until subscription
+        // teardown completes — handlers that check get_session() during teardown
+        // need the entry to exist.
+        if let Some(session) = self.account_manager.get_session(pubkey) {
+            session.cancel();
         }
 
-        // Unsubscribe from account-specific subscriptions before logout
         self.relay_control
             .deactivate_account_subscriptions(pubkey)
             .await;
+
+        self.account_manager.remove_session(pubkey);
 
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
@@ -560,34 +563,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_identity_creates_cancellation_channel() {
+    async fn test_create_identity_creates_session() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
 
         assert!(
             whitenoise
-                .background_task_cancellation
-                .contains_key(&account.pubkey),
-            "activate_account should create a cancellation channel"
+                .account_manager
+                .get_session(&account.pubkey)
+                .is_some(),
+            "activate_account should create a session"
         );
     }
 
     #[tokio::test]
-    async fn test_logout_signals_and_removes_cancellation_channel() {
+    async fn test_logout_signals_cancellation_and_removes_session() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
 
-        // Subscribe to the cancellation channel before logout
         let cancel_rx = whitenoise
-            .background_task_cancellation
-            .get(&account.pubkey)
-            .expect("cancellation channel should exist after login")
-            .value()
-            .subscribe();
+            .account_manager
+            .get_session(&account.pubkey)
+            .expect("session should exist after login")
+            .subscribe_cancellation();
 
-        // Initially not cancelled
         assert!(
             !*cancel_rx.borrow(),
             "should not be cancelled before logout"
@@ -595,18 +596,17 @@ mod tests {
 
         whitenoise.logout(&account.pubkey).await.unwrap();
 
-        // After logout, the channel should have been signalled
         assert!(
             *cancel_rx.borrow(),
             "logout should signal cancellation to running background tasks"
         );
 
-        // And the entry should be removed from the map
         assert!(
-            !whitenoise
-                .background_task_cancellation
-                .contains_key(&account.pubkey),
-            "logout should remove the cancellation channel entry"
+            whitenoise
+                .account_manager
+                .get_session(&account.pubkey)
+                .is_none(),
+            "logout should remove the session"
         );
     }
 

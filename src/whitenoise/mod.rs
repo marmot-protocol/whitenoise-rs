@@ -8,7 +8,7 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{EventId, PublicKey, RelayUrl};
 use tokio::sync::{
-    Mutex, OnceCell, Semaphore,
+    Mutex, OnceCell,
     mpsc::{self, Sender},
     watch,
 };
@@ -43,6 +43,7 @@ pub mod push_notifications;
 pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
+pub mod session;
 mod signer;
 pub mod storage;
 mod streaming;
@@ -159,8 +160,6 @@ pub struct Whitenoise {
     notification_stream_manager: notification_streaming::NotificationStreamManager,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
-    /// Per-account concurrency guards to prevent race conditions in contact list processing
-    contact_list_guards: DashMap<PublicKey, Arc<Semaphore>>,
     /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
     user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
@@ -170,15 +169,8 @@ pub struct Whitenoise {
     /// External signers for accounts using NIP-55 (Amber) or similar.
     /// Maps account pubkey to their signer implementation.
     external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
-    /// Per-account cancellation signals for background tasks (e.g. contact list
-    /// user fetches). Sending `true` tells all background tasks for that account
-    /// to stop. A new channel is created on login and signalled on logout.
-    background_task_cancellation: DashMap<PublicKey, watch::Sender<bool>>,
-    /// Pubkeys with a login in progress (between login_start and
-    /// login_publish_default_relays / login_with_custom_relay / login_cancel).
-    /// The value holds whichever relay lists were already discovered on the
-    /// network so that step 2a can publish defaults only for the missing ones.
-    pending_logins: DashMap<PublicKey, accounts::DiscoveredRelayLists>,
+    /// Per-account session manager. Holds active sessions and pending logins.
+    pub(crate) account_manager: session::AccountManager,
     /// Debounced worker that coalesces discovery subscription rebuilds.
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
     /// In-memory coordination for delayed MIP-05 token-list responses.
@@ -215,11 +207,11 @@ impl std::fmt::Debug for Whitenoise {
             .field("notification_stream_manager", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
-            .field("contact_list_guards", &"<REDACTED>")
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .field("pending_push_token_responses", &"<REDACTED>")
+            .field("account_manager", &"<REDACTED>")
             .finish()
     }
 }
@@ -257,13 +249,11 @@ impl Whitenoise {
             ),
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
-            contact_list_guards: DashMap::new(),
             user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             external_signers: DashMap::new(),
-            background_task_cancellation: DashMap::new(),
-            pending_logins: DashMap::new(),
+            account_manager: session::AccountManager::default(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
             pending_push_token_responses: Arc::new(DashMap::new()),
         }
@@ -589,6 +579,15 @@ impl Whitenoise {
         }
 
         init_timing::record("background_tasks");
+
+        // Restore account sessions for all persisted accounts before setting up
+        // subscriptions so that each account has an MDK instance ready.
+        whitenoise_ref
+            .account_manager
+            .restore_sessions(whitenoise_ref)
+            .await;
+
+        init_timing::record("session_restore");
 
         // Fetch events and setup subscriptions after event processing has started
         Self::setup_all_subscriptions(whitenoise_ref).await?;
