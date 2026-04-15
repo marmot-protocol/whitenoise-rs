@@ -221,20 +221,18 @@ impl Whitenoise {
     /// (e.g. because the background subscription setup failed on mobile).
     #[perf_instrument("whitenoise")]
     pub async fn is_account_subscriptions_operational(&self, account: &Account) -> Result<bool> {
-        let relay_healthy = self
-            .relay_control
-            .has_account_subscriptions(&account.pubkey)
-            .await;
+        let Some(session) = self.session(&account.pubkey) else {
+            return Ok(false);
+        };
+
+        let relay_healthy = session.group_handle.has_active_subscription().await;
 
         if !relay_healthy {
             return Ok(false);
         }
 
         let mdk_count = self.active_group_count(account)?;
-        let plane_count = self
-            .relay_control
-            .group_plane_account_group_count(&account.pubkey)
-            .await;
+        let plane_count = session.group_handle.group_count().await;
 
         if mdk_count != plane_count {
             tracing::info!(
