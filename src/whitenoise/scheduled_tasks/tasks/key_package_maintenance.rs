@@ -376,7 +376,7 @@ async fn rotate_expired_packages(
 mod tests {
     use super::*;
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
-    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::prelude::*;
 
@@ -639,6 +639,28 @@ mod tests {
             2,
             "An expired hash_ref group should be rotated as a whole"
         );
+    }
+
+    #[test]
+    fn test_count_key_package_hash_groups_deduplicates_twins() {
+        let keys = nostr_sdk::Keys::generate();
+        let canonical = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let separate = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND, "separate")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![
+            live_package(canonical, vec![1, 2, 3]),
+            live_package(legacy, vec![1, 2, 3]),
+            live_package(separate, vec![4, 5, 6]),
+        ];
+
+        assert_eq!(count_key_package_hash_groups(&packages), 2);
     }
 
     #[test]

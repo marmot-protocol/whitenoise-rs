@@ -8,6 +8,8 @@ use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 
+const MAX_RELAY_KEY_PACKAGE_DELETE_ROUNDS: u32 = 10;
+
 /// Verifies the key package maintenance task handles both cases:
 /// 1. Publishes key packages when none exist
 /// 2. Rotates expired key packages (deletes old, publishes new)
@@ -212,15 +214,43 @@ async fn delete_all_relay_key_packages(
     account: &crate::Account,
     delete_mls_stored_keys: bool,
 ) -> Result<usize, WhitenoiseError> {
-    let key_packages = context
-        .whitenoise
-        .fetch_all_key_packages_for_account(account)
-        .await?;
+    let mut total_deleted = 0;
 
-    context
-        .whitenoise
-        .delete_key_packages_for_account(account, key_packages, delete_mls_stored_keys, 1)
-        .await
+    for round in 0..MAX_RELAY_KEY_PACKAGE_DELETE_ROUNDS {
+        let key_packages = context
+            .whitenoise
+            .fetch_all_key_packages_for_account(account)
+            .await?;
+
+        if key_packages.is_empty() {
+            return Ok(total_deleted);
+        }
+
+        let key_package_count = key_packages.len();
+        let delete_mls_stored_keys_this_round = delete_mls_stored_keys && round == 0;
+        let deleted = context
+            .whitenoise
+            .delete_key_packages_for_account(
+                account,
+                key_packages,
+                delete_mls_stored_keys_this_round,
+                1,
+            )
+            .await?;
+
+        total_deleted += deleted;
+
+        if deleted == 0 {
+            tracing::warn!(
+                "Deleted 0 key package(s) despite {} remaining after {} relay cleanup round(s)",
+                key_package_count,
+                round + 1,
+            );
+            break;
+        }
+    }
+
+    Ok(total_deleted)
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.

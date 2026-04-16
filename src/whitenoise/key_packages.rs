@@ -1187,20 +1187,29 @@ impl Whitenoise {
         event_id: &str,
         age_secs: i64,
     ) -> Result<()> {
+        let package =
+            PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.database)
+                .await?
+                .ok_or_else(|| {
+                    WhitenoiseError::Internal(format!(
+                        "Published key package not found: {event_id}"
+                    ))
+                })?;
+
         sqlx::query(
             "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
-             WHERE account_pubkey = ? AND event_id = ?",
+             WHERE account_pubkey = ? AND key_package_hash_ref = ?",
         )
         .bind(age_secs)
         .bind(account_pubkey.to_hex())
-        .bind(event_id)
+        .bind(&package.key_package_hash_ref)
         .execute(&self.database.pool)
         .await
         .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
 
         tracing::debug!(
             target: "whitenoise::key_packages",
-            "Backdated consumed_at by {}s for KP event {} (TEST ONLY)",
+            "Backdated consumed_at by {}s for KP hash_ref group containing event {} (TEST ONLY)",
             age_secs,
             event_id
         );
@@ -1244,7 +1253,13 @@ mod tests {
 
     /// Creates a persisted account with a key package relay and stored keys.
     async fn create_account_with_relay(whitenoise: &Whitenoise) -> Account {
+        let (account, _keys) = create_account_with_relay_and_keys(whitenoise).await;
+        account
+    }
+
+    async fn create_account_with_relay_and_keys(whitenoise: &Whitenoise) -> (Account, Keys) {
         let (account, keys) = create_test_account(whitenoise).await;
+        let account = account.save(&whitenoise.database).await.unwrap();
         whitenoise
             .secrets_store
             .store_private_key(&keys)
@@ -1260,7 +1275,7 @@ mod tests {
         user.add_relay(&relay, crate::RelayType::KeyPackage, &whitenoise.database)
             .await
             .unwrap();
-        account
+        (account, keys)
     }
 
     #[tokio::test]
@@ -2040,6 +2055,89 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_key_packages_from_storage_deduplicates_hash_ref_twins() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_account_with_relay_and_keys(&whitenoise).await;
+        let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let key_package_data = whitenoise
+            .encoded_key_package(&account, &relays)
+            .await
+            .unwrap();
+
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags_30443.to_vec())
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &key_package_data.content)
+            .tags(key_package_data.tags_443.to_vec())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &key_package_data.hash_ref,
+            &canonical.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND,
+            Some(&key_package_data.d_tag),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &key_package_data.hash_ref,
+            &legacy.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+
+        let invalid_untracked = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let duplicate_untracked =
+            EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
+                .sign_with_keys(&keys)
+                .unwrap();
+
+        whitenoise
+            .delete_key_packages_from_storage(
+                &account,
+                &[
+                    canonical.clone(),
+                    legacy.clone(),
+                    invalid_untracked,
+                    duplicate_untracked,
+                ],
+                4,
+            )
+            .await
+            .unwrap();
+
+        let canonical_record = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &canonical.id.to_hex(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let legacy_record = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &legacy.id.to_hex(),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(canonical_record.key_material_deleted);
+        assert!(legacy_record.key_material_deleted);
     }
 
     #[tokio::test]
