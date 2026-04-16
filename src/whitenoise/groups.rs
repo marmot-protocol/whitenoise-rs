@@ -8,13 +8,17 @@ use nostr_sdk::prelude::*;
 
 use crate::{
     RelayType, perf_instrument, perf_span,
+    relay_control::ephemeral::KeyPackageLookup,
     whitenoise::{
         Whitenoise,
         accounts::Account,
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
+        key_packages::{
+            REQUIRED_MLS_CIPHERSUITE_TAG, missing_required_mls_proposals,
+            validate_marmot_key_package_tags,
+        },
         relays::Relay,
         users::User,
     },
@@ -106,12 +110,29 @@ impl Whitenoise {
         }
 
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let some_event = user.key_package_event(self).await?;
+        let lookup = user.key_package_lookup(self).await?;
         drop(_kp_fetch);
 
-        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-        ))?;
+        let event = match lookup {
+            KeyPackageLookup::Found(event) => event,
+            KeyPackageLookup::Incompatible { event, reason } => {
+                if !missing_required_mls_proposals(&event).is_empty() {
+                    return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
+                        member_pubkey: *pk,
+                    });
+                }
+
+                return Err(WhitenoiseError::IncompatibleKeyPackage {
+                    member_pubkey: *pk,
+                    reason,
+                });
+            }
+            KeyPackageLookup::NotFound => {
+                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::KeyPackage(
+                    "Does not exist".to_owned(),
+                )));
+            }
+        };
 
         Self::validate_fetched_member_key_package(&event, pk)?;
 
@@ -587,42 +608,7 @@ impl Whitenoise {
 
         // Fetch key packages for all members
         for pk in members.iter() {
-            let (user, newly_created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
-
-            if newly_created {
-                // Sync relay lists synchronously so that the key package relay lookup below
-                // has a chance to find the user's relays before falling back to account defaults.
-                // Metadata is not needed to add a member to a group; skip it on the critical path.
-                if let Err(e) = user.update_relay_lists(self).await {
-                    tracing::warn!(
-                        target: "whitenoise::accounts::groups::add_members_to_group",
-                        "Failed to update relay lists for new user {}: {}",
-                        user.pubkey,
-                        e
-                    );
-                }
-            }
-            // Try and get user's key package relays, if they don't have any, use account's default relays
-            let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
-            if relays_to_use.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::add_members_to_group",
-                    "User {} has no relays configured, using account's default relays",
-                    user.pubkey
-                );
-                relays_to_use = account.nip65_relays(self).await?;
-            }
-            let relays_to_use_urls = Relay::urls(&relays_to_use);
-            let some_event = self
-                .relay_control
-                .fetch_user_key_package(*pk, &relays_to_use_urls)
-                .await?;
-            let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-                mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-            ))?;
-
-            Self::validate_fetched_member_key_package(&event, pk)?;
-
+            let (user, event) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
         }

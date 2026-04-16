@@ -30,7 +30,7 @@ mod relay_sync;
 pub use key_package::KeyPackageStatus;
 
 #[cfg(test)]
-use key_package::{classify_key_package, has_valid_encoding_tag};
+use key_package::classify_key_package;
 
 /// Timeout for a targeted discovery catch-up query.
 ///
@@ -2422,73 +2422,12 @@ mod tests {
         }
     }
 
-    mod has_valid_encoding_tag_tests {
-        use super::*;
-
-        async fn create_key_package_event_with_tags(tags: Vec<Tag>) -> Event {
-            let keys = Keys::generate();
-            let builder = EventBuilder::new(Kind::MlsKeyPackage, "test-content").tags(tags);
-            builder.sign(&keys).await.unwrap()
-        }
-
-        #[tokio::test]
-        async fn test_valid_encoding_tag() {
-            let event = create_key_package_event_with_tags(vec![Tag::custom(
-                TagKind::Custom("encoding".into()),
-                vec!["base64"],
-            )])
-            .await;
-            assert!(has_valid_encoding_tag(&event));
-        }
-
-        #[tokio::test]
-        async fn test_no_encoding_tag() {
-            let event = create_key_package_event_with_tags(vec![Tag::custom(
-                TagKind::Custom("mls_protocol_version".into()),
-                vec!["1.0"],
-            )])
-            .await;
-            assert!(!has_valid_encoding_tag(&event));
-        }
-
-        #[tokio::test]
-        async fn test_wrong_encoding_value() {
-            let event = create_key_package_event_with_tags(vec![Tag::custom(
-                TagKind::Custom("encoding".into()),
-                vec!["hex"],
-            )])
-            .await;
-            assert!(!has_valid_encoding_tag(&event));
-        }
-
-        #[tokio::test]
-        async fn test_encoding_tag_among_other_tags() {
-            let event = create_key_package_event_with_tags(vec![
-                Tag::custom(TagKind::Custom("mls_protocol_version".into()), vec!["1.0"]),
-                Tag::custom(TagKind::Custom("mls_ciphersuite".into()), vec!["0x0001"]),
-                Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
-                Tag::custom(
-                    TagKind::Custom("relays".into()),
-                    vec!["wss://relay.example.com"],
-                ),
-            ])
-            .await;
-            assert!(has_valid_encoding_tag(&event));
-        }
-
-        #[tokio::test]
-        async fn test_empty_tags() {
-            let event = create_key_package_event_with_tags(vec![]).await;
-            assert!(!has_valid_encoding_tag(&event));
-        }
-    }
-
     mod classify_key_package_tests {
         use super::*;
 
         async fn create_event_with_tags(tags: Vec<Tag>) -> Event {
             let keys = Keys::generate();
-            let builder = EventBuilder::new(Kind::MlsKeyPackage, "test-content").tags(tags);
+            let builder = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50").tags(tags);
             builder.sign(&keys).await.unwrap()
         }
 
@@ -2499,10 +2438,15 @@ mod tests {
 
         #[tokio::test]
         async fn test_valid_event_returns_valid() {
-            let event = create_event_with_tags(vec![Tag::custom(
-                TagKind::Custom("encoding".into()),
-                vec!["base64"],
-            )])
+            let event = create_event_with_tags(vec![
+                Tag::custom(TagKind::Custom("mls_ciphersuite".into()), vec!["0x0001"]),
+                Tag::custom(
+                    TagKind::Custom("mls_extensions".into()),
+                    vec!["0x000a", "0xf2ee"],
+                ),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), vec!["0x000a"]),
+                Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
+            ])
             .await;
             let result = classify_key_package(Some(event));
             assert!(matches!(result, KeyPackageStatus::Valid(_)));

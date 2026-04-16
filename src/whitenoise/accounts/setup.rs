@@ -1373,9 +1373,16 @@ mod tests {
 
         // Use a valid 64-char hex string as event_id
         let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &[1, 2, 3],
+            event_hex,
+            Kind::MlsKeyPackage,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         let event_id = EventId::parse(event_hex).unwrap();
         assert!(
@@ -1392,9 +1399,16 @@ mod tests {
         account.save(&whitenoise.database).await.unwrap();
 
         let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &[1, 2, 3],
+            event_hex,
+            Kind::MlsKeyPackage,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
         // Mark key material as deleted
         let pkg =

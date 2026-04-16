@@ -170,6 +170,9 @@ pub enum WhitenoiseError {
     #[error("Missing required encoding tag ['encoding','base64']")]
     MissingEncodingTag,
 
+    #[error("Missing required d tag for kind:30443 key package")]
+    MissingKeyPackageDTag,
+
     #[error("Invalid base64 key package content: {0}")]
     InvalidBase64(#[from] base64ct::Error),
 
@@ -184,6 +187,22 @@ pub enum WhitenoiseError {
 
     #[error("Missing required mls_extensions [{}]", missing.join(", "))]
     MissingMlsExtensions { missing: Vec<String> },
+
+    #[error("Missing required mls_proposals [{}]", missing.join(", "))]
+    MissingMlsProposals { missing: Vec<String> },
+
+    #[error(
+        "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
+    )]
+    KeyPackageMissingSelfRemove { member_pubkey: PublicKey },
+
+    #[error(
+        "Cannot add this user yet. Their key package is incompatible with this app version ({reason}). Ask them to update White Noise and open the app so it can publish a new key package."
+    )]
+    IncompatibleKeyPackage {
+        member_pubkey: PublicKey,
+        reason: String,
+    },
 
     #[error("Invalid timestamp")]
     InvalidTimestamp,

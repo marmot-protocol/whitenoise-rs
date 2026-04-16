@@ -289,6 +289,7 @@ mod tests {
 
     use crate::RelayType;
     use crate::whitenoise::accounts::Account;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND;
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
@@ -371,9 +372,8 @@ mod tests {
                 "Key package should be authored by the account's public key"
             );
             assert_eq!(
-                event.kind,
-                Kind::MlsKeyPackage,
-                "Event should be a key package (kind 443)"
+                event.kind, MLS_KEY_PACKAGE_KIND,
+                "Event should be a canonical key package (kind 30443)"
             );
         }
     }
@@ -440,7 +440,7 @@ mod tests {
         );
         assert!(
             key_package_events.is_some(),
-            "Key package (kind 443) should be published for new accounts"
+            "Key package (kind 30443) should be published for new accounts"
         );
     }
 

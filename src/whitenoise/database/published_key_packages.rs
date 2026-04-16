@@ -1,4 +1,4 @@
-use nostr_sdk::PublicKey;
+use nostr_sdk::{Kind, PublicKey};
 
 use super::{Database, DatabaseError};
 use crate::perf_instrument;
@@ -15,6 +15,8 @@ pub struct PublishedKeyPackage {
     pub account_pubkey: String,
     pub key_package_hash_ref: Vec<u8>,
     pub event_id: String,
+    pub kind: i64,
+    pub d_tag: Option<String>,
     pub consumed_at: Option<i64>,
     pub key_material_deleted: bool,
     pub created_at: i64,
@@ -28,12 +30,15 @@ where
     i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     bool: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    Option<String>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
 {
     fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
         let id: i64 = row.try_get("id")?;
         let account_pubkey: String = row.try_get("account_pubkey")?;
         let key_package_hash_ref: Vec<u8> = row.try_get("key_package_hash_ref")?;
         let event_id: String = row.try_get("event_id")?;
+        let kind: i64 = row.try_get("kind")?;
+        let d_tag: Option<String> = row.try_get("d_tag")?;
         let consumed_at: Option<i64> = row.try_get("consumed_at")?;
         let key_material_deleted: bool = row.try_get("key_material_deleted")?;
         let created_at: i64 = row.try_get("created_at")?;
@@ -43,6 +48,8 @@ where
             account_pubkey,
             key_package_hash_ref,
             event_id,
+            kind,
+            d_tag,
             consumed_at,
             key_material_deleted,
             created_at,
@@ -61,15 +68,20 @@ impl PublishedKeyPackage {
         account_pubkey: &PublicKey,
         hash_ref: &[u8],
         event_id: &str,
+        kind: Kind,
+        d_tag: Option<&str>,
         database: &Database,
     ) -> Result<(), DatabaseError> {
         sqlx::query(
-            "INSERT OR IGNORE INTO published_key_packages (account_pubkey, key_package_hash_ref, event_id)
-             VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO published_key_packages
+             (account_pubkey, key_package_hash_ref, event_id, kind, d_tag)
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(account_pubkey.to_hex())
         .bind(hash_ref)
         .bind(event_id)
+        .bind(i64::from(kind.as_u16()))
+        .bind(d_tag)
         .execute(&database.pool)
         .await?;
 
@@ -93,7 +105,8 @@ impl PublishedKeyPackage {
         database: &Database,
     ) -> Result<Option<Self>, DatabaseError> {
         let row = sqlx::query_as::<_, Self>(
-            "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
+            "SELECT id, account_pubkey, key_package_hash_ref, event_id, kind, d_tag,
+                    consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ? AND event_id = ?",
         )
@@ -118,13 +131,22 @@ impl PublishedKeyPackage {
         event_id: &str,
         database: &Database,
     ) -> Result<bool, DatabaseError> {
+        let row = Self::find_by_event_id(account_pubkey, event_id, database).await?;
+        let Some(package) = row else {
+            return Ok(false);
+        };
+
+        if package.key_material_deleted {
+            return Ok(false);
+        }
+
         let result = sqlx::query(
             "UPDATE published_key_packages
              SET consumed_at = unixepoch()
-             WHERE account_pubkey = ? AND event_id = ? AND key_material_deleted = 0",
+             WHERE account_pubkey = ? AND key_package_hash_ref = ? AND key_material_deleted = 0",
         )
         .bind(account_pubkey.to_hex())
-        .bind(event_id)
+        .bind(&package.key_package_hash_ref)
         .execute(&database.pool)
         .await?;
 
@@ -145,7 +167,8 @@ impl PublishedKeyPackage {
         database: &Database,
     ) -> Result<Vec<Self>, DatabaseError> {
         let rows = sqlx::query_as::<_, Self>(
-            "SELECT id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at
+            "SELECT id, account_pubkey, key_package_hash_ref, event_id, kind, d_tag,
+                    consumed_at, key_material_deleted, created_at
              FROM published_key_packages
              WHERE account_pubkey = ?
                AND consumed_at IS NOT NULL
@@ -182,11 +205,34 @@ impl PublishedKeyPackage {
             .await?;
         Ok(())
     }
+
+    /// Marks all rows sharing a key package hash as deleted.
+    ///
+    /// Dual-published kind:30443/kind:443 events point at the same local MLS
+    /// key material, so cleanup must update the whole hash group together.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn mark_key_material_deleted_by_hash_ref(
+        account_pubkey: &PublicKey,
+        hash_ref: &[u8],
+        database: &Database,
+    ) -> Result<u64, DatabaseError> {
+        let result = sqlx::query(
+            "UPDATE published_key_packages
+             SET key_material_deleted = 1
+             WHERE account_pubkey = ? AND key_package_hash_ref = ?",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(hash_ref)
+        .execute(&database.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::Keys;
+    use nostr_sdk::{Keys, Kind};
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
@@ -204,6 +250,8 @@ mod tests {
                 account_pubkey TEXT NOT NULL,
                 key_package_hash_ref BLOB NOT NULL,
                 event_id TEXT NOT NULL,
+                kind INTEGER NOT NULL DEFAULT 443,
+                d_tag TEXT NULL,
                 consumed_at INTEGER,
                 key_material_deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -228,7 +276,15 @@ mod tests {
         let hash_ref = vec![1, 2, 3, 4, 5];
         let event_id = "abc123";
 
-        let result = PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, &db).await;
+        let result = PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            event_id,
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await;
         assert!(result.is_ok());
 
         let count: (i64,) =
@@ -248,11 +304,11 @@ mod tests {
         let hash_ref = vec![1, 2, 3, 4, 5];
         let event_id = "abc123";
 
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, &db)
+        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
             .await
             .unwrap();
         // Second insert with same event_id should be ignored (INSERT OR IGNORE)
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, &db)
+        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
             .await
             .unwrap();
 
@@ -284,7 +340,7 @@ mod tests {
         let hash_ref = vec![1, 2, 3];
         let event_id = "known_event";
 
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, &db)
+        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
             .await
             .unwrap();
 
@@ -296,8 +352,36 @@ mod tests {
         let pkg = result.unwrap();
         assert_eq!(pkg.key_package_hash_ref, hash_ref);
         assert_eq!(pkg.event_id, event_id);
+        assert_eq!(pkg.kind, 443);
+        assert_eq!(pkg.d_tag, None);
         assert!(pkg.consumed_at.is_none());
         assert!(!pkg.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_create_stores_kind_and_d_tag() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let hash_ref = vec![1, 2, 3];
+        let d_tag = "d-tag-value";
+
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "canonical_event",
+            Kind::Custom(30443),
+            Some(d_tag),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkg.kind, 30443);
+        assert_eq!(pkg.d_tag.as_deref(), Some(d_tag));
     }
 
     #[tokio::test]
@@ -306,9 +390,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
         let event_id = "consume_test";
 
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            event_id,
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         let updated = PublishedKeyPackage::mark_consumed(&pubkey, event_id, &db)
             .await
@@ -320,6 +411,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(pkg.consumed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_mark_consumed_marks_key_package_twins() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let hash_ref = vec![1, 2, 3];
+
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "canonical_event",
+            Kind::Custom(30443),
+            Some("d-tag-value"),
+            &db,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "legacy_event",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let updated = PublishedKeyPackage::mark_consumed(&pubkey, "canonical_event", &db)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let canonical = PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy = PublishedKeyPackage::find_by_event_id(&pubkey, "legacy_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(canonical.consumed_at.is_some());
+        assert_eq!(legacy.consumed_at, canonical.consumed_at);
+    }
+
+    #[tokio::test]
+    async fn test_mark_consumed_marks_canonical_when_legacy_consumed() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let hash_ref = vec![1, 2, 3];
+
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "canonical_event",
+            Kind::Custom(30443),
+            Some("d-tag-value"),
+            &db,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "legacy_event",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let updated = PublishedKeyPackage::mark_consumed(&pubkey, "legacy_event", &db)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let canonical = PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy = PublishedKeyPackage::find_by_event_id(&pubkey, "legacy_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(legacy.consumed_at.is_some());
+        assert_eq!(canonical.consumed_at, legacy.consumed_at);
     }
 
     #[tokio::test]
@@ -339,9 +520,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
         let event_id = "burst_test";
 
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            event_id,
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         // First consumption
         PublishedKeyPackage::mark_consumed(&pubkey, event_id, &db)
@@ -371,9 +559,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
         let event_id = "deleted_test";
 
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            event_id,
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&pubkey, event_id, &db)
             .await
             .unwrap();
@@ -400,9 +595,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         // Insert a consumed KP with recent timestamp
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], "recent", &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            "recent",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&pubkey, "recent", &db)
             .await
             .unwrap();
@@ -459,9 +661,16 @@ mod tests {
         .unwrap();
 
         // One recently consumed KP (blocks all cleanup for this account)
-        PublishedKeyPackage::create(&pubkey, &[4, 5, 6], "recent_event", &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[4, 5, 6],
+            "recent_event",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&pubkey, "recent_event", &db)
             .await
             .unwrap();
@@ -481,9 +690,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
         let event_id = "delete_test";
 
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            event_id,
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
             .await
@@ -500,6 +716,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(pkg.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_mark_key_material_deleted_by_hash_ref_marks_twins() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let hash_ref = vec![1, 2, 3];
+
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "canonical_event",
+            Kind::Custom(30443),
+            Some("d-tag-value"),
+            &db,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "legacy_event",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let affected =
+            PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(&pubkey, &hash_ref, &db)
+                .await
+                .unwrap();
+        assert_eq!(affected, 2);
+
+        let canonical = PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy = PublishedKeyPackage::find_by_event_id(&pubkey, "legacy_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(canonical.key_material_deleted);
+        assert!(legacy.key_material_deleted);
     }
 
     #[tokio::test]
@@ -521,9 +783,16 @@ mod tests {
         .unwrap();
 
         // Insert recently consumed KP for account 2
-        PublishedKeyPackage::create(&pubkey2, &[4, 5, 6], "event_b1", &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey2,
+            &[4, 5, 6],
+            "event_b1",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         PublishedKeyPackage::mark_consumed(&pubkey2, "event_b1", &db)
             .await
             .unwrap();
@@ -556,9 +825,16 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         // Insert a published but unconsumed KP
-        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], "unconsumed", &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &[1, 2, 3],
+            "unconsumed",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         let eligible = PublishedKeyPackage::find_eligible_for_cleanup(&pubkey, 30, &db)
             .await
