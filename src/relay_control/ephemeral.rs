@@ -19,6 +19,7 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         database::{Database, published_events::PublishedEvent},
+        error::WhitenoiseError,
         key_packages::{
             MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG,
             is_key_package_kind, validate_marmot_key_package_tags,
@@ -86,10 +87,10 @@ pub(crate) enum MessagePublishResult {
     Failed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum KeyPackageLookup {
     Found(Event),
-    Incompatible { event: Event, reason: String },
+    Incompatible { error: WhitenoiseError },
     NotFound,
 }
 
@@ -820,7 +821,7 @@ impl EphemeralPlane {
                 Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND => valid_current.push(event),
                 Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND_LEGACY => valid_legacy.push(event),
                 Ok(()) => {}
-                Err(error) => incompatible.push((event, error.to_string())),
+                Err(error) => incompatible.push((event, error)),
             }
         }
 
@@ -842,7 +843,7 @@ impl EphemeralPlane {
             .into_iter()
             .max_by_key(|(event, _)| (event.created_at, event.id))
         {
-            Some((event, reason)) => KeyPackageLookup::Incompatible { event, reason },
+            Some((_event, error)) => KeyPackageLookup::Incompatible { error },
             None => KeyPackageLookup::NotFound,
         }
     }
@@ -1591,8 +1592,8 @@ mod tests {
 
         assert!(matches!(
             lookup,
-            KeyPackageLookup::Incompatible { event, reason }
-                if event.id == incompatible.id && reason.contains("mls_proposals")
+            KeyPackageLookup::Incompatible { error }
+                if matches!(error, WhitenoiseError::MissingMlsProposals { .. })
         ));
     }
 
@@ -1614,8 +1615,8 @@ mod tests {
 
         assert!(matches!(
             lookup,
-            KeyPackageLookup::Incompatible { event, reason }
-                if event.id == incompatible.id && reason.contains("encoding")
+            KeyPackageLookup::Incompatible { error }
+                if matches!(error, WhitenoiseError::MissingEncodingTag)
         ));
     }
 

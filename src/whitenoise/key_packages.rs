@@ -114,12 +114,10 @@ pub(crate) fn validate_marmot_key_package_tags(
 }
 
 pub(crate) fn missing_required_mls_proposals(event: &Event) -> Vec<String> {
-    let proposals: HashSet<String> = normalized_tag_values(
-        event,
-        TagKind::Custom(std::borrow::Cow::Borrowed("mls_proposals")),
-    )
-    .into_iter()
-    .collect();
+    let proposals: HashSet<String> =
+        normalized_tag_values(event, TagKind::Custom("mls_proposals".into()))
+            .into_iter()
+            .collect();
 
     REQUIRED_MLS_PROPOSAL_TAGS
         .into_iter()
@@ -727,10 +725,10 @@ impl Whitenoise {
     pub async fn delete_all_key_packages_for_account(
         &self,
         account: &Account,
-        delete_mls_stored_keys: bool,
+        _delete_mls_stored_keys: bool,
     ) -> Result<usize> {
         let signer = self.get_signer_for_account(account)?;
-        self.delete_all_key_packages_loop(account, delete_mls_stored_keys, signer)
+        self.delete_all_key_packages_loop(account, _delete_mls_stored_keys, signer)
             .await
     }
 
@@ -754,12 +752,12 @@ impl Whitenoise {
     pub async fn delete_all_key_packages_for_account_with_signer(
         &self,
         account: &Account,
-        delete_mls_stored_keys: bool,
+        _delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
         self.delete_all_key_packages_loop(
             account,
-            delete_mls_stored_keys,
+            _delete_mls_stored_keys,
             std::sync::Arc::new(signer),
         )
         .await

@@ -58,6 +58,11 @@ where
 }
 
 impl PublishedKeyPackage {
+    /// Returns the event kind as a typed [`Kind`].
+    pub fn kind(&self) -> Kind {
+        Kind::Custom(self.kind as u16)
+    }
+
     /// Records a published key package for lifecycle tracking.
     ///
     /// Called at publish time with the hash_ref computed atomically during
@@ -120,9 +125,10 @@ impl PublishedKeyPackage {
 
     /// Marks a published key package as consumed (used by a Welcome).
     ///
-    /// Sets `consumed_at` to the current timestamp. A KP can be consumed
-    /// multiple times (last-resort reuse); each Welcome updates `consumed_at`,
-    /// restarting the quiet period before cleanup.
+    /// Updates `consumed_at` for all rows that share the same `key_package_hash_ref`
+    /// as the given event, so both the canonical (kind:30443) and legacy (kind:443) twins
+    /// are marked together. A KP can be consumed multiple times (last-resort reuse);
+    /// each Welcome restarts the quiet period before key material cleanup.
     ///
     /// Returns `false` if no matching row exists or key material is already deleted.
     #[perf_instrument("db::published_key_packages")]
@@ -512,6 +518,70 @@ mod tests {
             .await
             .unwrap();
         assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn test_mark_consumed_on_already_consumed_updates_timestamp_for_twins() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let hash_ref = vec![1, 2, 3];
+
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "canonical_burst",
+            Kind::Custom(30443),
+            Some("d-tag"),
+            &db,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            "legacy_burst",
+            Kind::MlsKeyPackage,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // First consumption via canonical event_id
+        PublishedKeyPackage::mark_consumed(&pubkey, "canonical_burst", &db)
+            .await
+            .unwrap();
+        let first_canonical =
+            PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_burst", &db)
+                .await
+                .unwrap()
+                .unwrap();
+        let first_legacy = PublishedKeyPackage::find_by_event_id(&pubkey, "legacy_burst", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Both twins should be consumed with the same timestamp
+        assert_eq!(first_canonical.consumed_at, first_legacy.consumed_at);
+
+        // Second consumption (burst) via legacy event_id — both twins must update
+        let updated = PublishedKeyPackage::mark_consumed(&pubkey, "legacy_burst", &db)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let second_canonical =
+            PublishedKeyPackage::find_by_event_id(&pubkey, "canonical_burst", &db)
+                .await
+                .unwrap()
+                .unwrap();
+        let second_legacy = PublishedKeyPackage::find_by_event_id(&pubkey, "legacy_burst", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(second_canonical.consumed_at.unwrap() >= first_canonical.consumed_at.unwrap());
+        assert_eq!(second_canonical.consumed_at, second_legacy.consumed_at);
     }
 
     #[tokio::test]

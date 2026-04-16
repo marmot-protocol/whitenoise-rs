@@ -15,10 +15,7 @@ use crate::{
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        key_packages::{
-            REQUIRED_MLS_CIPHERSUITE_TAG, missing_required_mls_proposals,
-            validate_marmot_key_package_tags,
-        },
+        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
         relays::Relay,
         users::User,
     },
@@ -115,8 +112,8 @@ impl Whitenoise {
 
         let event = match lookup {
             KeyPackageLookup::Found(event) => event,
-            KeyPackageLookup::Incompatible { event, reason } => {
-                if !missing_required_mls_proposals(&event).is_empty() {
+            KeyPackageLookup::Incompatible { error } => {
+                if matches!(error, WhitenoiseError::MissingMlsProposals { .. }) {
                     return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
                         member_pubkey: *pk,
                     });
@@ -124,7 +121,7 @@ impl Whitenoise {
 
                 return Err(WhitenoiseError::IncompatibleKeyPackage {
                     member_pubkey: *pk,
-                    reason,
+                    reason: error.to_string(),
                 });
             }
             KeyPackageLookup::NotFound => {
