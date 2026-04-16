@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
 use nostr_sdk::{PublicKey, RelayUrl};
 
@@ -8,11 +7,9 @@ use super::SharedSigner;
 use crate::RelayType;
 use crate::nostr_manager::Result as NostrResult;
 use crate::relay_control::RelayControlPlane;
-use crate::relay_control::ephemeral::{EphemeralPlane, MessagePublishResult};
+use crate::relay_control::ephemeral::EphemeralPlane;
 use crate::relay_control::groups::GroupSubscriptionSpec;
-use crate::whitenoise::database::Database;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::message_streaming::MessageStreamManager;
 
 /// Scoped handle into the shared ephemeral relay plane.
 ///
@@ -174,27 +171,9 @@ impl AccountEphemeralHandle {
         }
     }
 
-    #[expect(dead_code, reason = "phase 7+")]
-    pub(crate) async fn publish_message_event(
-        &self,
-        event: Event,
-        relays: &[RelayUrl],
-        event_id: &str,
-        group_id: &GroupId,
-        database: &Database,
-        stream_manager: &Arc<MessageStreamManager>,
-    ) -> MessagePublishResult {
-        self.ephemeral
-            .publish_message_event(
-                event,
-                &self.account_pubkey,
-                relays,
-                event_id,
-                group_id,
-                database,
-                stream_manager,
-            )
-            .await
+    /// Clone the underlying `EphemeralPlane` for use in spawned background tasks.
+    pub(crate) fn clone_inner(&self) -> crate::relay_control::ephemeral::EphemeralPlane {
+        self.ephemeral.clone()
     }
 
     // ── Fetch helpers (anonymous scope, no signer needed) ───────────
@@ -314,6 +293,7 @@ mod tests {
 
     use super::*;
     use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
+    use crate::whitenoise::database::Database;
     use crate::whitenoise::session::test_helpers::test_db;
 
     fn test_ephemeral_plane(database: Arc<Database>) -> EphemeralPlane {

@@ -1612,6 +1612,7 @@ mod tests {
             aggregated_message::AggregatedMessage::insert_message(
                 &msg1,
                 &group_id,
+                &test_pubkey,
                 &whitenoise.database,
             )
             .await
@@ -1619,6 +1620,7 @@ mod tests {
             aggregated_message::AggregatedMessage::insert_message(
                 &msg2,
                 &group_id,
+                &test_pubkey,
                 &whitenoise.database,
             )
             .await
@@ -1726,6 +1728,7 @@ mod tests {
             aggregated_message::AggregatedMessage::insert_message(
                 &msg,
                 group_id,
+                &author,
                 &whitenoise.database,
             )
             .await
@@ -3274,6 +3277,7 @@ mod tests {
                 aggregated_message::AggregatedMessage::insert_message(
                     &msg,
                     &group.mls_group_id,
+                    &creator.pubkey,
                     &whitenoise.database,
                 )
                 .await
