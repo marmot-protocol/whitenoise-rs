@@ -59,20 +59,39 @@ use crate::whitenoise::background_notifications::{
 const FALLBACK_FAILURE_JSON: &str =
     r#"{"status":"failed","notifications":[],"error":"internal error: failed to build response"}"#;
 
+/// Static failure JSON used specifically when the main body's `catch_unwind`
+/// catches an internal panic. Distinct from [`FALLBACK_FAILURE_JSON`] so that
+/// debugging can distinguish a panic origin from a serialization-failure
+/// origin. Both are intentionally hardcoded so they cannot themselves fail.
+const PANIC_FAILURE_JSON: &str = r#"{"status":"failed","notifications":[],"error":"internal panic in wn_collect_notifications_after_push"}"#;
+
+/// Number of worker threads for [`FFI_RUNTIME`]. Two is the minimum that
+/// guarantees the event processor and the drain loop can make concurrent
+/// progress: one worker drives `drain_notifications` (blocked on the
+/// broadcast receiver), the other drives the spawned event processor that
+/// feeds it. More than two would be wasteful for this workload.
+const FFI_RUNTIME_WORKERS: usize = 2;
+
 /// Process-lifetime Tokio runtime used by [`wn_collect_notifications_after_push`].
 ///
-/// The runtime **must** outlive every FFI call because `initialize_whitenoise`
-/// spawns long-lived tasks (event processor, scheduled tasks, discovery sync
-/// worker) onto whichever runtime is active when `block_on` is running. If we
-/// created a fresh runtime per FFI call and dropped it on return, those tasks
-/// would be aborted, leaving the `GLOBAL_WHITENOISE` singleton populated but
-/// functionally dead: the next FFI call would fast-path through
-/// `ensure_initialized` yet silently produce `no_data` because no event
-/// processor is running.
+/// Two reasons this must be process-lifetime *and* multi-threaded:
 ///
-/// A current-thread runtime is sufficient: between FFI calls the runtime is
-/// idle (no one is driving it), and when a later `block_on` is invoked the
-/// runtime resumes driving any tasks parked across the previous call.
+/// 1. **Outlive the FFI call.** `initialize_whitenoise` spawns long-lived
+///    tasks (event processor, scheduled tasks, discovery sync worker) onto
+///    whichever runtime is active when `block_on` is running. If we built
+///    a fresh runtime per FFI call and dropped it on return, those tasks
+///    would be aborted, leaving the `GLOBAL_WHITENOISE` singleton populated
+///    but functionally dead: the next FFI call would fast-path through
+///    `ensure_initialized` yet silently produce `no_data` because no event
+///    processor is running.
+/// 2. **Multi-threaded for concurrency.** A `current_thread` runtime can in
+///    principle interleave tasks during `await` points, but it is fragile:
+///    any synchronous CPU work in the event-processor / decryption path
+///    would stall the drain loop, and any future code that does a small
+///    blocking call inline would deadlock. A multi-thread runtime sized for
+///    this workload (event processor on one worker, drain on another)
+///    eliminates that class of concern entirely. iOS background processes
+///    can comfortably afford two worker threads.
 static FFI_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Get or lazily initialize the process-lifetime Tokio runtime.
@@ -84,8 +103,10 @@ fn ffi_runtime() -> Option<&'static tokio::runtime::Runtime> {
     if let Some(rt) = FFI_RUNTIME.get() {
         return Some(rt);
     }
-    match tokio::runtime::Builder::new_current_thread()
+    match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(FFI_RUNTIME_WORKERS)
         .enable_all()
+        .thread_name("wn-ffi")
         .build()
     {
         Ok(rt) => {
@@ -133,7 +154,11 @@ pub type WnJsonCallback =
 /// * `logs_dir_ptr`, `logs_dir_len` — UTF-8 bytes for the logs directory.
 /// * `keyring_service_id_ptr`, `keyring_service_id_len` — UTF-8 bytes for the
 ///   keyring service identifier.
-/// * `max_wait_ms` — Hard deadline for collection in milliseconds.
+/// * `max_wait_ms` — Hard deadline for collection in milliseconds. `u32` is
+///   intentional: it matches the C `uint32_t` convention for short timeouts
+///   and gives a maximum representable wait of ~49 days, far above the
+///   internal `IOS_MAX_WAIT` clamp (25 s). A wider integer would suggest the
+///   value is unbounded in practice, which it is not.
 /// * `callback` — Function invoked with the JSON result. See
 ///   [`WnJsonCallback`] for lifetime rules.
 /// * `user_data` — Opaque context passed through to `callback`. Not
@@ -215,8 +240,7 @@ pub unsafe extern "C" fn wn_collect_notifications_after_push(
     .unwrap_or_else(|_| {
         // Internal panic escaped. Fall back to a static failure JSON; the
         // callback is still invoked exactly once below.
-        r#"{"status":"failed","notifications":[],"error":"internal panic in wn_collect_notifications_after_push"}"#
-            .to_string()
+        PANIC_FAILURE_JSON.to_string()
     });
 
     // Invoke the callback with the JSON bytes. The buffer lives on Rust's
@@ -321,55 +345,39 @@ mod tests {
         capture.payloads.lock().unwrap().push(bytes);
     }
 
-    /// Helper: call the FFI with valid inputs for the null-checks, returning
-    /// the captured JSON payload as a parsed Value. The argument list mirrors
-    /// the FFI's own (ptr, len) pairs plus null-override booleans per input,
-    /// so the count is inherent rather than incidental.
-    #[allow(clippy::too_many_arguments)]
-    fn call_ffi(
-        data_dir: &str,
-        data_dir_len: usize,
-        data_dir_ptr_null: bool,
-        logs_dir: &str,
-        logs_dir_len: usize,
-        logs_dir_ptr_null: bool,
-        svc: &str,
-        svc_len: usize,
-        svc_ptr_null: bool,
+    /// Returns the (ptr, len) pair representing a null pointer with a
+    /// caller-supplied non-zero length — the input shape we want to reject.
+    fn null_with_len(len: usize) -> (*const u8, usize) {
+        (std::ptr::null(), len)
+    }
+
+    /// Returns the (ptr, len) pair for a valid string view.
+    fn from_str(s: &str) -> (*const u8, usize) {
+        (s.as_ptr(), s.len())
+    }
+
+    /// Run the FFI once with explicit (ptr, len) pairs for each input and
+    /// return the parsed JSON payload delivered to the callback.
+    fn run_ffi(
+        data_dir: (*const u8, usize),
+        logs_dir: (*const u8, usize),
+        svc: (*const u8, usize),
     ) -> serde_json::Value {
         let capture = Capture::new();
         let user_data = &capture as *const Capture as *mut c_void;
-
-        let data_ptr = if data_dir_ptr_null {
-            std::ptr::null()
-        } else {
-            data_dir.as_ptr()
-        };
-        let logs_ptr = if logs_dir_ptr_null {
-            std::ptr::null()
-        } else {
-            logs_dir.as_ptr()
-        };
-        let svc_ptr = if svc_ptr_null {
-            std::ptr::null()
-        } else {
-            svc.as_ptr()
-        };
-
         unsafe {
             wn_collect_notifications_after_push(
-                data_ptr,
-                data_dir_len,
-                logs_ptr,
-                logs_dir_len,
-                svc_ptr,
-                svc_len,
+                data_dir.0,
+                data_dir.1,
+                logs_dir.0,
+                logs_dir.1,
+                svc.0,
+                svc.1,
                 1000,
                 capture_callback,
                 user_data,
             );
         }
-
         let bytes = capture.take_only();
         let s = std::str::from_utf8(&bytes).expect("callback payload must be valid UTF-8");
         serde_json::from_str(s).expect("callback payload must be valid JSON")
@@ -377,18 +385,10 @@ mod tests {
 
     #[test]
     fn null_data_dir_ptr_with_len_reports_failure_via_callback() {
-        let logs = "/tmp/logs";
-        let svc = "test.svc";
-        let v = call_ffi(
-            "",
-            10, // non-zero len with null ptr
-            true,
-            logs,
-            logs.len(),
-            false,
-            svc,
-            svc.len(),
-            false,
+        let v = run_ffi(
+            null_with_len(10),
+            from_str("/tmp/logs"),
+            from_str("test.svc"),
         );
         assert_eq!(v["status"], "failed");
         assert!(
@@ -399,27 +399,21 @@ mod tests {
 
     #[test]
     fn null_logs_dir_ptr_with_len_reports_failure_via_callback() {
-        let data = "/tmp/data";
-        let svc = "test.svc";
-        let v = call_ffi(data, data.len(), false, "", 10, true, svc, svc.len(), false);
+        let v = run_ffi(
+            from_str("/tmp/data"),
+            null_with_len(10),
+            from_str("test.svc"),
+        );
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("logs_dir"));
     }
 
     #[test]
     fn null_keyring_service_id_ptr_with_len_reports_failure_via_callback() {
-        let data = "/tmp/data";
-        let logs = "/tmp/logs";
-        let v = call_ffi(
-            data,
-            data.len(),
-            false,
-            logs,
-            logs.len(),
-            false,
-            "",
-            10,
-            true,
+        let v = run_ffi(
+            from_str("/tmp/data"),
+            from_str("/tmp/logs"),
+            null_with_len(10),
         );
         assert_eq!(v["status"], "failed");
         assert!(v["error"].as_str().unwrap().contains("keyring_service_id"));
