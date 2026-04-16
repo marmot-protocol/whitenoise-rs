@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -9,6 +12,9 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
+use crate::whitenoise::key_packages::{
+    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
+};
 use crate::whitenoise::scheduled_tasks::Task;
 
 /// Maximum age for a key package before it should be rotated (30 days).
@@ -16,6 +22,12 @@ const KEY_PACKAGE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Maximum number of accounts to process concurrently.
 const MAX_CONCURRENT_ACCOUNTS: usize = 5;
+
+#[derive(Debug, Clone)]
+struct LivePublishedKeyPackage {
+    event: Event,
+    key_package_hash_ref: Vec<u8>,
+}
 
 pub(crate) struct KeyPackageMaintenance;
 
@@ -150,11 +162,12 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
         Ok(packages) => packages,
         Err(e) => return MaintenanceResult::Error(e),
     };
+    let our_packages = filter_compatible_key_packages(our_packages);
 
     if our_packages.is_empty() {
         tracing::info!(
             target: "whitenoise::scheduler::key_package_maintenance",
-            "Account {} has key package events on relays but none with live local state, publishing new one",
+            "Account {} has key package events on relays but none with live compatible local state, publishing new one",
             account.pubkey.to_hex()
         );
         return publish_new_key_package(whitenoise, account).await;
@@ -166,7 +179,7 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
     if our_expired_packages.is_empty() {
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
-            "Account {} has {} live tracked key package(s), none expired",
+            "Account {} has {} live compatible tracked key package(s), none expired",
             account.pubkey.to_hex(),
             our_packages.len()
         );
@@ -175,25 +188,72 @@ async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> Ma
 
     // Delete expired packages, only republishing if all our packages are
     // expired (so we'd have zero left after deletion).
+    let total_package_group_count = count_key_package_hash_groups(&our_packages);
     rotate_expired_packages(
         whitenoise,
         account,
         our_expired_packages,
-        our_packages.len(),
+        total_package_group_count,
     )
     .await
 }
 
-/// Returns key packages that are older than the maximum age threshold.
-fn find_expired_packages(packages: &[Event]) -> Vec<Event> {
+fn filter_compatible_key_packages(
+    packages: Vec<LivePublishedKeyPackage>,
+) -> Vec<LivePublishedKeyPackage> {
+    packages
+        .into_iter()
+        .filter(|package| {
+            match validate_marmot_key_package_tags(&package.event, REQUIRED_MLS_CIPHERSUITE_TAG) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "whitenoise::scheduler::key_package_maintenance",
+                        "Ignoring locally tracked key package {} because it is incompatible: {}",
+                        package.event.id,
+                        e
+                    );
+                    false
+                }
+            }
+        })
+        .collect()
+}
+
+/// Returns whole key package hash groups whose newest event is older than the maximum age.
+fn find_expired_packages(packages: &[LivePublishedKeyPackage]) -> Vec<LivePublishedKeyPackage> {
     let now = Timestamp::now();
     let max_age_secs = KEY_PACKAGE_MAX_AGE.as_secs();
+    let mut packages_by_hash_ref: HashMap<Vec<u8>, Vec<LivePublishedKeyPackage>> = HashMap::new();
 
+    for package in packages {
+        packages_by_hash_ref
+            .entry(package.key_package_hash_ref.clone())
+            .or_default()
+            .push(package.clone());
+    }
+
+    packages_by_hash_ref
+        .into_values()
+        .filter(|package_group| {
+            package_group
+                .iter()
+                .map(|package| package.event.created_at)
+                .max()
+                .is_some_and(|most_recent| {
+                    now.as_secs().saturating_sub(most_recent.as_secs()) >= max_age_secs
+                })
+        })
+        .flatten()
+        .collect()
+}
+
+fn count_key_package_hash_groups(packages: &[LivePublishedKeyPackage]) -> usize {
     packages
         .iter()
-        .filter(|p| now.as_secs().saturating_sub(p.created_at.as_secs()) >= max_age_secs)
-        .cloned()
-        .collect()
+        .map(|package| &package.key_package_hash_ref)
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 /// Returns relay key packages that this device published and still has usable local state for.
@@ -202,7 +262,7 @@ async fn find_live_published_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,
     packages: Vec<Event>,
-) -> Result<Vec<Event>, WhitenoiseError> {
+) -> Result<Vec<LivePublishedKeyPackage>, WhitenoiseError> {
     let mut our_packages = Vec::new();
 
     for event in packages {
@@ -213,9 +273,11 @@ async fn find_live_published_key_packages(
         )
         .await?
         {
-            Some(pkg) if !pkg.key_material_deleted && pkg.consumed_at.is_none() => {
-                our_packages.push(event)
-            }
+            Some(pkg) if !pkg.key_material_deleted && pkg.consumed_at.is_none() => our_packages
+                .push(LivePublishedKeyPackage {
+                    event,
+                    key_package_hash_ref: pkg.key_package_hash_ref,
+                }),
             Some(_) | None => {}
         }
     }
@@ -255,21 +317,27 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
     account: &Account,
-    expired_packages: Vec<Event>,
-    total_package_count: usize,
+    expired_packages: Vec<LivePublishedKeyPackage>,
+    total_package_group_count: usize,
 ) -> MaintenanceResult {
-    let non_expired_count = total_package_count - expired_packages.len();
+    let expired_group_count = count_key_package_hash_groups(&expired_packages);
+    let non_expired_group_count = total_package_group_count.saturating_sub(expired_group_count);
+    let expired_events: Vec<Event> = expired_packages
+        .into_iter()
+        .map(|package| package.event)
+        .collect();
 
     tracing::info!(
         target: "whitenoise::scheduler::key_package_maintenance",
-        "Account {} has {} expired key package(s) and {} non-expired, cleaning up",
+        "Account {} has {} expired key package group(s) ({} event(s)) and {} non-expired group(s), cleaning up",
         account.pubkey.to_hex(),
-        expired_packages.len(),
-        non_expired_count
+        expired_group_count,
+        expired_events.len(),
+        non_expired_group_count
     );
 
     // Only publish a new key package if deleting the expired ones would leave zero packages
-    if non_expired_count == 0 {
+    if non_expired_group_count == 0 {
         if let Err(e) = whitenoise.publish_key_package_for_account(account).await {
             match e {
                 WhitenoiseError::AccountMissingKeyPackageRelays => {
@@ -288,7 +356,7 @@ async fn rotate_expired_packages(
 
     // Delete expired key packages (don't delete MLS stored keys for now)
     match whitenoise
-        .delete_key_packages_for_account(account, expired_packages, false, 1)
+        .delete_key_packages_for_account(account, expired_events, false, 1)
         .await
     {
         Ok(deleted) => MaintenanceResult::RotatedExpired { deleted },
@@ -308,7 +376,31 @@ async fn rotate_expired_packages(
 mod tests {
     use super::*;
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
+    use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use nostr_sdk::prelude::*;
+
+    fn live_package(event: Event, key_package_hash_ref: Vec<u8>) -> LivePublishedKeyPackage {
+        LivePublishedKeyPackage {
+            event,
+            key_package_hash_ref,
+        }
+    }
+
+    fn compatible_key_package_event(content: &str) -> Event {
+        let keys = Keys::generate();
+        let tags = vec![
+            Tag::custom(TagKind::MlsCiphersuite, vec![REQUIRED_MLS_CIPHERSUITE_TAG]),
+            Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
+            Tag::custom(TagKind::Custom("mls_proposals".into()), vec!["0x000a"]),
+            Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
+        ];
+
+        EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, content)
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn test_execute_republishes_when_local_key_material_is_missing() {
@@ -465,11 +557,14 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let packages = vec![old_event.clone(), fresh_event.clone()];
+        let packages = vec![
+            live_package(old_event.clone(), vec![1]),
+            live_package(fresh_event.clone(), vec![2]),
+        ];
         let expired = find_expired_packages(&packages);
 
         assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].id, old_event.id);
+        assert_eq!(expired[0].event.id, old_event.id);
     }
 
     #[test]
@@ -483,7 +578,8 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let expired = find_expired_packages(&[fresh1, fresh2]);
+        let packages = vec![live_package(fresh1, vec![1]), live_package(fresh2, vec![2])];
+        let expired = find_expired_packages(&packages);
         assert!(expired.is_empty());
     }
 
@@ -491,6 +587,79 @@ mod tests {
     fn test_find_expired_packages_handles_empty_input() {
         let expired = find_expired_packages(&[]);
         assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn test_find_expired_packages_keeps_group_when_twin_is_fresh() {
+        let keys = nostr_sdk::Keys::generate();
+        let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
+
+        let old_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old")
+            .custom_created_at(old_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let fresh_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![
+            live_package(old_event, vec![1, 2, 3]),
+            live_package(fresh_event, vec![1, 2, 3]),
+        ];
+        let expired = find_expired_packages(&packages);
+
+        assert!(
+            expired.is_empty(),
+            "A hash_ref group should not expire while any twin is fresh"
+        );
+    }
+
+    #[test]
+    fn test_find_expired_packages_returns_entire_expired_group() {
+        let keys = nostr_sdk::Keys::generate();
+        let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
+
+        let old_event_a = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old-a")
+            .custom_created_at(old_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let old_event_b = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old-b")
+            .custom_created_at(old_timestamp)
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let packages = vec![
+            live_package(old_event_a, vec![1, 2, 3]),
+            live_package(old_event_b, vec![1, 2, 3]),
+        ];
+        let expired = find_expired_packages(&packages);
+
+        assert_eq!(
+            expired.len(),
+            2,
+            "An expired hash_ref group should be rotated as a whole"
+        );
+    }
+
+    #[test]
+    fn test_filter_compatible_key_packages_requires_self_remove() {
+        let compatible = compatible_key_package_event("Y29tcGF0aWJsZQ==");
+        let incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "aW5jb21wYXRpYmxl")
+            .tags(vec![
+                Tag::custom(TagKind::MlsCiphersuite, vec![REQUIRED_MLS_CIPHERSUITE_TAG]),
+                Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
+                Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+
+        let filtered = filter_compatible_key_packages(vec![
+            live_package(compatible.clone(), vec![1]),
+            live_package(incompatible, vec![2]),
+        ]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].event.id, compatible.id);
     }
 
     #[test]

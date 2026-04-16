@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
+use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
 use async_trait::async_trait;
@@ -61,11 +62,10 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             initially_published.len()
         );
 
-        // Delete any existing key packages to start with a clean slate.
-        let deleted = context
-            .whitenoise
-            .delete_all_key_packages_for_account(&account, true)
-            .await?;
+        // Delete any existing key packages to start with a clean slate. This
+        // test needs a fully empty relay state, while the app-facing "delete
+        // all" helper intentionally removes only legacy kind:443 copies.
+        let deleted = delete_all_relay_key_packages(context, &account, true).await?;
         tracing::info!("✓ Deleted {} existing key package(s)", deleted);
 
         let before_delete = wait_for_key_packages(
@@ -98,11 +98,8 @@ impl TestCase for KeyPackageMaintenanceTestCase {
             after_publish.len()
         );
 
-        // Delete current key packages and publish an expired one
-        context
-            .whitenoise
-            .delete_all_key_packages_for_account(&account, true)
-            .await?;
+        // Delete current key packages and publish an expired one.
+        delete_all_relay_key_packages(context, &account, true).await?;
         wait_for_key_packages(
             context,
             &account,
@@ -210,6 +207,22 @@ where
     .await
 }
 
+async fn delete_all_relay_key_packages(
+    context: &ScenarioContext,
+    account: &crate::Account,
+    delete_mls_stored_keys: bool,
+) -> Result<usize, WhitenoiseError> {
+    let key_packages = context
+        .whitenoise
+        .fetch_all_key_packages_for_account(account)
+        .await?;
+
+    context
+        .whitenoise
+        .delete_key_packages_for_account(account, key_packages, delete_mls_stored_keys, 1)
+        .await
+}
+
 /// Publishes a key package with a backdated timestamp using test infrastructure.
 async fn publish_backdated_key_package(
     context: &ScenarioContext,
@@ -233,7 +246,7 @@ async fn publish_backdated_key_package(
     let backdated = Timestamp::now() - Duration::from_secs(days_old * 24 * 60 * 60);
 
     // Build and sign the event with custom timestamp
-    let event = EventBuilder::new(Kind::MlsKeyPackage, &key_package_data.content)
+    let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &key_package_data.content)
         .tags(key_package_data.tags_443.to_vec())
         .custom_created_at(backdated)
         .sign_with_keys(&keys)
@@ -253,6 +266,8 @@ async fn publish_backdated_key_package(
             &account.pubkey,
             &key_package_data.hash_ref,
             &event_id.to_hex(),
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
         )
         .await?;
 

@@ -9,6 +9,11 @@ use crate::whitenoise::{
     users::User,
 };
 
+#[cfg(test)]
+use crate::whitenoise::key_packages::{
+    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
+};
+
 /// Status of a user's key package on relays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPackageStatus {
@@ -152,10 +157,6 @@ impl User {
 /// Determines [`KeyPackageStatus`] from an optional key package event.
 #[cfg(test)]
 pub(super) fn classify_key_package(event: Option<Event>) -> KeyPackageStatus {
-    use crate::whitenoise::key_packages::{
-        REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
-    };
-
     match event {
         None => KeyPackageStatus::NotFound,
         Some(event) => {

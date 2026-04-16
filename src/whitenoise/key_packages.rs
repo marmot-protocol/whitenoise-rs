@@ -693,12 +693,13 @@ impl Whitenoise {
         Ok(key_package_events)
     }
 
-    /// Deletes all key package events from relays for the given account.
+    /// Deletes all legacy key package events from relays for the given account.
     ///
-    /// This method finds all key package events authored by the account and publishes
-    /// a batch deletion event to efficiently remove them from the relays. It then verifies
-    /// the deletions by refetching and returns the actual count of deleted key packages.
-    /// Optionally, it can also delete the MLS stored keys from local storage.
+    /// This developer-facing cleanup keeps canonical replaceable kind:30443 key packages
+    /// intact and only removes legacy kind:443 copies. The `delete_mls_stored_keys`
+    /// argument is preserved for API compatibility, but shared local MLS key material
+    /// is not deleted from this legacy-only path because kind:443 and kind:30443 twins
+    /// can reference the same `hash_ref`.
     ///
     /// Automatically uses the appropriate signer for the account:
     /// - For external accounts (Amber/NIP-55): uses the registered external signer
@@ -707,11 +708,12 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account to delete key packages for
-    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
+    /// * `delete_mls_stored_keys` - Preserved for API compatibility; ignored by this
+    ///   legacy-only cleanup path
     ///
     /// # Returns
     ///
-    /// Returns the number of key packages that were successfully deleted.
+    /// Returns the number of legacy key packages that were successfully deleted.
     ///
     /// # Errors
     ///
@@ -732,7 +734,7 @@ impl Whitenoise {
             .await
     }
 
-    /// Deletes all key package events from relays using an external signer.
+    /// Deletes all legacy key package events from relays using an external signer.
     ///
     /// This is used for external signer accounts (like Amber/NIP-55) where the
     /// private key is not available locally. The signer is used to sign the
@@ -741,12 +743,13 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account to delete key packages for
-    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
+    /// * `delete_mls_stored_keys` - Preserved for API compatibility; ignored by this
+    ///   legacy-only cleanup path
     /// * `signer` - The external signer to use for signing deletion events
     ///
     /// # Returns
     ///
-    /// Returns the number of key packages that were successfully deleted.
+    /// Returns the number of legacy key packages that were successfully deleted.
     #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account_with_signer(
         &self,
@@ -762,7 +765,7 @@ impl Whitenoise {
         .await
     }
 
-    /// Loops fetch-delete rounds until no key packages remain on relays, up to
+    /// Loops fetch-delete rounds until no legacy key packages remain on relays, up to
     /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
     /// only a subset of key packages per query, so a single fetch-delete pass
     /// can leave packages behind.
@@ -770,18 +773,20 @@ impl Whitenoise {
     async fn delete_all_key_packages_loop(
         &self,
         account: &Account,
-        delete_mls_stored_keys: bool,
+        _delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<usize> {
         let mut total_deleted = 0;
 
         for round in 0..MAX_DELETE_ROUNDS {
-            let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
+            let key_package_events = Self::legacy_key_package_events(
+                self.fetch_all_key_packages_for_account(account).await?,
+            );
 
             if key_package_events.is_empty() {
                 tracing::info!(
                     target: "whitenoise::key_packages",
-                    "All key packages deleted for account {} \
+                    "All legacy key packages deleted for account {} \
                      ({} total across {} round(s))",
                     account.pubkey.to_hex(),
                     total_deleted,
@@ -792,7 +797,7 @@ impl Whitenoise {
 
             tracing::debug!(
                 target: "whitenoise::key_packages",
-                "Round {}: found {} remaining key package(s) for account {}",
+                "Round {}: found {} remaining legacy key package(s) for account {}",
                 round + 1,
                 key_package_events.len(),
                 account.pubkey.to_hex(),
@@ -804,7 +809,7 @@ impl Whitenoise {
                 .delete_key_packages_for_account_internal(
                     account,
                     key_package_events,
-                    delete_mls_stored_keys,
+                    false,
                     1,
                     signer.clone(),
                 )
@@ -817,7 +822,7 @@ impl Whitenoise {
             if deleted == 0 {
                 tracing::warn!(
                     target: "whitenoise::key_packages",
-                    "Round {} deleted 0 key packages despite {} found \
+                    "Round {} deleted 0 legacy key packages despite {} found \
                      — relays may not support deletion",
                     round + 1,
                     batch_size,
@@ -827,6 +832,13 @@ impl Whitenoise {
         }
 
         Ok(total_deleted)
+    }
+
+    fn legacy_key_package_events(events: Vec<Event>) -> Vec<Event> {
+        events
+            .into_iter()
+            .filter(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
+            .collect()
     }
 
     /// Deletes the specified key package events from relays for the given account.
@@ -1139,20 +1151,24 @@ impl Whitenoise {
     ///
     /// Integration-test helper for cases that manually publish custom key
     /// package events (for example with a backdated timestamp) and still need
-    /// maintenance to treat them as locally-owned packages.
+    /// maintenance to treat them as locally-owned packages. Callers pass the
+    /// event kind explicitly so canonical and legacy test fixtures match the
+    /// event that was actually published.
     #[cfg(feature = "integration-tests")]
     pub async fn track_published_key_package_for_testing(
         &self,
         account_pubkey: &nostr_sdk::PublicKey,
         hash_ref: &[u8],
         event_id: &str,
+        kind: Kind,
+        d_tag: Option<&str>,
     ) -> Result<()> {
         PublishedKeyPackage::create(
             account_pubkey,
             hash_ref,
             event_id,
-            Kind::MlsKeyPackage,
-            None,
+            kind,
+            d_tag,
             &self.database,
         )
         .await
@@ -1502,6 +1518,24 @@ mod tests {
         EventBuilder::new(Kind::TextNote, "test_content")
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn test_legacy_key_package_events_filters_to_kind_443() {
+        let keys = Keys::generate();
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let text_note = create_non_key_package_event(&keys);
+
+        let filtered =
+            Whitenoise::legacy_key_package_events(vec![canonical, legacy.clone(), text_note]);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, legacy.id);
     }
 
     #[test]
