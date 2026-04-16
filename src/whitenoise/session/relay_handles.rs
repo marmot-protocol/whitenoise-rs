@@ -6,12 +6,12 @@ use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::SharedSigner;
 use crate::RelayType;
-use crate::nostr_manager::{NostrManagerError, Result as NostrResult};
+use crate::nostr_manager::Result as NostrResult;
 use crate::relay_control::RelayControlPlane;
 use crate::relay_control::ephemeral::{EphemeralPlane, MessagePublishResult};
 use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::whitenoise::database::Database;
-use crate::whitenoise::error::WhitenoiseError;
+use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::message_streaming::MessageStreamManager;
 
 /// Scoped handle into the shared ephemeral relay plane.
@@ -39,12 +39,12 @@ impl AccountEphemeralHandle {
     }
 
     /// Read the current signer, returning an error if none is set.
-    async fn require_signer(&self) -> NostrResult<Arc<dyn NostrSigner>> {
-        self.signer.read().await.clone().ok_or_else(|| {
-            NostrManagerError::WhitenoiseInstance(
-                WhitenoiseError::SignerUnavailable(self.account_pubkey).to_string(),
-            )
-        })
+    async fn require_signer(&self) -> Result<Arc<dyn NostrSigner>> {
+        self.signer
+            .read()
+            .await
+            .clone()
+            .ok_or(WhitenoiseError::SignerUnavailable(self.account_pubkey))
     }
 
     // ── Publish helpers (signer baked in) ───────────────────────────
@@ -56,9 +56,10 @@ impl AccountEphemeralHandle {
         rumor: UnsignedEvent,
         extra_tags: &[Tag],
         relays: &[RelayUrl],
-    ) -> NostrResult<Output<EventId>> {
+    ) -> Result<Output<EventId>> {
         let signer = self.require_signer().await?;
-        self.ephemeral
+        Ok(self
+            .ephemeral
             .publish_gift_wrap_to(
                 receiver,
                 rumor,
@@ -67,7 +68,7 @@ impl AccountEphemeralHandle {
                 relays,
                 signer,
             )
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 7+")]
@@ -75,11 +76,12 @@ impl AccountEphemeralHandle {
         &self,
         metadata: &Metadata,
         relays: &[RelayUrl],
-    ) -> NostrResult<Output<EventId>> {
+    ) -> Result<Output<EventId>> {
         let signer = self.require_signer().await?;
-        self.ephemeral
+        Ok(self
+            .ephemeral
             .publish_metadata_with_signer(metadata, relays, signer)
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 5+")]
@@ -88,11 +90,12 @@ impl AccountEphemeralHandle {
         relay_list: &[RelayUrl],
         relay_type: RelayType,
         target_relays: &[RelayUrl],
-    ) -> NostrResult<()> {
+    ) -> Result<()> {
         let signer = self.require_signer().await?;
-        self.ephemeral
+        Ok(self
+            .ephemeral
             .publish_relay_list_with_signer(relay_list, relay_type, target_relays, signer)
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 5+")]
@@ -101,11 +104,12 @@ impl AccountEphemeralHandle {
         follow_list: &[PublicKey],
         target_relays: &[RelayUrl],
         created_at: Option<Timestamp>,
-    ) -> NostrResult<()> {
+    ) -> Result<()> {
         let signer = self.require_signer().await?;
-        self.ephemeral
+        Ok(self
+            .ephemeral
             .publish_follow_list_with_signer_at(follow_list, target_relays, created_at, signer)
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 14")]
@@ -114,11 +118,12 @@ impl AccountEphemeralHandle {
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[Tag],
-    ) -> NostrResult<Output<EventId>> {
+    ) -> Result<Output<EventId>> {
         let signer = self.require_signer().await?;
-        self.ephemeral
+        Ok(self
+            .ephemeral
             .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 7+")]
@@ -126,21 +131,23 @@ impl AccountEphemeralHandle {
         &self,
         event_ids: &[EventId],
         relays: &[RelayUrl],
-    ) -> NostrResult<Output<EventId>> {
+    ) -> Result<Output<EventId>> {
         if event_ids.is_empty() {
-            return Err(NostrManagerError::WhitenoiseInstance(
+            return Err(WhitenoiseError::InvalidInput(
                 "Cannot publish event deletion with empty event_ids list".to_string(),
             ));
         }
         let signer = self.require_signer().await?;
         if event_ids.len() == 1 {
-            self.ephemeral
+            Ok(self
+                .ephemeral
                 .publish_event_deletion_with_signer(&event_ids[0], relays, signer)
-                .await
+                .await?)
         } else {
-            self.ephemeral
+            Ok(self
+                .ephemeral
                 .publish_batch_event_deletion_with_signer(event_ids, relays, signer)
-                .await
+                .await?)
         }
     }
 
@@ -197,8 +204,8 @@ impl AccountEphemeralHandle {
         &self,
         relays: &[RelayUrl],
         pubkey: PublicKey,
-    ) -> NostrResult<Option<Event>> {
-        self.ephemeral.fetch_metadata_from(relays, pubkey).await
+    ) -> Result<Option<Event>> {
+        Ok(self.ephemeral.fetch_metadata_from(relays, pubkey).await?)
     }
 
     #[expect(dead_code, reason = "phase 7+")]
@@ -207,10 +214,11 @@ impl AccountEphemeralHandle {
         pubkey: PublicKey,
         relay_type: RelayType,
         relays: &[RelayUrl],
-    ) -> NostrResult<Option<Event>> {
-        self.ephemeral
+    ) -> Result<Option<Event>> {
+        Ok(self
+            .ephemeral
             .fetch_user_relays(pubkey, relay_type, relays)
-            .await
+            .await?)
     }
 
     #[expect(dead_code, reason = "phase 7+")]
@@ -218,16 +226,20 @@ impl AccountEphemeralHandle {
         &self,
         pubkey: PublicKey,
         relays: &[RelayUrl],
-    ) -> NostrResult<Option<Event>> {
-        self.ephemeral.fetch_user_key_package(pubkey, relays).await
+    ) -> Result<Option<Event>> {
+        Ok(self
+            .ephemeral
+            .fetch_user_key_package(pubkey, relays)
+            .await?)
     }
 
     // ── Relay warming ───────────────────────────────────────────────
 
-    pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> NostrResult<()> {
-        self.ephemeral
+    pub(crate) async fn warm_relays(&self, relays: &[RelayUrl]) -> Result<()> {
+        Ok(self
+            .ephemeral
             .warm_relays_for_account(self.account_pubkey, relays)
-            .await
+            .await?)
     }
 }
 
@@ -306,7 +318,10 @@ mod tests {
         let handle = AccountEphemeralHandle::new(pk, plane, signer);
         let result = handle.require_signer().await;
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::SignerUnavailable(missing_pk)) if missing_pk == pk
+        ));
     }
 
     #[tokio::test]
