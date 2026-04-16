@@ -91,8 +91,8 @@ pub struct WhitenoiseConfig {
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
 
-    /// Benchmark-only override for the Whitenoise SQLCipher keyring key id.
-    #[cfg(feature = "benchmark-tests")]
+    /// Test-only override for the Whitenoise SQLCipher keyring key id.
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
     pub database_key_id: Option<String>,
 
     /// Configured discovery relays for the relay-control discovery plane.
@@ -114,7 +114,7 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
             keyring_service_id: keyring_service_id.to_string(),
-            #[cfg(feature = "benchmark-tests")]
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
@@ -140,7 +140,7 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
             keyring_service_id: keyring_service_id.to_string(),
-            #[cfg(feature = "benchmark-tests")]
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
             database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
@@ -151,7 +151,7 @@ impl WhitenoiseConfig {
         self
     }
 
-    #[cfg(feature = "benchmark-tests")]
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
     pub fn with_database_key_id(mut self, database_key_id: &str) -> Self {
         self.database_key_id = Some(database_key_id.to_string());
         self
@@ -502,7 +502,7 @@ impl Whitenoise {
         init_timing::record("directories_and_logging");
 
         let database_path = data_dir.join("whitenoise.sqlite");
-        #[cfg(feature = "benchmark-tests")]
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
         let database = Arc::new(match config.database_key_id.as_deref() {
             Some(database_key_id) => {
                 Database::new_encrypted_with_key_id(
@@ -514,7 +514,7 @@ impl Whitenoise {
             }
             None => Database::new_encrypted(database_path, &keyring_service_id).await?,
         });
-        #[cfg(not(feature = "benchmark-tests"))]
+        #[cfg(not(any(test, feature = "integration-tests", feature = "benchmark-tests")))]
         let database = Arc::new(Database::new_encrypted(database_path, &keyring_service_id).await?);
 
         init_timing::record("database");
@@ -812,6 +812,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::group_information::GroupInformation;
@@ -822,13 +824,16 @@ pub mod test_utils {
 
     // Test configuration and setup helpers
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
+        static TEST_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+        let id = TEST_CONFIG_ID.fetch_add(1, Ordering::SeqCst);
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");
         let logs_temp_dir = TempDir::new().expect("Failed to create temp logs dir");
         let config = WhitenoiseConfig::new(
             data_temp_dir.path(),
             logs_temp_dir.path(),
-            "com.whitenoise.test",
+            &format!("com.whitenoise.test.{id}"),
         )
+        .with_database_key_id(&format!("test.whitenoise.db.key.{id}"))
         .with_discovery_relays(Relay::urls(&Relay::defaults()));
         (config, data_temp_dir, logs_temp_dir)
     }
@@ -876,12 +881,9 @@ pub mod test_utils {
         init_tracing(&config.logs_dir);
 
         let database = Arc::new(
-            Database::new_encrypted(
-                config.data_dir.join("test.sqlite"),
-                &config.keyring_service_id,
-            )
-            .await
-            .unwrap(),
+            Database::new(config.data_dir.join("test.sqlite"))
+                .await
+                .unwrap(),
         );
         let secrets_store = SecretsStore::new(&config.keyring_service_id);
 

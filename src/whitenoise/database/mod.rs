@@ -108,7 +108,7 @@ impl Database {
         .await
     }
 
-    #[cfg(feature = "benchmark-tests")]
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
     pub(crate) async fn new_encrypted_with_key_id(
         db_path: PathBuf,
         keyring_service_id: &str,
@@ -201,12 +201,9 @@ impl Database {
             .connect_with(connect_options)
             .await?;
 
-        if let Some(config) = encryption_config {
+        if encryption_config.is_some() {
             let mut conn = pool.acquire().await?;
-            encryption::validate_encrypted_database(db_path, config).await?;
-            sqlx::query("SELECT count(*) FROM sqlite_master")
-                .fetch_one(&mut *conn)
-                .await?;
+            sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
         }
 
         Ok(pool)

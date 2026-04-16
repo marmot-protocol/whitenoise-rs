@@ -127,7 +127,17 @@ async fn migrate_plaintext_database(
         return Err(err.into());
     }
 
-    validate_encrypted_database(db_path, config).await?;
+    if let Err(err) = validate_encrypted_database(db_path, config).await {
+        fs::rename(&backup_path, db_path).map_err(|rollback_err| {
+            DatabaseError::EncryptionMigration(format!(
+                "Encrypted database validation failed ({err}); rollback from {} to {} failed: {rollback_err}",
+                backup_path.display(),
+                db_path.display(),
+            ))
+        })?;
+        return Err(err);
+    }
+
     remove_file_if_exists(&backup_path)?;
 
     Ok(())
