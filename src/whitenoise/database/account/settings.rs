@@ -9,8 +9,8 @@ use std::sync::Arc;
 use nostr_sdk::PublicKey;
 
 use crate::whitenoise::account_settings::AccountSettings;
-use crate::whitenoise::database::{Database, DatabaseError};
-use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::database::Database;
+use crate::whitenoise::error::Result;
 
 /// Repository for account settings scoped to a single account.
 #[derive(Clone, Debug)]
@@ -30,9 +30,7 @@ impl AccountSettingsRepo {
     ///
     /// Delegates to `AccountSettings::find_or_create_for_pubkey`.
     pub async fn find_or_create(&self) -> Result<AccountSettings> {
-        AccountSettings::find_or_create_for_pubkey(&self.account_pubkey, &self.db)
-            .await
-            .map_err(|e| WhitenoiseError::Database(DatabaseError::Sqlx(e)))
+        Ok(AccountSettings::find_or_create_for_pubkey(&self.account_pubkey, &self.db).await?)
     }
 
     /// Return whether notifications are enabled for this account.
@@ -41,9 +39,10 @@ impl AccountSettingsRepo {
     ///
     /// Delegates to `AccountSettings::notifications_enabled_for_pubkey`.
     pub async fn notifications_enabled(&self) -> Result<bool> {
-        AccountSettings::notifications_enabled_for_pubkey(&self.account_pubkey, &self.db)
-            .await
-            .map_err(|e| WhitenoiseError::Database(DatabaseError::Sqlx(e)))
+        Ok(
+            AccountSettings::notifications_enabled_for_pubkey(&self.account_pubkey, &self.db)
+                .await?,
+        )
     }
 
     /// Set `notifications_enabled` for this account and return the updated
@@ -58,39 +57,19 @@ impl AccountSettingsRepo {
     /// push-token sync separately. Phase 5 callers must account for this when
     /// migrating away from the `Whitenoise` facade.
     pub async fn update_notifications_enabled(&self, enabled: bool) -> Result<AccountSettings> {
-        AccountSettings::update_notifications_enabled(&self.account_pubkey, enabled, &self.db)
-            .await
-            .map_err(|e| WhitenoiseError::Database(DatabaseError::Sqlx(e)))
+        Ok(
+            AccountSettings::update_notifications_enabled(&self.account_pubkey, enabled, &self.db)
+                .await?,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::{Keys, PublicKey};
+    use nostr_sdk::Keys;
 
     use super::AccountSettingsRepo;
-    use crate::whitenoise::database::Database;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
-
-    async fn insert_test_account(database: &Database, pubkey: &PublicKey) {
-        let user_pubkey = pubkey.to_hex();
-        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
-            .bind(&user_pubkey)
-            .execute(&database.pool)
-            .await
-            .expect("insert user");
-        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
-            .bind(&user_pubkey)
-            .fetch_one(&database.pool)
-            .await
-            .expect("get user id");
-        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
-            .bind(&user_pubkey)
-            .bind(user_id)
-            .execute(&database.pool)
-            .await
-            .expect("insert account");
-    }
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, insert_test_account};
 
     #[tokio::test]
     async fn find_or_create_returns_defaults_for_new_account() {

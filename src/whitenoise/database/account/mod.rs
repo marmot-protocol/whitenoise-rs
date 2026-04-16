@@ -36,11 +36,17 @@ pub struct AccountRepositories {
 
 impl AccountRepositories {
     /// Construct repositories for `account_pubkey` backed by `db`.
-    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Self {
-        Self {
+    ///
+    /// Returns an error if no account row exists for `account_pubkey` (required
+    /// by [`AccountFollowsRepo`] to resolve the integer account id).
+    pub(crate) async fn new(
+        account_pubkey: PublicKey,
+        db: Arc<Database>,
+    ) -> crate::whitenoise::error::Result<Self> {
+        Ok(Self {
             drafts: DraftsRepo::new(account_pubkey, db.clone()),
             settings: AccountSettingsRepo::new(account_pubkey, db.clone()),
-            follows: AccountFollowsRepo::new(account_pubkey, db),
-        }
+            follows: AccountFollowsRepo::new(account_pubkey, db).await?,
+        })
     }
 }

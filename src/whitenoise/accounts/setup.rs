@@ -18,8 +18,8 @@ use crate::whitenoise::{Whitenoise, WhitenoiseError};
 use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
-    fn insert_account_session(&self, account: &Account) -> Result<()> {
-        let session = Arc::new(AccountSession::from_account(account, self)?);
+    async fn insert_account_session(&self, account: &Account) -> Result<()> {
+        let session = Arc::new(AccountSession::from_account(account, self).await?);
         self.account_manager.insert_session(session);
         Ok(())
     }
@@ -53,7 +53,7 @@ impl Whitenoise {
 
         // Session must exist before subscriptions so that event handlers
         // (e.g. contact-list guard) can look it up immediately.
-        self.insert_account_session(account)?;
+        self.insert_account_session(account).await?;
 
         // Subscriptions and key package setup operate on disjoint relay
         // sessions (group/inbox plane vs ephemeral plane) with no shared
@@ -88,7 +88,7 @@ impl Whitenoise {
 
         // Session must exist before subscriptions so that event handlers
         // (e.g. contact-list guard) can look it up immediately.
-        self.insert_account_session(account)?;
+        self.insert_account_session(account).await?;
 
         self.setup_subscriptions(account, inbox_relays).await?;
         tracing::debug!(target: "whitenoise::accounts", "Subscriptions setup");

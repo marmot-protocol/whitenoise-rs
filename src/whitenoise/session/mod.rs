@@ -68,14 +68,14 @@ pub struct AccountSession {
 }
 
 impl AccountSession {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         signer: Option<Arc<dyn NostrSigner>>,
         ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
         relay_control: Arc<crate::relay_control::RelayControlPlane>,
         db: Arc<Database>,
-    ) -> Self {
+    ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
         let ephemeral = relay_handles::AccountEphemeralHandle::new(
@@ -84,8 +84,8 @@ impl AccountSession {
             signer.clone(),
         );
         let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
-        Self {
-            repos: AccountRepositories::new(account_pubkey, db),
+        Ok(Self {
+            repos: AccountRepositories::new(account_pubkey, db).await?,
             account_pubkey,
             mdk: Arc::new(mdk),
             signer,
@@ -95,26 +95,27 @@ impl AccountSession {
             group_handle,
             inbox: RwLock::new(None),
             activation_lock: Mutex::new(()),
-        }
+        })
     }
 
     /// Build a session from a persisted account, loading MDK and (for local
     /// accounts) the signer from the secrets store.
-    pub(crate) fn from_account(account: &Account, wn: &Whitenoise) -> Result<Self> {
+    pub(crate) async fn from_account(account: &Account, wn: &Whitenoise) -> Result<Self> {
         let mdk = wn.create_mdk_for_account(account.pubkey)?;
         let signer = if account.has_local_key() {
             Some(wn.get_signer_for_account(account)?)
         } else {
             None
         };
-        Ok(Self::new(
+        Self::new(
             account.pubkey,
             mdk,
             signer,
             wn.relay_control.ephemeral(),
             wn.relay_control.clone(),
             wn.database.clone(),
-        ))
+        )
+        .await
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -393,7 +394,7 @@ impl AccountManager {
         let mut err_count = 0usize;
 
         for account in &accounts {
-            match AccountSession::from_account(account, wn) {
+            match AccountSession::from_account(account, wn).await {
                 Ok(session) => {
                     self.insert_session(Arc::new(session));
                     ok_count += 1;
@@ -460,6 +461,26 @@ pub(crate) mod test_helpers {
     pub async fn test_session(pubkey: PublicKey) -> Arc<AccountSession> {
         let mdk = create_mdk(pubkey);
         let db = test_db().await;
+
+        // Insert the account row so AccountFollowsRepo can resolve the account id.
+        let user_pubkey = pubkey.to_hex();
+        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
+            .bind(&user_pubkey)
+            .execute(&db.pool)
+            .await
+            .expect("insert test user");
+        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
+            .bind(&user_pubkey)
+            .fetch_one(&db.pool)
+            .await
+            .expect("get test user id");
+        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
+            .bind(&user_pubkey)
+            .bind(user_id)
+            .execute(&db.pool)
+            .await
+            .expect("insert test account");
+
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
         let ephemeral = EphemeralPlane::new(
             EphemeralPlaneConfig::default(),
@@ -473,14 +494,11 @@ pub(crate) mod test_helpers {
             event_sender,
             [0u8; 16],
         ));
-        Arc::new(AccountSession::new(
-            pubkey,
-            mdk,
-            None,
-            ephemeral,
-            relay_control,
-            db,
-        ))
+        Arc::new(
+            AccountSession::new(pubkey, mdk, None, ephemeral, relay_control, db)
+                .await
+                .expect("create test session"),
+        )
     }
 }
 

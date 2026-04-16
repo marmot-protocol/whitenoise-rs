@@ -779,6 +779,56 @@ pub mod test_utils {
     use nostr_sdk::{EventBuilder, EventId, Keys, PublicKey, RelayUrl, UnsignedEvent};
     use tempfile::TempDir;
 
+    // ── Shared raw-SQL fixture helpers ────────────────────────────────────────
+
+    /// Insert a minimal user + account row for `pubkey`.
+    ///
+    /// Used by repository unit tests that need a real account row in the DB
+    /// without going through the full account-creation flow.
+    pub async fn insert_test_account(
+        database: &crate::whitenoise::database::Database,
+        pubkey: &PublicKey,
+    ) {
+        let user_pubkey = pubkey.to_hex();
+        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
+            .bind(&user_pubkey)
+            .execute(&database.pool)
+            .await
+            .expect("insert user");
+        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
+            .bind(&user_pubkey)
+            .fetch_one(&database.pool)
+            .await
+            .expect("get user id");
+        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
+            .bind(&user_pubkey)
+            .bind(user_id)
+            .execute(&database.pool)
+            .await
+            .expect("insert account");
+    }
+
+    /// Insert a minimal `group_information` row for `group_id`.
+    ///
+    /// Used by repository unit tests that need a real group row in the DB
+    /// without going through the full group-creation flow.
+    pub async fn insert_test_group(
+        database: &crate::whitenoise::database::Database,
+        group_id: &GroupId,
+    ) {
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
+             VALUES (?, 'group', ?, ?)",
+        )
+        .bind(group_id.as_slice())
+        .bind(now)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .expect("insert group_information");
+    }
+
     // Test configuration and setup helpers
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");

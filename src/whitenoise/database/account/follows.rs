@@ -5,57 +5,62 @@
 //! is baked in at construction time.
 //!
 //! Because the underlying `account_follows` table is keyed by integer
-//! `account_id`, each operation first loads the [`Account`] row to resolve the
-//! primary key, then delegates to the existing DB methods. The resolved
-//! [`Account`] is cached on first load so subsequent calls within the same
-//! repo instance avoid repeated DB round-trips.
+//! `account_id`, construction eagerly resolves the integer primary key once
+//! and stores it directly. All subsequent operations use that stored `i64`
+//! without further DB round-trips to load the full [`Account`] row.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use nostr_sdk::PublicKey;
+use sqlx::Row;
 
-use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::Database;
+use crate::whitenoise::database::{Database, DatabaseError};
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::users::User;
 
 /// Repository for follow relationships scoped to a single account.
 #[derive(Clone, Debug)]
 pub struct AccountFollowsRepo {
-    account_pubkey: PublicKey,
+    /// Immutable integer primary key for the account row.
+    ///
+    /// Resolved once at construction; the `accounts.id` column is a stable FK
+    /// that never changes after insertion.
+    account_id: i64,
     db: Arc<Database>,
-    /// Cached [`Account`] row. Populated on first use; shared across clones.
-    account_cache: Arc<OnceLock<Account>>,
 }
 
 impl AccountFollowsRepo {
     /// Construct a new [`AccountFollowsRepo`] for `account_pubkey`.
-    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Self {
-        Self {
-            account_pubkey,
-            db,
-            account_cache: Arc::new(OnceLock::new()),
-        }
+    ///
+    /// Performs a single DB lookup to resolve the integer account id. Returns
+    /// an error if no account row exists for `account_pubkey`.
+    pub(crate) async fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Result<Self> {
+        let account_id = Self::resolve_account_id(&account_pubkey, &db).await?;
+        Ok(Self { account_id, db })
     }
 
-    /// Load the [`Account`] row for this repo's pubkey, caching the result.
-    ///
-    /// On first call a DB lookup is performed. Subsequent calls return the
-    /// cached value without hitting the database.
-    async fn load_account(&self) -> Result<&Account> {
-        if let Some(account) = self.account_cache.get() {
-            return Ok(account);
-        }
-        let account = Account::find_by_pubkey(&self.account_pubkey, &self.db).await?;
-        // If another task raced us, discard our result and use theirs.
-        Ok(self.account_cache.get_or_init(|| account))
+    async fn resolve_account_id(pubkey: &PublicKey, db: &Database) -> Result<i64> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM accounts WHERE pubkey = ?")
+            .bind(pubkey.to_hex())
+            .fetch_optional(&db.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+        row.map(|(id,)| id).ok_or(WhitenoiseError::AccountNotFound)
     }
 
     /// Return all users followed by this account.
-    ///
-    /// Delegates to `Account::follows` with the baked-in account pubkey.
     pub async fn all(&self) -> Result<Vec<User>> {
-        self.load_account().await?.follows(&self.db).await
+        let users = sqlx::query_as::<_, User>(
+            "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.metadata_known_at, u.updated_at
+             FROM account_follows af
+             JOIN users u ON af.user_id = u.id
+             WHERE af.account_id = ?",
+        )
+        .bind(self.account_id)
+        .fetch_all(&self.db.pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+        Ok(users)
     }
 
     /// Return whether this account follows `target_pubkey`.
@@ -63,37 +68,51 @@ impl AccountFollowsRepo {
     /// Returns `false` (rather than an error) when `target_pubkey` has no user
     /// record in the database, matching the existing behaviour in
     /// `Whitenoise::is_following_user`.
-    ///
-    /// Delegates to `Account::is_following_user` with the baked-in account
-    /// pubkey.
     pub async fn is_following(&self, target_pubkey: &PublicKey) -> Result<bool> {
         let user = match User::find_by_pubkey(target_pubkey, &self.db).await {
             Ok(user) => user,
             Err(WhitenoiseError::UserNotFound) => return Ok(false),
             Err(e) => return Err(e),
         };
-        self.load_account()
-            .await?
-            .is_following_user(&user, &self.db)
-            .await
+        let result = sqlx::query(
+            "SELECT COUNT(*) FROM account_follows WHERE account_id = ? AND user_id = ?",
+        )
+        .bind(self.account_id)
+        .bind(user.id)
+        .fetch_one(&self.db.pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+        Ok(result.get::<i64, _>(0) > 0)
     }
 
     /// Record that this account follows `user`.
-    ///
-    /// Delegates to `Account::follow_user` with the baked-in account pubkey.
     pub async fn add(&self, user: &User) -> Result<()> {
-        self.load_account().await?.follow_user(user, &self.db).await
+        let now = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "INSERT INTO account_follows (account_id, user_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(account_id, user_id) DO UPDATE SET updated_at = ?",
+        )
+        .bind(self.account_id)
+        .bind(user.id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&self.db.pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+        Ok(())
     }
 
     /// Remove the follow relationship between this account and `user`.
-    ///
-    /// Delegates to `Account::unfollow_user` with the baked-in account
-    /// pubkey.
     pub async fn remove(&self, user: &User) -> Result<()> {
-        self.load_account()
-            .await?
-            .unfollow_user(user, &self.db)
+        sqlx::query("DELETE FROM account_follows WHERE account_id = ? AND user_id = ?")
+            .bind(self.account_id)
+            .bind(user.id)
+            .execute(&self.db.pool)
             .await
+            .map_err(DatabaseError::Sqlx)?;
+        Ok(())
     }
 }
 
@@ -103,28 +122,8 @@ mod tests {
 
     use super::AccountFollowsRepo;
     use crate::whitenoise::database::Database;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, insert_test_account};
     use crate::whitenoise::users::User;
-
-    async fn insert_test_account(database: &Database, pubkey: &PublicKey) {
-        let user_pubkey = pubkey.to_hex();
-        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
-            .bind(&user_pubkey)
-            .execute(&database.pool)
-            .await
-            .expect("insert user");
-        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
-            .bind(&user_pubkey)
-            .fetch_one(&database.pool)
-            .await
-            .expect("get user id");
-        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
-            .bind(&user_pubkey)
-            .bind(user_id)
-            .execute(&database.pool)
-            .await
-            .expect("insert account");
-    }
 
     async fn insert_test_user(database: &Database, pubkey: &PublicKey) -> User {
         let (user, _) = User::find_or_create_by_pubkey(pubkey, database)
@@ -139,7 +138,9 @@ mod tests {
         let keys = Keys::generate();
         insert_test_account(&wn.database, &keys.public_key()).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         assert!(repo.all().await.unwrap().is_empty());
     }
 
@@ -151,7 +152,9 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         let target_user = insert_test_user(&wn.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         repo.add(&target_user).await.unwrap();
 
         let follows = repo.all().await.unwrap();
@@ -167,7 +170,9 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         insert_test_user(&wn.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         assert!(!repo.is_following(&target_pk).await.unwrap());
     }
 
@@ -178,7 +183,9 @@ mod tests {
         insert_test_account(&wn.database, &keys.public_key()).await;
         let unknown_pk = Keys::generate().public_key();
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         assert!(!repo.is_following(&unknown_pk).await.unwrap());
     }
 
@@ -190,7 +197,9 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         let target_user = insert_test_user(&wn.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         repo.add(&target_user).await.unwrap();
 
         assert!(repo.is_following(&target_pk).await.unwrap());
@@ -204,7 +213,9 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         let target_user = insert_test_user(&wn.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         repo.add(&target_user).await.unwrap();
         repo.remove(&target_user).await.unwrap();
 
@@ -220,7 +231,9 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         let target_user = insert_test_user(&wn.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+            .await
+            .unwrap();
         assert!(repo.remove(&target_user).await.is_ok());
     }
 
@@ -234,12 +247,25 @@ mod tests {
         let target_pk = Keys::generate().public_key();
         let target_user = insert_test_user(&wn.database, &target_pk).await;
 
-        let repo_a = AccountFollowsRepo::new(keys_a.public_key(), wn.database.clone());
-        let repo_b = AccountFollowsRepo::new(keys_b.public_key(), wn.database.clone());
+        let repo_a = AccountFollowsRepo::new(keys_a.public_key(), wn.database.clone())
+            .await
+            .unwrap();
+        let repo_b = AccountFollowsRepo::new(keys_b.public_key(), wn.database.clone())
+            .await
+            .unwrap();
 
         repo_a.add(&target_user).await.unwrap();
 
         assert!(repo_a.is_following(&target_pk).await.unwrap());
         assert!(!repo_b.is_following(&target_pk).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn new_returns_error_for_unknown_account() {
+        let (wn, _d, _l) = create_mock_whitenoise().await;
+        let unknown_pk = Keys::generate().public_key();
+
+        let result = AccountFollowsRepo::new(unknown_pk, wn.database.clone()).await;
+        assert!(result.is_err());
     }
 }

@@ -66,45 +66,12 @@ impl DraftsRepo {
 #[cfg(test)]
 mod tests {
     use mdk_core::prelude::GroupId;
-    use nostr_sdk::{Keys, PublicKey};
+    use nostr_sdk::Keys;
 
     use super::DraftsRepo;
-    use crate::whitenoise::database::Database;
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
-
-    async fn insert_test_account(database: &Database, pubkey: &PublicKey) {
-        let user_pubkey = pubkey.to_hex();
-        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
-            .bind(&user_pubkey)
-            .execute(&database.pool)
-            .await
-            .expect("insert user");
-        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
-            .bind(&user_pubkey)
-            .fetch_one(&database.pool)
-            .await
-            .expect("get user id");
-        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
-            .bind(&user_pubkey)
-            .bind(user_id)
-            .execute(&database.pool)
-            .await
-            .expect("insert account");
-    }
-
-    async fn insert_test_group(database: &Database, group_id: &GroupId) {
-        let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query(
-            "INSERT INTO group_information (mls_group_id, group_type, created_at, updated_at)
-             VALUES (?, 'group', ?, ?)",
-        )
-        .bind(group_id.as_slice())
-        .bind(now)
-        .bind(now)
-        .execute(&database.pool)
-        .await
-        .expect("insert group_information");
-    }
+    use crate::whitenoise::test_utils::{
+        create_mock_whitenoise, insert_test_account, insert_test_group,
+    };
 
     #[tokio::test]
     async fn save_creates_draft_scoped_to_account() {
