@@ -664,7 +664,10 @@ impl Whitenoise {
         // Shutdown gracefully before deleting data
         self.shutdown().await?;
 
-        // Tear down all relay-control subscriptions
+        // Deactivate session-owned inbox planes before tearing down shared infra
+        self.account_manager.deactivate_all_inboxes().await;
+
+        // Tear down shared relay-control subscriptions (group, ephemeral, telemetry)
         self.relay_control.shutdown_all().await;
 
         // Remove database (accounts and media) data
@@ -2810,10 +2813,10 @@ mod tests {
 
             // Tear down subscriptions to simulate the welcome-processing
             // cascade failure (group exists in MDK but not in group plane)
-            whitenoise
-                .relay_control
-                .deactivate_account_subscriptions(&creator_account.pubkey)
-                .await;
+            let session = whitenoise
+                .session(&creator_account.pubkey)
+                .expect("session should exist");
+            session.deactivate_subscriptions().await;
 
             // Re-activate inbox only (without groups) to isolate the test
             // to the group count parity check — inbox is healthy, groups are not
@@ -2824,10 +2827,9 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            whitenoise
-                .relay_control
-                .activate_account_subscriptions(
-                    creator_account.pubkey,
+            session
+                .activate_subscriptions(
+                    &whitenoise.relay_control,
                     &inbox_relays,
                     &[], // empty group specs — simulates the missing group
                     creator_account.since_timestamp(10),
@@ -2947,10 +2949,10 @@ mod tests {
             );
 
             // Test recovery - ensure_account_subscriptions should fix broken state
-            whitenoise
-                .relay_control
-                .deactivate_account_subscriptions(&account.pubkey)
-                .await;
+            let session = whitenoise
+                .session(&account.pubkey)
+                .expect("session should exist");
+            session.deactivate_subscriptions().await;
 
             let is_operational = whitenoise
                 .is_account_subscriptions_operational(&account)
@@ -3050,10 +3052,10 @@ mod tests {
             let account2 = whitenoise.create_identity().await.unwrap();
 
             // Break account1's subscriptions
-            whitenoise
-                .relay_control
-                .deactivate_account_subscriptions(&account1.pubkey)
-                .await;
+            let session1 = whitenoise
+                .session(&account1.pubkey)
+                .expect("session should exist");
+            session1.deactivate_subscriptions().await;
 
             // Verify account1 is not operational
             let account1_operational = whitenoise
@@ -3471,10 +3473,10 @@ mod tests {
 
             // Simulate app startup gap: no signer registered yet + account subscriptions missing.
             whitenoise.remove_external_signer(&account.pubkey);
-            whitenoise
-                .relay_control
-                .deactivate_account_subscriptions(&account.pubkey)
-                .await;
+            let session = whitenoise
+                .session(&account.pubkey)
+                .expect("session should exist");
+            session.deactivate_subscriptions().await;
 
             let before = whitenoise
                 .is_account_subscriptions_operational(&account)

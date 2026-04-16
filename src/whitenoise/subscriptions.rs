@@ -225,9 +225,10 @@ impl Whitenoise {
             return Ok(false);
         };
 
-        let relay_healthy = session.group_handle.has_active_subscription().await;
+        let inbox_healthy = session.has_inbox_subscription().await;
+        let group_healthy = session.group_handle.has_active_subscription().await;
 
-        if !relay_healthy {
+        if !inbox_healthy || !group_healthy {
             return Ok(false);
         }
 
@@ -287,7 +288,8 @@ impl Whitenoise {
     /// Returns a live in-memory snapshot of relay-plane state for debugging.
     #[perf_instrument("whitenoise")]
     pub async fn get_relay_control_state(&self) -> RelayControlStateSnapshot {
-        self.relay_control.snapshot().await
+        let inbox_snapshots = self.account_manager.collect_inbox_snapshots().await;
+        self.relay_control.snapshot(inbox_snapshots).await
     }
 
     #[perf_instrument("whitenoise")]
