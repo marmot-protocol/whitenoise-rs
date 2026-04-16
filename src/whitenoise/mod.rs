@@ -91,6 +91,10 @@ pub struct WhitenoiseConfig {
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
 
+    /// Benchmark-only override for the Whitenoise SQLCipher keyring key id.
+    #[cfg(feature = "benchmark-tests")]
+    pub database_key_id: Option<String>,
+
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
 }
@@ -110,6 +114,8 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(feature = "benchmark-tests")]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
@@ -134,12 +140,20 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(feature = "benchmark-tests")]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    #[cfg(feature = "benchmark-tests")]
+    pub fn with_database_key_id(mut self, database_key_id: &str) -> Self {
+        self.database_key_id = Some(database_key_id.to_string());
         self
     }
 }
@@ -487,7 +501,21 @@ impl Whitenoise {
 
         init_timing::record("directories_and_logging");
 
-        let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
+        let database_path = data_dir.join("whitenoise.sqlite");
+        #[cfg(feature = "benchmark-tests")]
+        let database = Arc::new(match config.database_key_id.as_deref() {
+            Some(database_key_id) => {
+                Database::new_encrypted_with_key_id(
+                    database_path,
+                    &keyring_service_id,
+                    database_key_id,
+                )
+                .await?
+            }
+            None => Database::new_encrypted(database_path, &keyring_service_id).await?,
+        });
+        #[cfg(not(feature = "benchmark-tests"))]
+        let database = Arc::new(Database::new_encrypted(database_path, &keyring_service_id).await?);
 
         init_timing::record("database");
 
@@ -848,9 +876,12 @@ pub mod test_utils {
         init_tracing(&config.logs_dir);
 
         let database = Arc::new(
-            Database::new(config.data_dir.join("test.sqlite"))
-                .await
-                .unwrap(),
+            Database::new_encrypted(
+                config.data_dir.join("test.sqlite"),
+                &config.keyring_service_id,
+            )
+            .await
+            .unwrap(),
         );
         let secrets_store = SecretsStore::new(&config.keyring_service_id);
 
