@@ -5038,4 +5038,49 @@ mod tests {
         assert!(found_contents.contains(&"charlie hello"));
         assert!(found_contents.contains(&"delta hello"));
     }
+
+    /// Regression test for GitHub issue #739: delivery-status isolation between accounts.
+    ///
+    /// Two local accounts share a group. Account A sends a message (gets delivery
+    /// status `Sending`). Account B queries the same message and must see no
+    /// delivery status (NULL), because delivery tracking is sender-local.
+    #[tokio::test]
+    async fn test_delivery_status_isolated_between_accounts() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let group_id = GroupId::from_slice(&[42; 32]);
+        setup_group(&group_id, &whitenoise.database).await;
+
+        let account_a = Keys::generate().public_key();
+        let account_b = Keys::generate().public_key();
+
+        // Account A sends a message with delivery status
+        let mut msg = create_test_chat_message(1, account_a);
+        msg.delivery_status = Some(DeliveryStatus::Sending);
+        AggregatedMessage::insert_message(&msg, &group_id, &account_a, &whitenoise.database)
+            .await
+            .unwrap();
+
+        // Account A sees delivery status on their own message
+        let fetched_by_a =
+            AggregatedMessage::find_by_id(&msg.id, &group_id, &account_a, &whitenoise.database)
+                .await
+                .unwrap()
+                .expect("message should exist");
+        assert_eq!(
+            fetched_by_a.delivery_status,
+            Some(DeliveryStatus::Sending),
+            "sender should see their own delivery status"
+        );
+
+        // Account B queries the same message — must NOT see A's delivery status
+        let fetched_by_b =
+            AggregatedMessage::find_by_id(&msg.id, &group_id, &account_b, &whitenoise.database)
+                .await
+                .unwrap()
+                .expect("message should exist for any account");
+        assert_eq!(
+            fetched_by_b.delivery_status, None,
+            "other account must not see sender's delivery status (issue #739)"
+        );
+    }
 }

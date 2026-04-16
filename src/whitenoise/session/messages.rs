@@ -265,6 +265,9 @@ impl<'a> MessageOpsForGroup<'a> {
 
     // ── Private helpers ────────────────────────────────────────────
 
+    // TODO(durable-task-runtime): Move spawn to caller. Views should not call
+    // tokio::spawn internally per the session-projection architecture rules.
+    // Blocked on the durable task runtime that replaces fire-and-forget publishing.
     fn spawn_publish_task(
         &self,
         message_event: Event,
@@ -283,9 +286,17 @@ impl<'a> MessageOpsForGroup<'a> {
         let author = mdk_message.pubkey;
         let content = mdk_message.content.clone();
 
+        // TODO: Push config and relay sync context should live on AccountSession
+        // instead of reaching back to the singleton. Tracked for Phase 16b.
         let (push_config, push_relay_sync) = match crate::whitenoise::Whitenoise::get_instance() {
             Ok(wn) => (Some(wn.config.clone()), Some(wn.user_relay_sync_context())),
-            Err(_) => (None, None),
+            Err(_) => {
+                tracing::debug!(
+                    target: "whitenoise::messages",
+                    "Whitenoise singleton unavailable, push notifications skipped"
+                );
+                (None, None)
+            }
         };
 
         tokio::spawn(async move {
