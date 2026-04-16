@@ -46,6 +46,7 @@
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::slice;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::whitenoise::WhitenoiseConfig;
@@ -57,6 +58,53 @@ use crate::whitenoise::background_notifications::{
 /// Guaranteed to be valid JSON conforming to the documented shape.
 const FALLBACK_FAILURE_JSON: &str =
     r#"{"status":"failed","notifications":[],"error":"internal error: failed to build response"}"#;
+
+/// Process-lifetime Tokio runtime used by [`wn_collect_notifications_after_push`].
+///
+/// The runtime **must** outlive every FFI call because `initialize_whitenoise`
+/// spawns long-lived tasks (event processor, scheduled tasks, discovery sync
+/// worker) onto whichever runtime is active when `block_on` is running. If we
+/// created a fresh runtime per FFI call and dropped it on return, those tasks
+/// would be aborted, leaving the `GLOBAL_WHITENOISE` singleton populated but
+/// functionally dead: the next FFI call would fast-path through
+/// `ensure_initialized` yet silently produce `no_data` because no event
+/// processor is running.
+///
+/// A current-thread runtime is sufficient: between FFI calls the runtime is
+/// idle (no one is driving it), and when a later `block_on` is invoked the
+/// runtime resumes driving any tasks parked across the previous call.
+static FFI_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+/// Get or lazily initialize the process-lifetime Tokio runtime.
+///
+/// Returns `None` if the runtime could not be constructed (extremely rare —
+/// typically only happens if OS thread/fd allocation fails). Callers should
+/// surface this as a failure JSON via the callback.
+fn ffi_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = FFI_RUNTIME.get() {
+        return Some(rt);
+    }
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => {
+            // If another caller raced us to init, `set` returns Err with the
+            // losing value (which is then dropped). Either way, `get` returns
+            // the winner.
+            let _ = FFI_RUNTIME.set(rt);
+            FFI_RUNTIME.get()
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "whitenoise::ffi",
+                "Failed to build FFI Tokio runtime: {}",
+                e
+            );
+            None
+        }
+    }
+}
 
 /// Callback invoked with a JSON payload.
 ///
@@ -148,21 +196,16 @@ pub unsafe extern "C" fn wn_collect_notifications_after_push(
         );
         let max_wait = Duration::from_millis(u64::from(max_wait_ms));
 
-        // Use a current-thread runtime: this FFI call is a bounded, single
-        // async operation driven to completion via block_on. A multi-threaded
-        // runtime would spawn worker threads we don't need for a background
-        // iOS push handler. `enable_all()` keeps net + time + the blocking
-        // worker pool available for SQLite and any spawn_blocking callers
-        // down the call stack.
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                return result_to_json(BackgroundNotificationResult::failed(format!(
-                    "failed to create tokio runtime: {e}"
-                )));
+        // Drive the async work on a process-lifetime runtime. See
+        // [`FFI_RUNTIME`] for why this cannot be a per-call runtime: the
+        // spawned tasks inside `initialize_whitenoise` must outlive the
+        // `block_on` that spawned them.
+        let rt = match ffi_runtime() {
+            Some(rt) => rt,
+            None => {
+                return result_to_json(BackgroundNotificationResult::failed(
+                    "failed to create tokio runtime".to_string(),
+                ));
             }
         };
 

@@ -178,6 +178,12 @@ async fn collect_notifications_inner(
     config: WhitenoiseConfig,
     max_wait: Duration,
 ) -> Result<BackgroundNotificationResult> {
+    // Start the budget clock before init so the whole call — not just the
+    // drain phase — stays within `max_wait`. If cold init consumes most or
+    // all of the budget, drain gets whatever is left (down to zero, in which
+    // case drain returns immediately with an empty collection).
+    let start = std::time::Instant::now();
+
     tracing::info!(
         target: "whitenoise::background_notifications",
         max_wait_ms = max_wait.as_millis() as u64,
@@ -202,14 +208,19 @@ async fn collect_notifications_inner(
     // than a misleading "no_data" result.
     whitenoise.ensure_all_subscriptions().await?;
 
+    let init_elapsed = start.elapsed();
+    let drain_budget = max_wait.saturating_sub(init_elapsed);
     tracing::debug!(
         target: "whitenoise::background_notifications",
+        init_ms = init_elapsed.as_millis() as u64,
+        drain_budget_ms = drain_budget.as_millis() as u64,
         "Subscriptions refreshed, starting collection window"
     );
 
     // Step 4: Collect notifications with quiet-window + hard deadline +
-    // size cap (MAX_COLLECTED).
-    let collected = drain_notifications(&mut rx, max_wait).await;
+    // size cap (MAX_COLLECTED). Uses the *remaining* budget after init so
+    // the total call stays within `max_wait`.
+    let collected = drain_notifications(&mut rx, drain_budget).await;
 
     tracing::info!(
         target: "whitenoise::background_notifications",
@@ -448,6 +459,27 @@ mod tests {
 
         let collected = drain_notifications(&mut rx, Duration::from_secs(60)).await;
         assert_eq!(collected.len(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_notifications_zero_budget_returns_empty_immediately() {
+        // When init has consumed the entire caller-provided budget, the drain
+        // phase receives `Duration::ZERO`. It must not panic and must not
+        // pull any events off the channel — it should return an empty Vec
+        // on the very first loop iteration.
+        let (tx, mut rx) = broadcast::channel(16);
+        // Put events on the channel so we can prove we don't consume any.
+        for i in 0..3 {
+            let content = format!("msg {i}");
+            tx.send(make_test_notification(
+                NotificationTrigger::NewMessage,
+                &content,
+            ))
+            .expect("send should succeed while rx is alive");
+        }
+
+        let collected = drain_notifications(&mut rx, Duration::ZERO).await;
+        assert_eq!(collected.len(), 0, "zero budget must not drain any events");
     }
 
     #[test]
