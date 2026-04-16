@@ -166,6 +166,10 @@ async fn recover_interrupted_migration(
             }
             Err(err) => {
                 if backup_path.exists() {
+                    tracing::warn!(
+                        target: "whitenoise::database",
+                        "Encrypted temp database is invalid ({err}); restoring plaintext backup"
+                    );
                     remove_file_if_exists(&temp_path)?;
                     fs::rename(&backup_path, db_path)?;
                     return Ok(());
@@ -185,15 +189,15 @@ async fn recover_interrupted_migration(
 
 async fn checkpoint_plaintext_database(db_path: &Path) -> Result<(), DatabaseError> {
     let mut conn = plaintext_connect_options(db_path, false).connect().await?;
-    let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .fetch_one(&mut conn)
-        .await?;
-    let busy: i64 = row.try_get(0)?;
+    let (busy, log, checkpointed): (i64, i64, i64) =
+        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&mut conn)
+            .await?;
 
-    if busy != 0 {
-        return Err(DatabaseError::EncryptionMigration(
-            "Could not checkpoint plaintext database before encryption migration".to_string(),
-        ));
+    if busy != 0 || log != checkpointed {
+        return Err(DatabaseError::EncryptionMigration(format!(
+            "WAL checkpoint incomplete before encryption migration: busy={busy}, log={log}, checkpointed={checkpointed}"
+        )));
     }
 
     conn.close().await?;
@@ -356,6 +360,8 @@ fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+// SQLite's ATTACH DATABASE does not accept bind parameters — only literal strings — so we
+// must embed the path directly with proper SQL single-quote escaping.
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -373,10 +379,20 @@ impl MigrationLock {
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                 if Self::is_stale(path)? {
                     remove_file_if_exists(path)?;
-                    OpenOptions::new().write(true).create_new(true).open(path)?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
+                    match OpenOptions::new().write(true).create_new(true).open(path) {
+                        Ok(_) => {
+                            return Ok(Self {
+                                path: path.to_path_buf(),
+                            });
+                        }
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                            return Err(DatabaseError::EncryptionMigration(format!(
+                                "Database encryption migration is already running: {}",
+                                path.display()
+                            )));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
                 }
 
                 Err(DatabaseError::EncryptionMigration(format!(

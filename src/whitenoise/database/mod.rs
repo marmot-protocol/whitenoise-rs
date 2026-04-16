@@ -202,6 +202,8 @@ impl Database {
             .await?;
 
         if encryption_config.is_some() {
+            // Confirm the pool can acquire a working connection end-to-end. Key correctness and
+            // schema integrity are already verified in prepare_sqlcipher_database before we reach here.
             let mut conn = pool.acquire().await?;
             sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
         }

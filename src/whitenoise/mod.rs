@@ -91,7 +91,7 @@ pub struct WhitenoiseConfig {
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
 
-    /// Test-only override for the Whitenoise SQLCipher keyring key id.
+    /// Override for the Whitenoise SQLCipher keyring key id; available in test and benchmark builds.
     #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
     pub database_key_id: Option<String>,
 
