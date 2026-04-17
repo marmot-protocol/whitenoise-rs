@@ -48,6 +48,10 @@ impl AccountFollowsRepo {
     }
 
     /// Return all users followed by this account.
+    ///
+    /// The SQL here mirrors `Account::follows` in `database/accounts.rs`. Both
+    /// coexist during the session/projection migration; `Account::follows` will
+    /// be removed once all callers have moved to this repo.
     pub async fn all(&self) -> Result<Vec<User>> {
         let users = sqlx::query_as::<_, User>(
             "SELECT u.id, u.pubkey, u.metadata, u.created_at, u.metadata_known_at, u.updated_at
