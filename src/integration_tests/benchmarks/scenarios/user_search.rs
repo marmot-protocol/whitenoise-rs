@@ -78,6 +78,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
         unreachable!()
     }
 
+    #[allow(deprecated)]
     async fn run_benchmark(
         &mut self,
         whitenoise: &'static Whitenoise,

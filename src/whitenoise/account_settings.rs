@@ -21,11 +21,18 @@ pub struct AccountSettings {
 
 impl Whitenoise {
     /// Returns the settings for `account`, creating a default row if none exists.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::settings().get() instead."
+    )]
     pub async fn account_settings(
         &self,
         account: &Account,
     ) -> Result<AccountSettings, WhitenoiseError> {
-        Ok(AccountSettings::find_or_create_for_pubkey(&account.pubkey, &self.database).await?)
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.settings().get().await
     }
 
     /// Sets the notification preference for `account` and returns the updated settings.
@@ -33,14 +40,23 @@ impl Whitenoise {
     /// Disabling notifications here does not clear any locally stored push
     /// registration. MIP-05 sharing/removal decisions are handled separately by
     /// the push-notifications subsystem.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::settings().update_notifications_enabled() for DB ops; \
+                this facade also handles push-token reconciliation."
+    )]
     pub async fn update_notifications_enabled(
         &self,
         account: &Account,
         enabled: bool,
     ) -> Result<AccountSettings, WhitenoiseError> {
-        let settings =
-            AccountSettings::update_notifications_enabled(&account.pubkey, enabled, &self.database)
-                .await?;
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let settings = session
+            .settings()
+            .update_notifications_enabled(enabled)
+            .await?;
 
         let result = match enabled {
             true => self.share_local_push_token_to_joined_groups(account).await,
@@ -65,6 +81,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use crate::whitenoise::test_utils::*;
 

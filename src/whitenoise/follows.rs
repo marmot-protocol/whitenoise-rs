@@ -19,6 +19,11 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will follow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be followed
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::social().add_follow() / remove_follow() for DB ops; \
+                this facade also handles Nostr publish and user resolution."
+    )]
     #[perf_instrument("follows")]
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
         let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
@@ -28,7 +33,10 @@ impl Whitenoise {
             self.discovery_sync_worker.request_rebuild();
         }
 
-        account.follow_user(&user, &self.database).await?;
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.social().add_follow(&user).await?;
         self.background_publish_account_follow_list(account).await?;
         Ok(())
     }
@@ -43,6 +51,11 @@ impl Whitenoise {
     ///
     /// * `account` - The account that will unfollow the user (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to be unfollowed
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::social().remove_follow() for DB ops; \
+                this facade also handles Nostr publish."
+    )]
     #[perf_instrument("follows")]
     pub async fn unfollow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
         let user = match self.find_user_by_pubkey(pubkey).await {
@@ -50,7 +63,10 @@ impl Whitenoise {
             Err(WhitenoiseError::UserNotFound) => return Ok(()),
             Err(e) => return Err(e),
         };
-        account.unfollow_user(&user, &self.database).await?;
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.social().remove_follow(&user).await?;
         self.background_publish_account_follow_list(account).await?;
         Ok(())
     }
@@ -65,14 +81,16 @@ impl Whitenoise {
     ///
     /// * `account` - The account to check (must exist in database with valid ID)
     /// * `pubkey` - The public key of the user to check if followed
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::social().is_following() instead."
+    )]
     #[perf_instrument("follows")]
     pub async fn is_following_user(&self, account: &Account, pubkey: &PublicKey) -> Result<bool> {
-        let user = match self.find_user_by_pubkey(pubkey).await {
-            Ok(user) => user,
-            Err(WhitenoiseError::UserNotFound) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        account.is_following_user(&user, &self.database).await
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.social().is_following(pubkey).await
     }
 
     /// Retrieves all users that an account follows.
@@ -84,13 +102,21 @@ impl Whitenoise {
     /// # Arguments
     ///
     /// * `account` - The account whose follows to retrieve (must exist in database with valid ID)
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::social().follows() instead."
+    )]
     #[perf_instrument("follows")]
     pub async fn follows(&self, account: &Account) -> Result<Vec<User>> {
-        account.follows(&self.database).await
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.social().follows().await
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use nostr_sdk::Keys;
 

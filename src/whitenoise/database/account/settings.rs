@@ -54,8 +54,7 @@ impl AccountSettingsRepo {
     /// push-token reconciliation (sharing or removing the local push token
     /// from joined groups). Callers that need the full side-effectful behaviour
     /// should use `Whitenoise::update_notifications_enabled` instead, or handle
-    /// push-token sync separately. Phase 5 callers must account for this when
-    /// migrating away from the `Whitenoise` facade.
+    /// push-token sync separately.
     pub async fn update_notifications_enabled(&self, enabled: bool) -> Result<AccountSettings> {
         Ok(
             AccountSettings::update_notifications_enabled(&self.account_pubkey, enabled, &self.db)

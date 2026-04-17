@@ -28,6 +28,7 @@ impl SaveDraftTestCase {
 
 #[async_trait]
 impl TestCase for SaveDraftTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Saving draft for account '{}' in group '{}'...",
