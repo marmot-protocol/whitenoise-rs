@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use nostr_sdk::PublicKey;
-use sqlx::Row;
 
 use crate::whitenoise::database::{Database, DatabaseError};
 use crate::whitenoise::error::{Result, WhitenoiseError};
@@ -69,20 +68,19 @@ impl AccountFollowsRepo {
     /// record in the database, matching the existing behaviour in
     /// `Whitenoise::is_following_user`.
     pub async fn is_following(&self, target_pubkey: &PublicKey) -> Result<bool> {
-        let user = match User::find_by_pubkey(target_pubkey, &self.db).await {
-            Ok(user) => user,
-            Err(WhitenoiseError::UserNotFound) => return Ok(false),
-            Err(e) => return Err(e),
-        };
-        let result = sqlx::query(
-            "SELECT COUNT(*) FROM account_follows WHERE account_id = ? AND user_id = ?",
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT EXISTS (
+                 SELECT 1 FROM account_follows af
+                 JOIN users u ON af.user_id = u.id
+                 WHERE u.pubkey = ? AND af.account_id = ?
+             )",
         )
+        .bind(target_pubkey.to_hex())
         .bind(self.account_id)
-        .bind(user.id)
-        .fetch_one(&self.db.pool)
+        .fetch_optional(&self.db.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
-        Ok(result.get::<i64, _>(0) > 0)
+        Ok(row.map(|(exists,)| exists).unwrap_or(false))
     }
 
     /// Record that this account follows `user`.

@@ -441,6 +441,7 @@ pub(crate) mod test_helpers {
     use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
+    use crate::whitenoise::test_utils::insert_test_account;
 
     pub async fn test_db() -> Arc<Database> {
         let pool = SqlitePoolOptions::new()
@@ -463,23 +464,7 @@ pub(crate) mod test_helpers {
         let db = test_db().await;
 
         // Insert the account row so AccountFollowsRepo can resolve the account id.
-        let user_pubkey = pubkey.to_hex();
-        sqlx::query("INSERT INTO users (pubkey, metadata) VALUES (?, '{}')")
-            .bind(&user_pubkey)
-            .execute(&db.pool)
-            .await
-            .expect("insert test user");
-        let (user_id,): (i64,) = sqlx::query_as("SELECT id FROM users WHERE pubkey = ?")
-            .bind(&user_pubkey)
-            .fetch_one(&db.pool)
-            .await
-            .expect("get test user id");
-        sqlx::query("INSERT INTO accounts (pubkey, user_id, last_synced_at) VALUES (?, ?, NULL)")
-            .bind(&user_pubkey)
-            .bind(user_id)
-            .execute(&db.pool)
-            .await
-            .expect("insert test account");
+        insert_test_account(&db, &pubkey).await;
 
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
         let ephemeral = EphemeralPlane::new(
