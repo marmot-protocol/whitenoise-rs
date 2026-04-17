@@ -33,6 +33,7 @@ impl LoadDraftTestCase {
 
 #[async_trait]
 impl TestCase for LoadDraftTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Loading draft for account '{}' in group '{}'...",

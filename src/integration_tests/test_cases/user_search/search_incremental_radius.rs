@@ -34,6 +34,7 @@ impl SearchIncrementalRadiusTestCase {
 
 #[async_trait]
 impl TestCase for SearchIncrementalRadiusTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let account = context.get_account(&self.account_name)?;
         let searcher_pubkey = account.pubkey;

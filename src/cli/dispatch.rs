@@ -1208,6 +1208,7 @@ async fn profile_update(
     Ok(to_response(&metadata))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn follows_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
@@ -1232,6 +1233,7 @@ enum FollowAction {
     Remove,
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn follows_mutate(
     wn: &Whitenoise,
@@ -1249,6 +1251,7 @@ async fn follows_mutate(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn follows_check(
     wn: &Whitenoise,

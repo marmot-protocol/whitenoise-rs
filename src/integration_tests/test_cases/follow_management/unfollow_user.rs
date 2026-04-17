@@ -20,6 +20,7 @@ impl UnfollowUserTestCase {
 
 #[async_trait]
 impl TestCase for UnfollowUserTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Unfollowing user {} from account: {}",
