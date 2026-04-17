@@ -138,7 +138,7 @@ transitional lookup.
 
 ### Phase 4: Account repository scaffold for the first small domains (~500 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #754
 
 <details>
 <summary>Details</summary>

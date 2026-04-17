@@ -17,6 +17,8 @@ use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
+use crate::whitenoise::database::Database;
+use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 
 /// Signer slot shared between `AccountSession` and its relay handles.
@@ -52,6 +54,8 @@ impl AccountInboxState {
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
+    #[expect(dead_code, reason = "used in Phase 5 view-pattern callers")]
+    pub(crate) repos: AccountRepositories,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -64,13 +68,14 @@ pub struct AccountSession {
 }
 
 impl AccountSession {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         signer: Option<Arc<dyn NostrSigner>>,
         ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
         relay_control: Arc<crate::relay_control::RelayControlPlane>,
-    ) -> Self {
+        db: Arc<Database>,
+    ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
         let ephemeral = relay_handles::AccountEphemeralHandle::new(
@@ -79,7 +84,8 @@ impl AccountSession {
             signer.clone(),
         );
         let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
-        Self {
+        Ok(Self {
+            repos: AccountRepositories::new(account_pubkey, db).await?,
             account_pubkey,
             mdk: Arc::new(mdk),
             signer,
@@ -89,25 +95,27 @@ impl AccountSession {
             group_handle,
             inbox: RwLock::new(None),
             activation_lock: Mutex::new(()),
-        }
+        })
     }
 
     /// Build a session from a persisted account, loading MDK and (for local
     /// accounts) the signer from the secrets store.
-    pub(crate) fn from_account(account: &Account, wn: &Whitenoise) -> Result<Self> {
+    pub(crate) async fn from_account(account: &Account, wn: &Whitenoise) -> Result<Self> {
         let mdk = wn.create_mdk_for_account(account.pubkey)?;
         let signer = if account.has_local_key() {
             Some(wn.get_signer_for_account(account)?)
         } else {
             None
         };
-        Ok(Self::new(
+        Self::new(
             account.pubkey,
             mdk,
             signer,
             wn.relay_control.ephemeral(),
             wn.relay_control.clone(),
-        ))
+            wn.database.clone(),
+        )
+        .await
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -386,7 +394,7 @@ impl AccountManager {
         let mut err_count = 0usize;
 
         for account in &accounts {
-            match AccountSession::from_account(account, wn) {
+            match AccountSession::from_account(account, wn).await {
                 Ok(session) => {
                     self.insert_session(Arc::new(session));
                     ok_count += 1;
@@ -433,6 +441,7 @@ pub(crate) mod test_helpers {
     use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
+    use crate::whitenoise::test_utils::insert_test_account;
 
     pub async fn test_db() -> Arc<Database> {
         let pool = SqlitePoolOptions::new()
@@ -453,6 +462,10 @@ pub(crate) mod test_helpers {
     pub async fn test_session(pubkey: PublicKey) -> Arc<AccountSession> {
         let mdk = create_mdk(pubkey);
         let db = test_db().await;
+
+        // Insert the account row so AccountFollowsRepo can resolve the account id.
+        insert_test_account(&db, &pubkey).await;
+
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
         let ephemeral = EphemeralPlane::new(
             EphemeralPlaneConfig::default(),
@@ -460,14 +473,17 @@ pub(crate) mod test_helpers {
             event_sender.clone(),
             RelayObservability::new(RelayObservabilityConfig::default()),
         );
-        let relay_control = Arc::new(RelayControlPlane::new(db, vec![], event_sender, [0u8; 16]));
-        Arc::new(AccountSession::new(
-            pubkey,
-            mdk,
-            None,
-            ephemeral,
-            relay_control,
-        ))
+        let relay_control = Arc::new(RelayControlPlane::new(
+            db.clone(),
+            vec![],
+            event_sender,
+            [0u8; 16],
+        ));
+        Arc::new(
+            AccountSession::new(pubkey, mdk, None, ephemeral, relay_control, db)
+                .await
+                .expect("create test session"),
+        )
     }
 }
 
