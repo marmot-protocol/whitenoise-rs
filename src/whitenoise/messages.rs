@@ -1,45 +1,22 @@
 pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
 use crate::{
-    perf_instrument, perf_span,
+    perf_instrument,
     types::MessageWithTokens,
     whitenoise::{
         Whitenoise,
         accounts::Account,
-        accounts_groups::AccountGroup,
         aggregated_message::AggregatedMessage,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::{Database, retry_on_lock},
-        error::{Result, WhitenoiseError},
+        error::Result,
         media_files::MediaFile,
-        message_aggregator::{
-            ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
-        },
-        message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
-        push_notifications::publish_notification_requests_after_delivery_with,
+        message_aggregator::{ChatMessage, SearchResult},
     },
 };
 use mdk_core::prelude::{message_types::Message, *};
 use nostr_sdk::prelude::*;
 
 impl Whitenoise {
-    /// Sends a message to a specific group and returns the message with parsed tokens.
-    ///
-    /// This method creates and sends a message to a group using the Nostr MLS protocol.
-    /// It handles the complete message lifecycle including event creation, MLS message
-    /// generation, publishing to relays, and token parsing. The message content is
-    /// automatically parsed for tokens (e.g., mentions, hashtags) before returning.
-    ///
-    /// # Arguments
-    ///
-    /// * `sender_pubkey` - The public key of the user sending the message. This is used
-    ///   to identify the sender and fetch their account for message creation.
-    /// * `group_id` - The unique identifier of the target group where the message will be sent.
-    /// * `message` - The content of the message to be sent as a string.
-    /// * `kind` - The Nostr event kind as a u16. This determines the type of event being created
-    ///   (e.g., text note, reaction, etc.).
-    /// * `tags` - Optional vector of Nostr tags to include with the message. If None, an empty
-    ///   tag list will be used.
     #[perf_instrument("messages")]
     pub async fn send_message_to_group(
         &self,
@@ -49,331 +26,39 @@ impl Whitenoise {
         kind: u16,
         tags: Option<Vec<Tag>>,
     ) -> Result<MessageWithTokens> {
-        let _build_span = perf_span!("messages::build_unsigned_event");
-        let (inner_event, event_id) =
-            self.create_unsigned_nostr_event(&account.pubkey, &message, kind, tags)?;
-        drop(_build_span);
-
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-
-        // Guard: fail immediately if no relays configured (before creating MLS message
-        // to avoid persisting a message in MDK storage that can never be delivered)
-        let _relay_check = perf_span!("messages::get_group_relays");
-        let group_relays: Vec<RelayUrl> = mdk.get_relays(group_id)?.into_iter().collect();
-        drop(_relay_check);
-        if group_relays.is_empty() {
-            return Err(WhitenoiseError::GroupMissingRelays);
-        }
-
-        let _mls_span = perf_span!("messages::mls_create_message");
-        let message_event = mdk.create_message(group_id, inner_event, None)?;
-        let mdk_message =
-            mdk.get_message(group_id, &event_id)?
-                .ok_or(WhitenoiseError::MdkCoreError(
-                    mdk_core::error::Error::MessageNotFound,
-                ))?;
-        drop(_mls_span);
-
-        let _parse_span = perf_span!("messages::parse_content_tokens");
-        let tokens = self.content_parser.parse(&mdk_message.content);
-        drop(_parse_span);
-
-        // Proactive caching + delivery tracking for all outgoing event kinds.
-        // Kind 9 (chat): full message processing + NewMessage emission
-        // Kind 7/5 (reaction/deletion): insert event + apply aggregated effect on parent
-        match kind {
-            9 => {
-                self.process_and_emit_outgoing_message(&mdk_message, group_id)
-                    .await?;
-            }
-            7 => {
-                self.cache_and_apply_outgoing_reaction(&mdk_message, group_id)
-                    .await?;
-            }
-            5 => {
-                self.cache_and_apply_outgoing_deletion(&mdk_message, group_id)
-                    .await?;
-            }
-            other => {
-                return Err(WhitenoiseError::Internal(format!(
-                    "Unsupported outgoing event kind: {other}"
-                )));
-            }
-        }
-
-        // Spawn background publish task with retries + delivery tracking for all kinds.
-        // Any successfully delivered outgoing event can fan out best-effort notification
-        // requests; receivers decide what to surface locally.
-        // On failure for kind 7/5, cascade by reversing the optimistic aggregated effect.
-        let ephemeral = self.relay_control.ephemeral();
-        let user_relay_sync = self.user_relay_sync_context();
-        let config = self.config.clone();
-        let event_id_str = event_id.to_string();
-        let account_pubkey = account.pubkey;
-        let database = self.database.clone();
-        let stream_manager = self.message_stream_manager.clone();
-        let group_id_clone = group_id.clone();
-        let tags_clone = mdk_message.tags.clone();
-        let message_author = mdk_message.pubkey;
-        let reaction_content = mdk_message.content.clone();
-
-        tokio::spawn(async move {
-            let publish_result = ephemeral
-                .publish_message_event(
-                    message_event,
-                    &account_pubkey,
-                    &group_relays,
-                    &event_id_str,
-                    &group_id_clone,
-                    &database,
-                    &stream_manager,
-                )
-                .await;
-
-            if publish_result.succeeded()
-                && let Err(error) = publish_notification_requests_after_delivery_with(
-                    &config,
-                    &database,
-                    &user_relay_sync,
-                    &ephemeral,
-                    account_pubkey,
-                    &group_id_clone,
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account_pubkey.to_hex(),
-                    error = %error,
-                    "Failed to publish best-effort notification requests after message delivery"
-                );
-            }
-
-            // On failure, reverse optimistic aggregated effects for reactions/deletions
-            if !publish_result.succeeded() {
-                Whitenoise::cascade_delivery_failure(
-                    kind,
-                    &event_id_str,
-                    &tags_clone,
-                    &message_author,
-                    &reaction_content,
-                    &group_id_clone,
-                    &database,
-                    &stream_manager,
-                )
-                .await;
-            }
-        });
-
-        Ok(MessageWithTokens::new(mdk_message, tokens))
-    }
-
-    /// Process an outgoing chat message for optimistic UI display.
-    ///
-    /// Aggregates the raw MDK message into a `ChatMessage`, sets its delivery
-    /// status to `Sending`, persists it in the cache, and emits a `NewMessage`
-    /// update so the UI shows it immediately.
-    #[perf_instrument("messages")]
-    async fn process_and_emit_outgoing_message(
-        &self,
-        mdk_message: &Message,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let chat_message = self
-            .message_aggregator
-            .process_single_message(
-                mdk_message,
-                &self.content_parser,
-                MediaFile::find_by_group(&self.database, group_id).await?,
-            )
-            .await
-            .map(|mut msg| {
-                msg.delivery_status = Some(DeliveryStatus::Sending);
-                msg
-            })?;
-
-        AggregatedMessage::insert_message(&chat_message, group_id, &self.database).await?;
-
-        // Emit NewMessage so the UI shows it immediately (optimistic)
-        self.message_stream_manager.emit(
-            group_id,
-            MessageUpdate {
-                trigger: UpdateTrigger::NewMessage,
-                message: chat_message,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Cache an outgoing reaction (kind 7) and optimistically apply it to the parent.
-    ///
-    /// Inserts the reaction event into `aggregated_messages`, sets delivery status
-    /// to `Sending`, applies the reaction to the target kind-9 message, and emits
-    /// a `ReactionAdded` update so the UI reflects the change immediately.
-    #[perf_instrument("messages")]
-    async fn cache_and_apply_outgoing_reaction(
-        &self,
-        mdk_message: &Message,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        // Insert the reaction event row
-        AggregatedMessage::insert_reaction(mdk_message, group_id, &self.database).await?;
-
-        // Track delivery status for the reaction event (direct insert, not full
-        // update_delivery_status which opens a transaction that can contend with
-        // background publish_with_retries)
-        AggregatedMessage::insert_delivery_status(
-            &mdk_message.id.to_string(),
-            group_id,
-            &DeliveryStatus::Sending,
-            &self.database,
-        )
-        .await?;
-
-        // Apply reaction to the target kind-9 message (if e-tag is present and target cached)
-        if let Ok(target_id) = Self::extract_reaction_target_id(&mdk_message.tags)
-            && let Some(mut target) =
-                AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
-        {
-            let emoji = emoji_utils::validate_and_normalize_reaction(
-                &mdk_message.content,
-                self.message_aggregator.config().normalize_emoji,
-            )?;
-
-            reaction_handler::add_reaction_to_message(
-                &mut target,
-                &mdk_message.pubkey,
-                &emoji,
-                mdk_message.created_at,
-                mdk_message.id,
-            );
-
-            AggregatedMessage::update_reactions(
-                &target.id,
-                group_id,
-                &target.reactions,
-                &self.database,
-            )
+        let session = self.require_session(&account.pubkey)?;
+        let result = session
+            .messages()
+            .for_group(group_id)
+            .send(message, kind, tags)
             .await?;
 
-            self.message_stream_manager.emit(
+        if result.last_message_deleted {
+            self.emit_chat_list_update_for_group(
                 group_id,
-                MessageUpdate {
-                    trigger: UpdateTrigger::ReactionAdded,
-                    message: target,
-                },
-            );
+                ChatListUpdateTrigger::LastMessageDeleted,
+            )
+            .await;
         }
 
-        Ok(())
+        Ok(result.message)
     }
 
-    /// Cache an outgoing deletion (kind 5) and optimistically apply it to the parent.
-    ///
-    /// Inserts the deletion event into `aggregated_messages`, sets delivery status
-    /// to `Sending`, marks the target message(s) as deleted, and emits appropriate
-    /// updates so the UI reflects the change immediately.
     #[perf_instrument("messages")]
-    async fn cache_and_apply_outgoing_deletion(
+    pub async fn retry_message_publish(
         &self,
-        mdk_message: &Message,
+        account: &Account,
         group_id: &GroupId,
+        event_id: &EventId,
     ) -> Result<()> {
-        // Insert the deletion event row
-        AggregatedMessage::insert_deletion(mdk_message, group_id, &self.database).await?;
-
-        // Track delivery status for the deletion event (direct insert, not full
-        // update_delivery_status which opens a transaction that can contend with
-        // background publish_with_retries)
-        AggregatedMessage::insert_delivery_status(
-            &mdk_message.id.to_string(),
-            group_id,
-            &DeliveryStatus::Sending,
-            &self.database,
-        )
-        .await?;
-
-        // Capture the last message ID *before* applying deletions so we can
-        // detect if the deletion removed it and emit a chat-list update.
-        let last_message_id = AggregatedMessage::find_last_by_group_ids(
-            std::slice::from_ref(group_id),
-            &self.database,
-        )
-        .await
-        .ok()
-        .and_then(|v| v.into_iter().next())
-        .map(|s| s.message_id.to_hex());
-
-        // Apply deletion to all targets (reactions and/or messages)
-        let deletion_event_id_str = mdk_message.id.to_string();
-        let target_ids = Self::extract_deletion_target_ids(&mdk_message.tags);
-        for target_id in &target_ids {
-            // Check if target is a reaction — must remove from parent's reaction summary
-            if let Some(reaction) =
-                AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.database).await?
-            {
-                // Remove reaction from parent message's summary
-                if let Ok(parent_id) = Self::extract_reaction_target_id(&reaction.tags)
-                    && let Some(mut parent) =
-                        AggregatedMessage::find_by_id(&parent_id, group_id, &self.database).await?
-                    && reaction_handler::remove_reaction_from_message(&mut parent, &reaction.author)
-                {
-                    AggregatedMessage::update_reactions(
-                        &parent_id,
-                        group_id,
-                        &parent.reactions,
-                        &self.database,
-                    )
-                    .await?;
-
-                    self.message_stream_manager.emit(
-                        group_id,
-                        MessageUpdate {
-                            trigger: UpdateTrigger::ReactionRemoved,
-                            message: parent,
-                        },
-                    );
-                }
-
-                AggregatedMessage::mark_deleted(
-                    target_id,
-                    group_id,
-                    &deletion_event_id_str,
-                    &self.database,
-                )
-                .await?;
-                continue;
-            }
-
-            // Target is a message — mark as deleted
-            AggregatedMessage::mark_deleted(
-                target_id,
-                group_id,
-                &deletion_event_id_str,
-                &self.database,
-            )
+        let session = self.require_session(&account.pubkey)?;
+        let result = session
+            .messages()
+            .for_group(group_id)
+            .retry_publish(event_id)
             .await?;
 
-            if let Some(mut msg) =
-                AggregatedMessage::find_by_id(target_id, group_id, &self.database).await?
-            {
-                msg.is_deleted = true;
-                self.message_stream_manager.emit(
-                    group_id,
-                    MessageUpdate {
-                        trigger: UpdateTrigger::MessageDeleted,
-                        message: msg,
-                    },
-                );
-            }
-        }
-
-        // If the deleted target was the last message in the group, emit a
-        // chat-list update so the UI shows the new last message.
-        if let Some(last_id) = last_message_id
-            && target_ids.contains(&last_id)
-        {
+        if result.last_message_deleted {
             self.emit_chat_list_update_for_group(
                 group_id,
                 ChatListUpdateTrigger::LastMessageDeleted,
@@ -384,247 +69,16 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Reverse optimistic aggregated effects when a reaction/deletion fails to publish.
-    ///
-    /// - **Kind 7 (reaction)**: Remove the reaction from the parent message's summary.
-    /// - **Kind 5 (deletion)**: Clear `deletion_event_id` on targets so they reappear.
-    /// - **Kind 9 / other**: No cascade needed — the message already shows Failed status.
-    #[perf_instrument("messages")]
-    async fn cascade_delivery_failure(
-        kind: u16,
-        event_id: &str,
-        tags: &Tags,
-        author: &PublicKey,
-        content: &str,
-        group_id: &GroupId,
-        database: &Database,
-        stream_manager: &MessageStreamManager,
-    ) {
-        match kind {
-            7 => {
-                // Reaction failed: remove from parent message's reaction summary
-                let target_id = match Self::extract_reaction_target_id(tags) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "whitenoise::messages::delivery",
-                            "Failed to extract reaction target for cascade: {e}",
-                        );
-                        return;
-                    }
-                };
-
-                let result = retry_on_lock(|| async {
-                    let Some(mut parent) =
-                        AggregatedMessage::find_by_id(&target_id, group_id, database).await?
-                    else {
-                        return Ok(None);
-                    };
-
-                    if !reaction_handler::remove_reaction_from_message(&mut parent, author) {
-                        return Ok(None);
-                    }
-
-                    AggregatedMessage::update_reactions(
-                        &target_id,
-                        group_id,
-                        &parent.reactions,
-                        database,
-                    )
-                    .await?;
-
-                    Ok(Some(parent))
-                })
-                .await;
-
-                match result {
-                    Ok(Some(parent)) => {
-                        stream_manager.emit(
-                            group_id,
-                            MessageUpdate {
-                                trigger: UpdateTrigger::ReactionRemoved,
-                                message: parent,
-                            },
-                        );
-                        tracing::info!(
-                            target: "whitenoise::messages::delivery",
-                            "Cascaded reaction failure: removed reaction \
-                             '{content}' from message {target_id}",
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            target: "whitenoise::messages::delivery",
-                            "Failed to cascade reaction failure after \
-                             retries: {e}",
-                        );
-                    }
-                }
-            }
-            5 => {
-                // Deletion failed: unmark targets so they reappear
-                let result = retry_on_lock(|| async {
-                    AggregatedMessage::unmark_deleted(event_id, group_id, database).await
-                })
-                .await;
-
-                if let Err(e) = result {
-                    tracing::error!(
-                        target: "whitenoise::messages::delivery",
-                        "Failed to cascade deletion failure after \
-                         retries: {e}",
-                    );
-                    return;
-                }
-
-                // Re-emit affected target messages so the UI reflects
-                // them as not deleted
-                let target_ids = Self::extract_deletion_target_ids(tags);
-                for target_id in target_ids {
-                    if let Ok(Some(msg)) =
-                        AggregatedMessage::find_by_id(&target_id, group_id, database).await
-                    {
-                        stream_manager.emit(
-                            group_id,
-                            MessageUpdate {
-                                trigger: UpdateTrigger::DeliveryStatusChanged,
-                                message: msg,
-                            },
-                        );
-                    }
-                }
-
-                tracing::info!(
-                    target: "whitenoise::messages::delivery",
-                    "Cascaded deletion failure: unmarked targets \
-                     of deletion {event_id}",
-                );
-            }
-            _ => {} // Kind 9 and others: no cascade needed
-        }
-    }
-
-    /// Retry publishing a failed message.
-    ///
-    /// Creates a brand new message with the same content, tags, and kind as the
-    /// original failed message but with a new event ID and `Timestamp::now()`.
-    /// The original message is marked as `Retried` so it's excluded from future
-    /// UI snapshots. The new message follows the normal `NewMessage` flow.
-    ///
-    /// Also emits `DeliveryStatusChanged` for the original message when it moves
-    /// to `Retried`, so subscribers can update immediately without a reload.
-    #[perf_instrument("messages")]
-    pub async fn retry_message_publish(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        event_id: &EventId,
-    ) -> Result<()> {
-        // Guard: only retry messages that are in Failed state to prevent duplicate publishes
-        let event_id_str = event_id.to_string();
-        let original = match AggregatedMessage::find_by_id(&event_id_str, group_id, &self.database)
-            .await?
-        {
-            Some(cached) if matches!(cached.delivery_status, Some(DeliveryStatus::Failed(_))) => {
-                cached
-            }
-            Some(cached) => {
-                return Err(WhitenoiseError::Internal(format!(
-                    "Can only retry messages with Failed delivery status, got {:?}",
-                    cached.delivery_status
-                )));
-            }
-            None => {
-                return Err(WhitenoiseError::MessageNotFound);
-            }
-        };
-
-        // Create the new message FIRST — if this fails, the original stays visible as Failed
-        // rather than being hidden with no replacement.
-        let tags = original.tags.to_vec();
-        self.send_message_to_group(
-            account,
-            group_id,
-            original.content,
-            original.kind,
-            Some(tags),
-        )
-        .await?;
-
-        // Mark the original message as Retried so it's excluded from future snapshots.
-        // This is best-effort: if it fails, the user sees a duplicate (original Failed +
-        // new Sending) which is harmless and self-corrects on next app restart.
-        match AggregatedMessage::update_delivery_status_with_retry(
-            &event_id_str,
-            group_id,
-            &DeliveryStatus::Retried,
-            &self.database,
-        )
-        .await
-        {
-            Ok(updated_original) => {
-                self.message_stream_manager.emit(
-                    group_id,
-                    MessageUpdate {
-                        trigger: UpdateTrigger::DeliveryStatusChanged,
-                        message: updated_original,
-                    },
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::messages::delivery",
-                    "Failed to mark original message {} as Retried: {e}",
-                    event_id_str,
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Fetches all messages for a specific group with parsed tokens.
-    ///
-    /// This method retrieves all messages that have been sent to a particular group,
-    /// parsing the content of each message to extract tokens (e.g., mentions, hashtags).
-    /// The messages are returned with both the original message data and the parsed tokens.
-    ///
-    /// # Arguments
-    ///
-    /// * `pubkey` - The public key of the user requesting the messages. This is used to
-    ///   fetch the appropriate account and verify access permissions.
-    /// * `group_id` - The unique identifier of the group whose messages should be retrieved.
     #[perf_instrument("messages")]
     pub async fn fetch_messages_for_group(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<MessageWithTokens>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let messages = mdk.get_messages(group_id, None)?;
-        let messages_with_tokens = messages
-            .iter()
-            .map(|message| MessageWithTokens {
-                message: message.clone(),
-                tokens: self.content_parser.parse(&message.content),
-            })
-            .collect::<Vec<MessageWithTokens>>();
-        Ok(messages_with_tokens)
+        let session = self.require_session(&account.pubkey)?;
+        session.messages().for_group(group_id).fetch().await
     }
 
-    /// Fetch and aggregate messages for a group - Main consumer API
-    ///
-    /// Returns pre-aggregated messages from the cache in oldest-first order. The cache is
-    /// kept up-to-date by:
-    /// - Event processor: Caches messages as they arrive (real-time updates)
-    /// - Startup sync: Populates cache with existing messages on initialization
-    ///
-    /// # Arguments
-    /// * `pubkey`   - The public key of the user requesting messages
-    /// * `group_id` - The group to fetch messages for
-    /// * `options`  - Pagination cursor and direction (see [`PaginationOptions`]).
-    /// * `limit`    - Maximum number of messages to return. Defaults to 50, capped at 200.
     #[perf_instrument("messages")]
     pub async fn fetch_aggregated_messages_for_group(
         &self,
@@ -633,44 +87,14 @@ impl Whitenoise {
         options: &PaginationOptions,
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
-        Account::find_by_pubkey(pubkey, &self.database).await?; // Verify account exists (security check)
-
-        let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
-
-        AggregatedMessage::find_messages_by_group_paginated(
-            group_id,
-            &self.database,
-            options,
-            limit,
-            cleared_at_ms,
-        )
-        .await
-        .map_err(|e| match e {
-            crate::whitenoise::database::DatabaseError::InvalidCursor { reason } => {
-                WhitenoiseError::InvalidCursor { reason }
-            }
-            other => {
-                WhitenoiseError::Internal(format!("Failed to read cached messages: {}", other))
-            }
-        })
+        let session = self.require_session(pubkey)?;
+        session
+            .messages()
+            .for_group(group_id)
+            .fetch_aggregated(options, limit)
+            .await
     }
 
-    /// Fetch the newest messages for a group, ensuring all unread messages are included
-    /// and at least `minimum` messages are returned.
-    ///
-    /// The effective fetch size is `max(unread_count, minimum)`, so the caller always
-    /// receives a full page even when there are no unread messages, and always receives
-    /// every unread message when there are more unreads than the minimum.
-    ///
-    /// Messages are returned in oldest-first order, ready for display in a chat view.
-    ///
-    /// # Arguments
-    /// * `pubkey`   - The public key of the requesting user (security check; must be a
-    ///                registered account).
-    /// * `group_id` - The MLS group to fetch messages for.
-    /// * `minimum`  - Floor on the number of messages to return. `None` defaults to 50.
-    ///                Values above 200 are clamped to 200.
     #[perf_instrument("messages")]
     pub async fn fetch_messages_unread_with_minimum(
         &self,
@@ -678,33 +102,14 @@ impl Whitenoise {
         group_id: &GroupId,
         minimum: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-
-        let read_marker = self.get_last_read_message_id(&account, group_id).await?;
-
-        let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
-
-        let minimum_val = minimum.unwrap_or(50);
-
-        Ok(AggregatedMessage::find_messages_with_unread_minimum(
-            group_id,
-            read_marker.as_ref(),
-            minimum_val,
-            &self.database,
-            cleared_at_ms,
-        )
-        .await?)
+        let session = self.require_session(pubkey)?;
+        session
+            .messages()
+            .for_group(group_id)
+            .fetch_unread_with_minimum(minimum)
+            .await
     }
 
-    /// Fetch a single aggregated message by its event ID.
-    ///
-    /// Returns `None` if the message does not exist in the cache or belongs to a different group.
-    ///
-    /// # Arguments
-    /// * `pubkey`   - The public key of the requesting user (security check)
-    /// * `group_id` - The group the message belongs to
-    /// * `message_id` - Hex-encoded event ID of the message
     #[perf_instrument("messages")]
     pub async fn fetch_message_by_id(
         &self,
@@ -712,17 +117,14 @@ impl Whitenoise {
         group_id: &GroupId,
         message_id: &str,
     ) -> Result<Option<ChatMessage>> {
-        Account::find_by_pubkey(pubkey, &self.database).await?;
-
-        Ok(AggregatedMessage::find_by_id(message_id, group_id, &self.database).await?)
+        let session = self.require_session(pubkey)?;
+        session
+            .messages()
+            .for_group(group_id)
+            .fetch_by_id(message_id)
+            .await
     }
 
-    /// Search messages within a group by content.
-    ///
-    /// Uses forward-order substring matching: query tokens must appear in
-    /// the message content in the same order as typed. Each result includes
-    /// `highlight_spans` — char-index `[start, end]` pairs for each token in
-    /// the order they appear in the message content, for frontend highlighting.
     pub async fn search_messages_in_group(
         &self,
         pubkey: &PublicKey,
@@ -730,57 +132,22 @@ impl Whitenoise {
         query: &str,
         limit: Option<u32>,
     ) -> Result<Vec<SearchResult>> {
-        Account::find_by_pubkey(pubkey, &self.database).await?;
-
-        let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(pubkey, group_id, &self.database).await?;
-
-        let limit_val = limit.unwrap_or(50);
-        Ok(AggregatedMessage::search_messages_in_group(
-            group_id,
-            query,
-            limit_val,
-            &self.database,
-            cleared_at_ms,
-        )
-        .await?)
+        let session = self.require_session(pubkey)?;
+        session
+            .messages()
+            .for_group(group_id)
+            .search(query, limit)
+            .await
     }
 
-    /// Search messages across all groups the account belongs to.
-    ///
-    /// Like [`search_messages_in_group`](Self::search_messages_in_group) but without
-    /// a group filter. Each result includes `mls_group_id` so callers can group
-    /// results by conversation.
     pub async fn search_messages(
         &self,
         pubkey: &PublicKey,
         query: &str,
         limit: Option<u32>,
     ) -> Result<Vec<SearchResult>> {
-        Account::find_by_pubkey(pubkey, &self.database).await?;
-
-        let limit_val = limit.unwrap_or(50);
-        Ok(AggregatedMessage::search_messages(pubkey, query, limit_val, &self.database).await?)
-    }
-
-    /// Creates an unsigned nostr event with the given parameters
-    fn create_unsigned_nostr_event(
-        &self,
-        pubkey: &PublicKey,
-        message: &String,
-        kind: u16,
-        tags: Option<Vec<Tag>>,
-    ) -> Result<(UnsignedEvent, EventId)> {
-        let final_tags = tags.unwrap_or_default();
-
-        let mut inner_event =
-            UnsignedEvent::new(*pubkey, Timestamp::now(), kind.into(), final_tags, message);
-
-        inner_event.ensure_id();
-
-        let event_id = inner_event.id.unwrap(); // This is guaranteed to be Some by ensure_id
-
-        Ok((inner_event, event_id))
+        let session = self.require_session(pubkey)?;
+        session.messages().search(query, limit).await
     }
 
     /// Synchronize message cache with MDK on startup
@@ -936,6 +303,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::whitenoise::error::WhitenoiseError;
+    use crate::whitenoise::message_aggregator::DeliveryStatus;
+    use crate::whitenoise::message_streaming::{MessageStreamManager, UpdateTrigger};
+    use crate::whitenoise::session::messages::cascade_delivery_failure;
     use crate::whitenoise::test_utils::*;
 
     /// Test successful message sending with various scenarios:
@@ -1118,12 +489,13 @@ mod tests {
     /// Test helper method: create_unsigned_nostr_event
     #[tokio::test]
     async fn test_create_unsigned_nostr_event() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let test_keys = create_test_keys();
         let pubkey = test_keys.public_key();
 
+        use crate::whitenoise::session::messages::create_unsigned_nostr_event;
+
         // Test without tags
-        let result = whitenoise.create_unsigned_nostr_event(&pubkey, &"Test".to_string(), 1, None);
+        let result = create_unsigned_nostr_event(&pubkey, "Test", 1, None);
         assert!(result.is_ok());
         let (event, event_id) = result.unwrap();
         assert_eq!(event.pubkey, pubkey);
@@ -1133,7 +505,7 @@ mod tests {
 
         // Test with tags
         let tags = Some(vec![Tag::parse(vec!["e", "test_id"]).unwrap()]);
-        let result = whitenoise.create_unsigned_nostr_event(&pubkey, &"Test".to_string(), 1, tags);
+        let result = create_unsigned_nostr_event(&pubkey, "Test", 1, tags);
         assert!(result.is_ok());
         let (event, _) = result.unwrap();
         assert_eq!(event.tags.len(), 1);
@@ -1296,6 +668,7 @@ mod tests {
         // Verify we can fetch the messages from cache
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -1367,6 +740,7 @@ mod tests {
         // Verify all messages are retrievable
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -1432,6 +806,7 @@ mod tests {
         // Verify messages are correct
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -1664,6 +1039,7 @@ mod tests {
         let parent = AggregatedMessage::find_by_id(
             &chat_result.message.id.to_string(),
             &group.mls_group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1710,6 +1086,7 @@ mod tests {
         let msg = AggregatedMessage::find_by_id(
             &event_id.to_string(),
             &group.mls_group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1810,6 +1187,7 @@ mod tests {
         AggregatedMessage::update_delivery_status(
             &original_event_id.to_string(),
             &group.mls_group_id,
+            &creator.pubkey,
             &DeliveryStatus::Failed("simulated failure".to_string()),
             &whitenoise.database,
         )
@@ -1820,6 +1198,7 @@ mod tests {
         let msg = AggregatedMessage::find_by_id(
             &original_event_id.to_string(),
             &group.mls_group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1851,6 +1230,7 @@ mod tests {
         let original_msg = AggregatedMessage::find_by_id(
             &original_event_id.to_string(),
             &group.mls_group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1867,6 +1247,7 @@ mod tests {
         // The background publish may complete before we read, so accept Sending OR Sent.
         let all_messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -1939,11 +1320,15 @@ mod tests {
         let event_id = result.message.id.to_string();
 
         // Verify initial status is Sending
-        let msg =
-            AggregatedMessage::find_by_id(&event_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let msg = AggregatedMessage::find_by_id(
+            &event_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(msg.delivery_status, Some(DeliveryStatus::Sending));
 
         // Build a test event for bounded relay-control publish
@@ -1984,11 +1369,15 @@ mod tests {
             .await;
 
         // Verify status transitioned to Failed
-        let msg =
-            AggregatedMessage::find_by_id(&event_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let msg = AggregatedMessage::find_by_id(
+            &event_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             matches!(msg.delivery_status, Some(DeliveryStatus::Failed(_))),
             "Expected Failed status after exhausting retries, got {:?}",
@@ -2126,6 +1515,7 @@ mod tests {
         // Verify messages were recovered
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -2223,6 +1613,7 @@ mod tests {
         // Verify all messages were recovered
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -2293,16 +1684,21 @@ mod tests {
         );
 
         // find_by_id should return the message but with is_deleted=true
-        let target =
-            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let target = AggregatedMessage::find_by_id(
+            &target_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(target.is_deleted, "Message should be marked as deleted");
 
         // Also verify via find_messages_by_group — message should have is_deleted flag
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -2319,6 +1715,7 @@ mod tests {
         let has_status = AggregatedMessage::has_delivery_status(
             &del_event_id,
             &group.mls_group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await
@@ -2371,11 +1768,15 @@ mod tests {
             .unwrap();
 
         // Verify reaction was applied to parent
-        let parent =
-            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let parent = AggregatedMessage::find_by_id(
+            &target_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             !parent.reactions.by_emoji.is_empty(),
             "Parent should have reaction applied"
@@ -2386,7 +1787,7 @@ mod tests {
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
         let stream_manager = MessageStreamManager::new();
 
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             7,
             &reaction_event_id,
             &tags,
@@ -2399,11 +1800,15 @@ mod tests {
         .await;
 
         // Parent should no longer have the reaction
-        let parent =
-            AggregatedMessage::find_by_id(&target_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let parent = AggregatedMessage::find_by_id(
+            &target_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             parent.reactions.by_emoji.is_empty(),
             "Reaction should be removed after cascade failure"
@@ -2458,6 +1863,7 @@ mod tests {
         // Verify message is marked as deleted
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -2471,7 +1877,7 @@ mod tests {
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &target_id]).unwrap()]);
         let stream_manager = MessageStreamManager::new();
 
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             5,
             &del_event_id,
             &tags,
@@ -2486,6 +1892,7 @@ mod tests {
         // Message should no longer be deleted after cascade
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator.pubkey,
             None,
             &whitenoise.database,
         )
@@ -2498,6 +1905,118 @@ mod tests {
         );
     }
 
+    /// Regression: deleting a reaction then failing to publish must restore
+    /// the reaction on the parent message's summary.
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_restores_reaction_on_parent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a chat message (the parent)
+        let chat_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "React to me".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+        let parent_id = chat_result.message.id.to_hex();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a reaction targeting the parent
+        let reaction_tags = Some(vec![Tag::parse(vec!["e", &parent_id]).unwrap()]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "\u{1f44d}".to_string(), // thumbs up
+                7,
+                reaction_tags,
+            )
+            .await
+            .unwrap();
+        let reaction_id = reaction_result.message.id.to_hex();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify parent has the reaction
+        let parent = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            !parent.reactions.by_emoji.is_empty(),
+            "parent should have a reaction before deletion"
+        );
+
+        // Send a kind-5 deletion targeting the reaction
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &reaction_id]).unwrap()]);
+        let del_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                String::new(),
+                5,
+                deletion_tags,
+            )
+            .await
+            .unwrap();
+
+        // Verify parent's reaction was removed by the optimistic deletion
+        let parent_after_delete = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            parent_after_delete.reactions.by_emoji.is_empty(),
+            "parent should have no reactions after deletion"
+        );
+
+        // Cascade the deletion failure — should restore the reaction
+        let del_event_id = del_result.message.id.to_string();
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &reaction_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        cascade_delivery_failure(
+            5,
+            &del_event_id,
+            &tags,
+            &creator.pubkey,
+            "",
+            &group.mls_group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Parent should have the reaction back
+        let parent_after_cascade = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            !parent_after_cascade.reactions.by_emoji.is_empty(),
+            "parent should have reaction restored after cascade failure"
+        );
+    }
+
     /// Test cascade_delivery_failure is a no-op for kind 9.
     #[tokio::test]
     async fn test_cascade_kind9_is_noop() {
@@ -2507,7 +2026,7 @@ mod tests {
         let stream_manager = MessageStreamManager::new();
 
         // Should not panic or error — just a no-op
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             9,
             "some_event_id",
             &Tags::from_list(vec![]),
@@ -2568,7 +2087,7 @@ mod tests {
         let tags = Tags::from_list(vec![Tag::parse(vec!["e", &nonexistent_target]).unwrap()]);
 
         // Should return cleanly without panic — parent not found is handled
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             7,
             "some_reaction_id",
             &tags,
@@ -2591,7 +2110,7 @@ mod tests {
         let stream_manager = MessageStreamManager::new();
 
         // Empty tags — no e-tag to extract
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             7,
             "some_reaction_id",
             &Tags::new(),
@@ -2664,11 +2183,15 @@ mod tests {
         assert!(del_result.is_ok(), "Deletion should succeed");
 
         // The second message should be marked deleted
-        let msg =
-            AggregatedMessage::find_by_id(&last_id, &group.mls_group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let msg = AggregatedMessage::find_by_id(
+            &last_id,
+            &group.mls_group_id,
+            &creator.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(msg.is_deleted, "Last message should be marked deleted");
     }
 
@@ -2685,7 +2208,7 @@ mod tests {
         // Close the pool to force DB errors on find_by_id
         whitenoise.database.pool.close().await;
 
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             7,
             "reaction_event_id",
             &tags,
@@ -2712,7 +2235,7 @@ mod tests {
         // Close the pool to force DB errors on unmark_deleted
         whitenoise.database.pool.close().await;
 
-        Whitenoise::cascade_delivery_failure(
+        cascade_delivery_failure(
             5,
             "deletion_event_id",
             &tags,

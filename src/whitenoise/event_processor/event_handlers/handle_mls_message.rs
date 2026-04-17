@@ -16,6 +16,7 @@ use crate::{
         chat_list_streaming::ChatListUpdateTrigger,
         error::{Result, WhitenoiseError},
         media_files::MediaFile,
+        message_aggregator::processor::{extract_deletion_target_ids, extract_reaction_target_id},
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
         push_notifications::is_push_group_message_kind,
@@ -196,7 +197,9 @@ impl Whitenoise {
 
         match message.kind {
             Kind::ChatMessage => {
-                let msg = self.cache_chat_message(&group_id, &message).await?;
+                let msg = self
+                    .cache_chat_message(&account.pubkey, &group_id, &message)
+                    .await?;
                 let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
                 Whitenoise::spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
@@ -210,12 +213,15 @@ impl Whitenoise {
                 .await;
             }
             Kind::Reaction => {
-                if let Some(target) = self.cache_reaction(&group_id, &message).await? {
+                if let Some(target) = self
+                    .cache_reaction(&account.pubkey, &group_id, &message)
+                    .await?
+                {
                     self.emit_message_update(&group_id, UpdateTrigger::ReactionAdded, target);
                 }
             }
             Kind::EventDeletion => {
-                self.handle_deletion_application_message(&group_id, &message)
+                self.handle_deletion_application_message(&account.pubkey, &group_id, &message)
                     .await?;
             }
             _ => {
@@ -228,12 +234,16 @@ impl Whitenoise {
 
     async fn handle_deletion_application_message(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
         let last_message_id = self.get_last_message_id(group_id).await;
 
-        for (trigger, msg) in self.cache_deletion(group_id, message).await? {
+        for (trigger, msg) in self
+            .cache_deletion(account_pubkey, group_id, message)
+            .await?
+        {
             self.emit_message_update(group_id, trigger, msg);
         }
 
@@ -243,7 +253,7 @@ impl Whitenoise {
         // modifies shared state). We emit for ALL subscribed accounts because
         // subsequent handlers will see incorrect post-deletion state.
         if let Some(last_message_id) = last_message_id {
-            let deleted_ids = Self::extract_deletion_target_ids(&message.tags);
+            let deleted_ids = extract_deletion_target_ids(&message.tags);
             if deleted_ids.contains(&last_message_id) {
                 self.emit_chat_list_update_for_group(
                     group_id,
@@ -469,6 +479,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_chat_message(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<ChatMessage> {
@@ -482,14 +493,20 @@ impl Whitenoise {
         // Preserve existing delivery status for relay echoes of locally-sent messages.
         // This keeps stream payloads aligned with the latest DB state instead of
         // regressing to `None` on reprocessing.
-        if let Some(existing_message) =
-            AggregatedMessage::find_by_id(&chat_message.id, group_id, &self.database).await?
+        if let Some(existing_message) = AggregatedMessage::find_by_id(
+            &chat_message.id,
+            group_id,
+            account_pubkey,
+            &self.database,
+        )
+        .await?
             && existing_message.delivery_status.is_some()
         {
             chat_message.delivery_status = existing_message.delivery_status;
         }
 
-        AggregatedMessage::insert_message(&chat_message, group_id, &self.database).await?;
+        AggregatedMessage::insert_message(&chat_message, group_id, account_pubkey, &self.database)
+            .await?;
 
         // Apply orphaned reactions/deletions - modifies in-place and returns final state
         let final_message = self
@@ -514,14 +531,20 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_reaction(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
         // If this reaction already has a delivery status, it was sent by us and already
         // applied to the parent — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
-            .await?
+        if AggregatedMessage::has_delivery_status(
+            &message.id.to_string(),
+            group_id,
+            account_pubkey,
+            &self.database,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "whitenoise::cache",
@@ -534,7 +557,9 @@ impl Whitenoise {
 
         AggregatedMessage::insert_reaction(message, group_id, &self.database).await?;
 
-        let result = self.apply_reaction_to_target(message, group_id).await?;
+        let result = self
+            .apply_reaction_to_target(account_pubkey, message, group_id)
+            .await?;
 
         if result.is_none() {
             tracing::debug!(
@@ -560,13 +585,15 @@ impl Whitenoise {
     /// Returns `Err` for real failures (malformed tags, invalid emoji, DB errors).
     async fn apply_reaction_to_target(
         &self,
+        account_pubkey: &PublicKey,
         reaction: &Message,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
-        let target_id = Self::extract_reaction_target_id(&reaction.tags)?;
+        let target_id = extract_reaction_target_id(&reaction.tags)?;
 
         let Some(mut target) =
-            AggregatedMessage::find_by_id(&target_id, group_id, &self.database).await?
+            AggregatedMessage::find_by_id(&target_id, group_id, account_pubkey, &self.database)
+                .await?
         else {
             return Ok(None); // True orphan: target not yet cached
         };
@@ -602,14 +629,20 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn cache_deletion(
         &self,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
         // If this deletion already has a delivery status, it was sent by us and already
         // applied to targets — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
-        if AggregatedMessage::has_delivery_status(&message.id.to_string(), group_id, &self.database)
-            .await?
+        if AggregatedMessage::has_delivery_status(
+            &message.id.to_string(),
+            group_id,
+            account_pubkey,
+            &self.database,
+        )
+        .await?
         {
             tracing::debug!(
                 target: "whitenoise::cache",
@@ -622,7 +655,9 @@ impl Whitenoise {
 
         AggregatedMessage::insert_deletion(message, group_id, &self.database).await?;
 
-        let updates = self.apply_deletions_to_targets(message, group_id).await?;
+        let updates = self
+            .apply_deletions_to_targets(account_pubkey, message, group_id)
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::cache",
@@ -638,15 +673,16 @@ impl Whitenoise {
     /// Apply deletion to all targets and collect updates to emit.
     async fn apply_deletions_to_targets(
         &self,
+        account_pubkey: &PublicKey,
         deletion: &Message,
         group_id: &GroupId,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
-        let target_ids = Self::extract_deletion_target_ids(&deletion.tags);
+        let target_ids = extract_deletion_target_ids(&deletion.tags);
         let mut updates = Vec::with_capacity(target_ids.len());
 
         for target_id in target_ids {
             if let Some(update) = self
-                .apply_single_deletion(&target_id, &deletion.id, group_id)
+                .apply_single_deletion(account_pubkey, &target_id, &deletion.id, group_id)
                 .await?
             {
                 updates.push(update);
@@ -659,6 +695,7 @@ impl Whitenoise {
     /// Apply deletion to a single target, returning the appropriate update.
     async fn apply_single_deletion(
         &self,
+        account_pubkey: &PublicKey,
         target_id: &str,
         deletion_event_id: &EventId,
         group_id: &GroupId,
@@ -668,7 +705,7 @@ impl Whitenoise {
             AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.database).await?
         {
             let parent_update = self
-                .remove_reaction_from_parent(&reaction, group_id)
+                .remove_reaction_from_parent(account_pubkey, &reaction, group_id)
                 .await?;
             AggregatedMessage::mark_deleted(
                 target_id,
@@ -682,7 +719,8 @@ impl Whitenoise {
 
         // Check if target is a message
         if let Some(mut msg) =
-            AggregatedMessage::find_by_id(target_id, group_id, &self.database).await?
+            AggregatedMessage::find_by_id(target_id, group_id, account_pubkey, &self.database)
+                .await?
         {
             msg.is_deleted = true;
             AggregatedMessage::mark_deleted(
@@ -709,15 +747,17 @@ impl Whitenoise {
     /// Remove a reaction from its parent message and return the updated parent.
     async fn remove_reaction_from_parent(
         &self,
+        account_pubkey: &PublicKey,
         reaction: &AggregatedMessage,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
-        let Ok(parent_id) = Self::extract_reaction_target_id(&reaction.tags) else {
+        let Ok(parent_id) = extract_reaction_target_id(&reaction.tags) else {
             return Ok(None);
         };
 
         let Some(mut parent) =
-            AggregatedMessage::find_by_id(&parent_id, group_id, &self.database).await?
+            AggregatedMessage::find_by_id(&parent_id, group_id, account_pubkey, &self.database)
+                .await?
         else {
             return Ok(None);
         };
@@ -742,20 +782,6 @@ impl Whitenoise {
         } else {
             Ok(None)
         }
-    }
-
-    pub(crate) fn extract_reaction_target_id(tags: &Tags) -> Result<String> {
-        tags.iter()
-            .find(|tag| tag.kind() == nostr_sdk::TagKind::e())
-            .and_then(|tag| tag.content().map(|s| s.to_string()))
-            .ok_or_else(|| WhitenoiseError::InvalidEvent("Reaction missing e-tag".to_string()))
-    }
-
-    pub(crate) fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {
-        tags.iter()
-            .filter(|tag| tag.kind() == nostr_sdk::TagKind::e())
-            .filter_map(|tag| tag.content().map(|s| s.to_string()))
-            .collect()
     }
 
     /// Apply any orphaned reactions/deletions to a newly cached message.
@@ -918,10 +944,14 @@ mod tests {
         assert!(result.is_ok(), "Failed to handle regular message");
 
         // Verify message was cached
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(cached_msg.is_some(), "Message should be cached");
 
         // Test 2: Reaction message (Kind 7)
@@ -941,11 +971,15 @@ mod tests {
         assert!(result.is_ok(), "Failed to handle reaction");
 
         // Verify reaction was applied to cached message
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             !cached_msg.reactions.by_emoji.is_empty(),
             "Reaction should be applied"
@@ -968,11 +1002,15 @@ mod tests {
         assert!(result.is_ok(), "Failed to handle deletion");
 
         // Verify message was marked as deleted
-        let cached_msg =
-            AggregatedMessage::find_by_id(&message_id.to_string(), group_id, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let cached_msg = AggregatedMessage::find_by_id(
+            &message_id.to_string(),
+            group_id,
+            &creator_account.pubkey,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(cached_msg.is_deleted, "Message should be marked as deleted");
     }
 
@@ -1018,7 +1056,7 @@ mod tests {
 
         // Initial cache pass creates the row without delivery status.
         let first = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
             .await
             .unwrap();
         assert_eq!(first.delivery_status, None);
@@ -1027,6 +1065,7 @@ mod tests {
         AggregatedMessage::update_delivery_status(
             &message_id.to_string(),
             &group.mls_group_id,
+            &creator_account.pubkey,
             &DeliveryStatus::Sent(1),
             &whitenoise.database,
         )
@@ -1035,7 +1074,7 @@ mod tests {
 
         // Relay echo reprocess should preserve the existing status.
         let second = whitenoise
-            .cache_chat_message(&group.mls_group_id, &message)
+            .cache_chat_message(&creator_account.pubkey, &group.mls_group_id, &message)
             .await
             .unwrap();
         assert_eq!(second.delivery_status, Some(DeliveryStatus::Sent(1)));
@@ -1043,6 +1082,7 @@ mod tests {
         let persisted = AggregatedMessage::find_by_id(
             &message_id.to_string(),
             &group.mls_group_id,
+            &creator_account.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1184,6 +1224,7 @@ mod tests {
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
             group_id,
+            &creator_account.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1290,6 +1331,7 @@ mod tests {
         let cached_msg = AggregatedMessage::find_by_id(
             &future_message_id.to_string(),
             group_id,
+            &creator_account.pubkey,
             &whitenoise.database,
         )
         .await
@@ -1364,12 +1406,12 @@ mod tests {
         // Test extract_reaction_target_id
         let mut tags = Tags::new();
         tags.push(Tag::parse(vec!["e", "test_event_id"]).unwrap());
-        let target_id = Whitenoise::extract_reaction_target_id(&tags).unwrap();
+        let target_id = extract_reaction_target_id(&tags).unwrap();
         assert_eq!(target_id, "test_event_id");
 
         // Test extract_reaction_target_id with missing e-tag
         let empty_tags = Tags::new();
-        let result = Whitenoise::extract_reaction_target_id(&empty_tags);
+        let result = extract_reaction_target_id(&empty_tags);
         assert!(result.is_err(), "Should fail with missing e-tag");
 
         // Test extract_deletion_target_ids with multiple targets
@@ -1378,7 +1420,7 @@ mod tests {
         tags.push(Tag::parse(vec!["e", "id2"]).unwrap());
         tags.push(Tag::parse(vec!["p", "some_pubkey"]).unwrap()); // Should be ignored
 
-        let target_ids = Whitenoise::extract_deletion_target_ids(&tags);
+        let target_ids = extract_deletion_target_ids(&tags);
         assert_eq!(target_ids.len(), 2);
         assert!(target_ids.contains(&"id1".to_string()));
         assert!(target_ids.contains(&"id2".to_string()));
@@ -1434,6 +1476,7 @@ mod tests {
         // Verify all messages are in cache
         let messages = AggregatedMessage::find_messages_by_group(
             &group.mls_group_id,
+            &creator_account.pubkey,
             None,
             &whitenoise.database,
         )
@@ -1504,10 +1547,14 @@ mod tests {
             token_tag.encrypted_token.to_base64()
         );
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
@@ -1575,10 +1622,14 @@ mod tests {
             leaf_one.encrypted_token.to_base64()
         );
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
@@ -1628,10 +1679,14 @@ mod tests {
         .unwrap();
         assert!(stored.is_empty());
 
-        let cached_messages =
-            AggregatedMessage::find_messages_by_group(&group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let cached_messages = AggregatedMessage::find_messages_by_group(
+            &group_id,
+            &member_account.pubkey,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
         assert!(cached_messages.is_empty());
     }
 
