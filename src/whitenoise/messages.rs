@@ -1905,6 +1905,118 @@ mod tests {
         );
     }
 
+    /// Regression: deleting a reaction then failing to publish must restore
+    /// the reaction on the parent message's summary.
+    #[tokio::test]
+    async fn test_cascade_deletion_failure_restores_reaction_on_parent() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_pubkey = members[0].0.pubkey;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member_pubkey], config, None)
+            .await
+            .unwrap();
+
+        // Send a chat message (the parent)
+        let chat_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "React to me".to_string(),
+                9,
+                None,
+            )
+            .await
+            .unwrap();
+        let parent_id = chat_result.message.id.to_hex();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a reaction targeting the parent
+        let reaction_tags = Some(vec![Tag::parse(vec!["e", &parent_id]).unwrap()]);
+        let reaction_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                "\u{1f44d}".to_string(), // thumbs up
+                7,
+                reaction_tags,
+            )
+            .await
+            .unwrap();
+        let reaction_id = reaction_result.message.id.to_hex();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify parent has the reaction
+        let parent = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            !parent.reactions.by_emoji.is_empty(),
+            "parent should have a reaction before deletion"
+        );
+
+        // Send a kind-5 deletion targeting the reaction
+        let deletion_tags = Some(vec![Tag::parse(vec!["e", &reaction_id]).unwrap()]);
+        let del_result = whitenoise
+            .send_message_to_group(
+                &creator,
+                &group.mls_group_id,
+                String::new(),
+                5,
+                deletion_tags,
+            )
+            .await
+            .unwrap();
+
+        // Verify parent's reaction was removed by the optimistic deletion
+        let parent_after_delete = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            parent_after_delete.reactions.by_emoji.is_empty(),
+            "parent should have no reactions after deletion"
+        );
+
+        // Cascade the deletion failure — should restore the reaction
+        let del_event_id = del_result.message.id.to_string();
+        let tags = Tags::from_list(vec![Tag::parse(vec!["e", &reaction_id]).unwrap()]);
+        let stream_manager = MessageStreamManager::new();
+
+        cascade_delivery_failure(
+            5,
+            &del_event_id,
+            &tags,
+            &creator.pubkey,
+            "",
+            &group.mls_group_id,
+            &whitenoise.database,
+            &stream_manager,
+        )
+        .await;
+
+        // Parent should have the reaction back
+        let parent_after_cascade = whitenoise
+            .fetch_message_by_id(&creator.pubkey, &group.mls_group_id, &parent_id)
+            .await
+            .unwrap()
+            .expect("parent should exist");
+        assert!(
+            !parent_after_cascade.reactions.by_emoji.is_empty(),
+            "parent should have reaction restored after cascade failure"
+        );
+    }
+
     /// Test cascade_delivery_failure is a no-op for kind 9.
     #[tokio::test]
     async fn test_cascade_kind9_is_noop() {

@@ -175,8 +175,36 @@ impl<'a> MessageOpsForGroup<'a> {
         kind: u16,
         tags: Option<Vec<Tag>>,
     ) -> Result<SendResult> {
+        let tags_vec = tags.unwrap_or_default();
+
+        // Validate kind + tag invariants before any MDK/DB writes.
+        // Reactions require an e-tag (target message), deletions require at
+        // least one e-tag (target messages/reactions).
+        match kind {
+            9 => {}
+            7 => {
+                if !tags_vec.iter().any(|t| t.kind() == TagKind::e()) {
+                    return Err(WhitenoiseError::Internal(
+                        "Reaction event missing e-tag".to_string(),
+                    ));
+                }
+            }
+            5 => {
+                if !tags_vec.iter().any(|t| t.kind() == TagKind::e()) {
+                    return Err(WhitenoiseError::Internal(
+                        "Deletion event requires at least one e-tag".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(WhitenoiseError::Internal(format!(
+                    "Unsupported outgoing event kind: {other}"
+                )));
+            }
+        }
+
         let (inner_event, event_id) =
-            create_unsigned_nostr_event(self.pubkey(), &message, kind, tags)?;
+            create_unsigned_nostr_event(self.pubkey(), &message, kind, Some(tags_vec))?;
 
         let mdk = &self.session.mdk;
 
@@ -201,11 +229,7 @@ impl<'a> MessageOpsForGroup<'a> {
             5 => {
                 last_message_deleted = self.cache_and_apply_outgoing_deletion(&mdk_message).await?
             }
-            other => {
-                return Err(WhitenoiseError::Internal(format!(
-                    "Unsupported outgoing event kind: {other}"
-                )));
-            }
+            _ => unreachable!("validated above"),
         }
 
         self.spawn_publish_task(message_event, group_relays, event_id, kind, &mdk_message);
@@ -622,7 +646,50 @@ async fn cascade_deletion_failure(
         return;
     }
 
+    // Restore each target. For reactions, re-add them to the parent's summary
+    // (the optimistic delete path removed them). For messages, just re-emit.
     for target_id in extract_deletion_target_ids(tags) {
+        // Check if the restored target is a reaction — if so, re-attach to parent
+        if let Ok(Some(reaction)) =
+            AggregatedMessage::find_reaction_by_id(&target_id, group_id, database).await
+        {
+            if let Ok(parent_id) = extract_reaction_target_id(&reaction.tags)
+                && let Ok(Some(mut parent)) =
+                    AggregatedMessage::find_by_id(&parent_id, group_id, author, database).await
+            {
+                reaction_handler::add_reaction_to_message(
+                    &mut parent,
+                    &reaction.author,
+                    &reaction.content,
+                    Timestamp::from(reaction.created_at.timestamp() as u64),
+                    reaction.event_id,
+                );
+                if let Err(e) = AggregatedMessage::update_reactions(
+                    &parent_id,
+                    group_id,
+                    &parent.reactions,
+                    database,
+                )
+                .await
+                {
+                    tracing::error!(
+                        target: "whitenoise::messages::delivery",
+                        "Failed to restore reaction on parent {parent_id}: {e}",
+                    );
+                } else {
+                    stream_manager.emit(
+                        group_id,
+                        MessageUpdate {
+                            trigger: UpdateTrigger::ReactionAdded,
+                            message: parent,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Regular message target — just re-emit so UI reflects it as not deleted
         if let Ok(Some(msg)) =
             AggregatedMessage::find_by_id(&target_id, group_id, author, database).await
         {
