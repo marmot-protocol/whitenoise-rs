@@ -59,8 +59,11 @@ where
 
 impl PublishedKeyPackage {
     /// Returns the event kind as a typed [`Kind`].
+    ///
+    /// Published key package rows store custom Nostr kinds (`30443` and legacy
+    /// `443`). Standard NIP kinds would need different handling.
     pub fn kind(&self) -> Kind {
-        Kind::Custom(self.kind as u16)
+        Kind::Custom(u16::try_from(self.kind).unwrap_or_default())
     }
 
     /// Records a published key package for lifecycle tracking.
@@ -121,6 +124,28 @@ impl PublishedKeyPackage {
         .await?;
 
         Ok(row)
+    }
+
+    /// Looks up all published key packages sharing the same hash reference.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn find_by_hash_ref(
+        account_pubkey: &PublicKey,
+        hash_ref: &[u8],
+        database: &Database,
+    ) -> Result<Vec<Self>, DatabaseError> {
+        let rows = sqlx::query_as::<_, Self>(
+            "SELECT id, account_pubkey, key_package_hash_ref, event_id, kind, d_tag,
+                    consumed_at, key_material_deleted, created_at
+             FROM published_key_packages
+             WHERE account_pubkey = ? AND key_package_hash_ref = ?
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(hash_ref)
+        .fetch_all(&database.pool)
+        .await?;
+
+        Ok(rows)
     }
 
     /// Marks a published key package as consumed (used by a Welcome).
@@ -196,22 +221,6 @@ impl PublishedKeyPackage {
         Ok(rows)
     }
 
-    /// Marks a published key package's key material as deleted.
-    ///
-    /// Called after the maintenance task successfully deletes the local MLS
-    /// key material. Rows are never deleted — the table serves as an audit trail.
-    #[perf_instrument("db::published_key_packages")]
-    pub(crate) async fn mark_key_material_deleted(
-        id: i64,
-        database: &Database,
-    ) -> Result<(), DatabaseError> {
-        sqlx::query("UPDATE published_key_packages SET key_material_deleted = 1 WHERE id = ?")
-            .bind(id)
-            .execute(&database.pool)
-            .await?;
-        Ok(())
-    }
-
     /// Marks all rows sharing a key package hash as deleted.
     ///
     /// Dual-published kind:30443/kind:443 events point at the same local MLS
@@ -238,10 +247,11 @@ impl PublishedKeyPackage {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::{Keys, Kind};
+    use nostr_sdk::Keys;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
 
     async fn setup_test_db() -> Database {
         let pool = SqlitePoolOptions::new()
@@ -286,7 +296,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             event_id,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -310,13 +320,27 @@ mod tests {
         let hash_ref = vec![1, 2, 3, 4, 5];
         let event_id = "abc123";
 
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            event_id,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         // Second insert with same event_id should be ignored (INSERT OR IGNORE)
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            event_id,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM published_key_packages WHERE account_pubkey = ?")
@@ -346,9 +370,16 @@ mod tests {
         let hash_ref = vec![1, 2, 3];
         let event_id = "known_event";
 
-        PublishedKeyPackage::create(&pubkey, &hash_ref, event_id, Kind::MlsKeyPackage, None, &db)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            event_id,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         let result = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
             .await
@@ -375,7 +406,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "canonical_event",
-            Kind::Custom(30443),
+            MLS_KEY_PACKAGE_KIND,
             Some(d_tag),
             &db,
         )
@@ -400,7 +431,7 @@ mod tests {
             &pubkey,
             &[1, 2, 3],
             event_id,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -429,7 +460,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "canonical_event",
-            Kind::Custom(30443),
+            MLS_KEY_PACKAGE_KIND,
             Some("d-tag-value"),
             &db,
         )
@@ -439,7 +470,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "legacy_event",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -474,7 +505,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "canonical_event",
-            Kind::Custom(30443),
+            MLS_KEY_PACKAGE_KIND,
             Some("d-tag-value"),
             &db,
         )
@@ -484,7 +515,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "legacy_event",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -530,7 +561,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "canonical_burst",
-            Kind::Custom(30443),
+            MLS_KEY_PACKAGE_KIND,
             Some("d-tag"),
             &db,
         )
@@ -540,7 +571,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "legacy_burst",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -594,7 +625,7 @@ mod tests {
             &pubkey,
             &[1, 2, 3],
             event_id,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -633,7 +664,7 @@ mod tests {
             &pubkey,
             &[1, 2, 3],
             event_id,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -643,12 +674,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate key material deletion
-        let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
-            .await
-            .unwrap()
-            .unwrap();
-        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &db)
+        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(&pubkey, &[1, 2, 3], &db)
             .await
             .unwrap();
 
@@ -669,7 +695,7 @@ mod tests {
             &pubkey,
             &[1, 2, 3],
             "recent",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -735,7 +761,7 @@ mod tests {
             &pubkey,
             &[4, 5, 6],
             "recent_event",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -755,37 +781,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mark_key_material_deleted() {
+    async fn test_mark_key_material_deleted_by_hash_ref() {
         let db = setup_test_db().await;
         let pubkey = Keys::generate().public_key();
-        let event_id = "delete_test";
+        let canonical_event_id = "delete_test_canonical";
+        let legacy_event_id = "delete_test_legacy";
+        let hash_ref = [1, 2, 3];
 
         PublishedKeyPackage::create(
             &pubkey,
-            &[1, 2, 3],
-            event_id,
-            Kind::MlsKeyPackage,
+            &hash_ref,
+            canonical_event_id,
+            MLS_KEY_PACKAGE_KIND,
+            Some("test-d-tag"),
+            &db,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &pubkey,
+            &hash_ref,
+            legacy_event_id,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
         .await
         .unwrap();
 
-        let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
+        let canonical = PublishedKeyPackage::find_by_event_id(&pubkey, canonical_event_id, &db)
             .await
             .unwrap()
             .unwrap();
-        assert!(!pkg.key_material_deleted);
-
-        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &db)
-            .await
-            .unwrap();
-
-        let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
+        let legacy = PublishedKeyPackage::find_by_event_id(&pubkey, legacy_event_id, &db)
             .await
             .unwrap()
             .unwrap();
-        assert!(pkg.key_material_deleted);
+        assert!(!canonical.key_material_deleted);
+        assert!(!legacy.key_material_deleted);
+
+        let updated =
+            PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(&pubkey, &hash_ref, &db)
+                .await
+                .unwrap();
+        assert_eq!(updated, 2);
+
+        let canonical = PublishedKeyPackage::find_by_event_id(&pubkey, canonical_event_id, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy = PublishedKeyPackage::find_by_event_id(&pubkey, legacy_event_id, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(canonical.key_material_deleted);
+        assert!(legacy.key_material_deleted);
     }
 
     #[tokio::test]
@@ -798,7 +848,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "canonical_event",
-            Kind::Custom(30443),
+            MLS_KEY_PACKAGE_KIND,
             Some("d-tag-value"),
             &db,
         )
@@ -808,7 +858,7 @@ mod tests {
             &pubkey,
             &hash_ref,
             "legacy_event",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -857,7 +907,7 @@ mod tests {
             &pubkey2,
             &[4, 5, 6],
             "event_b1",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )
@@ -899,7 +949,7 @@ mod tests {
             &pubkey,
             &[1, 2, 3],
             "unconsumed",
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             None,
             &db,
         )

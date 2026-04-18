@@ -376,7 +376,9 @@ async fn rotate_expired_packages(
 mod tests {
     use super::*;
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
-    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
+    use crate::whitenoise::key_packages::{
+        MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY,
+    };
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::prelude::*;
 
@@ -392,7 +394,10 @@ mod tests {
         let tags = vec![
             Tag::custom(TagKind::MlsCiphersuite, vec![REQUIRED_MLS_CIPHERSUITE_TAG]),
             Tag::custom(TagKind::MlsExtensions, vec!["0x000a", "0xf2ee"]),
-            Tag::custom(TagKind::Custom("mls_proposals".into()), vec!["0x000a"]),
+            Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                vec!["0x000a"],
+            ),
             Tag::custom(TagKind::Custom("encoding".into()), vec!["base64"]),
         ];
 
@@ -547,13 +552,13 @@ mod tests {
 
         // Create an event with a timestamp 31 days in the past
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
-        let old_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old")
+        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
 
         // Create an event with a fresh timestamp
-        let fresh_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh")
+        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -571,10 +576,10 @@ mod tests {
     fn test_find_expired_packages_returns_empty_when_all_fresh() {
         let keys = nostr_sdk::Keys::generate();
 
-        let fresh1 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh1")
+        let fresh1 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh1")
             .sign_with_keys(&keys)
             .unwrap();
-        let fresh2 = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh2")
+        let fresh2 = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh2")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -594,11 +599,11 @@ mod tests {
         let keys = nostr_sdk::Keys::generate();
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
 
-        let old_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old")
+        let old_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
-        let fresh_event = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "fresh")
+        let fresh_event = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "fresh")
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -619,11 +624,11 @@ mod tests {
         let keys = nostr_sdk::Keys::generate();
         let old_timestamp = nostr_sdk::Timestamp::now() - Duration::from_secs(31 * 24 * 60 * 60);
 
-        let old_event_a = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old-a")
+        let old_event_a = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old-a")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();
-        let old_event_b = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::MlsKeyPackage, "old-b")
+        let old_event_b = nostr_sdk::EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "old-b")
             .custom_created_at(old_timestamp)
             .sign_with_keys(&keys)
             .unwrap();

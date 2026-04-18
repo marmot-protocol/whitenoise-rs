@@ -65,9 +65,9 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         );
 
         // Delete any existing key packages to start with a clean slate. This
-        // test needs a fully empty relay state, while the app-facing "delete
-        // all" helper intentionally removes only legacy kind:443 copies.
-        let deleted = delete_all_relay_key_packages(context, &account, true).await?;
+        // test needs a fully empty relay state, while the developer-facing
+        // legacy cleanup intentionally removes only kind:443 copies.
+        let deleted = delete_all_relay_key_packages_for_test_setup(context, &account, true).await?;
         tracing::info!("✓ Deleted {} existing key package(s)", deleted);
 
         let before_delete = wait_for_key_packages(
@@ -101,7 +101,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         );
 
         // Delete current key packages and publish an expired one.
-        delete_all_relay_key_packages(context, &account, true).await?;
+        delete_all_relay_key_packages_for_test_setup(context, &account, true).await?;
         wait_for_key_packages(
             context,
             &account,
@@ -209,7 +209,7 @@ where
     .await
 }
 
-async fn delete_all_relay_key_packages(
+async fn delete_all_relay_key_packages_for_test_setup(
     context: &ScenarioContext,
     account: &crate::Account,
     delete_mls_stored_keys: bool,
