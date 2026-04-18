@@ -865,6 +865,7 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::database::media_files::MediaFile;
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
@@ -2354,6 +2355,125 @@ mod tests {
         assert!(
             metadata.original_filename.is_some(),
             "Original filename should be stored"
+        );
+    }
+
+    /// MP4 ftyp header only (matches `types::tests::test_detect_non_image_mp4_video`).
+    fn minimal_mp4_fixture() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x18, // Box size
+            b'f', b't', b'y', b'p', // "ftyp"
+            b'i', b's', b'o', b'm', // Brand: isom
+            0x00, 0x00, 0x00, 0x00, // Version
+            b'i', b's', b'o', b'm', // Compatible brands
+            b'm', b'p', b'4', b'2',
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_upload_chat_media_video_stores_original_filename_in_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "video/mp4",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = &members[0].0;
+        let member_pubkeys = vec![member_account.pubkey];
+
+        let admin_pubkeys = vec![creator_account.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator_account, member_pubkeys, config, None)
+            .await
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let expected_basename = "video_picker_ABC123.mp4";
+        let video_path = temp_dir.path().join(expected_basename);
+        tokio::fs::write(&video_path, minimal_mp4_fixture())
+            .await
+            .unwrap();
+        let temp_path = video_path.to_str().unwrap();
+
+        let test_options = MediaProcessingOptions {
+            generate_blurhash: false,
+            ..Default::default()
+        };
+        let result = whitenoise
+            .upload_chat_media(
+                &creator_account,
+                &group.mls_group_id,
+                temp_path,
+                Some(blossom_url),
+                Some(test_options),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to upload chat video: {:?}",
+            result.unwrap_err()
+        );
+
+        let media_file = result.unwrap();
+        assert_eq!(media_file.mime_type, "video/mp4");
+        assert_eq!(media_file.media_type, "chat_media");
+
+        let metadata = media_file
+            .file_metadata
+            .as_ref()
+            .expect("video uploads must persist FileMetadata for MIP-04 decryption");
+        assert_eq!(
+            metadata.original_filename.as_deref(),
+            Some(expected_basename),
+            "receiver imeta / decrypt must use the same basename the sender encrypted with"
+        );
+        assert!(
+            metadata.dimensions.is_none(),
+            "minimal MP4 fixture has no parsed dimensions unless MDK adds video support"
+        );
+
+        let original_hash_bytes: [u8; 32] = media_file
+            .original_file_hash
+            .as_ref()
+            .expect("chat_media should store original_file_hash")
+            .as_slice()
+            .try_into()
+            .expect("original_file_hash must be 32 bytes");
+
+        let reloaded = MediaFile::find_by_original_hash_and_group(
+            &whitenoise.database,
+            &original_hash_bytes,
+            &group.mls_group_id,
+            &creator_account.pubkey,
+        )
+        .await
+        .unwrap()
+        .expect("MediaFile row should exist after upload");
+
+        assert_eq!(
+            reloaded
+                .file_metadata
+                .as_ref()
+                .and_then(|m| m.original_filename.as_deref()),
+            Some(expected_basename),
+            "filename metadata must round-trip through SQLite for download/decrypt"
         );
     }
 
