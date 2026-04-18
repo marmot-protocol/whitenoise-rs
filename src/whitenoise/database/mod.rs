@@ -1,15 +1,18 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
+use mdk_sqlite_storage::EncryptionConfig;
 use sqlx::{
-    ConnectOptions, Sqlite, SqlitePool,
-    migrate::{MigrateDatabase, Migrator},
+    ConnectOptions, SqlitePool,
+    migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
+
+mod encryption;
 
 pub mod account_settings;
 pub mod accounts;
@@ -56,6 +59,12 @@ pub enum DatabaseError {
     Serialization(#[from] serde_json::Error),
     #[error("Search query did not return a position column for message {message_id}")]
     MissingSearchPosition { message_id: String },
+    #[error("Database encryption key error: {0}")]
+    EncryptionKey(String),
+    #[error("Encrypted database {path} is missing keyring key {key_id}")]
+    MissingEncryptionKey { path: String, key_id: String },
+    #[error("Database encryption migration error: {0}")]
+    EncryptionMigration(String),
 }
 
 impl DatabaseError {
@@ -84,40 +93,51 @@ pub struct Database {
 
 impl Database {
     pub async fn new(db_path: PathBuf) -> Result<Self, DatabaseError> {
-        // Create parent directories if they don't exist
+        Self::open(db_path, None).await
+    }
+
+    pub async fn new_encrypted(
+        db_path: PathBuf,
+        keyring_service_id: &str,
+    ) -> Result<Self, DatabaseError> {
+        Self::open_encrypted(
+            db_path,
+            keyring_service_id,
+            encryption::WHITENOISE_DB_KEY_ID,
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+    pub(crate) async fn new_encrypted_with_key_id(
+        db_path: PathBuf,
+        keyring_service_id: &str,
+        key_id: &str,
+    ) -> Result<Self, DatabaseError> {
+        Self::open_encrypted(db_path, keyring_service_id, key_id).await
+    }
+
+    async fn open_encrypted(
+        db_path: PathBuf,
+        keyring_service_id: &str,
+        key_id: &str,
+    ) -> Result<Self, DatabaseError> {
+        let encryption_config =
+            encryption::prepare_sqlcipher_database(&db_path, keyring_service_id, key_id).await?;
+        let database = Self::open(db_path.clone(), Some(&encryption_config)).await?;
+        encryption::cleanup_completed_migration(&db_path)?;
+        Ok(database)
+    }
+
+    async fn open(
+        db_path: PathBuf,
+        encryption_config: Option<&EncryptionConfig>,
+    ) -> Result<Self, DatabaseError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db_url = format!("sqlite://{}", db_path.display());
-
-        // Create database if it doesn't exist
-        tracing::debug!("Checking if DB exists...{:?}", db_url);
-        match Sqlite::database_exists(&db_url).await {
-            Ok(true) => {
-                tracing::debug!("DB exists");
-            }
-            Ok(false) => {
-                tracing::debug!("DB does not exist, creating...");
-                Sqlite::create_database(&db_url).await.map_err(|e| {
-                    tracing::error!("Error creating DB: {:?}", e);
-                    DatabaseError::Sqlx(e)
-                })?;
-                tracing::debug!("DB created");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not check if database exists: {:?}, attempting to create",
-                    e
-                );
-                Sqlite::create_database(&db_url).await.map_err(|e| {
-                    tracing::error!("Error creating DB: {:?}", e);
-                    DatabaseError::Sqlx(e)
-                })?;
-            }
-        }
-
-        let pool = Self::create_connection_pool(&db_url).await?;
+        let pool = Self::create_connection_pool(&db_path, encryption_config).await?;
 
         // Automatically run migrations
         MIGRATOR.run(&pool).await?;
@@ -130,7 +150,10 @@ impl Database {
     }
 
     /// Creates and configures a SQLite connection pool
-    async fn create_connection_pool(db_url: &str) -> Result<SqlitePool, DatabaseError> {
+    async fn create_connection_pool(
+        db_path: &Path,
+        encryption_config: Option<&EncryptionConfig>,
+    ) -> Result<SqlitePool, DatabaseError> {
         tracing::debug!("Creating connection pool...");
 
         // Log every SQL statement only when explicitly opted in (e.g. benchmarks).
@@ -141,8 +164,7 @@ impl Database {
             tracing::log::LevelFilter::Off
         };
 
-        let connect_options = format!("{db_url}?mode=rwc")
-            .parse::<SqliteConnectOptions>()?
+        let connect_options = Self::connect_options(db_path, encryption_config)
             .log_statements(log_statements_level)
             .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_millis(500));
 
@@ -174,7 +196,21 @@ impl Database {
             })
             .connect_with(connect_options)
             .await?;
+
         Ok(pool)
+    }
+
+    fn connect_options(
+        db_path: &Path,
+        encryption_config: Option<&EncryptionConfig>,
+    ) -> SqliteConnectOptions {
+        match encryption_config {
+            Some(config) => encryption::encrypted_connect_options(db_path, config, true),
+            None => SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_millis(u64::from(DB_BUSY_TIMEOUT_MS))),
+        }
     }
 
     /// Runs all pending database migrations
@@ -413,8 +449,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{
+        fs::{self, File},
+        io::Read,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use mdk_sqlite_storage::keyring;
     use tempfile::TempDir;
+
+    use crate::whitenoise::Whitenoise;
+
+    const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+    fn unique_service_id() -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("com.whitenoise.database-test.{id}")
+    }
+
+    fn read_db_header(db_path: &Path) -> [u8; 16] {
+        let mut file = File::open(db_path).expect("Failed to open database file");
+        let mut header = [0_u8; 16];
+        file.read_exact(&mut header)
+            .expect("Failed to read database header");
+        header
+    }
 
     async fn create_test_db() -> (Database, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -451,6 +512,152 @@ mod tests {
         let db = db.unwrap();
         assert_eq!(db.path, db_path);
         assert!(db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_database_creation() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("encrypted.db");
+        let service_id = unique_service_id();
+
+        let db = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to create encrypted database");
+
+        assert_eq!(db.path, db_path);
+        assert!(db_path.exists());
+        assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
+        assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
+
+        let result =
+            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'")
+                .fetch_optional(&db.pool)
+                .await
+                .expect("Failed to check accounts table");
+
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_database_reopen_existing() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("encrypted-reopen.db");
+        let service_id = unique_service_id();
+        let pubkey = "aa".repeat(32);
+
+        let db = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to create encrypted database");
+        setup_account(&db, &pubkey).await;
+        drop(db);
+
+        let reopened = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to reopen encrypted database");
+
+        let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&reopened.pool)
+            .await
+            .expect("Failed to count accounts");
+
+        assert_eq!(account_count.0, 1);
+        assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_database_migrates_to_encrypted_without_data_loss() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("migrate.db");
+        let service_id = unique_service_id();
+        let pubkey = "bb".repeat(32);
+
+        let plaintext = Database::new(db_path.clone())
+            .await
+            .expect("Failed to create plaintext database");
+        setup_account(&plaintext, &pubkey).await;
+        drop(plaintext);
+
+        assert_eq!(read_db_header(&db_path), *SQLITE_HEADER);
+        assert!(encryption::is_plaintext_sqlite_database(&db_path).unwrap());
+
+        let encrypted = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to migrate plaintext database");
+
+        let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&encrypted.pool)
+            .await
+            .expect("Failed to count migrated accounts");
+
+        assert_eq!(account_count.0, 1);
+        assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
+        assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
+        assert!(!PathBuf::from(format!("{}.plaintext.backup", db_path.display())).exists());
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_migration_restores_plaintext_backup_when_database_missing() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("recover-backup.db");
+        let backup_path = PathBuf::from(format!("{}.plaintext.backup", db_path.display()));
+        let service_id = unique_service_id();
+        let pubkey = "cc".repeat(32);
+
+        let plaintext = Database::new(db_path.clone())
+            .await
+            .expect("Failed to create plaintext database");
+        setup_account(&plaintext, &pubkey).await;
+        sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&plaintext.pool)
+            .await
+            .expect("Failed to checkpoint plaintext database");
+        drop(plaintext);
+
+        fs::rename(&db_path, &backup_path).expect("Failed to move plaintext database to backup");
+
+        assert!(!db_path.exists());
+        assert_eq!(read_db_header(&backup_path), *SQLITE_HEADER);
+
+        let encrypted = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to recover and migrate plaintext backup");
+
+        let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&encrypted.pool)
+            .await
+            .expect("Failed to count recovered accounts");
+
+        assert_eq!(account_count.0, 1);
+        assert!(db_path.exists());
+        assert!(!backup_path.exists());
+        assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
+        assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_database_requires_existing_key() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("missing-key.db");
+        let service_id = unique_service_id();
+
+        let db = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to create encrypted database");
+        drop(db);
+
+        keyring::delete_db_key(&service_id, encryption::WHITENOISE_DB_KEY_ID)
+            .expect("Failed to delete database key");
+
+        let err = Database::new_encrypted(db_path, &service_id)
+            .await
+            .expect_err("Encrypted database should require its existing key");
+
+        assert!(matches!(err, DatabaseError::MissingEncryptionKey { .. }));
     }
 
     #[tokio::test]

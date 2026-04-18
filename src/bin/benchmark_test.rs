@@ -3,6 +3,11 @@ use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use clap::Parser;
 use keyring_core::Entry;
 use nostr_sdk::Keys;
@@ -16,10 +21,6 @@ use ::whitenoise::integration_tests::benchmarks::registry::BenchmarkRegistry;
 use ::whitenoise::integration_tests::benchmarks::{DETAILED_MODE, init_perf_layer};
 use ::whitenoise::whitenoise::secrets_store::SecretsStore;
 use ::whitenoise::*;
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 /// Filename written into the data directory by `--login` and read by `--seed-nsec`.
 ///
 /// The file contains one line per keyring entry that must survive the process
@@ -27,13 +28,15 @@ use std::os::unix::fs::OpenOptionsExt;
 ///
 ///   `<keyring_key_id>` `<hex-encoded secret>`
 ///
-/// Only MDK DB encryption keys (`mdk.db.key.*`) are written. The Nostr private
-/// key is not needed across the boundary because the warm-init run does not
-/// call `login()`.
+/// Only database encryption keys are written. The Nostr private key is not
+/// needed across the boundary because the warm-init run does not call `login()`.
 const KEYRING_SIDECAR: &str = "benchmark_keyring.txt";
 
 /// Service name used for all keyring entries in benchmark builds.
 const KEYRING_SERVICE: &str = "com.whitenoise.benchmark";
+
+/// Benchmark-scoped keyring key id used by the Whitenoise SQLCipher database.
+const BENCHMARK_WHITENOISE_DB_KEY_ID: &str = "benchmark.whitenoise.db.key.v1";
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -52,9 +55,9 @@ struct Args {
     /// to sync from relays, then shut down. Use this to seed a data directory
     /// with a real account before running `--init-only` measurements.
     ///
-    /// After shutdown, the MDK DB encryption key is written to a sidecar file
+    /// After shutdown, database encryption keys are written to a sidecar file
     /// inside `--data-dir` so that subsequent `--init-only --seed-nsec` runs
-    /// can restore it to the in-memory keyring before opening the encrypted DB.
+    /// can restore them to the in-memory keyring before opening encrypted DBs.
     #[clap(long, value_name = "NSEC")]
     login: Option<String>,
 
@@ -63,13 +66,13 @@ struct Args {
     ///
     /// The mock keyring used in benchmark builds is in-memory and does not
     /// survive across process boundaries.  The seeding `--login` run generates
-    /// a random 32-byte MDK DB encryption key, stores it in the mock keyring,
-    /// writes the DB, and exits — the key is gone.  The next `--init-only`
-    /// process starts with an empty mock keyring, finds the encrypted SQLite
-    /// file on disk, and fails with `KeyringEntryMissingForExistingDatabase`.
+    /// random 32-byte DB encryption keys, stores them in the mock keyring,
+    /// writes the DBs, and exits — the keys are gone.  The next `--init-only`
+    /// process starts with an empty mock keyring, finds encrypted SQLite files
+    /// on disk, and fails while opening them.
     ///
-    /// `--login` writes the MDK key to `<data-dir>/benchmark_keyring.txt`.
-    /// Passing `--seed-nsec <NSEC>` reads that sidecar and injects the key
+    /// `--login` writes DB keys to `<data-dir>/benchmark_keyring.txt`.
+    /// Passing `--seed-nsec <NSEC>` reads that sidecar and injects the keys
     /// back into the mock keyring before `initialize_whitenoise` is called.
     /// The nsec is required so the Nostr private key is also re-seeded (some
     /// startup paths read the account keys from the keyring).
@@ -141,23 +144,32 @@ fn write_json_output(
 /// Saves keyring entries that must survive across process boundaries to a
 /// plain-text sidecar file inside the benchmark data directory.
 ///
-/// Only the MDK DB encryption key for the given account pubkey is saved — it
-/// is a random 32-byte blob that cannot be re-derived from any other material.
-/// The Nostr private key is re-seeded separately in `restore_keyring_sidecar`.
+/// The DB encryption keys are random 32-byte blobs that cannot be re-derived
+/// from any other material. The Nostr private key is re-seeded separately in
+/// `restore_keyring_sidecar`.
 fn save_keyring_sidecar(
     data_dir: &std::path::Path,
     pubkey_hex: &str,
 ) -> Result<(), WhitenoiseError> {
-    let db_key_id = format!("mdk.db.key.{pubkey_hex}");
-    let entry = Entry::new(KEYRING_SERVICE, &db_key_id)
-        .map_err(|e| WhitenoiseError::Internal(format!("keyring entry error: {e}")))?;
+    let db_key_ids = [
+        BENCHMARK_WHITENOISE_DB_KEY_ID.to_string(),
+        format!("mdk.db.key.{pubkey_hex}"),
+    ];
 
-    let secret = entry.get_secret().map_err(|e| {
-        WhitenoiseError::Internal(format!("failed to read MDK DB key from keyring: {e}"))
-    })?;
+    let mut sidecar = String::new();
+    for db_key_id in &db_key_ids {
+        let entry = Entry::new(KEYRING_SERVICE, db_key_id)
+            .map_err(|e| WhitenoiseError::Internal(format!("keyring entry error: {e}")))?;
 
-    let hex_secret = hex::encode(&secret);
-    let line = format!("{db_key_id} {hex_secret}\n");
+        let secret = entry.get_secret().map_err(|e| {
+            WhitenoiseError::Internal(format!(
+                "failed to read DB key {db_key_id} from keyring: {e}"
+            ))
+        })?;
+
+        let hex_secret = hex::encode(&secret);
+        sidecar.push_str(&format!("{db_key_id} {hex_secret}\n"));
+    }
 
     let path = data_dir.join(KEYRING_SIDECAR);
     // Use OpenOptions with mode 0o600 at create time so the file is never
@@ -165,7 +177,6 @@ fn save_keyring_sidecar(
     // where the raw encryption key is exposed with the process umask.
     #[cfg(unix)]
     {
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -175,21 +186,21 @@ fn save_keyring_sidecar(
             .map_err(|e| {
                 WhitenoiseError::Internal(format!("failed to create keyring sidecar: {e}"))
             })?;
-        file.write_all(line.as_bytes()).map_err(|e| {
+        file.write_all(sidecar.as_bytes()).map_err(|e| {
             WhitenoiseError::Internal(format!("failed to write keyring sidecar: {e}"))
         })?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&path, &line).map_err(|e| {
+        std::fs::write(&path, &sidecar).map_err(|e| {
             WhitenoiseError::Internal(format!("failed to write keyring sidecar: {e}"))
         })?;
     }
 
     tracing::info!(
-        "Saved MDK DB key to sidecar {} (key_id={})",
+        "Saved DB keys to sidecar {} (key_ids={})",
         path.display(),
-        db_key_id
+        db_key_ids.join(",")
     );
     Ok(())
 }
@@ -197,9 +208,8 @@ fn save_keyring_sidecar(
 /// Restores keyring entries from the sidecar file written by `save_keyring_sidecar`,
 /// and also re-seeds the Nostr private key.
 ///
-/// Must be called BEFORE `Whitenoise::initialize_whitenoise` so that the MDK
-/// DB encryption key is present when `MdkSqliteStorage::new` tries to open the
-/// existing database.
+/// Must be called BEFORE `Whitenoise::initialize_whitenoise` so database
+/// encryption keys are present before existing encrypted databases are opened.
 fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(), WhitenoiseError> {
     // Must initialise the mock store before any keyring_core::Entry calls.
     Whitenoise::initialize_mock_keyring_store();
@@ -215,7 +225,7 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
         keys.public_key().to_hex()
     );
 
-    // Restore MDK DB encryption keys from the sidecar.
+    // Restore database encryption keys from the sidecar.
     let path = data_dir.join(KEYRING_SIDECAR);
     let content = std::fs::read_to_string(&path).map_err(|e| {
         WhitenoiseError::Internal(format!(
@@ -263,14 +273,15 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     tracing::info!("=== Starting Whitenoise Performance Benchmark Suite ===");
 
-    // Warm-init runs: restore MDK DB encryption key from the sidecar written by
+    // Warm-init runs: restore DB encryption keys from the sidecar written by
     // the preceding --login run, and re-seed the Nostr private key. Both must be
-    // in the mock keyring BEFORE initialize_whitenoise opens the encrypted MLS DB.
+    // in the mock keyring BEFORE initialize_whitenoise opens encrypted DBs.
     if let Some(ref nsec) = args.seed_nsec {
         restore_keyring_sidecar(&args.data_dir, nsec)?;
     }
 
-    let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE);
+    let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE)
+        .with_database_key_id(BENCHMARK_WHITENOISE_DB_KEY_ID);
     if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
         tracing::error!("Failed to initialize Whitenoise: {}", err);
         std::process::exit(1);
@@ -296,8 +307,8 @@ async fn main() -> Result<(), WhitenoiseError> {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // Save the MDK DB encryption key to a sidecar file so that subsequent
-        // --init-only --seed-nsec runs can restore it to their empty mock keyrings.
+        // Save DB encryption keys to a sidecar file so that subsequent
+        // --init-only --seed-nsec runs can restore them to their empty mock keyrings.
         save_keyring_sidecar(&args.data_dir, &account.pubkey.to_hex())?;
 
         whitenoise.shutdown().await?;

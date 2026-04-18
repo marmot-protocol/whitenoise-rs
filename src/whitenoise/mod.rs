@@ -91,6 +91,10 @@ pub struct WhitenoiseConfig {
     /// to avoid key collisions in the system keyring.
     pub keyring_service_id: String,
 
+    /// Override for the Whitenoise SQLCipher keyring key id; available in test and benchmark builds.
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+    pub database_key_id: Option<String>,
+
     /// Configured discovery relays for the relay-control discovery plane.
     pub discovery_relays: Vec<RelayUrl>,
 }
@@ -110,6 +114,8 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: None, // Use default MessageAggregator configuration
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
@@ -134,12 +140,20 @@ impl WhitenoiseConfig {
             logs_dir: formatted_logs_dir,
             message_aggregator_config: Some(aggregator_config),
             keyring_service_id: keyring_service_id.to_string(),
+            #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+            database_key_id: None,
             discovery_relays: DiscoveryPlaneConfig::curated_default_relays(),
         }
     }
 
     pub fn with_discovery_relays(mut self, discovery_relays: Vec<RelayUrl>) -> Self {
         self.discovery_relays = discovery_relays;
+        self
+    }
+
+    #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+    pub fn with_database_key_id(mut self, database_key_id: &str) -> Self {
+        self.database_key_id = Some(database_key_id.to_string());
         self
     }
 }
@@ -487,7 +501,21 @@ impl Whitenoise {
 
         init_timing::record("directories_and_logging");
 
-        let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
+        let database_path = data_dir.join("whitenoise.sqlite");
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+        let database = Arc::new(match config.database_key_id.as_deref() {
+            Some(database_key_id) => {
+                Database::new_encrypted_with_key_id(
+                    database_path,
+                    &keyring_service_id,
+                    database_key_id,
+                )
+                .await?
+            }
+            None => Database::new_encrypted(database_path, &keyring_service_id).await?,
+        });
+        #[cfg(not(any(test, feature = "integration-tests", feature = "benchmark-tests")))]
+        let database = Arc::new(Database::new_encrypted(database_path, &keyring_service_id).await?);
 
         init_timing::record("database");
 
@@ -784,6 +812,8 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use crate::whitenoise::accounts_groups::AccountGroup;
     use crate::whitenoise::group_information::GroupInformation;
@@ -794,13 +824,16 @@ pub mod test_utils {
 
     // Test configuration and setup helpers
     pub(crate) fn create_test_config() -> (WhitenoiseConfig, TempDir, TempDir) {
+        static TEST_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+        let id = TEST_CONFIG_ID.fetch_add(1, Ordering::SeqCst);
         let data_temp_dir = TempDir::new().expect("Failed to create temp data dir");
         let logs_temp_dir = TempDir::new().expect("Failed to create temp logs dir");
         let config = WhitenoiseConfig::new(
             data_temp_dir.path(),
             logs_temp_dir.path(),
-            "com.whitenoise.test",
+            &format!("com.whitenoise.test.{id}"),
         )
+        .with_database_key_id(&format!("test.whitenoise.db.key.{id}"))
         .with_discovery_relays(Relay::urls(&Relay::defaults()));
         (config, data_temp_dir, logs_temp_dir)
     }
