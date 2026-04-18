@@ -485,6 +485,17 @@ impl RelayControlPlane {
     }
 
     #[perf_instrument("relay")]
+    pub(crate) async fn fetch_user_key_package_lookup(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<ephemeral::KeyPackageLookup> {
+        self.ephemeral
+            .fetch_user_key_package_lookup(pubkey, relays)
+            .await
+    }
+
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_welcome(
         &self,
         receiver: &PublicKey,
@@ -551,13 +562,14 @@ impl RelayControlPlane {
     #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
+        kind: nostr_sdk::Kind,
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[nostr_sdk::Tag],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
         self.ephemeral
-            .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
+            .publish_key_package_with_signer(kind, encoded_key_package, relays, tags, signer)
             .await
     }
 

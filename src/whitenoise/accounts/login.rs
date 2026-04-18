@@ -289,6 +289,7 @@ mod tests {
 
     use crate::RelayType;
     use crate::whitenoise::accounts::Account;
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
@@ -351,31 +352,35 @@ mod tests {
         whitenoise: &crate::whitenoise::Whitenoise,
         account: &Account,
     ) {
-        let key_package_event = whitenoise
-            .relay_control
-            .fetch_user_key_package(
-                account.pubkey,
-                &Relay::urls(&account.key_package_relays(whitenoise).await.unwrap()),
-            )
+        let key_package_events = whitenoise
+            .fetch_all_key_packages_for_account(account)
             .await
             .unwrap();
 
         assert!(
-            key_package_event.is_some(),
+            !key_package_events.is_empty(),
             "Account should have a key package published to relays"
         );
 
-        if let Some(event) = key_package_event {
+        for event in &key_package_events {
             assert_eq!(
                 event.pubkey, account.pubkey,
                 "Key package should be authored by the account's public key"
             );
-            assert_eq!(
-                event.kind,
-                Kind::MlsKeyPackage,
-                "Event should be a key package (kind 443)"
-            );
         }
+
+        assert!(
+            key_package_events
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+            "Account should publish a canonical key package (kind 30443)"
+        );
+        assert!(
+            key_package_events
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "Account should publish a legacy key package twin (kind 443)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -440,7 +445,7 @@ mod tests {
         );
         assert!(
             key_package_events.is_some(),
-            "Key package (kind 443) should be published for new accounts"
+            "Key package (kind 30443) should be published for new accounts"
         );
     }
 
