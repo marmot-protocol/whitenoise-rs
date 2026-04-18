@@ -122,10 +122,6 @@ impl Database {
         keyring_service_id: &str,
         key_id: &str,
     ) -> Result<Self, DatabaseError> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let encryption_config =
             encryption::prepare_sqlcipher_database(&db_path, keyring_service_id, key_id).await?;
         let database = Self::open(db_path.clone(), Some(&encryption_config)).await?;
@@ -200,13 +196,6 @@ impl Database {
             })
             .connect_with(connect_options)
             .await?;
-
-        if encryption_config.is_some() {
-            // Confirm the pool can acquire a working connection end-to-end. Key correctness and
-            // schema integrity are already verified in prepare_sqlcipher_database before we reach here.
-            let mut conn = pool.acquire().await?;
-            sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
-        }
 
         Ok(pool)
     }
@@ -461,9 +450,9 @@ where
 mod tests {
     use super::*;
     use std::{
-        fs::File,
+        fs::{self, File},
         io::Read,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -480,7 +469,7 @@ mod tests {
         format!("com.whitenoise.database-test.{id}")
     }
 
-    fn read_db_header(db_path: &PathBuf) -> [u8; 16] {
+    fn read_db_header(db_path: &Path) -> [u8; 16] {
         let mut file = File::open(db_path).expect("Failed to open database file");
         let mut header = [0_u8; 16];
         file.read_exact(&mut header)
@@ -607,6 +596,46 @@ mod tests {
         assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
         assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
         assert!(!PathBuf::from(format!("{}.plaintext.backup", db_path.display())).exists());
+    }
+
+    #[tokio::test]
+    async fn test_interrupted_migration_restores_plaintext_backup_when_database_missing() {
+        Whitenoise::initialize_mock_keyring_store();
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let db_path = temp_dir.path().join("recover-backup.db");
+        let backup_path = PathBuf::from(format!("{}.plaintext.backup", db_path.display()));
+        let service_id = unique_service_id();
+        let pubkey = "cc".repeat(32);
+
+        let plaintext = Database::new(db_path.clone())
+            .await
+            .expect("Failed to create plaintext database");
+        setup_account(&plaintext, &pubkey).await;
+        sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&plaintext.pool)
+            .await
+            .expect("Failed to checkpoint plaintext database");
+        drop(plaintext);
+
+        fs::rename(&db_path, &backup_path).expect("Failed to move plaintext database to backup");
+
+        assert!(!db_path.exists());
+        assert_eq!(read_db_header(&backup_path), *SQLITE_HEADER);
+
+        let encrypted = Database::new_encrypted(db_path.clone(), &service_id)
+            .await
+            .expect("Failed to recover and migrate plaintext backup");
+
+        let account_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&encrypted.pool)
+            .await
+            .expect("Failed to count recovered accounts");
+
+        assert_eq!(account_count.0, 1);
+        assert!(db_path.exists());
+        assert!(!backup_path.exists());
+        assert_ne!(read_db_header(&db_path), *SQLITE_HEADER);
+        assert!(encryption::is_sqlcipher_database(&db_path).unwrap());
     }
 
     #[tokio::test]

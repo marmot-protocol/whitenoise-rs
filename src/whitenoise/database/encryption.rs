@@ -90,7 +90,7 @@ async fn assert_sqlcipher_available() -> Result<(), DatabaseError> {
 
     if version.is_empty() {
         return Err(DatabaseError::EncryptionMigration(
-            "SQLite was built without SQLCipher support".to_string(),
+            "SQLCipher is not available (cipher_version is empty)".to_string(),
         ));
     }
 
@@ -128,6 +128,14 @@ async fn migrate_plaintext_database(
     }
 
     if let Err(err) = validate_encrypted_database(db_path, config).await {
+        if let Err(rollback_err) = remove_file_if_exists(db_path) {
+            return Err(DatabaseError::EncryptionMigration(format!(
+                "Encrypted database validation failed ({err}); rollback from {} to {} failed while removing bad encrypted database: {rollback_err}",
+                backup_path.display(),
+                db_path.display(),
+            )));
+        }
+
         fs::rename(&backup_path, db_path).map_err(|rollback_err| {
             DatabaseError::EncryptionMigration(format!(
                 "Encrypted database validation failed ({err}); rollback from {} to {} failed: {rollback_err}",
@@ -147,16 +155,13 @@ async fn recover_interrupted_migration(
     db_path: &Path,
     config: &EncryptionConfig,
 ) -> Result<(), DatabaseError> {
-    if db_path.exists() {
-        let temp_path = sidecar_path(db_path, ".encrypted.tmp");
-        if database_file_state(db_path)? == DatabaseFileState::Plaintext {
-            remove_file_if_exists(&temp_path)?;
-        }
-        return Ok(());
-    }
-
     let temp_path = sidecar_path(db_path, ".encrypted.tmp");
     let backup_path = sidecar_path(db_path, ".plaintext.backup");
+
+    if db_path.exists() {
+        remove_file_if_exists(&temp_path)?;
+        return Ok(());
+    }
 
     if temp_path.exists() {
         match validate_encrypted_database(&temp_path, config).await {
