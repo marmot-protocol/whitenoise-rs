@@ -240,6 +240,11 @@ impl AccountGroupHandle {
         }
     }
 
+    /// Return a reference to the underlying relay control plane.
+    pub(crate) fn relay_control(&self) -> &Arc<RelayControlPlane> {
+        &self.relay_control
+    }
+
     pub(crate) async fn sync_subscriptions(
         &self,
         group_specs: &[GroupSubscriptionSpec],

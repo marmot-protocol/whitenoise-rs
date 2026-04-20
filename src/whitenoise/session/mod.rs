@@ -1,5 +1,6 @@
 mod groups;
 pub(crate) mod messages;
+pub(crate) mod push;
 pub(crate) mod relay_handles;
 
 mod drafts;
@@ -10,16 +11,17 @@ mod social;
 pub use self::drafts::DraftOps;
 pub use self::groups::GroupOps;
 pub use self::membership::{MembershipOps, MembershipOpsForGroup};
+pub use self::push::PushOps;
 pub use self::settings::SettingsOps;
 pub use self::social::SocialOps;
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use mdk_core::prelude::MDK;
+use mdk_core::prelude::{GroupId, MDK};
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::prelude::NostrSigner;
-use nostr_sdk::{PublicKey, RelayUrl};
+use nostr_sdk::{EventId, PublicKey, RelayUrl};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, watch};
 use tokio::task::JoinHandle;
 
@@ -82,6 +84,8 @@ pub struct AccountSession {
     inbox: RwLock<Option<AccountInboxState>>,
     /// Serializes concurrent activate/deactivate operations.
     activation_lock: Mutex<()>,
+    /// In-memory coordination for delayed MIP-05 token-list responses.
+    pub(crate) pending_push_token_responses: Arc<DashMap<(GroupId, EventId), ()>>,
 }
 
 impl AccountSession {
@@ -117,6 +121,7 @@ impl AccountSession {
             group_handle,
             inbox: RwLock::new(None),
             activation_lock: Mutex::new(()),
+            pending_push_token_responses: Arc::new(DashMap::new()),
         })
     }
 
@@ -203,10 +208,71 @@ impl AccountSession {
     pub fn membership(&self) -> MembershipOps<'_> {
         MembershipOps::new(self)
     }
-  
+
     /// Return a view for group read operations scoped to this session.
     pub fn groups(&self) -> GroupOps<'_> {
         GroupOps::new(self)
+    }
+
+    /// Return a view for push notification operations scoped to this session.
+    pub fn push(&self) -> PushOps<'_> {
+        PushOps::new(self)
+    }
+
+    /// Schedule a delayed MIP-05 token-list response.
+    ///
+    /// Inserts the response key into the pending map, then spawns a delayed
+    /// task (1-3 seconds random) that dispatches the response if it has not
+    /// been cleared by an incoming token-list response in the meantime.
+    pub(crate) fn schedule_pending_token_response(
+        &self,
+        group_id: GroupId,
+        request_event_id: EventId,
+    ) {
+        use std::time::Duration;
+
+        use rand::Rng;
+
+        use crate::whitenoise::push_notifications::respond_to_token_request_with;
+
+        let key = (group_id.clone(), request_event_id);
+        self.pending_push_token_responses.insert(key, ());
+
+        let mdk = Arc::clone(&self.mdk);
+        let database = Arc::clone(&self.database);
+        let pending = Arc::clone(&self.pending_push_token_responses);
+        let relay_control = Arc::clone(self.group_handle.relay_control());
+        let account_pubkey = self.account_pubkey;
+        let delay_ms = ::rand::rng().random_range(1_000u64..=3_000);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            let key = (group_id.clone(), request_event_id);
+            if pending.remove(&key).is_none() {
+                return;
+            }
+
+            if let Err(error) = respond_to_token_request_with(
+                &mdk,
+                &database,
+                &relay_control,
+                &account_pubkey,
+                &group_id,
+                request_event_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "whitenoise::push_notifications",
+                    account = %account_pubkey.to_hex(),
+                    group_id = %hex::encode(group_id.as_slice()),
+                    request_event_id = %request_event_id.to_hex(),
+                    error = %error,
+                    "Failed to send delayed MIP-05 token-list response"
+                );
+            }
+        });
     }
 
     // ── Inbox plane lifecycle ──────────────────────────────────────

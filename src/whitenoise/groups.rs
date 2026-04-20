@@ -200,6 +200,7 @@ impl Whitenoise {
         account_group.accept(self).await?;
 
         // Best-effort: share the creator's push token into the new group.
+        #[allow(deprecated)]
         if let Err(error) = self
             .share_local_push_token_to_group(creator_account, &group.mls_group_id)
             .await
