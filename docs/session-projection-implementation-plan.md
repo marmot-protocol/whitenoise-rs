@@ -471,7 +471,7 @@ same PR.
 
 ### Phase 17: BroadcastHub consolidation (~400 LOC)
 
-- [ ] Not started
+- [x] Completed in PR `#765`
 
 <details>
 <summary>Details</summary>

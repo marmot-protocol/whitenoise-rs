@@ -18,6 +18,7 @@ pub mod accounts;
 pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
+mod broadcast_hub;
 pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
