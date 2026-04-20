@@ -47,6 +47,7 @@ impl VerifySelfUpdateTestCase {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl TestCase for VerifySelfUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;

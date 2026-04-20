@@ -1,3 +1,4 @@
+mod groups;
 pub(crate) mod messages;
 pub(crate) mod relay_handles;
 
@@ -6,6 +7,7 @@ mod settings;
 mod social;
 
 pub use self::drafts::DraftOps;
+pub use self::groups::GroupOps;
 pub use self::settings::SettingsOps;
 pub use self::social::SocialOps;
 
@@ -193,6 +195,11 @@ impl AccountSession {
     /// Return a view for follow/social operations scoped to this session.
     pub fn social(&self) -> SocialOps<'_> {
         SocialOps::new(self)
+    }
+
+    /// Return a view for group read operations scoped to this session.
+    pub fn groups(&self) -> GroupOps<'_> {
+        GroupOps::new(self)
     }
 
     // ── Inbox plane lifecycle ──────────────────────────────────────

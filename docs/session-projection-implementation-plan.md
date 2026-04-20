@@ -261,7 +261,7 @@ delivery-status isolation test.
 
 ### Phase 8: Migrate group read operations (~500 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #763
 
 <details>
 <summary>Details</summary>

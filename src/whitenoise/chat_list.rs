@@ -252,6 +252,7 @@ impl Whitenoise {
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Declined and archived groups are filtered out.
+    #[allow(deprecated)]
     #[perf_instrument("chat_list")]
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
         let visible = self.visible_groups(account).await?;
@@ -265,6 +266,7 @@ impl Whitenoise {
     /// Retrieves the archived chat list for an account.
     ///
     /// Returns only archived chats, sorted by last activity.
+    #[allow(deprecated)]
     #[perf_instrument("chat_list")]
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
         let visible = self.visible_groups(account).await?;

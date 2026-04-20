@@ -357,189 +357,98 @@ impl Whitenoise {
         Ok(group)
     }
 
-    #[perf_instrument("groups")]
+    #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().all() instead.")]
     pub async fn groups(
         &self,
         account: &Account,
         active_filter: bool,
     ) -> Result<Vec<group_types::Group>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups: Vec<group_types::Group> = mdk
-            .get_groups()
-            .map_err(WhitenoiseError::from)?
-            .into_iter()
-            .filter(|group| !active_filter || group.state == group_types::GroupState::Active)
-            .collect();
-
-        Ok(groups)
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().all(active_filter)
     }
 
-    /// Returns visible groups for the account (pending + accepted + removed, excluding declined).
-    ///
-    /// `AccountGroup` is the source of truth for visibility:
-    /// - **Pending** (`user_confirmation = NULL`) — invited, not yet accepted
-    /// - **Accepted** (`user_confirmation = true`) — active member
-    /// - **Removed** (`user_confirmation = true`, `removed_at IS NOT NULL`) — kicked by admin;
-    ///   group stays visible (read-only) until the user explicitly archives or deletes it
-    /// - **Declined** (`user_confirmation = false`) — hidden, never shown
-    ///
-    /// All MDK groups (including inactive) are fetched so that removed groups, which MDK
-    /// marks as `Inactive`, are still paired with their `AccountGroup` records and returned.
-    ///
-    /// # Arguments
-    /// * `account` - The account to get visible groups for
-    ///
-    /// # Returns
-    /// * `Ok(Vec<GroupWithMembership>)` - List of visible groups with their membership data
-    /// * `Err(WhitenoiseError)` - If there's an error accessing storage
-    #[perf_instrument("groups")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().visible() instead."
+    )]
     pub async fn visible_groups(&self, account: &Account) -> Result<Vec<GroupWithMembership>> {
-        // Fetch all MDK groups (including inactive) — AccountGroup is the source of
-        // truth for visibility. Removed groups (inactive in MDK but with a removed_at
-        // record) must remain visible in the chat list until the user archives them.
-        let all_groups = self.groups(account, false).await?;
-
-        // Get visible AccountGroup records (pending + accepted, including removed)
-        let visible_account_groups =
-            AccountGroup::visible_for_account(self, &account.pubkey).await?;
-
-        // Build a map for efficient lookup when pairing
-        let memberships_by_id: HashMap<_, _> = visible_account_groups
-            .into_iter()
-            .map(|ag| (ag.mls_group_id.clone(), ag))
-            .collect();
-
-        // Include inactive MDK groups only when explicitly removed — not for unrelated inactive state.
-        Ok(all_groups
-            .into_iter()
-            .filter_map(|group| {
-                let membership = memberships_by_id.get(&group.mls_group_id)?.clone();
-                if group.state == group_types::GroupState::Active || membership.is_removed() {
-                    Some(GroupWithMembership { group, membership })
-                } else {
-                    None
-                }
-            })
-            .collect())
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().visible().await
     }
 
-    /// Returns visible groups for the account, each paired with its [`GroupInformation`].
-    ///
-    /// This eliminates the N+1 pattern of calling [`Whitenoise::visible_groups`] and then
-    /// fetching [`GroupInformation`] individually for each group. Group metadata (including
-    /// [`crate::whitenoise::group_information::GroupType`]) is fetched in a single batch
-    /// query and included in every returned item, so callers can filter or branch on
-    /// `group_type` without any further round-trips.
-    ///
-    /// Groups with no `group_information` row are excluded from the result. In practice
-    /// this is safe: the row is created eagerly at group creation and welcome time.
-    ///
-    /// # Arguments
-    /// * `account` - The account to get visible groups for
-    ///
-    /// # Returns
-    /// * `Ok(Vec<GroupWithInfoAndMembership>)` - Visible groups with info and membership data
-    /// * `Err(WhitenoiseError)` - If there is an error accessing storage
-    #[perf_instrument("groups")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().visible_with_info() instead."
+    )]
     pub async fn visible_groups_with_info(
         &self,
         account: &Account,
     ) -> Result<Vec<GroupWithInfoAndMembership>> {
-        let visible = self.visible_groups(account).await?;
-
-        if visible.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Batch-fetch all GroupInformation rows for the visible group IDs.
-        let group_ids: Vec<_> = visible
-            .iter()
-            .map(|gwm| gwm.group.mls_group_id.clone())
-            .collect();
-        let info_list = GroupInformation::find_by_mls_group_ids(&group_ids, &self.database).await?;
-        let info_by_id: HashMap<_, _> = info_list
-            .into_iter()
-            .map(|gi| (gi.mls_group_id.clone(), gi))
-            .collect();
-
-        // Pair each visible group with its GroupInformation, dropping any without a row.
-        let result = visible
-            .into_iter()
-            .filter_map(|gwm| {
-                let info = info_by_id.get(&gwm.group.mls_group_id)?.clone();
-                Some(GroupWithInfoAndMembership {
-                    group: gwm.group,
-                    info,
-                    membership: gwm.membership,
-                })
-            })
-            .collect();
-
-        Ok(result)
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().visible_with_info().await
     }
 
-    /// Retrieves a single group by its MLS group ID
-    ///
-    /// # Arguments
-    /// * `account` - The account that has access to the group
-    /// * `group_id` - The MLS group ID to retrieve
-    ///
-    /// # Returns
-    /// * `Ok(Group)` - The group if found
-    /// * `Err(WhitenoiseError::GroupNotFound)` - If the group doesn't exist
-    /// * `Err(WhitenoiseError)` - If there's an error accessing storage
-    #[perf_instrument("groups")]
+    #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().get() instead.")]
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let group = mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        Ok(group)
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().get(group_id)
     }
 
-    #[perf_instrument("groups")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().members() instead."
+    )]
     pub async fn group_members(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        Ok(mdk
-            .get_members(group_id)
-            .map_err(WhitenoiseError::from)?
-            .into_iter()
-            .collect::<Vec<PublicKey>>())
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().members(group_id)
     }
 
-    #[perf_instrument("groups")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().relays() instead."
+    )]
     pub async fn group_relays(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<BTreeSet<RelayUrl>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        mdk.get_relays(group_id).map_err(WhitenoiseError::from)
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().relays(group_id)
     }
 
-    #[perf_instrument("groups")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().admins() instead."
+    )]
     pub async fn group_admins(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Vec<PublicKey>> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        Ok(mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?
-            .admin_pubkeys
-            .into_iter()
-            .collect::<Vec<PublicKey>>())
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.groups().admins(group_id)
     }
 
     #[perf_instrument("groups")]
+    #[allow(deprecated)]
     async fn ensure_account_is_group_admin(
         &self,
         account: &Account,
@@ -862,6 +771,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;
