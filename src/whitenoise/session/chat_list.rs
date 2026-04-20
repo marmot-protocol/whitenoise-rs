@@ -13,8 +13,7 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list::{
-    ChatListItem, assemble_chat_list_items, collect_pubkeys_to_fetch, resolve_chat_name,
-    resolve_display_name, sort_chat_list,
+    ChatListItem, assemble_chat_list_items, collect_pubkeys_to_fetch, sort_chat_list,
 };
 use crate::whitenoise::error::Result;
 use crate::whitenoise::group_information::{GroupInformation, GroupType};
@@ -65,130 +64,29 @@ impl<'a> ChatListOps<'a> {
 
     /// Build a single [`ChatListItem`] for a specific group.
     ///
-    /// Used by the streaming system to construct updates without re-fetching
-    /// the entire chat list. Returns `Ok(None)` if the group is not visible
-    /// or not fully initialized.
+    /// Returns `Ok(None)` if the group is not visible or not fully initialized.
     #[perf_instrument("chat_list")]
     pub(crate) async fn build_item(&self, group_id: &GroupId) -> Result<Option<ChatListItem>> {
-        // 1. Get group from MDK
         let Some(group) = self.session.mdk.get_group(group_id)? else {
             return Ok(None);
         };
 
-        // 2. Get GroupInformation
-        let group_info =
-            match GroupInformation::find_by_mls_group_id(group_id, &self.session.database).await {
-                Ok(info) => info,
-                Err(_) => return Ok(None),
-            };
-
-        // 3. Get AccountGroup for visibility/pending status
         let account_group = AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
             &self.session.database,
         )
         .await?;
-        let Some(account_group) = account_group else {
+        let Some(membership) = account_group else {
             return Ok(None);
         };
-        if !account_group.is_visible() {
+        if !membership.is_visible() {
             return Ok(None);
         }
-        let pending_confirmation = account_group.is_pending();
-        let welcomer_pubkey = account_group.welcomer_pubkey;
 
-        // 4. For DMs: get members, find other user, lookup metadata
-        let (dm_peer_pubkey, dm_other_user) = if group_info.group_type == GroupType::DirectMessage {
-            let members: Vec<PublicKey> = self
-                .session
-                .mdk
-                .get_members(group_id)?
-                .into_iter()
-                .collect();
-            if let Some(other_pk) = members
-                .iter()
-                .find(|pk| *pk != &self.session.account_pubkey)
-                .copied()
-            {
-                let user = User::find_by_pubkey(&other_pk, &self.session.database)
-                    .await
-                    .ok();
-                (Some(other_pk), user)
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
-        // 5. Get last message
-        let last_message_summaries = AggregatedMessage::find_last_by_group_ids(
-            std::slice::from_ref(group_id),
-            &self.session.database,
-        )
-        .await?;
-        let last_message_summary = last_message_summaries.into_iter().next();
-
-        // 6. Filter by visibility and resolve author display name
-        let last_message_summary = last_message_summary
-            .filter(|summary| account_group.is_message_visible(summary.created_at));
-        let last_message = if let Some(mut summary) = last_message_summary {
-            let author_user = User::find_by_pubkey(&summary.author, &self.session.database)
-                .await
-                .ok();
-            summary.author_display_name = resolve_display_name(author_user.as_ref());
-            Some(summary)
-        } else {
-            None
-        };
-
-        // 7. Resolve name and image
-        let name = resolve_chat_name(&group, &group_info.group_type, dm_other_user.as_ref());
-
-        let (group_image_path, group_image_url) = match group_info.group_type {
-            GroupType::Group => {
-                let path = self.resolve_single_group_image(&group).await;
-                (path, None)
-            }
-            GroupType::DirectMessage => {
-                let url = dm_other_user
-                    .as_ref()
-                    .and_then(|u| u.metadata.picture.as_ref().map(|url| url.to_string()));
-                (None, url)
-            }
-        };
-
-        // 8. Compute unread count
-        let cleared_ms = account_group
-            .chat_cleared_at
-            .map(|dt| dt.timestamp_millis());
-        let unread_count = AggregatedMessage::count_unread_for_group(
-            group_id,
-            account_group.last_read_message_id.as_ref(),
-            &self.session.database,
-            cleared_ms,
-        )
-        .await?;
-
-        Ok(Some(ChatListItem {
-            mls_group_id: group_id.clone(),
-            name,
-            group_type: group_info.group_type,
-            created_at: group_info.created_at,
-            group_image_path,
-            group_image_url,
-            last_message,
-            pending_confirmation,
-            welcomer_pubkey,
-            unread_count,
-            pin_order: account_group.pin_order,
-            dm_peer_pubkey,
-            archived_at: account_group.archived_at,
-            removed_at: account_group.removed_at,
-            self_removed: account_group.self_removed,
-            muted_until: account_group.muted_until,
-        }))
+        let gwm = GroupWithMembership { group, membership };
+        let mut items = self.build_for(vec![gwm]).await?;
+        Ok(items.pop())
     }
 
     // ── Private helpers ────────────────────────────────────────────────
@@ -310,13 +208,5 @@ impl<'a> ChatListOps<'a> {
 
         wn.resolve_group_image_paths(&account, &group_type_groups)
             .await
-    }
-
-    async fn resolve_single_group_image(&self, group: &group_types::Group) -> Option<PathBuf> {
-        let wn = Whitenoise::get_instance().ok()?;
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, &self.session.database)
-            .await
-            .ok()?;
-        wn.resolve_group_image_path(&account, group).await.ok()?
     }
 }
