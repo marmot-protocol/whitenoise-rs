@@ -333,7 +333,7 @@ Move `groups/media.rs` account-scoped operations into session-owned media/group 
 
 ### Phase 12: Migrate memberships (`accounts_groups`) (~700 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #764
 
 <details>
 <summary>Details</summary>

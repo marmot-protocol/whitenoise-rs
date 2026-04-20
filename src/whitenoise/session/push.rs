@@ -407,6 +407,14 @@ impl<'a> PushOps<'a> {
         group_state: GroupState,
     ) -> std::result::Result<(), String> {
         if group_state != GroupState::Active {
+            // Clean up stale cache rows for inactive groups (no relay publish
+            // possible without an active MLS group).
+            self.session
+                .repos
+                .group_push_tokens
+                .delete_by_member_pubkey(group_id, &self.session.account_pubkey)
+                .await
+                .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
             return Ok(());
         }
 

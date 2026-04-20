@@ -244,9 +244,16 @@ impl AccountSession {
         let relay_control = Arc::clone(self.group_handle.relay_control());
         let account_pubkey = self.account_pubkey;
         let delay_ms = ::rand::rng().random_range(1_000u64..=3_000);
+        let mut cancel_rx = self.cancellation.subscribe();
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+                _ = cancel_rx.changed() => {
+                    pending.remove(&(group_id, request_event_id));
+                    return;
+                }
+            }
 
             let key = (group_id.clone(), request_event_id);
             if pending.remove(&key).is_none() {
