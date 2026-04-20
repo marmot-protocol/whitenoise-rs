@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::perf_instrument;
 use crate::whitenoise::{
-    Whitenoise, accounts::Account, aggregated_message::AggregatedMessage,
-    chat_list_streaming::ChatListUpdateTrigger, database::Database, drafts::Draft,
+    Whitenoise, accounts::Account, chat_list_streaming::ChatListUpdateTrigger, database::Database,
     error::WhitenoiseError,
 };
 
@@ -375,10 +374,10 @@ impl AccountGroup {
 }
 
 impl Whitenoise {
-    /// Gets or creates an AccountGroup for the given account and MLS group.
-    ///
-    /// For DM groups, pass the other participant's pubkey as `dm_peer_pubkey`
-    /// so it can be persisted for efficient lookups.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().get_or_create() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn get_or_create_account_group(
         &self,
@@ -386,38 +385,58 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(AccountGroup, bool), WhitenoiseError> {
-        AccountGroup::get_or_create(self, &account.pubkey, mls_group_id, dm_peer_pubkey).await
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .get_or_create(dm_peer_pubkey)
+            .await
     }
 
-    /// Gets all visible AccountGroups for the given account.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().visible_groups() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn get_visible_account_groups(
         &self,
         account: &Account,
     ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        AccountGroup::visible_for_account(self, &account.pubkey).await
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().visible_groups().await
     }
 
-    /// Gets all pending AccountGroups for the given account.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().pending_groups() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn get_pending_account_groups(
         &self,
         account: &Account,
     ) -> Result<Vec<AccountGroup>, WhitenoiseError> {
-        AccountGroup::pending_for_account(self, &account.pubkey).await
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().pending_groups().await
     }
 
-    /// Accepts a group invite for the given account and MLS group.
+    /// Accepts a group invite and best-effort shares the local push token.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().accept() for DB ops; \
+                this facade also handles push-token sharing."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn accept_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-        let accepted = account_group.accept(self).await?;
+        let session = self.require_session(&account.pubkey)?;
+        let accepted = session
+            .membership()
+            .for_group(mls_group_id)
+            .accept()
+            .await?;
 
         // Best-effort: share the local push token now that the group is accepted.
         if let Err(error) = self
@@ -436,17 +455,24 @@ impl Whitenoise {
         Ok(accepted)
     }
 
-    /// Declines a group invite for the given account and MLS group.
+    /// Declines a group invite and best-effort removes the local push token.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().decline() for DB ops; \
+                this facade also handles push-token removal."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn decline_account_group(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-        let declined = account_group.decline(self).await?;
+        let session = self.require_session(&account.pubkey)?;
+        let declined = session
+            .membership()
+            .for_group(mls_group_id)
+            .decline()
+            .await?;
 
         // Best-effort: remove any push token previously shared under the old behavior.
         if let Err(error) = self
@@ -465,54 +491,42 @@ impl Whitenoise {
         Ok(declined)
     }
 
-    /// Marks a message as read for the given account.
-    ///
-    /// Looks up the message to find its group, then atomically updates the
-    /// last_read_message_id only if the new message is newer than the current
-    /// read marker. This prevents regression when messages arrive out of order
-    /// or when the UI marks an older message as read after a newer one.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().mark_message_read() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn mark_message_read(
         &self,
         account: &Account,
         message_id: &EventId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let message = AggregatedMessage::find_by_message_id(message_id, &self.database)
-            .await?
-            .ok_or(WhitenoiseError::MessageNotFound)?;
-
-        let account_group = AccountGroup::get(self, &account.pubkey, &message.mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        // Atomic compare-and-update: only advances if newer
-        let message_created_at_ms = message.created_at.timestamp_millis();
-        if let Some(updated) = account_group
-            .update_last_read_if_newer(message_id, message_created_at_ms, &self.database)
-            .await?
-        {
-            return Ok(updated);
-        }
-
-        // Update was skipped (message not newer), return current state
-        Ok(account_group)
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().mark_message_read(message_id).await
     }
 
-    /// Gets the last read message ID for an account in a group.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().last_read_message_id() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn get_last_read_message_id(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<EventId>, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
-        Ok(account_group.and_then(|ag| ag.last_read_message_id))
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(group_id)
+            .last_read_message_id()
+            .await
     }
 
-    /// Sets the pin order for a chat.
-    ///
-    /// - `None` = unpin the chat
-    /// - `Some(n)` = pin the chat with order n (lower values appear first)
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().set_pin_order() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn set_chat_pin_order(
         &self,
@@ -520,77 +534,50 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         pin_order: Option<i64>,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group
-            .update_pin_order(pin_order, &self.database)
-            .await?;
-
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .set_pin_order(pin_order)
+            .await
     }
 
-    /// Archives a chat for the given account.
-    ///
-    /// Idempotent: if already archived, returns the existing state unchanged.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().archive() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn archive_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        if account_group.is_archived() {
-            return Ok(account_group);
-        }
-
-        let updated = account_group.archive(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatArchiveChanged,
-        )
-        .await;
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().for_group(mls_group_id).archive().await
     }
 
-    /// Unarchives a chat for the given account.
-    ///
-    /// Idempotent: if not archived, returns the existing state unchanged.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().unarchive() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn unarchive_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        if !account_group.is_archived() {
-            return Ok(account_group);
-        }
-
-        let updated = account_group.unarchive(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatArchiveChanged,
-        )
-        .await;
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .unarchive()
+            .await
     }
 
-    /// Mutes a chat for the given account for the specified duration.
-    ///
-    /// Re-muting with a different duration always overwrites the previous
-    /// `muted_until` value. Use [`MuteDuration::Forever`] to mute indefinitely.
-    /// Returns [`WhitenoiseError::InvalidInput`] if [`MuteDuration::Custom`] carries
-    /// a timestamp that is not in the future.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().mute() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn mute_chat(
         &self,
@@ -598,184 +585,90 @@ impl Whitenoise {
         mls_group_id: &GroupId,
         duration: MuteDuration,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let until = duration.to_expiry();
-        if until <= Utc::now() {
-            return Err(WhitenoiseError::InvalidInput(
-                "mute_chat: `until` must be in the future".to_string(),
-            ));
-        }
-
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group.mute(until, self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatMuteChanged,
-        )
-        .await;
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .mute(duration)
+            .await
     }
 
-    /// Unmutes a chat for the given account.
-    ///
-    /// Always clears `muted_until` and emits `ChatMuteChanged`, even if the
-    /// mute has already expired. This ensures an explicit "Unmute" action is
-    /// immediate rather than waiting for the background cleanup task.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().unmute() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn unmute_chat(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let updated = account_group.unmute(self).await?;
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::ChatMuteChanged,
-        )
-        .await;
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().for_group(mls_group_id).unmute().await
     }
 
-    /// Marks a group as voluntarily departed for the given account.
-    ///
-    /// Idempotent. Emits [`ChatListUpdateTrigger::LeftGroup`] when the row changes.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().mark_as_left() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub(crate) async fn mark_as_left(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let Some(updated) = account_group.mark_left(self).await? else {
-            // Already departed (left or removed) — reload current state.
-            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
-                .await?
-                .ok_or(WhitenoiseError::GroupNotFound)?;
-            return Ok(current);
-        };
-
-        self.emit_chat_list_update(account, mls_group_id, ChatListUpdateTrigger::LeftGroup)
-            .await;
-
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .mark_as_left()
+            .await
     }
 
-    /// Marks a group as removed for the given account.
-    ///
-    /// Idempotent. Emits [`ChatListUpdateTrigger::RemovedFromGroup`] when the row changes.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().mark_as_removed() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub(crate) async fn mark_as_removed(
         &self,
         account: &Account,
         mls_group_id: &GroupId,
     ) -> Result<AccountGroup, WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, mls_group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let Some(updated) = account_group.mark_removed(self).await? else {
-            // Another task won the atomic update — reload the current row so
-            // we return the persisted removed_at rather than the stale pre-load value.
-            let current = AccountGroup::get(self, &account.pubkey, mls_group_id)
-                .await?
-                .ok_or(WhitenoiseError::GroupNotFound)?;
-            return Ok(current);
-        };
-
-        self.emit_chat_list_update(
-            account,
-            mls_group_id,
-            ChatListUpdateTrigger::RemovedFromGroup,
-        )
-        .await;
-
-        Ok(updated)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .membership()
+            .for_group(mls_group_id)
+            .mark_as_removed()
+            .await
     }
 
-    /// Returns the group ID of the latest DM group between the account and the
-    /// given peer, or `None` if no DM group exists between them.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().dm_group_with_peer() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn get_dm_group_with_peer(
         &self,
         account: &Account,
         peer_pubkey: &PublicKey,
     ) -> Result<Option<GroupId>, WhitenoiseError> {
-        AccountGroup::find_latest_dm_group_with_peer(self, &account.pubkey, peer_pubkey).await
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().dm_group_with_peer(peer_pubkey).await
     }
 
-    /// Clears all messages from this account's view by setting a per-account
-    /// timestamp floor. Messages at or before the current time are hidden.
-    ///
-    /// The group remains in the chat list with no visible messages. This is a
-    /// local-only operation with no protocol-level side effects.
-    ///
-    /// Works correctly in multi-account scenarios: each account's
-    /// `chat_cleared_at` is independent. Messages are only physically deleted
-    /// when all accounts sharing the group have cleared.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::membership().for_group().clear_chat() instead."
+    )]
     #[perf_instrument("account_groups")]
     pub async fn clear_chat(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<(), WhitenoiseError> {
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        account_group
-            .clear_chat_state(Utc::now(), &self.database)
-            .await?;
-
-        if let Err(e) = Draft::delete(&account.pubkey, group_id, &self.database).await {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                "Failed to delete draft during clear_chat: {}",
-                e
-            );
-        }
-
-        if let Err(e) = self.database.try_cleanup_cleared_messages(group_id).await {
-            tracing::warn!(
-                target: "whitenoise::accounts_groups",
-                "Failed to cleanup cleared messages: {}",
-                e
-            );
-        }
-
-        match self.create_mdk_for_account(account.pubkey) {
-            Ok(mdk) => {
-                if let Err(e) = mdk.delete_messages_for_group(group_id) {
-                    tracing::warn!(
-                        target: "whitenoise::accounts_groups",
-                        "Failed to delete MDK messages during clear_chat: {}",
-                        e
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::accounts_groups",
-                    "Failed to create MDK for clear_chat message cleanup: {}",
-                    e
-                );
-            }
-        }
-
-        self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::ChatCleared)
-            .await;
-
-        Ok(())
+        let session = self.require_session(&account.pubkey)?;
+        session.membership().for_group(group_id).clear_chat().await
     }
 
     /// Deletes all local data for a group from this account's perspective.
@@ -920,8 +813,10 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::whitenoise::aggregated_message::AggregatedMessage;
     use crate::whitenoise::group_information::{GroupInformation, GroupType};
     use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 

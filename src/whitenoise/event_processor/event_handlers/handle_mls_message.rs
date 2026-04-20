@@ -406,6 +406,7 @@ impl Whitenoise {
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
             );
+            #[allow(deprecated)]
             self.mark_as_removed(account, mls_group_id).await?;
         }
 
