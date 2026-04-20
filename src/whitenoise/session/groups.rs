@@ -135,7 +135,7 @@ impl<'a> GroupOps<'a> {
             .get_members(group_id)
             .map_err(WhitenoiseError::from)?
             .into_iter()
-            .collect::<Vec<PublicKey>>())
+            .collect())
     }
 
     /// Return the relay URLs for a group.
@@ -148,14 +148,6 @@ impl<'a> GroupOps<'a> {
 
     /// Return the admin public keys for a group.
     pub fn admins(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
-        Ok(self
-            .session
-            .mdk
-            .get_group(group_id)
-            .map_err(WhitenoiseError::from)?
-            .ok_or(WhitenoiseError::GroupNotFound)?
-            .admin_pubkeys
-            .into_iter()
-            .collect::<Vec<PublicKey>>())
+        Ok(self.get(group_id)?.admin_pubkeys.into_iter().collect())
     }
 }
