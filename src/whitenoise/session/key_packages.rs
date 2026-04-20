@@ -35,22 +35,18 @@ impl<'a> KeyPackageOps<'a> {
 
     // ── Public API ─────────────────────────────────────────────────────
 
-    /// Publish a new key package for this account with retry (up to 3 attempts).
-    ///
     /// Creates a single MLS key package, then retries relay publishing with
     /// exponential backoff if publishing fails. The key package is created
     /// only once to avoid orphaning unused key material in local MLS storage.
     #[perf_instrument("key_packages")]
     pub async fn publish(&self) -> Result<()> {
         let relays = self.prepare_relays().await?;
-
         if relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
 
         let key_package_data = self.encoded_key_package(&relays).await?;
         let relay_urls = Relay::urls(&relays);
-
         let mut last_error = None;
 
         for attempt in 0..MAX_PUBLISH_ATTEMPTS {
@@ -113,11 +109,9 @@ impl<'a> KeyPackageOps<'a> {
         Ok(())
     }
 
-    /// Fetch all key package events for this account from its key package relays.
     #[perf_instrument("key_packages")]
     pub async fn fetch_all(&self) -> Result<Vec<Event>> {
         let relays = self.prepare_relays().await?;
-
         if relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
         }
@@ -145,18 +139,9 @@ impl<'a> KeyPackageOps<'a> {
             );
         }
 
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Found {} valid key package event(s) for account {}",
-            key_package_events.len(),
-            self.session.account_pubkey.to_hex()
-        );
-
         Ok(key_package_events)
     }
 
-    /// Delete a single key package from relays, optionally deleting local key material.
-    ///
     /// Returns `true` if the deletion event was accepted by at least one relay.
     #[perf_instrument("key_packages")]
     pub async fn delete(&self, event_id: &EventId, delete_mls_stored_keys: bool) -> Result<bool> {
@@ -178,8 +163,6 @@ impl<'a> KeyPackageOps<'a> {
         Ok(!result.success.is_empty())
     }
 
-    /// Delete all key packages for this account with convergence loop.
-    ///
     /// Fetches and deletes in rounds until no key packages remain on relays,
     /// up to 10 rounds.
     #[perf_instrument("key_packages")]
@@ -192,8 +175,7 @@ impl<'a> KeyPackageOps<'a> {
             if key_package_events.is_empty() {
                 tracing::info!(
                     target: "whitenoise::key_packages",
-                    "All key packages deleted for account {} \
-                     ({} total across {} round(s))",
+                    "All key packages deleted for account {} ({} total across {} round(s))",
                     self.session.account_pubkey.to_hex(),
                     total_deleted,
                     round + 1,
@@ -201,18 +183,9 @@ impl<'a> KeyPackageOps<'a> {
                 return Ok(total_deleted);
             }
 
-            tracing::debug!(
-                target: "whitenoise::key_packages",
-                "Round {}: found {} remaining key package(s) for account {}",
-                round + 1,
-                key_package_events.len(),
-                self.session.account_pubkey.to_hex(),
-            );
-
             let batch_size = key_package_events.len();
-
             let deleted = self
-                .delete_batch_internal(key_package_events, delete_mls_stored_keys, 1)
+                .delete_batch(key_package_events, delete_mls_stored_keys, 1)
                 .await?;
 
             total_deleted += deleted;
@@ -220,8 +193,7 @@ impl<'a> KeyPackageOps<'a> {
             if deleted == 0 {
                 tracing::warn!(
                     target: "whitenoise::key_packages",
-                    "Round {} deleted 0 key packages despite {} found \
-                     — relays may not support deletion",
+                    "Round {} deleted 0 key packages despite {} found — relays may not support deletion",
                     round + 1,
                     batch_size,
                 );
@@ -233,7 +205,6 @@ impl<'a> KeyPackageOps<'a> {
     }
 
     /// Delete specific key package events from relays with retry.
-    ///
     /// Storage deletion happens only on the initial attempt.
     #[perf_instrument("key_packages")]
     pub(crate) async fn delete_batch(
@@ -242,13 +213,69 @@ impl<'a> KeyPackageOps<'a> {
         delete_mls_stored_keys: bool,
         max_retries: u32,
     ) -> Result<usize> {
-        self.delete_batch_internal(key_package_events, delete_mls_stored_keys, max_retries)
-            .await
+        if key_package_events.is_empty() {
+            return Ok(0);
+        }
+
+        let original_count = key_package_events.len();
+        let original_ids: HashSet<EventId> = key_package_events.iter().map(|e| e.id).collect();
+
+        let relays = self.prepare_relays().await?;
+        if relays.is_empty() {
+            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
+        }
+        let relay_urls = Relay::urls(&relays);
+
+        if delete_mls_stored_keys {
+            self.delete_from_storage(&key_package_events)?;
+        }
+
+        let mut pending_ids: Vec<EventId> = key_package_events.iter().map(|e| e.id).collect();
+
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                tracing::debug!(
+                    target: "whitenoise::key_packages",
+                    "Retry {}/{} for {} remaining key package(s)",
+                    attempt,
+                    max_retries,
+                    pending_ids.len()
+                );
+            }
+
+            self.publish_deletion(&pending_ids, &relay_urls).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let remaining_events = self.fetch_all().await?;
+            pending_ids = remaining_events
+                .iter()
+                .filter(|e| original_ids.contains(&e.id))
+                .map(|e| e.id)
+                .collect();
+
+            if pending_ids.is_empty() {
+                break;
+            }
+        }
+
+        let deleted_count = original_count - pending_ids.len();
+
+        if !pending_ids.is_empty() {
+            tracing::warn!(
+                target: "whitenoise::key_packages",
+                "After {} retries, {} of {} key package(s) still not deleted for account {}",
+                max_retries,
+                pending_ids.len(),
+                original_count,
+                self.session.account_pubkey.to_hex()
+            );
+        }
+
+        Ok(deleted_count)
     }
 
     // ── Private helpers ────────────────────────────────────────────────
 
-    /// Create and encode a key package for this account.
     #[perf_instrument("key_packages")]
     async fn encoded_key_package(&self, relays: &[Relay]) -> Result<KeyPackageEventData> {
         let key_package_relay_urls = Relay::urls(relays);
@@ -257,11 +284,9 @@ impl<'a> KeyPackageOps<'a> {
             .mdk
             .create_key_package_for_event(&self.session.account_pubkey, key_package_relay_urls)
             .map_err(|e| WhitenoiseError::Configuration(format!("NostrMls error: {}", e)))?;
-
         Ok(data)
     }
 
-    /// Publish an encoded key package to relays. Returns the event ID on success.
     #[perf_instrument("key_packages")]
     async fn publish_to_relays(
         &self,
@@ -281,16 +306,9 @@ impl<'a> KeyPackageOps<'a> {
             ));
         }
 
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Published key package to {} relay(s)",
-            result.success.len(),
-        );
-
         Ok(*result.id())
     }
 
-    /// Record a published key package in the lifecycle tracking table.
     #[perf_instrument("key_packages")]
     async fn track_published(&self, hash_ref: &[u8], event_id: &EventId) {
         if let Err(e) = self
@@ -308,7 +326,6 @@ impl<'a> KeyPackageOps<'a> {
         }
     }
 
-    /// Resolve key package relay URLs for this account.
     async fn prepare_relays(&self) -> Result<Vec<Relay>> {
         let user = User::find_by_pubkey(&self.session.account_pubkey, &self.session.database)
             .await
@@ -317,7 +334,6 @@ impl<'a> KeyPackageOps<'a> {
             .await
     }
 
-    /// Delete local MLS key material for a single key package event.
     async fn delete_local_key_material(&self, event_id: &EventId) {
         match self
             .session
@@ -355,17 +371,11 @@ impl<'a> KeyPackageOps<'a> {
                     );
                 }
             }
-            Ok(Some(_)) => {
-                tracing::debug!(
-                    target: "whitenoise::key_packages",
-                    "Key material already deleted for event {}, skipping local deletion",
-                    event_id
-                );
-            }
+            Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::warn!(
                     target: "whitenoise::key_packages",
-                    "No published key package record found for event {}, cannot delete local key material",
+                    "No published key package record for event {}, cannot delete local key material",
                     event_id
                 );
             }
@@ -380,31 +390,21 @@ impl<'a> KeyPackageOps<'a> {
         }
     }
 
-    /// Delete key packages from local MLS storage by parsing them from events.
-    fn delete_from_storage(
-        &self,
-        key_package_events: &[Event],
-        initial_count: usize,
-    ) -> Result<()> {
-        let mut storage_delete_count = 0;
-
+    fn delete_from_storage(&self, key_package_events: &[Event]) -> Result<()> {
         for event in key_package_events {
             match self.session.mdk.parse_key_package(event) {
                 Ok(key_package) => {
-                    match self
+                    if let Err(e) = self
                         .session
                         .mdk
                         .delete_key_package_from_storage(&key_package)
                     {
-                        Ok(_) => storage_delete_count += 1,
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "whitenoise::key_packages",
-                                "Failed to delete key package from storage for event {}: {}",
-                                event.id,
-                                e
-                            );
-                        }
+                        tracing::warn!(
+                            target: "whitenoise::key_packages",
+                            "Failed to delete key package from storage for event {}: {}",
+                            event.id,
+                            e
+                        );
                     }
                 }
                 Err(e) => {
@@ -417,147 +417,27 @@ impl<'a> KeyPackageOps<'a> {
                 }
             }
         }
-
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Deleted {} out of {} key packages from MLS storage",
-            storage_delete_count,
-            initial_count
-        );
-
         Ok(())
     }
 
-    /// Publish a batch deletion event for the given event IDs.
     #[perf_instrument("key_packages")]
     async fn publish_deletion(&self, event_ids: &[EventId], relay_urls: &[RelayUrl]) -> Result<()> {
-        match self
+        let result = self
             .session
             .ephemeral
             .publish_event_deletion(event_ids, relay_urls)
-            .await
-        {
-            Ok(result) => {
-                if result.success.is_empty() {
-                    tracing::error!(
-                        target: "whitenoise::key_packages",
-                        "Batch deletion event was not accepted by any relay",
-                    );
-                } else {
-                    tracing::info!(
-                        target: "whitenoise::key_packages",
-                        "Published batch deletion event to {} relay(s) for {} key packages",
-                        result.success.len(),
-                        event_ids.len()
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "whitenoise::key_packages",
-                    "Failed to publish batch deletion event: {}",
-                    e
-                );
-                Err(e)
-            }
-        }
-    }
-
-    /// Internal batch delete with retry logic.
-    async fn delete_batch_internal(
-        &self,
-        key_package_events: Vec<Event>,
-        delete_mls_stored_keys: bool,
-        max_retries: u32,
-    ) -> Result<usize> {
-        if key_package_events.is_empty() {
-            tracing::debug!(
+            .await?;
+        if result.success.is_empty() {
+            tracing::error!(
                 target: "whitenoise::key_packages",
-                "No key package events to delete for account {}",
-                self.session.account_pubkey.to_hex()
-            );
-            return Ok(0);
-        }
-
-        let original_count = key_package_events.len();
-        let original_ids: HashSet<EventId> = key_package_events.iter().map(|e| e.id).collect();
-
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Deleting {} key package events for account {}",
-            original_count,
-            self.session.account_pubkey.to_hex()
-        );
-
-        let relays = self.prepare_relays().await?;
-        if relays.is_empty() {
-            return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
-        }
-        let relay_urls = Relay::urls(&relays);
-
-        // Delete from local storage on initial attempt only
-        if delete_mls_stored_keys {
-            self.delete_from_storage(&key_package_events, original_count)?;
-        }
-
-        let mut pending_ids: Vec<EventId> = key_package_events.iter().map(|e| e.id).collect();
-
-        for attempt in 0..=max_retries {
-            if attempt > 0 {
-                tracing::debug!(
-                    target: "whitenoise::key_packages",
-                    "Retry {}/{} for {} remaining key package(s)",
-                    attempt,
-                    max_retries,
-                    pending_ids.len()
-                );
-            }
-
-            self.publish_deletion(&pending_ids, &relay_urls).await?;
-
-            // Wait for relays to process
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            // Check which of our original packages are still present
-            let remaining_events = self.fetch_all().await?;
-            pending_ids = remaining_events
-                .iter()
-                .filter(|e| original_ids.contains(&e.id))
-                .map(|e| e.id)
-                .collect();
-
-            if pending_ids.is_empty() {
-                break;
-            }
-        }
-
-        let deleted_count = original_count - pending_ids.len();
-
-        if pending_ids.is_empty() {
-            tracing::info!(
-                target: "whitenoise::key_packages",
-                "Successfully deleted {} key package(s) for account {}",
-                deleted_count,
-                self.session.account_pubkey.to_hex()
-            );
-        } else {
-            tracing::warn!(
-                target: "whitenoise::key_packages",
-                "After {} retries, {} of {} key package(s) still not deleted for account {}",
-                max_retries,
-                pending_ids.len(),
-                original_count,
-                self.session.account_pubkey.to_hex()
+                "Batch deletion event was not accepted by any relay"
             );
         }
-
-        Ok(deleted_count)
+        Ok(())
     }
 
     // ── Testing helpers ────────────────────────────────────────────────
 
-    /// Look up a published key package record by event ID (test helper).
     #[cfg(feature = "integration-tests")]
     pub async fn find_published_for_testing(
         &self,
@@ -570,7 +450,6 @@ impl<'a> KeyPackageOps<'a> {
             .await
     }
 
-    /// Record a published key package for lifecycle tracking (test helper).
     #[cfg(feature = "integration-tests")]
     pub async fn track_published_for_testing(&self, hash_ref: &[u8], event_id: &str) -> Result<()> {
         self.session
@@ -580,7 +459,6 @@ impl<'a> KeyPackageOps<'a> {
             .await
     }
 
-    /// Backdate `consumed_at` for a published key package (test helper).
     #[cfg(feature = "integration-tests")]
     pub async fn backdate_consumed_at_for_testing(
         &self,
@@ -597,14 +475,6 @@ impl<'a> KeyPackageOps<'a> {
         .execute(&self.session.database.pool)
         .await
         .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
-
-        tracing::debug!(
-            target: "whitenoise::key_packages",
-            "Backdated consumed_at by {}s for KP event {} (TEST ONLY)",
-            age_secs,
-            event_id
-        );
-
         Ok(())
     }
 }

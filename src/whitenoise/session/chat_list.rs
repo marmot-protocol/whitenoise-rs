@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use futures::future::join_all;
 use mdk_core::prelude::*;
 use nostr_sdk::PublicKey;
 
@@ -215,11 +214,42 @@ impl<'a> ChatListOps<'a> {
             .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.membership.clone()))
             .collect();
 
-        let group_info_map = self.build_group_info_map(&group_ids).await?;
-        let dm_other_users = self.identify_dm_participants().await?;
-        let last_message_map = self.build_last_message_map(&group_ids).await?;
+        let group_info_map = {
+            let infos = GroupInformation::get_by_mls_group_ids_with_mdk(
+                &group_ids,
+                &self.session.mdk,
+                &self.session.database,
+            )
+            .await?;
+            infos
+                .into_iter()
+                .map(|gi| (gi.mls_group_id.clone(), gi))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let dm_other_users: HashMap<GroupId, PublicKey> = AccountGroup::find_dm_peers_for_account(
+            &self.session.account_pubkey,
+            &self.session.database,
+        )
+        .await?
+        .into_iter()
+        .collect();
+
+        let last_message_map: HashMap<GroupId, ChatMessageSummary> =
+            AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.database)
+                .await?
+                .into_iter()
+                .map(|s| (s.mls_group_id.clone(), s))
+                .collect();
+
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
-        let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
+        let users_by_pubkey: HashMap<PublicKey, User> =
+            User::find_by_pubkeys(&pubkeys_to_fetch, &self.session.database)
+                .await?
+                .into_iter()
+                .map(|u| (u.pubkey, u))
+                .collect();
+
         let image_paths = self.resolve_group_images(&groups, &group_info_map).await;
 
         let group_markers: Vec<_> = membership_map
@@ -248,60 +278,8 @@ impl<'a> ChatListOps<'a> {
         Ok(items)
     }
 
-    #[perf_instrument("chat_list")]
-    async fn build_group_info_map(
-        &self,
-        group_ids: &[GroupId],
-    ) -> Result<HashMap<GroupId, GroupInformation>> {
-        let group_infos = GroupInformation::get_by_mls_group_ids_with_mdk(
-            group_ids,
-            &self.session.mdk,
-            &self.session.database,
-        )
-        .await?;
-        Ok(group_infos
-            .into_iter()
-            .map(|gi| (gi.mls_group_id.clone(), gi))
-            .collect())
-    }
-
-    #[perf_instrument("chat_list")]
-    async fn identify_dm_participants(&self) -> Result<HashMap<GroupId, PublicKey>> {
-        let pairs = AccountGroup::find_dm_peers_for_account(
-            &self.session.account_pubkey,
-            &self.session.database,
-        )
-        .await?;
-        Ok(pairs.into_iter().collect())
-    }
-
-    #[perf_instrument("chat_list")]
-    async fn build_last_message_map(
-        &self,
-        group_ids: &[GroupId],
-    ) -> Result<HashMap<GroupId, ChatMessageSummary>> {
-        let summaries =
-            AggregatedMessage::find_last_by_group_ids(group_ids, &self.session.database).await?;
-        Ok(summaries
-            .into_iter()
-            .map(|s| (s.mls_group_id.clone(), s))
-            .collect())
-    }
-
-    #[perf_instrument("chat_list")]
-    async fn build_users_by_pubkey(
-        &self,
-        pubkeys: &[PublicKey],
-    ) -> Result<HashMap<PublicKey, User>> {
-        let users = User::find_by_pubkeys(pubkeys, &self.session.database).await?;
-        Ok(users.into_iter().map(|u| (u.pubkey, u)).collect())
-    }
-
-    /// Resolve image paths for Group-type chats.
-    ///
     /// Transitionally calls `Whitenoise::get_instance()` for media resolution.
     /// Returns an empty map if the singleton is unavailable (e.g. in tests).
-    #[perf_instrument("chat_list")]
     async fn resolve_group_images(
         &self,
         groups: &[group_types::Group],
@@ -311,7 +289,6 @@ impl<'a> ChatListOps<'a> {
             Ok(wn) => wn,
             Err(_) => return HashMap::new(),
         };
-
         let account =
             match Account::find_by_pubkey(&self.session.account_pubkey, &self.session.database)
                 .await
@@ -331,38 +308,10 @@ impl<'a> ChatListOps<'a> {
             .cloned()
             .collect();
 
-        let futures = group_type_groups.iter().map(|group| {
-            let group_id = group.mls_group_id.clone();
-            async {
-                let result = wn.resolve_group_image_path(&account, group).await;
-                (group_id, result)
-            }
-        });
-
-        let results = join_all(futures).await;
-
-        let mut paths = HashMap::new();
-        for (group_id, result) in results {
-            match result {
-                Ok(Some(path)) => {
-                    paths.insert(group_id, path);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::chat_list",
-                        "Failed to resolve image for group {}: {}",
-                        hex::encode(group_id.as_slice()),
-                        e
-                    );
-                }
-            }
-        }
-
-        paths
+        wn.resolve_group_image_paths(&account, &group_type_groups)
+            .await
     }
 
-    /// Resolve a single group image path (used by `build_item`).
     async fn resolve_single_group_image(&self, group: &group_types::Group) -> Option<PathBuf> {
         let wn = Whitenoise::get_instance().ok()?;
         let account = Account::find_by_pubkey(&self.session.account_pubkey, &self.session.database)

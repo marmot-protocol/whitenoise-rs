@@ -722,7 +722,7 @@ impl Whitenoise {
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
     #[perf_instrument("chat_list")]
-    async fn resolve_group_image_paths(
+    pub(crate) async fn resolve_group_image_paths(
         &self,
         account: &Account,
         groups: &[group_types::Group],
