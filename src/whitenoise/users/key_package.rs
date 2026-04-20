@@ -1,11 +1,17 @@
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
+use crate::relay_control::ephemeral::KeyPackageLookup;
 use crate::whitenoise::{
     Whitenoise,
     error::Result,
     relays::{Relay, RelayType},
     users::User,
+};
+
+#[cfg(test)]
+use crate::whitenoise::key_packages::{
+    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
 };
 
 /// Status of a user's key package on relays.
@@ -78,6 +84,17 @@ impl User {
     /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
     #[perf_instrument("users")]
     pub async fn key_package_event(&self, whitenoise: &Whitenoise) -> Result<Option<Event>> {
+        match self.key_package_lookup(whitenoise).await? {
+            KeyPackageLookup::Found(event) => Ok(Some(event)),
+            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+        }
+    }
+
+    #[perf_instrument("users")]
+    pub(crate) async fn key_package_lookup(
+        &self,
+        whitenoise: &Whitenoise,
+    ) -> Result<KeyPackageLookup> {
         let relay_urls = self.key_package_relay_urls(whitenoise).await?;
         if relay_urls.is_empty() {
             tracing::warn!(
@@ -85,14 +102,14 @@ impl User {
                 "No relays available for user {}; returning None",
                 self.pubkey
             );
-            return Ok(None);
+            return Ok(KeyPackageLookup::NotFound);
         }
 
-        let event = whitenoise
+        let lookup = whitenoise
             .relay_control
-            .fetch_user_key_package(self.pubkey, &relay_urls)
+            .fetch_user_key_package_lookup(self.pubkey, &relay_urls)
             .await?;
-        Ok(event)
+        Ok(lookup)
     }
 
     /// Checks the status of a user's key package on relays.
@@ -105,8 +122,8 @@ impl User {
     /// method will perform a blocking relay sync and retry once.
     #[perf_instrument("users")]
     pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
-        let event = self.key_package_event(whitenoise).await?;
-        let status = classify_key_package(event);
+        let lookup = self.key_package_lookup(whitenoise).await?;
+        let status = classify_key_package_lookup(lookup);
 
         match status {
             KeyPackageStatus::NotFound
@@ -129,36 +146,33 @@ impl User {
                     );
                     return Ok(KeyPackageStatus::NotFound);
                 }
-                let event = self.key_package_event(whitenoise).await?;
-                Ok(classify_key_package(event))
+                let lookup = self.key_package_lookup(whitenoise).await?;
+                Ok(classify_key_package_lookup(lookup))
             }
             other => Ok(other),
         }
     }
 }
 
-/// Checks whether a key package event has the required `["encoding", "base64"]` tag.
-///
-/// Per MIP-00/MIP-02, key package events must include an explicit encoding tag.
-/// Old key packages published before this requirement lack this tag and are
-/// incompatible with current clients.
-pub(super) fn has_valid_encoding_tag(event: &Event) -> bool {
-    event.tags.iter().any(|tag| {
-        let s = tag.as_slice();
-        s.len() >= 2 && s[0] == "encoding" && s[1] == "base64"
-    })
-}
-
 /// Determines [`KeyPackageStatus`] from an optional key package event.
+#[cfg(test)]
 pub(super) fn classify_key_package(event: Option<Event>) -> KeyPackageStatus {
     match event {
         None => KeyPackageStatus::NotFound,
         Some(event) => {
-            if has_valid_encoding_tag(&event) {
+            if validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok() {
                 KeyPackageStatus::Valid(Box::new(event))
             } else {
                 KeyPackageStatus::Incompatible
             }
         }
+    }
+}
+
+fn classify_key_package_lookup(lookup: KeyPackageLookup) -> KeyPackageStatus {
+    match lookup {
+        KeyPackageLookup::Found(event) => KeyPackageStatus::Valid(Box::new(event)),
+        KeyPackageLookup::Incompatible { .. } => KeyPackageStatus::Incompatible,
+        KeyPackageLookup::NotFound => KeyPackageStatus::NotFound,
     }
 }

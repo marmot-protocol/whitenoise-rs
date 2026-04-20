@@ -1,5 +1,6 @@
 //! Scheduled task to clean up local MLS key material for consumed key packages.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -137,21 +138,26 @@ async fn cleanup_consumed_key_packages(
     );
 
     let mdk = whitenoise.create_mdk_for_account(account.pubkey)?;
+    let mut cleaned_hash_refs = HashSet::new();
     let mut cleaned = 0usize;
 
     for consumed in &eligible {
+        if !cleaned_hash_refs.insert(consumed.key_package_hash_ref.clone()) {
+            continue;
+        }
+
         match mdk.delete_key_package_from_storage_by_hash_ref(&consumed.key_package_hash_ref) {
             Ok(()) => {
-                if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
-                    consumed.id,
+                if let Err(e) = PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
+                    &account.pubkey,
+                    &consumed.key_package_hash_ref,
                     &whitenoise.database,
                 )
                 .await
                 {
                     tracing::warn!(
                         target: "whitenoise::scheduler::consumed_key_package_cleanup",
-                        "Deleted key material but failed to mark record {}: {}",
-                        consumed.id,
+                        "Deleted key material but failed to mark hash_ref group: {}",
                         e
                     );
                 }

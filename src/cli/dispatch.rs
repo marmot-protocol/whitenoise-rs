@@ -2259,7 +2259,7 @@ async fn keys_delete(
 async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let count = wn
-        .delete_all_key_packages_for_account(&account, true)
+        .delete_legacy_key_packages_for_account(&account)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "deleted_count": count })))

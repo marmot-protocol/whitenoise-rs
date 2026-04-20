@@ -1030,6 +1030,7 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
 
@@ -1371,16 +1372,43 @@ mod tests {
         let (account, _keys) = create_test_account(&whitenoise).await;
         account.save(&whitenoise.database).await.unwrap();
 
-        // Use a valid 64-char hex string as event_id
-        let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        // Use valid 64-char hex strings as event IDs.
+        let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let canonical_event_hex =
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let hash_ref = [1, 2, 3];
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            legacy_event_hex,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            canonical_event_hex,
+            MLS_KEY_PACKAGE_KIND,
+            Some("canonical-d-tag"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
-        let event_id = EventId::parse(event_hex).unwrap();
+        let event_id = EventId::parse(legacy_event_hex).unwrap();
         assert!(
             whitenoise
                 .is_own_key_package(&account.pubkey, &event_id)
+                .await
+        );
+
+        let canonical_event_id = EventId::parse(canonical_event_hex).unwrap();
+        assert!(
+            whitenoise
+                .is_own_key_package(&account.pubkey, &canonical_event_id)
                 .await
         );
     }
@@ -1391,25 +1419,50 @@ mod tests {
         let (account, _keys) = create_test_account(&whitenoise).await;
         account.save(&whitenoise.database).await.unwrap();
 
-        let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let canonical_event_hex =
+            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let hash_ref = [1, 2, 3];
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            legacy_event_hex,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            canonical_event_hex,
+            MLS_KEY_PACKAGE_KIND,
+            Some("canonical-d-tag"),
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
-        // Mark key material as deleted
-        let pkg =
-            PublishedKeyPackage::find_by_event_id(&account.pubkey, event_hex, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
-        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &whitenoise.database)
-            .await
-            .unwrap();
+        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
+            &account.pubkey,
+            &hash_ref,
+            &whitenoise.database,
+        )
+        .await
+        .unwrap();
 
-        let event_id = EventId::parse(event_hex).unwrap();
+        let event_id = EventId::parse(legacy_event_hex).unwrap();
         assert!(
             !whitenoise
                 .is_own_key_package(&account.pubkey, &event_id)
+                .await
+        );
+
+        let canonical_event_id = EventId::parse(canonical_event_hex).unwrap();
+        assert!(
+            !whitenoise
+                .is_own_key_package(&account.pubkey, &canonical_event_id)
                 .await
         );
     }

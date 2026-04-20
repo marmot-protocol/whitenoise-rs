@@ -19,11 +19,18 @@ use crate::{
         accounts::Account,
         aggregated_message::AggregatedMessage,
         database::{Database, published_events::PublishedEvent},
-        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
+        error::WhitenoiseError,
+        key_packages::{
+            MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG,
+            is_key_package_kind, validate_marmot_key_package_tags,
+        },
         message_aggregator::DeliveryStatus,
         message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger},
     },
 };
+
+#[cfg(test)]
+use crate::whitenoise::key_packages::MLS_PROPOSALS_TAG_KEY;
 
 fn build_follow_list_event_builder(
     follow_list: &[PublicKey],
@@ -81,6 +88,13 @@ pub(crate) struct EphemeralScope {
 pub(crate) enum MessagePublishResult {
     Published(Output<EventId>),
     Failed,
+}
+
+#[derive(Debug)]
+pub(crate) enum KeyPackageLookup {
+    Found(Event),
+    Incompatible { error: WhitenoiseError },
+    NotFound,
 }
 
 impl MessagePublishResult {
@@ -212,8 +226,20 @@ impl EphemeralPlane {
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
+        match self.fetch_user_key_package_lookup(pubkey, relays).await? {
+            KeyPackageLookup::Found(event) => Ok(Some(event)),
+            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+        }
+    }
+
+    #[perf_instrument("relay")]
+    pub(crate) async fn fetch_user_key_package_lookup(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> Result<KeyPackageLookup> {
         self.anonymous_scope()
-            .fetch_user_key_package(pubkey, relays)
+            .fetch_user_key_package_lookup(pubkey, relays)
             .await
     }
 
@@ -302,13 +328,13 @@ impl EphemeralPlane {
     #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
+        kind: Kind,
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[Tag],
         signer: Arc<dyn NostrSigner>,
     ) -> Result<Output<EventId>> {
-        let event_builder =
-            EventBuilder::new(Kind::MlsKeyPackage, encoded_key_package).tags(tags.to_vec());
+        let event_builder = EventBuilder::new(kind, encoded_key_package).tags(tags.to_vec());
 
         self.publish_event_builder_with_signer(event_builder, relays, signer)
             .await
@@ -783,6 +809,47 @@ impl EphemeralPlane {
     fn is_key_package_event_semantically_valid(event: &Event) -> bool {
         validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
     }
+
+    pub(crate) fn key_package_lookup_from_events(events: Events) -> KeyPackageLookup {
+        let mut valid_current = Vec::new();
+        let mut valid_legacy = Vec::new();
+        let mut incompatible = Vec::new();
+
+        for event in events
+            .into_iter()
+            .filter(|event| is_key_package_kind(event.kind))
+            .filter(is_event_timestamp_valid)
+        {
+            match validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG) {
+                Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND => valid_current.push(event),
+                Ok(()) if event.kind == MLS_KEY_PACKAGE_KIND_LEGACY => valid_legacy.push(event),
+                Ok(()) => {}
+                Err(error) => incompatible.push((event, error)),
+            }
+        }
+
+        if let Some(event) = valid_current
+            .into_iter()
+            .max_by_key(|event| (event.created_at, event.id))
+        {
+            return KeyPackageLookup::Found(event);
+        }
+
+        if let Some(event) = valid_legacy
+            .into_iter()
+            .max_by_key(|event| (event.created_at, event.id))
+        {
+            return KeyPackageLookup::Found(event);
+        }
+
+        match incompatible
+            .into_iter()
+            .max_by_key(|(event, _)| (event.created_at, event.id))
+        {
+            Some((_event, error)) => KeyPackageLookup::Incompatible { error },
+            None => KeyPackageLookup::NotFound,
+        }
+    }
 }
 
 impl EphemeralScope {
@@ -830,12 +897,24 @@ impl EphemeralScope {
         pubkey: PublicKey,
         relays: &[RelayUrl],
     ) -> Result<Option<Event>> {
-        let filter = Filter::new().kind(Kind::MlsKeyPackage).author(pubkey);
+        match self.fetch_user_key_package_lookup(pubkey, relays).await? {
+            KeyPackageLookup::Found(event) => Ok(Some(event)),
+            KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
+        }
+    }
+
+    #[perf_instrument("relay")]
+    pub(crate) async fn fetch_user_key_package_lookup(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> Result<KeyPackageLookup> {
+        let filter = Filter::new()
+            .kinds([MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY])
+            .author(pubkey);
         let events = self.fetch_events_from(relays, filter).await?;
 
-        EphemeralPlane::latest_from_events_with_validation(events, Kind::MlsKeyPackage, |event| {
-            EphemeralPlane::is_key_package_event_semantically_valid(event)
-        })
+        Ok(EphemeralPlane::key_package_lookup_from_events(events))
     }
 
     #[perf_instrument("relay")]
@@ -870,7 +949,10 @@ mod tests {
             observability::{RelayObservabilityConfig, RelayTelemetryKind},
             sessions::{RelaySession, RelaySessionConfig},
         },
-        whitenoise::database::{Database, relay_events::RelayEventRecord},
+        whitenoise::{
+            database::{Database, relay_events::RelayEventRecord},
+            key_packages::REQUIRED_MLS_PROPOSAL_TAGS,
+        },
     };
 
     async fn setup_test_db() -> Database {
@@ -1184,7 +1266,7 @@ mod tests {
         let earlier = Timestamp::from(now.as_secs() - 60);
 
         // Older event: fully Marmot-compatible
-        let older_valid = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let older_valid = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1194,12 +1276,16 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
             ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
             .custom_created_at(earlier)
             .sign_with_keys(&keys)
             .unwrap();
 
         // Newer event: has encoding tag + non-empty content but wrong ciphersuite
-        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let newer_incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1209,6 +1295,10 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
             ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
             .custom_created_at(now)
             .sign_with_keys(&keys)
             .unwrap();
@@ -1216,14 +1306,14 @@ mod tests {
         assert!(newer_incompatible.created_at > older_valid.created_at);
 
         let filter = Filter::new()
-            .kind(Kind::MlsKeyPackage)
+            .kind(MLS_KEY_PACKAGE_KIND_LEGACY)
             .author(keys.public_key());
         let mut events = Events::new(&filter);
         events.insert(older_valid.clone());
         events.insert(newer_incompatible);
         let result = EphemeralPlane::latest_from_events_with_validation(
             events,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             EphemeralPlane::is_key_package_event_semantically_valid,
         )
         .unwrap();
@@ -1242,7 +1332,7 @@ mod tests {
         let now = Timestamp::now();
         let earlier = Timestamp::from(now.as_secs() - 60);
 
-        let older = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let older = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1251,12 +1341,16 @@ mod tests {
             .tag(Tag::custom(
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
             ))
             .custom_created_at(earlier)
             .sign_with_keys(&keys)
             .unwrap();
 
-        let newer = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let newer = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1265,13 +1359,17 @@ mod tests {
             .tag(Tag::custom(
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
             ))
             .custom_created_at(now)
             .sign_with_keys(&keys)
             .unwrap();
 
         let filter = Filter::new()
-            .kind(Kind::MlsKeyPackage)
+            .kind(MLS_KEY_PACKAGE_KIND_LEGACY)
             .author(keys.public_key());
         let mut events = Events::new(&filter);
         events.insert(older);
@@ -1279,7 +1377,7 @@ mod tests {
 
         let result = EphemeralPlane::latest_from_events_with_validation(
             events,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             EphemeralPlane::is_key_package_event_semantically_valid,
         )
         .unwrap();
@@ -1299,7 +1397,7 @@ mod tests {
         let now = Timestamp::now();
         let earlier = Timestamp::from(now.as_secs() - 60);
 
-        let older_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let older_incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1309,11 +1407,15 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
             ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
             .custom_created_at(earlier)
             .sign_with_keys(&keys)
             .unwrap();
 
-        let newer_incompatible = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let newer_incompatible = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
@@ -1323,12 +1425,16 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xF2EE"],
             ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
             .custom_created_at(now)
             .sign_with_keys(&keys)
             .unwrap();
 
         let filter = Filter::new()
-            .kind(Kind::MlsKeyPackage)
+            .kind(MLS_KEY_PACKAGE_KIND_LEGACY)
             .author(keys.public_key());
         let mut events = Events::new(&filter);
         events.insert(older_incompatible);
@@ -1336,7 +1442,7 @@ mod tests {
 
         let result = EphemeralPlane::latest_from_events_with_validation(
             events,
-            Kind::MlsKeyPackage,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
             EphemeralPlane::is_key_package_event_semantically_valid,
         )
         .unwrap();
@@ -1346,6 +1452,175 @@ mod tests {
             Some(newer_incompatible.id),
             "Should fall back to the newest timestamp-valid event when none are Marmot-compatible"
         );
+    }
+
+    fn key_package_tags(kind: Kind, include_encoding: bool, proposals: &[&str]) -> Vec<Tag> {
+        let mut tags = Vec::new();
+        if kind == MLS_KEY_PACKAGE_KIND {
+            tags.push(Tag::identifier(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ));
+        }
+        tags.push(Tag::custom(
+            TagKind::Custom("mls_ciphersuite".into()),
+            [REQUIRED_MLS_CIPHERSUITE_TAG],
+        ));
+        tags.push(Tag::custom(
+            TagKind::Custom("mls_extensions".into()),
+            ["0x000a", "0xf2ee"],
+        ));
+        if !proposals.is_empty() {
+            tags.push(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                proposals.iter().copied(),
+            ));
+        }
+        if include_encoding {
+            tags.push(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]));
+        }
+        tags
+    }
+
+    fn signed_key_package_event(
+        keys: &Keys,
+        kind: Kind,
+        created_at: Timestamp,
+        include_encoding: bool,
+        proposals: &[&str],
+    ) -> Event {
+        EventBuilder::new(kind, "dGVzdF9jb250ZW50")
+            .tags(key_package_tags(kind, include_encoding, proposals))
+            .custom_created_at(created_at)
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn key_package_events(keys: &Keys, events: Vec<Event>) -> Events {
+        let filter = Filter::new()
+            .kinds([MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY])
+            .author(keys.public_key());
+        let mut event_set = Events::new(&filter);
+        for event in events {
+            event_set.insert(event);
+        }
+        event_set
+    }
+
+    #[test]
+    fn test_key_package_lookup_prefers_valid_current_over_newer_valid_legacy() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let older = Timestamp::from(now.as_secs() - 60);
+
+        let current = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND,
+            older,
+            true,
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
+        let legacy = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            now,
+            true,
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
+
+        let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
+            &keys,
+            vec![current.clone(), legacy],
+        ));
+
+        assert!(matches!(lookup, KeyPackageLookup::Found(event) if event.id == current.id));
+    }
+
+    #[test]
+    fn test_key_package_lookup_accepts_valid_legacy_without_current() {
+        let keys = Keys::generate();
+        let legacy = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            Timestamp::now(),
+            true,
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
+
+        let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
+            &keys,
+            vec![legacy.clone()],
+        ));
+
+        assert!(matches!(lookup, KeyPackageLookup::Found(event) if event.id == legacy.id));
+    }
+
+    #[test]
+    fn test_key_package_lookup_ignores_newer_invalid_current() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let older = Timestamp::from(now.as_secs() - 60);
+
+        let older_valid = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND,
+            older,
+            true,
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
+        let newer_invalid = signed_key_package_event(&keys, MLS_KEY_PACKAGE_KIND, now, true, &[]);
+
+        let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
+            &keys,
+            vec![older_valid.clone(), newer_invalid],
+        ));
+
+        assert!(matches!(lookup, KeyPackageLookup::Found(event) if event.id == older_valid.id));
+    }
+
+    #[test]
+    fn test_key_package_lookup_reports_missing_self_remove_as_incompatible() {
+        let keys = Keys::generate();
+        let incompatible = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            Timestamp::now(),
+            true,
+            &[],
+        );
+
+        let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
+            &keys,
+            vec![incompatible.clone()],
+        ));
+
+        assert!(matches!(
+            lookup,
+            KeyPackageLookup::Incompatible { error }
+                if matches!(error, WhitenoiseError::MissingMlsProposals { .. })
+        ));
+    }
+
+    #[test]
+    fn test_key_package_lookup_reports_missing_encoding_as_incompatible() {
+        let keys = Keys::generate();
+        let incompatible = signed_key_package_event(
+            &keys,
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            Timestamp::now(),
+            false,
+            &REQUIRED_MLS_PROPOSAL_TAGS,
+        );
+
+        let lookup = EphemeralPlane::key_package_lookup_from_events(key_package_events(
+            &keys,
+            vec![incompatible.clone()],
+        ));
+
+        assert!(matches!(
+            lookup,
+            KeyPackageLookup::Incompatible { error }
+                if matches!(error, WhitenoiseError::MissingEncodingTag)
+        ));
     }
 
     #[test]
