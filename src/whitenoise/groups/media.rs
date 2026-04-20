@@ -354,18 +354,14 @@ impl Whitenoise {
         let hash_hex = hex::encode(prepared.encrypted_hash);
         let cached_filename = format!("{}.{}", hash_hex, media_detection.extension());
 
-        let file_metadata = if prepared.dimensions.is_some()
-            || prepared.blurhash.is_some()
-            || prepared.thumbhash.is_some()
-        {
-            Some(FileMetadata {
-                original_filename: Some(prepared.filename.clone()),
-                dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
-                blurhash: prepared.blurhash.clone(),
-                thumbhash: prepared.thumbhash.clone(),
-            })
-        } else {
-            None
+        // `original_filename` must always be persisted: MDK binds it to the ciphertext (AAD /
+        // key derivation). Videos often have no dimensions/blurhash/thumbhash, but omitting
+        // `FileMetadata` entirely used to drop the filename and break receiver decryption.
+        let file_metadata = FileMetadata {
+            original_filename: Some(prepared.filename.clone()),
+            dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
+            blurhash: prepared.blurhash.clone(),
+            thumbhash: prepared.thumbhash.clone(),
         };
 
         let upload = MediaFileUpload {
@@ -376,7 +372,7 @@ impl Whitenoise {
             media_type: "chat_media",
             blossom_url: Some(descriptor.url.as_str()),
             nostr_key: Some(upload_keys_hex),
-            file_metadata: file_metadata.as_ref(),
+            file_metadata: Some(&file_metadata),
             nonce: Some(hex::encode(prepared.nonce)),
             scheme_version: Some("mip04-v2"),
         };
