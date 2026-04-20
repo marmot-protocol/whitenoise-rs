@@ -40,6 +40,7 @@ impl AddMembersBenchmark {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl BenchmarkTestCase for AddMembersBenchmark {
     async fn run_iteration(
         &self,

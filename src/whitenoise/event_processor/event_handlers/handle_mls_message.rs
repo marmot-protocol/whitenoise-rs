@@ -339,6 +339,7 @@ impl Whitenoise {
         }
     }
 
+    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn handle_auto_committed_proposal(
         &self,

@@ -283,7 +283,7 @@ Create only the repos needed for group membership reads. Leave mutation-heavy pa
 
 ### Phase 9: Migrate group member/data mutation operations (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #766
 
 <details>
 <summary>Details</summary>
