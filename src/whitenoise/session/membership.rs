@@ -128,6 +128,11 @@ impl<'a> MembershipOpsForGroup<'a> {
             return;
         };
         let Ok(account) = Account::find_by_pubkey(self.pubkey(), self.db()).await else {
+            tracing::debug!(
+                target: "whitenoise::membership",
+                account = %self.pubkey().to_hex(),
+                "Account row not found for chat list emit"
+            );
             return;
         };
         wn.emit_chat_list_update(&account, self.group_id, trigger)
@@ -161,6 +166,10 @@ impl<'a> MembershipOpsForGroup<'a> {
     // ── Accept / decline ──────────────────────────────────────────
 
     /// Accept a group invite (DB-only, no push-token side effects).
+    ///
+    /// Callers that need push-token sharing should use
+    /// `Whitenoise::accept_account_group` until push ops move to the session
+    /// in Phase 13.
     pub async fn accept(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
         Ok(account_group
@@ -169,6 +178,10 @@ impl<'a> MembershipOpsForGroup<'a> {
     }
 
     /// Decline a group invite (DB-only, no push-token side effects).
+    ///
+    /// Callers that need push-token removal should use
+    /// `Whitenoise::decline_account_group` until push ops move to the session
+    /// in Phase 13.
     pub async fn decline(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
         Ok(account_group
