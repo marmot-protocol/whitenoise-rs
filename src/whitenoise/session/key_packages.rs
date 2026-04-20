@@ -465,16 +465,49 @@ impl<'a> KeyPackageOps<'a> {
         event_id: &str,
         age_secs: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
-             WHERE account_pubkey = ? AND event_id = ?",
-        )
-        .bind(age_secs)
-        .bind(self.session.account_pubkey.to_hex())
-        .bind(event_id)
-        .execute(&self.session.database.pool)
-        .await
-        .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
-        Ok(())
+        self.session
+            .repos
+            .published_key_packages
+            .backdate_consumed_at(event_id, age_secs)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+
+    use crate::whitenoise::session::test_helpers::test_session;
+
+    #[tokio::test]
+    async fn publish_fails_with_no_relays() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let result = session.key_packages().publish().await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("key package relay") || err_msg.contains("AccountNotFound"),
+            "Expected relay or account error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_all_fails_with_no_relays() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let result = session.key_packages().fetch_all().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_batch_empty_returns_zero() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let result = session.key_packages().delete_batch(vec![], false, 0).await;
+        assert_eq!(result.unwrap(), 0);
     }
 }

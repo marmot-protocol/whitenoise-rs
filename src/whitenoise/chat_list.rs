@@ -269,6 +269,12 @@ impl Whitenoise {
     /// Called from the emit path which runs inside `tokio::spawn`. Cannot
     /// delegate to session ops without hitting the compiler recursion limit
     /// (the extra async indirection pushes h2/hyper trait evaluation past 128).
+    ///
+    /// NOTE: This implementation resolves DM peers via MDK group membership,
+    /// while `ChatListOps::build_item` uses `AccountGroup::find_dm_peers_for_account`
+    /// (batch SQL). The two paths can diverge in edge cases where MDK membership
+    /// and the DB are transiently inconsistent. Tracked for removal in phase 15
+    /// (session-scoped event dispatch) when emit paths use session directly.
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::chat_list().build_item() instead."

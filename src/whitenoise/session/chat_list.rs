@@ -176,13 +176,13 @@ impl<'a> ChatListOps<'a> {
         Ok(items)
     }
 
-    /// Transitionally calls `Whitenoise::get_instance()` for media resolution.
     /// Returns an empty map if the singleton is unavailable (e.g. in tests).
     async fn resolve_group_images(
         &self,
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> HashMap<GroupId, PathBuf> {
+        // TODO(phase-16b): remove singleton access once media services move to session scope.
         let wn = match Whitenoise::get_instance() {
             Ok(wn) => wn,
             Err(_) => return HashMap::new(),
@@ -208,5 +208,44 @@ impl<'a> ChatListOps<'a> {
 
         wn.resolve_group_image_paths(&account, &group_type_groups)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+
+    use crate::whitenoise::session::test_helpers::test_session;
+
+    #[tokio::test]
+    async fn active_returns_empty_for_new_session() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let items = session.chat_list().active().await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn archived_returns_empty_for_new_session() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        let items = session.chat_list().archived().await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_item_returns_none_for_nonexistent_group() {
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+        let fake_group_id = mdk_core::prelude::GroupId::from_slice(&[0xAB; 32]);
+
+        let result = session
+            .chat_list()
+            .build_item(&fake_group_id)
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }

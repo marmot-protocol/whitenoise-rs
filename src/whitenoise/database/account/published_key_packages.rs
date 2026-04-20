@@ -72,4 +72,20 @@ impl PublishedKeyPackagesRepo {
     pub async fn mark_key_material_deleted(&self, id: i64) -> Result<()> {
         Ok(PublishedKeyPackage::mark_key_material_deleted(id, &self.db).await?)
     }
+
+    /// Backdate `consumed_at` into the past for testing cleanup eligibility.
+    #[cfg(feature = "integration-tests")]
+    pub async fn backdate_consumed_at(&self, event_id: &str, age_secs: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
+             WHERE account_pubkey = ? AND event_id = ?",
+        )
+        .bind(age_secs)
+        .bind(self.account_pubkey.to_hex())
+        .bind(event_id)
+        .execute(&self.db.pool)
+        .await
+        .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
+        Ok(())
+    }
 }
