@@ -249,6 +249,7 @@ fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(),
 }
 
 #[tokio::main]
+#[allow(deprecated)]
 async fn main() -> Result<(), WhitenoiseError> {
     let args = Args::parse();
 

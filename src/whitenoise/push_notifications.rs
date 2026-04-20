@@ -1387,6 +1387,7 @@ impl PushRegistration {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 

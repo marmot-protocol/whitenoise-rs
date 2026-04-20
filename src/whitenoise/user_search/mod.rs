@@ -1579,6 +1579,7 @@ async fn build_network_layer_from_follows(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::cached_graph_user::CachedGraphUser;

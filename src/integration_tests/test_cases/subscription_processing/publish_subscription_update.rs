@@ -322,6 +322,7 @@ impl PublishSubscriptionUpdateTestCase {
     }
 
     /// Verify follow list processed into follows (account-based)
+    #[allow(deprecated)]
     async fn verify_follow_list(
         &self,
         context: &mut ScenarioContext,
@@ -363,6 +364,7 @@ impl PublishSubscriptionUpdateTestCase {
 
 #[async_trait]
 impl TestCase for PublishSubscriptionUpdateTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let has_metadata = self.metadata.is_some();
         let has_relay = self.new_relay_url.is_some();

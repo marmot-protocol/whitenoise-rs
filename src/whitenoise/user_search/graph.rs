@@ -605,6 +605,7 @@ async fn fetch_events_with_retries(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::test_utils::create_mock_whitenoise;

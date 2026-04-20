@@ -89,6 +89,9 @@ impl AccountFollowsRepo {
 
     /// Record that this account follows `user`.
     pub async fn add(&self, user: &User) -> Result<()> {
+        let user_id = user
+            .id
+            .ok_or_else(|| DatabaseError::MissingUserId(user.pubkey.to_hex()))?;
         let now = chrono::Utc::now().timestamp_millis();
         sqlx::query(
             "INSERT INTO account_follows (account_id, user_id, created_at, updated_at)
@@ -96,7 +99,7 @@ impl AccountFollowsRepo {
              ON CONFLICT(account_id, user_id) DO UPDATE SET updated_at = ?",
         )
         .bind(self.account_id)
-        .bind(user.id)
+        .bind(user_id)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -108,9 +111,12 @@ impl AccountFollowsRepo {
 
     /// Remove the follow relationship between this account and `user`.
     pub async fn remove(&self, user: &User) -> Result<()> {
+        let user_id = user
+            .id
+            .ok_or_else(|| DatabaseError::MissingUserId(user.pubkey.to_hex()))?;
         sqlx::query("DELETE FROM account_follows WHERE account_id = ? AND user_id = ?")
             .bind(self.account_id)
-            .bind(user.id)
+            .bind(user_id)
             .execute(&self.db.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;

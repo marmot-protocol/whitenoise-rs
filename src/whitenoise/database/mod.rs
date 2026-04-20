@@ -56,6 +56,8 @@ pub enum DatabaseError {
     Serialization(#[from] serde_json::Error),
     #[error("Search query did not return a position column for message {message_id}")]
     MissingSearchPosition { message_id: String },
+    #[error("User {0} has no database id; pass a persisted User from find_or_create_by_pubkey")]
+    MissingUserId(String),
 }
 
 impl DatabaseError {

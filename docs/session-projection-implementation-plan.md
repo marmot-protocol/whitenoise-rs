@@ -109,7 +109,7 @@ transitional lookup.
 
 ### Phase 3: Scoped relay handles (~700 LOC)
 
-- [ ] Not started
+- [x] Completed in PRs #753, #755, #756
 
 <details>
 <summary>Details</summary>
@@ -158,7 +158,7 @@ exposing a pubkey argument. Add the remaining repos when their domains migrate r
 
 ### Phase 5: View pattern + migrate drafts/follows/settings (~700 LOC)
 
-- [ ] Not started
+- [x] Completed on branch `phase-5-view-pattern-migrate-ops`
 
 <details>
 <summary>Details</summary>

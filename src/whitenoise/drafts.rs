@@ -32,6 +32,7 @@ impl Whitenoise {
     ///
     /// Uses upsert semantics: creates a new draft or updates an existing one.
     /// Returns the persisted draft.
+    #[deprecated(since = "0.0.0", note = "Use AccountSession::drafts().save() instead.")]
     pub async fn save_draft(
         &self,
         account: &Account,
@@ -40,37 +41,47 @@ impl Whitenoise {
         reply_to_id: Option<&EventId>,
         media_attachments: &[MediaFile],
     ) -> Result<Draft, WhitenoiseError> {
-        Draft::save(
-            &account.pubkey,
-            group_id,
-            content,
-            reply_to_id,
-            media_attachments,
-            &self.database,
-        )
-        .await
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session
+            .drafts()
+            .save(group_id, content, reply_to_id, media_attachments)
+            .await
     }
 
     /// Loads the draft for (account, group), if any.
+    #[deprecated(since = "0.0.0", note = "Use AccountSession::drafts().load() instead.")]
     pub async fn load_draft(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<Draft>, WhitenoiseError> {
-        Draft::find(&account.pubkey, group_id, &self.database).await
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.drafts().load(group_id).await
     }
 
     /// Deletes the draft for (account, group).
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::drafts().delete() instead."
+    )]
     pub async fn delete_draft(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<(), WhitenoiseError> {
-        Draft::delete(&account.pubkey, group_id, &self.database).await
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session.drafts().delete(group_id).await
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use mdk_core::prelude::GroupId;
 

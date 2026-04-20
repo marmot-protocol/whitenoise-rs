@@ -1,6 +1,14 @@
 pub(crate) mod messages;
 pub(crate) mod relay_handles;
 
+mod drafts;
+mod settings;
+mod social;
+
+pub use self::drafts::DraftOps;
+pub use self::settings::SettingsOps;
+pub use self::social::SocialOps;
+
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -56,7 +64,6 @@ impl AccountInboxState {
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
-    #[expect(dead_code, reason = "used in Phase 5 view-pattern callers")]
     pub(crate) repos: AccountRepositories,
     pub(crate) database: Arc<Database>,
     pub(crate) message_stream_manager:
@@ -171,6 +178,21 @@ impl AccountSession {
                     "Failed to acquire contact list processing permit".to_string(),
                 )
             })
+    }
+
+    /// Return a view for draft message operations scoped to this session.
+    pub fn drafts(&self) -> DraftOps<'_> {
+        DraftOps::new(self)
+    }
+
+    /// Return a view for per-account settings operations scoped to this session.
+    pub fn settings(&self) -> SettingsOps<'_> {
+        SettingsOps::new(self)
+    }
+
+    /// Return a view for follow/social operations scoped to this session.
+    pub fn social(&self) -> SocialOps<'_> {
+        SocialOps::new(self)
     }
 
     // ── Inbox plane lifecycle ──────────────────────────────────────
