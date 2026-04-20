@@ -118,7 +118,7 @@ impl ChatListItem {
 ///
 /// Fallback chain: display_name -> name -> None
 /// Does not fall back to truncated pubkey.
-fn resolve_display_name(user: Option<&User>) -> Option<String> {
+pub(crate) fn resolve_display_name(user: Option<&User>) -> Option<String> {
     user.and_then(|u| {
         u.metadata
             .display_name
@@ -133,7 +133,7 @@ fn resolve_display_name(user: Option<&User>) -> Option<String> {
 ///
 /// - Groups: Returns the group name from MDK (may be empty string)
 /// - DMs: Returns the other user's display name (None if no metadata)
-fn resolve_chat_name(
+pub(crate) fn resolve_chat_name(
     group: &group_types::Group,
     group_type: &GroupType,
     dm_other_user: Option<&User>,
@@ -153,7 +153,7 @@ fn get_dm_other_user(group_members: &[PublicKey], account_pubkey: &PublicKey) ->
 }
 
 /// Collects all pubkeys that need metadata lookup (DM participants + message authors).
-fn collect_pubkeys_to_fetch(
+pub(crate) fn collect_pubkeys_to_fetch(
     dm_other_users: &HashMap<GroupId, PublicKey>,
     last_message_map: &HashMap<GroupId, ChatMessageSummary>,
 ) -> Vec<PublicKey> {
@@ -167,7 +167,7 @@ fn collect_pubkeys_to_fetch(
 }
 
 /// Assembles ChatListItems from all the collected data.
-fn assemble_chat_list_items(
+pub(crate) fn assemble_chat_list_items(
     groups: &[group_types::Group],
     group_info_map: &HashMap<GroupId, GroupInformation>,
     dm_other_users: &HashMap<GroupId, PublicKey>,
@@ -247,11 +247,16 @@ pub(crate) fn sort_chat_list(items: &mut [ChatListItem]) {
     items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 }
 
+#[allow(deprecated)]
 impl Whitenoise {
     /// Retrieves the active (non-archived) chat list for an account.
     ///
     /// Returns a list of chat summaries sorted by last activity (most recent first).
     /// Declined and archived groups are filtered out.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().active() instead."
+    )]
     #[allow(deprecated)]
     #[perf_instrument("chat_list")]
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
@@ -266,6 +271,10 @@ impl Whitenoise {
     /// Retrieves the archived chat list for an account.
     ///
     /// Returns only archived chats, sorted by last activity.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().archived() instead."
+    )]
     #[allow(deprecated)]
     #[perf_instrument("chat_list")]
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
@@ -347,6 +356,10 @@ impl Whitenoise {
     /// - Group doesn't exist in MDK
     /// - GroupInformation doesn't exist (group not fully initialized)
     /// - AccountGroup is declined
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().build_item() instead."
+    )]
     #[perf_instrument("chat_list")]
     pub(crate) async fn build_chat_list_item(
         &self,

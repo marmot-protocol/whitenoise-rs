@@ -2,10 +2,13 @@ use std::{fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
+use mdk_core::prelude::MDK;
+use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::perf_instrument;
+use crate::whitenoise::database::Database;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -105,24 +108,32 @@ impl GroupInformation {
         mls_group_ids: &[GroupId],
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
-        // First try to get existing records
-        let existing =
-            GroupInformation::find_by_mls_group_ids(mls_group_ids, &whitenoise.database).await?;
+        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
+        Self::get_by_mls_group_ids_with_mdk(mls_group_ids, &mdk, &whitenoise.database).await
+    }
 
-        // Create a map for quick lookups, but continue to preserve input order
+    /// Get group information for multiple MLS group IDs using an existing MDK instance.
+    ///
+    /// Session-compatible variant that avoids requiring `&Whitenoise`. Missing
+    /// groups will be created with a type inferred from the group name.
+    #[perf_instrument("group_info")]
+    pub(crate) async fn get_by_mls_group_ids_with_mdk(
+        mls_group_ids: &[GroupId],
+        mdk: &MDK<MdkSqliteStorage>,
+        database: &Database,
+    ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
+        let existing = GroupInformation::find_by_mls_group_ids(mls_group_ids, database).await?;
+
         let mut existing_map: std::collections::HashMap<GroupId, GroupInformation> = existing
             .into_iter()
             .map(|gi| (gi.mls_group_id.clone(), gi))
             .collect();
-
-        let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
 
         let mut results = Vec::new();
         for mls_group_id in mls_group_ids {
             if let Some(existing_info) = existing_map.remove(mls_group_id) {
                 results.push(existing_info);
             } else {
-                // Create missing record with a type inferred from the group name
                 let group = mdk
                     .get_group(mls_group_id)?
                     .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -130,7 +141,7 @@ impl GroupInformation {
                 let (new_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
                     mls_group_id,
                     Some(group_type),
-                    &whitenoise.database,
+                    database,
                 )
                 .await?;
                 results.push(new_info);

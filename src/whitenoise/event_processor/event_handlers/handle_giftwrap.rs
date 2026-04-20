@@ -392,6 +392,7 @@ impl Whitenoise {
     ///
     /// Marks the consumed key package in the published_key_packages table,
     /// then deletes it from relays and publishes a fresh replacement.
+    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn rotate_key_package(
         whitenoise: &Whitenoise,

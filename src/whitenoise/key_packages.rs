@@ -153,6 +153,7 @@ pub(crate) fn filter_key_package_events_for_account(
     (valid_events, dropped_wrong_kind, dropped_wrong_author)
 }
 
+#[allow(deprecated)]
 impl Whitenoise {
     /// Helper method to create and encode a key package for the given account.
     ///
@@ -180,6 +181,10 @@ impl Whitenoise {
     /// 3 times with exponential backoff (2s, 4s) if publishing fails. The key
     /// package is created only once to avoid orphaning unused key material in
     /// local MLS storage.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().publish() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub async fn publish_key_package_for_account(&self, account: &Account) -> Result<()> {
         let relays = account.key_package_relays(self).await?;
@@ -281,6 +286,10 @@ impl Whitenoise {
     /// This is a convenience wrapper that calls [`Self::encoded_key_package`] followed by
     /// [`Self::publish_key_package_to_relays`]. If you need retry semantics, prefer calling
     /// those two methods separately so the key package is only created once.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().create_and_publish() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub(crate) async fn create_and_publish_key_package(
         &self,
@@ -458,6 +467,10 @@ impl Whitenoise {
     /// - For local accounts: uses keys from the secrets store
     ///
     /// Returns `true` if a key package was found and deleted, `false` if no key package was found.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().delete() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub async fn delete_key_package_for_account(
         &self,
@@ -591,6 +604,10 @@ impl Whitenoise {
     /// - Failed to retrieve account's key package relays
     /// - Network error while fetching events from relays
     /// - NostrSDK error during event streaming
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().fetch_all() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub async fn fetch_all_key_packages_for_account(
         &self,
@@ -668,6 +685,10 @@ impl Whitenoise {
     /// - Failed to get signing keys for the account
     /// - Network error while fetching or publishing events
     /// - Batch deletion event publishing failed
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().delete_all() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub async fn delete_all_key_packages_for_account(
         &self,
@@ -795,6 +816,10 @@ impl Whitenoise {
     /// # Returns
     ///
     /// Returns the number of key packages that were successfully deleted.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().delete_batch() instead."
+    )]
     #[perf_instrument("key_packages")]
     pub(crate) async fn delete_key_packages_for_account(
         &self,
@@ -1011,6 +1036,10 @@ impl Whitenoise {
     ///
     /// Integration-test helper for verifying lifecycle states (consumed_at,
     /// key_material_deleted) without exposing the raw database handle.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().find_published_for_testing() instead."
+    )]
     #[cfg(feature = "integration-tests")]
     pub async fn find_published_key_package_for_testing(
         &self,
@@ -1027,6 +1056,10 @@ impl Whitenoise {
     /// Integration-test helper for cases that manually publish custom key
     /// package events (for example with a backdated timestamp) and still need
     /// maintenance to treat them as locally-owned packages.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().track_published_for_testing() instead."
+    )]
     #[cfg(feature = "integration-tests")]
     pub async fn track_published_key_package_for_testing(
         &self,
@@ -1044,6 +1077,10 @@ impl Whitenoise {
     /// Integration-test helper that shifts `consumed_at` into the past so the
     /// maintenance task considers it eligible for cleanup without waiting the
     /// full quiet period.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().backdate_consumed_at_for_testing() instead."
+    )]
     #[cfg(feature = "integration-tests")]
     pub async fn backdate_consumed_at_for_testing(
         &self,
@@ -1074,6 +1111,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use chrono::Utc;
     use nostr_sdk::{EventBuilder, Keys, Kind, Tag, TagKind};

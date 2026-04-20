@@ -10,6 +10,7 @@
 
 mod drafts;
 mod follows;
+mod published_key_packages;
 mod settings;
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use nostr_sdk::PublicKey;
 
 pub use self::drafts::DraftsRepo;
 pub use self::follows::AccountFollowsRepo;
+pub use self::published_key_packages::PublishedKeyPackagesRepo;
 pub use self::settings::AccountSettingsRepo;
 
 use crate::whitenoise::database::Database;
@@ -32,6 +34,8 @@ pub struct AccountRepositories {
     pub settings: AccountSettingsRepo,
     /// Follow relationship repository for this account.
     pub follows: AccountFollowsRepo,
+    /// Published key package lifecycle tracking repository for this account.
+    pub published_key_packages: PublishedKeyPackagesRepo,
 }
 
 impl AccountRepositories {
@@ -46,7 +50,8 @@ impl AccountRepositories {
         Ok(Self {
             drafts: DraftsRepo::new(account_pubkey, db.clone()),
             settings: AccountSettingsRepo::new(account_pubkey, db.clone()),
-            follows: AccountFollowsRepo::new(account_pubkey, db).await?,
+            follows: AccountFollowsRepo::new(account_pubkey, db.clone()).await?,
+            published_key_packages: PublishedKeyPackagesRepo::new(account_pubkey, db),
         })
     }
 }

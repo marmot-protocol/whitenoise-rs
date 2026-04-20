@@ -1272,6 +1272,7 @@ async fn follows_check(
     Ok(Response::ok(serde_json::json!({ "following": following })))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
@@ -1348,6 +1349,7 @@ async fn unmute_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn archived_chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
@@ -2163,6 +2165,7 @@ async fn demote_admin(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 async fn keys_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let packages = wn
@@ -2182,6 +2185,7 @@ async fn keys_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Respo
     Ok(Response::ok(serde_json::json!({ "key_packages": items })))
 }
 
+#[allow(deprecated)]
 async fn keys_publish(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     wn.publish_key_package_for_account(&account)
@@ -2190,6 +2194,7 @@ async fn keys_publish(wn: &Whitenoise, account_str: &str) -> Result<Response, Re
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 async fn keys_delete(
     wn: &Whitenoise,
     account_str: &str,
@@ -2205,6 +2210,7 @@ async fn keys_delete(
     Ok(Response::ok(serde_json::json!({ "deleted": deleted })))
 }
 
+#[allow(deprecated)]
 async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let count = wn

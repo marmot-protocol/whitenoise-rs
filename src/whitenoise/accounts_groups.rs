@@ -683,6 +683,7 @@ impl Whitenoise {
     /// (`removed_at.is_none()`), they remain a member in the protocol -- other
     /// members continue encrypting messages for them, and their key packages
     /// remain published. The recommended flow is `leave_group` -> `delete_chat`.
+    #[allow(deprecated)]
     #[perf_instrument("account_groups")]
     pub async fn delete_chat(
         &self,

@@ -136,6 +136,7 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
     summary
 }
 
+#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     let packages = match whitenoise.fetch_all_key_packages_for_account(account).await {
@@ -305,6 +306,7 @@ async fn find_live_published_key_packages(
 }
 
 /// Publishes a new key package when the account has no usable local one.
+#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
     tracing::info!(
@@ -332,6 +334,7 @@ async fn publish_new_key_package(whitenoise: &Whitenoise, account: &Account) -> 
 /// If the account would be left with zero key packages after deletion, a new one is
 /// published first to avoid a gap. Otherwise, only the expired packages are deleted
 /// without republishing, since the account already has a valid package.
+#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn rotate_expired_packages(
     whitenoise: &Whitenoise,
@@ -391,6 +394,7 @@ async fn rotate_expired_packages(
 /// was enforced. They cause interop failures with newer MDK versions. We only delete
 /// them (without republishing) because the account already has at least one valid key
 /// package. This avoids unnecessary key package churn.
+#[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn delete_outdated_packages(
     whitenoise: &Whitenoise,
@@ -415,6 +419,7 @@ async fn delete_outdated_packages(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use nostr_sdk::{
         Client, EventBuilder, EventId, FromBech32, Keys, Kind, SecretKey, Tag, TagKind,
