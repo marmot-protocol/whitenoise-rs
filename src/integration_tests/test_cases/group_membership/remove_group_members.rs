@@ -33,6 +33,7 @@ impl RemoveGroupMembersTestCase {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl TestCase for RemoveGroupMembersTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(

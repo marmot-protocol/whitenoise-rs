@@ -38,6 +38,7 @@ const NETWORK_FETCH_RETRIES: usize = 3;
 ///
 /// This is purely local data (MLS/MDK) — no network fetch required.
 #[perf_instrument("user_search")]
+#[allow(deprecated)]
 pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
     searcher_pubkey: &PublicKey,
