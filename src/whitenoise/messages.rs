@@ -299,6 +299,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::time::Duration;
 

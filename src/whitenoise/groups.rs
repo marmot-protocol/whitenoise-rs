@@ -845,6 +845,7 @@ impl Whitenoise {
         // Optimistic local update is best-effort after publish success.
         // When the auto-committed removal commit arrives later,
         // mark_as_removed() will converge the local state regardless.
+        #[allow(deprecated)]
         if let Err(error) = self.mark_as_left(account, group_id).await {
             tracing::warn!(
                 target: "whitenoise::groups",
@@ -862,6 +863,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;

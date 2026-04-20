@@ -18,6 +18,7 @@ impl MarkMessageReadTestCase {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl TestCase for MarkMessageReadTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {

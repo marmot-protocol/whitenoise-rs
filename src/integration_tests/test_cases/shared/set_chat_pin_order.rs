@@ -31,6 +31,7 @@ impl SetChatPinOrderTestCase {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait]
 impl TestCase for SetChatPinOrderTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {

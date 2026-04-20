@@ -1324,6 +1324,7 @@ pub mod test_utils {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::test_utils::*;
     use super::*;

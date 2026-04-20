@@ -1282,6 +1282,7 @@ async fn chats_list(wn: &Whitenoise, account_str: &str) -> Result<Response, Resp
     Ok(to_response(&clean))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn archive_chat(
     wn: &Whitenoise,
@@ -1296,6 +1297,7 @@ async fn archive_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn unarchive_chat(
     wn: &Whitenoise,
@@ -1310,6 +1312,7 @@ async fn unarchive_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn mute_chat(
     wn: &Whitenoise,
@@ -1325,6 +1328,7 @@ async fn mute_chat(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn unmute_chat(
     wn: &Whitenoise,
