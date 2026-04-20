@@ -373,6 +373,7 @@ impl AccountGroup {
     }
 }
 
+#[allow(deprecated)]
 impl Whitenoise {
     #[deprecated(
         since = "0.0.0",

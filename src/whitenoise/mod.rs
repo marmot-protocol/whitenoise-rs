@@ -4,9 +4,8 @@ use std::sync::{Arc, OnceLock};
 use ::rand::RngCore;
 
 use dashmap::DashMap;
-use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::NostrSigner;
-use nostr_sdk::{EventId, PublicKey, RelayUrl};
+use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::sync::{
     Mutex, OnceCell,
     mpsc::{self, Sender},
@@ -19,6 +18,7 @@ pub mod accounts;
 pub mod accounts_groups;
 pub mod aggregated_message;
 pub mod app_settings;
+mod broadcast_hub;
 pub(crate) mod cached_graph_user;
 pub mod chat_list;
 pub mod chat_list_streaming;
@@ -173,8 +173,6 @@ pub struct Whitenoise {
     pub(crate) account_manager: session::AccountManager,
     /// Debounced worker that coalesces discovery subscription rebuilds.
     discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
-    /// In-memory coordination for delayed MIP-05 token-list responses.
-    pending_push_token_responses: Arc<DashMap<(PublicKey, GroupId, EventId), ()>>,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -210,7 +208,6 @@ impl std::fmt::Debug for Whitenoise {
             .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
-            .field("pending_push_token_responses", &"<REDACTED>")
             .field("account_manager", &"<REDACTED>")
             .finish()
     }
@@ -255,7 +252,6 @@ impl Whitenoise {
             external_signers: DashMap::new(),
             account_manager: session::AccountManager::default(),
             discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
-            pending_push_token_responses: Arc::new(DashMap::new()),
         }
     }
 

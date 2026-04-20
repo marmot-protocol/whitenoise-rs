@@ -29,7 +29,7 @@ pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 
 impl Whitenoise {
     #[perf_instrument("groups")]
-    async fn resolve_member_delivery_relays(
+    pub(crate) async fn resolve_member_delivery_relays(
         &self,
         member: &User,
         fallback_account: &Account,
@@ -200,6 +200,7 @@ impl Whitenoise {
         account_group.accept(self).await?;
 
         // Best-effort: share the creator's push token into the new group.
+        #[allow(deprecated)]
         if let Err(error) = self
             .share_local_push_token_to_group(creator_account, &group.mls_group_id)
             .await
@@ -447,8 +448,8 @@ impl Whitenoise {
         session.groups().admins(group_id)
     }
 
-    #[perf_instrument("groups")]
     #[allow(deprecated)]
+    #[perf_instrument("groups")]
     async fn ensure_account_is_group_admin(
         &self,
         account: &Account,
@@ -462,23 +463,11 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Adds new members to an existing MLS group
-    ///
-    /// This method performs the complete workflow for adding members to a group:
-    /// 1. Fetches key packages for all new members from their configured relays
-    /// 2. Creates an MLS add members proposal and generates welcome messages
-    /// 3. Publishes the evolution event to relays (with retry)
-    /// 4. Only after relay acceptance, merges the pending commit locally
-    /// 5. Sends welcome messages to each new member via gift wrap
-    ///
-    /// Per MIP-03, the evolution event is published to relays *before* merging
-    /// the pending commit locally. This ensures we only advance local state
-    /// after confirming the relay accepted the event.
-    ///
-    /// # Arguments
-    /// * `account` - The account performing the member addition (must be group admin)
-    /// * `group_id` - The ID of the group to add members to
-    /// * `members` - Vector of public keys for the new members to add
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().add_members() instead."
+    )]
+    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn add_members_to_group(
         &self,
@@ -494,24 +483,17 @@ impl Whitenoise {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
 
-        // Fetch key packages for all members
         for pk in members.iter() {
             let (user, newly_created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
 
-            if newly_created {
-                // Sync relay lists synchronously so that the key package relay lookup below
-                // has a chance to find the user's relays before falling back to account defaults.
-                // Metadata is not needed to add a member to a group; skip it on the critical path.
-                if let Err(e) = user.update_relay_lists(self).await {
-                    tracing::warn!(
-                        target: "whitenoise::accounts::groups::add_members_to_group",
-                        "Failed to update relay lists for new user {}: {}",
-                        user.pubkey,
-                        e
-                    );
-                }
+            if newly_created && let Err(e) = user.update_relay_lists(self).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts::groups::add_members_to_group",
+                    "Failed to update relay lists for new user {}: {}",
+                    user.pubkey,
+                    e
+                );
             }
-            // Try and get user's key package relays, if they don't have any, use account's default relays
             let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
             if relays_to_use.is_empty() {
                 tracing::warn!(
@@ -543,9 +525,7 @@ impl Whitenoise {
         drop(_mls_add);
 
         let evolution_event = update_result.evolution_event;
-        let welcome_rumors = update_result.welcome_rumors;
-
-        let welcome_rumors = match welcome_rumors {
+        let welcome_rumors = match update_result.welcome_rumors {
             None => {
                 return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::Group(
                     "Missing welcome message".to_owned(),
@@ -563,10 +543,7 @@ impl Whitenoise {
         self.publish_and_merge_commit(evolution_event, &account.pubkey, group_id, &relay_urls)
             .await?;
 
-        // Evolution event published and commit merged successfully
-        // Fan out the welcome message to all members
         for (welcome_rumor, user) in welcome_rumors.iter().zip(users) {
-            // Get the public key of the member from the key package event
             let key_package_event_id =
                 welcome_rumor
                     .tags
@@ -584,7 +561,6 @@ impl Whitenoise {
                     "No public key found in key package event".to_string(),
                 ))?;
 
-            // Create a timestamp 1 month in the future
             let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
             let relays_to_use = self
@@ -613,21 +589,11 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Removes members from an existing MLS group
-    ///
-    /// This method performs the complete workflow for removing members from a group:
-    /// 1. Creates an MLS remove members proposal
-    /// 2. Publishes the evolution event to relays (with retry)
-    /// 3. Only after relay acceptance, merges the pending commit locally
-    ///
-    /// Per MIP-03, the evolution event is published to relays *before* merging
-    /// the pending commit locally. This ensures we only advance local state
-    /// after confirming the relay accepted the event.
-    ///
-    /// # Arguments
-    /// * `account` - The account performing the member removal (must be group admin)
-    /// * `group_id` - The ID of the group to remove members from
-    /// * `members` - Vector of public keys for the members to remove
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().remove_members() instead."
+    )]
+    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn remove_members_from_group(
         &self,
@@ -641,9 +607,7 @@ impl Whitenoise {
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
             let update_result = mdk.remove_members(group_id, &members)?;
-
             (relay_urls, update_result.evolution_event)
         };
 
@@ -651,21 +615,11 @@ impl Whitenoise {
             .await
     }
 
-    /// Updates group metadata and publishes the change to group relays.
-    ///
-    /// This method performs the complete workflow for updating group data:
-    /// 1. Creates an MLS group data update proposal
-    /// 2. Publishes the evolution event to relays (with retry)
-    /// 3. Only after relay acceptance, merges the pending commit locally
-    ///
-    /// Per MIP-03, the evolution event is published to relays *before* merging
-    /// the pending commit locally. This ensures we only advance local state
-    /// after confirming the relay accepted the event.
-    ///
-    /// # Arguments
-    /// * `account` - The account performing the group data update (must be group admin)
-    /// * `group_id` - The ID of the group to update
-    /// * `group_data` - The new group data to update
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().update_group_data() instead."
+    )]
+    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn update_group_data(
         &self,
@@ -679,9 +633,7 @@ impl Whitenoise {
         let (relay_urls, evolution_event) = {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
             let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
-
             let update_result = mdk.update_group_data(group_id, group_data)?;
-
             (relay_urls, update_result.evolution_event)
         };
 
@@ -691,12 +643,11 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Removes the caller from the group's `admin_pubkeys` list.
-    ///
-    /// This is a prerequisite for `leave_group()` — the MIP-03 protocol requires
-    /// admins to relinquish admin status before sending a SelfRemove proposal.
-    /// If the caller is the last admin, they must designate another admin first
-    /// via `update_group_data()`.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().self_demote() instead."
+    )]
+    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn self_demote(&self, account: &Account, group_id: &GroupId) -> Result<()> {
         self.ensure_account_is_group_admin(account, group_id)
@@ -713,25 +664,13 @@ impl Whitenoise {
             .await
     }
 
-    /// Leaves a group by creating a SelfRemove proposal and publishing it.
-    ///
-    /// After the proposal is successfully published, the group is optimistically
-    /// marked as departed locally (`removed_at` + `self_removed`). When another
-    /// member auto-commits the proposal, the resulting commit will trigger
-    /// `mark_as_removed()` which no-ops idempotently since `removed_at` is
-    /// already set.
-    ///
-    /// # Arguments
-    /// * `account` - The account that wants to leave the group
-    /// * `group_id` - The ID of the group to leave
-    ///
-    /// # Errors
-    /// * `AlreadyDepartedFromGroup` if the account has already departed
-    /// * MDK errors if the caller is still an admin (must call `self_demote()` first)
-    /// * Relay errors if the proposal cannot be published
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().leave() instead."
+    )]
+    #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        // Guard: can't leave a group you've already departed from
         let account_group = AccountGroup::get(self, &account.pubkey, group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -747,7 +686,6 @@ impl Whitenoise {
             (relay_urls, update_result.evolution_event)
         };
 
-        // Publish the SelfRemove proposal to the group relays
         self.publish_event_with_retry(evolution_event, &account.pubkey, &relay_urls)
             .await?;
 
@@ -764,7 +702,6 @@ impl Whitenoise {
             );
         }
 
-        // Always refresh subscriptions after publish
         self.background_refresh_account_group_subscriptions(account);
 
         Ok(())

@@ -166,6 +166,7 @@ impl Whitenoise {
         outcome: &MessageProcessingOutcome,
         message: &Message,
     ) -> Result<()> {
+        #[allow(deprecated)]
         self.handle_received_push_group_message(
             mdk,
             account,
@@ -338,6 +339,7 @@ impl Whitenoise {
         }
     }
 
+    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn handle_auto_committed_proposal(
         &self,
@@ -410,6 +412,7 @@ impl Whitenoise {
             self.mark_as_removed(account, mls_group_id).await?;
         }
 
+        #[allow(deprecated)]
         if still_active
             && let Err(error) = self
                 .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
@@ -867,6 +870,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,

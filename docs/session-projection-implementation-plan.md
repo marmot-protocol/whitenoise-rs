@@ -283,7 +283,7 @@ Create only the repos needed for group membership reads. Leave mutation-heavy pa
 
 ### Phase 9: Migrate group member/data mutation operations (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #766
 
 <details>
 <summary>Details</summary>
@@ -363,7 +363,7 @@ Add `AccountGroupsRepo` in this phase.
 
 ### Phase 13: Migrate push account ops (~700 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #767
 
 <details>
 <summary>Details</summary>
@@ -471,7 +471,7 @@ same PR.
 
 ### Phase 17: BroadcastHub consolidation (~400 LOC)
 
-- [ ] Not started
+- [x] Completed in PR `#765`
 
 <details>
 <summary>Details</summary>

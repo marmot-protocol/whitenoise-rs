@@ -72,6 +72,10 @@ impl Whitenoise {
     /// state. This ensures a failed publish never leaves the group stuck with
     /// a dangling pending commit that would block all subsequent operations.
     /// The error from the publish attempt is returned to the caller.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use GroupOps::publish_and_merge_commit() instead."
+    )]
     pub(crate) async fn publish_and_merge_commit(
         &self,
         evolution_event: Event,
@@ -108,6 +112,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use nostr_sdk::prelude::*;
 
