@@ -1,3 +1,4 @@
+pub(crate) mod messages;
 pub(crate) mod relay_handles;
 
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::database::Database;
 use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+use crate::whitenoise::message_aggregator::AggregatorConfig;
 
 /// Signer slot shared between `AccountSession` and its relay handles.
 ///
@@ -56,6 +58,10 @@ pub struct AccountSession {
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
     #[expect(dead_code, reason = "used in Phase 5 view-pattern callers")]
     pub(crate) repos: AccountRepositories,
+    pub(crate) database: Arc<Database>,
+    pub(crate) message_stream_manager:
+        Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
+    pub(crate) aggregator_config: AggregatorConfig,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -71,10 +77,12 @@ impl AccountSession {
     pub(crate) async fn new(
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
+        database: Arc<Database>,
+        message_stream_manager: Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
+        aggregator_config: AggregatorConfig,
         signer: Option<Arc<dyn NostrSigner>>,
         ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
         relay_control: Arc<crate::relay_control::RelayControlPlane>,
-        db: Arc<Database>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
@@ -85,9 +93,12 @@ impl AccountSession {
         );
         let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
         Ok(Self {
-            repos: AccountRepositories::new(account_pubkey, db).await?,
+            repos: AccountRepositories::new(account_pubkey, database.clone()).await?,
             account_pubkey,
             mdk: Arc::new(mdk),
+            database,
+            message_stream_manager,
+            aggregator_config,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
@@ -110,10 +121,12 @@ impl AccountSession {
         Self::new(
             account.pubkey,
             mdk,
+            wn.database.clone(),
+            wn.message_stream_manager.clone(),
+            wn.message_aggregator.config().clone(),
             signer,
             wn.relay_control.ephemeral(),
             wn.relay_control.clone(),
-            wn.database.clone(),
         )
         .await
     }
@@ -140,6 +153,11 @@ impl AccountSession {
     /// Signal cancellation to all background tasks associated with this session.
     pub(crate) fn cancel(&self) {
         let _ = self.cancellation.send(true);
+    }
+
+    /// Return a lightweight view for message read/search operations.
+    pub fn messages(&self) -> messages::MessageOps<'_> {
+        messages::MessageOps::new(self)
     }
 
     /// Acquire the contact-list processing permit for this session.
@@ -425,6 +443,11 @@ impl Whitenoise {
     pub fn session(&self, pubkey: &PublicKey) -> Option<Arc<AccountSession>> {
         self.account_manager.get_session(pubkey)
     }
+
+    /// Look up an active session, returning an error if none exists.
+    pub(crate) fn require_session(&self, pubkey: &PublicKey) -> Result<Arc<AccountSession>> {
+        self.session(pubkey).ok_or(WhitenoiseError::AccountNotFound)
+    }
 }
 
 #[cfg(test)]
@@ -479,10 +502,21 @@ pub(crate) mod test_helpers {
             event_sender,
             [0u8; 16],
         ));
+        let stream_manager =
+            Arc::new(crate::whitenoise::message_streaming::MessageStreamManager::default());
         Arc::new(
-            AccountSession::new(pubkey, mdk, None, ephemeral, relay_control, db)
-                .await
-                .expect("create test session"),
+            AccountSession::new(
+                pubkey,
+                mdk,
+                db,
+                stream_manager,
+                AggregatorConfig::default(),
+                None,
+                ephemeral,
+                relay_control,
+            )
+            .await
+            .expect("create test session"),
         )
     }
 }

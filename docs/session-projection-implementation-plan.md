@@ -202,7 +202,7 @@ call sites are migrated.
 
 ### Phase 6: Migrate message read/search operations (~500 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #760
 
 <details>
 <summary>Details</summary>
@@ -224,7 +224,7 @@ current shared `Database`.
 
 ### Phase 7: Migrate message send/retry/projection write path + delivery-status scope fix (~1000 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #760
 
 <details>
 <summary>Details</summary>

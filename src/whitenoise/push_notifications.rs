@@ -1524,6 +1524,7 @@ mod tests {
 
     async fn wait_for_message_sent_status(
         whitenoise: &Whitenoise,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
         message_id: &EventId,
     ) {
@@ -1532,6 +1533,7 @@ mod tests {
                 let message = AggregatedMessage::find_by_id(
                     &message_id.to_string(),
                     group_id,
+                    account_pubkey,
                     &whitenoise.database,
                 )
                 .await
@@ -2066,7 +2068,13 @@ mod tests {
             )
             .await
             .unwrap();
-        wait_for_message_sent_status(&whitenoise, &group_id, &chat_result.message.id).await;
+        wait_for_message_sent_status(
+            &whitenoise,
+            &admin_account.pubkey,
+            &group_id,
+            &chat_result.message.id,
+        )
+        .await;
 
         let admin_mdk = whitenoise
             .create_mdk_for_account(admin_account.pubkey)
@@ -2227,7 +2235,13 @@ mod tests {
             .await
             .unwrap();
 
-        wait_for_message_sent_status(&whitenoise, &group_id, &send_result.message.id).await;
+        wait_for_message_sent_status(
+            &whitenoise,
+            &creator.pubkey,
+            &group_id,
+            &send_result.message.id,
+        )
+        .await;
 
         let creator_mdk = whitenoise.create_mdk_for_account(creator.pubkey).unwrap();
         let active_leaf_map = creator_mdk.group_leaf_map(&group_id).unwrap();
@@ -2267,6 +2281,7 @@ mod tests {
         let cached_message = AggregatedMessage::find_by_id(
             &send_result.message.id.to_string(),
             &group_id,
+            &creator.pubkey,
             &whitenoise.database,
         )
         .await

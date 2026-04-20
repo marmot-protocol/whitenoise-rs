@@ -569,6 +569,7 @@ impl EphemeralPlane {
                     Self::update_and_emit_delivery_status(
                         event_id,
                         group_id,
+                        account_pubkey,
                         &status,
                         database,
                         stream_manager,
@@ -581,6 +582,7 @@ impl EphemeralPlane {
                 Self::update_and_emit_delivery_status(
                     event_id,
                     group_id,
+                    account_pubkey,
                     &status,
                     database,
                     stream_manager,
@@ -609,6 +611,7 @@ impl EphemeralPlane {
                 Self::update_and_emit_delivery_status(
                     event_id,
                     group_id,
+                    account_pubkey,
                     &status,
                     database,
                     stream_manager,
@@ -681,12 +684,17 @@ impl EphemeralPlane {
     async fn update_and_emit_delivery_status(
         event_id: &str,
         group_id: &GroupId,
+        account_pubkey: &PublicKey,
         status: &DeliveryStatus,
         database: &Database,
         stream_manager: &MessageStreamManager,
     ) {
         match AggregatedMessage::update_delivery_status_with_retry(
-            event_id, group_id, status, database,
+            event_id,
+            group_id,
+            account_pubkey,
+            status,
+            database,
         )
         .await
         {

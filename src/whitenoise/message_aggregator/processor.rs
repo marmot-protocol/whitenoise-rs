@@ -253,10 +253,24 @@ fn try_process_deletion(
     any_processed
 }
 
+/// Extract the reaction target event ID from an event's e-tags.
+pub(crate) fn extract_reaction_target_id(
+    tags: &Tags,
+) -> core::result::Result<String, crate::whitenoise::error::WhitenoiseError> {
+    tags.iter()
+        .find(|tag| tag.kind() == TagKind::e())
+        .and_then(|tag| tag.content().map(|s| s.to_string()))
+        .ok_or_else(|| {
+            crate::whitenoise::error::WhitenoiseError::InvalidEvent(
+                "Reaction missing e-tag".to_string(),
+            )
+        })
+}
+
 /// Extract target message IDs from deletion event e-tags
 pub(crate) fn extract_deletion_target_ids(tags: &Tags) -> Vec<String> {
     tags.iter()
-        .filter(|tag| tag.kind() == TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)))
+        .filter(|tag| tag.kind() == TagKind::e())
         .filter_map(|tag| tag.content().map(|s| s.to_string()))
         .collect()
 }

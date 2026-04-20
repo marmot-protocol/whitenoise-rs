@@ -5,7 +5,7 @@
 //! regular chat messages, reactions, deletions, and replies.
 
 pub(crate) mod emoji_utils;
-mod processor;
+pub(crate) mod processor;
 pub(crate) mod reaction_handler;
 mod types;
 // mod state;  // Future: For Phase 2 stateful implementation
