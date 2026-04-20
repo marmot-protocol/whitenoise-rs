@@ -122,7 +122,7 @@ impl GroupInformation {
         mdk: &MDK<MdkSqliteStorage>,
         database: &Database,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
-        let existing = GroupInformation::find_by_mls_group_ids(mls_group_ids, database).await?;
+        let existing = Self::find_by_mls_group_ids(mls_group_ids, database).await?;
 
         let mut existing_map: std::collections::HashMap<GroupId, GroupInformation> = existing
             .into_iter()
@@ -138,12 +138,9 @@ impl GroupInformation {
                     .get_group(mls_group_id)?
                     .ok_or(WhitenoiseError::GroupNotFound)?;
                 let group_type = Self::infer_group_type_from_group_name(&group.name);
-                let (new_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
-                    mls_group_id,
-                    Some(group_type),
-                    database,
-                )
-                .await?;
+                let (new_info, _was_created) =
+                    Self::find_or_create_by_mls_group_id(mls_group_id, Some(group_type), database)
+                        .await?;
                 results.push(new_info);
             }
         }
