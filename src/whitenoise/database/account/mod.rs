@@ -59,7 +59,7 @@ impl AccountRepositories {
             drafts: DraftsRepo::new(account_pubkey, db.clone()),
             settings: AccountSettingsRepo::new(account_pubkey, db.clone()),
             follows: AccountFollowsRepo::new(account_pubkey, db.clone()).await?,
-            published_key_packages: PublishedKeyPackagesRepo::new(account_pubkey, db),
+            published_key_packages: PublishedKeyPackagesRepo::new(account_pubkey, db.clone()),
             push_registrations: PushRegistrationsRepo::new(account_pubkey, db.clone()),
             group_push_tokens: GroupPushTokensRepo::new(account_pubkey, db),
         })
