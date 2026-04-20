@@ -2893,12 +2893,10 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::pause();
         let settings = whitenoise
             .update_notifications_enabled(&admin_account, false)
             .await
             .unwrap();
-        tokio::time::resume();
         assert!(!settings.notifications_enabled);
 
         let cached_after_disable = GroupPushToken::find_by_account_and_group(

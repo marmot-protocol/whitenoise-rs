@@ -131,6 +131,38 @@ impl PublishedKeyPackage {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Atomically checks whether a tracked key package is usable and claims it.
+    ///
+    /// Claiming updates `consumed_at` in the same SQL statement that verifies
+    /// `key_material_deleted = 0`, which prevents stale check-then-use races.
+    ///
+    /// Returns `Ok(None)` when the row doesn't exist or key material is already deleted.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn claim_if_usable(
+        account_pubkey: &PublicKey,
+        event_id: &str,
+        database: &Database,
+    ) -> Result<Option<Self>, DatabaseError> {
+        let row = sqlx::query_as::<_, Self>(
+            "UPDATE published_key_packages
+             SET consumed_at = unixepoch()
+             WHERE id = (
+                 SELECT id
+                 FROM published_key_packages
+                 WHERE account_pubkey = ? AND event_id = ? AND key_material_deleted = 0
+                 LIMIT 1
+             )
+             AND key_material_deleted = 0
+             RETURNING id, account_pubkey, key_package_hash_ref, event_id, consumed_at, key_material_deleted, created_at",
+        )
+        .bind(account_pubkey.to_hex())
+        .bind(event_id)
+        .fetch_optional(&database.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     /// Returns all published key packages eligible for key material cleanup.
     ///
     /// A package is eligible when:
@@ -392,6 +424,50 @@ mod tests {
             .await
             .unwrap();
         assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_usable_claims_row() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let event_id = "claim_test";
+
+        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
+            .await
+            .unwrap();
+
+        let claimed = PublishedKeyPackage::claim_if_usable(&pubkey, event_id, &db)
+            .await
+            .unwrap()
+            .expect("claim should return row");
+
+        assert_eq!(claimed.event_id, event_id);
+        assert!(claimed.consumed_at.is_some());
+        assert!(!claimed.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_claim_if_usable_returns_none_when_deleted() {
+        let db = setup_test_db().await;
+        let pubkey = Keys::generate().public_key();
+        let event_id = "claim_deleted_test";
+
+        PublishedKeyPackage::create(&pubkey, &[1, 2, 3], event_id, &db)
+            .await
+            .unwrap();
+
+        let pkg = PublishedKeyPackage::find_by_event_id(&pubkey, event_id, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &db)
+            .await
+            .unwrap();
+
+        let claimed = PublishedKeyPackage::claim_if_usable(&pubkey, event_id, &db)
+            .await
+            .unwrap();
+        assert!(claimed.is_none());
     }
 
     #[tokio::test]

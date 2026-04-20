@@ -206,6 +206,22 @@ impl ProcessedEvent {
             .await
             .map_err(WhitenoiseError::Database)
     }
+
+    /// Gets the newest mute list (NIP-51 kind 10000) event timestamp for an account.
+    #[perf_instrument("db::processed_events")]
+    pub(crate) async fn newest_mute_list_timestamp(
+        account_id: i64,
+        database: &Database,
+    ) -> Result<Option<DateTime<Utc>>, WhitenoiseError> {
+        Self::newest_event_timestamp_for_kind(
+            Some(account_id),
+            Kind::MuteList.as_u16(),
+            None,
+            database,
+        )
+        .await
+        .map_err(WhitenoiseError::Database)
+    }
 }
 
 #[cfg(test)]

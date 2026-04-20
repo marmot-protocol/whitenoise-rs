@@ -15,6 +15,8 @@ pub struct AccountSettings {
     pub id: Option<i64>,
     pub account_pubkey: PublicKey,
     pub notifications_enabled: bool,
+    /// When true (default), welcomes from users on this account's NIP-51 mute list are auto-declined.
+    pub refuse_invites_from_muted_users: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -62,6 +64,20 @@ impl Whitenoise {
 
         Ok(settings)
     }
+
+    /// Sets whether invites from muted users are automatically declined for `account`.
+    pub async fn update_refuse_invites_from_muted_users(
+        &self,
+        account: &Account,
+        refuse: bool,
+    ) -> Result<AccountSettings, WhitenoiseError> {
+        Ok(AccountSettings::update_refuse_invites_from_muted_users(
+            &account.pubkey,
+            refuse,
+            &self.database,
+        )
+        .await?)
+    }
 }
 
 #[cfg(test)]
@@ -75,6 +91,7 @@ mod tests {
 
         let settings = whitenoise.account_settings(&account).await.unwrap();
         assert!(settings.notifications_enabled);
+        assert!(settings.refuse_invites_from_muted_users);
         assert_eq!(settings.account_pubkey, account.pubkey);
 
         let settings = whitenoise
@@ -88,5 +105,17 @@ mod tests {
             .await
             .unwrap();
         assert!(settings.notifications_enabled);
+
+        let settings = whitenoise
+            .update_refuse_invites_from_muted_users(&account, false)
+            .await
+            .unwrap();
+        assert!(!settings.refuse_invites_from_muted_users);
+
+        let settings = whitenoise
+            .update_refuse_invites_from_muted_users(&account, true)
+            .await
+            .unwrap();
+        assert!(settings.refuse_invites_from_muted_users);
     }
 }

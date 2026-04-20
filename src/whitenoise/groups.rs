@@ -27,7 +27,26 @@ mod publish;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 
+const MEMBER_KEY_PACKAGE_FETCH_ATTEMPTS: usize = 12;
+const MEMBER_KEY_PACKAGE_FETCH_DELAY: Duration = Duration::from_millis(250);
+
 impl Whitenoise {
+    async fn fetch_member_key_package_with_retry(&self, user: &User) -> Result<Event> {
+        for attempt in 1..=MEMBER_KEY_PACKAGE_FETCH_ATTEMPTS {
+            if let Some(event) = user.key_package_event(self).await? {
+                return Ok(event);
+            }
+
+            if attempt < MEMBER_KEY_PACKAGE_FETCH_ATTEMPTS {
+                tokio::time::sleep(MEMBER_KEY_PACKAGE_FETCH_DELAY).await;
+            }
+        }
+
+        Err(WhitenoiseError::MdkCoreError(mdk_core::Error::KeyPackage(
+            "Does not exist".to_owned(),
+        )))
+    }
+
     #[perf_instrument("groups")]
     async fn resolve_member_delivery_relays(
         &self,
@@ -106,12 +125,8 @@ impl Whitenoise {
         }
 
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let some_event = user.key_package_event(self).await?;
+        let event = self.fetch_member_key_package_with_retry(&user).await?;
         drop(_kp_fetch);
-
-        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-        ))?;
 
         Self::validate_fetched_member_key_package(&event, pk)?;
 
@@ -602,24 +617,7 @@ impl Whitenoise {
                     );
                 }
             }
-            // Try and get user's key package relays, if they don't have any, use account's default relays
-            let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
-            if relays_to_use.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::add_members_to_group",
-                    "User {} has no relays configured, using account's default relays",
-                    user.pubkey
-                );
-                relays_to_use = account.nip65_relays(self).await?;
-            }
-            let relays_to_use_urls = Relay::urls(&relays_to_use);
-            let some_event = self
-                .relay_control
-                .fetch_user_key_package(*pk, &relays_to_use_urls)
-                .await?;
-            let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-                mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-            ))?;
+            let event = self.fetch_member_key_package_with_retry(&user).await?;
 
             Self::validate_fetched_member_key_package(&event, pk)?;
 

@@ -322,7 +322,12 @@ impl Whitenoise {
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
-        if Whitenoise::get_instance().is_ok() {
+        let publish_via_global_singleton = match Whitenoise::get_instance() {
+            Ok(global) => core::ptr::eq(core::ptr::from_ref(global), core::ptr::from_ref(self)),
+            Err(_) => false,
+        };
+
+        if publish_via_global_singleton {
             let account = account.clone();
             tokio::spawn(async move {
                 let wn = match Whitenoise::get_instance() {
@@ -638,6 +643,83 @@ impl Whitenoise {
         );
 
         Ok(key_package_events)
+    }
+
+    async fn latest_usable_key_package_candidates(&self, account: &Account) -> Result<Vec<Event>> {
+        let mut events = self.fetch_all_key_packages_for_account(account).await?;
+        events.retain(|event| {
+            validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok()
+        });
+        events.sort_by_key(|event| (event.created_at, event.id));
+        Ok(events)
+    }
+
+    /// Returns the newest semantically valid key package event visible on relays whose key
+    /// material is still tracked locally (`published_key_packages` row with
+    /// `key_material_deleted = 0`) and atomically claims the tracking row for immediate use.
+    ///
+    /// The claim (`consumed_at` update) is performed in the same SQL statement as the
+    /// `key_material_deleted = 0` check to avoid stale check-then-use races.
+    #[perf_instrument("key_packages")]
+    pub(crate) async fn claim_latest_usable_key_package_event(
+        &self,
+        account: &Account,
+    ) -> Result<Option<(PublishedKeyPackage, Event)>> {
+        let events = self.latest_usable_key_package_candidates(account).await?;
+
+        for event in events.into_iter().rev() {
+            let claimed = PublishedKeyPackage::claim_if_usable(
+                &account.pubkey,
+                &event.id.to_hex(),
+                &self.database,
+            )
+            .await?;
+            if let Some(pkg) = claimed {
+                return Ok(Some((pkg, event)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Returns the newest semantically valid key package event visible on relays whose key
+    /// material is still tracked locally (`published_key_packages` row with
+    /// `key_material_deleted = 0`).
+    ///
+    /// Unlike [`Self::claim_latest_usable_key_package_event`], this method does not mutate
+    /// tracking state and should be used only for readiness/polling checks.
+    #[perf_instrument("key_packages")]
+    pub(crate) async fn peek_latest_usable_key_package_event(
+        &self,
+        account: &Account,
+    ) -> Result<Option<Event>> {
+        let events = self.latest_usable_key_package_candidates(account).await?;
+
+        for event in events.into_iter().rev() {
+            let tracked = PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &event.id.to_hex(),
+                &self.database,
+            )
+            .await?;
+            if tracked.is_some_and(|pkg| !pkg.key_material_deleted) {
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Compatibility helper for existing call sites that only need the event payload.
+    #[perf_instrument("key_packages")]
+    pub(crate) async fn fetch_latest_usable_key_package_event(
+        &self,
+        account: &Account,
+    ) -> Result<Option<Event>> {
+        Ok(self
+            .claim_latest_usable_key_package_event(account)
+            .await?
+            .map(|(_, event)| event))
     }
 
     /// Deletes all key package events from relays for the given account.

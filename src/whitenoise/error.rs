@@ -32,6 +32,9 @@ pub enum WhitenoiseError {
     #[error("Contact list error: {0}")]
     ContactList(String),
 
+    #[error("Mute list error: {0}")]
+    MuteList(String),
+
     #[error("MDK SQLite storage error: {0}")]
     MdkSqliteStorage(#[from] mdk_sqlite_storage::error::Error),
 

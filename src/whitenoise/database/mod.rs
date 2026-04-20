@@ -11,6 +11,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
+pub mod account_muted_users;
 pub mod account_settings;
 pub mod accounts;
 pub mod accounts_groups;

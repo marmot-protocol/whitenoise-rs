@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
 use nostr_sdk::{Event, EventBuilder, Filter, Kind, NostrSigner, PublicKey, Tag, TagStandard};
@@ -256,6 +257,7 @@ impl Whitenoise {
 
     /// Replaces the mute list cache and emits `UserBlockChanged` for every
     /// pubkey that was added or removed compared to the previous state.
+    #[cfg(test)]
     pub(crate) async fn sync_and_emit(
         &self,
         account: &Account,
