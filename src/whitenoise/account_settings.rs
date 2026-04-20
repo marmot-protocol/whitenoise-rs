@@ -19,6 +19,7 @@ pub struct AccountSettings {
     pub updated_at: DateTime<Utc>,
 }
 
+#[allow(deprecated)]
 impl Whitenoise {
     /// Returns the settings for `account`, creating a default row if none exists.
     #[deprecated(

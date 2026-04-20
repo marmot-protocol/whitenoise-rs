@@ -10,6 +10,8 @@
 
 mod drafts;
 mod follows;
+mod group_push_tokens;
+mod push_registrations;
 mod settings;
 
 use std::sync::Arc;
@@ -18,6 +20,8 @@ use nostr_sdk::PublicKey;
 
 pub use self::drafts::DraftsRepo;
 pub use self::follows::AccountFollowsRepo;
+pub use self::group_push_tokens::GroupPushTokensRepo;
+pub use self::push_registrations::PushRegistrationsRepo;
 pub use self::settings::AccountSettingsRepo;
 
 use crate::whitenoise::database::Database;
@@ -32,6 +36,10 @@ pub struct AccountRepositories {
     pub settings: AccountSettingsRepo,
     /// Follow relationship repository for this account.
     pub follows: AccountFollowsRepo,
+    /// Push registration repository for this account.
+    pub push_registrations: PushRegistrationsRepo,
+    /// Cached group push tokens repository for this account.
+    pub group_push_tokens: GroupPushTokensRepo,
 }
 
 impl AccountRepositories {
@@ -46,7 +54,9 @@ impl AccountRepositories {
         Ok(Self {
             drafts: DraftsRepo::new(account_pubkey, db.clone()),
             settings: AccountSettingsRepo::new(account_pubkey, db.clone()),
-            follows: AccountFollowsRepo::new(account_pubkey, db).await?,
+            follows: AccountFollowsRepo::new(account_pubkey, db.clone()).await?,
+            push_registrations: PushRegistrationsRepo::new(account_pubkey, db.clone()),
+            group_push_tokens: GroupPushTokensRepo::new(account_pubkey, db),
         })
     }
 }

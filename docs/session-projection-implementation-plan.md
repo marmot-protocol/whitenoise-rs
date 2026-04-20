@@ -363,7 +363,7 @@ Add `AccountGroupsRepo` in this phase.
 
 ### Phase 13: Migrate push account ops (~700 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #767
 
 <details>
 <summary>Details</summary>

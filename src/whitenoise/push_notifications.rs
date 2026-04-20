@@ -1,31 +1,24 @@
 //! Push notification registration state and per-group token cache models.
 
 use core::fmt;
-use std::sync::Arc;
-use std::time::Duration;
 use std::{
     collections::{BTreeMap, HashSet},
     str::FromStr,
 };
 
-use ::rand::Rng;
 use chrono::{DateTime, Utc};
-use futures::stream::{self, StreamExt};
 use mdk_core::mip05::{
-    EncryptedToken, LeafTokenTag, Mip05GroupMessage, NotificationPlatform, PushTokenPlaintext,
-    TokenTag, build_notification_batches, build_token_list_response_rumor,
-    build_token_removal_rumor, build_token_request_rumor, encrypt_push_token, parse_group_message,
+    EncryptedToken, LeafTokenTag, NotificationPlatform, PushTokenPlaintext, TokenTag,
+    build_notification_batches, build_token_list_response_rumor, encrypt_push_token,
 };
-use mdk_core::prelude::{GroupId, MDK, group_types::GroupState};
+use mdk_core::prelude::{GroupId, MDK};
 use mdk_sqlite_storage::MdkSqliteStorage;
 use nostr_sdk::{EventId, Kind, PublicKey, RelayUrl};
 use serde::{Deserialize, Serialize};
 
 use crate::whitenoise::{
     Whitenoise, WhitenoiseConfig,
-    account_settings::AccountSettings,
     accounts::Account,
-    accounts_groups::AccountGroup,
     database::Database,
     error::{Result, WhitenoiseError},
     relays::{Relay, RelayType},
@@ -35,11 +28,6 @@ use crate::{
     perf_instrument,
     relay_control::{RelayControlPlane, ephemeral::EphemeralPlane},
 };
-
-/// Maximum number of groups to publish push token events to concurrently.
-/// Caps relay connection pressure while still parallelising the bulk of the
-/// per-group relay round-trips.
-const MAX_CONCURRENT_GROUP_PUBLISHES: usize = 10;
 
 /// Supported native push-token platforms for device registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -141,66 +129,8 @@ const PUSH_GROUP_MESSAGE_KINDS: [u16; 3] = [
     mdk_core::mip05::TOKEN_REMOVAL_KIND,
 ];
 
-#[derive(Clone)]
-struct PendingTokenResponseContext {
-    config: WhitenoiseConfig,
-    database: Arc<Database>,
-    pending_push_token_responses: Arc<dashmap::DashMap<(PublicKey, GroupId, EventId), ()>>,
-    relay_control: Arc<RelayControlPlane>,
-}
-
 pub(crate) fn is_push_group_message_kind(kind: Kind) -> bool {
     PUSH_GROUP_MESSAGE_KINDS.contains(&kind.as_u16())
-}
-
-impl PendingTokenResponseContext {
-    fn clear_pending_token_response(
-        &self,
-        account_pubkey: &PublicKey,
-        group_id: &GroupId,
-        request_event_id: &EventId,
-    ) -> bool {
-        self.pending_push_token_responses
-            .remove(&(*account_pubkey, group_id.clone(), *request_event_id))
-            .is_some()
-    }
-
-    async fn dispatch_pending_token_response(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        request_event_id: EventId,
-    ) -> Result<bool> {
-        if !self.clear_pending_token_response(&account.pubkey, group_id, &request_event_id) {
-            return Ok(false);
-        }
-
-        self.respond_to_token_request(account, group_id, request_event_id)
-            .await?;
-        Ok(true)
-    }
-
-    async fn respond_to_token_request(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        request_event_id: EventId,
-    ) -> Result<()> {
-        let mdk = Account::create_mdk(
-            account.pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service_id,
-        )?;
-        respond_to_token_request_with(
-            &mdk,
-            &self.database,
-            &self.relay_control,
-            account,
-            group_id,
-            request_event_id,
-        )
-        .await
-    }
 }
 
 #[perf_instrument("push_notifications")]
@@ -280,10 +210,10 @@ async fn group_push_token_tags_for_response_with(
 }
 
 #[perf_instrument("push_notifications")]
-async fn publish_push_group_message_with(
+pub(crate) async fn publish_push_group_message_with(
     mdk: &MDK<MdkSqliteStorage>,
     relay_control: &RelayControlPlane,
-    account: &Account,
+    account_pubkey: &PublicKey,
     group_id: &GroupId,
     rumor: nostr_sdk::UnsignedEvent,
 ) -> Result<()> {
@@ -291,34 +221,34 @@ async fn publish_push_group_message_with(
     let event = mdk.create_message(group_id, rumor, None)?;
 
     relay_control
-        .publish_event_to(event, &account.pubkey, &relay_urls)
+        .publish_event_to(event, account_pubkey, &relay_urls)
         .await?;
     Ok(())
 }
 
 #[perf_instrument("push_notifications")]
-async fn respond_to_token_request_with(
+pub(crate) async fn respond_to_token_request_with(
     mdk: &MDK<MdkSqliteStorage>,
     database: &Database,
     relay_control: &RelayControlPlane,
-    account: &Account,
+    account_pubkey: &PublicKey,
     group_id: &GroupId,
     request_event_id: EventId,
 ) -> Result<()> {
     let token_tags =
-        group_push_token_tags_for_response_with(&account.pubkey, group_id, database, mdk).await?;
+        group_push_token_tags_for_response_with(account_pubkey, group_id, database, mdk).await?;
 
     if token_tags.is_empty() {
         return Ok(());
     }
 
     let rumor = build_token_list_response_rumor(
-        account.pubkey,
+        *account_pubkey,
         nostr_sdk::Timestamp::now(),
         request_event_id,
         token_tags,
     )?;
-    publish_push_group_message_with(mdk, relay_control, account, group_id, rumor).await
+    publish_push_group_message_with(mdk, relay_control, account_pubkey, group_id, rumor).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,18 +554,26 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
     Ok(())
 }
 
+/// Deprecated facades that delegate to session-scoped `PushOps`.
+///
+/// These will be removed once all call sites (groups.rs, accounts_groups.rs,
+/// account_settings.rs, handle_mls_message.rs) are migrated to use the session
+/// directly.
+#[allow(deprecated)]
 impl Whitenoise {
-    /// Returns the locally stored push registration for `account`, if present.
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().registration() instead."
+    )]
     pub async fn push_registration(&self, account: &Account) -> Result<Option<PushRegistration>> {
-        Ok(PushRegistration::find_by_account_pubkey(&account.pubkey, &self.database).await?)
+        let session = self.require_session(&account.pubkey)?;
+        session.push().registration().await
     }
 
-    /// Creates or replaces the locally stored push registration for `account`.
-    ///
-    /// This updates local persistence and, when notifications remain shareable,
-    /// best-effort MIP-05 token sharing for the account's joined groups.
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().upsert_registration() instead."
+    )]
     pub async fn upsert_push_registration(
         &self,
         account: &Account,
@@ -644,693 +582,145 @@ impl Whitenoise {
         server_pubkey: &PublicKey,
         relay_hint: Option<&RelayUrl>,
     ) -> Result<PushRegistration> {
-        validate_raw_token(raw_token)?;
-        let pending_registration = PushRegistration {
-            account_pubkey: account.pubkey,
-            platform,
-            raw_token: raw_token.to_string(),
-            server_pubkey: *server_pubkey,
-            relay_hint: relay_hint.cloned(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_shared_at: None,
-        };
-        pending_registration.push_token_plaintext()?;
-
-        let previous_token_tag = self
-            .push_registration(account)
-            .await?
-            .as_ref()
-            .map(PushRegistration::token_tag)
-            .transpose()?
-            .flatten();
-        let new_token_tag = pending_registration.token_tag()?;
-
-        let registration = PushRegistration::upsert(
-            &account.pubkey,
-            platform,
-            raw_token,
-            server_pubkey,
-            relay_hint,
-            &self.database,
-        )
-        .await?;
-
-        let notifications_enabled =
-            AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
-                .await?;
-
-        if previous_token_tag.is_some() && new_token_tag.is_none() {
-            if let Err(error) = self
-                .remove_local_push_token_from_joined_groups(account)
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    error = %error,
-                    "Failed to remove previously shared push token after registration became unshareable"
-                );
-            }
-        } else if notifications_enabled
-            && let Some(new_token_tag) = new_token_tag.as_ref()
-            && let Err(error) = self
-                .share_push_token_to_joined_groups(account, new_token_tag)
-                .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account.pubkey.to_hex(),
-                error = %error,
-                "Failed to share updated push registration to joined groups"
-            );
-        }
-
-        Ok(registration)
-    }
-
-    /// Removes the locally stored push registration for `account`.
-    #[perf_instrument("push_notifications")]
-    pub async fn clear_push_registration(&self, account: &Account) -> Result<()> {
-        PushRegistration::delete_by_account_pubkey(&account.pubkey, &self.database).await?;
-
-        if let Err(error) = self
-            .remove_local_push_token_from_joined_groups(account)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .push()
+            .upsert_registration(platform, raw_token, server_pubkey, relay_hint)
             .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account.pubkey.to_hex(),
-                error = %error,
-                "Failed to remove shared push token from joined groups after local clear"
-            );
-        }
-
-        Ok(())
     }
 
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().clear_registration() instead."
+    )]
+    pub async fn clear_push_registration(&self, account: &Account) -> Result<()> {
+        let session = self.require_session(&account.pubkey)?;
+        session.push().clear_registration().await
+    }
+
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().handle_received_push_group_message() instead."
+    )]
     pub(crate) async fn handle_received_push_group_message(
         &self,
-        mdk: &MDK<MdkSqliteStorage>,
+        _mdk: &MDK<MdkSqliteStorage>,
         account: &Account,
         message: &mdk_core::prelude::message_types::Message,
         sender_leaf_index: Option<u32>,
     ) -> Result<bool> {
-        if !is_push_group_message_kind(message.kind) {
-            return Ok(false);
-        }
-
-        let group_message = parse_group_message(message)?;
-
-        match group_message {
-            Mip05GroupMessage::TokenRequest(request) => {
-                let leaf_index = sender_leaf_index.ok_or_else(|| {
-                    WhitenoiseError::InvalidEvent(
-                        "MIP-05 token request missing sender leaf index".to_string(),
-                    )
-                })?;
-
-                self.merge_token_request(
-                    account,
-                    &message.mls_group_id,
-                    message.event.pubkey,
-                    leaf_index,
-                    request,
-                )
-                .await?;
-
-                if let Some(request_event_id) = message.event.id {
-                    self.schedule_pending_token_response(
-                        account.clone(),
-                        message.mls_group_id.clone(),
-                        request_event_id,
-                    );
-                }
-            }
-            Mip05GroupMessage::TokenListResponse(response) => {
-                let request_event_id = response.request_event_id;
-                self.merge_token_list_response(mdk, account, &message.mls_group_id, response)
-                    .await?;
-                self.clear_pending_token_response(
-                    &account.pubkey,
-                    &message.mls_group_id,
-                    &request_event_id,
-                );
-            }
-            Mip05GroupMessage::TokenRemoval(_) => {
-                let leaf_index = sender_leaf_index.ok_or_else(|| {
-                    WhitenoiseError::InvalidEvent(
-                        "MIP-05 token removal missing sender leaf index".to_string(),
-                    )
-                })?;
-
-                GroupPushToken::delete(
-                    &account.pubkey,
-                    &message.mls_group_id,
-                    leaf_index,
-                    &self.database,
-                )
-                .await?;
-            }
-        }
-
-        Ok(true)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .push()
+            .handle_received_push_group_message(message, sender_leaf_index)
+            .await
     }
 
     #[cfg(test)]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::pending_push_token_responses directly."
+    )]
     pub(crate) fn has_pending_token_response(
         &self,
         account_pubkey: &PublicKey,
         group_id: &GroupId,
         request_event_id: &EventId,
     ) -> bool {
-        self.pending_push_token_responses.contains_key(&(
-            *account_pubkey,
-            group_id.clone(),
-            *request_event_id,
-        ))
+        self.session(account_pubkey)
+            .map(|s| {
+                s.pending_push_token_responses
+                    .contains_key(&(group_id.clone(), *request_event_id))
+            })
+            .unwrap_or(false)
     }
 
-    pub(crate) fn clear_pending_token_response(
-        &self,
-        account_pubkey: &PublicKey,
-        group_id: &GroupId,
-        request_event_id: &EventId,
-    ) -> bool {
-        self.pending_push_token_responses
-            .remove(&(*account_pubkey, group_id.clone(), *request_event_id))
-            .is_some()
-    }
-
+    #[cfg(test)]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().dispatch_pending_token_response() instead."
+    )]
     pub(crate) async fn dispatch_pending_token_response(
         &self,
         account: &Account,
         group_id: &GroupId,
         request_event_id: EventId,
     ) -> Result<bool> {
-        if !self.clear_pending_token_response(&account.pubkey, group_id, &request_event_id) {
-            return Ok(false);
-        }
-
-        self.respond_to_token_request(account, group_id, request_event_id)
-            .await?;
-        Ok(true)
-    }
-
-    fn schedule_pending_token_response(
-        &self,
-        account: Account,
-        group_id: GroupId,
-        request_event_id: EventId,
-    ) {
-        let key = (account.pubkey, group_id.clone(), request_event_id);
-        self.pending_push_token_responses.insert(key, ());
-
-        let context = PendingTokenResponseContext {
-            config: self.config.clone(),
-            database: Arc::clone(&self.database),
-            pending_push_token_responses: Arc::clone(&self.pending_push_token_responses),
-            relay_control: Arc::clone(&self.relay_control),
-        };
-        let delay_ms = ::rand::rng().random_range(1_000..=3_000);
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            if let Err(error) = context
-                .dispatch_pending_token_response(&account, &group_id, request_event_id)
-                .await
-            {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    group_id = %hex::encode(group_id.as_slice()),
-                    request_event_id = %request_event_id.to_hex(),
-                    error = %error,
-                    "Failed to send delayed MIP-05 token-list response"
-                );
-            }
-        });
-    }
-
-    /// Returns `true` when push-gossip is allowed for the given group:
-    /// the MLS group must be active, the account must have an accepted
-    /// `AccountGroup` row, and the row must not be marked as removed.
-    async fn is_push_gossip_eligible(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        group_state: GroupState,
-    ) -> bool {
-        if group_state != GroupState::Active {
-            return false;
-        }
-        match AccountGroup::get(self, &account.pubkey, group_id).await {
-            Ok(Some(ag)) => ag.is_accepted() && !ag.is_removed(),
-            Ok(None) => false,
-            Err(error) => {
-                tracing::warn!(
-                    target: "whitenoise::push_notifications",
-                    account = %account.pubkey.to_hex(),
-                    group = %hex::encode(group_id.as_slice()),
-                    error = %error,
-                    "Failed to check push gossip eligibility; treating as ineligible"
-                );
-                false
-            }
-        }
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn share_push_token_to_joined_groups(
-        &self,
-        account: &Account,
-        token_tag: &TokenTag,
-    ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups = mdk.get_groups()?;
-
-        // Drive groups concurrently with a bounded cap so relay connections
-        // are not overwhelmed. RTTs for independent groups overlap while
-        // total in-flight publishes stay within a reasonable limit.
-        let failures: Vec<String> = stream::iter(groups.iter())
-            .map(|group| {
-                self.share_token_to_single_group(
-                    &mdk,
-                    account,
-                    &group.mls_group_id,
-                    group.state,
-                    token_tag,
-                )
-            })
-            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
-            .filter_map(|r| async move { r.err() })
-            .collect()
-            .await;
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(WhitenoiseError::Configuration(format!(
-                "failed to share push token to one or more groups: {}",
-                failures.join(", ")
-            )))
-        }
-    }
-
-    /// Publishes a push token request to a single group and updates the local
-    /// cache. Returns `Ok(())` if the group is ineligible (treated as a no-op)
-    /// or if both operations succeed. Returns `Err` with a descriptive message
-    /// on publish or cache-sync failure.
-    #[perf_instrument("push_notifications")]
-    async fn share_token_to_single_group(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        group_state: GroupState,
-        token_tag: &TokenTag,
-    ) -> std::result::Result<(), String> {
-        if !self
-            .is_push_gossip_eligible(account, group_id, group_state)
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .push()
+            .dispatch_pending_token_response(group_id, request_event_id)
             .await
-        {
-            return Ok(());
-        }
-
-        let rumor = build_token_request_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
-            vec![token_tag.clone()],
-        )
-        .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
-
-        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
-            .await
-            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))?;
-
-        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
-            .await
-            .map_err(|e| format!("{}: {e}", hex::encode(group_id.as_slice())))
     }
 
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().share_local_token_to_joined_groups() instead."
+    )]
     pub(crate) async fn share_local_push_token_to_joined_groups(
         &self,
         account: &Account,
     ) -> Result<()> {
-        if !AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
-            .await?
-        {
-            return Ok(());
-        }
-
-        let Some(token_tag) = self.local_push_token_tag(account).await? else {
-            return Ok(());
-        };
-
-        self.share_push_token_to_joined_groups(account, &token_tag)
-            .await
+        let session = self.require_session(&account.pubkey)?;
+        session.push().share_local_token_to_joined_groups().await
     }
 
-    #[perf_instrument("push_notifications")]
-    pub(crate) async fn reconcile_group_push_tokens_for_active_leaves(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let active_leaf_map = mdk.group_leaf_map(group_id)?;
-        let cached_tokens =
-            GroupPushToken::find_by_account_and_group(&account.pubkey, group_id, &self.database)
-                .await?;
-
-        for token in cached_tokens {
-            match active_leaf_map.get(&token.leaf_index) {
-                Some(active_member_pubkey) if active_member_pubkey == &token.member_pubkey => {
-                    continue;
-                }
-                Some(_) => {
-                    GroupPushToken::delete(
-                        &account.pubkey,
-                        group_id,
-                        token.leaf_index,
-                        &self.database,
-                    )
-                    .await?;
-                }
-                None => {
-                    let member_still_active = active_leaf_map
-                        .values()
-                        .any(|member_pubkey| member_pubkey == &token.member_pubkey);
-
-                    if member_still_active {
-                        GroupPushToken::delete(
-                            &account.pubkey,
-                            group_id,
-                            token.leaf_index,
-                            &self.database,
-                        )
-                        .await?;
-                    } else {
-                        GroupPushToken::delete_by_member_pubkey(
-                            &account.pubkey,
-                            group_id,
-                            &token.member_pubkey,
-                            &self.database,
-                        )
-                        .await?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn share_push_token_to_group(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        token_tag: &TokenTag,
-    ) -> Result<()> {
-        let rumor = build_token_request_rumor(
-            account.pubkey,
-            nostr_sdk::Timestamp::now(),
-            vec![token_tag.clone()],
-        )?;
-        publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor).await?;
-        self.sync_local_group_push_token_cache(mdk, account, group_id, Some(token_tag))
-            .await
-    }
-
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().share_local_token_to_group() instead."
+    )]
     pub(crate) async fn share_local_push_token_to_group(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        // Only share to groups the user has explicitly accepted.
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let group_state = mdk
-            .get_group(group_id)?
-            .map(|g| g.state)
-            .unwrap_or(GroupState::Inactive);
-        if !self
-            .is_push_gossip_eligible(account, group_id, group_state)
-            .await
-        {
-            return Ok(());
-        }
-
-        if !AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.database)
-            .await?
-        {
-            return Ok(());
-        }
-
-        let Some(token_tag) = self.local_push_token_tag(account).await? else {
-            return Ok(());
-        };
-
-        self.share_push_token_to_group(&mdk, account, group_id, &token_tag)
-            .await
+        let session = self.require_session(&account.pubkey)?;
+        session.push().share_local_token_to_group(group_id).await
     }
 
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().remove_local_token_from_joined_groups() instead."
+    )]
     pub(crate) async fn remove_local_push_token_from_joined_groups(
         &self,
         account: &Account,
     ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let groups = mdk.get_groups()?;
-
-        // Drive groups concurrently with a bounded cap so relay connections
-        // are not overwhelmed. RTTs for independent groups overlap while
-        // total in-flight publishes stay within a reasonable limit.
-        let failures: Vec<String> = stream::iter(groups.iter())
-            .map(|group| {
-                self.remove_token_from_single_group(&mdk, account, &group.mls_group_id, group.state)
-            })
-            .buffer_unordered(MAX_CONCURRENT_GROUP_PUBLISHES)
-            .filter_map(|r| async move { r.err() })
-            .collect()
-            .await;
-
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(WhitenoiseError::Configuration(format!(
-                "failed to remove push token from one or more groups: {}",
-                failures.join(", ")
-            )))
-        }
+        let session = self.require_session(&account.pubkey)?;
+        session.push().remove_local_token_from_joined_groups().await
     }
 
-    /// Publishes a push token removal to a single active group and clears the
-    /// local cache entry. Inactive groups are skipped silently.
-    ///
-    /// Cache sync is always attempted even when publishing fails — clearing
-    /// local state is best-effort cleanup that should not be blocked by a
-    /// relay error. Both failure messages are surfaced if both steps fail.
-    #[perf_instrument("push_notifications")]
-    async fn remove_token_from_single_group(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        group_state: GroupState,
-    ) -> std::result::Result<(), String> {
-        if group_state != GroupState::Active {
-            return Ok(());
-        }
-
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-
-        let publish_err =
-            publish_push_group_message_with(mdk, &self.relay_control, account, group_id, rumor)
-                .await
-                .err()
-                .map(|e| format!("{group_id_hex}: {e}"));
-
-        // Always run cache sync regardless of publish outcome.
-        let cache_err = self
-            .sync_local_group_push_token_cache(mdk, account, group_id, None)
-            .await
-            .err()
-            .map(|e| format!("{group_id_hex}: {e}"));
-
-        match (publish_err, cache_err) {
-            (None, None) => Ok(()),
-            (Some(e), None) | (None, Some(e)) => Err(e),
-            (Some(e1), Some(e2)) => Err(format!("{e1}, {e2}")),
-        }
-    }
-
-    /// Removes the local push token from a single group and clears
-    /// the sender's own cached leaf token for that group.
-    #[perf_instrument("push_notifications")]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().remove_local_token_from_group() instead."
+    )]
     pub(crate) async fn remove_local_push_token_from_group(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        let group_state = mdk
-            .get_group(group_id)?
-            .map(|g| g.state)
-            .unwrap_or(GroupState::Inactive);
+        let session = self.require_session(&account.pubkey)?;
+        session.push().remove_local_token_from_group(group_id).await
+    }
 
-        if group_state != GroupState::Active {
-            // Group is missing or inactive — clear any stale cache rows directly
-            // since own_leaf_index() is unavailable without an active MLS group.
-            GroupPushToken::delete_by_member_pubkey(
-                &account.pubkey,
-                group_id,
-                &account.pubkey,
-                &self.database,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        let rumor = build_token_removal_rumor(account.pubkey, nostr_sdk::Timestamp::now());
-        if let Err(error) =
-            publish_push_group_message_with(&mdk, &self.relay_control, account, group_id, rumor)
-                .await
-        {
-            tracing::warn!(
-                target: "whitenoise::push_notifications",
-                account = %account.pubkey.to_hex(),
-                group = %hex::encode(group_id.as_slice()),
-                error = %error,
-                "Failed to publish token removal to group"
-            );
-        }
-
-        self.sync_local_group_push_token_cache(&mdk, account, group_id, None)
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::push().reconcile_group_tokens_for_active_leaves() instead."
+    )]
+    pub(crate) async fn reconcile_group_push_tokens_for_active_leaves(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<()> {
+        let session = self.require_session(&account.pubkey)?;
+        session
+            .push()
+            .reconcile_group_tokens_for_active_leaves(group_id)
             .await
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn merge_token_request(
-        &self,
-        account: &Account,
-        mls_group_id: &GroupId,
-        member_pubkey: PublicKey,
-        leaf_index: u32,
-        request: mdk_core::mip05::TokenRequest,
-    ) -> Result<()> {
-        let Some(token) = request.tokens.into_iter().next() else {
-            return Err(WhitenoiseError::InvalidEvent(
-                "MIP-05 token request must include at least one token".to_string(),
-            ));
-        };
-
-        GroupPushToken::upsert(
-            &account.pubkey,
-            mls_group_id,
-            &member_pubkey,
-            leaf_index,
-            &token.server_pubkey,
-            Some(&token.relay_hint),
-            &token.encrypted_token.to_base64(),
-            &self.database,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn merge_token_list_response(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        mls_group_id: &GroupId,
-        response: mdk_core::mip05::TokenListResponse,
-    ) -> Result<()> {
-        let active_leaf_map = mdk.group_leaf_map(mls_group_id)?;
-
-        GroupPushToken::upsert_active_token_list_response(
-            &account.pubkey,
-            mls_group_id,
-            &active_leaf_map,
-            response.tokens,
-            &self.database,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn respond_to_token_request(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-        request_event_id: EventId,
-    ) -> Result<()> {
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
-        respond_to_token_request_with(
-            &mdk,
-            &self.database,
-            &self.relay_control,
-            account,
-            group_id,
-            request_event_id,
-        )
-        .await
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn sync_local_group_push_token_cache(
-        &self,
-        mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        group_id: &GroupId,
-        token_tag: Option<&TokenTag>,
-    ) -> Result<()> {
-        let leaf_index = mdk.own_leaf_index(group_id)?;
-
-        match token_tag {
-            Some(token_tag) => {
-                GroupPushToken::upsert(
-                    &account.pubkey,
-                    group_id,
-                    &account.pubkey,
-                    leaf_index,
-                    &token_tag.server_pubkey,
-                    Some(&token_tag.relay_hint),
-                    &token_tag.encrypted_token.to_base64(),
-                    &self.database,
-                )
-                .await?;
-            }
-            None => {
-                GroupPushToken::delete(&account.pubkey, group_id, leaf_index, &self.database)
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    #[perf_instrument("push_notifications")]
-    async fn local_push_token_tag(&self, account: &Account) -> Result<Option<TokenTag>> {
-        let Some(registration) = self.push_registration(account).await? else {
-            return Ok(None);
-        };
-
-        registration.token_tag()
     }
 }
 
-fn validate_raw_token(raw_token: &str) -> Result<()> {
+pub(crate) fn validate_raw_token(raw_token: &str) -> Result<()> {
     if raw_token.trim().is_empty() {
         return Err(WhitenoiseError::InvalidInput(
             "push registration token must not be empty".to_string(),
@@ -1341,7 +731,7 @@ fn validate_raw_token(raw_token: &str) -> Result<()> {
 }
 
 impl PushRegistration {
-    fn token_tag(&self) -> Result<Option<TokenTag>> {
+    pub(crate) fn token_tag(&self) -> Result<Option<TokenTag>> {
         let plaintext = self.push_token_plaintext()?;
         let Some(relay_hint) = self.relay_hint.clone() else {
             return Ok(None);
@@ -1356,7 +746,7 @@ impl PushRegistration {
         }))
     }
 
-    fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
+    pub(crate) fn push_token_plaintext(&self) -> Result<PushTokenPlaintext> {
         match self.platform {
             PushPlatform::Apns => {
                 // Apple push notification tokens are variable-length opaque data.
