@@ -933,6 +933,7 @@ fn cli_group_relay_urls() -> Vec<RelayUrl> {
         .collect()
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn create_group(
     wn: &Whitenoise,

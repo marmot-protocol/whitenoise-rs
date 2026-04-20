@@ -33,6 +33,7 @@ pub struct AddMembersPerformanceBenchmark {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl BenchmarkScenario for AddMembersPerformanceBenchmark {
     fn name(&self) -> &str {
         "Add Members Performance"

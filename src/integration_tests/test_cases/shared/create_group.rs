@@ -34,6 +34,7 @@ impl CreateGroupTestCase {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl TestCase for CreateGroupTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!("Creating group '{}'...", self.group_name);
