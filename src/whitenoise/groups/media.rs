@@ -217,6 +217,7 @@ impl Whitenoise {
     ///
     /// The returned metadata (hash, key, nonce) should be passed to `update_group_data`
     /// to update the group's image settings.
+    #[allow(deprecated)]
     #[perf_instrument("media")]
     pub async fn upload_group_image(
         &self,

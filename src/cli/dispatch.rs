@@ -15,6 +15,7 @@ use crate::whitenoise::users::KeyPackageStatus;
 use super::protocol::{MuteDuration, Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 pub async fn dispatch(req: Request) -> Response {
     let wn = match Whitenoise::get_instance() {
@@ -986,6 +987,7 @@ async fn add_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn get_group(
     wn: &Whitenoise,
@@ -1001,6 +1003,7 @@ async fn get_group(
     Ok(to_response(&group))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn group_pubkey_list(
     wn: &Whitenoise,
@@ -1028,6 +1031,7 @@ async fn group_pubkey_list(
     Ok(to_response(&members))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn group_relay_list(
     wn: &Whitenoise,
@@ -1110,6 +1114,7 @@ async fn rename_group(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn group_invites(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
@@ -2087,6 +2092,7 @@ async fn debug_ratchet_tree(
     })))
 }
 
+#[allow(deprecated)]
 async fn promote_admin(
     wn: &Whitenoise,
     account_str: &str,
@@ -2124,6 +2130,7 @@ async fn promote_admin(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 async fn demote_admin(
     wn: &Whitenoise,
     account_str: &str,

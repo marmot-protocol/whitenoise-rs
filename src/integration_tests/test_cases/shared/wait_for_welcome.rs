@@ -29,6 +29,7 @@ impl WaitForWelcomeTestCase {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl TestCase for WaitForWelcomeTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
