@@ -203,7 +203,7 @@ impl AccountSession {
     pub fn membership(&self) -> MembershipOps<'_> {
         MembershipOps::new(self)
     }
-  
+
     /// Return a view for group read operations scoped to this session.
     pub fn groups(&self) -> GroupOps<'_> {
         GroupOps::new(self)

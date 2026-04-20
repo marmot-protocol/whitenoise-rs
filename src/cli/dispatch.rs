@@ -966,6 +966,7 @@ async fn create_group(
     Ok(to_response(&group))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn add_members(
     wn: &Whitenoise,
@@ -1049,6 +1050,7 @@ async fn group_relay_list(
     Ok(to_response(&urls))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn remove_members(
     wn: &Whitenoise,
@@ -1070,6 +1072,7 @@ async fn remove_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn leave_group(
     wn: &Whitenoise,
@@ -1084,6 +1087,7 @@ async fn leave_group(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn self_demote(
     wn: &Whitenoise,
@@ -1098,6 +1102,7 @@ async fn self_demote(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[allow(deprecated)]
 #[perf_instrument("dispatch")]
 async fn rename_group(
     wn: &Whitenoise,
