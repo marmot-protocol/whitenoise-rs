@@ -9,17 +9,18 @@ use tracing_subscriber::filter::LevelFilter;
 #[cfg(feature = "benchmark-tests")]
 use crate::integration_tests::benchmarks::PerfTracingLayer;
 
+pub mod ffi;
+pub mod mdk;
 mod nostr_manager;
 pub mod perf;
 pub(crate) mod relay_control;
+mod types;
+pub mod whitenoise;
 
 // Re-export proc macro for ergonomic `#[perf_instrument("prefix")]` usage.
 // Crate-private because the macro expands to `crate::perf_span!(...)` which
 // only resolves inside this crate.
 pub(crate) use whitenoise_macros::perf_instrument;
-pub mod mdk;
-mod types;
-pub mod whitenoise;
 
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -91,6 +92,14 @@ pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTri
 // Notification streaming
 pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
+};
+
+// Background notification collection (iOS silent push). The async function
+// is re-exported alongside the result types so Rust callers can drive
+// collection directly without going through the FFI layer.
+pub use whitenoise::background_notifications::{
+    BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
+    NotificationUserDto, collect_notifications_after_push,
 };
 pub use whitenoise::push_notifications::{
     GroupPushDebugInfo, GroupPushToken, PushPlatform, PushRegistration,
