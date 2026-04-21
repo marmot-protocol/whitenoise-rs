@@ -210,7 +210,7 @@ impl<'a> GroupOps<'a> {
     /// `clear_pending_commit`, rolling back the MLS group to its pre-commit
     /// state.
     // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
-    async fn publish_and_merge_commit(
+    pub(crate) async fn publish_and_merge_commit(
         &self,
         evolution_event: Event,
         group_id: &GroupId,

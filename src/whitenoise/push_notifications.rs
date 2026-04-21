@@ -598,24 +598,6 @@ impl Whitenoise {
         session.push().clear_registration().await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().handle_received_push_group_message() instead."
-    )]
-    pub(crate) async fn handle_received_push_group_message(
-        &self,
-        _mdk: &MDK<MdkSqliteStorage>,
-        account: &Account,
-        message: &mdk_core::prelude::message_types::Message,
-        sender_leaf_index: Option<u32>,
-    ) -> Result<bool> {
-        let session = self.require_session(&account.pubkey)?;
-        session
-            .push()
-            .handle_received_push_group_message(message, sender_leaf_index)
-            .await
-    }
-
     #[cfg(test)]
     #[deprecated(
         since = "0.0.0",
@@ -703,6 +685,7 @@ impl Whitenoise {
         session.push().remove_local_token_from_group(group_id).await
     }
 
+    #[cfg(test)]
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::push().reconcile_group_tokens_for_active_leaves() instead."
