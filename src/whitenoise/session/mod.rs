@@ -227,7 +227,7 @@ impl AccountSession {
     pub fn chat_list(&self) -> ChatListOps<'_> {
         ChatListOps::new(self)
     }
-  
+
     /// Return a view for push notification operations scoped to this session.
     pub fn push(&self) -> PushOps<'_> {
         PushOps::new(self)

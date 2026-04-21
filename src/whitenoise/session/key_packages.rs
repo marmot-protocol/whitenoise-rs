@@ -145,13 +145,17 @@ impl<'a> KeyPackageOps<'a> {
     /// Returns `true` if the deletion event was accepted by at least one relay.
     #[perf_instrument("key_packages")]
     pub async fn delete(&self, event_id: &EventId, delete_mls_stored_keys: bool) -> Result<bool> {
-        if delete_mls_stored_keys {
-            self.delete_local_key_material(event_id).await;
-        }
-
+        // Resolve relays before wiping local MLS key material. If this step
+        // fails, the relay-side key package event is still live, so wiping
+        // local material would leave peers with a key package pointing at
+        // nonexistent local keys. Matches `delete_batch` ordering.
         let relays = self.prepare_relays().await?;
         if relays.is_empty() {
             return Ok(false);
+        }
+
+        if delete_mls_stored_keys {
+            self.delete_local_key_material(event_id).await;
         }
 
         let relay_urls = Relay::urls(&relays);
@@ -475,9 +479,51 @@ impl<'a> KeyPackageOps<'a> {
 
 #[cfg(test)]
 mod tests {
-    use nostr_sdk::Keys;
+    use nostr_sdk::{EventId, Keys, RelayUrl};
 
     use crate::whitenoise::session::test_helpers::test_session;
+
+    #[tokio::test]
+    async fn delete_keeps_local_material_when_no_relays() {
+        // Regression: when `prepare_relays` yields no relays, `delete()` must
+        // short-circuit BEFORE wiping local MLS key material. Otherwise the
+        // relay-side KP event stays live while local material is gone, leaving
+        // peers with a broken key package.
+        let pk = Keys::generate().public_key();
+        let session = test_session(pk).await;
+
+        // Create real MLS key material so that an incorrectly-ordered wipe
+        // would actually succeed. Without this, the MDK delete would no-op on
+        // a missing hash_ref and the test couldn't distinguish old from new.
+        let dummy_url = RelayUrl::parse("wss://test.invalid").unwrap();
+        let kp_data = session
+            .mdk
+            .create_key_package_for_event(&pk, vec![dummy_url])
+            .expect("create key package");
+
+        let event_id = EventId::all_zeros();
+        session
+            .repos
+            .published_key_packages
+            .create(&kp_data.hash_ref, &event_id.to_hex())
+            .await
+            .expect("seed published_key_packages row");
+
+        let result = session.key_packages().delete(&event_id, true).await;
+        assert!(matches!(result, Ok(false)));
+
+        let pkg = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event_id.to_hex())
+            .await
+            .expect("lookup")
+            .expect("record exists");
+        assert!(
+            !pkg.key_material_deleted,
+            "delete() wiped local key material despite relay check yielding no relays"
+        );
+    }
 
     #[tokio::test]
     async fn publish_fails_with_no_relays() {
