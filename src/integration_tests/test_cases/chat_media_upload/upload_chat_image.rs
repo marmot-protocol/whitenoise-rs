@@ -43,6 +43,7 @@ impl UploadChatImageTestCase {
 
 #[async_trait]
 impl TestCase for UploadChatImageTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading chat image for group {} using account: {}",

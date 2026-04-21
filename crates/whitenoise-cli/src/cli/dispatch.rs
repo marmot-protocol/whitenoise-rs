@@ -1870,6 +1870,8 @@ async fn unreact_to_message(
     Ok(to_response(&result))
 }
 
+#[allow(deprecated)]
+#[perf_instrument("dispatch")]
 async fn upload_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1949,6 +1951,8 @@ fn build_imeta_tag(media_file: &whitenoise::MediaFile) -> Result<nostr_sdk::Tag,
         .map_err(|e| Response::err(format!("failed to create imeta tag: {e}")))
 }
 
+#[allow(deprecated)]
+#[perf_instrument("dispatch")]
 async fn download_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1973,6 +1977,8 @@ async fn download_media(
     Ok(to_response(&media_file))
 }
 
+#[allow(deprecated)]
+#[perf_instrument("dispatch")]
 async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
     let group_id = parse_group_id(group_id_hex)?;
 

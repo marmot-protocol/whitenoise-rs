@@ -1,5 +1,9 @@
 //! Group read and mutation operations scoped to an [`AccountSession`].
 
+mod media;
+
+pub use self::media::MediaOps;
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -743,5 +747,10 @@ impl<'a> GroupOps<'a> {
                 );
             }
         }
+    }
+
+    /// Return a view for group media operations scoped to this session.
+    pub fn media(&self) -> MediaOps<'_> {
+        MediaOps::new(self.session)
     }
 }

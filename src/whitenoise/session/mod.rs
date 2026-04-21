@@ -12,7 +12,7 @@ mod social;
 
 pub use self::chat_list::ChatListOps;
 pub use self::drafts::DraftOps;
-pub use self::groups::GroupOps;
+pub use self::groups::{GroupOps, MediaOps};
 pub use self::key_packages::KeyPackageOps;
 pub use self::membership::{MembershipOps, MembershipOpsForGroup};
 pub use self::push::PushOps;

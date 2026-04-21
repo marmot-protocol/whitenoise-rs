@@ -46,6 +46,7 @@ impl UploadAudioTestCase {
 
 #[async_trait]
 impl TestCase for UploadAudioTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading MP3 audio for group {} using account: {}",

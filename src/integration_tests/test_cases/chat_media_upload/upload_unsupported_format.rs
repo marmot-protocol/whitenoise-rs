@@ -41,6 +41,7 @@ impl UnsupportedFormatTestCase {
 
 #[async_trait]
 impl TestCase for UnsupportedFormatTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Testing unsupported format rejection for group {} using account: {}",
