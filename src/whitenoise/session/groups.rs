@@ -16,9 +16,7 @@ use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::group_information::{GroupInformation, GroupType};
 use crate::whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
-use crate::whitenoise::key_packages::{
-    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
-};
+use crate::whitenoise::key_packages::validate_fetched_member_key_package;
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::User;
 
@@ -292,7 +290,7 @@ impl<'a> GroupOps<'a> {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             users.push(user);
@@ -558,7 +556,7 @@ impl<'a> GroupOps<'a> {
             mdk_core::Error::KeyPackage("Does not exist".to_owned()),
         ))?;
 
-        Self::validate_fetched_member_key_package(&event, pk)?;
+        validate_fetched_member_key_package(&event, pk)?;
 
         Ok((user, event))
     }
@@ -745,25 +743,5 @@ impl<'a> GroupOps<'a> {
                 }
             }
         });
-    }
-
-    // ── Static helpers ────────────────────────────────────────────────
-
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
-        if event.pubkey != *pk {
-            return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
-                event.id, event.pubkey, pk
-            )));
-        }
-
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
-
-        Ok(())
     }
 }

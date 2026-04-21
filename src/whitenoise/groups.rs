@@ -4,6 +4,10 @@ use std::time::Duration;
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+use std::sync::Arc;
+
+use futures::future::{join_all, try_join_all};
+
 use crate::{
     RelayType, perf_instrument, perf_span,
     whitenoise::{
@@ -12,7 +16,7 @@ use crate::{
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
+        key_packages::validate_fetched_member_key_package,
         relays::Relay,
         users::User,
     },
@@ -69,24 +73,6 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
-        if event.pubkey != *pk {
-            return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
-                event.id, event.pubkey, pk
-            )));
-        }
-
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
-
-        Ok(())
-    }
-
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
@@ -105,7 +91,7 @@ impl Whitenoise {
             mdk_core::Error::KeyPackage("Does not exist".to_owned()),
         ))?;
 
-        Self::validate_fetched_member_key_package(&event, pk)?;
+        validate_fetched_member_key_package(&event, pk)?;
 
         Ok((user, event))
     }
@@ -160,6 +146,12 @@ impl Whitenoise {
         Ok(())
     }
 
+    // NOTE: Unlike the other deprecated wrappers below (all(), get(), archive_chat(), etc.),
+    // this method retains its own implementation rather than delegating to
+    // `AccountSession::groups().create_group()`. The session path calls `Self::wn()` (the
+    // singleton bridge) which panics in unit tests where no global singleton is registered.
+    // Delegating here would break the existing test suite. Remove this copy when Phase 16
+    // eliminates the singleton.
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::groups().create_group() instead."
@@ -173,10 +165,6 @@ impl Whitenoise {
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        use std::sync::Arc;
-
-        use futures::future::{join_all, try_join_all};
-
         let signer = self.get_signer_for_account(creator_account)?;
 
         let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
@@ -470,7 +458,7 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             users.push(user);
