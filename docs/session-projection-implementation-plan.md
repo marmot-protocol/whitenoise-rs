@@ -319,7 +319,7 @@ and push-token sharing hooks.
 
 ### Phase 11: Migrate group media operations (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #772
 
 <details>
 <summary>Details</summary>
