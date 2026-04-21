@@ -1,12 +1,10 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::{join_all, try_join_all};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
-
-use std::sync::Arc;
-
-use futures::future::{join_all, try_join_all};
 
 use crate::{
     RelayType, perf_instrument, perf_span,

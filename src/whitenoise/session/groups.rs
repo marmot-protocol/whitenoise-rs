@@ -7,7 +7,6 @@ use std::time::Duration;
 use futures::future::{join_all, try_join_all};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
-use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::AccountSession;
 use crate::whitenoise::Whitenoise;
