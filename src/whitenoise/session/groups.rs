@@ -527,7 +527,7 @@ impl<'a> GroupOps<'a> {
         self.finalize_group_records(&group, &member_pubkeys, group_type, &group_name)
             .await?;
 
-        Self::background_publish_welcomes(welcome_data, signer, self.session.account_pubkey);
+        Self::publish_welcomes(welcome_data, signer, self.session.account_pubkey).await;
 
         let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
         wn.background_refresh_account_group_subscriptions(&account);
@@ -664,84 +664,86 @@ impl<'a> GroupOps<'a> {
         Ok(())
     }
 
-    /// Delivers welcome messages to group members in a background task.
-    /// Uses `join_all` to attempt all members even if individual publishes fail.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
-    fn background_publish_welcomes(
+    /// Delivers welcome messages to all group members, attempting every member even if
+    /// individual publishes fail. Errors are logged as warnings rather than propagated —
+    /// missed welcomes are non-fatal; the relay layer retries with exponential backoff.
+    ///
+    /// The caller is responsible for deciding whether to `tokio::spawn` this for
+    /// fire-and-forget behaviour. The view itself does not spawn.
+    // TODO(phase-16): Replace singleton bridge with session-owned relay_control.
+    async fn publish_welcomes(
         welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
         signer: Arc<dyn NostrSigner>,
         creator_pubkey: PublicKey,
     ) {
-        tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
+        let whitenoise = match Whitenoise::get_instance() {
+            Ok(wn) => wn,
+            Err(error) => {
+                tracing::error!(
+                    target: "whitenoise::session::groups",
+                    "Failed to get Whitenoise instance for welcome publishing: {}",
+                    error
+                );
+                return;
+            }
+        };
+
+        let creator_account =
+            match Account::find_by_pubkey(&creator_pubkey, &whitenoise.database).await {
+                Ok(account) => account,
                 Err(error) => {
                     tracing::error!(
                         target: "whitenoise::session::groups",
-                        "Failed to get Whitenoise instance for background welcome publishing: {}",
+                        "Failed to find creator account for welcome publishing: {}",
                         error
                     );
                     return;
                 }
             };
 
-            let creator_account =
-                match Account::find_by_pubkey(&creator_pubkey, &whitenoise.database).await {
-                    Ok(account) => account,
-                    Err(error) => {
-                        tracing::error!(
-                            target: "whitenoise::session::groups",
-                            "Failed to find creator account for welcome publishing: {}",
-                            error
-                        );
-                        return;
-                    }
-                };
+        let futures = welcome_data
+            .into_iter()
+            .map(|(rumor, member, member_pubkey)| {
+                let signer = signer.clone();
+                let creator = &creator_account;
+                async move {
+                    let relays_to_use = whitenoise
+                        .resolve_member_delivery_relays(
+                            &member,
+                            creator,
+                            "whitenoise::session::groups::create_group",
+                        )
+                        .await?;
 
-            let futures = welcome_data
-                .into_iter()
-                .map(|(rumor, member, member_pubkey)| {
-                    let signer = signer.clone();
-                    let creator = &creator_account;
-                    async move {
-                        let relays_to_use = whitenoise
-                            .resolve_member_delivery_relays(
-                                &member,
-                                creator,
-                                "whitenoise::session::groups::create_group",
-                            )
-                            .await?;
+                    let one_month_future =
+                        Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
-                        let one_month_future =
-                            Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
+                    whitenoise
+                        .relay_control
+                        .publish_welcome(
+                            &member_pubkey,
+                            rumor,
+                            &[Tag::expiration(one_month_future)],
+                            creator.pubkey,
+                            &Relay::urls(&relays_to_use),
+                            signer,
+                        )
+                        .await
+                        .map_err(WhitenoiseError::from)?;
 
-                        whitenoise
-                            .relay_control
-                            .publish_welcome(
-                                &member_pubkey,
-                                rumor,
-                                &[Tag::expiration(one_month_future)],
-                                creator.pubkey,
-                                &Relay::urls(&relays_to_use),
-                                signer,
-                            )
-                            .await
-                            .map_err(WhitenoiseError::from)?;
-
-                        Ok::<(), WhitenoiseError>(())
-                    }
-                });
-
-            let results = join_all(futures).await;
-            for result in results {
-                if let Err(error) = result {
-                    tracing::warn!(
-                        target: "whitenoise::session::groups",
-                        "Background welcome publish failed: {}",
-                        error
-                    );
+                    Ok::<(), WhitenoiseError>(())
                 }
+            });
+
+        let results = join_all(futures).await;
+        for result in results {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::session::groups",
+                    "Welcome publish failed: {}",
+                    error
+                );
             }
-        });
+        }
     }
 }
