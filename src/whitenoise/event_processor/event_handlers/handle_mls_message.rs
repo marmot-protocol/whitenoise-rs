@@ -148,8 +148,9 @@ impl Whitenoise {
         message: Message,
     ) -> Result<()> {
         if is_push_group_message_kind(message.kind) {
-            if let Err(error) = self
-                .handle_push_application_message(session, outcome, &message)
+            if let Err(error) = session
+                .push()
+                .handle_received_push_group_message(&message, outcome.context.sender_leaf_index)
                 .await
             {
                 tracing::warn!(
@@ -167,19 +168,6 @@ impl Whitenoise {
 
         self.handle_standard_application_message(account, mdk, group_id, inner_event, message)
             .await
-    }
-
-    async fn handle_push_application_message(
-        &self,
-        session: &Arc<AccountSession>,
-        outcome: &MessageProcessingOutcome,
-        message: &Message,
-    ) -> Result<()> {
-        session
-            .push()
-            .handle_received_push_group_message(message, outcome.context.sender_leaf_index)
-            .await?;
-        Ok(())
     }
 
     #[perf_instrument("event_handlers")]

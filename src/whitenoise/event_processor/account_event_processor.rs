@@ -91,7 +91,7 @@ impl Whitenoise {
         );
 
         let result = self
-            .route_account_event_for_processing(&event, &session, &account)
+            .route_account_event_for_processing(&session, &account, &event)
             .await;
 
         // Handle the result - success, retry, or give up
@@ -145,7 +145,7 @@ impl Whitenoise {
                     Kind::GiftWrap => {
                         // Use rumor timestamp for advancement per NIP-59
                         match self
-                            .extract_rumor_timestamp_for_advancement(&event, &session, &account)
+                            .extract_rumor_timestamp_for_advancement(&event, &session)
                             .await
                         {
                             Ok(Some(rumor_timestamp)) => {
@@ -325,9 +325,9 @@ impl Whitenoise {
     #[perf_instrument("event_processor")]
     async fn route_account_event_for_processing(
         &self,
-        event: &Event,
         session: &Arc<AccountSession>,
         account: &Account,
+        event: &Event,
     ) -> Result<()> {
         match event.kind {
             Kind::GiftWrap => match validate_giftwrap_target(account, event) {
@@ -357,19 +357,18 @@ impl Whitenoise {
         }
     }
 
-    /// Extract rumor timestamp from giftwrap event for sync advancement
+    /// Extract rumor timestamp from giftwrap event for sync advancement.
+    ///
+    /// Only called after `handle_giftwrap` succeeds, so the session signer
+    /// is guaranteed to exist (giftwrap decryption already used it).
     #[perf_instrument("event_processor")]
     async fn extract_rumor_timestamp_for_advancement(
         &self,
         event: &Event,
         session: &Arc<AccountSession>,
-        account: &Account,
     ) -> Result<Option<Timestamp>> {
-        // Prefer session signer; fall back to Whitenoise lookup for external
-        // signers that may not yet be registered on the session.
-        let signer = match session.get_signer() {
-            Some(s) => s,
-            None => self.get_signer_for_account(account)?,
+        let Some(signer) = session.get_signer() else {
+            return Ok(None);
         };
 
         match extract_rumor(&signer, event).await {
@@ -485,7 +484,7 @@ mod tests {
             .unwrap();
 
         let result = whitenoise
-            .route_account_event_for_processing(&event, &session, &account)
+            .route_account_event_for_processing(&session, &account, &event)
             .await;
 
         // Unhandled events return Ok(())

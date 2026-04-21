@@ -626,6 +626,7 @@ impl Whitenoise {
             .await
     }
 
+    #[cfg(test)]
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::membership().for_group().mark_as_removed() instead."
