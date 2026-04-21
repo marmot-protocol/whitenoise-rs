@@ -1016,6 +1016,7 @@ impl Whitenoise {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;

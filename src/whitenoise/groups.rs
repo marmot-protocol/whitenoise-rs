@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use crate::{
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        key_packages::{REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags},
+        key_packages::validate_fetched_member_key_package,
         relays::Relay,
         users::User,
     },
@@ -71,77 +71,141 @@ impl Whitenoise {
         Ok(fallback_relays)
     }
 
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
-        if event.pubkey != *pk {
-            return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
-                event.id, event.pubkey, pk
-            )));
-        }
-
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
-
-        Ok(())
-    }
-
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
-    ///
-    /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
-    /// preflight status checks and actual group creation use the same fallback chain.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
         if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
-                target: "whitenoise::accounts::groups::create_group",
+                target: "whitenoise::groups",
                 "Failed to update relay lists for new user {}: {}",
                 user.pubkey,
                 e
             );
         }
 
-        let _kp_fetch = perf_span!("groups::fetch_key_package");
         let some_event = user.key_package_event(self).await?;
-        drop(_kp_fetch);
-
         let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
             mdk_core::Error::KeyPackage("Does not exist".to_owned()),
         ))?;
 
-        Self::validate_fetched_member_key_package(&event, pk)?;
+        validate_fetched_member_key_package(&event, pk)?;
 
         Ok((user, event))
     }
 
-    /// Validates and pairs welcome rumors from MLS group creation with their
-    /// target members and key package pubkeys.
-    fn prepare_welcomes(
-        welcome_rumors: Vec<UnsignedEvent>,
-        members: Vec<User>,
-        key_package_events: &[Event],
-    ) -> Result<Vec<(UnsignedEvent, User, PublicKey)>> {
-        if welcome_rumors.len() != members.len() {
+    /// Creates local database records for a newly created group.
+    #[allow(deprecated)]
+    #[perf_instrument("groups")]
+    async fn finalize_group_records(
+        &self,
+        group: &group_types::Group,
+        member_pubkeys: &[PublicKey],
+        group_type: Option<GroupType>,
+        group_name: &str,
+        creator_account: &Account,
+    ) -> Result<()> {
+        let group_info = GroupInformation::create_for_group(
+            self,
+            &group.mls_group_id.clone(),
+            group_type,
+            group_name,
+        )
+        .await?;
+
+        let dm_peer = if group_info.group_type == GroupType::DirectMessage {
+            member_pubkeys.first()
+        } else {
+            None
+        };
+
+        let (account_group, _) = AccountGroup::get_or_create(
+            self,
+            &creator_account.pubkey,
+            &group.mls_group_id,
+            dm_peer,
+        )
+        .await?;
+        account_group.accept(self).await?;
+
+        if let Err(error) = self
+            .share_local_push_token_to_group(creator_account, &group.mls_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::groups",
+                account = %creator_account.pubkey.to_hex(),
+                group = %hex::encode(group.mls_group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after group creation"
+            );
+        }
+
+        Ok(())
+    }
+
+    // NOTE: Unlike the other deprecated wrappers below (all(), get(), archive_chat(), etc.),
+    // this method retains its own implementation rather than delegating to
+    // `AccountSession::groups().create_group()`. The session path calls `Self::wn()` (the
+    // singleton bridge) which panics in unit tests where no global singleton is registered.
+    // Delegating here would break the existing test suite. Remove this copy when Phase 16
+    // eliminates the singleton.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::groups().create_group() instead."
+    )]
+    #[allow(deprecated)]
+    #[perf_instrument("groups")]
+    pub async fn create_group(
+        &self,
+        creator_account: &Account,
+        member_pubkeys: Vec<PublicKey>,
+        config: NostrGroupConfigData,
+        group_type: Option<GroupType>,
+    ) -> Result<group_types::Group> {
+        let signer = self.get_signer_for_account(creator_account)?;
+
+        let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
+        if unique.len() != member_pubkeys.len() {
+            return Err(WhitenoiseError::InvalidInput(
+                "member_pubkeys contains duplicates".to_string(),
+            ));
+        }
+
+        let member_futures = member_pubkeys
+            .iter()
+            .map(|pk| self.resolve_member_key_package(pk));
+        let resolved_members = try_join_all(member_futures).await?;
+        let (members, key_package_events): (Vec<User>, Vec<Event>) =
+            resolved_members.into_iter().unzip();
+
+        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
+        let group_name = config.name.clone();
+
+        let create_group_result =
+            mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
+
+        let group = create_group_result.group;
+
+        if create_group_result.welcome_rumors.len() != members.len() {
             return Err(WhitenoiseError::Internal(
                 "Welcome rumours are missing for some of the members".to_string(),
             ));
         }
 
-        let kp_pubkey_by_event_id: HashMap<EventId, PublicKey> = key_package_events
-            .iter()
-            .map(|event| (event.id, event.pubkey))
-            .collect();
+        let kp_pubkey_by_event_id: std::collections::HashMap<EventId, PublicKey> =
+            key_package_events
+                .iter()
+                .map(|event| (event.id, event.pubkey))
+                .collect();
 
-        let mut members_by_pubkey: HashMap<PublicKey, User> = members
+        let mut members_by_pubkey: std::collections::HashMap<PublicKey, User> = members
             .into_iter()
             .map(|member| (member.pubkey, member))
             .collect();
 
-        welcome_rumors
+        let welcome_data: Vec<(UnsignedEvent, User, PublicKey)> = create_group_result
+            .welcome_rumors
             .into_iter()
             .map(|rumor| {
                 let kp_event_id = rumor.tags.event_ids().next().ok_or_else(|| {
@@ -161,75 +225,25 @@ impl Whitenoise {
                         )))?;
                 Ok((rumor, member, member_pubkey))
             })
-            .collect()
-    }
+            .collect::<Result<_>>()?;
 
-    /// Creates local database records for a newly created group:
-    /// GroupInformation and AccountGroup (auto-accepted for the creator).
-    #[perf_instrument("groups")]
-    async fn finalize_group_records(
-        &self,
-        group: &group_types::Group,
-        member_pubkeys: &[PublicKey],
-        group_type: Option<GroupType>,
-        group_name: &str,
-        creator_account: &Account,
-    ) -> Result<()> {
-        let group_info = GroupInformation::create_for_group(
-            self,
-            &group.mls_group_id.clone(),
+        self.finalize_group_records(
+            &group,
+            &member_pubkeys,
             group_type,
-            group_name,
+            &group_name,
+            creator_account,
         )
         .await?;
 
-        // For DM groups, the peer is the single member we're creating the group with
-        let dm_peer = if group_info.group_type == GroupType::DirectMessage {
-            member_pubkeys.first()
-        } else {
-            None
-        };
-
-        let (account_group, _) = AccountGroup::get_or_create(
-            self,
-            &creator_account.pubkey,
-            &group.mls_group_id,
-            dm_peer,
-        )
-        .await?;
-        account_group.accept(self).await?;
-
-        // Best-effort: share the creator's push token into the new group.
-        #[allow(deprecated)]
-        if let Err(error) = self
-            .share_local_push_token_to_group(creator_account, &group.mls_group_id)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::groups",
-                account = %creator_account.pubkey.to_hex(),
-                group = %hex::encode(group.mls_group_id.as_slice()),
-                error = %error,
-                "Failed to share local push token after group creation"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Delivers welcome messages to group members in a background task.
-    /// Uses `join_all` to attempt all members even if individual publishes fail.
-    fn background_publish_welcomes(
-        welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
-        signer: Arc<dyn NostrSigner>,
-        creator_account: Account,
-    ) {
+        // Background welcome publishing
+        let creator_account_clone = creator_account.clone();
         tokio::spawn(async move {
             let whitenoise = match Whitenoise::get_instance() {
                 Ok(wn) => wn,
                 Err(error) => {
                     tracing::error!(
-                        target: "whitenoise::accounts::groups::create_group",
+                        target: "whitenoise::groups",
                         "Failed to get Whitenoise instance for background welcome publishing: {}",
                         error
                     );
@@ -240,14 +254,14 @@ impl Whitenoise {
             let futures = welcome_data
                 .into_iter()
                 .map(|(rumor, member, member_pubkey)| {
-                    let signer = signer.clone();
-                    let creator = &creator_account;
+                    let signer: Arc<dyn NostrSigner> = signer.clone();
+                    let creator = &creator_account_clone;
                     async move {
                         let relays_to_use = whitenoise
                             .resolve_member_delivery_relays(
                                 &member,
                                 creator,
-                                "whitenoise::accounts::groups::create_group",
+                                "whitenoise::groups::create_group",
                             )
                             .await?;
 
@@ -275,84 +289,14 @@ impl Whitenoise {
             for result in results {
                 if let Err(error) = result {
                     tracing::warn!(
-                        target: "whitenoise::accounts::groups::create_group",
+                        target: "whitenoise::groups",
                         "Background welcome publish failed: {}",
                         error
                     );
                 }
             }
         });
-    }
 
-    /// Creates a new MLS group with the specified members and settings.
-    ///
-    /// Welcome messages are delivered to members in a background task after the
-    /// group is fully committed locally. If welcome delivery fails for a member
-    /// (after 3 relay-level retries with exponential backoff), the failure is
-    /// logged but does not prevent `Ok(group)` from being returned. The affected
-    /// member must be removed and re-invited to recover.
-    ///
-    /// # Arguments
-    /// * `creator_account` - Account of the group creator (must be the active account)
-    /// * `member_pubkeys` - List of public keys for group members
-    /// * `config` - Group configuration data
-    /// * `group_type` - Optional explicit group type. If None, will be inferred from participant count
-    #[perf_instrument("groups")]
-    pub async fn create_group(
-        &self,
-        creator_account: &Account,
-        member_pubkeys: Vec<PublicKey>,
-        config: NostrGroupConfigData,
-        group_type: Option<GroupType>,
-    ) -> Result<group_types::Group> {
-        let signer = self.get_signer_for_account(creator_account)?;
-
-        // Reject duplicate member pubkeys before doing any async work
-        let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
-        if unique.len() != member_pubkeys.len() {
-            return Err(WhitenoiseError::InvalidInput(
-                "member_pubkeys contains duplicates".to_string(),
-            ));
-        }
-
-        // Resolve members and fetch key packages concurrently
-        let member_futures = member_pubkeys
-            .iter()
-            .map(|pk| self.resolve_member_key_package(pk));
-        let resolved_members = try_join_all(member_futures).await?;
-        let (members, key_package_events): (Vec<User>, Vec<Event>) =
-            resolved_members.into_iter().unzip();
-
-        tracing::debug!(
-            target: "whitenoise::accounts::groups::create_group",
-            "Successfully fetched the key packages of members"
-        );
-
-        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
-        let group_name = config.name.clone();
-
-        let _mls_span = perf_span!("groups::mls_create_group");
-        let create_group_result =
-            mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
-        drop(_mls_span);
-
-        let group = create_group_result.group;
-        let welcome_data = Self::prepare_welcomes(
-            create_group_result.welcome_rumors,
-            members,
-            &key_package_events,
-        )?;
-
-        self.finalize_group_records(
-            &group,
-            &member_pubkeys,
-            group_type,
-            &group_name,
-            creator_account,
-        )
-        .await?;
-
-        Self::background_publish_welcomes(welcome_data, signer, creator_account.clone());
         self.background_refresh_account_group_subscriptions(creator_account);
 
         Ok(group)
@@ -512,7 +456,7 @@ impl Whitenoise {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             users.push(user);

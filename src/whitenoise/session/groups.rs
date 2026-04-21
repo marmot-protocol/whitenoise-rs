@@ -1,23 +1,21 @@
 //! Group read and mutation operations scoped to an [`AccountSession`].
 
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::{join_all, try_join_all};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
-use nostr_sdk::{PublicKey, RelayUrl};
 
 use super::AccountSession;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::group_information::GroupInformation;
+use crate::whitenoise::group_information::{GroupInformation, GroupType};
 use crate::whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
-use crate::whitenoise::key_packages::{
-    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
-};
+use crate::whitenoise::key_packages::validate_fetched_member_key_package;
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::User;
 
@@ -291,7 +289,7 @@ impl<'a> GroupOps<'a> {
                 mdk_core::Error::KeyPackage("Does not exist".to_owned()),
             ))?;
 
-            Self::validate_fetched_member_key_package(&event, pk)?;
+            validate_fetched_member_key_package(&event, pk)?;
 
             key_package_events.push(event);
             users.push(user);
@@ -466,23 +464,284 @@ impl<'a> GroupOps<'a> {
         Ok(())
     }
 
-    // ── Static helpers ────────────────────────────────────────────────
+    // ── Group creation ──────────────────────────────────────────────
 
-    fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
-        if event.pubkey != *pk {
-            return Err(WhitenoiseError::InvalidInput(format!(
-                "Fetched key package event {} signed by {} instead of expected {}",
-                event.id, event.pubkey, pk
-            )));
+    /// Creates a new MLS group with the specified members and settings.
+    ///
+    /// Welcome messages are delivered inline after the group is committed locally.
+    /// If welcome delivery fails for a member, the failure is logged but does not
+    /// prevent `Ok(group)` from being returned.
+    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
+    pub async fn create_group(
+        &self,
+        member_pubkeys: Vec<PublicKey>,
+        config: NostrGroupConfigData,
+        group_type: Option<GroupType>,
+    ) -> Result<group_types::Group> {
+        let wn = Self::wn()?;
+        let signer = self
+            .session
+            .get_signer()
+            .ok_or(WhitenoiseError::SignerUnavailable(
+                self.session.account_pubkey,
+            ))?;
+
+        // Reject duplicate member pubkeys before doing any async work
+        let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
+        if unique.len() != member_pubkeys.len() {
+            return Err(WhitenoiseError::InvalidInput(
+                "member_pubkeys contains duplicates".to_string(),
+            ));
         }
 
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
-            WhitenoiseError::InvalidInput(format!(
-                "Incompatible key package event {} for member {}: {}",
-                event.id, pk, e
-            ))
-        })?;
+        // Resolve members and fetch key packages concurrently
+        let member_futures = member_pubkeys
+            .iter()
+            .map(|pk| self.resolve_member_key_package(pk));
+        let resolved_members = try_join_all(member_futures).await?;
+        let (members, key_package_events): (Vec<User>, Vec<Event>) =
+            resolved_members.into_iter().unzip();
+
+        tracing::debug!(
+            target: "whitenoise::session::groups",
+            "Successfully fetched the key packages of members"
+        );
+
+        let group_name = config.name.clone();
+
+        let create_group_result = self.session.mdk.create_group(
+            &self.session.account_pubkey,
+            key_package_events.clone(),
+            config,
+        )?;
+
+        let group = create_group_result.group;
+        let welcome_data = Self::prepare_welcomes(
+            create_group_result.welcome_rumors,
+            members,
+            &key_package_events,
+        )?;
+
+        self.finalize_group_records(&group, &member_pubkeys, group_type, &group_name)
+            .await?;
+
+        Self::publish_welcomes(welcome_data, signer, self.session.account_pubkey).await;
+
+        let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
+        wn.background_refresh_account_group_subscriptions(&account);
+
+        Ok(group)
+    }
+
+    /// Resolves a single member for group creation: finds or creates the user
+    /// record, syncs relay lists for new users, fetches and validates the key
+    /// package.
+    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
+    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+        let wn = Self::wn()?;
+        let (user, created) = User::find_or_create_by_pubkey(pk, &wn.database).await?;
+        if created && let Err(e) = user.update_relay_lists(wn).await {
+            tracing::warn!(
+                target: "whitenoise::session::groups",
+                "Failed to update relay lists for new user {}: {}",
+                user.pubkey,
+                e
+            );
+        }
+
+        let some_event = user.key_package_event(wn).await?;
+        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
+            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
+        ))?;
+
+        validate_fetched_member_key_package(&event, pk)?;
+
+        Ok((user, event))
+    }
+
+    /// Validates and pairs welcome rumors with their target members and key
+    /// package pubkeys.
+    fn prepare_welcomes(
+        welcome_rumors: Vec<UnsignedEvent>,
+        members: Vec<User>,
+        key_package_events: &[Event],
+    ) -> Result<Vec<(UnsignedEvent, User, PublicKey)>> {
+        if welcome_rumors.len() != members.len() {
+            return Err(WhitenoiseError::Internal(
+                "Welcome rumours are missing for some of the members".to_string(),
+            ));
+        }
+
+        let kp_pubkey_by_event_id: HashMap<EventId, PublicKey> = key_package_events
+            .iter()
+            .map(|event| (event.id, event.pubkey))
+            .collect();
+
+        let mut members_by_pubkey: HashMap<PublicKey, User> = members
+            .into_iter()
+            .map(|member| (member.pubkey, member))
+            .collect();
+
+        welcome_rumors
+            .into_iter()
+            .map(|rumor| {
+                let kp_event_id = rumor.tags.event_ids().next().ok_or_else(|| {
+                    WhitenoiseError::Internal("No event ID found in welcome rumor".to_string())
+                })?;
+                let member_pubkey = kp_pubkey_by_event_id.get(kp_event_id).copied().ok_or(
+                    WhitenoiseError::Internal(
+                        "No public key found in key package event".to_string(),
+                    ),
+                )?;
+                let member =
+                    members_by_pubkey
+                        .remove(&member_pubkey)
+                        .ok_or(WhitenoiseError::Internal(format!(
+                            "No member record found for welcome target {}",
+                            member_pubkey
+                        )))?;
+                Ok((rumor, member, member_pubkey))
+            })
+            .collect()
+    }
+
+    /// Creates local database records for a newly created group:
+    /// GroupInformation and AccountGroup (auto-accepted for the creator).
+    // TODO(phase-16): Remove singleton bridge when push ops fully on session.
+    async fn finalize_group_records(
+        &self,
+        group: &group_types::Group,
+        member_pubkeys: &[PublicKey],
+        group_type: Option<GroupType>,
+        group_name: &str,
+    ) -> Result<()> {
+        let group_type = group_type
+            .unwrap_or_else(|| GroupInformation::infer_group_type_from_group_name(group_name));
+
+        // For DM groups, the peer is the single member we're creating the group with
+        let dm_peer = if group_type == GroupType::DirectMessage {
+            member_pubkeys.first()
+        } else {
+            None
+        };
+
+        let (_group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
+            &group.mls_group_id,
+            Some(group_type),
+            &self.session.database,
+        )
+        .await?;
+
+        let (account_group, _) = AccountGroup::find_or_create(
+            &self.session.account_pubkey,
+            &group.mls_group_id,
+            dm_peer,
+            &self.session.database,
+        )
+        .await?;
+        account_group
+            .update_user_confirmation(true, &self.session.database)
+            .await?;
+
+        // Best-effort: share the creator's push token into the new group.
+        if let Err(error) = self
+            .session
+            .push()
+            .share_local_token_to_group(&group.mls_group_id)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::session::groups",
+                account = %self.session.account_pubkey.to_hex(),
+                group = %hex::encode(group.mls_group_id.as_slice()),
+                error = %error,
+                "Failed to share local push token after group creation"
+            );
+        }
 
         Ok(())
+    }
+
+    /// Delivers welcome messages to all group members, attempting every member even if
+    /// individual publishes fail. Errors are logged as warnings rather than propagated —
+    /// missed welcomes are non-fatal; the relay layer retries with exponential backoff.
+    ///
+    /// The caller is responsible for deciding whether to `tokio::spawn` this for
+    /// fire-and-forget behaviour. The view itself does not spawn.
+    // TODO(phase-16): Replace singleton bridge with session-owned relay_control.
+    async fn publish_welcomes(
+        welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
+        signer: Arc<dyn NostrSigner>,
+        creator_pubkey: PublicKey,
+    ) {
+        let whitenoise = match Whitenoise::get_instance() {
+            Ok(wn) => wn,
+            Err(error) => {
+                tracing::error!(
+                    target: "whitenoise::session::groups",
+                    "Failed to get Whitenoise instance for welcome publishing: {}",
+                    error
+                );
+                return;
+            }
+        };
+
+        let creator_account =
+            match Account::find_by_pubkey(&creator_pubkey, &whitenoise.database).await {
+                Ok(account) => account,
+                Err(error) => {
+                    tracing::error!(
+                        target: "whitenoise::session::groups",
+                        "Failed to find creator account for welcome publishing: {}",
+                        error
+                    );
+                    return;
+                }
+            };
+
+        let futures = welcome_data
+            .into_iter()
+            .map(|(rumor, member, member_pubkey)| {
+                let signer = signer.clone();
+                let creator = &creator_account;
+                async move {
+                    let relays_to_use = whitenoise
+                        .resolve_member_delivery_relays(
+                            &member,
+                            creator,
+                            "whitenoise::session::groups::create_group",
+                        )
+                        .await?;
+
+                    let one_month_future =
+                        Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
+
+                    whitenoise
+                        .relay_control
+                        .publish_welcome(
+                            &member_pubkey,
+                            rumor,
+                            &[Tag::expiration(one_month_future)],
+                            creator.pubkey,
+                            &Relay::urls(&relays_to_use),
+                            signer,
+                        )
+                        .await
+                        .map_err(WhitenoiseError::from)?;
+
+                    Ok::<(), WhitenoiseError>(())
+                }
+            });
+
+        let results = join_all(futures).await;
+        for result in results {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "whitenoise::session::groups",
+                    "Welcome publish failed: {}",
+                    error
+                );
+            }
+        }
     }
 }

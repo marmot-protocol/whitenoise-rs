@@ -122,6 +122,29 @@ pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
         .collect()
 }
 
+/// Validates that a fetched key package event is signed by the expected public key and
+/// has the required Marmot compatibility tags.
+///
+/// Called after fetching a key package from a relay to reject tampered or incompatible
+/// events before passing them into MDK.
+pub(crate) fn validate_fetched_member_key_package(event: &Event, pk: &PublicKey) -> Result<()> {
+    if event.pubkey != *pk {
+        return Err(WhitenoiseError::InvalidInput(format!(
+            "Fetched key package event {} signed by {} instead of expected {}",
+            event.id, event.pubkey, pk
+        )));
+    }
+
+    validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
+        WhitenoiseError::InvalidInput(format!(
+            "Incompatible key package event {} for member {}: {}",
+            event.id, pk, e
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Filters relay responses to key package events that match the expected kind and author.
 ///
 /// Returns `(valid_events, dropped_wrong_kind, dropped_wrong_author)`.

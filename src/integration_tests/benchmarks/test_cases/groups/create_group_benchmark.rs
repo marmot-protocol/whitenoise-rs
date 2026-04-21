@@ -34,6 +34,7 @@ impl CreateGroupBenchmark {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl BenchmarkTestCase for CreateGroupBenchmark {
     async fn run_iteration(
         &self,

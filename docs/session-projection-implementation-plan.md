@@ -302,7 +302,7 @@ Create only the repos needed for group membership reads. Leave mutation-heavy pa
 
 ### Phase 10: Migrate `create_group` and welcome delivery helpers (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #769
 
 <details>
 <summary>Details</summary>

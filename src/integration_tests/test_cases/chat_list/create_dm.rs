@@ -27,6 +27,7 @@ impl CreateDmTestCase {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl TestCase for CreateDmTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
