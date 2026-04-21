@@ -589,4 +589,52 @@ mod tests {
             "Error should describe missing p tag, got: {err_msg}"
         );
     }
+
+    /// When the session is removed (account logged out) between event receipt
+    /// and processing, the event is silently discarded and not tracked.
+    #[tokio::test]
+    async fn test_process_account_event_discards_when_session_missing() {
+        let (whitenoise, _d, _l) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&account.pubkey)
+            .unwrap();
+
+        // Build a contact-list event for this account
+        let event = EventBuilder::new(Kind::ContactList, "")
+            .sign(&keys)
+            .await
+            .unwrap();
+
+        // Remove the session to simulate logout
+        whitenoise.account_manager.remove_session(&account.pubkey);
+        assert!(whitenoise.session(&account.pubkey).is_none());
+
+        // Process the event; it should be silently discarded
+        let relay_url = RelayUrl::parse("ws://localhost:8080/").unwrap();
+        whitenoise
+            .process_account_event(
+                event.clone(),
+                EventSource::RelaySubscription(SubscriptionContext {
+                    plane: RelayPlane::Discovery,
+                    account_pubkey: Some(account.pubkey),
+                    relay_url,
+                    stream: SubscriptionStream::DiscoveryFollowLists,
+                    group_ids: Vec::new(),
+                }),
+                Default::default(),
+            )
+            .await;
+
+        // Event must NOT be tracked as processed
+        assert!(
+            !whitenoise
+                .event_tracker
+                .already_processed_account_event(&event.id, &account.pubkey)
+                .await
+                .unwrap(),
+            "Event should not be tracked when session is missing"
+        );
+    }
 }

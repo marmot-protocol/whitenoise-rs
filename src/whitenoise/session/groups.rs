@@ -187,7 +187,7 @@ impl<'a> GroupOps<'a> {
     }
 
     /// Return the relay URLs configured for the group, or error if none.
-    fn ensure_relays(&self, group_id: &GroupId) -> Result<Vec<RelayUrl>> {
+    pub(crate) fn ensure_relays(&self, group_id: &GroupId) -> Result<Vec<RelayUrl>> {
         let relays = self
             .session
             .mdk

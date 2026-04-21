@@ -32,6 +32,10 @@ impl Whitenoise {
             account.pubkey.to_hex()
         );
 
+        // Fail fast if the signer is unavailable (external-signer account
+        // that hasn't re-registered after restart). The event stays
+        // unprocessed and relay replay will deliver it again once the
+        // signer slot is filled via register_external_signer().
         let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
         let signer = session
             .get_signer()

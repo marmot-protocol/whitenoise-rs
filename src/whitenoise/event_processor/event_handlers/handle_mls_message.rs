@@ -286,7 +286,7 @@ impl Whitenoise {
         match result {
             MessageProcessingResult::ApplicationMessage(_) => Ok(()),
             MessageProcessingResult::Proposal(update_result) => {
-                self.handle_auto_committed_proposal(session, account, mdk, update_result)
+                self.handle_auto_committed_proposal(session, account, update_result)
                     .await
             }
             MessageProcessingResult::PendingProposal { mls_group_id } => {
@@ -350,14 +350,13 @@ impl Whitenoise {
         &self,
         session: &Arc<AccountSession>,
         account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         update_result: mdk_core::prelude::UpdateGroupResult,
     ) -> Result<()> {
         let group_id = &update_result.mls_group_id;
-        let relay_urls = Self::ensure_group_relays(mdk, group_id)?;
+        let groups = session.groups();
+        let relay_urls = groups.ensure_relays(group_id)?;
 
-        session
-            .groups()
+        groups
             .publish_and_merge_commit(update_result.evolution_event.clone(), group_id, &relay_urls)
             .await?;
 
@@ -412,13 +411,11 @@ impl Whitenoise {
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
             );
-            drop(
-                session
-                    .membership()
-                    .for_group(mls_group_id)
-                    .mark_as_removed()
-                    .await?,
-            );
+            let _ = session
+                .membership()
+                .for_group(mls_group_id)
+                .mark_as_removed()
+                .await?;
         }
 
         if still_active
