@@ -1110,6 +1110,7 @@ pub mod test_utils {
         )
     }
 
+    #[allow(deprecated)]
     pub(crate) async fn setup_multiple_test_accounts(
         whitenoise: &Whitenoise,
         count: usize,

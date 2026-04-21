@@ -1,4 +1,6 @@
+mod chat_list;
 mod groups;
+mod key_packages;
 pub(crate) mod messages;
 pub(crate) mod push;
 pub(crate) mod relay_handles;
@@ -8,8 +10,10 @@ mod membership;
 mod settings;
 mod social;
 
+pub use self::chat_list::ChatListOps;
 pub use self::drafts::DraftOps;
 pub use self::groups::GroupOps;
+pub use self::key_packages::KeyPackageOps;
 pub use self::membership::{MembershipOps, MembershipOpsForGroup};
 pub use self::push::PushOps;
 pub use self::settings::SettingsOps;
@@ -212,6 +216,16 @@ impl AccountSession {
     /// Return a view for group read operations scoped to this session.
     pub fn groups(&self) -> GroupOps<'_> {
         GroupOps::new(self)
+    }
+
+    /// Return a view for key package lifecycle operations scoped to this session.
+    pub fn key_packages(&self) -> KeyPackageOps<'_> {
+        KeyPackageOps::new(self)
+    }
+
+    /// Return a view for chat list read operations scoped to this session.
+    pub fn chat_list(&self) -> ChatListOps<'_> {
+        ChatListOps::new(self)
     }
 
     /// Return a view for push notification operations scoped to this session.

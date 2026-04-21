@@ -109,7 +109,6 @@ impl AccountEphemeralHandle {
             .await?)
     }
 
-    #[expect(dead_code, reason = "phase 14")]
     pub(crate) async fn publish_key_package(
         &self,
         encoded_key_package: &str,
@@ -123,7 +122,6 @@ impl AccountEphemeralHandle {
             .await?)
     }
 
-    #[expect(dead_code, reason = "phase 7+")]
     pub(crate) async fn publish_event_deletion(
         &self,
         event_ids: &[EventId],
@@ -146,6 +144,19 @@ impl AccountEphemeralHandle {
                 .publish_batch_event_deletion_with_signer(event_ids, relays, signer)
                 .await?)
         }
+    }
+
+    /// Fetch all key package events for this account from the given relays.
+    pub(crate) async fn fetch_key_packages_from_relays(
+        &self,
+        relays: &[RelayUrl],
+    ) -> Result<Vec<Event>> {
+        let filter = Filter::new()
+            .kind(Kind::MlsKeyPackage)
+            .author(self.account_pubkey);
+
+        let fetched = self.ephemeral.fetch_events_from(relays, filter).await?;
+        Ok(fetched.into_iter().collect())
     }
 
     // ── Publish helpers (event already signed) ──────────────────────

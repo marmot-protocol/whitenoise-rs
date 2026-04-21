@@ -193,6 +193,7 @@ impl Whitenoise {
     /// - Subscription is established BEFORE fetching to capture concurrent updates
     /// - Any updates that arrived during fetch are merged into `initial_items`
     /// - The receiver only yields updates AFTER the initial snapshot
+    #[allow(deprecated)]
     #[perf_instrument("whitenoise")]
     pub async fn subscribe_to_chat_list(
         &self,
@@ -246,6 +247,7 @@ impl Whitenoise {
     ///
     /// Same race-condition-free design as `subscribe_to_chat_list`, but uses
     /// `get_archived_chat_list` and the archived stream manager.
+    #[allow(deprecated)]
     #[perf_instrument("whitenoise")]
     pub async fn subscribe_to_archived_chat_list(
         &self,

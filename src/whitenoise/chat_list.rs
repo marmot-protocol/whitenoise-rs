@@ -17,7 +17,6 @@ use crate::whitenoise::{
     chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger},
     error::Result,
     group_information::{GroupInformation, GroupType},
-    groups::GroupWithMembership,
     message_aggregator::ChatMessageSummary,
     users::User,
 };
@@ -118,7 +117,7 @@ impl ChatListItem {
 ///
 /// Fallback chain: display_name -> name -> None
 /// Does not fall back to truncated pubkey.
-fn resolve_display_name(user: Option<&User>) -> Option<String> {
+pub(crate) fn resolve_display_name(user: Option<&User>) -> Option<String> {
     user.and_then(|u| {
         u.metadata
             .display_name
@@ -133,7 +132,7 @@ fn resolve_display_name(user: Option<&User>) -> Option<String> {
 ///
 /// - Groups: Returns the group name from MDK (may be empty string)
 /// - DMs: Returns the other user's display name (None if no metadata)
-fn resolve_chat_name(
+pub(crate) fn resolve_chat_name(
     group: &group_types::Group,
     group_type: &GroupType,
     dm_other_user: Option<&User>,
@@ -144,16 +143,8 @@ fn resolve_chat_name(
     }
 }
 
-/// Finds the "other user" in a DM group (the participant who isn't the account owner).
-fn get_dm_other_user(group_members: &[PublicKey], account_pubkey: &PublicKey) -> Option<PublicKey> {
-    group_members
-        .iter()
-        .find(|pk| *pk != account_pubkey)
-        .copied()
-}
-
 /// Collects all pubkeys that need metadata lookup (DM participants + message authors).
-fn collect_pubkeys_to_fetch(
+pub(crate) fn collect_pubkeys_to_fetch(
     dm_other_users: &HashMap<GroupId, PublicKey>,
     last_message_map: &HashMap<GroupId, ChatMessageSummary>,
 ) -> Vec<PublicKey> {
@@ -167,7 +158,7 @@ fn collect_pubkeys_to_fetch(
 }
 
 /// Assembles ChatListItems from all the collected data.
-fn assemble_chat_list_items(
+pub(crate) fn assemble_chat_list_items(
     groups: &[group_types::Group],
     group_info_map: &HashMap<GroupId, GroupInformation>,
     dm_other_users: &HashMap<GroupId, PublicKey>,
@@ -247,162 +238,97 @@ pub(crate) fn sort_chat_list(items: &mut [ChatListItem]) {
     items.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 }
 
+#[allow(deprecated)]
 impl Whitenoise {
-    /// Retrieves the active (non-archived) chat list for an account.
-    ///
-    /// Returns a list of chat summaries sorted by last activity (most recent first).
-    /// Declined and archived groups are filtered out.
-    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().active() instead."
+    )]
     #[perf_instrument("chat_list")]
     pub async fn get_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        let visible = self.visible_groups(account).await?;
-        let active: Vec<_> = visible
-            .into_iter()
-            .filter(|gwm| !gwm.membership.is_archived())
-            .collect();
-        self.build_chat_list_for(account, active).await
+        self.require_session(&account.pubkey)?
+            .chat_list()
+            .active()
+            .await
     }
 
-    /// Retrieves the archived chat list for an account.
-    ///
-    /// Returns only archived chats, sorted by last activity.
-    #[allow(deprecated)]
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().archived() instead."
+    )]
     #[perf_instrument("chat_list")]
     pub async fn get_archived_chat_list(&self, account: &Account) -> Result<Vec<ChatListItem>> {
-        let visible = self.visible_groups(account).await?;
-        let archived: Vec<_> = visible
-            .into_iter()
-            .filter(|gwm| gwm.membership.is_archived())
-            .collect();
-        self.build_chat_list_for(account, archived).await
-    }
-
-    /// Builds a sorted chat list from a pre-filtered set of groups.
-    ///
-    /// Handles the expensive batch pipeline: group info, messages, users, images,
-    /// unread counts, assembly, and sorting.
-    #[perf_instrument("chat_list")]
-    async fn build_chat_list_for(
-        &self,
-        account: &Account,
-        groups_with_membership: Vec<GroupWithMembership>,
-    ) -> Result<Vec<ChatListItem>> {
-        if groups_with_membership.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let groups: Vec<_> = groups_with_membership
-            .iter()
-            .map(|gwm| gwm.group.clone())
-            .collect();
-        let group_ids: Vec<GroupId> = groups.iter().map(|g| g.mls_group_id.clone()).collect();
-
-        let membership_map: HashMap<GroupId, AccountGroup> = groups_with_membership
-            .iter()
-            .map(|gwm| (gwm.group.mls_group_id.clone(), gwm.membership.clone()))
-            .collect();
-
-        let group_info_map = self
-            .build_group_info_map(account.pubkey, &group_ids)
-            .await?;
-        let dm_other_users = self.identify_dm_participants(account).await?;
-        let last_message_map = self.build_last_message_map(&group_ids).await?;
-        let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
-        let users_by_pubkey = self.build_users_by_pubkey(&pubkeys_to_fetch).await?;
-        let image_paths = self
-            .resolve_group_images(account, &groups, &group_info_map)
-            .await;
-
-        let group_markers: Vec<_> = membership_map
-            .iter()
-            .map(|(gid, ag)| {
-                let cleared_ms = ag.chat_cleared_at.map(|dt| dt.timestamp_millis());
-                (gid.clone(), ag.last_read_message_id, cleared_ms)
-            })
-            .collect();
-        let unread_counts =
-            AggregatedMessage::count_unread_for_groups(&group_markers, &self.database).await?;
-
-        let mut items = assemble_chat_list_items(
-            &groups,
-            &group_info_map,
-            &dm_other_users,
-            &last_message_map,
-            &users_by_pubkey,
-            &image_paths,
-            &membership_map,
-            &unread_counts,
-        );
-        sort_chat_list(&mut items);
-
-        Ok(items)
+        self.require_session(&account.pubkey)?
+            .chat_list()
+            .archived()
+            .await
     }
 
     /// Builds a single ChatListItem for a specific group.
     ///
-    /// Used by the streaming system to construct updates without re-fetching the entire chat list.
-    /// Performs individual queries rather than batch operations.
+    /// Called from the emit path which runs inside `tokio::spawn`. Cannot
+    /// delegate to session ops without hitting the compiler recursion limit
+    /// (the extra async indirection pushes h2/hyper trait evaluation past 128).
     ///
-    /// Returns `Ok(None)` if:
-    /// - Group doesn't exist in MDK
-    /// - GroupInformation doesn't exist (group not fully initialized)
-    /// - AccountGroup is declined
+    /// NOTE: This implementation resolves DM peers via MDK group membership,
+    /// while `ChatListOps::build_item` uses `AccountGroup::find_dm_peers_for_account`
+    /// (batch SQL). The two paths can diverge in edge cases where MDK membership
+    /// and the DB are transiently inconsistent. Tracked for removal in phase 15
+    /// (session-scoped event dispatch) when emit paths use session directly.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::chat_list().build_item() instead."
+    )]
     #[perf_instrument("chat_list")]
     pub(crate) async fn build_chat_list_item(
         &self,
         account: &Account,
         group_id: &GroupId,
     ) -> Result<Option<ChatListItem>> {
-        // 1. Get group from MDK
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let Some(group) = mdk.get_group(group_id)? else {
             return Ok(None);
         };
 
-        // 2. Get GroupInformation (returns error if not found)
         let group_info =
             match GroupInformation::find_by_mls_group_id(group_id, &self.database).await {
                 Ok(info) => info,
-                Err(_) => return Ok(None), // Group not fully initialized
+                Err(_) => return Ok(None),
             };
 
-        // 3. Get AccountGroup for visibility/pending status and welcomer pubkey
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id).await?;
+        let account_group =
+            AccountGroup::find_by_account_and_group(&account.pubkey, group_id, &self.database)
+                .await?;
         let Some(account_group) = account_group else {
-            return Ok(None); // No AccountGroup record
+            return Ok(None);
         };
         if !account_group.is_visible() {
-            return Ok(None); // Declined
+            return Ok(None);
         }
-        let pending_confirmation = account_group.is_pending();
-        let welcomer_pubkey = account_group.welcomer_pubkey;
 
-        // 4. For DMs: get members, find other user, lookup metadata
         let (dm_peer_pubkey, dm_other_user) = if group_info.group_type == GroupType::DirectMessage {
             let members: Vec<PublicKey> = mdk.get_members(group_id)?.into_iter().collect();
-            if let Some(other_pk) = get_dm_other_user(&members, &account.pubkey) {
-                let user = User::find_by_pubkey(&other_pk, &self.database).await.ok();
-                (Some(other_pk), user)
-            } else {
-                (None, None)
+            let other_pk = members.iter().find(|pk| *pk != &account.pubkey).copied();
+            match other_pk {
+                Some(pk) => {
+                    let user = User::find_by_pubkey(&pk, &self.database).await.ok();
+                    (Some(pk), user)
+                }
+                None => (None, None),
             }
         } else {
             (None, None)
         };
 
-        // 5. Get last message
-        let last_message_summaries = AggregatedMessage::find_last_by_group_ids(
+        let last_message_summary = AggregatedMessage::find_last_by_group_ids(
             std::slice::from_ref(group_id),
             &self.database,
         )
-        .await?;
-        let last_message_summary = last_message_summaries.into_iter().next();
+        .await?
+        .into_iter()
+        .next()
+        .filter(|s| account_group.is_message_visible(s.created_at));
 
-        // 6. Lookup message author metadata and build final last_message.
-        //    Filter out messages at or before chat_cleared_at so the chat list
-        //    preview does not show a message the user explicitly cleared.
-        let last_message_summary = last_message_summary
-            .filter(|summary| account_group.is_message_visible(summary.created_at));
         let last_message = if let Some(mut summary) = last_message_summary {
             let author_user = User::find_by_pubkey(&summary.author, &self.database)
                 .await
@@ -413,9 +339,7 @@ impl Whitenoise {
             None
         };
 
-        // 7. Resolve name and image based on group type
         let name = resolve_chat_name(&group, &group_info.group_type, dm_other_user.as_ref());
-
         let (group_image_path, group_image_url) = match group_info.group_type {
             GroupType::Group => {
                 let path = self
@@ -433,7 +357,6 @@ impl Whitenoise {
             }
         };
 
-        // 8. Compute unread count
         let cleared_ms = account_group
             .chat_cleared_at
             .map(|dt| dt.timestamp_millis());
@@ -445,14 +368,6 @@ impl Whitenoise {
         )
         .await?;
 
-        // 9. Get pin order, archived_at, removed_at, self_removed, and muted_until
-        let pin_order = account_group.pin_order;
-        let archived_at = account_group.archived_at;
-        let removed_at = account_group.removed_at;
-        let self_removed = account_group.self_removed;
-        let muted_until = account_group.muted_until;
-
-        // 10. Assemble and return ChatListItem
         Ok(Some(ChatListItem {
             mls_group_id: group_id.clone(),
             name,
@@ -461,15 +376,15 @@ impl Whitenoise {
             group_image_path,
             group_image_url,
             last_message,
-            pending_confirmation,
-            welcomer_pubkey,
+            pending_confirmation: account_group.is_pending(),
+            welcomer_pubkey: account_group.welcomer_pubkey,
             unread_count,
-            pin_order,
+            pin_order: account_group.pin_order,
             dm_peer_pubkey,
-            archived_at,
-            removed_at,
-            self_removed,
-            muted_until,
+            archived_at: account_group.archived_at,
+            removed_at: account_group.removed_at,
+            self_removed: account_group.self_removed,
+            muted_until: account_group.muted_until,
         }))
     }
 
@@ -630,77 +545,6 @@ impl Whitenoise {
         }
     }
 
-    #[perf_instrument("chat_list")]
-    async fn build_group_info_map(
-        &self,
-        account_pubkey: PublicKey,
-        group_ids: &[GroupId],
-    ) -> Result<HashMap<GroupId, GroupInformation>> {
-        let group_infos =
-            GroupInformation::get_by_mls_group_ids(account_pubkey, group_ids, self).await?;
-        Ok(group_infos
-            .into_iter()
-            .map(|gi| (gi.mls_group_id.clone(), gi))
-            .collect())
-    }
-
-    /// Identifies the "other user" in each DM group using the persisted
-    /// `dm_peer_pubkey` column, avoiding per-group MDK membership lookups.
-    #[perf_instrument("chat_list")]
-    async fn identify_dm_participants(
-        &self,
-        account: &Account,
-    ) -> Result<HashMap<GroupId, PublicKey>> {
-        let pairs =
-            AccountGroup::find_dm_peers_for_account(&account.pubkey, &self.database).await?;
-        Ok(pairs.into_iter().collect())
-    }
-
-    #[perf_instrument("chat_list")]
-    async fn build_last_message_map(
-        &self,
-        group_ids: &[GroupId],
-    ) -> Result<HashMap<GroupId, ChatMessageSummary>> {
-        let summaries =
-            AggregatedMessage::find_last_by_group_ids(group_ids, &self.database).await?;
-        Ok(summaries
-            .into_iter()
-            .map(|s| (s.mls_group_id.clone(), s))
-            .collect())
-    }
-
-    #[perf_instrument("chat_list")]
-    async fn build_users_by_pubkey(
-        &self,
-        pubkeys: &[PublicKey],
-    ) -> Result<HashMap<PublicKey, User>> {
-        let users = User::find_by_pubkeys(pubkeys, &self.database).await?;
-        Ok(users.into_iter().map(|u| (u.pubkey, u)).collect())
-    }
-
-    /// Resolves image paths for Group-type chats only (DMs use profile picture URLs).
-    #[perf_instrument("chat_list")]
-    async fn resolve_group_images(
-        &self,
-        account: &Account,
-        groups: &[group_types::Group],
-        group_info_map: &HashMap<GroupId, GroupInformation>,
-    ) -> HashMap<GroupId, PathBuf> {
-        let group_type_groups: Vec<_> = groups
-            .iter()
-            .filter(|g| {
-                group_info_map
-                    .get(&g.mls_group_id)
-                    .map(|info| info.group_type == GroupType::Group)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        self.resolve_group_image_paths(account, &group_type_groups)
-            .await
-    }
-
     /// Resolves image paths for multiple groups in parallel.
     ///
     /// Directly uses the groups already fetched from MDK, avoiding
@@ -709,7 +553,7 @@ impl Whitenoise {
     /// Groups without images return None (not an error).
     /// Download failures are logged but don't fail the batch.
     #[perf_instrument("chat_list")]
-    async fn resolve_group_image_paths(
+    pub(crate) async fn resolve_group_image_paths(
         &self,
         account: &Account,
         groups: &[group_types::Group],
