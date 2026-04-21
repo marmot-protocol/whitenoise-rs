@@ -468,10 +468,9 @@ impl<'a> GroupOps<'a> {
 
     /// Creates a new MLS group with the specified members and settings.
     ///
-    /// Welcome messages are delivered to members in a background task after the
-    /// group is fully committed locally. If welcome delivery fails for a member
-    /// (after relay-level retries), the failure is logged but does not prevent
-    /// `Ok(group)` from being returned.
+    /// Welcome messages are delivered inline after the group is committed locally.
+    /// If welcome delivery fails for a member, the failure is logged but does not
+    /// prevent `Ok(group)` from being returned.
     // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     pub async fn create_group(
         &self,
