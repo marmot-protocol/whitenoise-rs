@@ -237,6 +237,9 @@ impl Whitenoise {
     )]
     #[perf_instrument("media")]
     pub async fn get_media_files_for_group(&self, group_id: &GroupId) -> Result<Vec<MediaFile>> {
+        // NOTE: Cannot delegate through session.groups().media() — this wrapper has no `account`
+        // parameter and therefore no session to look up. Both paths query the same DB table;
+        // this divergence is harmless until the method signature is updated in phase 15+.
         MediaFile::find_by_group(&self.database, group_id).await
     }
 

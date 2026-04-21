@@ -64,6 +64,7 @@ static BLOSSOM_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         let url = attempt.url();
         let allowed = match url.scheme() {
             "https" => true,
+            // TODO(phase-16): Move is_debug_local_blossom_url to a free fn to remove Whitenoise coupling.
             "http" if Whitenoise::is_debug_local_blossom_url(url) => true,
             _ => false,
         };
@@ -870,6 +871,7 @@ impl<'a> MediaOps<'a> {
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
         // Enforce HTTPS before making any network contact.
+        // TODO(phase-16): Move require_https to a free fn to remove Whitenoise coupling.
         Whitenoise::require_https(blossom_url)?;
 
         // Build the Blossom download URL: <base>/<hex-hash>
@@ -938,6 +940,7 @@ impl<'a> MediaOps<'a> {
         mime_type: &str,
         upload_keypair: &Keys,
     ) -> Result<nostr_blossom::bud02::BlobDescriptor> {
+        // TODO(phase-16): Move require_https to a free fn to remove Whitenoise coupling.
         Whitenoise::require_https(blossom_server_url)?;
 
         let sha256 = Sha256Hash::hash(&encrypted_data);
@@ -983,6 +986,7 @@ impl<'a> MediaOps<'a> {
             .await
             .map_err(|_| BlossomError::Timeout(Self::BLOSSOM_TIMEOUT))??;
 
+        // TODO(phase-16): Move require_https to a free fn to remove Whitenoise coupling.
         Whitenoise::require_https(&descriptor.url)?;
 
         Ok(descriptor)
