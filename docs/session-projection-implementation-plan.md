@@ -387,7 +387,7 @@ tables.
 
 ### Phase 14: Migrate key packages and chat list reads (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #768
 
 <details>
 <summary>Details</summary>
