@@ -151,7 +151,7 @@ pub struct Whitenoise {
     content_parser: crate::nostr_manager::parser::ContentParser,
     relay_control: Arc<RelayControlPlane>,
     secrets_store: SecretsStore,
-    pub(crate) storage: storage::Storage,
+    storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
     message_stream_manager: Arc<message_streaming::MessageStreamManager>,
     user_stream_manager: user_streaming::UserStreamManager,

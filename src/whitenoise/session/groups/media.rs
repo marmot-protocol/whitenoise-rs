@@ -166,7 +166,6 @@ impl<'a> MediaOps<'a> {
         // Download and cache the image
         self.download_and_cache_group_image(
             blossom_url,
-            &self.session.account_pubkey,
             group_id,
             &image_hash,
             &image_key,
@@ -479,7 +478,6 @@ impl<'a> MediaOps<'a> {
         let media_file = self
             .download_and_cache_group_image(
                 blossom_url,
-                &self.session.account_pubkey,
                 &group.mls_group_id,
                 image_hash,
                 image_key.as_ref(),
@@ -497,7 +495,6 @@ impl<'a> MediaOps<'a> {
     async fn download_and_cache_group_image(
         &self,
         blossom_url: Option<Url>,
-        account_pubkey: &PublicKey,
         group_id: &GroupId,
         image_hash: &[u8; 32],
         image_key: &[u8; 32],
@@ -507,13 +504,7 @@ impl<'a> MediaOps<'a> {
 
         if let Some(cached_path) = self.check_cached_image(&hash_hex).await? {
             let media_file = self
-                .link_cached_image_to_group(
-                    account_pubkey,
-                    group_id,
-                    &cached_path,
-                    image_hash,
-                    image_key,
-                )
+                .link_cached_image_to_group(group_id, &cached_path, image_hash, image_key)
                 .await?;
             return Ok(media_file);
         }
@@ -551,7 +542,6 @@ impl<'a> MediaOps<'a> {
 
         let media_file = self
             .store_and_record_group_image(
-                account_pubkey,
                 group_id,
                 &decrypted_data,
                 image_hash,
@@ -589,7 +579,6 @@ impl<'a> MediaOps<'a> {
 
     async fn link_cached_image_to_group(
         &self,
-        account_pubkey: &PublicKey,
         group_id: &GroupId,
         cached_path: &Path,
         image_hash: &[u8; 32],
@@ -601,7 +590,6 @@ impl<'a> MediaOps<'a> {
         match existing_record_opt {
             Some(existing_record) => {
                 self.link_cached_image_from_existing_record(
-                    account_pubkey,
                     group_id,
                     cached_path,
                     image_hash,
@@ -610,21 +598,14 @@ impl<'a> MediaOps<'a> {
                 .await
             }
             None => {
-                self.link_cached_image_with_detection(
-                    account_pubkey,
-                    group_id,
-                    cached_path,
-                    image_hash,
-                    image_key,
-                )
-                .await
+                self.link_cached_image_with_detection(group_id, cached_path, image_hash, image_key)
+                    .await
             }
         }
     }
 
     async fn link_cached_image_from_existing_record(
         &self,
-        account_pubkey: &PublicKey,
         group_id: &GroupId,
         cached_path: &Path,
         image_hash: &[u8; 32],
@@ -651,13 +632,12 @@ impl<'a> MediaOps<'a> {
         // TODO(phase-16): Remove singleton bridge when storage moves to session.
         let wn = Self::wn()?;
         wn.media_files()
-            .record_in_database(account_pubkey, group_id, cached_path, upload)
+            .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
             .await
     }
 
     async fn link_cached_image_with_detection(
         &self,
-        account_pubkey: &PublicKey,
         group_id: &GroupId,
         cached_path: &Path,
         image_hash: &[u8; 32],
@@ -704,13 +684,12 @@ impl<'a> MediaOps<'a> {
         // TODO(phase-16): Remove singleton bridge when storage moves to session.
         let wn = Self::wn()?;
         wn.media_files()
-            .record_in_database(account_pubkey, group_id, cached_path, upload)
+            .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
             .await
     }
 
     async fn store_and_record_group_image(
         &self,
-        account_pubkey: &PublicKey,
         group_id: &GroupId,
         decrypted_data: &[u8],
         image_hash: &[u8; 32],
@@ -745,7 +724,7 @@ impl<'a> MediaOps<'a> {
         // TODO(phase-16): Remove singleton bridge when storage moves to session.
         let wn = Self::wn()?;
         wn.media_files()
-            .store_and_record(account_pubkey, group_id, &filename, upload)
+            .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
             .await
     }
 
