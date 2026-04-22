@@ -38,7 +38,6 @@ use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::message_aggregator::AggregatorConfig;
 
 /// Signer slot shared between `AccountSession` and its relay handles.
 ///
@@ -75,7 +74,6 @@ pub struct AccountSession {
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
     pub(crate) shared: Arc<crate::whitenoise::shared::SharedServices>,
     pub(crate) repos: AccountRepositories,
-    pub(crate) aggregator_config: AggregatorConfig,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -94,7 +92,6 @@ impl AccountSession {
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         shared: Arc<crate::whitenoise::shared::SharedServices>,
-        aggregator_config: AggregatorConfig,
         signer: Option<Arc<dyn NostrSigner>>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
@@ -112,7 +109,6 @@ impl AccountSession {
             mdk: Arc::new(mdk),
             shared,
             repos,
-            aggregator_config,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
@@ -133,14 +129,7 @@ impl AccountSession {
         } else {
             None
         };
-        Self::new(
-            account.pubkey,
-            mdk,
-            wn.shared.clone(),
-            wn.shared.message_aggregator.config().clone(),
-            signer,
-        )
-        .await
+        Self::new(account.pubkey, mdk, wn.shared.clone(), signer).await
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -604,7 +593,7 @@ pub(crate) mod test_helpers {
 
         let shared = test_shared(db).await;
         Arc::new(
-            AccountSession::new(pubkey, mdk, shared, AggregatorConfig::default(), None)
+            AccountSession::new(pubkey, mdk, shared, None)
                 .await
                 .expect("create test session"),
         )

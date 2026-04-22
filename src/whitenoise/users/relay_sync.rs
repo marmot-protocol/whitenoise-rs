@@ -336,18 +336,18 @@ impl User {
         relay_type: RelayType,
         query_relay_urls: &[RelayUrl],
     ) -> Result<Vec<Relay>> {
-        let existing_relays = self.relays(relay_type, &context.database).await?;
+        let existing_relays = self.relays(relay_type, &context.shared.database).await?;
         if query_relay_urls.is_empty() {
             return Ok(existing_relays);
         }
 
         let query_relays: Vec<Relay> = query_relay_urls.iter().map(Relay::new).collect();
-        let scope = context.relay_control.ephemeral().anonymous_scope();
+        let scope = context.shared.relay_control.ephemeral().anonymous_scope();
         let _changed = self
             .sync_relays_for_type_with_context(context, &scope, relay_type, &query_relays)
             .await?;
 
-        self.relays(relay_type, &context.database).await
+        self.relays(relay_type, &context.shared.database).await
     }
 
     /// Synchronizes relays for a specific type with the network state.
@@ -444,7 +444,7 @@ impl User {
                     crate::nostr_manager::utils::relay_urls_from_event(&event);
                 let changed = self
                     .sync_relay_urls_with_database(
-                        &context.database,
+                        &context.shared.database,
                         relay_type,
                         &relay_hashset,
                         Some(timestamp_to_datetime(event.created_at)?),
@@ -453,6 +453,7 @@ impl User {
 
                 if changed {
                     context
+                        .shared
                         .event_tracker
                         .track_processed_global_event(&event)
                         .await?;
@@ -493,7 +494,8 @@ impl UserRelaySyncContext {
         relay_type: RelayType,
         query_relay_urls: &[RelayUrl],
     ) -> Result<Vec<Relay>> {
-        let (user, _created) = User::find_or_create_by_pubkey(&pubkey, &self.database).await?;
+        let (user, _created) =
+            User::find_or_create_by_pubkey(&pubkey, &self.shared.database).await?;
         user.sync_relay_type_from_query_urls(self, relay_type, query_relay_urls)
             .await
     }

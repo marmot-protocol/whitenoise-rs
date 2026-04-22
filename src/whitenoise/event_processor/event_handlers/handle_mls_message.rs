@@ -9,6 +9,7 @@ use nostr_sdk::prelude::*;
 #[cfg(test)]
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::{
+    nostr_manager::parser::ContentParser,
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
@@ -493,7 +494,7 @@ impl Whitenoise {
         let mut chat_message = self
             .shared
             .message_aggregator
-            .process_single_message(message, &self.content_parser, media_files)
+            .process_single_message(message, &ContentParser::new(), media_files)
             .await?;
 
         // Preserve existing delivery status for relay echoes of locally-sent messages.

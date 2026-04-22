@@ -11,13 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     perf_instrument,
-    relay_control::RelayControlPlane,
     whitenoise::{
         Whitenoise,
-        database::Database,
         database::processed_events::ProcessedEvent,
         error::{Result, WhitenoiseError},
-        event_tracker::EventTracker,
         relays::{Relay, RelayType},
         user_streaming::{UserUpdate, UserUpdateTrigger},
         utils::timestamp_to_datetime,
@@ -51,22 +48,12 @@ static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::
 
 #[derive(Clone)]
 pub(crate) struct UserRelaySyncContext {
-    database: Arc<Database>,
-    event_tracker: Arc<dyn EventTracker>,
-    relay_control: Arc<RelayControlPlane>,
+    shared: Arc<crate::whitenoise::shared::SharedServices>,
 }
 
 impl UserRelaySyncContext {
-    pub(crate) fn new(
-        database: Arc<Database>,
-        event_tracker: Arc<dyn EventTracker>,
-        relay_control: Arc<RelayControlPlane>,
-    ) -> Self {
-        Self {
-            database,
-            event_tracker,
-            relay_control,
-        }
+    pub(crate) fn new(shared: Arc<crate::whitenoise::shared::SharedServices>) -> Self {
+        Self { shared }
     }
 }
 
@@ -200,11 +187,7 @@ impl User {
 
 impl Whitenoise {
     pub(crate) fn user_relay_sync_context(&self) -> UserRelaySyncContext {
-        UserRelaySyncContext::new(
-            Arc::clone(&self.shared.database),
-            Arc::clone(&self.shared.event_tracker),
-            Arc::clone(&self.shared.relay_control),
-        )
+        UserRelaySyncContext::new(self.shared.clone())
     }
 
     /// Retrieves a user by their public key.

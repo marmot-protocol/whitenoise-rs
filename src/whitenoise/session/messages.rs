@@ -382,7 +382,8 @@ impl<'a> MessageOpsForGroup<'a> {
             crate::whitenoise::media_files::MediaFile::find_by_group(self.db(), self.group_id)
                 .await?;
 
-        let aggregator = MessageAggregator::with_config(self.session.aggregator_config.clone());
+        let aggregator =
+            MessageAggregator::with_config(self.session.shared.message_aggregator.config().clone());
         let chat_message = aggregator
             .process_single_message(mdk_message, &ContentParser::new(), media_files)
             .await
@@ -419,7 +420,11 @@ impl<'a> MessageOpsForGroup<'a> {
         {
             let emoji = emoji_utils::validate_and_normalize_reaction(
                 &mdk_message.content,
-                self.session.aggregator_config.normalize_emoji,
+                self.session
+                    .shared
+                    .message_aggregator
+                    .config()
+                    .normalize_emoji,
             )?;
             reaction_handler::add_reaction_to_message(
                 &mut target,

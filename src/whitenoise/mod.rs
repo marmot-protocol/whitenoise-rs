@@ -147,7 +147,6 @@ impl WhitenoiseConfig {
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
     pub(crate) shared: Arc<shared::SharedServices>,
-    content_parser: crate::nostr_manager::parser::ContentParser,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
     /// Shutdown signal for scheduled tasks
@@ -175,7 +174,6 @@ impl std::fmt::Debug for Whitenoise {
         f.debug_struct("Whitenoise")
             .field("config", &self.config)
             .field("shared", &"<REDACTED>")
-            .field("content_parser", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
@@ -222,7 +220,6 @@ impl Whitenoise {
         Self {
             config,
             shared,
-            content_parser: crate::nostr_manager::parser::ContentParser::new(),
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
             scheduler_shutdown: components.scheduler_shutdown,

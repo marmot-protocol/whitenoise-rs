@@ -1,6 +1,7 @@
 pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
 use crate::{
+    nostr_manager::parser::ContentParser,
     perf_instrument,
     types::MessageWithTokens,
     whitenoise::{
@@ -281,7 +282,7 @@ impl Whitenoise {
                 pubkey,
                 group_id,
                 new_events.clone(),
-                &self.content_parser,
+                &ContentParser::new(),
                 media_files,
             )
             .await?;
