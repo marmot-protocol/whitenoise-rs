@@ -2,19 +2,17 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo test --features cli,integration-tests --test cli_relay_control_e2e
+//! cargo test --test cli_relay_control_e2e
 //! ```
-
-#![cfg(all(feature = "cli", feature = "integration-tests"))]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use whitenoise::cli::client;
-use whitenoise::cli::protocol::{Request, Response};
 use whitenoise::test_fixtures::nostr::{
     JEFF_PUBKEY_HEX, MAX_PUBKEY_HEX, publish_user_search_seed_events,
 };
+use whitenoise_cli::cli::client;
+use whitenoise_cli::cli::protocol::{Request, Response};
 
 #[path = "support/cli.rs"]
 mod cli_support;

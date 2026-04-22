@@ -21,9 +21,6 @@ pub mod mdk;
 mod types;
 pub mod whitenoise;
 
-#[cfg(feature = "cli")]
-pub mod cli;
-
 // Integration tests module - included when integration-tests feature is enabled
 // This provides IDE support.
 #[cfg(feature = "integration-tests")]
@@ -63,6 +60,7 @@ pub use whitenoise::relays::{Relay, RelayType};
 pub use whitenoise::drafts::Draft;
 
 // Media files
+pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
 
 // Messaging
@@ -92,9 +90,12 @@ pub use whitenoise::push_notifications::{GroupPushToken, PushPlatform, PushRegis
 
 // User search
 pub use whitenoise::user_search::{
-    MatchQuality, MatchResult, MatchedField, SearchUpdateTrigger, UserSearchResult,
-    UserSearchSubscription, UserSearchUpdate,
+    MatchQuality, MatchResult, MatchedField, SearchUpdateTrigger, UserSearchParams,
+    UserSearchResult, UserSearchSubscription, UserSearchUpdate,
 };
+
+// Chat list
+pub use whitenoise::chat_list::ChatListItem;
 
 // Zapstore version check
 pub use whitenoise::zapstore::fetch_latest_zapstore_version;

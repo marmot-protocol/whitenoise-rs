@@ -2,15 +2,15 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use whitenoise::cli::commands::{
+use whitenoise_cli::cli::commands::{
     accounts::AccountsCmd, chats::ChatsCmd, daemon::DaemonCmd, debug::DebugCmd,
     follows::FollowsCmd, groups::GroupsCmd, identity, keys::KeysCmd, media::MediaCmd,
     messages::MessagesCmd, notifications::NotificationsCmd, profile::ProfileCmd, relays::RelaysCmd,
     settings::SettingsCmd, users::UsersCmd,
 };
-use whitenoise::cli::config::Config;
-use whitenoise::cli::protocol::Request;
-use whitenoise::cli::{client, output};
+use whitenoise_cli::cli::config::Config;
+use whitenoise_cli::cli::protocol::Request;
+use whitenoise_cli::cli::{client, output};
 
 #[derive(Parser, Debug)]
 #[clap(name = "wn", about = "Whitenoise CLI", version)]
@@ -123,7 +123,7 @@ enum Cmd {
 }
 
 #[tokio::main]
-async fn main() -> whitenoise::cli::Result<()> {
+async fn main() -> whitenoise_cli::cli::Result<()> {
     let args = Args::parse();
     let config = Config::resolve(None, None);
     let socket = args.socket.unwrap_or_else(|| config.socket_path());
@@ -150,7 +150,7 @@ async fn main() -> whitenoise::cli::Result<()> {
         Cmd::Keys(cmd) => cmd.run(&socket, args.json, args.account.as_deref()).await,
         Cmd::Reset { confirm } => {
             if !confirm {
-                return Err(whitenoise::cli::CliError::msg(
+                return Err(whitenoise_cli::cli::CliError::msg(
                     "this will delete ALL data (database, MLS state, logs). Pass --confirm to proceed.",
                 ));
             }

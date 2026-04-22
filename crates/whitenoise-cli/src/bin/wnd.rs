@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use whitenoise::cli::config::{Config, KEYRING_SERVICE_ID};
-use whitenoise::cli::server;
 use whitenoise::{Whitenoise, WhitenoiseConfig};
+use whitenoise_cli::cli::config::{Config, KEYRING_SERVICE_ID};
+use whitenoise_cli::cli::server;
 
 #[derive(Parser, Debug)]
 #[clap(name = "wnd", about = "Whitenoise daemon")]
@@ -17,7 +17,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> whitenoise::cli::Result<()> {
+async fn main() -> whitenoise_cli::cli::Result<()> {
     let args = Args::parse();
     let config = Config::resolve(args.data_dir.as_ref(), args.logs_dir.as_ref());
 

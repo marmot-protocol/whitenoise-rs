@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/whitenoise-macros"]
+members = [".", "crates/whitenoise-macros", "crates/whitenoise-cli"]
 
 [package]
 name = "whitenoise"
@@ -89,8 +89,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64ct = "=1.7.3"
 whitenoise-macros = { path = "crates/whitenoise-macros" }
 tempfile = "3.19.1"
-dirs = { version = "6", optional = true }
-rpassword = { version = "7", optional = true }
 indicatif = { version = "0.18.3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -122,19 +120,11 @@ tokio = { version = "1.44", features = ["test-util"] }
 
 [features]
 default = []
-cli = ["clap", "dirs", "rpassword"]
+# Retained for keyring store selection on macOS: CLI binaries are unsigned and must
+# use the regular Keychain store (not Protected Data). Enabled by whitenoise-cli.
+cli = []
 integration-tests = ["clap"]
 benchmark-tests = ["integration-tests", "indicatif"]
-
-[[bin]]
-name = "wnd"
-path = "src/bin/wnd.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "wn"
-path = "src/bin/wn.rs"
-required-features = ["cli"]
 
 [[bin]]
 name = "integration_test"

@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use crate::Whitenoise;
+use whitenoise::Whitenoise;
 
 use super::config::Config;
 use super::dispatch;

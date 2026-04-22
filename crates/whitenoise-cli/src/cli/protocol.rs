@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::whitenoise::accounts_groups::MuteDuration;
+pub use whitenoise::MuteDuration;
 
 /// A request from the CLI client to the daemon.
 ///

@@ -9,7 +9,7 @@ use std::io;
 
 use thiserror::Error;
 
-use crate::whitenoise::error::WhitenoiseError;
+use whitenoise::WhitenoiseError;
 
 pub type Result<T> = core::result::Result<T, CliError>;
 

@@ -97,7 +97,7 @@ impl Relay {
         }
     }
 
-    pub(crate) fn defaults() -> Vec<Relay> {
+    pub fn defaults() -> Vec<Relay> {
         let urls: &[&str] = if cfg!(debug_assertions) {
             &["ws://localhost:8080", "ws://localhost:7777"]
         } else {
