@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use mdk_core::GroupId;
 use nostr_sdk::prelude::*;
@@ -12,53 +14,42 @@ use crate::{
         database::published_key_packages::PublishedKeyPackage,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
+        session::AccountSession,
     },
 };
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
-    pub async fn handle_giftwrap(&self, account: &Account, event: Event) -> Result<()> {
+    pub async fn handle_giftwrap(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: Event,
+    ) -> Result<()> {
         tracing::debug!(
             target: "whitenoise::event_handlers::handle_giftwrap",
             "Giftwrap received for account: {}",
             account.pubkey.to_hex()
         );
 
-        // For external signer accounts, use the registered signer.
-        // For local accounts, use the keys from the secrets store.
+        // Fail fast if the signer is unavailable (external-signer account
+        // that hasn't re-registered after restart). The event stays
+        // unprocessed and relay replay will deliver it again once the
+        // signer slot is filled via register_external_signer().
         let _decrypt_span = perf_span!("event_handlers::giftwrap_decrypt");
-        let unwrapped = if account.uses_external_signer() {
-            let signer = self.get_external_signer(&account.pubkey).ok_or_else(|| {
-                WhitenoiseError::Configuration(format!(
-                    "No external signer registered for account: {}",
-                    account.pubkey.to_hex()
-                ))
-            })?;
-            tracing::debug!(
-                target: "whitenoise::event_handlers::handle_giftwrap",
-                "Using external signer for giftwrap decryption"
-            );
-            // Arc<dyn NostrSigner> implements NostrSigner, so we can pass it directly
-            extract_rumor(&signer, &event).await.map_err(|e| {
-                WhitenoiseError::Configuration(format!(
-                    "Failed to decrypt giftwrap with external signer: {}",
-                    e
-                ))
-            })?
-        } else {
-            let keys = self
-                .secrets_store
-                .get_nostr_keys_for_pubkey(&account.pubkey)?;
-            extract_rumor(&keys, &event).await.map_err(|e| {
-                WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
-            })?
-        };
+        let signer = session
+            .get_signer()
+            .ok_or(WhitenoiseError::SignerUnavailable(account.pubkey))?;
+
+        let unwrapped = extract_rumor(&signer, &event).await.map_err(|e| {
+            WhitenoiseError::Configuration(format!("Failed to decrypt giftwrap: {}", e))
+        })?;
 
         drop(_decrypt_span);
 
         match unwrapped.rumor.kind {
             Kind::MlsWelcome => {
-                self.process_welcome(account, event, unwrapped.rumor)
+                self.process_welcome(session, account, event, unwrapped.rumor)
                     .await?;
             }
             _ => {
@@ -76,6 +67,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn process_welcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         event: Event,
         rumor: UnsignedEvent,
@@ -144,7 +136,7 @@ impl Whitenoise {
             }
         }
 
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let mdk = &*session.mdk;
 
         // Process the welcome to get group info (but don't accept yet)
         let welcome = mdk
@@ -591,6 +583,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         let mut welcome_rumor =
             build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
@@ -617,7 +610,7 @@ mod tests {
         .unwrap();
 
         let result = whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
         assert!(
             result.is_ok(),
@@ -641,6 +634,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         let mut welcome_rumor =
             build_welcome_rumor(&whitenoise, &creator_account, member_account.pubkey).await;
@@ -668,7 +662,7 @@ mod tests {
         .unwrap();
 
         let result = whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
         assert!(
             result.is_ok(),
@@ -693,6 +687,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
@@ -700,7 +695,7 @@ mod tests {
 
         // Member should successfully process welcome
         let result = whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
         assert!(result.is_ok());
     }
@@ -713,6 +708,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
@@ -720,7 +716,7 @@ mod tests {
 
         // Member processes the welcome
         let result = whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
         assert!(result.is_ok());
 
@@ -761,6 +757,7 @@ mod tests {
     async fn test_handle_giftwrap_non_welcome_ok() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let account_session = whitenoise.require_session(&account.pubkey).unwrap();
 
         // Build a non-welcome rumor and giftwrap it to the account
         let sender_keys = create_test_keys();
@@ -777,7 +774,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = whitenoise.handle_giftwrap(&account, giftwrap_event).await;
+        let result = whitenoise
+            .handle_giftwrap(&account_session, &account, giftwrap_event)
+            .await;
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
     }
 
@@ -907,12 +906,13 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         // Build and process a real MLS Welcome
         let giftwrap_event =
             build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
         whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await
             .unwrap();
 
@@ -962,6 +962,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Member starts with subscriptions but no groups
@@ -985,7 +986,7 @@ mod tests {
         let giftwrap_event =
             build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
         whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await
             .unwrap();
 
@@ -1078,6 +1079,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         // Build a real MLS Welcome giftwrap addressed to the member
         let giftwrap_event =
@@ -1091,7 +1093,7 @@ mod tests {
 
         // Processing should fail because the DB lookup errors out
         let result = whitenoise
-            .handle_giftwrap(&member_account, giftwrap_event)
+            .handle_giftwrap(&member_session, &member_account, giftwrap_event)
             .await;
         assert!(
             result.is_err(),

@@ -407,7 +407,7 @@ split phase.
 
 ### Phase 15: Session-scoped event dispatch (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #770
 
 <details>
 <summary>Details</summary>

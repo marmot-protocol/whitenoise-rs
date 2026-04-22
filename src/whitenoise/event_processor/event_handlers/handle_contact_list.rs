@@ -1,13 +1,15 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{OwnedSemaphorePermit, watch};
+use tokio::sync::watch;
 
 use crate::whitenoise::{
     Whitenoise,
     accounts::Account,
     database::processed_events::ProcessedEvent,
     error::{Result, WhitenoiseError},
+    session::AccountSession,
     utils::timestamp_to_datetime,
 };
 use crate::{
@@ -24,8 +26,13 @@ const CONTACT_LIST_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
-    pub(crate) async fn handle_contact_list(&self, account: &Account, event: Event) -> Result<()> {
-        let _permit = self.acquire_contact_list_guard(account).await?;
+    pub(crate) async fn handle_contact_list(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: Event,
+    ) -> Result<()> {
+        let _permit = session.acquire_contact_list_permit().await?;
         let account_id = account.id.ok_or(WhitenoiseError::AccountNotFound)?;
 
         if self.should_skip_contact_list(&event, account_id).await? {
@@ -37,7 +44,7 @@ impl Whitenoise {
             .update_follows_from_event(contacts.clone(), &self.database)
             .await?;
 
-        self.schedule_background_user_fetch(&contacts, &account.pubkey);
+        self.schedule_background_user_fetch(session, &contacts);
 
         self.event_tracker
             .track_processed_account_event(&event, &account.pubkey)
@@ -52,20 +59,6 @@ impl Whitenoise {
         );
 
         Ok(())
-    }
-
-    #[perf_instrument("event_handlers")]
-    async fn acquire_contact_list_guard(&self, account: &Account) -> Result<OwnedSemaphorePermit> {
-        self.account_manager
-            .get_session(&account.pubkey)
-            .ok_or_else(|| {
-                WhitenoiseError::ContactList(format!(
-                    "No active session for account {}",
-                    account.pubkey.to_hex()
-                ))
-            })?
-            .acquire_contact_list_permit()
-            .await
     }
 
     #[perf_instrument("event_handlers")]
@@ -111,7 +104,7 @@ impl Whitenoise {
     ///
     /// This avoids the login bootstrap flood where each followed user triggers
     /// its own relay-list and metadata fetch workflow.
-    fn schedule_background_user_fetch(&self, pubkeys: &[PublicKey], account_pubkey: &PublicKey) {
+    fn schedule_background_user_fetch(&self, session: &Arc<AccountSession>, pubkeys: &[PublicKey]) {
         if pubkeys.is_empty() {
             return;
         }
@@ -119,10 +112,7 @@ impl Whitenoise {
         let pubkeys = pubkeys.to_vec();
         let total = pubkeys.len();
 
-        let cancel_rx = self
-            .account_manager
-            .get_session(account_pubkey)
-            .map(|s| s.subscribe_cancellation());
+        let cancel_rx = Some(session.subscribe_cancellation());
 
         let tid = crate::perf::current_trace_id();
         tokio::spawn(crate::perf::with_trace_id(tid, async move {
@@ -324,6 +314,7 @@ mod tests {
     async fn test_handle_contact_list_success() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
@@ -338,7 +329,7 @@ mod tests {
         let event = build_contact_list_event(&keys, &contacts, Some(timestamp)).await;
 
         whitenoise
-            .handle_contact_list(&account, event.clone())
+            .handle_contact_list(&session, &account, event.clone())
             .await
             .unwrap();
 
@@ -375,6 +366,7 @@ mod tests {
     async fn test_handle_contact_list_idempotency() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
@@ -385,11 +377,11 @@ mod tests {
 
         // Process the same event twice
         whitenoise
-            .handle_contact_list(&account, event.clone())
+            .handle_contact_list(&session, &account, event.clone())
             .await
             .unwrap();
         whitenoise
-            .handle_contact_list(&account, event)
+            .handle_contact_list(&session, &account, event)
             .await
             .unwrap();
 
@@ -402,6 +394,7 @@ mod tests {
     async fn test_handle_contact_list_stale_events_ignored() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
@@ -418,7 +411,7 @@ mod tests {
         let current_event =
             build_contact_list_event(&keys, &[current_contact], Some(current_timestamp)).await;
         whitenoise
-            .handle_contact_list(&account, current_event)
+            .handle_contact_list(&session, &account, current_event)
             .await
             .unwrap();
 
@@ -426,7 +419,7 @@ mod tests {
         let older_event =
             build_contact_list_event(&keys, &[older_contact], Some(older_timestamp)).await;
         whitenoise
-            .handle_contact_list(&account, older_event)
+            .handle_contact_list(&session, &account, older_event)
             .await
             .unwrap();
 
@@ -438,7 +431,7 @@ mod tests {
         let same_ts_event =
             build_contact_list_event(&keys, &[same_ts_contact], Some(current_timestamp)).await;
         whitenoise
-            .handle_contact_list(&account, same_ts_event)
+            .handle_contact_list(&session, &account, same_ts_event)
             .await
             .unwrap();
 
@@ -454,6 +447,7 @@ mod tests {
     async fn test_handle_contact_list_newer_event_replaces() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
@@ -469,7 +463,7 @@ mod tests {
         // Process first event
         let first_event = build_contact_list_event(&keys, &[first_contact], Some(t1)).await;
         whitenoise
-            .handle_contact_list(&account, first_event)
+            .handle_contact_list(&session, &account, first_event)
             .await
             .unwrap();
         assert_eq!(
@@ -480,7 +474,7 @@ mod tests {
         // Process newer event - should replace
         let second_event = build_contact_list_event(&keys, &[second_contact], Some(t2)).await;
         whitenoise
-            .handle_contact_list(&account, second_event)
+            .handle_contact_list(&session, &account, second_event)
             .await
             .unwrap();
 
@@ -491,7 +485,7 @@ mod tests {
         // Process empty list - should clear all follows
         let empty_event = build_contact_list_event(&keys, &[], Some(t3)).await;
         whitenoise
-            .handle_contact_list(&account, empty_event)
+            .handle_contact_list(&session, &account, empty_event)
             .await
             .unwrap();
 
@@ -510,12 +504,14 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account1 = whitenoise.create_identity().await.unwrap();
+        let session1 = whitenoise.require_session(&account1.pubkey).unwrap();
         let keys1 = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account1.pubkey)
             .unwrap();
 
         let account2 = whitenoise.create_identity().await.unwrap();
+        let session2 = whitenoise.require_session(&account2.pubkey).unwrap();
         let keys2 = whitenoise
             .secrets_store
             .get_nostr_keys_for_pubkey(&account2.pubkey)
@@ -526,6 +522,7 @@ mod tests {
 
         whitenoise
             .handle_contact_list(
+                &session1,
                 &account1,
                 build_contact_list_event(&keys1, &[contact1], None).await,
             )
@@ -533,6 +530,7 @@ mod tests {
             .unwrap();
         whitenoise
             .handle_contact_list(
+                &session2,
                 &account2,
                 build_contact_list_event(&keys2, &[contact2], None).await,
             )
@@ -548,14 +546,21 @@ mod tests {
         assert_eq!(follows2[0].pubkey, contact2);
     }
 
+    /// Verifies that an Account with `id: None` still triggers an error even
+    /// when a valid session exists. The handler checks `account.id` early and
+    /// returns `AccountNotFound` before doing any work.
     #[tokio::test]
     async fn test_handle_contact_list_requires_saved_account() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let keys = Keys::generate();
+        // Create a real identity (which has a session) then fabricate an
+        // Account struct with id: None to simulate the unsaved-account path.
+        let real_account = whitenoise.create_identity().await.unwrap();
+        let session = whitenoise.require_session(&real_account.pubkey).unwrap();
+
         let unsaved_account = Account {
             id: None,
-            pubkey: keys.public_key(),
+            pubkey: real_account.pubkey,
             user_id: 0,
             account_type: AccountType::Local,
             last_synced_at: None,
@@ -563,11 +568,15 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
+        let keys = whitenoise
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&real_account.pubkey)
+            .unwrap();
         let event = build_contact_list_event(&keys, &[Keys::generate().public_key()], None).await;
 
         assert!(
             whitenoise
-                .handle_contact_list(&unsaved_account, event)
+                .handle_contact_list(&session, &unsaved_account, event)
                 .await
                 .is_err()
         );

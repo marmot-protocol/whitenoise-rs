@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use mdk_core::prelude::group_types::GroupState;
 use mdk_core::prelude::message_types::Message;
 use mdk_core::prelude::{GroupId, MessageProcessingOutcome, MessageProcessingResult};
@@ -20,6 +22,7 @@ use crate::{
         message_aggregator::{ChatMessage, emoji_utils, reaction_handler},
         message_streaming::{MessageUpdate, UpdateTrigger},
         push_notifications::is_push_group_message_kind,
+        session::AccountSession,
     },
 };
 #[cfg(test)]
@@ -46,7 +49,12 @@ fn extract_group_id(result: &MessageProcessingResult) -> Option<&GroupId> {
 
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
-    pub async fn handle_mls_message(&self, account: &Account, event: Event) -> Result<()> {
+    pub async fn handle_mls_message(
+        &self,
+        session: &Arc<AccountSession>,
+        account: &Account,
+        event: Event,
+    ) -> Result<()> {
         tracing::debug!(
           target: "whitenoise::event_handlers::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",
@@ -55,7 +63,7 @@ impl Whitenoise {
           account.pubkey.to_hex()
         );
 
-        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let mdk = &*session.mdk;
         let _mls_proc = perf_span!("event_handlers::mls_process_message");
         let outcome = match mdk.process_message_with_context(&event) {
             Ok(outcome) => {
@@ -111,8 +119,9 @@ impl Whitenoise {
 
         if let Some((group_id, inner_event, message)) = Self::extract_message_details(&outcome) {
             self.handle_application_message_outcome(
+                session,
                 account,
-                &mdk,
+                mdk,
                 &outcome,
                 group_id,
                 inner_event,
@@ -121,7 +130,7 @@ impl Whitenoise {
             .await?;
         }
 
-        self.handle_non_application_outcome(account, &mdk, outcome.result)
+        self.handle_non_application_outcome(session, account, mdk, outcome.result)
             .await?;
 
         Ok(())
@@ -130,6 +139,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_application_message_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         outcome: &MessageProcessingOutcome,
@@ -138,8 +148,9 @@ impl Whitenoise {
         message: Message,
     ) -> Result<()> {
         if is_push_group_message_kind(message.kind) {
-            if let Err(error) = self
-                .handle_push_application_message(mdk, account, outcome, &message)
+            if let Err(error) = session
+                .push()
+                .handle_received_push_group_message(&message, outcome.context.sender_leaf_index)
                 .await
             {
                 tracing::warn!(
@@ -157,24 +168,6 @@ impl Whitenoise {
 
         self.handle_standard_application_message(account, mdk, group_id, inner_event, message)
             .await
-    }
-
-    async fn handle_push_application_message(
-        &self,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
-        account: &Account,
-        outcome: &MessageProcessingOutcome,
-        message: &Message,
-    ) -> Result<()> {
-        #[allow(deprecated)]
-        self.handle_received_push_group_message(
-            mdk,
-            account,
-            message,
-            outcome.context.sender_leaf_index,
-        )
-        .await?;
-        Ok(())
     }
 
     #[perf_instrument("event_handlers")]
@@ -270,6 +263,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_non_application_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         result: MessageProcessingResult,
@@ -280,7 +274,7 @@ impl Whitenoise {
         match result {
             MessageProcessingResult::ApplicationMessage(_) => Ok(()),
             MessageProcessingResult::Proposal(update_result) => {
-                self.handle_auto_committed_proposal(account, mdk, update_result)
+                self.handle_auto_committed_proposal(session, account, update_result)
                     .await
             }
             MessageProcessingResult::PendingProposal { mls_group_id } => {
@@ -312,7 +306,7 @@ impl Whitenoise {
                 Ok(())
             }
             MessageProcessingResult::Commit { mls_group_id } => {
-                self.handle_commit_outcome(account, mdk, &mls_group_id)
+                self.handle_commit_outcome(session, account, mdk, &mls_group_id)
                     .await
             }
             MessageProcessingResult::Unprocessable { mls_group_id } => {
@@ -339,24 +333,20 @@ impl Whitenoise {
         }
     }
 
-    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn handle_auto_committed_proposal(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
-        mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         update_result: mdk_core::prelude::UpdateGroupResult,
     ) -> Result<()> {
         let group_id = &update_result.mls_group_id;
-        let relay_urls = Self::ensure_group_relays(mdk, group_id)?;
+        let groups = session.groups();
+        let relay_urls = groups.ensure_relays(group_id)?;
 
-        self.publish_and_merge_commit(
-            update_result.evolution_event.clone(),
-            &account.pubkey,
-            group_id,
-            &relay_urls,
-        )
-        .await?;
+        groups
+            .publish_and_merge_commit(update_result.evolution_event.clone(), group_id, &relay_urls)
+            .await?;
 
         self.background_refresh_account_group_subscriptions(account);
 
@@ -386,6 +376,7 @@ impl Whitenoise {
     #[perf_instrument("event_handlers")]
     async fn handle_commit_outcome(
         &self,
+        session: &Arc<AccountSession>,
         account: &Account,
         mdk: &mdk_core::prelude::MDK<MdkSqliteStorage>,
         mls_group_id: &GroupId,
@@ -408,14 +399,17 @@ impl Whitenoise {
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
             );
-            #[allow(deprecated)]
-            self.mark_as_removed(account, mls_group_id).await?;
+            let _ = session
+                .membership()
+                .for_group(mls_group_id)
+                .mark_as_removed()
+                .await?;
         }
 
-        #[allow(deprecated)]
         if still_active
-            && let Err(error) = self
-                .reconcile_group_push_tokens_for_active_leaves(account, mls_group_id)
+            && let Err(error) = session
+                .push()
+                .reconcile_group_tokens_for_active_leaves(mls_group_id)
                 .await
         {
             tracing::warn!(
@@ -911,6 +905,7 @@ mod tests {
         // Arrange: Setup whitenoise and create a group
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
@@ -944,7 +939,7 @@ mod tests {
         let message_event = mdk.create_message(group_id, inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
         assert!(result.is_ok(), "Failed to handle regular message");
 
@@ -971,7 +966,7 @@ mod tests {
         let reaction_event = mdk.create_message(group_id, reaction_inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, reaction_event)
+            .handle_mls_message(&creator_session, &creator_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Failed to handle reaction");
 
@@ -1002,7 +997,7 @@ mod tests {
         let deletion_event = mdk.create_message(group_id, deletion_inner, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, deletion_event)
+            .handle_mls_message(&creator_session, &creator_account, deletion_event)
             .await;
         assert!(result.is_ok(), "Failed to handle deletion");
 
@@ -1101,6 +1096,7 @@ mod tests {
     async fn test_handle_mls_message_error_handling() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
@@ -1136,7 +1132,7 @@ mod tests {
         bad_event.kind = Kind::TextNote;
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, bad_event)
+            .handle_mls_message(&creator_session, &creator_account, bad_event)
             .await;
 
         assert!(result.is_err(), "Expected error for corrupted event");
@@ -1151,6 +1147,7 @@ mod tests {
     async fn test_handle_mls_message_orphaned_reactions_and_deletions() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
@@ -1188,7 +1185,7 @@ mod tests {
             .unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, reaction_event)
+            .handle_mls_message(&creator_session, &creator_account, reaction_event)
             .await;
         assert!(result.is_ok(), "Orphaned reaction should be stored");
 
@@ -1218,7 +1215,7 @@ mod tests {
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
         assert!(
             result.is_ok(),
@@ -1255,6 +1252,7 @@ mod tests {
     async fn test_invalid_orphaned_reactions_are_skipped() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
@@ -1289,7 +1287,7 @@ mod tests {
         let valid_event = mdk.create_message(group_id, valid_reaction, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&creator_account, valid_event)
+            .handle_mls_message(&creator_session, &creator_account, valid_event)
             .await
             .unwrap();
 
@@ -1307,7 +1305,7 @@ mod tests {
             .unwrap();
 
         whitenoise
-            .handle_mls_message(&creator_account, invalid_event)
+            .handle_mls_message(&creator_session, &creator_account, invalid_event)
             .await
             .unwrap();
 
@@ -1323,7 +1321,7 @@ mod tests {
         let message_event = mdk.create_message(group_id, actual_message, None).unwrap();
 
         let result = whitenoise
-            .handle_mls_message(&creator_account, message_event)
+            .handle_mls_message(&creator_session, &creator_account, message_event)
             .await;
 
         // The critical assertion: message processing should succeed
@@ -1436,6 +1434,7 @@ mod tests {
     async fn test_handle_mls_message_cache_integration() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -1473,7 +1472,7 @@ mod tests {
                 .unwrap();
 
             whitenoise
-                .handle_mls_message(&creator_account, event)
+                .handle_mls_message(&creator_session, &creator_account, event)
                 .await
                 .unwrap();
         }
@@ -1512,6 +1511,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1531,7 +1531,7 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
@@ -1569,6 +1569,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1603,7 +1604,7 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
@@ -1644,6 +1645,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1671,7 +1673,7 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, removal, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
@@ -1701,6 +1703,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1718,7 +1721,7 @@ mod tests {
         let event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, event)
+            .handle_mls_message(&member_session, &member_account, event)
             .await
             .unwrap();
 
@@ -1745,6 +1748,7 @@ mod tests {
         let admin_account = whitenoise.create_identity().await.unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
@@ -1763,7 +1767,7 @@ mod tests {
         let request_event = admin_mdk.create_message(&group_id, request, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, request_event)
+            .handle_mls_message(&member_session, &member_account, request_event)
             .await
             .unwrap();
 
@@ -1786,7 +1790,7 @@ mod tests {
         let response_event = admin_mdk.create_message(&group_id, response, None).unwrap();
 
         whitenoise
-            .handle_mls_message(&member_account, response_event)
+            .handle_mls_message(&member_session, &member_account, response_event)
             .await
             .unwrap();
 
@@ -1810,6 +1814,7 @@ mod tests {
         let members = setup_multiple_test_accounts(&whitenoise, 2).await;
         let member_one = members[0].0.clone();
         let member_two = members[1].0.clone();
+        let member_two_session = whitenoise.require_session(&member_two.pubkey).unwrap();
 
         wait_for_key_package_publication(&whitenoise, &[&member_one, &member_two]).await;
 
@@ -1851,7 +1856,7 @@ mod tests {
         };
 
         whitenoise
-            .handle_mls_message(&member_two, removal_event)
+            .handle_mls_message(&member_two_session, &member_two, removal_event)
             .await
             .unwrap();
 
@@ -1878,6 +1883,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
@@ -1895,7 +1901,7 @@ mod tests {
         // Admin processes the leave proposal -- should auto-commit because
         // admin_account is the group admin
         let result = whitenoise
-            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
             .await;
         assert!(
             result.is_ok(),
@@ -1927,6 +1933,7 @@ mod tests {
     async fn test_unprocessable_message_returns_err() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -1963,14 +1970,16 @@ mod tests {
 
         // First processing: should succeed
         let first = whitenoise
-            .handle_mls_message(&creator_account, event.clone())
+            .handle_mls_message(&creator_session, &creator_account, event.clone())
             .await;
         assert!(first.is_ok(), "First processing should succeed: {first:?}");
 
         // Second processing of the same event: MDK returns Unprocessable because
         // the event was already processed and its state recorded as Processed.
         // Our handler must propagate this as an error.
-        let second = whitenoise.handle_mls_message(&creator_account, event).await;
+        let second = whitenoise
+            .handle_mls_message(&creator_session, &creator_account, event)
+            .await;
         assert!(
             second.is_err(),
             "Second processing of same event should return Err"
@@ -2002,6 +2011,7 @@ mod tests {
     async fn test_unprocessable_not_tracked_via_process_account_event() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
 
         let member_accounts = members
@@ -2082,7 +2092,9 @@ mod tests {
 
         // Confirm that handle_mls_message itself returns Err on duplicate so
         // any caller that bypasses the skip check also cannot silently succeed.
-        let direct_result = whitenoise.handle_mls_message(&creator_account, event).await;
+        let direct_result = whitenoise
+            .handle_mls_message(&creator_session, &creator_account, event)
+            .await;
         assert!(
             direct_result.is_err(),
             "Direct second call to handle_mls_message must return Err"
@@ -2097,6 +2109,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let admin_account = whitenoise.create_identity().await.unwrap();
+        let admin_session = whitenoise.require_session(&admin_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_account = members[0].0.clone();
 
@@ -2112,7 +2125,7 @@ mod tests {
 
         // Admin auto-commits the leave proposal
         whitenoise
-            .handle_mls_message(&admin_account, leave_result.evolution_event)
+            .handle_mls_message(&admin_session, &admin_account, leave_result.evolution_event)
             .await
             .expect("auto-commit should succeed");
 

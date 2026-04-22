@@ -1239,8 +1239,11 @@ pub mod test_utils {
             .await
             .unwrap();
 
+            let session = whitenoise
+                .require_session(&member_account.pubkey)
+                .expect("member must have an active session");
             whitenoise
-                .handle_giftwrap(member_account, giftwrap)
+                .handle_giftwrap(&session, member_account, giftwrap)
                 .await
                 .expect("member should process welcome successfully");
         }
