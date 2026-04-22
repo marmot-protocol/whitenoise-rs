@@ -359,17 +359,18 @@ impl Whitenoise {
 
     /// Extract rumor timestamp from giftwrap event for sync advancement.
     ///
-    /// Only called after `handle_giftwrap` succeeds, so the session signer
-    /// is guaranteed to exist (giftwrap decryption already used it).
+    /// Only called after `handle_giftwrap` succeeds. A missing signer here
+    /// is surfaced as `SignerUnavailable` so it is distinguishable from an
+    /// actual rumor-extraction failure in the caller's logs.
     #[perf_instrument("event_processor")]
     async fn extract_rumor_timestamp_for_advancement(
         &self,
         event: &Event,
         session: &Arc<AccountSession>,
     ) -> Result<Option<Timestamp>> {
-        let Some(signer) = session.get_signer() else {
-            return Ok(None);
-        };
+        let signer = session
+            .get_signer()
+            .ok_or(WhitenoiseError::SignerUnavailable(session.account_pubkey))?;
 
         match extract_rumor(&signer, event).await {
             Ok(unwrapped) => Ok(Some(unwrapped.rumor.created_at)),
