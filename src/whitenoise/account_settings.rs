@@ -21,21 +21,6 @@ pub struct AccountSettings {
 
 #[allow(deprecated)]
 impl Whitenoise {
-    /// Returns the settings for `account`, creating a default row if none exists.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::settings().get() instead."
-    )]
-    pub async fn account_settings(
-        &self,
-        account: &Account,
-    ) -> Result<AccountSettings, WhitenoiseError> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.settings().get().await
-    }
-
     /// Sets the notification preference for `account` and returns the updated settings.
     ///
     /// Disabling notifications here does not clear any locally stored push
@@ -91,7 +76,13 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
 
-        let settings = whitenoise.account_settings(&account).await.unwrap();
+        let settings = whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .settings()
+            .get()
+            .await
+            .unwrap();
         assert!(settings.notifications_enabled);
         assert_eq!(settings.account_pubkey, account.pubkey);
 

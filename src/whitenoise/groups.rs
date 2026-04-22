@@ -330,20 +330,6 @@ impl Whitenoise {
         session.groups().visible().await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().visible_with_info() instead."
-    )]
-    pub async fn visible_groups_with_info(
-        &self,
-        account: &Account,
-    ) -> Result<Vec<GroupWithInfoAndMembership>> {
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
-        session.groups().visible_with_info().await
-    }
-
     #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().get() instead.")]
     pub async fn group(&self, account: &Account, group_id: &GroupId) -> Result<group_types::Group> {
         let session = self
@@ -1607,7 +1593,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut with_info = whitenoise.visible_groups_with_info(&account).await.unwrap();
+        let mut with_info = whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .visible_with_info()
+            .await
+            .unwrap();
 
         // Both groups are visible; GroupInformation is included for each.
         assert_eq!(with_info.len(), 2, "Both groups should be returned");
@@ -1651,7 +1643,13 @@ mod tests {
             .unwrap();
         ag_declined.decline(&whitenoise).await.unwrap();
 
-        let with_info = whitenoise.visible_groups_with_info(&account).await.unwrap();
+        let with_info = whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .visible_with_info()
+            .await
+            .unwrap();
 
         assert_eq!(with_info.len(), 1, "Declined group should be excluded");
         assert_eq!(with_info[0].group.mls_group_id, group_accepted.mls_group_id);
@@ -1685,7 +1683,10 @@ mod tests {
             .unwrap();
 
         let non_dms: Vec<_> = whitenoise
-            .visible_groups_with_info(&account)
+            .session(&account.pubkey)
+            .unwrap()
+            .groups()
+            .visible_with_info()
             .await
             .unwrap()
             .into_iter()

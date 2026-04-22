@@ -561,43 +561,6 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
 /// directly.
 #[allow(deprecated)]
 impl Whitenoise {
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().registration() instead."
-    )]
-    pub async fn push_registration(&self, account: &Account) -> Result<Option<PushRegistration>> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().registration().await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().upsert_registration() instead."
-    )]
-    pub async fn upsert_push_registration(
-        &self,
-        account: &Account,
-        platform: PushPlatform,
-        raw_token: &str,
-        server_pubkey: &PublicKey,
-        relay_hint: Option<&RelayUrl>,
-    ) -> Result<PushRegistration> {
-        let session = self.require_session(&account.pubkey)?;
-        session
-            .push()
-            .upsert_registration(platform, raw_token, server_pubkey, relay_hint)
-            .await
-    }
-
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().clear_registration() instead."
-    )]
-    pub async fn clear_push_registration(&self, account: &Account) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session.push().clear_registration().await
-    }
-
     #[cfg(test)]
     #[deprecated(
         since = "0.0.0",
@@ -683,23 +646,6 @@ impl Whitenoise {
     ) -> Result<()> {
         let session = self.require_session(&account.pubkey)?;
         session.push().remove_local_token_from_group(group_id).await
-    }
-
-    #[cfg(test)]
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::push().reconcile_group_tokens_for_active_leaves() instead."
-    )]
-    pub(crate) async fn reconcile_group_push_tokens_for_active_leaves(
-        &self,
-        account: &Account,
-        group_id: &GroupId,
-    ) -> Result<()> {
-        let session = self.require_session(&account.pubkey)?;
-        session
-            .push()
-            .reconcile_group_tokens_for_active_leaves(group_id)
-            .await
     }
 }
 
@@ -1687,15 +1633,20 @@ mod tests {
 
         assert!(
             whitenoise
-                .push_registration(&account)
+                .session(&account.pubkey)
+                .unwrap()
+                .push()
+                .registration()
                 .await
                 .unwrap()
                 .is_none()
         );
 
         let created = whitenoise
-            .upsert_push_registration(
-                &account,
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &"aa".repeat(32),
                 &server_pubkey,
@@ -1709,13 +1660,10 @@ mod tests {
         assert_eq!(created.relay_hint, Some(relay_hint.clone()));
 
         let replaced = whitenoise
-            .upsert_push_registration(
-                &account,
-                PushPlatform::Fcm,
-                "token-two",
-                &server_pubkey,
-                None,
-            )
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(PushPlatform::Fcm, "token-two", &server_pubkey, None)
             .await
             .unwrap();
         assert_eq!(replaced.platform, PushPlatform::Fcm);
@@ -1723,16 +1671,28 @@ mod tests {
         assert_eq!(replaced.relay_hint, None);
 
         let stored = whitenoise
-            .push_registration(&account)
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .registration()
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored, replaced);
 
-        whitenoise.clear_push_registration(&account).await.unwrap();
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .clear_registration()
+            .await
+            .unwrap();
         assert!(
             whitenoise
-                .push_registration(&account)
+                .session(&account.pubkey)
+                .unwrap()
+                .push()
+                .registration()
                 .await
                 .unwrap()
                 .is_none()
@@ -1746,13 +1706,10 @@ mod tests {
         let server_pubkey = Keys::generate().public_key();
 
         whitenoise
-            .upsert_push_registration(
-                &account,
-                PushPlatform::Fcm,
-                "device-token",
-                &server_pubkey,
-                None,
-            )
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(PushPlatform::Fcm, "device-token", &server_pubkey, None)
             .await
             .unwrap();
 
@@ -1762,7 +1719,13 @@ mod tests {
             .unwrap();
         assert!(!settings.notifications_enabled);
 
-        let stored = whitenoise.push_registration(&account).await.unwrap();
+        let stored = whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .registration()
+            .await
+            .unwrap();
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().raw_token, "device-token");
     }
@@ -1774,7 +1737,10 @@ mod tests {
         let server_pubkey = Keys::generate().public_key();
 
         let err = whitenoise
-            .upsert_push_registration(&account, PushPlatform::Apns, "   ", &server_pubkey, None)
+            .session(&account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(PushPlatform::Apns, "   ", &server_pubkey, None)
             .await
             .unwrap_err();
 
@@ -1802,8 +1768,10 @@ mod tests {
         let apns_hex_token = "11".repeat(32);
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -1859,8 +1827,10 @@ mod tests {
             count_published_events_for_account(&whitenoise, &admin_account).await;
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -1926,7 +1896,10 @@ mod tests {
         .unwrap();
 
         whitenoise
-            .reconcile_group_push_tokens_for_active_leaves(&member_account, &group_id)
+            .session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .reconcile_group_tokens_for_active_leaves(&group_id)
             .await
             .unwrap();
 
@@ -1954,8 +1927,10 @@ mod tests {
         let apns_hex_token = "33".repeat(32);
 
         whitenoise
-            .upsert_push_registration(
-                &member_account,
+            .session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -2006,8 +1981,10 @@ mod tests {
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &"66".repeat(32),
                 &server_pubkey,
@@ -2103,8 +2080,10 @@ mod tests {
             count_published_events_for_account(&whitenoise, &admin_account).await;
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -2149,8 +2128,10 @@ mod tests {
             count_published_events_for_account(&whitenoise, &admin_account).await;
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &"55".repeat(32),
                 &server_pubkey,
@@ -2183,8 +2164,10 @@ mod tests {
         );
 
         whitenoise
-            .upsert_push_registration(
-                &admin_account,
+            .session(&admin_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Fcm,
                 "token-without-relay-hint",
                 &server_pubkey,
@@ -2338,8 +2321,10 @@ mod tests {
         let apns_hex_token = "33".repeat(32);
 
         whitenoise
-            .upsert_push_registration(
-                &member_account,
+            .session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -2428,8 +2413,10 @@ mod tests {
 
         // Register push and trigger fanout via upsert.
         whitenoise
-            .upsert_push_registration(
-                &member_account,
+            .session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &apns_hex_token,
                 &server_pubkey,
@@ -2482,8 +2469,10 @@ mod tests {
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
 
         whitenoise
-            .upsert_push_registration(
-                &creator,
+            .session(&creator.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &"44".repeat(32),
                 &server_pubkey,
@@ -2532,8 +2521,10 @@ mod tests {
         let relay_hint = RelayUrl::parse("wss://push.example.com").unwrap();
 
         whitenoise
-            .upsert_push_registration(
-                &member_account,
+            .session(&member_account.pubkey)
+            .unwrap()
+            .push()
+            .upsert_registration(
                 PushPlatform::Apns,
                 &"55".repeat(32),
                 &server_pubkey,
