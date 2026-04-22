@@ -163,9 +163,9 @@ mod tests {
     async fn test_save_creates_new_draft() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&whitenoise.database, &group_id).await;
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
 
         let draft = Draft::save(
             &keys.public_key(),
@@ -173,7 +173,7 @@ mod tests {
             "hello",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -190,9 +190,9 @@ mod tests {
     async fn test_save_updates_existing_draft() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&whitenoise.database, &group_id).await;
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
 
         let first = Draft::save(
             &keys.public_key(),
@@ -200,7 +200,7 @@ mod tests {
             "v1",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -210,7 +210,7 @@ mod tests {
             "v2",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -223,9 +223,9 @@ mod tests {
     async fn test_save_preserves_created_at_on_update() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&whitenoise.database, &group_id).await;
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
 
         let first = Draft::save(
             &keys.public_key(),
@@ -233,7 +233,7 @@ mod tests {
             "v1",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -247,7 +247,7 @@ mod tests {
             "v2",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -260,9 +260,9 @@ mod tests {
     async fn test_find_returns_draft() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&whitenoise.database, &group_id).await;
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
 
         Draft::save(
             &keys.public_key(),
@@ -270,12 +270,12 @@ mod tests {
             "persisted",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.database)
+        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.shared.database)
             .await
             .unwrap()
             .expect("draft should exist");
@@ -288,7 +288,7 @@ mod tests {
         let keys = Keys::generate();
         let group_id = GroupId::from_slice(b"test-group-id-00");
 
-        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.database)
+        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -298,9 +298,9 @@ mod tests {
     async fn test_delete_removes_draft() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&whitenoise.database, &group_id).await;
+        insert_test_group(&whitenoise.shared.database, &group_id).await;
 
         Draft::save(
             &keys.public_key(),
@@ -308,16 +308,16 @@ mod tests {
             "to delete",
             None,
             &[],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        Draft::delete(&keys.public_key(), &group_id, &whitenoise.database)
+        Draft::delete(&keys.public_key(), &group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.database)
+        let found = Draft::find(&keys.public_key(), &group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -329,7 +329,8 @@ mod tests {
         let keys = Keys::generate();
         let group_id = GroupId::from_slice(b"test-group-id-00");
 
-        let result = Draft::delete(&keys.public_key(), &group_id, &whitenoise.database).await;
+        let result =
+            Draft::delete(&keys.public_key(), &group_id, &whitenoise.shared.database).await;
         assert!(result.is_ok());
     }
 }

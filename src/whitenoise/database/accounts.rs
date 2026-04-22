@@ -716,11 +716,12 @@ mod tests {
         };
 
         // Test save_account
-        let result = account.save(&whitenoise.database).await;
+        let result = account.save(&whitenoise.shared.database).await;
         assert!(result.is_ok());
 
         // Test that we can load it back (this verifies it was saved correctly)
-        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_account =
+            Account::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_account.is_ok());
 
         let loaded = loaded_account.unwrap();
@@ -756,11 +757,12 @@ mod tests {
             updated_at: test_updated_at,
         };
 
-        let result = account.save(&whitenoise.database).await;
+        let result = account.save(&whitenoise.shared.database).await;
         assert!(result.is_ok());
 
         // Verify it was saved correctly by loading it back
-        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_account =
+            Account::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_account.is_ok());
 
         let loaded = loaded_account.unwrap();
@@ -781,7 +783,8 @@ mod tests {
 
         // Try to load a non-existent account
         let non_existent_pubkey = nostr_sdk::Keys::generate().public_key();
-        let result = Account::find_by_pubkey(&non_existent_pubkey, &whitenoise.database).await;
+        let result =
+            Account::find_by_pubkey(&non_existent_pubkey, &whitenoise.shared.database).await;
 
         assert!(result.is_err());
         if let Err(WhitenoiseError::AccountNotFound) = result {
@@ -813,11 +816,12 @@ mod tests {
         };
 
         // Save the account
-        let save_result = original_account.save(&whitenoise.database).await;
+        let save_result = original_account.save(&whitenoise.shared.database).await;
         assert!(save_result.is_ok());
 
         // Load the account back
-        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_account =
+            Account::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_account.is_ok());
 
         let account = loaded_account.unwrap();
@@ -864,7 +868,7 @@ mod tests {
         };
 
         // Save the account first
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Create test users that will be followers
         let mut test_users = Vec::new();
@@ -895,31 +899,34 @@ mod tests {
             };
 
             // Save user first
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
 
             test_users.push((user_pubkey, metadata.clone()));
         }
 
         // Now manually insert the account_follows relationships
         // First we need to get the actual account ID and user IDs from the database
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         for (user_pubkey, _) in &test_users {
-            let saved_user = User::find_by_pubkey(user_pubkey, &whitenoise.database)
+            let saved_user = User::find_by_pubkey(user_pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
             // Create follower relationship using the proper API
             saved_account
-                .follow_user(&saved_user, &whitenoise.database)
+                .follow_user(&saved_user, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
 
         // Test follows
-        let followers = saved_account.follows(&whitenoise.database).await.unwrap();
+        let followers = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Verify we got all followers
         assert_eq!(followers.len(), 3);
@@ -963,13 +970,16 @@ mod tests {
         };
 
         // Save the account
-        account.save(&whitenoise.database).await.unwrap();
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        account.save(&whitenoise.shared.database).await.unwrap();
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Test follows with no followers
-        let followers = saved_account.follows(&whitenoise.database).await.unwrap();
+        let followers = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Verify empty result
         assert_eq!(followers.len(), 0);
@@ -997,7 +1007,7 @@ mod tests {
         };
 
         // Save the account
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Create a single test user
         let user_pubkey = nostr_sdk::Keys::generate().public_key();
@@ -1016,24 +1026,27 @@ mod tests {
         };
 
         // Save user
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the saved account and user with their database IDs
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.database)
+        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Create the follower relationship using the proper API
         saved_account
-            .follow_user(&saved_user, &whitenoise.database)
+            .follow_user(&saved_user, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Test follows
-        let followers = saved_account.follows(&whitenoise.database).await.unwrap();
+        let followers = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Verify single follower
         assert_eq!(followers.len(), 1);
@@ -1066,7 +1079,7 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Create a user with complex metadata
         let user_pubkey = nostr_sdk::Keys::generate().public_key();
@@ -1088,24 +1101,27 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Create the follower relationship
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.database)
+        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Create the follower relationship using the proper API
         saved_account
-            .follow_user(&saved_user, &whitenoise.database)
+            .follow_user(&saved_user, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Test follows
-        let followers = saved_account.follows(&whitenoise.database).await.unwrap();
+        let followers = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Verify complex metadata is preserved
         assert_eq!(followers.len(), 1);
@@ -1136,7 +1152,7 @@ mod tests {
         };
 
         // Test follows with non-existent account
-        let result = fake_account.follows(&whitenoise.database).await;
+        let result = fake_account.follows(&whitenoise.shared.database).await;
 
         // Should return empty list rather than error since no followers exist
         assert!(result.is_ok());
@@ -1164,7 +1180,7 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Create multiple users with predictable names
         let user_names = vec!["Alpha", "Beta", "Charlie", "Delta", "Echo"];
@@ -1183,16 +1199,16 @@ mod tests {
                 updated_at: test_timestamp,
             };
 
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
             test_users.push(user_pubkey);
         }
 
         // Create follower relationships
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         for user_pubkey in &test_users {
-            let saved_user = User::find_by_pubkey(user_pubkey, &whitenoise.database)
+            let saved_user = User::find_by_pubkey(user_pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1203,14 +1219,20 @@ mod tests {
             .bind(saved_user.id)
             .bind(test_timestamp.timestamp_millis())
             .bind(test_timestamp.timestamp_millis())
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
         }
 
         // Test follows multiple times to ensure consistent ordering
-        let followers1 = saved_account.follows(&whitenoise.database).await.unwrap();
-        let followers2 = saved_account.follows(&whitenoise.database).await.unwrap();
+        let followers1 = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        let followers2 = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         assert_eq!(followers1.len(), 5);
         assert_eq!(followers2.len(), 5);
@@ -1240,18 +1262,18 @@ mod tests {
             created_at,
             updated_at,
         };
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
-        let before = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let before = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let event_ms = chrono::Utc::now().timestamp_millis();
-        Account::update_last_synced_max(&pubkey, event_ms, &whitenoise.database)
+        Account::update_last_synced_max(&pubkey, event_ms, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let after = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let after = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1278,17 +1300,17 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
-        let before = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let before = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        Account::update_last_synced_max(&pubkey, older_ms, &whitenoise.database)
+        Account::update_last_synced_max(&pubkey, older_ms, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let after = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let after = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1315,17 +1337,17 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
-        let before = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let before = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        Account::update_last_synced_max(&pubkey, newer_ms, &whitenoise.database)
+        Account::update_last_synced_max(&pubkey, newer_ms, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let after = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let after = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1338,40 +1360,52 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Should return None when no accounts exist
-        let account = Account::first(&whitenoise.database).await.unwrap();
+        let account = Account::first(&whitenoise.shared.database).await.unwrap();
         assert!(account.is_none());
 
         // If there's a single account, it should return that account
         let test_keys = nostr_sdk::Keys::generate();
-        User::find_or_create_by_pubkey(&test_keys.public_key(), &whitenoise.database)
+        User::find_or_create_by_pubkey(&test_keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
         let (test_account, _) = Account::new(&whitenoise, Some(test_keys)).await.unwrap();
-        test_account.save(&whitenoise.database).await.unwrap();
-        let account = Account::first(&whitenoise.database).await.unwrap();
+        test_account
+            .save(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        let account = Account::first(&whitenoise.shared.database).await.unwrap();
         assert!(account.is_some());
         assert_eq!(account.unwrap().pubkey, test_account.pubkey);
 
         // If there's more than one account, it should still return the first one
         let test_keys2 = nostr_sdk::Keys::generate();
-        User::find_or_create_by_pubkey(&test_keys2.public_key(), &whitenoise.database)
+        User::find_or_create_by_pubkey(&test_keys2.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
         let (test_account2, _) = Account::new(&whitenoise, Some(test_keys2)).await.unwrap();
-        test_account2.save(&whitenoise.database).await.unwrap();
-        let account2 = Account::first(&whitenoise.database).await.unwrap();
+        test_account2
+            .save(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        let account2 = Account::first(&whitenoise.shared.database).await.unwrap();
         assert!(account2.is_some());
         assert_eq!(account2.unwrap().pubkey, test_account.pubkey);
 
         // If that first account is deleted, it should return the second one
-        test_account.delete(&whitenoise.database).await.unwrap();
-        let account3 = Account::first(&whitenoise.database).await.unwrap();
+        test_account
+            .delete(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        let account3 = Account::first(&whitenoise.shared.database).await.unwrap();
         assert!(account3.is_some());
         assert_eq!(account3.unwrap().pubkey, test_account2.pubkey);
 
         // If all accounts are deleted, it should return None
-        test_account2.delete(&whitenoise.database).await.unwrap();
-        let account4 = Account::first(&whitenoise.database).await.unwrap();
+        test_account2
+            .delete(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        let account4 = Account::first(&whitenoise.shared.database).await.unwrap();
         assert!(account4.is_none());
     }
 
@@ -1379,10 +1413,10 @@ mod tests {
     async fn test_update_follows_from_event_empty_list() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = crate::whitenoise::test_utils::create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the account with database ID populated
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1390,7 +1424,7 @@ mod tests {
         let contacts = vec![];
 
         let result = account
-            .update_follows_from_event(contacts, &whitenoise.database)
+            .update_follows_from_event(contacts, &whitenoise.shared.database)
             .await;
 
         assert!(result.is_ok());
@@ -1398,7 +1432,7 @@ mod tests {
         assert!(newly_created.is_empty());
 
         // Verify no follows exist
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert!(follows.is_empty());
     }
 
@@ -1406,10 +1440,10 @@ mod tests {
     async fn test_update_follows_from_event_new_follows() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = crate::whitenoise::test_utils::create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the account with database ID populated
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1419,7 +1453,7 @@ mod tests {
         let contacts = vec![contact1, contact2];
 
         let result = account
-            .update_follows_from_event(contacts.clone(), &whitenoise.database)
+            .update_follows_from_event(contacts.clone(), &whitenoise.shared.database)
             .await;
 
         assert!(result.is_ok());
@@ -1429,7 +1463,7 @@ mod tests {
         assert!(newly_created.contains(&contact2));
 
         // Verify follows were created
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 2);
 
         // Verify the correct users are being followed
@@ -1439,7 +1473,7 @@ mod tests {
 
         // Verify users were created (2 contacts + 1 account user = 3 total)
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&whitenoise.database.pool)
+            .fetch_one(&whitenoise.shared.database.pool)
             .await
             .unwrap();
         assert_eq!(user_count, 3);
@@ -1449,10 +1483,10 @@ mod tests {
     async fn test_update_follows_from_event_replace_existing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = crate::whitenoise::test_utils::create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the account with database ID populated
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1464,12 +1498,12 @@ mod tests {
         for pubkey in [&old_contact1, &old_contact2] {
             let (user, _) = crate::whitenoise::users::User::find_or_create_by_pubkey(
                 pubkey,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
             account
-                .follow_user(&user, &whitenoise.database)
+                .follow_user(&user, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -1480,7 +1514,7 @@ mod tests {
         let contacts = vec![new_contact1, new_contact2];
 
         let result = account
-            .update_follows_from_event(contacts.clone(), &whitenoise.database)
+            .update_follows_from_event(contacts.clone(), &whitenoise.shared.database)
             .await;
 
         assert!(result.is_ok());
@@ -1490,7 +1524,7 @@ mod tests {
         assert!(!newly_created.contains(&new_contact1)); // This user already existed
 
         // Verify follows were replaced using proper API
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 2);
 
         // Verify the correct users are being followed
@@ -1503,10 +1537,10 @@ mod tests {
     async fn test_update_follows_from_event_duplicate_contacts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = crate::whitenoise::test_utils::create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the account with database ID populated
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1516,7 +1550,7 @@ mod tests {
         let contacts = vec![contact1, contact2, contact1]; // contact1 appears twice
 
         let result = account
-            .update_follows_from_event(contacts.clone(), &whitenoise.database)
+            .update_follows_from_event(contacts.clone(), &whitenoise.shared.database)
             .await;
 
         // This should now succeed due to deduplication
@@ -1527,7 +1561,7 @@ mod tests {
         assert_eq!(result_unwrapped.len(), 2); // Both contacts should be newly created
 
         // Verify follows using proper API
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 2); // Only 2 follows due to deduplication
 
         // Verify the correct users are being followed
@@ -1540,10 +1574,10 @@ mod tests {
     async fn test_update_follows_from_event_large_contact_list() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = crate::whitenoise::test_utils::create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Get the account with database ID populated
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1554,7 +1588,7 @@ mod tests {
         }
 
         let result = account
-            .update_follows_from_event(contacts.clone(), &whitenoise.database)
+            .update_follows_from_event(contacts.clone(), &whitenoise.shared.database)
             .await;
 
         assert!(result.is_ok());
@@ -1562,12 +1596,12 @@ mod tests {
         assert_eq!(newly_created.len(), 100);
 
         // Verify all follows were created using proper API
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 100);
 
         // Verify all users were created (100 contacts + 1 account user = 101 total)
         let user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
-            .fetch_one(&whitenoise.database.pool)
+            .fetch_one(&whitenoise.shared.database.pool)
             .await
             .unwrap();
         assert_eq!(user_count, 101);
@@ -1626,11 +1660,12 @@ mod tests {
         };
 
         // Save the account
-        let result = account.save(&whitenoise.database).await;
+        let result = account.save(&whitenoise.shared.database).await;
         assert!(result.is_ok());
 
         // Load the account back and verify account_type is preserved
-        let loaded_account = Account::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_account =
+            Account::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_account.is_ok());
 
         let loaded = loaded_account.unwrap();
@@ -1661,7 +1696,7 @@ mod tests {
         };
 
         // Save the account
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Create a user to follow
         let user_pubkey = nostr_sdk::Keys::generate().public_key();
@@ -1675,23 +1710,26 @@ mod tests {
             metadata_known_at: None,
             updated_at: test_timestamp,
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Load the account and add a follow relationship
-        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.database)
+        let saved_account = Account::find_by_pubkey(&account_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.database)
+        let saved_user = User::find_by_pubkey(&user_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         saved_account
-            .follow_user(&saved_user, &whitenoise.database)
+            .follow_user(&saved_user, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Verify the external account can have follows
-        let follows = saved_account.follows(&whitenoise.database).await.unwrap();
+        let follows = saved_account
+            .follows(&whitenoise.shared.database)
+            .await
+            .unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, user_pubkey);
 
@@ -1703,21 +1741,21 @@ mod tests {
     async fn test_delete_account_success() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
-        let saved = account.save(&whitenoise.database).await.unwrap();
+        let saved = account.save(&whitenoise.shared.database).await.unwrap();
 
         // Verify it exists.
         assert!(
-            Account::find_by_pubkey(&saved.pubkey, &whitenoise.database)
+            Account::find_by_pubkey(&saved.pubkey, &whitenoise.shared.database)
                 .await
                 .is_ok()
         );
 
         // Delete it.
-        saved.delete(&whitenoise.database).await.unwrap();
+        saved.delete(&whitenoise.shared.database).await.unwrap();
 
         // Verify it's gone.
         assert!(
-            Account::find_by_pubkey(&saved.pubkey, &whitenoise.database)
+            Account::find_by_pubkey(&saved.pubkey, &whitenoise.shared.database)
                 .await
                 .is_err()
         );
@@ -1739,7 +1777,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let result = account.delete(&whitenoise.database).await;
+        let result = account.delete(&whitenoise.shared.database).await;
         assert!(result.is_err());
         assert!(
             matches!(result.unwrap_err(), WhitenoiseError::AccountNotFound),

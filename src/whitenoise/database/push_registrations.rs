@@ -188,7 +188,7 @@ mod tests {
             "token-a",
             &first_server,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -206,7 +206,7 @@ mod tests {
             "token-b",
             &second_server,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -218,7 +218,7 @@ mod tests {
         assert!(replaced.updated_at >= created.updated_at);
 
         let stored =
-            PushRegistration::find_by_account_pubkey(&account.pubkey, &whitenoise.database)
+            PushRegistration::find_by_account_pubkey(&account.pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .unwrap();
@@ -238,7 +238,7 @@ mod tests {
             "token-one",
             &server_pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -248,25 +248,31 @@ mod tests {
             "token-two",
             &server_pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let deleted =
-            PushRegistration::delete_by_account_pubkey(&account_one.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+        let deleted = PushRegistration::delete_by_account_pubkey(
+            &account_one.pubkey,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(deleted);
 
-        let account_one_registration =
-            PushRegistration::find_by_account_pubkey(&account_one.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
-        let account_two_registration =
-            PushRegistration::find_by_account_pubkey(&account_two.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+        let account_one_registration = PushRegistration::find_by_account_pubkey(
+            &account_one.pubkey,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let account_two_registration = PushRegistration::find_by_account_pubkey(
+            &account_two.pubkey,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(account_one_registration.is_none());
         assert_eq!(account_two_registration.unwrap().raw_token, "token-two");
@@ -285,7 +291,7 @@ mod tests {
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -298,7 +304,7 @@ mod tests {
         )
         .bind(shared_at_ms)
         .bind(account.pubkey.to_hex())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -310,7 +316,7 @@ mod tests {
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -322,7 +328,7 @@ mod tests {
             "token-b",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -342,7 +348,7 @@ mod tests {
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -355,7 +361,7 @@ mod tests {
         )
         .bind(updated_at_ms)
         .bind(account.pubkey.to_hex())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -367,7 +373,7 @@ mod tests {
             "token-a",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -379,7 +385,7 @@ mod tests {
             "token-b",
             &server_pubkey,
             Some(&relay_hint),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -398,7 +404,7 @@ mod tests {
             "   ",
             &server_pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap_err();

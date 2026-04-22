@@ -125,7 +125,7 @@ impl Whitenoise {
     /// theme preferences and other UI configuration. If no settings exist
     /// in the database, default settings will be created and saved.
     pub async fn app_settings(&self) -> Result<AppSettings> {
-        AppSettings::find_or_create_default(&self.database).await
+        AppSettings::find_or_create_default(&self.shared.database).await
     }
 
     /// Updates only the theme mode in the application settings.
@@ -139,7 +139,7 @@ impl Whitenoise {
     ///
     /// * `theme_mode` - The new [`ThemeMode`] to set (Light, Dark, or System)
     pub async fn update_theme_mode(&self, theme_mode: ThemeMode) -> Result<()> {
-        AppSettings::update_theme_mode(theme_mode, &self.database).await
+        AppSettings::update_theme_mode(theme_mode, &self.shared.database).await
     }
 
     /// Updates only the language in the application settings.
@@ -148,7 +148,7 @@ impl Whitenoise {
     ///
     /// * `language` - The new [`Language`] to set
     pub async fn update_language(&self, language: Language) -> Result<()> {
-        AppSettings::update_language(language, &self.database).await
+        AppSettings::update_language(language, &self.shared.database).await
     }
 }
 

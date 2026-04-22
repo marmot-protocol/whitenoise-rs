@@ -46,7 +46,7 @@ impl Task for ConsumedKeyPackageCleanup {
             "Starting consumed key package cleanup"
         );
 
-        let accounts = Account::all(&whitenoise.database).await?;
+        let accounts = Account::all(&whitenoise.shared.database).await?;
 
         if accounts.is_empty() {
             tracing::debug!(
@@ -121,7 +121,7 @@ async fn cleanup_consumed_key_packages(
     let eligible = PublishedKeyPackage::find_eligible_for_cleanup(
         &account.pubkey,
         CONSUMED_KP_QUIET_PERIOD_SECS,
-        &whitenoise.database,
+        &whitenoise.shared.database,
     )
     .await?;
 
@@ -144,7 +144,7 @@ async fn cleanup_consumed_key_packages(
             Ok(()) => {
                 if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
                     consumed.id,
-                    &whitenoise.database,
+                    &whitenoise.shared.database,
                 )
                 .await
                 {

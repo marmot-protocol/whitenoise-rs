@@ -41,12 +41,13 @@ impl Whitenoise {
 
         let contacts = crate::nostr_manager::utils::pubkeys_from_event(&event);
         let newly_created = account
-            .update_follows_from_event(contacts.clone(), &self.database)
+            .update_follows_from_event(contacts.clone(), &self.shared.database)
             .await?;
 
         self.schedule_background_user_fetch(session, &contacts);
 
-        self.event_tracker
+        self.shared
+            .event_tracker
             .track_processed_account_event(&event, &account.pubkey)
             .await?;
 
@@ -63,7 +64,7 @@ impl Whitenoise {
 
     #[perf_instrument("event_handlers")]
     async fn should_skip_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
-        if ProcessedEvent::exists(&event.id, Some(account_id), &self.database).await? {
+        if ProcessedEvent::exists(&event.id, Some(account_id), &self.shared.database).await? {
             tracing::debug!(
                 target: "whitenoise::handle_contact_list",
                 "Skipping already processed event {}",
@@ -83,7 +84,8 @@ impl Whitenoise {
     async fn is_stale_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
         let event_time = timestamp_to_datetime(event.created_at)?;
         let newest_time =
-            ProcessedEvent::newest_contact_list_timestamp(account_id, &self.database).await?;
+            ProcessedEvent::newest_contact_list_timestamp(account_id, &self.shared.database)
+                .await?;
 
         match newest_time {
             Some(newest) if event_time.timestamp_millis() <= newest.timestamp_millis() => {
@@ -134,7 +136,7 @@ impl Whitenoise {
                 total,
             );
 
-            whitenoise.discovery_sync_worker.request_rebuild();
+            whitenoise.shared.discovery_sync_worker.request_rebuild();
 
             let fetched = Self::fetch_users_batch(whitenoise, &pubkeys, cancel_rx).await;
 
@@ -160,6 +162,7 @@ impl Whitenoise {
         unique_pubkeys.dedup();
 
         let Some(context_relay) = whitenoise
+            .shared
             .relay_control
             .discovery()
             .relays()
@@ -193,7 +196,7 @@ impl Whitenoise {
                 } else {
                     tokio::select! {
                         result = whitenoise
-                            .relay_control
+                            .shared.relay_control
                             .discovery()
                             .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT) => Some(result),
                         _ = cancel_rx.changed() => {
@@ -208,6 +211,7 @@ impl Whitenoise {
             } else {
                 Some(
                     whitenoise
+                        .shared
                         .relay_control
                         .discovery()
                         .fetch_events(filter, CONTACT_LIST_CATCH_UP_TIMEOUT)
@@ -316,6 +320,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -334,7 +339,7 @@ mod tests {
             .unwrap();
 
         // Verify follows were created and deduplicated
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 2, "Duplicates should be deduplicated");
 
         let follow_pubkeys: Vec<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
@@ -344,14 +349,14 @@ mod tests {
         // Verify event was tracked as processed
         let account_id = account.id.unwrap();
         assert!(
-            ProcessedEvent::exists(&event.id, Some(account_id), &whitenoise.database)
+            ProcessedEvent::exists(&event.id, Some(account_id), &whitenoise.shared.database)
                 .await
                 .unwrap()
         );
 
         // Verify timestamp was recorded for future ordering checks
         let newest_timestamp =
-            ProcessedEvent::newest_contact_list_timestamp(account_id, &whitenoise.database)
+            ProcessedEvent::newest_contact_list_timestamp(account_id, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .unwrap();
@@ -368,6 +373,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -386,7 +392,7 @@ mod tests {
             .unwrap();
 
         // Should still have exactly 1 follow
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 1);
     }
 
@@ -396,6 +402,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -423,7 +430,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, current_contact, "Older event ignored");
 
@@ -435,7 +442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(
             follows[0].pubkey, current_contact,
@@ -449,6 +456,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -467,7 +475,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            account.follows(&whitenoise.database).await.unwrap().len(),
+            account
+                .follows(&whitenoise.shared.database)
+                .await
+                .unwrap()
+                .len(),
             1
         );
 
@@ -478,7 +490,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.database).await.unwrap();
+        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, second_contact);
 
@@ -491,7 +503,7 @@ mod tests {
 
         assert!(
             account
-                .follows(&whitenoise.database)
+                .follows(&whitenoise.shared.database)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -506,6 +518,7 @@ mod tests {
         let account1 = whitenoise.create_identity().await.unwrap();
         let session1 = whitenoise.require_session(&account1.pubkey).unwrap();
         let keys1 = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account1.pubkey)
             .unwrap();
@@ -513,6 +526,7 @@ mod tests {
         let account2 = whitenoise.create_identity().await.unwrap();
         let session2 = whitenoise.require_session(&account2.pubkey).unwrap();
         let keys2 = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account2.pubkey)
             .unwrap();
@@ -537,8 +551,8 @@ mod tests {
             .await
             .unwrap();
 
-        let follows1 = account1.follows(&whitenoise.database).await.unwrap();
-        let follows2 = account2.follows(&whitenoise.database).await.unwrap();
+        let follows1 = account1.follows(&whitenoise.shared.database).await.unwrap();
+        let follows2 = account2.follows(&whitenoise.shared.database).await.unwrap();
 
         assert_eq!(follows1.len(), 1);
         assert_eq!(follows2.len(), 1);
@@ -569,6 +583,7 @@ mod tests {
         };
 
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&real_account.pubkey)
             .unwrap();

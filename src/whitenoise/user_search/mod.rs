@@ -1184,7 +1184,7 @@ async fn process_tier4_result(
                 pk,
                 &Metadata::new(),
                 CONFIDENT_CACHE_TTL_MS,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         } else {
@@ -1387,7 +1387,7 @@ fn process_tier5_result(
             // Confirmed absent on all known relays — cache empty.
             // Spawn so we don't block the select loop on a DB write.
             let pk = result.pubkey;
-            let db = whitenoise.database.clone();
+            let db = whitenoise.shared.database.clone();
             tokio::spawn(async move {
                 let _ = CachedGraphUser::upsert_metadata_only(
                     &pk,
@@ -1415,7 +1415,7 @@ fn process_tier5_result(
                 // Unlike confident misses (EOSE), relay errors are transient, so
                 // we use a shorter TTL to allow re-discovery soon.
                 let pk = result.pubkey;
-                let db = whitenoise.database.clone();
+                let db = whitenoise.shared.database.clone();
                 tokio::spawn(async move {
                     let _ = CachedGraphUser::upsert_metadata_only(
                         &pk,
@@ -1880,7 +1880,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Now follow this user
         whitenoise
@@ -1920,14 +1920,14 @@ mod tests {
             Some(Metadata::new().name("User1")),
             Some(vec![target_keys.public_key()]),
         );
-        cached1.upsert(&whitenoise.database).await.unwrap();
+        cached1.upsert(&whitenoise.shared.database).await.unwrap();
 
         let cached2 = CachedGraphUser::new(
             user2.public_key(),
             Some(Metadata::new().name("User2")),
             Some(vec![target_keys.public_key()]),
         );
-        cached2.upsert(&whitenoise.database).await.unwrap();
+        cached2.upsert(&whitenoise.shared.database).await.unwrap();
 
         // Follow both users
         whitenoise
@@ -1945,7 +1945,10 @@ mod tests {
             Some(Metadata::new().name("DedupeTarget")),
             Some(vec![]),
         );
-        target_cached.upsert(&whitenoise.database).await.unwrap();
+        target_cached
+            .upsert(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Search at radius 2 should find target only once
         let updates = run_search(&whitenoise, "dedupetarget", account.pubkey, 2, 2).await;
@@ -2230,7 +2233,7 @@ mod tests {
         // Create a cached user with empty metadata (confirmed absent)
         let pk = random_pk();
         let cached = CachedGraphUser::new(pk, Some(Metadata::new()), Some(vec![]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let (tx_broadcast, _rx_broadcast) = broadcast::channel(100);
         let (tx_in, rx_in) = mpsc::channel(10);
@@ -2542,7 +2545,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let unknown_pk = random_pk();
 
@@ -2600,7 +2603,7 @@ mod tests {
             Some(Metadata::new().name("CachedHit")),
             Some(vec![]),
         );
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let unknown_pk = random_pk();
 
@@ -2668,7 +2671,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Follow the user
         whitenoise
@@ -2682,7 +2685,7 @@ mod tests {
             Some(Metadata::new().name("aleups").display_name("Aleups")),
             Some(vec![]),
         );
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -2719,7 +2722,10 @@ mod tests {
             Some(Metadata::new().name("SeedUser")),
             Some(vec![discoverable_pk]),
         );
-        cached_seed.upsert(&whitenoise.database).await.unwrap();
+        cached_seed
+            .upsert(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Pre-populate the discoverable user's metadata
         let cached_target = CachedGraphUser::new(
@@ -2727,7 +2733,10 @@ mod tests {
             Some(Metadata::new().name("FallbackTarget")),
             Some(vec![]),
         );
-        cached_target.upsert(&whitenoise.database).await.unwrap();
+        cached_target
+            .upsert(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Search at radius 0-2: radius 1 should be empty, triggering fallback
         let updates = run_search(&whitenoise, "fallbacktarget", account.pubkey, 0, 2).await;
@@ -2757,7 +2766,10 @@ mod tests {
             Some(Metadata::new().name("SeedAccount")),
             Some(vec![]),
         );
-        cached_seed.upsert(&whitenoise.database).await.unwrap();
+        cached_seed
+            .upsert(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         let updates = run_search(&whitenoise, "seedaccount", account.pubkey, 0, 2).await;
 
@@ -2791,7 +2803,10 @@ mod tests {
             Some(Metadata::new().name("SeedAccount")),
             Some(vec![]),
         );
-        cached_seed.upsert(&whitenoise.database).await.unwrap();
+        cached_seed
+            .upsert(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         let updates = run_search(&whitenoise, "seedaccount", account.pubkey, 0, 2).await;
 

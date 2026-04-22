@@ -35,12 +35,16 @@ impl Whitenoise {
         fallback_account: &Account,
         context: &'static str,
     ) -> Result<Vec<Relay>> {
-        let inbox_relays = member.relays(RelayType::Inbox, &self.database).await?;
+        let inbox_relays = member
+            .relays(RelayType::Inbox, &self.shared.database)
+            .await?;
         if !inbox_relays.is_empty() {
             return Ok(inbox_relays);
         }
 
-        let nip65_relays = member.relays(RelayType::Nip65, &self.database).await?;
+        let nip65_relays = member
+            .relays(RelayType::Nip65, &self.shared.database)
+            .await?;
         if !nip65_relays.is_empty() {
             return Ok(nip65_relays);
         }
@@ -74,7 +78,7 @@ impl Whitenoise {
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
-        let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
+        let (user, created) = User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
         if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
                 target: "whitenoise::groups",
@@ -269,6 +273,7 @@ impl Whitenoise {
                             Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
                         whitenoise
+                            .shared
                             .relay_control
                             .publish_welcome(
                                 &member_pubkey,
@@ -428,7 +433,8 @@ impl Whitenoise {
         let mut users = Vec::new();
 
         for pk in members.iter() {
-            let (user, newly_created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
+            let (user, newly_created) =
+                User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
 
             if newly_created && let Err(e) = user.update_relay_lists(self).await {
                 tracing::warn!(
@@ -438,7 +444,9 @@ impl Whitenoise {
                     e
                 );
             }
-            let mut relays_to_use = user.relays(RelayType::KeyPackage, &self.database).await?;
+            let mut relays_to_use = user
+                .relays(RelayType::KeyPackage, &self.shared.database)
+                .await?;
             if relays_to_use.is_empty() {
                 tracing::warn!(
                     target: "whitenoise::accounts::groups::add_members_to_group",
@@ -449,6 +457,7 @@ impl Whitenoise {
             }
             let relays_to_use_urls = Relay::urls(&relays_to_use);
             let some_event = self
+                .shared
                 .relay_control
                 .fetch_user_key_package(*pk, &relays_to_use_urls)
                 .await?;
@@ -517,7 +526,8 @@ impl Whitenoise {
 
             let relay_urls = Relay::urls(&relays_to_use);
 
-            self.relay_control
+            self.shared
+                .relay_control
                 .publish_welcome(
                     &member_pubkey,
                     welcome_rumor.clone(),
@@ -694,11 +704,12 @@ mod tests {
         let mut member_pubkeys = Vec::new();
         for _ in 0..2 {
             let member_account = whitenoise.create_identity().await.unwrap();
-            let member_user = User::find_by_pubkey(&member_account.pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+            let member_user =
+                User::find_by_pubkey(&member_account.pubkey, &whitenoise.shared.database)
+                    .await
+                    .unwrap();
             creator_account
-                .follow_user(&member_user, &whitenoise.database)
+                .follow_user(&member_user, &whitenoise.shared.database)
                 .await
                 .unwrap();
             member_pubkeys.push(member_account.pubkey);
@@ -1248,9 +1259,12 @@ mod tests {
         relay_type: RelayType,
         relay_urls: &[&str],
     ) -> Vec<RelayUrl> {
-        let existing_relays = user.relays(relay_type, &whitenoise.database).await.unwrap();
+        let existing_relays = user
+            .relays(relay_type, &whitenoise.shared.database)
+            .await
+            .unwrap();
         for relay in existing_relays {
-            user.remove_relay(&relay, relay_type, &whitenoise.database)
+            user.remove_relay(&relay, relay_type, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -1262,7 +1276,7 @@ mod tests {
                 .find_or_create_relay_by_url(&relay_url)
                 .await
                 .unwrap();
-            user.add_relay(&relay, relay_type, &whitenoise.database)
+            user.add_relay(&relay, relay_type, &whitenoise.shared.database)
                 .await
                 .unwrap();
             configured_urls.push(relay_url);
@@ -1277,7 +1291,10 @@ mod tests {
         let fallback_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
 
-        let fallback_user = fallback_account.user(&whitenoise.database).await.unwrap();
+        let fallback_user = fallback_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(
             &whitenoise,
             &fallback_user,
@@ -1286,7 +1303,10 @@ mod tests {
         )
         .await;
 
-        let member_user = member_account.user(&whitenoise.database).await.unwrap();
+        let member_user = member_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(
             &whitenoise,
             &member_user,
@@ -1323,7 +1343,10 @@ mod tests {
         let fallback_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
 
-        let fallback_user = fallback_account.user(&whitenoise.database).await.unwrap();
+        let fallback_user = fallback_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(
             &whitenoise,
             &fallback_user,
@@ -1332,7 +1355,10 @@ mod tests {
         )
         .await;
 
-        let member_user = member_account.user(&whitenoise.database).await.unwrap();
+        let member_user = member_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         let nip65_urls = set_user_relays(
             &whitenoise,
             &member_user,
@@ -1360,11 +1386,17 @@ mod tests {
         let fallback_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
 
-        let member_user = member_account.user(&whitenoise.database).await.unwrap();
+        let member_user = member_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(&whitenoise, &member_user, RelayType::Inbox, &[]).await;
         set_user_relays(&whitenoise, &member_user, RelayType::Nip65, &[]).await;
 
-        let fallback_user = fallback_account.user(&whitenoise.database).await.unwrap();
+        let fallback_user = fallback_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         let fallback_urls = set_user_relays(
             &whitenoise,
             &fallback_user,
@@ -1391,11 +1423,17 @@ mod tests {
         let fallback_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
 
-        let member_user = member_account.user(&whitenoise.database).await.unwrap();
+        let member_user = member_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(&whitenoise, &member_user, RelayType::Inbox, &[]).await;
         set_user_relays(&whitenoise, &member_user, RelayType::Nip65, &[]).await;
 
-        let fallback_user = fallback_account.user(&whitenoise.database).await.unwrap();
+        let fallback_user = fallback_account
+            .user(&whitenoise.shared.database)
+            .await
+            .unwrap();
         set_user_relays(&whitenoise, &fallback_user, RelayType::Nip65, &[]).await;
 
         let error = whitenoise
@@ -1478,7 +1516,7 @@ mod tests {
         sqlx::query("DELETE FROM accounts_groups WHERE account_pubkey = ? AND mls_group_id = ?")
             .bind(account.pubkey.to_hex())
             .bind(group.mls_group_id.as_slice())
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
 
@@ -1918,7 +1956,7 @@ mod tests {
 
         // Verify the nostr_key (upload keypair) was stored in the database
         let media_file = crate::whitenoise::database::media_files::MediaFile::find_by_hash(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &hash,
         )
         .await

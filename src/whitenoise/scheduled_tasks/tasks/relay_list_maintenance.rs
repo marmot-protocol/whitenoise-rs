@@ -46,7 +46,7 @@ impl Task for RelayListMaintenance {
             "Starting relay list maintenance"
         );
 
-        let accounts = Account::all(&whitenoise.database).await?;
+        let accounts = Account::all(&whitenoise.shared.database).await?;
 
         if accounts.is_empty() {
             tracing::debug!(
@@ -183,6 +183,7 @@ async fn check_and_republish(
 
     // 3. Query the network for the existing relay list event
     let network_event = match whitenoise
+        .shared
         .relay_control
         .fetch_user_relays(account.pubkey, relay_type, &source_urls)
         .await
@@ -237,6 +238,7 @@ async fn check_and_republish(
     let target_urls = Relay::urls(&source_relays);
 
     match whitenoise
+        .shared
         .relay_control
         .publish_relay_list_with_signer(&relay_urls, relay_type, &target_urls, signer)
         .await
@@ -278,6 +280,7 @@ mod tests {
 
         loop {
             match whitenoise
+                .shared
                 .relay_control
                 .fetch_user_relays(account.pubkey, relay_type, source_urls)
                 .await
@@ -412,6 +415,7 @@ mod tests {
 
         // Verify relay lists are still discoverable after maintenance (unchanged)
         let inbox_after = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_urls)
             .await
@@ -422,6 +426,7 @@ mod tests {
         );
 
         let kp_after = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_urls)
             .await
@@ -448,7 +453,7 @@ mod tests {
         let account = Account::new_external(whitenoise, keys.public_key())
             .await
             .unwrap();
-        let account = account.save(&whitenoise.database).await.unwrap();
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
 
         // Verify no local relays exist
         let inbox = account.inbox_relays(whitenoise).await.unwrap();

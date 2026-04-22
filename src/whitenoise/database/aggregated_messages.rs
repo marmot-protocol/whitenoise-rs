@@ -1671,7 +1671,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count, 0);
@@ -1682,9 +1682,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let ids = AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let ids =
+            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert!(ids.is_empty());
     }
 
@@ -1698,7 +1699,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1709,19 +1710,23 @@ mod tests {
     async fn test_insert_message() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(1, author);
 
         // Insert message
-        let result =
-            AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-                .await;
+        let result = AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await;
         assert!(result.is_ok());
 
         // Verify it was inserted
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -1731,7 +1736,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1744,7 +1749,7 @@ mod tests {
     async fn test_insert_multiple_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[2; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -1753,13 +1758,18 @@ mod tests {
         for i in 1..=3 {
             let message = create_test_chat_message(i, author);
             message_ids.push(message.id.clone());
-            AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &message,
+                &group_id,
+                &author,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
         }
 
         // Verify count
-        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+        let count = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count, 3);
@@ -1769,7 +1779,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1777,7 +1787,7 @@ mod tests {
 
         // Verify event IDs
         let event_ids =
-            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(event_ids.len(), 3);
@@ -1790,19 +1800,25 @@ mod tests {
     async fn test_mark_deleted_does_not_decrease_count() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[3; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message
         let message = create_test_chat_message(10, author);
-        AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        let count_before = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let count_before =
+            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(count_before, 1);
 
         // Mark as deleted - need a valid 64-char hex ID
@@ -1811,13 +1827,13 @@ mod tests {
             &message.id,
             &group_id,
             &deletion_event_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         // Count should remain the same - mark_deleted doesn't remove the row
-        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count_after, 1);
@@ -1827,7 +1843,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1839,39 +1855,55 @@ mod tests {
     async fn test_delete_by_group_removes_all_events() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[4; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert multiple messages
         let message1 = create_test_chat_message(20, author);
-        AggregatedMessage::insert_message(&message1, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message1,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let message2 = create_test_chat_message(21, author);
-        AggregatedMessage::insert_message(&message2, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message2,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let message3 = create_test_chat_message(22, author);
-        AggregatedMessage::insert_message(&message3, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message3,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Verify count before deletion
-        let count_before = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let count_before =
+            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(count_before, 3);
 
         // Delete all events for the group
-        AggregatedMessage::delete_by_group(&group_id, &whitenoise.database)
+        AggregatedMessage::delete_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Count should now be zero
-        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
+        let count_after = AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count_after, 0);
@@ -1881,7 +1913,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1889,7 +1921,7 @@ mod tests {
 
         // No event IDs should be found
         let event_ids =
-            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.database)
+            AggregatedMessage::get_all_event_ids_by_group(&group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert!(event_ids.is_empty());
@@ -1900,36 +1932,46 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id_1 = GroupId::from_slice(&[5; 32]);
         let group_id_2 = GroupId::from_slice(&[6; 32]);
-        setup_group(&group_id_1, &whitenoise.database).await;
-        setup_group(&group_id_2, &whitenoise.database).await;
+        setup_group(&group_id_1, &whitenoise.shared.database).await;
+        setup_group(&group_id_2, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert message in group 1
         let message1 = create_test_chat_message(30, author);
-        AggregatedMessage::insert_message(&message1, &group_id_1, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message1,
+            &group_id_1,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Insert message in group 2
         let message2 = create_test_chat_message(31, author);
-        AggregatedMessage::insert_message(&message2, &group_id_2, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message2,
+            &group_id_2,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Delete group 1
-        AggregatedMessage::delete_by_group(&group_id_1, &whitenoise.database)
+        AggregatedMessage::delete_by_group(&group_id_1, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Group 1 should be empty
-        let count_1 = AggregatedMessage::count_by_group(&group_id_1, &whitenoise.database)
+        let count_1 = AggregatedMessage::count_by_group(&group_id_1, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count_1, 0);
 
         // Group 2 should still have its message
-        let count_2 = AggregatedMessage::count_by_group(&group_id_2, &whitenoise.database)
+        let count_2 = AggregatedMessage::count_by_group(&group_id_2, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(count_2, 1);
@@ -1939,15 +1981,20 @@ mod tests {
     async fn test_update_reactions() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[7; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message with empty reactions
         let message = create_test_chat_message(40, author);
-        AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Update with reactions
         let mut reactions = ReactionSummary::default();
@@ -1964,7 +2011,7 @@ mod tests {
             &message.id,
             &group_id,
             &reactions,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1974,7 +2021,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1987,7 +2034,7 @@ mod tests {
     async fn test_find_last_by_group_ids_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let result = AggregatedMessage::find_last_by_group_ids(&[], &whitenoise.database)
+        let result = AggregatedMessage::find_last_by_group_ids(&[], &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -2011,7 +2058,7 @@ mod tests {
             &group_empty,
             &group_multiple_messages,
         ] {
-            setup_group(group_id, &whitenoise.database).await;
+            setup_group(group_id, &whitenoise.shared.database).await;
         }
 
         let author = Keys::generate().public_key();
@@ -2057,7 +2104,7 @@ mod tests {
             &msg_with_media,
             &group_with_media,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2069,7 +2116,7 @@ mod tests {
             &msg_no_media,
             &group_no_media,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2082,7 +2129,7 @@ mod tests {
             &msg_older,
             &group_with_deletion,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2094,7 +2141,7 @@ mod tests {
             &msg_deleted,
             &group_with_deletion,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2102,7 +2149,7 @@ mod tests {
             &msg_deleted.id,
             &group_with_deletion,
             &format!("{:0>64}", "del"),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2117,7 +2164,7 @@ mod tests {
             &msg_first,
             &group_multiple_messages,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2129,7 +2176,7 @@ mod tests {
             &msg_last,
             &group_multiple_messages,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2143,7 +2190,7 @@ mod tests {
                 group_empty.clone(),
                 group_multiple_messages.clone(),
             ],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2182,16 +2229,21 @@ mod tests {
     async fn test_find_by_message_id_returns_message() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[70; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(70, author);
-        AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let event_id = EventId::from_hex(&message.id).unwrap();
-        let found = AggregatedMessage::find_by_message_id(&event_id, &whitenoise.database)
+        let found = AggregatedMessage::find_by_message_id(&event_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2206,7 +2258,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let fake_id = EventId::all_zeros();
 
-        let found = AggregatedMessage::find_by_message_id(&fake_id, &whitenoise.database)
+        let found = AggregatedMessage::find_by_message_id(&fake_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2217,20 +2269,29 @@ mod tests {
     async fn test_count_unread_for_group_no_read_marker_returns_all() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[80; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         for i in 1..=3 {
             let msg = create_test_chat_message(80 + i, author);
-            AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &msg,
+                &group_id,
+                &author,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
         }
 
-        let count =
-            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database, None)
-                .await
-                .unwrap();
+        let count = AggregatedMessage::count_unread_for_group(
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count, 3);
     }
@@ -2239,16 +2300,21 @@ mod tests {
     async fn test_count_unread_for_group_with_read_marker() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[90; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let mut messages = Vec::new();
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(90 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &msg,
+                &group_id,
+                &author,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
             messages.push(msg);
         }
 
@@ -2257,7 +2323,7 @@ mod tests {
         let count = AggregatedMessage::count_unread_for_group(
             &group_id,
             Some(&read_marker_id),
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -2270,15 +2336,15 @@ mod tests {
     async fn test_count_unread_for_group_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[100; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(100, author);
         let msg2 = create_test_chat_message(101, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2287,15 +2353,19 @@ mod tests {
             &msg2.id,
             &group_id,
             &format!("{:0>64}", "del"),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let count =
-            AggregatedMessage::count_unread_for_group(&group_id, None, &whitenoise.database, None)
-                .await
-                .unwrap();
+        let count = AggregatedMessage::count_unread_for_group(
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count, 1); // Only msg1 counted
     }
@@ -2304,7 +2374,7 @@ mod tests {
     async fn test_count_unread_for_groups_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let result = AggregatedMessage::count_unread_for_groups(&[], &whitenoise.database)
+        let result = AggregatedMessage::count_unread_for_groups(&[], &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2320,7 +2390,7 @@ mod tests {
         let group3 = GroupId::from_slice(&[112; 32]); // Empty group
 
         for group_id in [&group1, &group2, &group3] {
-            setup_group(group_id, &whitenoise.database).await;
+            setup_group(group_id, &whitenoise.shared.database).await;
         }
 
         let author = Keys::generate().public_key();
@@ -2328,7 +2398,7 @@ mod tests {
         // Group 1: 3 messages
         for i in 1..=3 {
             let msg = create_test_chat_message(110 + i, author);
-            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -2336,7 +2406,7 @@ mod tests {
         // Group 2: 5 messages
         for i in 1..=5 {
             let msg = create_test_chat_message(120 + i, author);
-            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -2349,9 +2419,10 @@ mod tests {
             (group3.clone(), None, None),
         ];
 
-        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[&group1], 3);
@@ -2367,7 +2438,7 @@ mod tests {
         let group2 = GroupId::from_slice(&[131; 32]);
 
         for group_id in [&group1, &group2] {
-            setup_group(group_id, &whitenoise.database).await;
+            setup_group(group_id, &whitenoise.shared.database).await;
         }
 
         let author = Keys::generate().public_key();
@@ -2377,7 +2448,7 @@ mod tests {
         for i in 1..=5u8 {
             let mut msg = create_test_chat_message(130 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(&msg, &group1, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
             group1_messages.push(msg);
@@ -2389,7 +2460,7 @@ mod tests {
         for i in 1..=4u8 {
             let mut msg = create_test_chat_message(140 + i, author);
             msg.created_at = Timestamp::from(i as u64 * 1000);
-            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(&msg, &group2, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
             group2_messages.push(msg);
@@ -2401,9 +2472,10 @@ mod tests {
             (group2.clone(), Some(marker2), None),
         ];
 
-        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[&group1], 3); // Messages 3, 4, 5 unread
@@ -2419,7 +2491,7 @@ mod tests {
         let group_empty = GroupId::from_slice(&[152; 32]);
 
         for group_id in [&group_with_marker, &group_without_marker, &group_empty] {
-            setup_group(group_id, &whitenoise.database).await;
+            setup_group(group_id, &whitenoise.shared.database).await;
         }
 
         let author = Keys::generate().public_key();
@@ -2433,7 +2505,7 @@ mod tests {
                 &msg,
                 &group_with_marker,
                 &author,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -2448,7 +2520,7 @@ mod tests {
                 &msg,
                 &group_without_marker,
                 &author,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -2460,9 +2532,10 @@ mod tests {
             (group_empty.clone(), None, None),
         ];
 
-        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[&group_with_marker], 2); // Messages 3, 4 unread
@@ -2474,23 +2547,32 @@ mod tests {
     async fn test_update_delivery_status_and_find_by_id() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[200; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a message with Sending status
         let mut message = create_test_chat_message(200, author);
         message.delivery_status = Some(DeliveryStatus::Sending);
-        AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Verify initial Sending status via find_by_id
-        let found =
-            AggregatedMessage::find_by_id(&message.id, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(
+            &message.id,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sending));
 
         // Update to Sent(3) — returned message should have the updated status
@@ -2499,18 +2581,22 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Sent(3),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         assert_eq!(updated.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Verify via find_by_id as well
-        let found =
-            AggregatedMessage::find_by_id(&message.id, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(
+            &message.id,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(found.delivery_status, Some(DeliveryStatus::Sent(3)));
 
         // Update to Failed
@@ -2519,7 +2605,7 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Failed("timeout".to_string()),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2535,10 +2621,14 @@ mod tests {
         let group_id = GroupId::from_slice(&[201; 32]);
         let author = Keys::generate().public_key();
 
-        let found =
-            AggregatedMessage::find_by_id("nonexistent", &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(
+            "nonexistent",
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(found.is_none());
     }
 
@@ -2546,22 +2636,31 @@ mod tests {
     async fn test_insert_message_with_no_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[202; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let message = create_test_chat_message(202, author);
         // delivery_status is None (incoming message)
         assert!(message.delivery_status.is_none());
 
-        AggregatedMessage::insert_message(&message, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &message,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        let found =
-            AggregatedMessage::find_by_id(&message.id, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let found = AggregatedMessage::find_by_id(
+            &message.id,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(found.delivery_status, None);
     }
 
@@ -2569,28 +2668,38 @@ mod tests {
     async fn test_find_messages_by_group_preserves_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[203; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert incoming message (no delivery status)
         let msg_incoming = create_test_chat_message(203, author);
-        AggregatedMessage::insert_message(&msg_incoming, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &msg_incoming,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Insert outgoing message with Sent status
         let mut msg_outgoing = create_test_chat_message(204, author);
         msg_outgoing.delivery_status = Some(DeliveryStatus::Sent(2));
-        AggregatedMessage::insert_message(&msg_outgoing, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &msg_outgoing,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group(
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2606,7 +2715,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[205; 32]);
         let author = Keys::generate().public_key();
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         // Try to update delivery status for a message that doesn't exist
         let result = AggregatedMessage::update_delivery_status(
@@ -2614,7 +2723,7 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Sent(1),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await;
 
@@ -2634,35 +2743,50 @@ mod tests {
     async fn test_find_messages_by_group_excludes_retried() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[206; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
         // Insert a normal message
         let msg_normal = create_test_chat_message(206, author);
-        AggregatedMessage::insert_message(&msg_normal, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &msg_normal,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Insert a message with Retried status (simulating a retried failed message)
         let mut msg_retried = create_test_chat_message(207, author);
         msg_retried.delivery_status = Some(DeliveryStatus::Retried);
-        AggregatedMessage::insert_message(&msg_retried, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &msg_retried,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Insert a message with Failed status (should still be visible)
         let mut msg_failed = create_test_chat_message(208, author);
         msg_failed.delivery_status = Some(DeliveryStatus::Failed("error".to_string()));
-        AggregatedMessage::insert_message(&msg_failed, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &msg_failed,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group(
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2680,7 +2804,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let group_id = GroupId::from_slice(&[170; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(170, author);
@@ -2688,7 +2812,7 @@ mod tests {
         let msg3 = create_test_chat_message(172, author);
 
         for msg in [&msg1, &msg2, &msg3] {
-            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -2698,15 +2822,16 @@ mod tests {
             &msg2.id,
             &group_id,
             &format!("{:0>64}", "del"),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         let input = vec![(group_id.clone(), None, None)];
-        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(result[&group_id], 2); // msg1 and msg3, excluding deleted msg2
     }
@@ -2715,11 +2840,11 @@ mod tests {
     async fn test_insert_delivery_status_and_has_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[180; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(180, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2728,7 +2853,7 @@ mod tests {
             &msg.id,
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2740,7 +2865,7 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Sending,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2750,7 +2875,7 @@ mod tests {
             &msg.id,
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2758,7 +2883,7 @@ mod tests {
 
         // Verify it shows up in find_by_id
         let found =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.database)
+            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2769,11 +2894,11 @@ mod tests {
     async fn test_insert_delivery_status_upsert() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[181; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg = create_test_chat_message(181, author);
-        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2783,7 +2908,7 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Sending,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2794,13 +2919,13 @@ mod tests {
             &group_id,
             &author,
             &DeliveryStatus::Sent(2),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         let found =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.database)
+            AggregatedMessage::find_by_id(&msg.id, &group_id, &author, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2811,25 +2936,25 @@ mod tests {
     async fn test_unmark_deleted_reverses_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[182; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(182, author);
         let msg2 = create_test_chat_message(183, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let del_id = format!("{:0>64x}", 0xde1182u64);
 
         // Mark both as deleted by the same deletion event
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &whitenoise.database)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_id, &whitenoise.shared.database)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &whitenoise.database)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2838,7 +2963,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2848,7 +2973,7 @@ mod tests {
         );
 
         // Unmark — both should revert to not deleted
-        AggregatedMessage::unmark_deleted(&del_id, &group_id, &whitenoise.database)
+        AggregatedMessage::unmark_deleted(&del_id, &group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2856,7 +2981,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2871,30 +2996,30 @@ mod tests {
     async fn test_unmark_deleted_only_affects_matching_deletion() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[184; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let msg1 = create_test_chat_message(184, author);
         let msg2 = create_test_chat_message(185, author);
-        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg1, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
-        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg2, &group_id, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let del_a = format!("{:0>64x}", 0xde1au64);
         let del_b = format!("{:0>64x}", 0xde1bu64);
 
-        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &whitenoise.database)
+        AggregatedMessage::mark_deleted(&msg1.id, &group_id, &del_a, &whitenoise.shared.database)
             .await
             .unwrap();
-        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &whitenoise.database)
+        AggregatedMessage::mark_deleted(&msg2.id, &group_id, &del_b, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Unmark only del_a — msg1 should revert to not-deleted, msg2 stays deleted
-        AggregatedMessage::unmark_deleted(&del_a, &group_id, &whitenoise.database)
+        AggregatedMessage::unmark_deleted(&del_a, &group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2902,7 +3027,7 @@ mod tests {
             &group_id,
             &author,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2915,7 +3040,7 @@ mod tests {
     async fn test_find_orphaned_reactions_excludes_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[186; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         // Use valid hex IDs (find_orphaned_reactions parses message_id as EventId)
@@ -2943,28 +3068,39 @@ mod tests {
         .bind(&empty_tokens)
         .bind(&empty_reactions)
         .bind(&empty_media)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // The reaction should appear as orphaned
-        let orphans =
-            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let orphans = AggregatedMessage::find_orphaned_reactions(
+            &parent_id,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(orphans.len(), 1, "Non-deleted reaction should be found");
 
         // Now mark the reaction as deleted
         let del_id = format!("{:0>64x}", 0xde1186u64);
-        AggregatedMessage::mark_deleted(&reaction_id, &group_id, &del_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &reaction_id,
+            &group_id,
+            &del_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Deleted reaction should NOT appear as orphaned
-        let orphans =
-            AggregatedMessage::find_orphaned_reactions(&parent_id, &group_id, &whitenoise.database)
-                .await
-                .unwrap();
+        let orphans = AggregatedMessage::find_orphaned_reactions(
+            &parent_id,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(orphans.len(), 0, "Deleted reaction should be excluded");
     }
 
@@ -2978,7 +3114,7 @@ mod tests {
             "nonexistent",
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -3026,7 +3162,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -3040,7 +3176,7 @@ mod tests {
     async fn test_paginated_default_returns_up_to_50_newest() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[201; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
@@ -3052,7 +3188,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3061,7 +3197,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -3096,7 +3232,7 @@ mod tests {
     async fn test_paginated_before_cursor_excludes_on_or_after() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[202; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_100_000;
@@ -3108,7 +3244,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3120,7 +3256,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(cursor_ts),
                 before_message_id: Some(cursor_id.clone()),
@@ -3145,7 +3281,7 @@ mod tests {
     async fn test_paginated_limit_is_respected() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[203; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_200_000;
@@ -3156,7 +3292,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3164,7 +3300,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             Some(3),
             None,
@@ -3187,7 +3323,7 @@ mod tests {
     async fn test_paginated_limit_capped_at_200() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[204; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_300_000;
@@ -3201,7 +3337,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3210,7 +3346,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             Some(u32::MAX),
             None,
@@ -3225,7 +3361,7 @@ mod tests {
     async fn test_paginated_pages_are_contiguous_without_overlap_or_gap() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[205; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_400_000;
@@ -3237,7 +3373,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3246,7 +3382,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             Some(5),
             None,
@@ -3261,7 +3397,7 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(cursor_ts),
                 before_message_id: Some(cursor_id.to_string()),
@@ -3290,7 +3426,7 @@ mod tests {
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(cursor_ts2),
                 before_message_id: Some(cursor_id2.to_string()),
@@ -3312,7 +3448,7 @@ mod tests {
     async fn test_paginated_tied_timestamps_no_skip_or_duplicate_across_pages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[206; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -3322,18 +3458,32 @@ mod tests {
 
         // Seeds 1–6: all at `tie_ts` (identical created_at seconds)
         // Seeds 7–8: flanking timestamps to confirm ordering is correct
-        insert_message_at(7, author, tie_ts - 1, &group_id, &whitenoise.database).await; // earlier
+        insert_message_at(
+            7,
+            author,
+            tie_ts - 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await; // earlier
         for i in 1u8..=6 {
-            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.database).await;
+            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.shared.database).await;
         }
-        insert_message_at(8, author, tie_ts + 1, &group_id, &whitenoise.database).await; // later
+        insert_message_at(
+            8,
+            author,
+            tie_ts + 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await; // later
 
         // Total 8 messages. Page size 3 — three pages needed.
         // Page 1: newest 3
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             Some(3),
             None,
@@ -3348,7 +3498,7 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(c1_ts),
                 before_message_id: Some(c1_id.clone()),
@@ -3367,7 +3517,7 @@ mod tests {
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(c2_ts),
                 before_message_id: Some(c2_id.clone()),
@@ -3390,7 +3540,7 @@ mod tests {
         let page4 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(c3_ts),
                 before_message_id: Some(c3_id.clone()),
@@ -3442,7 +3592,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(ts),
                 ..Default::default()
@@ -3461,7 +3611,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before_message_id: Some(
                     "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -3490,7 +3640,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some("not-valid-hex-at-all".to_string()),
@@ -3510,7 +3660,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some("00000000000000000000000000000001".to_string()),
@@ -3533,7 +3683,7 @@ mod tests {
     async fn test_paginated_after_cursor_returns_only_newer_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[220; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_000_000;
@@ -3545,7 +3695,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3556,7 +3706,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3582,7 +3732,7 @@ mod tests {
     async fn test_paginated_after_cursor_returns_oldest_first() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[221; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_100_000;
@@ -3593,7 +3743,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3604,7 +3754,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3631,17 +3781,31 @@ mod tests {
     async fn test_paginated_after_cursor_tied_timestamps() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[222; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let tie_ts: u64 = 1_710_200_000;
 
         // Insert one message before the tie, six at tie_ts, one after
-        insert_message_at(7, author, tie_ts - 1, &group_id, &whitenoise.database).await;
+        insert_message_at(
+            7,
+            author,
+            tie_ts - 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await;
         for i in 1u8..=6 {
-            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.database).await;
+            insert_message_at(i, author, tie_ts, &group_id, &whitenoise.shared.database).await;
         }
-        insert_message_at(8, author, tie_ts + 1, &group_id, &whitenoise.database).await;
+        insert_message_at(
+            8,
+            author,
+            tie_ts + 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await;
 
         // Use the earliest message (seed 7, ts-1) as the after cursor
         let cursor_ts = Timestamp::from(tie_ts - 1);
@@ -3651,7 +3815,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3669,7 +3833,7 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(c1_ts),
                 after_message_id: Some(c1_id.clone()),
@@ -3687,7 +3851,7 @@ mod tests {
         let page3 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(c2_ts),
                 after_message_id: Some(c2_id.clone()),
@@ -3737,7 +3901,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(ts),
                 before_message_id: Some(id.to_string()),
@@ -3766,7 +3930,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(ts),
                 ..Default::default()
@@ -3785,7 +3949,7 @@ mod tests {
         let err = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after_message_id: Some(
                     "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
@@ -3807,7 +3971,7 @@ mod tests {
     async fn test_paginated_after_cursor_past_newest_returns_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[225; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_710_500_000;
@@ -3818,7 +3982,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3829,7 +3993,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 after: Some(cursor_ts),
                 after_message_id: Some(cursor_id.clone()),
@@ -3855,8 +4019,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_a = GroupId::from_slice(&[210; 32]);
         let group_b = GroupId::from_slice(&[211; 32]);
-        setup_group(&group_a, &whitenoise.database).await;
-        setup_group(&group_b, &whitenoise.database).await;
+        setup_group(&group_a, &whitenoise.shared.database).await;
+        setup_group(&group_b, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_701_000_000;
@@ -3868,7 +4032,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_a,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3878,7 +4042,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_b,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3886,7 +4050,7 @@ mod tests {
         let results_a = AggregatedMessage::find_messages_by_group_paginated(
             &group_a,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -3896,7 +4060,7 @@ mod tests {
         let results_b = AggregatedMessage::find_messages_by_group_paginated(
             &group_b,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -3922,7 +4086,7 @@ mod tests {
     async fn test_paginated_deleted_messages_are_included_as_tombstones() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[212; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_702_000_000;
@@ -3934,7 +4098,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -3942,14 +4106,19 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2_id,
+            &group_id,
+            &deletion_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -3981,7 +4150,7 @@ mod tests {
     async fn test_unread_minimum_deleted_messages_are_included_as_tombstones() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[214; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_702_000_000;
@@ -3993,7 +4162,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4001,9 +4170,14 @@ mod tests {
         // Delete seed-2 message
         let msg2_id = format!("{:0>64}", format!("{:x}", 2u8));
         let deletion_id = format!("{:0>64x}", 0xde1212u64);
-        AggregatedMessage::mark_deleted(&msg2_id, &group_id, &deletion_id, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::mark_deleted(
+            &msg2_id,
+            &group_id,
+            &deletion_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // No read marker → all non-deleted messages are unread (cnt=2), minimum=3
         // LIMIT = MAX(2, 3) = 3, so all 3 rows (including the tombstone) are returned.
@@ -4012,7 +4186,7 @@ mod tests {
             &author,
             None,
             3,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4040,13 +4214,20 @@ mod tests {
     async fn test_paginated_non_kind9_messages_are_excluded() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[213; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_703_000_000;
 
         // Insert one kind-9 message via the normal helper
-        insert_message_at(1, author, base_ts + 1, &group_id, &whitenoise.database).await;
+        insert_message_at(
+            1,
+            author,
+            base_ts + 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await;
 
         // Insert a kind-7 reaction row directly with raw SQL (insert_message always writes kind=9)
         let reaction_id = format!("{:0>64}", format!("{:x}", 200u8));
@@ -4068,14 +4249,14 @@ mod tests {
         .bind(&empty_tokens)
         .bind(&empty_reactions)
         .bind(&empty_media)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -4103,7 +4284,7 @@ mod tests {
     async fn test_paginated_uppercase_cursor_id_is_canonicalized() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[214; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_704_000_000;
@@ -4115,7 +4296,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4128,7 +4309,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(Timestamp::from(base_ts + 3)),
                 before_message_id: Some(uppercase_id.clone()),
@@ -4156,17 +4337,17 @@ mod tests {
     async fn test_paginated_single_message_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[215; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let ts: u64 = 1_705_000_000;
 
-        let msg = insert_message_at(1, author, ts, &group_id, &whitenoise.database).await;
+        let msg = insert_message_at(1, author, ts, &group_id, &whitenoise.shared.database).await;
 
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -4184,7 +4365,7 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
                 before_message_id: Some(page1[0].id.clone()),
@@ -4207,7 +4388,7 @@ mod tests {
     async fn test_paginated_exactly_default_limit_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[216; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_706_000_000;
@@ -4218,7 +4399,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4226,7 +4407,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -4243,7 +4424,7 @@ mod tests {
         let page2 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(page1[0].created_at),
                 before_message_id: Some(page1[0].id.clone()),
@@ -4266,7 +4447,7 @@ mod tests {
     async fn test_paginated_limit_one_traverses_all_messages() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[217; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_707_000_000;
@@ -4278,7 +4459,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4299,7 +4480,7 @@ mod tests {
             let page = AggregatedMessage::find_messages_by_group_paginated(
                 &group_id,
                 &author,
-                &whitenoise.database,
+                &whitenoise.shared.database,
                 &opts,
                 Some(1),
                 None,
@@ -4339,7 +4520,7 @@ mod tests {
     async fn test_paginated_cursor_at_oldest_message_yields_empty() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[218; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_708_000_000;
@@ -4351,7 +4532,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4360,7 +4541,7 @@ mod tests {
         let page1 = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -4374,7 +4555,7 @@ mod tests {
         let next_page = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions {
                 before: Some(oldest.created_at),
                 before_message_id: Some(oldest.id.clone()),
@@ -4399,13 +4580,20 @@ mod tests {
     async fn test_paginated_retried_messages_are_excluded() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[219; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_709_000_000;
 
         // Insert a normal message (seed 1) and a retried message (seed 2)
-        insert_message_at(1, author, base_ts + 1, &group_id, &whitenoise.database).await;
+        insert_message_at(
+            1,
+            author,
+            base_ts + 1,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await;
 
         let retried_msg = ChatMessage {
             id: format!("{:0>64}", format!("{:x}", 2u8)),
@@ -4422,14 +4610,19 @@ mod tests {
             media_attachments: vec![],
             delivery_status: Some(DeliveryStatus::Retried),
         };
-        AggregatedMessage::insert_message(&retried_msg, &group_id, &author, &whitenoise.database)
-            .await
-            .unwrap();
+        AggregatedMessage::insert_message(
+            &retried_msg,
+            &group_id,
+            &author,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             None,
@@ -4476,7 +4669,7 @@ mod tests {
     async fn test_search_messages_in_group() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[42; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
 
@@ -4494,7 +4687,7 @@ mod tests {
         ];
 
         for msg in &messages {
-            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.database)
+            AggregatedMessage::insert_message(msg, &group_id, &author, &whitenoise.shared.database)
                 .await
                 .unwrap();
         }
@@ -4505,7 +4698,7 @@ mod tests {
             &author,
             "hello",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4521,7 +4714,7 @@ mod tests {
             &author,
             "big plans",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4540,7 +4733,7 @@ mod tests {
             &author,
             "big",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4553,7 +4746,7 @@ mod tests {
             &author,
             "MARMOT",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4567,7 +4760,7 @@ mod tests {
             &author,
             "日本語",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4581,7 +4774,7 @@ mod tests {
             &author,
             "привет",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4594,7 +4787,7 @@ mod tests {
             &author,
             "नमस्ते",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4608,7 +4801,7 @@ mod tests {
             &author,
             "nonexistent",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4621,7 +4814,7 @@ mod tests {
             &author,
             "",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4636,7 +4829,7 @@ mod tests {
             &author,
             "",
             2,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4650,7 +4843,7 @@ mod tests {
     async fn test_search_same_timestamp_deterministic_ordering() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[99; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let same_ts = Timestamp::from(1_700_000_000u64);
@@ -4680,9 +4873,14 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &msg,
+                &group_id,
+                &author,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
         }
 
         // Search for all three: "same-ts" matches every message
@@ -4691,7 +4889,7 @@ mod tests {
             &author,
             "same-ts",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             None,
         )
         .await
@@ -4727,7 +4925,7 @@ mod tests {
         let group_declined = GroupId::from_slice(&[12; 32]);
 
         for gid in [&group_a, &group_b, &group_declined] {
-            setup_group(gid, &whitenoise.database).await;
+            setup_group(gid, &whitenoise.shared.database).await;
         }
 
         // Link account to groups: A = accepted, B = pending (null), C = declined
@@ -4754,19 +4952,19 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             };
-            ag.save(&whitenoise.database).await.unwrap();
+            ag.save(&whitenoise.shared.database).await.unwrap();
         }
 
         let author = Keys::generate().public_key();
 
         // Insert messages: "marmot" in all three groups
         let msg_a = create_test_chat_message_with_content(1, author, "marmot in group A");
-        AggregatedMessage::insert_message(&msg_a, &group_a, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg_a, &group_a, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let msg_b = create_test_chat_message_with_content(2, author, "marmot in group B");
-        AggregatedMessage::insert_message(&msg_b, &group_b, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg_b, &group_b, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -4776,20 +4974,20 @@ mod tests {
             &msg_declined,
             &group_declined,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         // Also add a second message in group A to verify per-group positions
         let msg_a2 = create_test_chat_message_with_content(4, author, "another marmot in group A");
-        AggregatedMessage::insert_message(&msg_a2, &group_a, &author, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg_a2, &group_a, &author, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Cross-group search for "marmot"
         let results =
-            AggregatedMessage::search_messages(&pubkey, "marmot", 50, &whitenoise.database)
+            AggregatedMessage::search_messages(&pubkey, "marmot", 50, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -4840,9 +5038,10 @@ mod tests {
         assert_eq!(group_b_result.position, 0);
 
         // Empty query returns all non-declined messages
-        let all_results = AggregatedMessage::search_messages(&pubkey, "", 50, &whitenoise.database)
-            .await
-            .unwrap();
+        let all_results =
+            AggregatedMessage::search_messages(&pubkey, "", 50, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(
             all_results.len(),
             3,
@@ -4851,16 +5050,20 @@ mod tests {
 
         // Limit is respected
         let limited =
-            AggregatedMessage::search_messages(&pubkey, "marmot", 1, &whitenoise.database)
+            AggregatedMessage::search_messages(&pubkey, "marmot", 1, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(limited.len(), 1, "limit should cap results");
 
         // No match returns empty
-        let no_match =
-            AggregatedMessage::search_messages(&pubkey, "nonexistent", 50, &whitenoise.database)
-                .await
-                .unwrap();
+        let no_match = AggregatedMessage::search_messages(
+            &pubkey,
+            "nonexistent",
+            50,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(no_match.is_empty(), "no match should return empty");
     }
 
@@ -4870,7 +5073,7 @@ mod tests {
     async fn test_find_messages_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[240; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
@@ -4882,7 +5085,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
         }
@@ -4895,7 +5098,7 @@ mod tests {
             &group_id,
             &author,
             Some(cleared_at_ms),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -4907,7 +5110,7 @@ mod tests {
         let messages = AggregatedMessage::find_messages_by_group_paginated(
             &group_id,
             &author,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &PaginationOptions::default(),
             None,
             Some(cleared_at_ms),
@@ -4922,7 +5125,7 @@ mod tests {
             &author,
             None,
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             Some(cleared_at_ms),
         )
         .await
@@ -4934,7 +5137,7 @@ mod tests {
     async fn test_count_unread_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[241; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
@@ -4946,7 +5149,7 @@ mod tests {
                 author,
                 base_ts + u64::from(i),
                 &group_id,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
             messages.push(msg);
@@ -4959,7 +5162,7 @@ mod tests {
         let count = AggregatedMessage::count_unread_for_group(
             &group_id,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             Some(cleared_at_ms),
         )
         .await
@@ -4971,7 +5174,7 @@ mod tests {
         let count = AggregatedMessage::count_unread_for_group(
             &group_id,
             Some(&marker),
-            &whitenoise.database,
+            &whitenoise.shared.database,
             Some(cleared_at_ms),
         )
         .await
@@ -4980,9 +5183,10 @@ mod tests {
 
         // count_unread_for_groups batch API
         let input = vec![(group_id.clone(), None, Some(cleared_at_ms))];
-        let result = AggregatedMessage::count_unread_for_groups(&input, &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            AggregatedMessage::count_unread_for_groups(&input, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(result[&group_id], 3);
     }
 
@@ -4990,7 +5194,7 @@ mod tests {
     async fn test_search_respects_chat_cleared_at() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[242; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let author = Keys::generate().public_key();
         let base_ts: u64 = 1_700_000_000;
@@ -5013,9 +5217,14 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            AggregatedMessage::insert_message(&msg, &group_id, &author, &whitenoise.database)
-                .await
-                .unwrap();
+            AggregatedMessage::insert_message(
+                &msg,
+                &group_id,
+                &author,
+                &whitenoise.shared.database,
+            )
+            .await
+            .unwrap();
         }
 
         // cleared_at = message 2's timestamp → messages 3, 4 visible
@@ -5026,7 +5235,7 @@ mod tests {
             &author,
             "hello",
             50,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             Some(cleared_at_ms),
         )
         .await
@@ -5048,7 +5257,7 @@ mod tests {
     async fn test_delivery_status_isolated_between_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[42; 32]);
-        setup_group(&group_id, &whitenoise.database).await;
+        setup_group(&group_id, &whitenoise.shared.database).await;
 
         let account_a = Keys::generate().public_key();
         let account_b = Keys::generate().public_key();
@@ -5056,16 +5265,20 @@ mod tests {
         // Account A sends a message with delivery status
         let mut msg = create_test_chat_message(1, account_a);
         msg.delivery_status = Some(DeliveryStatus::Sending);
-        AggregatedMessage::insert_message(&msg, &group_id, &account_a, &whitenoise.database)
+        AggregatedMessage::insert_message(&msg, &group_id, &account_a, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Account A sees delivery status on their own message
-        let fetched_by_a =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &account_a, &whitenoise.database)
-                .await
-                .unwrap()
-                .expect("message should exist");
+        let fetched_by_a = AggregatedMessage::find_by_id(
+            &msg.id,
+            &group_id,
+            &account_a,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .expect("message should exist");
         assert_eq!(
             fetched_by_a.delivery_status,
             Some(DeliveryStatus::Sending),
@@ -5073,11 +5286,15 @@ mod tests {
         );
 
         // Account B queries the same message — must NOT see A's delivery status
-        let fetched_by_b =
-            AggregatedMessage::find_by_id(&msg.id, &group_id, &account_b, &whitenoise.database)
-                .await
-                .unwrap()
-                .expect("message should exist for any account");
+        let fetched_by_b = AggregatedMessage::find_by_id(
+            &msg.id,
+            &group_id,
+            &account_b,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .expect("message should exist for any account");
         assert_eq!(
             fetched_by_b.delivery_status, None,
             "other account must not see sender's delivery status (issue #739)"

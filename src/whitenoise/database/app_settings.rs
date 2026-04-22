@@ -309,9 +309,9 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let settings = AppSettings::new(ThemeMode::System, None);
-        settings.save(&whitenoise.database).await.unwrap();
+        settings.save(&whitenoise.shared.database).await.unwrap();
 
-        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+        let loaded = AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(loaded.id, settings.id);
@@ -326,15 +326,15 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Ensure default settings exist
-        AppSettings::find_or_create_default(&whitenoise.database)
+        AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
 
-        AppSettings::update_theme_mode(ThemeMode::Dark, &whitenoise.database)
+        AppSettings::update_theme_mode(ThemeMode::Dark, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+        let loaded = AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(loaded.theme_mode, ThemeMode::Dark);
@@ -347,15 +347,15 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Ensure default settings exist
-        AppSettings::find_or_create_default(&whitenoise.database)
+        AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
 
-        AppSettings::update_language(Language::Spanish, &whitenoise.database)
+        AppSettings::update_language(Language::Spanish, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let loaded = AppSettings::find_or_create_default(&whitenoise.database)
+        let loaded = AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(loaded.language, Language::Spanish);
@@ -367,7 +367,7 @@ mod tests {
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let settings = AppSettings::find_or_create_default(&whitenoise.database)
+        let settings = AppSettings::find_or_create_default(&whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(settings.id, 1);
@@ -384,7 +384,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         sqlx::query("DELETE FROM app_settings WHERE id = 1")
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
 
@@ -395,11 +395,11 @@ mod tests {
         .bind("light")
         .bind(i64::MAX)
         .bind(chrono::Utc::now().timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
-        let result = AppSettings::find_or_create_default(&whitenoise.database).await;
+        let result = AppSettings::find_or_create_default(&whitenoise.shared.database).await;
         assert!(matches!(result, Err(WhitenoiseError::SqlxError(_))));
     }
 }

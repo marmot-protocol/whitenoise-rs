@@ -96,7 +96,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -122,7 +122,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -148,7 +148,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -184,7 +184,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();

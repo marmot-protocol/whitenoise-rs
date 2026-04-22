@@ -258,13 +258,15 @@ impl<'a> GroupOps<'a> {
             .ok_or(WhitenoiseError::SignerUnavailable(
                 self.session.account_pubkey,
             ))?;
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut users = Vec::new();
 
         for pk in member_pubkeys.iter() {
-            let (user, newly_created) = User::find_or_create_by_pubkey(pk, &wn.database).await?;
+            let (user, newly_created) =
+                User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
 
             if newly_created && let Err(e) = user.update_relay_lists(wn).await {
                 tracing::warn!(
@@ -275,7 +277,9 @@ impl<'a> GroupOps<'a> {
                 );
             }
 
-            let mut relays_to_use = user.relays(RelayType::KeyPackage, &wn.database).await?;
+            let mut relays_to_use = user
+                .relays(RelayType::KeyPackage, &wn.shared.database)
+                .await?;
             if relays_to_use.is_empty() {
                 tracing::warn!(
                     target: "whitenoise::session::groups",
@@ -286,6 +290,7 @@ impl<'a> GroupOps<'a> {
             }
             let relays_to_use_urls = Relay::urls(&relays_to_use);
             let some_event = wn
+                .shared
                 .relay_control
                 .fetch_user_key_package(*pk, &relays_to_use_urls)
                 .await?;
@@ -355,7 +360,8 @@ impl<'a> GroupOps<'a> {
 
             let relay_urls = Relay::urls(&relays_to_use);
 
-            wn.relay_control
+            wn.shared
+                .relay_control
                 .publish_welcome(
                     &member_pubkey,
                     welcome_rumor.clone(),
@@ -404,7 +410,8 @@ impl<'a> GroupOps<'a> {
             .await?;
 
         let wn = Self::wn()?;
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
         wn.background_refresh_account_group_subscriptions(&account);
         Ok(())
     }
@@ -452,7 +459,8 @@ impl<'a> GroupOps<'a> {
         )
         .await?;
 
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
 
         if let Err(error) = wn.mark_as_left(&account, group_id).await {
             tracing::warn!(
@@ -531,7 +539,8 @@ impl<'a> GroupOps<'a> {
 
         Self::publish_welcomes(welcome_data, signer, self.session.account_pubkey).await;
 
-        let account = Account::find_by_pubkey(&self.session.account_pubkey, &wn.database).await?;
+        let account =
+            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
         wn.background_refresh_account_group_subscriptions(&account);
 
         Ok(group)
@@ -543,7 +552,7 @@ impl<'a> GroupOps<'a> {
     // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
         let wn = Self::wn()?;
-        let (user, created) = User::find_or_create_by_pubkey(pk, &wn.database).await?;
+        let (user, created) = User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
         if created && let Err(e) = user.update_relay_lists(wn).await {
             tracing::warn!(
                 target: "whitenoise::session::groups",
@@ -691,7 +700,7 @@ impl<'a> GroupOps<'a> {
         };
 
         let creator_account =
-            match Account::find_by_pubkey(&creator_pubkey, &whitenoise.database).await {
+            match Account::find_by_pubkey(&creator_pubkey, &whitenoise.shared.database).await {
                 Ok(account) => account,
                 Err(error) => {
                     tracing::error!(
@@ -721,6 +730,7 @@ impl<'a> GroupOps<'a> {
                         Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
                     whitenoise
+                        .shared
                         .relay_control
                         .publish_welcome(
                             &member_pubkey,

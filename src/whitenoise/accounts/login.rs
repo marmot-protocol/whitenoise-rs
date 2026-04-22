@@ -32,10 +32,10 @@ impl Whitenoise {
         // `compute_global_since_timestamp()` for ALL accounts, forcing
         // global subscriptions to use `since=None` (unbounded re-fetch).
         let now_ms = Utc::now().timestamp_millis();
-        Account::update_last_synced_max(&account.pubkey, now_ms, &self.database).await?;
+        Account::update_last_synced_max(&account.pubkey, now_ms, &self.shared.database).await?;
         account.last_synced_at = DateTime::from_timestamp_millis(now_ms);
 
-        let user = account.user(&self.database).await?;
+        let user = account.user(&self.shared.database).await?;
 
         let relays = self
             .setup_relays_for_new_account(&mut account, &user)
@@ -74,7 +74,7 @@ impl Whitenoise {
         // tasks) was set up during the original login and is still active —
         // re-running activate_account would create duplicate subscriptions and
         // needlessly kill in-progress background tasks.
-        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.shared.database).await {
             tracing::debug!(
                 target: "whitenoise::accounts",
                 "Account {} is already logged in, returning existing account",
@@ -129,7 +129,7 @@ impl Whitenoise {
 
         // If this account is already logged in, return it as-is (see comment
         // in login() for rationale on not re-activating).
-        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await {
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.shared.database).await {
             tracing::debug!(
                 target: "whitenoise::accounts",
                 "Account {} is already logged in, returning existing account",
@@ -182,7 +182,7 @@ impl Whitenoise {
     ///
     /// * `account` - The account to log out.
     pub async fn logout(&self, pubkey: &PublicKey) -> Result<()> {
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
+        let account = Account::find_by_pubkey(pubkey, &self.shared.database).await?;
         let ephemeral_warm_relays = self
             .account_ephemeral_warm_relay_urls(&account)
             .await
@@ -208,6 +208,7 @@ impl Whitenoise {
 
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
+                .shared
                 .relay_control
                 .unwarm_ephemeral_relays(&ephemeral_warm_relays)
                 .await
@@ -220,7 +221,7 @@ impl Whitenoise {
         }
 
         // Delete the account from the database
-        account.delete(&self.database).await?;
+        account.delete(&self.shared.database).await?;
 
         // Sync discovery subscriptions with remaining accounts (tears down on last logout)
         if let Err(e) = self.sync_discovery_subscriptions().await {
@@ -233,7 +234,10 @@ impl Whitenoise {
 
         // Remove the private key from the secret store
         // For local accounts this is required; for external accounts this is best-effort cleanup
-        let result = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+        let result = self
+            .shared
+            .secrets_store
+            .remove_private_key_for_pubkey(pubkey);
         match (account.has_local_key(), result) {
             (true, Err(e)) => return Err(e.into()), // Local account MUST have key
             (false, Err(e)) => tracing::debug!("Expected - no key for external account: {}", e),
@@ -252,7 +256,7 @@ impl Whitenoise {
     ///
     /// Returns the count of accounts as a `usize`. Returns 0 if no accounts exist.
     pub async fn get_accounts_count(&self) -> Result<usize> {
-        let accounts = Account::all(&self.database).await?;
+        let accounts = Account::all(&self.shared.database).await?;
         Ok(accounts.len())
     }
 
@@ -262,7 +266,7 @@ impl Whitenoise {
     /// the Whitenoise instance. Each account represents a distinct identity with
     /// its own keypair, relay configurations, and associated data.
     pub async fn all_accounts(&self) -> Result<Vec<Account>> {
-        Account::all(&self.database).await
+        Account::all(&self.shared.database).await
     }
 
     /// Finds and returns an account by its public key.
@@ -274,7 +278,7 @@ impl Whitenoise {
     ///
     /// * `pubkey` - The public key of the account to find
     pub async fn find_account_by_pubkey(&self, pubkey: &PublicKey) -> Result<Account> {
-        Account::find_by_pubkey(pubkey, &self.database).await
+        Account::find_by_pubkey(pubkey, &self.shared.database).await
     }
 }
 
@@ -347,6 +351,7 @@ mod tests {
         account: &Account,
     ) {
         let key_package_event = whitenoise
+            .shared
             .relay_control
             .fetch_user_key_package(
                 account.pubkey,
@@ -404,18 +409,21 @@ mod tests {
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         // Check that all three event types were published
         let inbox_events = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::Inbox, &nip65_relay_urls)
             .await
             .unwrap();
 
         let key_package_relays_events = whitenoise
+            .shared
             .relay_control
             .fetch_user_relays(account.pubkey, RelayType::KeyPackage, &nip65_relay_urls)
             .await
             .unwrap();
 
         let key_package_events = whitenoise
+            .shared
             .relay_control
             .fetch_user_key_package(
                 account.pubkey,
@@ -452,7 +460,7 @@ mod tests {
             account.last_synced_at.is_some(),
             "New identity should have last_synced_at set to prevent global subscription poisoning"
         );
-        let db_account = Account::find_by_pubkey(&account.pubkey, &whitenoise.database)
+        let db_account = Account::find_by_pubkey(&account.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(
@@ -653,9 +661,13 @@ mod tests {
     async fn test_update_metadata() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         let default_relays = whitenoise.load_default_relays().await.unwrap();
         whitenoise
@@ -676,7 +688,7 @@ mod tests {
         let result = account.update_metadata(&new_metadata, &whitenoise).await;
         result.expect("Failed to update metadata. Are test relays running on localhost:8080 and localhost:7777?");
 
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         assert_eq!(user.metadata.name, new_metadata.name);
         assert_eq!(user.metadata.display_name, new_metadata.display_name);
         assert_eq!(user.metadata.about, new_metadata.about);
@@ -686,6 +698,7 @@ mod tests {
         let nip65_relays = account.nip65_relays(&whitenoise).await.unwrap();
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         let fetched_metadata = whitenoise
+            .shared
             .relay_control
             .fetch_metadata_from(&nip65_relay_urls, account.pubkey)
             .await
@@ -706,11 +719,19 @@ mod tests {
 
         // Local account logout removes key
         let (local_account, keys) = create_test_account(&whitenoise).await;
-        local_account.save(&whitenoise.database).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        local_account
+            .save(&whitenoise.shared.database)
+            .await
+            .unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&local_account.pubkey)
                 .is_ok()
@@ -718,6 +739,7 @@ mod tests {
         whitenoise.logout(&local_account.pubkey).await.unwrap();
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&local_account.pubkey)
                 .is_err()
@@ -728,8 +750,9 @@ mod tests {
         let ext_account = Account::new_external(&whitenoise, ext_keys.public_key())
             .await
             .unwrap();
-        ext_account.save(&whitenoise.database).await.unwrap();
+        ext_account.save(&whitenoise.shared.database).await.unwrap();
         whitenoise
+            .shared
             .secrets_store
             .store_private_key(&ext_keys)
             .unwrap(); // Stale key
@@ -737,6 +760,7 @@ mod tests {
         whitenoise.logout(&ext_account.pubkey).await.unwrap();
         assert!(
             whitenoise
+                .shared
                 .secrets_store
                 .get_nostr_keys_for_pubkey(&ext_account.pubkey)
                 .is_err()
@@ -746,7 +770,7 @@ mod tests {
         let ext2 = Account::new_external(&whitenoise, Keys::generate().public_key())
             .await
             .unwrap();
-        ext2.save(&whitenoise.database).await.unwrap();
+        ext2.save(&whitenoise.shared.database).await.unwrap();
         assert!(whitenoise.logout(&ext2.pubkey).await.is_ok());
     }
 
@@ -756,7 +780,7 @@ mod tests {
 
         // Create a local account directly in the database (bypassing relay setup)
         let (account, keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         assert_eq!(
             account.account_type,
@@ -765,10 +789,15 @@ mod tests {
         );
 
         // Store the key in secrets store
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         // Verify the key is stored
         let stored_keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey);
         assert!(stored_keys.is_ok(), "Key should be stored after login");
@@ -778,6 +807,7 @@ mod tests {
 
         // Verify the key was removed
         let stored_keys_after = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey);
         assert!(
@@ -796,7 +826,7 @@ mod tests {
 
         // Create external account manually (bypassing relay setup)
         let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         assert_eq!(
             account.account_type,
@@ -805,17 +835,27 @@ mod tests {
         );
 
         // Manually store a stale key (simulating orphaned key from failed migration)
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         // Verify the stale key is stored
-        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        let stored_keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&pubkey);
         assert!(stored_keys.is_ok(), "Stale key should be stored");
 
         // Logout should clean up the stale key via best-effort removal
         whitenoise.logout(&pubkey).await.unwrap();
 
         // Verify the stale key was removed
-        let stored_keys_after = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        let stored_keys_after = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&pubkey);
         assert!(
             stored_keys_after.is_err(),
             "Stale key should be removed after logout"
@@ -832,7 +872,7 @@ mod tests {
 
         // Create external account manually (bypassing relay setup)
         let account = Account::new_external(&whitenoise, pubkey).await.unwrap();
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         assert_eq!(
             account.account_type,
@@ -841,7 +881,10 @@ mod tests {
         );
 
         // Don't store any key - verify there's no key
-        let stored_keys = whitenoise.secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+        let stored_keys = whitenoise
+            .shared
+            .secrets_store
+            .get_nostr_keys_for_pubkey(&pubkey);
         assert!(stored_keys.is_err(), "No key should be stored");
 
         // Logout should succeed even with no key to remove
@@ -892,7 +935,11 @@ mod tests {
         // Create and persist account with stored keys
         let (account, keys) = create_test_account(&whitenoise).await;
         let account = whitenoise.persist_account(&account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         // Use the test image file
         let test_image_path = ".test/fake_image.png";
@@ -931,7 +978,11 @@ mod tests {
 
         let (account, keys) = create_test_account(&whitenoise).await;
         let account = whitenoise.persist_account(&account).await.unwrap();
-        whitenoise.secrets_store.store_private_key(&keys).unwrap();
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(&keys)
+            .unwrap();
 
         let blossom_url = nostr_sdk::Url::parse("http://localhost:3000").unwrap();
 

@@ -22,6 +22,7 @@ impl Whitenoise {
         // ensure_all_subscriptions task self-heals discovery within minutes.
         let (global_result, accounts_result) = tokio::join!(
             whitenoise_ref
+                .shared
                 .discovery_sync_worker
                 .request_rebuild_and_wait(),
             Self::setup_accounts_subscriptions(whitenoise_ref),
@@ -84,7 +85,7 @@ impl Whitenoise {
     pub(super) async fn setup_accounts_subscriptions(
         whitenoise_ref: &'static Whitenoise,
     ) -> Result<()> {
-        let accounts = Account::all(&whitenoise_ref.database).await?;
+        let accounts = Account::all(&whitenoise_ref.shared.database).await?;
         for account in accounts {
             let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
             // Setup subscriptions for this account
@@ -143,7 +144,7 @@ impl Whitenoise {
                 target: "whitenoise::ensure_global_subscriptions",
                 "Global subscriptions not operational, refreshing..."
             );
-            self.discovery_sync_worker.request_rebuild();
+            self.shared.discovery_sync_worker.request_rebuild();
         }
 
         Ok(())
@@ -193,7 +194,7 @@ impl Whitenoise {
         }
 
         // Fail fast only on database errors (catastrophic)
-        let accounts = Account::all(&self.database).await?;
+        let accounts = Account::all(&self.shared.database).await?;
 
         // Best-effort: log and continue for each account
         for account in &accounts {
@@ -255,18 +256,27 @@ impl Whitenoise {
     /// (the expected state after logout or on a fresh install).
     #[perf_instrument("whitenoise")]
     pub async fn is_global_subscriptions_operational(&self) -> Result<bool> {
-        let has_subscriptions = self.relay_control.has_discovery_subscriptions().await;
+        let has_subscriptions = self
+            .shared
+            .relay_control
+            .has_discovery_subscriptions()
+            .await;
 
         // Zero accounts with zero subscriptions is the correct retired state
         // (fresh install or after last logout). Users may still exist in the
         // DB but discovery subscriptions are correctly torn down.
-        let account_count = Account::all(&self.database).await?.len();
+        let account_count = Account::all(&self.shared.database).await?.len();
         if account_count == 0 && !has_subscriptions {
             return Ok(true);
         }
 
-        let db_user_count = User::all_pubkeys(&self.database).await?.len();
-        let plane_user_count = self.relay_control.discovery().watched_user_count().await;
+        let db_user_count = User::all_pubkeys(&self.shared.database).await?.len();
+        let plane_user_count = self
+            .shared
+            .relay_control
+            .discovery()
+            .watched_user_count()
+            .await;
 
         if !has_subscriptions {
             return Ok(false);
@@ -289,20 +299,20 @@ impl Whitenoise {
     #[perf_instrument("whitenoise")]
     pub async fn get_relay_control_state(&self) -> RelayControlStateSnapshot {
         let inbox_snapshots = self.account_manager.collect_inbox_snapshots().await;
-        self.relay_control.snapshot(inbox_snapshots).await
+        self.shared.relay_control.snapshot(inbox_snapshots).await
     }
 
     #[perf_instrument("whitenoise")]
     pub(crate) async fn sync_discovery_subscriptions(&self) -> Result<()> {
-        let accounts = Account::all(&self.database).await?;
-        let discovery = self.relay_control.discovery();
+        let accounts = Account::all(&self.shared.database).await?;
+        let discovery = self.shared.relay_control.discovery();
 
         if accounts.is_empty() {
             discovery.retire_all().await;
             return Ok(());
         }
 
-        let watched_users = User::all_pubkeys(&self.database).await?;
+        let watched_users = User::all_pubkeys(&self.shared.database).await?;
         let public_since = Self::compute_global_since_timestamp(&accounts);
         let follow_list_accounts: Vec<_> = accounts
             .iter()
@@ -333,6 +343,6 @@ impl Whitenoise {
     /// other relays happen to be connected for unrelated workloads.
     #[perf_instrument("whitenoise")]
     pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
-        self.relay_control.discovery().relays().to_vec()
+        self.shared.relay_control.discovery().relays().to_vec()
     }
 }

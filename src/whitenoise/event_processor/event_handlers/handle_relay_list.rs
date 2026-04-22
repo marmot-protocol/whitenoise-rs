@@ -19,7 +19,7 @@ impl Whitenoise {
         let already_processed = ProcessedEvent::exists(
             &event.id,
             None, // Global events (relay lists)
-            &self.database,
+            &self.shared.database,
         )
         .await?;
 
@@ -34,7 +34,7 @@ impl Whitenoise {
         }
 
         let (user, _newly_created) =
-            User::find_or_create_by_pubkey(&event.pubkey, &self.database).await?;
+            User::find_or_create_by_pubkey(&event.pubkey, &self.shared.database).await?;
 
         let relay_type = event.kind.into();
         let relay_urls = crate::nostr_manager::utils::relay_urls_from_event(&event);
@@ -54,7 +54,7 @@ impl Whitenoise {
             event_created_at,
             Some(event.kind),
             Some(&event.pubkey),
-            &self.database,
+            &self.shared.database,
         )
         .await?;
 
@@ -81,21 +81,22 @@ impl Whitenoise {
                 }
             };
 
-            let account = match Account::find_by_pubkey(&user_pubkey, &whitenoise.database).await {
-                Ok(account) => Some(account),
-                Err(WhitenoiseError::AccountNotFound) => None,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::handle_relay_list",
-                        "Failed to look up account for relay list refresh {}: {}",
-                        event_pubkey,
-                        error
-                    );
-                    None
-                }
-            };
+            let account =
+                match Account::find_by_pubkey(&user_pubkey, &whitenoise.shared.database).await {
+                    Ok(account) => Some(account),
+                    Err(WhitenoiseError::AccountNotFound) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "whitenoise::handle_relay_list",
+                            "Failed to look up account for relay list refresh {}: {}",
+                            event_pubkey,
+                            error
+                        );
+                        None
+                    }
+                };
 
-            whitenoise.discovery_sync_worker.request_rebuild();
+            whitenoise.shared.discovery_sync_worker.request_rebuild();
 
             if let Some(account) = account
                 && let Err(error) = whitenoise.refresh_account_subscriptions(&account).await
@@ -146,7 +147,7 @@ mod tests {
             .await
             .unwrap();
         let relays = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(relays.len(), 2);
@@ -162,7 +163,7 @@ mod tests {
         whitenoise.handle_relay_list(event.clone()).await.unwrap();
 
         // Event should be recorded exactly once
-        let processed = ProcessedEvent::exists(&event.id, None, &whitenoise.database)
+        let processed = ProcessedEvent::exists(&event.id, None, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(processed);
@@ -173,7 +174,7 @@ mod tests {
             .await
             .unwrap();
         let relays = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(relays.len(), 1);

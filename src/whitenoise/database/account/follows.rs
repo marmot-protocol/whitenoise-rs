@@ -144,9 +144,9 @@ mod tests {
     async fn all_returns_empty_for_new_account() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         assert!(repo.all().await.unwrap().is_empty());
@@ -156,11 +156,11 @@ mod tests {
     async fn add_and_all_returns_followed_user() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        let target_user = insert_test_user(&wn.database, &target_pk).await;
+        let target_user = insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         repo.add(&target_user).await.unwrap();
@@ -174,11 +174,11 @@ mod tests {
     async fn is_following_returns_false_when_not_following() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        insert_test_user(&wn.database, &target_pk).await;
+        insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         assert!(!repo.is_following(&target_pk).await.unwrap());
@@ -188,10 +188,10 @@ mod tests {
     async fn is_following_returns_false_for_unknown_user() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let unknown_pk = Keys::generate().public_key();
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         assert!(!repo.is_following(&unknown_pk).await.unwrap());
@@ -201,11 +201,11 @@ mod tests {
     async fn add_then_is_following_returns_true() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        let target_user = insert_test_user(&wn.database, &target_pk).await;
+        let target_user = insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         repo.add(&target_user).await.unwrap();
@@ -217,11 +217,11 @@ mod tests {
     async fn remove_clears_follow() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        let target_user = insert_test_user(&wn.database, &target_pk).await;
+        let target_user = insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         repo.add(&target_user).await.unwrap();
@@ -235,11 +235,11 @@ mod tests {
     async fn remove_nonexistent_is_noop() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        let target_user = insert_test_user(&wn.database, &target_pk).await;
+        let target_user = insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo = AccountFollowsRepo::new(keys.public_key(), wn.database.clone())
+        let repo = AccountFollowsRepo::new(keys.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
         assert!(repo.remove(&target_user).await.is_ok());
@@ -250,15 +250,15 @@ mod tests {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();
-        insert_test_account(&wn.database, &keys_a.public_key()).await;
-        insert_test_account(&wn.database, &keys_b.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys_a.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys_b.public_key()).await;
         let target_pk = Keys::generate().public_key();
-        let target_user = insert_test_user(&wn.database, &target_pk).await;
+        let target_user = insert_test_user(&wn.shared.database, &target_pk).await;
 
-        let repo_a = AccountFollowsRepo::new(keys_a.public_key(), wn.database.clone())
+        let repo_a = AccountFollowsRepo::new(keys_a.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
-        let repo_b = AccountFollowsRepo::new(keys_b.public_key(), wn.database.clone())
+        let repo_b = AccountFollowsRepo::new(keys_b.public_key(), wn.shared.database.clone())
             .await
             .unwrap();
 
@@ -273,7 +273,7 @@ mod tests {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let unknown_pk = Keys::generate().public_key();
 
-        let result = AccountFollowsRepo::new(unknown_pk, wn.database.clone()).await;
+        let result = AccountFollowsRepo::new(unknown_pk, wn.shared.database.clone()).await;
         assert!(result.is_err());
     }
 }

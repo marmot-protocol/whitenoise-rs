@@ -822,11 +822,11 @@ mod tests {
         group_id: &GroupId,
     ) -> Result<()> {
         let user_relay_sync = whitenoise.user_relay_sync_context();
-        let ephemeral = whitenoise.relay_control.ephemeral();
+        let ephemeral = whitenoise.shared.relay_control.ephemeral();
 
         publish_notification_requests_after_delivery_with(
             &whitenoise.config,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &user_relay_sync,
             &ephemeral,
             account.pubkey,
@@ -843,6 +843,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if whitenoise
+                    .shared
                     .relay_control
                     .fetch_user_relays(user_pubkey, RelayType::Inbox, query_relays)
                     .await
@@ -868,6 +869,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let events = whitenoise
+                    .shared
                     .relay_control
                     .ephemeral()
                     .fetch_events_from(
@@ -908,7 +910,7 @@ mod tests {
                     &message_id.to_string(),
                     group_id,
                     account_pubkey,
-                    &whitenoise.database,
+                    &whitenoise.shared.database,
                 )
                 .await
                 .unwrap()
@@ -934,9 +936,9 @@ mod tests {
                 max_publish_attempts: 1,
                 ad_hoc_relay_ttl: Duration::from_secs(30),
             },
-            whitenoise.database.clone(),
+            whitenoise.shared.database.clone(),
             whitenoise.event_sender.clone(),
-            whitenoise.relay_control.observability().clone(),
+            whitenoise.shared.relay_control.observability().clone(),
         )
     }
 
@@ -1117,21 +1119,21 @@ mod tests {
         let relay_url = RelayUrl::parse("wss://cached-push.example.com").unwrap();
         let (server_user, _created) = crate::whitenoise::users::User::find_or_create_by_pubkey(
             &server_pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
-        let relay = Relay::find_or_create_by_url(&relay_url, &whitenoise.database)
+        let relay = Relay::find_or_create_by_url(&relay_url, &whitenoise.shared.database)
             .await
             .unwrap();
 
         server_user
-            .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+            .add_relay(&relay, RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let (resolved_relays, relay_source) = resolve_notification_server_relays(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &whitenoise.user_relay_sync_context(),
             server_pubkey,
             &[],
@@ -1152,21 +1154,21 @@ mod tests {
         let duplicate_cached_hint = RelayUrl::parse("wss://cached-push.example.com").unwrap();
         let (server_user, _created) = crate::whitenoise::users::User::find_or_create_by_pubkey(
             &server_pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
-        let relay = Relay::find_or_create_by_url(&cached_relay, &whitenoise.database)
+        let relay = Relay::find_or_create_by_url(&cached_relay, &whitenoise.shared.database)
             .await
             .unwrap();
 
         server_user
-            .add_relay(&relay, RelayType::Inbox, &whitenoise.database)
+            .add_relay(&relay, RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
 
         let (resolved_relays, relay_source) = resolve_notification_server_relays(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &whitenoise.user_relay_sync_context(),
             server_pubkey,
             &[duplicate_cached_hint, fresh_hint.clone()],
@@ -1179,7 +1181,7 @@ mod tests {
         assert_eq!(
             Relay::urls(
                 &server_user
-                    .relays(RelayType::Inbox, &whitenoise.database)
+                    .relays(RelayType::Inbox, &whitenoise.shared.database)
                     .await
                     .unwrap()
             ),
@@ -1193,7 +1195,7 @@ mod tests {
         let server_pubkey = Keys::generate().public_key();
 
         let (resolved_relays, relay_source) = resolve_notification_server_relays(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &whitenoise.user_relay_sync_context(),
             server_pubkey,
             &[],
@@ -1204,13 +1206,15 @@ mod tests {
         assert!(resolved_relays.is_empty());
         assert_eq!(relay_source, NotificationRelaySource::HintFallback);
 
-        let server_user =
-            crate::whitenoise::users::User::find_by_pubkey(&server_pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+        let server_user = crate::whitenoise::users::User::find_by_pubkey(
+            &server_pubkey,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(
             server_user
-                .relays(RelayType::Inbox, &whitenoise.database)
+                .relays(RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1237,7 +1241,7 @@ mod tests {
         batches[0].relay_hints.clear();
 
         publish_notification_batches_best_effort(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &whitenoise.user_relay_sync_context(),
             &test_ephemeral_plane(&whitenoise),
             sender_pubkey,
@@ -1246,13 +1250,15 @@ mod tests {
         )
         .await;
 
-        let server_user =
-            crate::whitenoise::users::User::find_by_pubkey(&server_pubkey, &whitenoise.database)
-                .await
-                .unwrap();
+        let server_user = crate::whitenoise::users::User::find_by_pubkey(
+            &server_pubkey,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(
             server_user
-                .relays(RelayType::Inbox, &whitenoise.database)
+                .relays(RelayType::Inbox, &whitenoise.shared.database)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1285,7 +1291,7 @@ mod tests {
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1325,7 +1331,7 @@ mod tests {
             .await
             .unwrap();
         server_user
-            .remove_all_relays(&whitenoise.database)
+            .remove_all_relays(&whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1356,7 +1362,7 @@ mod tests {
             &server_account.pubkey,
             Some(&server_relay_urls[0]),
             &sender_token,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1368,7 +1374,7 @@ mod tests {
             &server_account.pubkey,
             Some(&server_relay_urls[0]),
             &recipient_token.to_base64(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1432,7 +1438,7 @@ mod tests {
             .await
             .unwrap();
         server_user
-            .remove_all_relays(&whitenoise.database)
+            .remove_all_relays(&whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1481,7 +1487,7 @@ mod tests {
             &server_account.pubkey,
             Some(&server_relay_urls[0]),
             &sender_token,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1493,7 +1499,7 @@ mod tests {
             &server_account.pubkey,
             Some(&server_relay_urls[0]),
             &recipient_token.to_base64(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1544,7 +1550,7 @@ mod tests {
             .await
             .unwrap();
         server_user
-            .remove_all_relays(&whitenoise.database)
+            .remove_all_relays(&whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1570,9 +1576,9 @@ mod tests {
         assert!(batches[0].events.len() > 1);
 
         publish_notification_batches_best_effort(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &whitenoise.user_relay_sync_context(),
-            &whitenoise.relay_control.ephemeral(),
+            &whitenoise.shared.relay_control.ephemeral(),
             sender_account.pubkey,
             &notification_token_counts_by_server(&token_tags),
             batches,
@@ -1638,7 +1644,7 @@ mod tests {
             &unreachable_server_pubkey,
             Some(&unreachable_relay),
             &encrypted_fcm_token_base64(&unreachable_server_pubkey, "bad-recipient-device"),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1647,7 +1653,7 @@ mod tests {
 
         publish_notification_requests_after_delivery_with(
             &whitenoise.config,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &user_relay_sync,
             &ephemeral,
             creator.pubkey,
@@ -1660,7 +1666,7 @@ mod tests {
             &send_result.message.id.to_string(),
             &group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1818,7 +1824,7 @@ mod tests {
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1914,7 +1920,7 @@ mod tests {
             &server_pubkey,
             Some(&relay_hint),
             "ciphertext-one",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1927,7 +1933,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1969,7 +1975,7 @@ mod tests {
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2013,7 +2019,7 @@ mod tests {
         let cached_before_disable = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2054,7 +2060,7 @@ mod tests {
         let cached_after_disable = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2165,7 +2171,7 @@ mod tests {
         let cached_after_share = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2194,7 +2200,7 @@ mod tests {
         let cached_after_removal = GroupPushToken::find_by_account_and_group(
             &admin_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2353,7 +2359,7 @@ mod tests {
         let cached_before = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2379,7 +2385,7 @@ mod tests {
         let cached_after = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2436,7 +2442,7 @@ mod tests {
         let accepted_tokens = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &accepted_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2451,7 +2457,7 @@ mod tests {
         let pending_tokens = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &pending_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2501,7 +2507,7 @@ mod tests {
         let cached_tokens = GroupPushToken::find_by_account_and_group(
             &creator.pubkey,
             &group.mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2553,7 +2559,7 @@ mod tests {
         let cached_before = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2574,7 +2580,7 @@ mod tests {
         let cached_after = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();

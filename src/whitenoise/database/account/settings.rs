@@ -74,9 +74,9 @@ mod tests {
     async fn find_or_create_returns_defaults_for_new_account() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
 
-        let repo = AccountSettingsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountSettingsRepo::new(keys.public_key(), wn.shared.database.clone());
         let settings = repo.find_or_create().await.unwrap();
 
         assert!(settings.id.is_some());
@@ -88,9 +88,9 @@ mod tests {
     async fn find_or_create_is_idempotent() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
 
-        let repo = AccountSettingsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountSettingsRepo::new(keys.public_key(), wn.shared.database.clone());
         let first = repo.find_or_create().await.unwrap();
         let second = repo.find_or_create().await.unwrap();
 
@@ -102,7 +102,7 @@ mod tests {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
 
-        let repo = AccountSettingsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountSettingsRepo::new(keys.public_key(), wn.shared.database.clone());
         assert!(repo.notifications_enabled().await.unwrap());
     }
 
@@ -110,9 +110,9 @@ mod tests {
     async fn update_notifications_enabled_persists_value() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
 
-        let repo = AccountSettingsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountSettingsRepo::new(keys.public_key(), wn.shared.database.clone());
 
         let updated = repo.update_notifications_enabled(false).await.unwrap();
         assert!(!updated.notifications_enabled);
@@ -124,9 +124,9 @@ mod tests {
     async fn update_notifications_enabled_round_trips() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
 
-        let repo = AccountSettingsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = AccountSettingsRepo::new(keys.public_key(), wn.shared.database.clone());
 
         let disabled = repo.update_notifications_enabled(false).await.unwrap();
         assert!(!disabled.notifications_enabled);

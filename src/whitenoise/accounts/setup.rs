@@ -31,7 +31,7 @@ impl Whitenoise {
     ) -> Result<Account> {
         let (account, _keys) = Account::new(self, Some(keys.clone())).await?;
 
-        self.secrets_store.store_private_key(keys).map_err(|e| {
+        self.shared.secrets_store.store_private_key(keys).map_err(|e| {
             tracing::error!(target: "whitenoise::accounts", "Failed to store private key: {}", e);
             e
         })?;
@@ -49,7 +49,7 @@ impl Whitenoise {
         inbox_relays: &[Relay],
         key_package_relays: &[Relay],
     ) -> Result<()> {
-        self.discovery_sync_worker.request_rebuild();
+        self.shared.discovery_sync_worker.request_rebuild();
 
         // Session must exist before subscriptions so that event handlers
         // (e.g. contact-list guard) can look it up immediately.
@@ -84,7 +84,7 @@ impl Whitenoise {
         account: &Account,
         inbox_relays: &[Relay],
     ) -> Result<()> {
-        self.discovery_sync_worker.request_rebuild();
+        self.shared.discovery_sync_worker.request_rebuild();
 
         // Session must exist before subscriptions so that event handlers
         // (e.g. contact-list guard) can look it up immediately.
@@ -102,10 +102,10 @@ impl Whitenoise {
 
     #[perf_instrument("accounts")]
     pub(super) async fn persist_account(&self, account: &Account) -> Result<Account> {
-        let saved_account = account.save(&self.database).await.map_err(|e| {
+        let saved_account = account.save(&self.shared.database).await.map_err(|e| {
             tracing::error!(target: "whitenoise::accounts", "Failed to save account: {}", e);
             // Try to clean up stored private key
-            if let Err(cleanup_err) = self.secrets_store.remove_private_key_for_pubkey(&account.pubkey) {
+            if let Err(cleanup_err) = self.shared.secrets_store.remove_private_key_for_pubkey(&account.pubkey) {
                 tracing::error!(target: "whitenoise::accounts", "Failed to cleanup private key after account save failure: {}", cleanup_err);
             }
             e
@@ -128,6 +128,7 @@ impl Whitenoise {
             let relays_urls = Relay::urls(key_package_relays);
 
             if let Some(event) = self
+                .shared
                 .relay_control
                 .fetch_user_key_package(account.pubkey, &relays_urls)
                 .await?
@@ -172,8 +173,12 @@ impl Whitenoise {
     /// and still has live local key material.
     #[perf_instrument("accounts")]
     async fn is_own_key_package(&self, pubkey: &PublicKey, event_id: &EventId) -> bool {
-        match PublishedKeyPackage::find_by_event_id(pubkey, &event_id.to_hex(), &self.database)
-            .await
+        match PublishedKeyPackage::find_by_event_id(
+            pubkey,
+            &event_id.to_hex(),
+            &self.shared.database,
+        )
+        .await
         {
             Ok(Some(pkg)) => !pkg.key_material_deleted,
             Ok(None) => false,
@@ -216,12 +221,16 @@ impl Whitenoise {
     ) -> Result<Vec<Relay>> {
         let default_relays = self.load_default_relays().await?;
 
-        user.add_relays(&default_relays, RelayType::Nip65, &self.database)
+        user.add_relays(&default_relays, RelayType::Nip65, &self.shared.database)
             .await?;
-        user.add_relays(&default_relays, RelayType::Inbox, &self.database)
+        user.add_relays(&default_relays, RelayType::Inbox, &self.shared.database)
             .await?;
-        user.add_relays(&default_relays, RelayType::KeyPackage, &self.database)
-            .await?;
+        user.add_relays(
+            &default_relays,
+            RelayType::KeyPackage,
+            &self.shared.database,
+        )
+        .await?;
 
         self.background_publish_account_relay_list(
             account,
@@ -462,6 +471,7 @@ impl Whitenoise {
         // Relay-control ephemeral sessions add/connect target relays internally,
         // so callers no longer need a separate pre-connection step here.
         let relay_event = self
+            .shared
             .relay_control
             .fetch_user_relays(pubkey, relay_type, &source_relay_urls)
             .await?;
@@ -514,7 +524,7 @@ impl Whitenoise {
         relays: &[Relay],
         relay_type: RelayType,
     ) -> Result<()> {
-        let user = account.user(&self.database).await?;
+        let user = account.user(&self.shared.database).await?;
         let relay_urls = Relay::urls(relays).into_iter().collect::<HashSet<_>>();
         user.sync_relay_urls(self, relay_type, &relay_urls, None)
             .await?;
@@ -534,7 +544,8 @@ impl Whitenoise {
     {
         let relays_urls = Relay::urls(relays);
         let target_relays_urls = Relay::urls(target_relays);
-        self.relay_control
+        self.shared
+            .relay_control
             .publish_relay_list_with_signer(
                 &relays_urls,
                 relay_type,
@@ -551,9 +562,9 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let ephemeral = self.relay_control.ephemeral();
+        let ephemeral = self.shared.relay_control.ephemeral();
         let signer = self.get_signer_for_account(account)?;
-        let user = account.user(&self.database).await?;
+        let user = account.user(&self.shared.database).await?;
         let relays = account.nip65_relays(self).await?;
 
         tokio::spawn(async move {
@@ -586,7 +597,7 @@ impl Whitenoise {
         relays: Option<&[Relay]>,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let ephemeral = self.relay_control.ephemeral();
+        let ephemeral = self.shared.relay_control.ephemeral();
         let relays = if let Some(relays) = relays {
             relays.to_vec()
         } else {
@@ -626,10 +637,10 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<()> {
         let account_clone = account.clone();
-        let ephemeral = self.relay_control.ephemeral();
+        let ephemeral = self.shared.relay_control.ephemeral();
         let relays = account.nip65_relays(self).await?;
         let signer = self.get_signer_for_account(account)?;
-        let follows = account.follows(&self.database).await?;
+        let follows = account.follows(&self.shared.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
         let created_at = Timestamp::now();
 
@@ -699,7 +710,7 @@ impl Whitenoise {
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
         for relay_url in group_specs.iter().flat_map(|spec| spec.relays.iter()) {
-            if let Err(e) = Relay::find_or_create_by_url(relay_url, &self.database).await {
+            if let Err(e) = Relay::find_or_create_by_url(relay_url, &self.shared.database).await {
                 tracing::warn!(
                     target: "whitenoise::accounts",
                     relay = %relay_url,
@@ -709,7 +720,8 @@ impl Whitenoise {
             }
         }
 
-        self.relay_control
+        self.shared
+            .relay_control
             .sync_account_group_subscriptions(
                 account.pubkey,
                 &group_specs,
@@ -744,7 +756,7 @@ impl Whitenoise {
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
         for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
-            Relay::find_or_create_by_url(relay_url, &self.database).await?;
+            Relay::find_or_create_by_url(relay_url, &self.shared.database).await?;
         }
 
         if Self::is_background_task_cancelled(cancel_rx) {
@@ -756,7 +768,8 @@ impl Whitenoise {
             return Ok(());
         }
 
-        self.relay_control
+        self.shared
+            .relay_control
             .sync_account_group_subscriptions(
                 account.pubkey,
                 &group_specs,
@@ -840,7 +853,7 @@ impl Whitenoise {
 
         // Ensure group relays are in the database
         for relay_url in group_specs.iter().flat_map(|group| group.relays.iter()) {
-            Relay::find_or_create_by_url(relay_url, &self.database).await?;
+            Relay::find_or_create_by_url(relay_url, &self.shared.database).await?;
         }
 
         // Standard buffer for initial activation (no prior teardown gap to cover).
@@ -872,7 +885,7 @@ impl Whitenoise {
         // — avoids cancelling a partially-warmed session if activation fails.
         let (activation_result, _) = tokio::join!(
             session.activate_subscriptions(
-                &self.relay_control,
+                &self.shared.relay_control,
                 &inbox_relays,
                 &group_specs,
                 since,
@@ -937,7 +950,7 @@ impl Whitenoise {
 
         let (activation_result, _) = tokio::join!(
             session.activate_subscriptions(
-                &self.relay_control,
+                &self.shared.relay_control,
                 &inbox_relays,
                 &group_specs,
                 since,
@@ -971,11 +984,14 @@ impl Whitenoise {
         // so there's no contention, and this halves the worst-case timeout.
         let session = self.session(&account.pubkey);
         let (anon_result, account_result) = tokio::join!(
-            self.relay_control.warm_ephemeral_relays(&warm_relays),
+            self.shared
+                .relay_control
+                .warm_ephemeral_relays(&warm_relays),
             async {
                 match &session {
                     Some(s) => s.ephemeral.warm_relays(&warm_relays).await,
                     None => Ok(self
+                        .shared
                         .relay_control
                         .warm_ephemeral_relays_for_account(account.pubkey, &warm_relays)
                         .await?),
@@ -1025,7 +1041,7 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
-        whitenoise.external_signers.clear();
+        whitenoise.shared.external_signers.clear();
         whitenoise.account_manager.clear_sessions();
         whitenoise.account_manager.clear_pending_logins();
         whitenoise.reset_nostr_client().await.unwrap();
@@ -1160,6 +1176,7 @@ mod tests {
 
         assert_eq!(
             whitenoise
+                .shared
                 .relay_control
                 .group_plane_account_group_count(&creator_account.pubkey)
                 .await,
@@ -1182,6 +1199,7 @@ mod tests {
         );
         assert_eq!(
             whitenoise
+                .shared
                 .relay_control
                 .group_plane_account_group_count(&creator_account.pubkey)
                 .await,
@@ -1201,24 +1219,24 @@ mod tests {
     async fn test_sync_account_relays_replaces_stale_relays() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
 
         let stale_relay = Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://stale-relay.example.com").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         let replacement_a = Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://replacement-a.example.com").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         let replacement_b = Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://replacement-b.example.com").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1226,7 +1244,7 @@ mod tests {
         user.add_relays(
             std::slice::from_ref(&stale_relay),
             RelayType::Nip65,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1283,13 +1301,18 @@ mod tests {
     async fn test_is_own_key_package_returns_true_for_tracked_kp() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         // Use a valid 64-char hex string as event_id
         let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &[1, 2, 3],
+            event_hex,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let event_id = EventId::parse(event_hex).unwrap();
         assert!(
@@ -1303,20 +1326,28 @@ mod tests {
     async fn test_is_own_key_package_returns_false_when_key_material_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.database).await.unwrap();
+        account.save(&whitenoise.shared.database).await.unwrap();
 
         let event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        PublishedKeyPackage::create(&account.pubkey, &[1, 2, 3], event_hex, &whitenoise.database)
-            .await
-            .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &[1, 2, 3],
+            event_hex,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Mark key material as deleted
-        let pkg =
-            PublishedKeyPackage::find_by_event_id(&account.pubkey, event_hex, &whitenoise.database)
-                .await
-                .unwrap()
-                .unwrap();
-        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &whitenoise.database)
+        let pkg = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            event_hex,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1334,7 +1365,7 @@ mod tests {
         let pubkey = Keys::generate().public_key();
 
         // Close the pool to simulate a database error
-        whitenoise.database.pool.close().await;
+        whitenoise.shared.database.pool.close().await;
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
@@ -1417,7 +1448,7 @@ mod tests {
             .refresh_account_group_subscriptions_with_cancel(&creator_account, Some(&rx))
             .await;
 
-        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.database)
+        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(stored_relay.url, relay_url);
@@ -1448,7 +1479,7 @@ mod tests {
 
         let _ = whitenoise.setup_subscriptions(&creator_account, &[]).await;
 
-        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.database)
+        let stored_relay = Relay::find_by_url(&relay_url, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(stored_relay.url, relay_url);

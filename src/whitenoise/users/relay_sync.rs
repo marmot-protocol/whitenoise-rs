@@ -19,7 +19,11 @@ impl User {
     /// Fetches the latest relay lists for this user from Nostr and updates the local database
     #[perf_instrument("relay_sync")]
     pub(crate) async fn update_relay_lists(&self, whitenoise: &Whitenoise) -> Result<()> {
-        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        let scope = whitenoise
+            .shared
+            .relay_control
+            .ephemeral()
+            .anonymous_scope();
         self.update_relay_lists_with_scope(whitenoise, &scope)
             .await?;
         Ok(())
@@ -57,7 +61,9 @@ impl User {
     }
 
     pub(super) async fn get_query_relays(&self, whitenoise: &Whitenoise) -> Result<Vec<Relay>> {
-        let stored_relays = self.relays(RelayType::Nip65, &whitenoise.database).await?;
+        let stored_relays = self
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
+            .await?;
 
         if stored_relays.is_empty() {
             tracing::debug!(
@@ -78,7 +84,11 @@ impl User {
         whitenoise: &Whitenoise,
         query_relays: &[Relay],
     ) -> Result<Vec<Relay>> {
-        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        let scope = whitenoise
+            .shared
+            .relay_control
+            .ephemeral()
+            .anonymous_scope();
         self.update_nip65_relays_with_scope(whitenoise, &scope, query_relays)
             .await
     }
@@ -95,7 +105,9 @@ impl User {
             .await
         {
             Ok(true) => {
-                let refreshed_relays = self.relays(RelayType::Nip65, &whitenoise.database).await?;
+                let refreshed_relays = self
+                    .relays(RelayType::Nip65, &whitenoise.shared.database)
+                    .await?;
                 tracing::info!(
                     target: "whitenoise::users::update_nip65_relays",
                     "Updated NIP-65 relays for user {}, now using {} relays for other types",
@@ -130,7 +142,11 @@ impl User {
         whitenoise: &Whitenoise,
         query_relays: &[Relay],
     ) -> Result<()> {
-        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        let scope = whitenoise
+            .shared
+            .relay_control
+            .ephemeral()
+            .anonymous_scope();
         self.update_secondary_relay_types_with_scope(whitenoise, &scope, query_relays)
             .await
     }
@@ -197,7 +213,7 @@ impl User {
         event_created_at: Option<DateTime<Utc>>,
     ) -> Result<bool> {
         self.sync_relay_urls_with_database(
-            &whitenoise.database,
+            &whitenoise.shared.database,
             relay_type,
             new_relay_urls,
             event_created_at,
@@ -344,7 +360,11 @@ impl User {
         relay_type: RelayType,
         query_relays: &[Relay],
     ) -> Result<bool> {
-        let scope = whitenoise.relay_control.ephemeral().anonymous_scope();
+        let scope = whitenoise
+            .shared
+            .relay_control
+            .ephemeral()
+            .anonymous_scope();
         self.sync_relays_for_type_with_context(
             &whitenoise.user_relay_sync_context(),
             &scope,
@@ -461,7 +481,7 @@ impl User {
     pub(crate) async fn all_users_with_relay_urls(
         whitenoise: &Whitenoise,
     ) -> Result<Vec<(PublicKey, Vec<RelayUrl>)>> {
-        Self::all_with_nip65_relay_urls(&whitenoise.database).await
+        Self::all_with_nip65_relay_urls(&whitenoise.shared.database).await
     }
 }
 

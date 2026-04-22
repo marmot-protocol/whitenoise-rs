@@ -74,7 +74,7 @@ impl GroupInformation {
         let (group_info, _was_created) = Self::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(group_type),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await?;
         Ok(group_info)
@@ -94,7 +94,7 @@ impl GroupInformation {
         let (group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
             mls_group_id,
             Some(Self::infer_group_type_from_group_name(&group.name)),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await?;
         Ok(group_info)
@@ -109,7 +109,7 @@ impl GroupInformation {
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
         let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
-        Self::get_by_mls_group_ids_with_mdk(mls_group_ids, &mdk, &whitenoise.database).await
+        Self::get_by_mls_group_ids_with_mdk(mls_group_ids, &mdk, &whitenoise.shared.database).await
     }
 
     /// Get group information for multiple MLS group IDs using an existing MDK instance.

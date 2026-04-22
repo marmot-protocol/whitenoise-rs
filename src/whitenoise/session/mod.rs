@@ -141,12 +141,12 @@ impl AccountSession {
         Self::new(
             account.pubkey,
             mdk,
-            wn.database.clone(),
-            wn.message_stream_manager.clone(),
-            wn.message_aggregator.config().clone(),
+            wn.shared.database.clone(),
+            wn.shared.message_stream_manager.clone(),
+            wn.shared.message_aggregator.config().clone(),
             signer,
-            wn.relay_control.ephemeral(),
-            wn.relay_control.clone(),
+            wn.shared.relay_control.ephemeral(),
+            wn.shared.relay_control.clone(),
         )
         .await
     }
@@ -519,7 +519,7 @@ impl AccountManager {
     /// External-signer accounts get `signer: None` until re-registered.
     /// Local accounts load their signer from the secrets store.
     pub async fn restore_sessions(&self, wn: &'static Whitenoise) {
-        let accounts = match Account::all(&wn.database).await {
+        let accounts = match Account::all(&wn.shared.database).await {
             Ok(accounts) => accounts,
             Err(e) => {
                 tracing::error!(

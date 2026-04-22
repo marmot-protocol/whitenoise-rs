@@ -15,6 +15,7 @@ impl Whitenoise {
             return Err(WhitenoiseError::ExternalSignerCannotExportNsec);
         }
         Ok(self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?
             .secret_key()
@@ -108,13 +109,15 @@ impl Whitenoise {
             "Registering external signer for account: {}",
             pubkey.to_hex()
         );
-        self.external_signers.insert(pubkey, Arc::new(signer));
+        self.shared
+            .external_signers
+            .insert(pubkey, Arc::new(signer));
         Ok(())
     }
 
     /// Gets the external signer for an account, if one is registered.
     pub fn get_external_signer(&self, pubkey: &PublicKey) -> Option<Arc<dyn NostrSigner>> {
-        self.external_signers.get(pubkey).map(|r| r.clone())
+        self.shared.external_signers.get(pubkey).map(|r| r.clone())
     }
 
     /// Gets the appropriate signer for an account.
@@ -146,6 +149,7 @@ impl Whitenoise {
         }
 
         let keys = self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)?;
         tracing::debug!(
@@ -163,6 +167,6 @@ impl Whitenoise {
             "Removing external signer for account: {}",
             pubkey.to_hex()
         );
-        self.external_signers.remove(pubkey);
+        self.shared.external_signers.remove(pubkey);
     }
 }

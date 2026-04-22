@@ -28,7 +28,7 @@ impl Task for CachedGraphUserCleanup {
 
     #[perf_instrument("scheduled::cached_graph_cleanup")]
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
-        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.database).await?;
+        let deleted = CachedGraphUser::cleanup_stale(&whitenoise.shared.database).await?;
 
         if deleted > 0 {
             tracing::info!(

@@ -37,7 +37,7 @@ impl Task for KeyPackageMaintenance {
             "Starting key package maintenance"
         );
 
-        let accounts = Account::all(&whitenoise.database).await?;
+        let accounts = Account::all(&whitenoise.shared.database).await?;
 
         if accounts.is_empty() {
             tracing::debug!(
@@ -291,7 +291,7 @@ async fn find_live_published_key_packages(
         match PublishedKeyPackage::find_by_event_id(
             &account.pubkey,
             &event.id.to_hex(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await?
         {
@@ -597,7 +597,7 @@ mod tests {
         let tracked = PublishedKeyPackage::find_by_event_id(
             &account.pubkey,
             &before[0].id.to_hex(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -606,7 +606,7 @@ mod tests {
         let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
         mdk.delete_key_package_from_storage_by_hash_ref(&tracked.key_package_hash_ref)
             .unwrap();
-        PublishedKeyPackage::mark_key_material_deleted(tracked.id, &whitenoise.database)
+        PublishedKeyPackage::mark_key_material_deleted(tracked.id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -654,7 +654,7 @@ mod tests {
         PublishedKeyPackage::mark_consumed(
             &account.pubkey,
             &before[0].id.to_hex(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -708,7 +708,7 @@ mod tests {
         PublishedKeyPackage::mark_consumed(
             &account.pubkey,
             &before[0].id.to_hex(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();

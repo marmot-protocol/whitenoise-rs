@@ -371,6 +371,7 @@ impl Whitenoise {
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<EventId> {
         let result = self
+            .shared
             .relay_control
             .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
             .await?;
@@ -402,7 +403,7 @@ impl Whitenoise {
             &account.pubkey,
             hash_ref,
             &event_id.to_hex(),
-            &self.database,
+            &self.shared.database,
         )
         .await
         {
@@ -476,15 +477,18 @@ impl Whitenoise {
             match PublishedKeyPackage::find_by_event_id(
                 &account.pubkey,
                 &event_id.to_hex(),
-                &self.database,
+                &self.shared.database,
             )
             .await
             {
                 Ok(Some(pkg)) if !pkg.key_material_deleted => {
                     let mdk = self.create_mdk_for_account(account.pubkey)?;
                     mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)?;
-                    if let Err(e) =
-                        PublishedKeyPackage::mark_key_material_deleted(pkg.id, &self.database).await
+                    if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
+                        pkg.id,
+                        &self.shared.database,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             target: "whitenoise::key_packages",
@@ -527,6 +531,7 @@ impl Whitenoise {
         let key_package_relays_urls = Relay::urls(&key_package_relays);
 
         let result = self
+            .shared
             .relay_control
             .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
             .await?;
@@ -901,6 +906,7 @@ impl Whitenoise {
         context: &str,
     ) -> Result<()> {
         match self
+            .shared
             .relay_control
             .publish_batch_event_deletion_with_signer(event_ids, relay_urls, signer)
             .await
@@ -949,7 +955,7 @@ impl Whitenoise {
         account_pubkey: &nostr_sdk::PublicKey,
         event_id: &str,
     ) -> Result<Option<PublishedKeyPackage>> {
-        PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.database)
+        PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.shared.database)
             .await
             .map_err(WhitenoiseError::from)
     }
@@ -970,7 +976,7 @@ impl Whitenoise {
         hash_ref: &[u8],
         event_id: &str,
     ) -> Result<()> {
-        PublishedKeyPackage::create(account_pubkey, hash_ref, event_id, &self.database)
+        PublishedKeyPackage::create(account_pubkey, hash_ref, event_id, &self.shared.database)
             .await
             .map_err(WhitenoiseError::from)
     }
@@ -998,7 +1004,7 @@ impl Whitenoise {
         .bind(age_secs)
         .bind(account_pubkey.to_hex())
         .bind(event_id)
-        .execute(&self.database.pool)
+        .execute(&self.shared.database.pool)
         .await
         .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
 
@@ -1051,20 +1057,25 @@ mod tests {
     async fn create_account_with_relay(whitenoise: &Whitenoise) -> Account {
         let (account, keys) = create_test_account(whitenoise).await;
         whitenoise
+            .shared
             .secrets_store
             .store_private_key(&keys)
             .expect("Should store keys");
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         // Use a loopback IP so connection refusal is instant (no DNS lookup).
         let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
             &RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
-        user.add_relay(&relay, crate::RelayType::KeyPackage, &whitenoise.database)
-            .await
-            .unwrap();
+        user.add_relay(
+            &relay,
+            crate::RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         account
     }
 
@@ -1076,6 +1087,7 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         whitenoise
+            .shared
             .secrets_store
             .store_private_key(&keys)
             .expect("Should store keys");
@@ -1181,6 +1193,7 @@ mod tests {
 
         // Store keys in the secrets store (simulates a local account)
         whitenoise
+            .shared
             .secrets_store
             .store_private_key(&keys)
             .expect("Should store keys");
@@ -1219,16 +1232,20 @@ mod tests {
         let (account, _keys) = create_test_account(&whitenoise).await;
 
         // Setup relays
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
             &RelayUrl::parse("wss://test.relay.com").unwrap(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
-        user.add_relay(&relay, crate::RelayType::KeyPackage, &whitenoise.database)
-            .await
-            .unwrap();
+        user.add_relay(
+            &relay,
+            crate::RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Should return relay URLs
         let urls = whitenoise.prepare_key_package_relay_urls(&account).await;
@@ -1763,6 +1780,7 @@ mod tests {
         // before fetching key packages from relays.
         let (account, keys) = create_test_account(&whitenoise).await;
         whitenoise
+            .shared
             .secrets_store
             .store_private_key(&keys)
             .expect("Should store keys");

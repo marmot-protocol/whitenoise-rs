@@ -414,6 +414,7 @@ impl<'a> MediaOps<'a> {
         // TODO(phase-16): Remove singleton bridge when storage moves to session.
         let wn = Self::wn()?;
         let cache_path = wn
+            .shared
             .storage
             .media_files
             .store_file(&cached_filename, &decrypted_data)

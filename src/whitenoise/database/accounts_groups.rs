@@ -740,7 +740,7 @@ mod tests {
         let result = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -754,10 +754,14 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[2; 32]);
 
-        let (account_group, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, was_created) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(was_created);
         assert_eq!(account_group.account_pubkey, account.pubkey);
@@ -773,17 +777,25 @@ mod tests {
         let group_id = GroupId::from_slice(&[3; 32]);
 
         // First create
-        let (original, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (original, was_created) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(was_created);
 
         // Second call should find existing
-        let (found, was_created) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (found, was_created) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(!was_created);
         assert_eq!(found.id, original.id);
@@ -795,15 +807,19 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[4; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(account_group.user_confirmation.is_none());
 
         let updated = account_group
-            .update_user_confirmation(true, &whitenoise.database)
+            .update_user_confirmation(true, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -817,13 +833,17 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[5; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let updated = account_group
-            .update_user_confirmation(false, &whitenoise.database)
+            .update_user_confirmation(false, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -838,30 +858,43 @@ mod tests {
         let group_id2 = GroupId::from_slice(&[9; 32]); // Will be accepted
         let group_id3 = GroupId::from_slice(&[10; 32]); // Will be declined
 
-        let (_ag1, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id1, None, &whitenoise.database)
-                .await
-                .unwrap();
-        let (ag2, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id2, None, &whitenoise.database)
-                .await
-                .unwrap();
-        let (ag3, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id3, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (_ag1, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id1,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let (ag2, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id2,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let (ag3, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id3,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // ag1 stays pending (NULL)
-        ag2.update_user_confirmation(true, &whitenoise.database)
+        ag2.update_user_confirmation(true, &whitenoise.shared.database)
             .await
             .unwrap();
-        ag3.update_user_confirmation(false, &whitenoise.database)
+        ag3.update_user_confirmation(false, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let visible = AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.database)
-            .await
-            .unwrap();
+        let visible =
+            AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         // Should only include pending and accepted, not declined
         assert_eq!(visible.len(), 2);
@@ -878,22 +911,31 @@ mod tests {
         let group_id1 = GroupId::from_slice(&[11; 32]); // Will be pending
         let group_id2 = GroupId::from_slice(&[12; 32]); // Will be accepted
 
-        let (_, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id1, None, &whitenoise.database)
-                .await
-                .unwrap();
-        let (ag2, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id2, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (_, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id1,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let (ag2, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id2,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        ag2.update_user_confirmation(true, &whitenoise.database)
+        ag2.update_user_confirmation(true, &whitenoise.shared.database)
             .await
             .unwrap();
 
-        let pending = AccountGroup::find_pending_for_account(&account.pubkey, &whitenoise.database)
-            .await
-            .unwrap();
+        let pending =
+            AccountGroup::find_pending_for_account(&account.pubkey, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].mls_group_id, group_id1);
@@ -906,14 +948,22 @@ mod tests {
         let account2 = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[14; 32]);
 
-        let (ag1, created1) =
-            AccountGroup::find_or_create(&account1.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-        let (ag2, created2) =
-            AccountGroup::find_or_create(&account2.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag1, created1) = AccountGroup::find_or_create(
+            &account1.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let (ag2, created2) = AccountGroup::find_or_create(
+            &account2.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(created1);
         assert!(created2);
@@ -927,7 +977,7 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[15; 32]);
 
-        let result = AccountGroup::find_by_group(&group_id, &whitenoise.database)
+        let result = AccountGroup::find_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -940,12 +990,16 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[16; 32]);
 
-        let (created_ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (created_ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        let result = AccountGroup::find_by_group(&group_id, &whitenoise.database)
+        let result = AccountGroup::find_by_group(&group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -965,19 +1019,34 @@ mod tests {
         let other_group = GroupId::from_slice(&[18; 32]);
 
         // Add accounts 1 and 2 to the target group
-        AccountGroup::find_or_create(&account1.pubkey, &target_group, None, &whitenoise.database)
-            .await
-            .unwrap();
-        AccountGroup::find_or_create(&account2.pubkey, &target_group, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account1.pubkey,
+            &target_group,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        AccountGroup::find_or_create(
+            &account2.pubkey,
+            &target_group,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Add account 3 to a different group (should not be returned)
-        AccountGroup::find_or_create(&account3.pubkey, &other_group, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account3.pubkey,
+            &other_group,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
-        let result = AccountGroup::find_by_group(&target_group, &whitenoise.database)
+        let result = AccountGroup::find_by_group(&target_group, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1020,7 +1089,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let saved = ag.save(&whitenoise.database).await.unwrap();
+        let saved = ag.save(&whitenoise.shared.database).await.unwrap();
 
         assert!(saved.id.is_some());
         assert_eq!(saved.account_pubkey, account.pubkey);
@@ -1056,7 +1125,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let original = ag.save(&whitenoise.database).await.unwrap();
+        let original = ag.save(&whitenoise.shared.database).await.unwrap();
         assert_eq!(original.welcomer_pubkey, Some(welcomer.pubkey));
         assert_eq!(original.user_confirmation, Some(true));
         assert_eq!(original.pin_order, Some(100));
@@ -1080,7 +1149,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let saved = update.save(&whitenoise.database).await.unwrap();
+        let saved = update.save(&whitenoise.shared.database).await.unwrap();
 
         assert_eq!(saved.id, original.id);
         assert!(saved.user_confirmation.is_none());
@@ -1094,14 +1163,18 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[32; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Archive the group
         let archived = ag
-            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(archived.is_archived());
@@ -1125,13 +1198,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        resaved.save(&whitenoise.database).await.unwrap();
+        resaved.save(&whitenoise.shared.database).await.unwrap();
 
         // Fetch and verify archived_at survived the save()
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1156,7 +1229,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1170,15 +1243,19 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             message_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(account_group.last_read_message_id.is_none());
 
@@ -1187,7 +1264,7 @@ mod tests {
             .update_last_read_if_newer(
                 &message_id,
                 message_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1208,7 +1285,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1225,7 +1302,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1235,22 +1312,26 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Set to older message first
         let updated = account_group
             .update_last_read_if_newer(
                 &older_msg_id,
                 older_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap()
@@ -1262,7 +1343,7 @@ mod tests {
             .update_last_read_if_newer(
                 &newer_msg_id,
                 newer_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1283,7 +1364,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1300,7 +1381,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1310,22 +1391,26 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Set to newer message first
         let updated = account_group
             .update_last_read_if_newer(
                 &newer_msg_id,
                 newer_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap()
@@ -1337,7 +1422,7 @@ mod tests {
             .update_last_read_if_newer(
                 &older_msg_id,
                 older_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1348,7 +1433,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1368,7 +1453,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1381,21 +1466,25 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             message_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         account_group
             .update_last_read_if_newer(
                 &message_id,
                 message_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1404,7 +1493,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1419,15 +1508,19 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[60; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(account_group.pin_order.is_none());
 
         let updated = account_group
-            .update_pin_order(Some(42), &whitenoise.database)
+            .update_pin_order(Some(42), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1440,21 +1533,25 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[61; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Set pin order first
         let pinned = account_group
-            .update_pin_order(Some(100), &whitenoise.database)
+            .update_pin_order(Some(100), &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(pinned.pin_order, Some(100));
 
         // Clear pin order
         let unpinned = pinned
-            .update_pin_order(None, &whitenoise.database)
+            .update_pin_order(None, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1467,13 +1564,17 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[62; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         account_group
-            .update_pin_order(Some(77), &whitenoise.database)
+            .update_pin_order(Some(77), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1481,7 +1582,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1496,16 +1597,20 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[63; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(account_group.archived_at.is_none());
 
         let now = Utc::now();
         let updated = account_group
-            .update_archived_at(Some(now), &whitenoise.database)
+            .update_archived_at(Some(now), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1519,21 +1624,25 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[64; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Set archived
         let archived = account_group
-            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(archived.is_archived());
 
         // Clear archived
         let unarchived = archived
-            .update_archived_at(None, &whitenoise.database)
+            .update_archived_at(None, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(unarchived.archived_at.is_none());
@@ -1546,13 +1655,17 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[65; 32]);
 
-        let (account_group, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (account_group, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         account_group
-            .update_archived_at(Some(Utc::now()), &whitenoise.database)
+            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1560,7 +1673,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1586,12 +1699,17 @@ mod tests {
         .unwrap();
 
         // Create account_group WITHOUT dm_peer_pubkey (simulates pre-migration state)
-        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1621,13 +1739,13 @@ mod tests {
             &account.pubkey,
             &group_id,
             Some(&peer.pubkey),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1651,12 +1769,17 @@ mod tests {
         .unwrap();
 
         // Create account_group without dm_peer_pubkey
-        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.database)
+            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1672,16 +1795,21 @@ mod tests {
         let group_id = GroupId::from_slice(&[73; 32]);
 
         // Create account_group without dm_peer_pubkey
-        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Update the dm_peer_pubkey
         AccountGroup::update_dm_peer_pubkey(
             &account.pubkey,
             &group_id,
             &peer.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1690,7 +1818,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1712,7 +1840,7 @@ mod tests {
             &account.pubkey,
             &group_id,
             Some(&original_peer.pubkey),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1722,7 +1850,7 @@ mod tests {
             &account.pubkey,
             &group_id,
             &new_peer.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1731,7 +1859,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1746,14 +1874,18 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[83; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Mark as removed
         let removed = ag
-            .mark_removed_atomic(&whitenoise.database)
+            .mark_removed_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("first mark_removed_atomic must update the row");
@@ -1778,13 +1910,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        resaved.save(&whitenoise.database).await.unwrap();
+        resaved.save(&whitenoise.shared.database).await.unwrap();
 
         // Fetch and verify removed_at survived
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1802,15 +1934,19 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[90; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(ag.removed_at.is_none());
         assert!(!ag.self_removed);
 
         let left = ag
-            .mark_left_atomic(&whitenoise.database)
+            .mark_left_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("first mark_left_atomic must update the row");
@@ -1826,19 +1962,26 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[91; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let first = ag
-            .mark_left_atomic(&whitenoise.database)
+            .mark_left_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("first call must succeed");
 
         // Second call must be a no-op
-        let second = first.mark_left_atomic(&whitenoise.database).await.unwrap();
+        let second = first
+            .mark_left_atomic(&whitenoise.shared.database)
+            .await
+            .unwrap();
         assert!(second.is_none(), "second mark_left_atomic must return None");
     }
 
@@ -1848,14 +1991,18 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[92; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // User leaves voluntarily
         let left = ag
-            .mark_left_atomic(&whitenoise.database)
+            .mark_left_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("mark_left_atomic must succeed");
@@ -1863,7 +2010,7 @@ mod tests {
 
         // Later commit arrives — mark_removed_atomic must be a no-op
         let removed = left
-            .mark_removed_atomic(&whitenoise.database)
+            .mark_removed_atomic(&whitenoise.shared.database)
             .await
             .unwrap();
         assert!(
@@ -1875,7 +2022,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1892,14 +2039,18 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[93; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Admin kicks user first
         let removed = ag
-            .mark_removed_atomic(&whitenoise.database)
+            .mark_removed_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("mark_removed_atomic must succeed");
@@ -1907,7 +2058,7 @@ mod tests {
 
         // User tries to leave — must be a no-op
         let left = removed
-            .mark_left_atomic(&whitenoise.database)
+            .mark_left_atomic(&whitenoise.shared.database)
             .await
             .unwrap();
         assert!(
@@ -1919,7 +2070,7 @@ mod tests {
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1936,14 +2087,18 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[94; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // User leaves voluntarily
         let left = ag
-            .mark_left_atomic(&whitenoise.database)
+            .mark_left_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("mark_left_atomic must succeed");
@@ -1968,13 +2123,13 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        resaved.save(&whitenoise.database).await.unwrap();
+        resaved.save(&whitenoise.shared.database).await.unwrap();
 
         // Fetch and verify self_removed survived
         let found = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1992,21 +2147,25 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[84; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Decline the invite first
         let declined = ag
-            .update_user_confirmation(false, &whitenoise.database)
+            .update_user_confirmation(false, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(declined.user_confirmation, Some(false));
 
         // Admin removes the user — user_confirmation must stay Some(false)
         let removed = declined
-            .mark_removed_atomic(&whitenoise.database)
+            .mark_removed_atomic(&whitenoise.shared.database)
             .await
             .unwrap()
             .expect("mark_removed_atomic must update the row");
@@ -2027,16 +2186,20 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[90; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(ag.chat_cleared_at.is_none());
 
         let now = Utc::now();
         let updated = ag
-            .update_chat_cleared_at(Some(now), &whitenoise.database)
+            .update_chat_cleared_at(Some(now), &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -2049,19 +2212,23 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[91; 32]);
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let cleared = ag
-            .update_chat_cleared_at(Some(Utc::now()), &whitenoise.database)
+            .update_chat_cleared_at(Some(Utc::now()), &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(cleared.chat_cleared_at.is_some());
 
         let uncleared = cleared
-            .update_chat_cleared_at(None, &whitenoise.database)
+            .update_chat_cleared_at(None, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(uncleared.chat_cleared_at.is_none());
@@ -2079,7 +2246,7 @@ mod tests {
         GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2092,22 +2259,26 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             message_time,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Set the read marker first
         let with_marker = ag
             .update_last_read_if_newer(
                 &message_id,
                 message_time.timestamp_millis(),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap()
@@ -2116,7 +2287,7 @@ mod tests {
 
         // Reset
         let reset = with_marker
-            .reset_last_read_message_id(&whitenoise.database)
+            .reset_last_read_message_id(&whitenoise.shared.database)
             .await
             .unwrap();
         assert!(reset.last_read_message_id.is_none());

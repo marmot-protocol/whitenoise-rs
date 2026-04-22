@@ -297,7 +297,7 @@ mod tests {
             &first_server,
             Some(&relay_hint),
             "ciphertext-one",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -313,7 +313,7 @@ mod tests {
             &second_server,
             None,
             "ciphertext-two",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -326,22 +326,26 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &account.pubkey,
             &mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         assert_eq!(stored, vec![replaced.clone()]);
 
-        let deleted =
-            GroupPushToken::delete(&account.pubkey, &mls_group_id, 7, &whitenoise.database)
-                .await
-                .unwrap();
+        let deleted = GroupPushToken::delete(
+            &account.pubkey,
+            &mls_group_id,
+            7,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(deleted);
 
         let stored_after_delete = GroupPushToken::find_by_account_and_group(
             &account.pubkey,
             &mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -365,7 +369,7 @@ mod tests {
             &first_server,
             None,
             "ciphertext-one",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -377,7 +381,7 @@ mod tests {
             &second_server,
             None,
             "ciphertext-two",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -385,7 +389,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &account.pubkey,
             &mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -413,7 +417,7 @@ mod tests {
             &first_server,
             None,
             "ciphertext-one",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -425,7 +429,7 @@ mod tests {
             &second_server,
             None,
             "ciphertext-two",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -434,7 +438,7 @@ mod tests {
             &account.pubkey,
             &mls_group_id,
             &member_pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -443,7 +447,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &account.pubkey,
             &mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -470,7 +474,7 @@ mod tests {
             &server_pubkey,
             None,
             "a1g1l1",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -482,7 +486,7 @@ mod tests {
             &server_pubkey,
             None,
             "a1g2l2",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -494,7 +498,7 @@ mod tests {
             &server_pubkey,
             None,
             "a2g1l3",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -502,26 +506,26 @@ mod tests {
         let account_one_group_one = GroupPushToken::find_by_account_and_group(
             &account_one.pubkey,
             &group_one,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         let account_one_group_two = GroupPushToken::find_by_account_and_group(
             &account_one.pubkey,
             &group_two,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         let account_two_group_one = GroupPushToken::find_by_account_and_group(
             &account_two.pubkey,
             &group_one,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
         let account_one_groups =
-            GroupPushToken::group_ids_for_account(&account_one.pubkey, &whitenoise.database)
+            GroupPushToken::group_ids_for_account(&account_one.pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -551,7 +555,7 @@ mod tests {
             &first_server,
             None,
             "ciphertext-one",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -566,7 +570,7 @@ mod tests {
         .bind(account.pubkey.to_hex())
         .bind(mls_group_id.as_slice())
         .bind(4_i64)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -580,7 +584,7 @@ mod tests {
             &second_server,
             None,
             "ciphertext-two",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -607,7 +611,7 @@ mod tests {
             &server_pubkey,
             None,
             " \n\t\r ",
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap_err();
