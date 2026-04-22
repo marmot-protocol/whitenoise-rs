@@ -85,7 +85,7 @@ impl<'a> GroupOps<'a> {
 
         let visible_account_groups = AccountGroup::find_visible_for_account(
             &self.session.account_pubkey,
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await?;
 
@@ -123,7 +123,8 @@ impl<'a> GroupOps<'a> {
             .map(|gwm| gwm.group.mls_group_id.clone())
             .collect();
         let info_list =
-            GroupInformation::find_by_mls_group_ids(&group_ids, &self.session.database).await?;
+            GroupInformation::find_by_mls_group_ids(&group_ids, &self.session.shared.database)
+                .await?;
         let info_by_id: HashMap<_, _> = info_list
             .into_iter()
             .map(|gi| (gi.mls_group_id.clone(), gi))
@@ -641,7 +642,7 @@ impl<'a> GroupOps<'a> {
         let (_group_info, _was_created) = GroupInformation::find_or_create_by_mls_group_id(
             &group.mls_group_id,
             Some(group_type),
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await?;
 
@@ -649,11 +650,11 @@ impl<'a> GroupOps<'a> {
             &self.session.account_pubkey,
             &group.mls_group_id,
             dm_peer,
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await?;
         account_group
-            .update_user_confirmation(true, &self.session.database)
+            .update_user_confirmation(true, &self.session.shared.database)
             .await?;
 
         // Best-effort: share the creator's push token into the new group.

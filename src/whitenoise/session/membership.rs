@@ -42,7 +42,7 @@ impl<'a> MembershipOps<'a> {
     }
 
     fn db(&self) -> &Arc<Database> {
-        &self.session.database
+        &self.session.shared.database
     }
 
     /// Return all visible (pending + accepted) account-group memberships.
@@ -104,7 +104,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     }
 
     fn db(&self) -> &Arc<Database> {
-        &self.session.database
+        &self.session.shared.database
     }
 
     /// Load the account-group row, returning `GroupNotFound` if absent.

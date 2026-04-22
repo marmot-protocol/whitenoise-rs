@@ -36,7 +36,6 @@ use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
-use crate::whitenoise::database::Database;
 use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::message_aggregator::AggregatorConfig;
@@ -74,10 +73,8 @@ impl AccountInboxState {
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
+    pub(crate) shared: Arc<crate::whitenoise::shared::SharedServices>,
     pub(crate) repos: AccountRepositories,
-    pub(crate) database: Arc<Database>,
-    pub(crate) message_stream_manager:
-        Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
     pub(crate) aggregator_config: AggregatorConfig,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
@@ -96,27 +93,25 @@ impl AccountSession {
     pub(crate) async fn new(
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
-        database: Arc<Database>,
-        message_stream_manager: Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
+        shared: Arc<crate::whitenoise::shared::SharedServices>,
         aggregator_config: AggregatorConfig,
         signer: Option<Arc<dyn NostrSigner>>,
-        ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
-        relay_control: Arc<crate::relay_control::RelayControlPlane>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
         let ephemeral = relay_handles::AccountEphemeralHandle::new(
             account_pubkey,
-            ephemeral_plane,
+            shared.relay_control.ephemeral(),
             signer.clone(),
         );
-        let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
+        let group_handle =
+            relay_handles::AccountGroupHandle::new(account_pubkey, shared.relay_control.clone());
+        let repos = AccountRepositories::new(account_pubkey, shared.database.clone()).await?;
         Ok(Self {
-            repos: AccountRepositories::new(account_pubkey, database.clone()).await?,
             account_pubkey,
             mdk: Arc::new(mdk),
-            database,
-            message_stream_manager,
+            shared,
+            repos,
             aggregator_config,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
@@ -141,12 +136,9 @@ impl AccountSession {
         Self::new(
             account.pubkey,
             mdk,
-            wn.shared.database.clone(),
-            wn.shared.message_stream_manager.clone(),
+            wn.shared.clone(),
             wn.shared.message_aggregator.config().clone(),
             signer,
-            wn.shared.relay_control.ephemeral(),
-            wn.shared.relay_control.clone(),
         )
         .await
     }
@@ -253,7 +245,7 @@ impl AccountSession {
         self.pending_push_token_responses.insert(key, ());
 
         let mdk = Arc::clone(&self.mdk);
-        let database = Arc::clone(&self.database);
+        let database = Arc::clone(&self.shared.database);
         let pending = Arc::clone(&self.pending_push_token_responses);
         let relay_control = Arc::clone(self.group_handle.relay_control());
         let account_pubkey = self.account_pubkey;
@@ -583,8 +575,6 @@ pub(crate) mod test_helpers {
 
     use super::*;
     use crate::relay_control::RelayControlPlane;
-    use crate::relay_control::ephemeral::{EphemeralPlane, EphemeralPlaneConfig};
-    use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
     use crate::whitenoise::test_utils::insert_test_account;
@@ -612,35 +602,50 @@ pub(crate) mod test_helpers {
         // Insert the account row so AccountFollowsRepo can resolve the account id.
         insert_test_account(&db, &pubkey).await;
 
+        let shared = test_shared(db).await;
+        Arc::new(
+            AccountSession::new(pubkey, mdk, shared, AggregatorConfig::default(), None)
+                .await
+                .expect("create test session"),
+        )
+    }
+
+    /// Build a minimal `SharedServices` for tests.
+    pub async fn test_shared(db: Arc<Database>) -> Arc<crate::whitenoise::shared::SharedServices> {
+        use dashmap::DashMap;
+
+        use crate::whitenoise::discovery_sync_worker::DiscoverySyncWorker;
+        use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
+        use crate::whitenoise::message_aggregator::MessageAggregator;
+        use crate::whitenoise::secrets_store::SecretsStore;
+        use crate::whitenoise::shared::SharedServices;
+        use crate::whitenoise::storage::Storage;
+
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
-        let ephemeral = EphemeralPlane::new(
-            EphemeralPlaneConfig::default(),
-            db.clone(),
-            event_sender.clone(),
-            RelayObservability::new(RelayObservabilityConfig::default()),
-        );
         let relay_control = Arc::new(RelayControlPlane::new(
             db.clone(),
             vec![],
             event_sender,
             [0u8; 16],
         ));
-        let stream_manager =
-            Arc::new(crate::whitenoise::message_streaming::MessageStreamManager::default());
-        Arc::new(
-            AccountSession::new(
-                pubkey,
-                mdk,
-                db,
-                stream_manager,
-                AggregatorConfig::default(),
-                None,
-                ephemeral,
-                relay_control,
-            )
-            .await
-            .expect("create test session"),
-        )
+        Arc::new(SharedServices {
+            database: db.clone(),
+            relay_control,
+            event_tracker: Arc::new(WhitenoiseEventTracker::new(db)),
+            secrets_store: SecretsStore::new("com.whitenoise.test"),
+            storage: Storage::new(std::env::temp_dir().as_path())
+                .await
+                .expect("test storage"),
+            message_aggregator: MessageAggregator::new(),
+            message_stream_manager: Arc::new(Default::default()),
+            user_stream_manager: Default::default(),
+            chat_list_stream_manager: Default::default(),
+            archived_chat_list_stream_manager: Default::default(),
+            notification_stream_manager: Default::default(),
+            user_resolution_guards: DashMap::new(),
+            external_signers: DashMap::new(),
+            discovery_sync_worker: DiscoverySyncWorker::new(),
+        })
     }
 }
 

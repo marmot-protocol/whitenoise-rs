@@ -454,7 +454,7 @@ impl<'a> PushOps<'a> {
         match AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await
         {
@@ -528,7 +528,7 @@ impl<'a> PushOps<'a> {
     ) -> Result<()> {
         respond_to_token_request_with(
             &self.session.mdk,
-            &self.session.database,
+            &self.session.shared.database,
             self.session.group_handle.relay_control(),
             &self.session.account_pubkey,
             group_id,

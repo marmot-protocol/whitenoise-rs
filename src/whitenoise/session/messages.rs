@@ -49,7 +49,7 @@ impl<'a> MessageOps<'a> {
     }
 
     fn db(&self) -> &Arc<Database> {
-        &self.session.database
+        &self.session.shared.database
     }
 }
 
@@ -65,11 +65,12 @@ impl<'a> MessageOpsForGroup<'a> {
     }
 
     fn db(&self) -> &Arc<Database> {
-        &self.session.database
+        &self.session.shared.database
     }
 
     fn emit(&self, trigger: UpdateTrigger, message: ChatMessage) {
         self.session
+            .shared
             .message_stream_manager
             .emit(self.group_id, MessageUpdate { trigger, message });
     }
@@ -302,8 +303,8 @@ impl<'a> MessageOpsForGroup<'a> {
     ) {
         let ephemeral = self.session.ephemeral.clone_inner();
         let account_pubkey = *self.pubkey();
-        let database = self.session.database.clone();
-        let stream_manager = self.session.message_stream_manager.clone();
+        let database = self.session.shared.database.clone();
+        let stream_manager = self.session.shared.message_stream_manager.clone();
         let group_id = self.group_id.clone();
         let event_id_str = event_id.to_string();
         let tags = mdk_message.tags.clone();
