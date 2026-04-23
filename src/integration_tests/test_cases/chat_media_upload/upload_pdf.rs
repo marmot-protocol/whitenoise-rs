@@ -36,6 +36,7 @@ impl UploadPdfTestCase {
 
 #[async_trait]
 impl TestCase for UploadPdfTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading PDF document for group {} using account: {}",

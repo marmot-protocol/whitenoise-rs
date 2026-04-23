@@ -21,6 +21,7 @@ use crate::whitenoise::error::Result;
 use crate::whitenoise::groups::blossom_error::BlossomError;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::secrets_store::SecretsStoreError;
+use crate::whitenoise::session::MediaOps;
 use crate::whitenoise::user_streaming::{UserUpdate, UserUpdateTrigger};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{Whitenoise, WhitenoiseError};
@@ -538,9 +539,9 @@ impl Account {
             Some(&signer),
         );
 
-        let descriptor = tokio::time::timeout(Whitenoise::BLOSSOM_TIMEOUT, upload_future)
+        let descriptor = tokio::time::timeout(MediaOps::BLOSSOM_TIMEOUT, upload_future)
             .await
-            .map_err(|_| BlossomError::Timeout(Whitenoise::BLOSSOM_TIMEOUT))?
+            .map_err(|_| BlossomError::Timeout(MediaOps::BLOSSOM_TIMEOUT))?
             .map_err(BlossomError::client)?;
 
         Whitenoise::require_https(&descriptor.url)?;

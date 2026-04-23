@@ -46,6 +46,7 @@ impl UploadVideoTestCase {
 
 #[async_trait]
 impl TestCase for UploadVideoTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Uploading MP4 video for group {} using account: {}",

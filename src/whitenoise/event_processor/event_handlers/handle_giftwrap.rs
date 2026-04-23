@@ -446,6 +446,7 @@ impl Whitenoise {
     }
 
     /// Sync group image cache if needed
+    #[allow(deprecated)]
     #[perf_instrument("event_handlers")]
     async fn sync_group_image(
         whitenoise: &Whitenoise,

@@ -35,6 +35,7 @@ impl DownloadChatMediaTestCase {
 
 #[async_trait]
 impl TestCase for DownloadChatMediaTestCase {
+    #[allow(deprecated)]
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         tracing::info!(
             "Testing download_chat_media for group {} using account: {}",
