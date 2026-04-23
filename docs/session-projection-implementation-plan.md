@@ -588,7 +588,7 @@ joins across account DB and shared DB.
 
 ### Phase 19: CLI crate extraction (~500 LOC of Cargo.toml + module moves)
 
-- [x] Completed in PR #XXX
+- [x] Completed in PR #774
 
 <details>
 <summary>Details</summary>
