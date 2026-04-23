@@ -4,6 +4,7 @@ use core::fmt;
 use std::{
     collections::{BTreeMap, HashSet},
     str::FromStr,
+    sync::Arc,
 };
 
 use chrono::{DateTime, Utc};
@@ -21,8 +22,8 @@ use crate::whitenoise::{
     accounts::Account,
     database::Database,
     error::{Result, WhitenoiseError},
+    event_tracker::EventTracker,
     relays::{Relay, RelayType},
-    shared::SharedServices,
     users::relay_sync,
 };
 use crate::{
@@ -373,18 +374,17 @@ fn notification_token_counts_by_server(tokens: &[TokenTag]) -> BTreeMap<PublicKe
 }
 
 async fn resolve_notification_server_relays(
-    shared: &SharedServices,
+    database: &Database,
+    relay_control: &RelayControlPlane,
+    event_tracker: &Arc<dyn EventTracker>,
     server_pubkey: PublicKey,
     relay_hints: &[RelayUrl],
 ) -> Result<(Vec<RelayUrl>, NotificationRelaySource)> {
     let (server_user, _created) =
-        crate::whitenoise::users::User::find_or_create_by_pubkey(&server_pubkey, &shared.database)
-            .await?;
+        crate::whitenoise::users::User::find_or_create_by_pubkey(&server_pubkey, database).await?;
     let deduped_hints = dedupe_relay_urls(relay_hints);
 
-    let cached_relays = server_user
-        .relays(RelayType::Inbox, &shared.database)
-        .await?;
+    let cached_relays = server_user.relays(RelayType::Inbox, database).await?;
     if !cached_relays.is_empty() {
         return Ok((
             dedupe_relay_urls(&Relay::urls(&cached_relays)),
@@ -397,7 +397,9 @@ async fn resolve_notification_server_relays(
     }
 
     let synced_relays = match relay_sync::sync_relay_type_for_pubkey(
-        shared,
+        database,
+        relay_control,
+        event_tracker,
         server_pubkey,
         RelayType::Inbox,
         &deduped_hints,
@@ -414,9 +416,7 @@ async fn resolve_notification_server_relays(
                 error = %error,
                 "Failed to sync notification server inbox relays from relay hints"
             );
-            server_user
-                .relays(RelayType::Inbox, &shared.database)
-                .await?
+            server_user.relays(RelayType::Inbox, database).await?
         }
     };
     if !synced_relays.is_empty() {
@@ -430,7 +430,9 @@ async fn resolve_notification_server_relays(
 }
 
 async fn publish_notification_batches_best_effort(
-    shared: &SharedServices,
+    database: &Database,
+    relay_control: &RelayControlPlane,
+    event_tracker: &Arc<dyn EventTracker>,
     ephemeral: &EphemeralPlane,
     account_pubkey: PublicKey,
     token_counts_by_server: &BTreeMap<PublicKey, usize>,
@@ -442,9 +444,14 @@ async fn publish_notification_batches_best_effort(
             .copied()
             .unwrap_or_default();
         let event_count = batch.events.len();
-        let relay_resolution =
-            resolve_notification_server_relays(shared, batch.server_pubkey, &batch.relay_hints)
-                .await;
+        let relay_resolution = resolve_notification_server_relays(
+            database,
+            relay_control,
+            event_tracker,
+            batch.server_pubkey,
+            &batch.relay_hints,
+        )
+        .await;
 
         let (relay_urls, relay_source) = match relay_resolution {
             Ok(result) => result,
@@ -512,7 +519,9 @@ async fn publish_notification_batches_best_effort(
 
 pub(crate) async fn publish_notification_requests_after_delivery_with(
     config: &WhitenoiseConfig,
-    shared: &SharedServices,
+    database: &Database,
+    relay_control: &RelayControlPlane,
+    event_tracker: &Arc<dyn EventTracker>,
     ephemeral: &EphemeralPlane,
     account_pubkey: PublicKey,
     group_id: &GroupId,
@@ -529,8 +538,7 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
             )
         })?;
     let cached_tokens =
-        GroupPushToken::find_by_account_and_group(&account_pubkey, group_id, &shared.database)
-            .await?;
+        GroupPushToken::find_by_account_and_group(&account_pubkey, group_id, database).await?;
     let recipient_tokens = prepare_notification_recipient_tokens(
         &account_pubkey,
         &cached_tokens,
@@ -546,7 +554,9 @@ pub(crate) async fn publish_notification_requests_after_delivery_with(
     let batches = build_notification_batches(recipient_tokens)?;
 
     publish_notification_batches_best_effort(
-        shared,
+        database,
+        relay_control,
+        event_tracker,
         ephemeral,
         account_pubkey,
         &token_counts_by_server,
@@ -774,7 +784,9 @@ mod tests {
 
         publish_notification_requests_after_delivery_with(
             &whitenoise.config,
-            &whitenoise.shared,
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
             &ephemeral,
             account.pubkey,
             group_id,
@@ -1079,10 +1091,15 @@ mod tests {
             .await
             .unwrap();
 
-        let (resolved_relays, relay_source) =
-            resolve_notification_server_relays(&whitenoise.shared, server_pubkey, &[])
-                .await
-                .unwrap();
+        let (resolved_relays, relay_source) = resolve_notification_server_relays(
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
+            server_pubkey,
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(resolved_relays, vec![relay_url]);
         assert_eq!(relay_source, NotificationRelaySource::Cached);
@@ -1111,7 +1128,9 @@ mod tests {
             .unwrap();
 
         let (resolved_relays, relay_source) = resolve_notification_server_relays(
-            &whitenoise.shared,
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
             server_pubkey,
             &[duplicate_cached_hint, fresh_hint.clone()],
         )
@@ -1136,10 +1155,15 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let server_pubkey = Keys::generate().public_key();
 
-        let (resolved_relays, relay_source) =
-            resolve_notification_server_relays(&whitenoise.shared, server_pubkey, &[])
-                .await
-                .unwrap();
+        let (resolved_relays, relay_source) = resolve_notification_server_relays(
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
+            server_pubkey,
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert!(resolved_relays.is_empty());
         assert_eq!(relay_source, NotificationRelaySource::HintFallback);
@@ -1179,7 +1203,9 @@ mod tests {
         batches[0].relay_hints.clear();
 
         publish_notification_batches_best_effort(
-            &whitenoise.shared,
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
             &test_ephemeral_plane(&whitenoise),
             sender_pubkey,
             &notification_token_counts_by_server(&token_tags),
@@ -1513,7 +1539,9 @@ mod tests {
         assert!(batches[0].events.len() > 1);
 
         publish_notification_batches_best_effort(
-            &whitenoise.shared,
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
             &whitenoise.shared.relay_control.ephemeral(),
             sender_account.pubkey,
             &notification_token_counts_by_server(&token_tags),
@@ -1588,7 +1616,9 @@ mod tests {
 
         publish_notification_requests_after_delivery_with(
             &whitenoise.config,
-            &whitenoise.shared,
+            &whitenoise.shared.database,
+            &whitenoise.shared.relay_control,
+            &whitenoise.shared.event_tracker,
             &ephemeral,
             creator.pubkey,
             &group_id,

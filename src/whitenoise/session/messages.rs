@@ -341,7 +341,9 @@ impl<'a> MessageOpsForGroup<'a> {
                 if let Some(config) = &push_config
                     && let Err(e) = publish_notification_requests_after_delivery_with(
                         config,
-                        &shared,
+                        &shared.database,
+                        &shared.relay_control,
+                        &shared.event_tracker,
                         &ephemeral,
                         account_pubkey,
                         &group_id,

@@ -220,8 +220,15 @@ impl Whitenoise {
         relay_type: RelayType,
         query_relay_urls: &[RelayUrl],
     ) -> Result<Vec<Relay>> {
-        relay_sync::sync_relay_type_for_pubkey(&self.shared, *pubkey, relay_type, query_relay_urls)
-            .await
+        relay_sync::sync_relay_type_for_pubkey(
+            &self.shared.database,
+            &self.shared.relay_control,
+            &self.shared.event_tracker,
+            *pubkey,
+            relay_type,
+            query_relay_urls,
+        )
+        .await
     }
 
     fn targeted_discovery_filter(pubkey: PublicKey) -> Filter {
