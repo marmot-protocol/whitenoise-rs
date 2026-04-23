@@ -489,7 +489,7 @@ boundary.
 
 ### Phase 18a: Database split audit + scaffolding (~600 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #776
 
 <details>
 <summary>Details</summary>
