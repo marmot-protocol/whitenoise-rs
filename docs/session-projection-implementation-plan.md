@@ -598,7 +598,11 @@ joins across account DB and shared DB.
 - Update workspace `Cargo.toml`
 - `whitenoise-cli` depends on `whitenoise` core crate
 - CLI-specific deps (`clap`, `rpassword`, `dirs`, `indicatif`) move to CLI crate
-- Remove `cli` feature flag from core crate
+- Retain `cli = []` as an empty feature flag in core (not removed as originally planned):
+  `src/whitenoise/mod.rs` uses `#[cfg(feature = "cli")]` to select the macOS keyring store —
+  CLI binaries are unsigned and must use `apple_native_keyring_store::keychain::Store` instead
+  of the Protected Data store, which requires a code-signed provisioning profile. The flag
+  carries no dependencies; it exists solely to gate this platform behaviour.
 
 **Validation:** `just precommit-quick`, CLI commands work end-to-end.
 
