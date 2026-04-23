@@ -25,12 +25,12 @@ image = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
 keyring-core = "0.7"
-mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8a8d06c19d617394b0e268f5f9adfad34db3cdf6", features = [
+mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8a8d06c19d617394b0e268f5f9adfad34db3cdf6" }
-mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8a8d06c19d617394b0e268f5f9adfad34db3cdf6" }
+mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
+mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
 
 nostr-blossom = "0.44"
 nostr-sdk = { version = "0.44", features = [
