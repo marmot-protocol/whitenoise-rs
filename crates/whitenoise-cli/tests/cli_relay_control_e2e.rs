@@ -11,8 +11,8 @@ use std::time::Duration;
 use whitenoise::test_fixtures::nostr::{
     JEFF_PUBKEY_HEX, MAX_PUBKEY_HEX, publish_user_search_seed_events,
 };
-use whitenoise_cli::cli::client;
-use whitenoise_cli::cli::protocol::{Request, Response};
+use whitenoise_cli::client;
+use whitenoise_cli::protocol::{Request, Response};
 
 #[path = "support/cli.rs"]
 mod cli_support;
