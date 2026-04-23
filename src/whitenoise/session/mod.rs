@@ -139,9 +139,13 @@ impl AccountSession {
 
     /// Read the current signer, if any.
     ///
-    /// Uses `try_read` to avoid blocking on the rare concurrent `set_signer`
-    /// write. Returns `None` when the write lock is held; callers fall through
-    /// to the legacy signer lookup which produces the same result.
+    /// Returns `None` in two cases: when no signer is set, and when a
+    /// concurrent `set_signer` write momentarily holds the lock (we
+    /// `try_read` to avoid blocking). Callers must handle `None` on their own
+    /// — some fall back to the legacy signer lookup
+    /// (`Whitenoise::get_signer_for_account`), others treat it as
+    /// `SignerUnavailable` and drop the work (e.g. `handle_giftwrap`). See
+    /// issue #777 for the planned disambiguation.
     pub fn get_signer(&self) -> Option<Arc<dyn NostrSigner>> {
         self.signer.try_read().ok().and_then(|g| g.clone())
     }
@@ -608,6 +612,10 @@ pub(crate) mod test_helpers {
     }
 
     /// Build a minimal `SharedServices` for tests.
+    ///
+    /// Diverges from `create_mock_whitenoise_internal` in one behavior: this
+    /// does not call `relay_control.start_telemetry_persistors()`. Tests built
+    /// on `test_shared` therefore do not exercise telemetry persistor paths.
     pub async fn test_shared(db: Arc<Database>) -> Arc<SharedServices> {
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
         let relay_control = Arc::new(RelayControlPlane::new(
