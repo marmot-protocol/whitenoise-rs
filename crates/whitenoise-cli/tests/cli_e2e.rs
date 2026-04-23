@@ -5,14 +5,12 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo test --features cli,integration-tests --test cli_e2e
+//! cargo test --test cli_e2e
 //! ```
 //!
 //! Prerequisites:
 //! - Local Nostr relays must be running for messaging tests (same setup as the
 //!   integration test binary).
-
-#![cfg(all(feature = "cli", feature = "integration-tests"))]
 
 use std::{path::PathBuf, time::Duration};
 

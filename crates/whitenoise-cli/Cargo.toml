@@ -1,0 +1,35 @@
+[package]
+name = "whitenoise-cli"
+version = "0.2.1"
+description = "Command-line interface for the Whitenoise daemon"
+authors = ["White Noise Authors"]
+edition = "2024"
+rust-version = "1.90.0"
+
+[dependencies]
+whitenoise = { path = "../..", features = ["cli"] }
+clap = { version = "4.5.37", features = ["derive"] }
+dirs = "6"
+rpassword = "7"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+mdk-core = { workspace = true }
+nostr-sdk = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+whitenoise = { path = "../..", features = ["cli", "integration-tests"] }
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "wn"
+path = "src/bin/wn.rs"
+
+[[bin]]
+name = "wnd"
+path = "src/bin/wnd.rs"
