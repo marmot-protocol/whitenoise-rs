@@ -913,6 +913,26 @@ impl<'a> MediaOps<'a> {
         Ok(content_length)
     }
 
+    // ── Test-only helpers ─────────────────────────────────────────────
+    //
+    // `check_content_length` and `download_blob_from_blossom` are private but
+    // must be exercised directly because the production path only calls them
+    // internally. Exposing them under `#[cfg(test)]` avoids dead-code warnings
+    // in release builds.
+
+    #[cfg(test)]
+    fn check_content_length_test(content_length: u64, limit: usize) -> Result<usize> {
+        Self::check_content_length(content_length, limit)
+    }
+
+    #[cfg(test)]
+    async fn download_blob_from_blossom_test(
+        blossom_url: &Url,
+        image_hash: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        Self::download_blob_from_blossom(blossom_url, image_hash).await
+    }
+
     async fn upload_encrypted_blob_to_blossom(
         blossom_server_url: &Url,
         encrypted_data: Vec<u8>,
@@ -969,5 +989,173 @@ impl<'a> MediaOps<'a> {
         Whitenoise::require_https(&descriptor.url)?;
 
         Ok(descriptor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mockito::Server;
+    use nostr_sdk::prelude::Url;
+
+    use super::MediaOps;
+    use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::error::WhitenoiseError;
+
+    // ── download_blob_from_blossom size-cap tests ─────────────────────────────
+    //
+    // These tests spin up a local mockito server and call the real streaming
+    // path.  They run only in debug builds because `require_https` allows
+    // loopback `http://` URLs in debug mode only.
+
+    /// Returns a fixed 32-byte hash for use as a fake blob hash in tests.
+    fn test_hash() -> [u8; 32] {
+        [0xab; 32]
+    }
+
+    /// Returns the URL path that `download_blob_from_blossom` will request for
+    /// `test_hash()`, i.e. `/<hex-encoded-hash>`.
+    fn test_path() -> String {
+        format!("/{}", hex::encode(test_hash()))
+    }
+
+    /// Returns a `localhost`-based URL for the mockito server.
+    ///
+    /// `mockito::Server` binds to a loopback address; using `localhost` keeps the
+    /// test URL readable while still reaching the local mock server.
+    fn localhost_url(server: &Server) -> Url {
+        let port = server.socket_address().port();
+        Url::parse(&format!("http://localhost:{port}")).unwrap()
+    }
+
+    /// Fast-path rejection: `Content-Length` header alone exceeds the limit.
+    ///
+    /// `check_content_length` is the pure function behind the fast-path guard.
+    /// Testing it directly avoids the need for a mock HTTP server and verifies
+    /// the logic independently of the network layer.
+    #[test]
+    fn content_length_guard_rejects_oversized_header() {
+        let limit = MediaOps::MAX_BLOB_BYTES;
+        let oversized = (limit + 1) as u64;
+        let err = MediaOps::check_content_length_test(oversized, limit).unwrap_err();
+        assert!(
+            matches!(err, WhitenoiseError::DownloadSizeLimitExceeded { limit: l } if l == MediaOps::MAX_BLOB_BYTES),
+            "Expected DownloadSizeLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Fast-path accepts a `Content-Length` exactly at the limit.
+    #[test]
+    fn content_length_guard_accepts_exact_limit() {
+        let limit = MediaOps::MAX_BLOB_BYTES;
+        let result = MediaOps::check_content_length_test(limit as u64, limit).unwrap();
+        assert_eq!(result, limit);
+    }
+
+    /// Fast-path accepts a `Content-Length` below the limit.
+    #[test]
+    fn content_length_guard_accepts_small_value() {
+        let result = MediaOps::check_content_length_test(1024, MediaOps::MAX_BLOB_BYTES).unwrap();
+        assert_eq!(result, 1024);
+    }
+
+    /// Authoritative guard: server streams > 100 MiB with no `Content-Length`.
+    ///
+    /// The streaming byte counter must catch this even when the header is absent.
+    /// `with_chunked_body` is used (not `with_body`) because mockito's `with_body`
+    /// automatically sets `Content-Length`, which would trigger the fast-path header
+    /// check instead of exercising the streaming byte counter.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    async fn download_rejects_oversized_streaming_body() {
+        let mut server = mockito::Server::new_async().await;
+        // One byte over the limit, sent as a chunked response without Content-Length.
+        let oversized_body = vec![0u8; MediaOps::MAX_BLOB_BYTES + 1];
+        let _mock = server
+            .mock("GET", test_path().as_str())
+            .with_status(200)
+            .with_chunked_body(move |w| std::io::Write::write_all(w, &oversized_body))
+            .create_async()
+            .await;
+
+        let url = localhost_url(&server);
+        let err = MediaOps::download_blob_from_blossom_test(&url, &test_hash())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                WhitenoiseError::DownloadSizeLimitExceeded {
+                    limit: MediaOps::MAX_BLOB_BYTES
+                }
+            ),
+            "Expected DownloadSizeLimitExceeded, got: {err:?}"
+        );
+    }
+
+    /// Happy path: a small response within the limit is returned successfully.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    async fn download_accepts_small_body() {
+        let mut server = mockito::Server::new_async().await;
+        let body = b"hello blossom";
+        let _mock = server
+            .mock("GET", test_path().as_str())
+            .with_status(200)
+            .with_body(&body[..])
+            .create_async()
+            .await;
+
+        let url = localhost_url(&server);
+        let result = MediaOps::download_blob_from_blossom_test(&url, &test_hash())
+            .await
+            .unwrap();
+
+        assert_eq!(result, body);
+    }
+
+    // ── require_https / blossom_client tests ─────────────────────────────────
+
+    #[test]
+    fn blossom_client_accepts_https() {
+        let url = Url::parse("https://blossom.primal.net").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    fn blossom_client_rejects_http() {
+        let url = Url::parse("http://evil.example.com").unwrap();
+        let err = Whitenoise::blossom_client(&url).unwrap_err();
+        assert!(
+            matches!(err, WhitenoiseError::BlossomInsecureUrl(_)),
+            "Expected BlossomInsecureUrl, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn blossom_client_rejects_ftp() {
+        let url = Url::parse("ftp://files.example.com/blob").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_err());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_allows_localhost_http_in_debug() {
+        let url = Url::parse("http://localhost:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_allows_loopback_http_in_debug() {
+        let url = Url::parse("http://127.0.0.1:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_ok());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn blossom_client_rejects_non_localhost_http_in_debug() {
+        let url = Url::parse("http://192.168.1.1:3000").unwrap();
+        assert!(Whitenoise::blossom_client(&url).is_err());
     }
 }
