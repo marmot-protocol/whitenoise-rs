@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::rand::RngCore;
 
-use dashmap::DashMap;
 use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::sync::{
     Mutex, OnceCell,
@@ -198,24 +197,14 @@ impl Whitenoise {
             session_salt,
         ));
 
-        let shared = Arc::new(shared::SharedServices {
+        let shared = Arc::new(shared::SharedServices::new(
             database,
             relay_control,
-            event_tracker: components.event_tracker,
-            secrets_store: components.secrets_store,
-            storage: components.storage,
-            message_aggregator: components.message_aggregator,
-            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
-            user_stream_manager: user_streaming::UserStreamManager::default(),
-            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
-            archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
-            ),
-            notification_stream_manager: notification_streaming::NotificationStreamManager::default(
-            ),
-            user_resolution_guards: DashMap::new(),
-            external_signers: DashMap::new(),
-            discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
-        });
+            components.event_tracker,
+            components.secrets_store,
+            components.storage,
+            components.message_aggregator,
+        ));
 
         Self {
             config,

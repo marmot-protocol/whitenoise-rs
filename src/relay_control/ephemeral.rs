@@ -556,7 +556,7 @@ impl EphemeralPlane {
         event_id: &str,
         group_id: &GroupId,
         database: &Database,
-        stream_manager: &Arc<MessageStreamManager>,
+        stream_manager: &MessageStreamManager,
     ) -> MessagePublishResult {
         match self.publish_event_to(event, account_pubkey, relays).await {
             Ok(output) => {

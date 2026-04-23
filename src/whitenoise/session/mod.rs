@@ -499,6 +499,9 @@ impl AccountManager {
     ///
     /// External-signer accounts get `signer: None` until re-registered.
     /// Local accounts load their signer from the secrets store.
+    // TODO(phase-16b): drop `'static` once the Whitenoise singleton is gone —
+    // `AccountSession::from_account` still needs a static borrow because
+    // singleton-reaching methods are called from spawned tasks.
     pub async fn restore_sessions(&self, wn: &'static Whitenoise) {
         let accounts = match Account::all(&wn.shared.database).await {
             Ok(accounts) => accounts,
@@ -560,14 +563,12 @@ pub(crate) mod test_helpers {
     use std::sync::Arc;
     use std::time::SystemTime;
 
-    use dashmap::DashMap;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
     use crate::relay_control::RelayControlPlane;
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
-    use crate::whitenoise::discovery_sync_worker::DiscoverySyncWorker;
     use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
     use crate::whitenoise::message_aggregator::MessageAggregator;
     use crate::whitenoise::secrets_store::SecretsStore;
@@ -615,24 +616,18 @@ pub(crate) mod test_helpers {
             event_sender,
             [0u8; 16],
         ));
-        Arc::new(SharedServices {
-            database: db.clone(),
+        let event_tracker = Arc::new(WhitenoiseEventTracker::new(db.clone()));
+        let storage = Storage::new(std::env::temp_dir().as_path())
+            .await
+            .expect("test storage");
+        Arc::new(SharedServices::new(
+            db,
             relay_control,
-            event_tracker: Arc::new(WhitenoiseEventTracker::new(db)),
-            secrets_store: SecretsStore::new("com.whitenoise.test"),
-            storage: Storage::new(std::env::temp_dir().as_path())
-                .await
-                .expect("test storage"),
-            message_aggregator: MessageAggregator::new(),
-            message_stream_manager: Arc::new(Default::default()),
-            user_stream_manager: Default::default(),
-            chat_list_stream_manager: Default::default(),
-            archived_chat_list_stream_manager: Default::default(),
-            notification_stream_manager: Default::default(),
-            user_resolution_guards: DashMap::new(),
-            external_signers: DashMap::new(),
-            discovery_sync_worker: DiscoverySyncWorker::new(),
-        })
+            event_tracker,
+            SecretsStore::new("com.whitenoise.test"),
+            storage,
+            MessageAggregator::new(),
+        ))
     }
 }
 

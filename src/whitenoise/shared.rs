@@ -29,7 +29,7 @@ pub(crate) struct SharedServices {
     pub(crate) secrets_store: SecretsStore,
     pub(crate) storage: Storage,
     pub(crate) message_aggregator: MessageAggregator,
-    pub(crate) message_stream_manager: Arc<MessageStreamManager>,
+    pub(crate) message_stream_manager: MessageStreamManager,
     pub(crate) user_stream_manager: UserStreamManager,
     pub(crate) chat_list_stream_manager: ChatListStreamManager,
     pub(crate) archived_chat_list_stream_manager: ChatListStreamManager,
@@ -37,4 +37,35 @@ pub(crate) struct SharedServices {
     pub(crate) user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     pub(crate) external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
     pub(crate) discovery_sync_worker: DiscoverySyncWorker,
+}
+
+impl SharedServices {
+    /// Build a `SharedServices` from its externally-configured fields. Stream
+    /// managers, registries, and the discovery worker use their defaults —
+    /// callers never need to supply them.
+    pub(crate) fn new(
+        database: Arc<Database>,
+        relay_control: Arc<RelayControlPlane>,
+        event_tracker: Arc<dyn EventTracker>,
+        secrets_store: SecretsStore,
+        storage: Storage,
+        message_aggregator: MessageAggregator,
+    ) -> Self {
+        Self {
+            database,
+            relay_control,
+            event_tracker,
+            secrets_store,
+            storage,
+            message_aggregator,
+            message_stream_manager: MessageStreamManager::default(),
+            user_stream_manager: UserStreamManager::default(),
+            chat_list_stream_manager: ChatListStreamManager::default(),
+            archived_chat_list_stream_manager: ChatListStreamManager::default(),
+            notification_stream_manager: NotificationStreamManager::default(),
+            user_resolution_guards: DashMap::new(),
+            external_signers: DashMap::new(),
+            discovery_sync_worker: DiscoverySyncWorker::new(),
+        }
+    }
 }
