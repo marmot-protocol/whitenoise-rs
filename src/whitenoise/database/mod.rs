@@ -12,6 +12,7 @@ use sqlx::{
 use thiserror::Error;
 
 pub mod account;
+pub mod account_db;
 pub mod account_settings;
 pub mod accounts;
 pub mod accounts_groups;
@@ -30,6 +31,7 @@ pub mod push_registrations;
 pub mod relay_events;
 pub mod relay_status;
 pub mod relays;
+pub mod shared_db;
 pub mod user_relays;
 pub mod users;
 pub mod utils;
