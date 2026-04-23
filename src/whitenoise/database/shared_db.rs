@@ -13,9 +13,28 @@ use crate::whitenoise::database::{Database, DatabaseError};
 
 /// A connection to the shared SQLite database.
 ///
-/// Holds data that is not tied to any single account: users, relays,
-/// group information, aggregated messages, app settings, and the media blob
-/// cache. See the implementation plan for the full table list.
+/// Holds data that is not tied to any single account: `app_settings`,
+/// `accounts` (registry), `users`, `relays`, `user_relays`,
+/// `cached_graph_users`, `group_information`, `processed_events` (global),
+/// `media_blobs`, `relay_status`, and `relay_events`.
+///
+/// See `rearchitecture.md` Appendix B for the authoritative table ownership
+/// map.
+///
+/// # Cross-scope FK audit
+///
+/// These FKs cross the shared/account boundary and will require
+/// application-level enforcement after the physical split in Phases 18b–18e:
+///
+/// - `accounts_groups.mls_group_id → group_information.mls_group_id`
+///   (`accounts_groups` moves to `account.sqlite`; `group_information` stays
+///   in `shared.sqlite`)
+/// - `aggregated_messages.mls_group_id → group_information.mls_group_id`
+///   (same cross-boundary reference)
+/// - `media_references.encrypted_file_hash → media_blobs.hash`
+///   (`media_references` is account-scoped; `media_blobs` is shared)
+/// - `drafts.mls_group_id → group_information.mls_group_id`
+///   (`drafts` is account-scoped; `group_information` is shared)
 ///
 /// # Current implementation
 ///

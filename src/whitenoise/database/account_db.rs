@@ -16,8 +16,35 @@ use crate::whitenoise::database::{Database, DatabaseError};
 /// A connection to a per-account SQLite database.
 ///
 /// Each account will have its own file, identified by the account's hex public
-/// key. Account-scoped tables (settings, follows, drafts, key packages,
-/// published events, group membership, push tokens) will live here.
+/// key. Account-scoped tables: `account_settings`, `account_follows`,
+/// `accounts_groups`, `drafts`, `push_registrations`, `group_push_tokens`,
+/// `published_key_packages`, `published_events`,
+/// `processed_events` (account-level), `aggregated_messages`,
+/// `message_delivery_status`, and `media_references`.
+///
+/// See `rearchitecture.md` Appendix B for the authoritative table ownership
+/// map.
+///
+/// # Cross-scope FK audit
+///
+/// These FKs cross the account/shared boundary and will require
+/// application-level enforcement after the physical split in Phases 18b–18e:
+///
+/// - `accounts_groups.account_pubkey → accounts.pubkey`
+///   (`accounts_groups` moves to `account.sqlite`; `accounts` stays in
+///   `shared.sqlite`)
+/// - `accounts_groups.mls_group_id → group_information.mls_group_id`
+///   (both FK targets live in `shared.sqlite`)
+/// - `account_settings.account_pubkey → accounts.pubkey`
+///   (same cross-boundary reference)
+/// - `aggregated_messages.mls_group_id → group_information.mls_group_id`
+///   (`group_information` is shared; `aggregated_messages` is account-scoped)
+/// - `message_delivery_status.aggregated_message_id → aggregated_messages.id`
+///   (both are account-scoped — no cross-boundary issue here)
+/// - `media_references.encrypted_file_hash → media_blobs.hash`
+///   (`media_blobs` is shared; `media_references` is account-scoped)
+/// - `drafts.mls_group_id → group_information.mls_group_id`
+///   (`group_information` is shared; `drafts` is account-scoped)
 ///
 /// # Current implementation
 ///
