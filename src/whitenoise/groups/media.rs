@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use mdk_core::media_processing::MediaProcessingOptions;
 use mdk_core::prelude::{GroupId, group_types};
@@ -13,10 +12,6 @@ use crate::whitenoise::database::media_files::MediaFile;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 
 impl Whitenoise {
-    /// Default timeout for Blossom HTTP operations (download and upload)
-    /// Set to 300 seconds to accommodate large image files over slow connections
-    pub(crate) const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
-
     /// Syncs group image cache if needed (smart, hash-based check)
     ///
     /// This method is called after processing welcomes and commits to proactively
@@ -31,7 +26,6 @@ impl Whitenoise {
     /// * `account` - The account viewing the group
     /// * `group_id` - The MLS group ID
     #[deprecated(
-        since = "0.0.0",
         note = "Use AccountSession::groups().media().sync_group_image_cache_if_needed() instead."
     )]
     #[perf_instrument("media")]
@@ -96,10 +90,7 @@ impl Whitenoise {
     ///
     /// The returned metadata (hash, key, nonce) should be passed to `update_group_data`
     /// to update the group's image settings.
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().media().upload_group_image() instead."
-    )]
+    #[deprecated(note = "Use AccountSession::groups().media().upload_group_image() instead.")]
     #[perf_instrument("media")]
     pub async fn upload_group_image(
         &self,
@@ -119,10 +110,7 @@ impl Whitenoise {
             .await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().media().upload_chat_media() instead."
-    )]
+    #[deprecated(note = "Use AccountSession::groups().media().upload_chat_media() instead.")]
     #[perf_instrument("media")]
     pub async fn upload_chat_media(
         &self,
@@ -142,10 +130,7 @@ impl Whitenoise {
             .await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().media().download_chat_media() instead."
-    )]
+    #[deprecated(note = "Use AccountSession::groups().media().download_chat_media() instead.")]
     #[perf_instrument("media")]
     pub async fn download_chat_media(
         &self,
@@ -164,7 +149,6 @@ impl Whitenoise {
     }
 
     #[deprecated(
-        since = "0.0.0",
         note = "Use AccountSession::groups().media().get_media_files_for_group() instead."
     )]
     #[perf_instrument("media")]
@@ -175,10 +159,7 @@ impl Whitenoise {
         MediaFile::find_by_group(&self.database, group_id).await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().media().get_group_image_path() instead."
-    )]
+    #[deprecated(note = "Use AccountSession::groups().media().get_group_image_path() instead.")]
     #[perf_instrument("media")]
     pub async fn get_group_image_path(
         &self,
@@ -195,10 +176,7 @@ impl Whitenoise {
             .await
     }
 
-    #[deprecated(
-        since = "0.0.0",
-        note = "Use AccountSession::groups().media().resolve_group_image_path() instead."
-    )]
+    #[deprecated(note = "Use AccountSession::groups().media().resolve_group_image_path() instead.")]
     #[perf_instrument("media")]
     pub(crate) async fn resolve_group_image_path(
         &self,

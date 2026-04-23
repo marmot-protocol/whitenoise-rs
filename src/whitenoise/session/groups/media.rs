@@ -111,7 +111,7 @@ impl<'a> MediaOps<'a> {
 
     /// Default timeout for Blossom HTTP operations (download and upload).
     /// Set to 300 seconds to accommodate large image files over slow connections.
-    const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
+    pub(crate) const BLOSSOM_TIMEOUT: Duration = Duration::from_secs(300);
 
     /// Maximum number of bytes accepted for a single blob download (100 MiB).
     ///
@@ -150,11 +150,7 @@ impl<'a> MediaOps<'a> {
 
         // Try to get the stored blossom_url from the database
         let blossom_url = if let Some(media_file) =
-            crate::whitenoise::database::media_files::MediaFile::find_by_hash(
-                &self.session.database,
-                &image_hash,
-            )
-            .await?
+            MediaFile::find_by_hash(&self.session.database, &image_hash).await?
         {
             media_file
                 .blossom_url
@@ -462,11 +458,7 @@ impl<'a> MediaOps<'a> {
             };
 
         let blossom_url = if let Some(media_file) =
-            crate::whitenoise::database::media_files::MediaFile::find_by_hash(
-                &self.session.database,
-                image_hash,
-            )
-            .await?
+            MediaFile::find_by_hash(&self.session.database, image_hash).await?
         {
             media_file
                 .blossom_url
@@ -845,7 +837,7 @@ impl<'a> MediaOps<'a> {
             })
     }
 
-    async fn download_blob_from_blossom(
+    pub(crate) async fn download_blob_from_blossom(
         blossom_url: &Url,
         image_hash: &[u8; 32],
     ) -> Result<Vec<u8>> {
@@ -905,32 +897,12 @@ impl<'a> MediaOps<'a> {
         })?
     }
 
-    fn check_content_length(content_length: u64, limit: usize) -> Result<usize> {
+    pub(crate) fn check_content_length(content_length: u64, limit: usize) -> Result<usize> {
         let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
         if content_length > limit {
             return Err(WhitenoiseError::DownloadSizeLimitExceeded { limit });
         }
         Ok(content_length)
-    }
-
-    // ── Test-only helpers ─────────────────────────────────────────────
-    //
-    // `check_content_length` and `download_blob_from_blossom` are private but
-    // must be exercised directly because the production path only calls them
-    // internally. Exposing them under `#[cfg(test)]` avoids dead-code warnings
-    // in release builds.
-
-    #[cfg(test)]
-    fn check_content_length_test(content_length: u64, limit: usize) -> Result<usize> {
-        Self::check_content_length(content_length, limit)
-    }
-
-    #[cfg(test)]
-    async fn download_blob_from_blossom_test(
-        blossom_url: &Url,
-        image_hash: &[u8; 32],
-    ) -> Result<Vec<u8>> {
-        Self::download_blob_from_blossom(blossom_url, image_hash).await
     }
 
     async fn upload_encrypted_blob_to_blossom(
@@ -1036,7 +1008,7 @@ mod tests {
     fn content_length_guard_rejects_oversized_header() {
         let limit = MediaOps::MAX_BLOB_BYTES;
         let oversized = (limit + 1) as u64;
-        let err = MediaOps::check_content_length_test(oversized, limit).unwrap_err();
+        let err = MediaOps::check_content_length(oversized, limit).unwrap_err();
         assert!(
             matches!(err, WhitenoiseError::DownloadSizeLimitExceeded { limit: l } if l == MediaOps::MAX_BLOB_BYTES),
             "Expected DownloadSizeLimitExceeded, got: {err:?}"
@@ -1047,14 +1019,14 @@ mod tests {
     #[test]
     fn content_length_guard_accepts_exact_limit() {
         let limit = MediaOps::MAX_BLOB_BYTES;
-        let result = MediaOps::check_content_length_test(limit as u64, limit).unwrap();
+        let result = MediaOps::check_content_length(limit as u64, limit).unwrap();
         assert_eq!(result, limit);
     }
 
     /// Fast-path accepts a `Content-Length` below the limit.
     #[test]
     fn content_length_guard_accepts_small_value() {
-        let result = MediaOps::check_content_length_test(1024, MediaOps::MAX_BLOB_BYTES).unwrap();
+        let result = MediaOps::check_content_length(1024, MediaOps::MAX_BLOB_BYTES).unwrap();
         assert_eq!(result, 1024);
     }
 
@@ -1078,7 +1050,7 @@ mod tests {
             .await;
 
         let url = localhost_url(&server);
-        let err = MediaOps::download_blob_from_blossom_test(&url, &test_hash())
+        let err = MediaOps::download_blob_from_blossom(&url, &test_hash())
             .await
             .unwrap_err();
 
@@ -1107,7 +1079,7 @@ mod tests {
             .await;
 
         let url = localhost_url(&server);
-        let result = MediaOps::download_blob_from_blossom_test(&url, &test_hash())
+        let result = MediaOps::download_blob_from_blossom(&url, &test_hash())
             .await
             .unwrap();
 
