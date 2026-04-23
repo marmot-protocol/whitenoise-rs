@@ -910,7 +910,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2484,7 +2484,7 @@ dependencies = [
 [[package]]
 name = "mdk-core"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=8a8d06c19d617394b0e268f5f9adfad34db3cdf6#8a8d06c19d617394b0e268f5f9adfad34db3cdf6"
+source = "git+https://github.com/marmot-protocol/mdk?rev=0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46#0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46"
 dependencies = [
  "base64",
  "blurhash",
@@ -2512,12 +2512,12 @@ dependencies = [
 [[package]]
 name = "mdk-macros"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=8a8d06c19d617394b0e268f5f9adfad34db3cdf6#8a8d06c19d617394b0e268f5f9adfad34db3cdf6"
+source = "git+https://github.com/marmot-protocol/mdk?rev=0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46#0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46"
 
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=8a8d06c19d617394b0e268f5f9adfad34db3cdf6#8a8d06c19d617394b0e268f5f9adfad34db3cdf6"
+source = "git+https://github.com/marmot-protocol/mdk?rev=0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46#0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46"
 dependencies = [
  "getrandom 0.4.2",
  "hex",
@@ -2538,7 +2538,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.7.1"
-source = "git+https://github.com/marmot-protocol/mdk?rev=8a8d06c19d617394b0e268f5f9adfad34db3cdf6#8a8d06c19d617394b0e268f5f9adfad34db3cdf6"
+source = "git+https://github.com/marmot-protocol/mdk?rev=0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46#0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46"
 dependencies = [
  "nostr",
  "openmls",
@@ -2764,7 +2764,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3865,9 +3865,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",

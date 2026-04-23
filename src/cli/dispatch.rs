@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate};
+use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate, group_types};
 use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 use crate::Whitenoise;
@@ -9,6 +10,7 @@ use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::app_settings::{Language, ThemeMode};
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
+use crate::whitenoise::groups::RequiredProposal;
 use crate::whitenoise::relays::{Relay, RelayType};
 use crate::whitenoise::users::KeyPackageStatus;
 
@@ -1002,6 +1004,12 @@ async fn add_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[derive(Serialize)]
+struct GroupShowResponse {
+    group: group_types::Group,
+    required_proposals: Vec<RequiredProposal>,
+}
+
 #[perf_instrument("dispatch")]
 async fn get_group(
     wn: &Whitenoise,
@@ -1014,7 +1022,16 @@ async fn get_group(
         .group(&account, &group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
-    Ok(to_response(&group))
+    let required_proposals = wn
+        .group_required_proposals(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .into_iter()
+        .collect();
+    Ok(to_response(&GroupShowResponse {
+        group,
+        required_proposals,
+    }))
 }
 
 #[perf_instrument("dispatch")]
@@ -2295,6 +2312,9 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
 #[cfg(test)]
 mod tests {
     use nostr_sdk::ToBech32;
+    use std::collections::BTreeSet;
+
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     use super::*;
 
@@ -2359,6 +2379,40 @@ mod tests {
     fn to_response_string() {
         let resp = to_response(&"hello");
         assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
+    }
+
+    // --- get_group ---
+
+    #[tokio::test]
+    async fn get_group_returns_nested_shape_with_required_proposals() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let response = get_group(
+            &whitenoise,
+            &creator.pubkey.to_hex(),
+            &hex::encode(group.mls_group_id.as_slice()),
+        )
+        .await
+        .expect("get_group succeeds for a valid account and group");
+
+        let value = response.result.expect("response carries a result");
+        let obj = value.as_object().expect("result serializes as an object");
+
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, BTreeSet::from(["group", "required_proposals"]));
+
+        assert_eq!(
+            obj["required_proposals"],
+            serde_json::json!(["self_remove"]),
+        );
     }
 
     // --- parse_relay_type ---

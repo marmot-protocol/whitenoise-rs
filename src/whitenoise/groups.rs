@@ -28,8 +28,10 @@ pub mod blossom_error;
 mod media;
 mod membership;
 mod publish;
+mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
+pub use required_proposals::RequiredProposal;
 
 impl Whitenoise {
     #[perf_instrument("groups")]
@@ -563,6 +565,49 @@ impl Whitenoise {
             .admin_pubkeys
             .into_iter()
             .collect::<Vec<PublicKey>>())
+    }
+
+    /// Returns the set of MLS proposal types required by the group's
+    /// `RequiredCapabilities` extension, projected onto the whitenoise mirror
+    /// enum [`RequiredProposal`].
+    ///
+    /// # Arguments
+    /// * `account` - The account that has access to the group
+    /// * `group_id` - The MLS group ID to inspect
+    ///
+    /// # Returns
+    /// * `Ok(BTreeSet<RequiredProposal>)` - The set of required proposal
+    ///   types. An empty set is the LCD outcome for mixed or empty-invitee
+    ///   groups and is **not** an error — it is distinct from
+    ///   [`WhitenoiseError::GroupNotFound`], which means the MLS record is
+    ///   missing.
+    ///
+    /// # Errors
+    /// * `WhitenoiseError::GroupNotFound` - If no MLS record exists for
+    ///   `group_id`
+    /// * `WhitenoiseError` - If loading the group record fails
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let required = wn.group_required_proposals(&account, &group_id).await?;
+    /// if required.contains(&RequiredProposal::SelfRemove) {
+    ///     // Non-admin members can leave without an admin commit.
+    /// }
+    /// ```
+    #[perf_instrument("groups")]
+    pub async fn group_required_proposals(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<BTreeSet<RequiredProposal>> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let required = mdk
+            .group_required_proposals(group_id)
+            .map_err(|e| match e {
+                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
+                other => WhitenoiseError::from(other),
+            })?;
+        Ok(required.into_iter().map(RequiredProposal::from).collect())
     }
 
     #[perf_instrument("groups")]
@@ -2681,5 +2726,39 @@ mod tests {
             group_before.description, group_after.description,
             "Group description should be unchanged when publish fails"
         );
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_returns_self_remove_for_native_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let required = whitenoise
+            .group_required_proposals(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(required, BTreeSet::from([RequiredProposal::SelfRemove]));
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_errors_on_missing_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let missing_group_id = GroupId::from_slice(&[0; 32]);
+
+        let err = whitenoise
+            .group_required_proposals(&account, &missing_group_id)
+            .await
+            .expect_err("fabricated group ID must error");
+
+        assert!(matches!(err, WhitenoiseError::GroupNotFound));
     }
 }
