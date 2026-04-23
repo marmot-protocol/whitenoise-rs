@@ -14,7 +14,7 @@ use crate::whitenoise::message_aggregator::processor::{
     extract_deletion_target_ids, extract_reaction_target_id,
 };
 use crate::whitenoise::message_aggregator::{
-    ChatMessage, DeliveryStatus, MessageAggregator, SearchResult, emoji_utils, reaction_handler,
+    ChatMessage, DeliveryStatus, SearchResult, emoji_utils, reaction_handler,
 };
 use crate::whitenoise::message_streaming::{MessageStreamManager, MessageUpdate, UpdateTrigger};
 use crate::whitenoise::push_notifications::publish_notification_requests_after_delivery_with;
@@ -303,24 +303,23 @@ impl<'a> MessageOpsForGroup<'a> {
     ) {
         let ephemeral = self.session.ephemeral.clone_inner();
         let account_pubkey = *self.pubkey();
-        let database = self.session.shared.database.clone();
-        let stream_manager = self.session.shared.message_stream_manager.clone();
+        let shared = self.session.shared.clone();
         let group_id = self.group_id.clone();
         let event_id_str = event_id.to_string();
         let tags = mdk_message.tags.clone();
         let author = mdk_message.pubkey;
         let content = mdk_message.content.clone();
 
-        // TODO: Push config and relay sync context should live on AccountSession
-        // instead of reaching back to the singleton. Tracked for Phase 16b.
-        let (push_config, push_relay_sync) = match crate::whitenoise::Whitenoise::get_instance() {
-            Ok(wn) => (Some(wn.config.clone()), Some(wn.user_relay_sync_context())),
+        // TODO: Push config should live on AccountSession instead of reaching
+        // back to the singleton. Tracked for Phase 16b.
+        let push_config = match crate::whitenoise::Whitenoise::get_instance() {
+            Ok(wn) => Some(wn.config.clone()),
             Err(_) => {
                 tracing::debug!(
                     target: "whitenoise::messages",
                     "Whitenoise singleton unavailable, push notifications skipped"
                 );
-                (None, None)
+                None
             }
         };
 
@@ -332,19 +331,17 @@ impl<'a> MessageOpsForGroup<'a> {
                     &group_relays,
                     &event_id_str,
                     &group_id,
-                    &database,
-                    &stream_manager,
+                    &shared.database,
+                    &shared.message_stream_manager,
                 )
                 .await
                 .succeeded();
 
             if ok {
                 if let Some(config) = &push_config
-                    && let Some(sync) = &push_relay_sync
                     && let Err(e) = publish_notification_requests_after_delivery_with(
                         config,
-                        &database,
-                        sync,
+                        &shared,
                         &ephemeral,
                         account_pubkey,
                         &group_id,
@@ -366,8 +363,8 @@ impl<'a> MessageOpsForGroup<'a> {
                     &author,
                     &content,
                     &group_id,
-                    &database,
-                    &stream_manager,
+                    &shared.database,
+                    &shared.message_stream_manager,
                 )
                 .await;
             }
@@ -382,9 +379,10 @@ impl<'a> MessageOpsForGroup<'a> {
             crate::whitenoise::media_files::MediaFile::find_by_group(self.db(), self.group_id)
                 .await?;
 
-        let aggregator =
-            MessageAggregator::with_config(self.session.shared.message_aggregator.config().clone());
-        let chat_message = aggregator
+        let chat_message = self
+            .session
+            .shared
+            .message_aggregator
             .process_single_message(mdk_message, &ContentParser::new(), media_files)
             .await
             .map(|mut msg| {

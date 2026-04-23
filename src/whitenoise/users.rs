@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::time::Duration as StdDuration;
 
 #[cfg(any(test, feature = "integration-tests"))]
 use std::sync::LazyLock;
@@ -22,7 +22,7 @@ use crate::{
 };
 
 mod key_package;
-mod relay_sync;
+pub(crate) mod relay_sync;
 
 pub use key_package::KeyPackageStatus;
 
@@ -45,17 +45,6 @@ enum UserResolutionMode {
 
 #[cfg(any(test, feature = "integration-tests"))]
 static USER_RESOLUTION_RUN_COUNTS: LazyLock<DashMap<String, usize>> = LazyLock::new(DashMap::new);
-
-#[derive(Clone)]
-pub(crate) struct UserRelaySyncContext {
-    shared: Arc<crate::whitenoise::shared::SharedServices>,
-}
-
-impl UserRelaySyncContext {
-    pub(crate) fn new(shared: Arc<crate::whitenoise::shared::SharedServices>) -> Self {
-        Self { shared }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct User {
@@ -186,10 +175,6 @@ impl User {
 }
 
 impl Whitenoise {
-    pub(crate) fn user_relay_sync_context(&self) -> UserRelaySyncContext {
-        UserRelaySyncContext::new(self.shared.clone())
-    }
-
     /// Retrieves a user by their public key.
     ///
     /// This method looks up a user in the database using their Nostr public key.
@@ -235,8 +220,7 @@ impl Whitenoise {
         relay_type: RelayType,
         query_relay_urls: &[RelayUrl],
     ) -> Result<Vec<Relay>> {
-        self.user_relay_sync_context()
-            .sync_relay_type_for_pubkey(*pubkey, relay_type, query_relay_urls)
+        relay_sync::sync_relay_type_for_pubkey(&self.shared, *pubkey, relay_type, query_relay_urls)
             .await
     }
 

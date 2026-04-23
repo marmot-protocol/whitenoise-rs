@@ -560,12 +560,19 @@ pub(crate) mod test_helpers {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    use dashmap::DashMap;
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::*;
     use crate::relay_control::RelayControlPlane;
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
+    use crate::whitenoise::discovery_sync_worker::DiscoverySyncWorker;
+    use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
+    use crate::whitenoise::message_aggregator::MessageAggregator;
+    use crate::whitenoise::secrets_store::SecretsStore;
+    use crate::whitenoise::shared::SharedServices;
+    use crate::whitenoise::storage::Storage;
     use crate::whitenoise::test_utils::insert_test_account;
 
     pub async fn test_db() -> Arc<Database> {
@@ -600,16 +607,7 @@ pub(crate) mod test_helpers {
     }
 
     /// Build a minimal `SharedServices` for tests.
-    pub async fn test_shared(db: Arc<Database>) -> Arc<crate::whitenoise::shared::SharedServices> {
-        use dashmap::DashMap;
-
-        use crate::whitenoise::discovery_sync_worker::DiscoverySyncWorker;
-        use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
-        use crate::whitenoise::message_aggregator::MessageAggregator;
-        use crate::whitenoise::secrets_store::SecretsStore;
-        use crate::whitenoise::shared::SharedServices;
-        use crate::whitenoise::storage::Storage;
-
+    pub async fn test_shared(db: Arc<Database>) -> Arc<SharedServices> {
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
         let relay_control = Arc::new(RelayControlPlane::new(
             db.clone(),
