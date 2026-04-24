@@ -77,11 +77,11 @@ mod tests {
     async fn save_creates_draft_scoped_to_account() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = DraftsRepo::new(keys.public_key(), wn.shared.database.clone());
         let draft = repo.save(&group_id, "hello", None, &[]).await.unwrap();
 
         assert!(draft.id.is_some());
@@ -93,11 +93,11 @@ mod tests {
     async fn find_returns_saved_draft() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = DraftsRepo::new(keys.public_key(), wn.shared.database.clone());
         repo.save(&group_id, "persisted", None, &[]).await.unwrap();
 
         let found = repo.find(&group_id).await.unwrap();
@@ -109,11 +109,11 @@ mod tests {
     async fn find_returns_none_when_no_draft_exists() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = DraftsRepo::new(keys.public_key(), wn.shared.database.clone());
         let found = repo.find(&group_id).await.unwrap();
         assert!(found.is_none());
     }
@@ -122,11 +122,11 @@ mod tests {
     async fn delete_removes_draft() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = DraftsRepo::new(keys.public_key(), wn.shared.database.clone());
         repo.save(&group_id, "to delete", None, &[]).await.unwrap();
         repo.delete(&group_id).await.unwrap();
 
@@ -137,11 +137,11 @@ mod tests {
     async fn delete_nonexistent_is_noop() {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&wn.database, &keys.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo = DraftsRepo::new(keys.public_key(), wn.database.clone());
+        let repo = DraftsRepo::new(keys.public_key(), wn.shared.database.clone());
         assert!(repo.delete(&group_id).await.is_ok());
     }
 
@@ -150,13 +150,13 @@ mod tests {
         let (wn, _d, _l) = create_mock_whitenoise().await;
         let keys_a = Keys::generate();
         let keys_b = Keys::generate();
-        insert_test_account(&wn.database, &keys_a.public_key()).await;
-        insert_test_account(&wn.database, &keys_b.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys_a.public_key()).await;
+        insert_test_account(&wn.shared.database, &keys_b.public_key()).await;
         let group_id = GroupId::from_slice(b"test-group-id-00");
-        insert_test_group(&wn.database, &group_id).await;
+        insert_test_group(&wn.shared.database, &group_id).await;
 
-        let repo_a = DraftsRepo::new(keys_a.public_key(), wn.database.clone());
-        let repo_b = DraftsRepo::new(keys_b.public_key(), wn.database.clone());
+        let repo_a = DraftsRepo::new(keys_a.public_key(), wn.shared.database.clone());
+        let repo_b = DraftsRepo::new(keys_b.public_key(), wn.shared.database.clone());
 
         repo_a
             .save(&group_id, "account A draft", None, &[])

@@ -20,7 +20,7 @@ impl Whitenoise {
     /// Get a reference to the message aggregator for advanced usage
     /// This allows consumers to access the message aggregator directly for custom processing
     pub fn message_aggregator(&self) -> &message_aggregator::MessageAggregator {
-        &self.message_aggregator
+        &self.shared.message_aggregator
     }
 
     /// Subscribe to message updates for a specific group.
@@ -47,18 +47,19 @@ impl Whitenoise {
         limit: Option<u32>,
     ) -> Result<message_streaming::GroupMessageSubscription> {
         // 1. Subscribe FIRST to capture any concurrent updates that arrive during the fetch.
-        let mut updates = self.message_stream_manager.subscribe(group_id);
+        let mut updates = self.shared.message_stream_manager.subscribe(group_id);
 
         // 2. Fetch the most-recent `limit` messages using the paginated query so the initial
         //    snapshot honours the same page size the Flutter side will use for further loads.
         let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(account_pubkey, group_id, &self.database).await?;
+            AccountGroup::chat_cleared_at_ms(account_pubkey, group_id, &self.shared.database)
+                .await?;
 
         let fetched_messages =
             aggregated_message::AggregatedMessage::find_messages_by_group_paginated(
                 group_id,
                 account_pubkey,
-                &self.database,
+                &self.shared.database,
                 &PaginationOptions::default(),
                 limit,
                 cleared_at_ms,
@@ -147,7 +148,7 @@ impl Whitenoise {
         &self,
         pubkey: &PublicKey,
     ) -> Result<user_streaming::UserSubscription> {
-        let mut updates = self.user_stream_manager.subscribe(pubkey);
+        let mut updates = self.shared.user_stream_manager.subscribe(pubkey);
         let initial_user = self.resolve_user(pubkey).await?;
         let initial_user = Self::drain_user_updates(initial_user, &mut updates)?;
 
@@ -199,7 +200,10 @@ impl Whitenoise {
         &self,
         account: &Account,
     ) -> Result<chat_list_streaming::ChatListSubscription> {
-        let mut updates = self.chat_list_stream_manager.subscribe(&account.pubkey);
+        let mut updates = self
+            .shared
+            .chat_list_stream_manager
+            .subscribe(&account.pubkey);
 
         let fetched_items = self.get_chat_list(account).await?;
 
@@ -254,6 +258,7 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<chat_list_streaming::ChatListSubscription> {
         let mut updates = self
+            .shared
             .archived_chat_list_stream_manager
             .subscribe(&account.pubkey);
 
@@ -305,7 +310,7 @@ impl Whitenoise {
     /// Notifications are real-time only
     pub fn subscribe_to_notifications(&self) -> notification_streaming::NotificationSubscription {
         notification_streaming::NotificationSubscription {
-            updates: self.notification_stream_manager.subscribe(),
+            updates: self.shared.notification_stream_manager.subscribe(),
         }
     }
 
@@ -314,7 +319,7 @@ impl Whitenoise {
     /// This provides high-level methods that coordinate between the storage layer
     /// (filesystem) and database layer (metadata) for media files.
     pub(crate) fn media_files(&self) -> media_files::MediaFiles<'_> {
-        media_files::MediaFiles::new(&self.storage, &self.database)
+        media_files::MediaFiles::new(&self.shared.storage, &self.shared.database)
     }
 }
 

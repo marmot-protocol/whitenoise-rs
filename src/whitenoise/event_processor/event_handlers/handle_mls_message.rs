@@ -9,6 +9,7 @@ use nostr_sdk::prelude::*;
 #[cfg(test)]
 use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 use crate::{
+    nostr_manager::parser::ContentParser,
     perf_instrument, perf_span,
     whitenoise::{
         Whitenoise,
@@ -100,10 +101,13 @@ impl Whitenoise {
         // MDK has already processed the message (updating MLS state), but we
         // must not write application-level data for a group the user deleted.
         if let Some(group_id) = extract_group_id(&outcome.result) {
-            let has_account_group =
-                AccountGroup::find_by_account_and_group(&account.pubkey, group_id, &self.database)
-                    .await?
-                    .is_some();
+            let has_account_group = AccountGroup::find_by_account_and_group(
+                &account.pubkey,
+                group_id,
+                &self.shared.database,
+            )
+            .await?
+            .is_some();
 
             if !has_account_group {
                 tracing::info!(
@@ -457,17 +461,21 @@ impl Whitenoise {
         trigger: UpdateTrigger,
         message: ChatMessage,
     ) {
-        self.message_stream_manager
+        self.shared
+            .message_stream_manager
             .emit(group_id, MessageUpdate { trigger, message });
     }
 
     /// Gets the ID of the last message in a group (if any).
     async fn get_last_message_id(&self, group_id: &GroupId) -> Option<String> {
-        AggregatedMessage::find_last_by_group_ids(std::slice::from_ref(group_id), &self.database)
-            .await
-            .ok()
-            .and_then(|v| v.into_iter().next())
-            .map(|s| s.message_id.to_hex())
+        AggregatedMessage::find_last_by_group_ids(
+            std::slice::from_ref(group_id),
+            &self.shared.database,
+        )
+        .await
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|s| s.message_id.to_hex())
     }
 
     /// Cache a new chat message and return it for emission.
@@ -481,11 +489,12 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<ChatMessage> {
-        let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
+        let media_files = MediaFile::find_by_group(&self.shared.database, group_id).await?;
 
         let mut chat_message = self
+            .shared
             .message_aggregator
-            .process_single_message(message, &self.content_parser, media_files)
+            .process_single_message(message, &ContentParser::new(), media_files)
             .await?;
 
         // Preserve existing delivery status for relay echoes of locally-sent messages.
@@ -495,7 +504,7 @@ impl Whitenoise {
             &chat_message.id,
             group_id,
             account_pubkey,
-            &self.database,
+            &self.shared.database,
         )
         .await?
             && existing_message.delivery_status.is_some()
@@ -503,8 +512,13 @@ impl Whitenoise {
             chat_message.delivery_status = existing_message.delivery_status;
         }
 
-        AggregatedMessage::insert_message(&chat_message, group_id, account_pubkey, &self.database)
-            .await?;
+        AggregatedMessage::insert_message(
+            &chat_message,
+            group_id,
+            account_pubkey,
+            &self.shared.database,
+        )
+        .await?;
 
         // Apply orphaned reactions/deletions - modifies in-place and returns final state
         let final_message = self
@@ -540,7 +554,7 @@ impl Whitenoise {
             &message.id.to_string(),
             group_id,
             account_pubkey,
-            &self.database,
+            &self.shared.database,
         )
         .await?
         {
@@ -553,7 +567,7 @@ impl Whitenoise {
             return Ok(None);
         }
 
-        AggregatedMessage::insert_reaction(message, group_id, &self.database).await?;
+        AggregatedMessage::insert_reaction(message, group_id, &self.shared.database).await?;
 
         let result = self
             .apply_reaction_to_target(account_pubkey, message, group_id)
@@ -589,16 +603,20 @@ impl Whitenoise {
     ) -> Result<Option<ChatMessage>> {
         let target_id = extract_reaction_target_id(&reaction.tags)?;
 
-        let Some(mut target) =
-            AggregatedMessage::find_by_id(&target_id, group_id, account_pubkey, &self.database)
-                .await?
+        let Some(mut target) = AggregatedMessage::find_by_id(
+            &target_id,
+            group_id,
+            account_pubkey,
+            &self.shared.database,
+        )
+        .await?
         else {
             return Ok(None); // True orphan: target not yet cached
         };
 
         let emoji = emoji_utils::validate_and_normalize_reaction(
             &reaction.content,
-            self.message_aggregator.config().normalize_emoji,
+            self.shared.message_aggregator.config().normalize_emoji,
         )?;
 
         reaction_handler::add_reaction_to_message(
@@ -613,7 +631,7 @@ impl Whitenoise {
             &target.id,
             group_id,
             &target.reactions,
-            &self.database,
+            &self.shared.database,
         )
         .await?;
 
@@ -638,7 +656,7 @@ impl Whitenoise {
             &message.id.to_string(),
             group_id,
             account_pubkey,
-            &self.database,
+            &self.shared.database,
         )
         .await?
         {
@@ -651,7 +669,7 @@ impl Whitenoise {
             return Ok(Vec::new());
         }
 
-        AggregatedMessage::insert_deletion(message, group_id, &self.database).await?;
+        AggregatedMessage::insert_deletion(message, group_id, &self.shared.database).await?;
 
         let updates = self
             .apply_deletions_to_targets(account_pubkey, message, group_id)
@@ -700,7 +718,8 @@ impl Whitenoise {
     ) -> Result<Option<(UpdateTrigger, ChatMessage)>> {
         // Check if target is a reaction
         if let Some(reaction) =
-            AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.database).await?
+            AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.shared.database)
+                .await?
         {
             let parent_update = self
                 .remove_reaction_from_parent(account_pubkey, &reaction, group_id)
@@ -709,23 +728,27 @@ impl Whitenoise {
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.database,
+                &self.shared.database,
             )
             .await?;
             return Ok(parent_update.map(|msg| (UpdateTrigger::ReactionRemoved, msg)));
         }
 
         // Check if target is a message
-        if let Some(mut msg) =
-            AggregatedMessage::find_by_id(target_id, group_id, account_pubkey, &self.database)
-                .await?
+        if let Some(mut msg) = AggregatedMessage::find_by_id(
+            target_id,
+            group_id,
+            account_pubkey,
+            &self.shared.database,
+        )
+        .await?
         {
             msg.is_deleted = true;
             AggregatedMessage::mark_deleted(
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.database,
+                &self.shared.database,
             )
             .await?;
             return Ok(Some((UpdateTrigger::MessageDeleted, msg)));
@@ -736,7 +759,7 @@ impl Whitenoise {
             target_id,
             group_id,
             &deletion_event_id.to_string(),
-            &self.database,
+            &self.shared.database,
         )
         .await?;
         Ok(None)
@@ -753,9 +776,13 @@ impl Whitenoise {
             return Ok(None);
         };
 
-        let Some(mut parent) =
-            AggregatedMessage::find_by_id(&parent_id, group_id, account_pubkey, &self.database)
-                .await?
+        let Some(mut parent) = AggregatedMessage::find_by_id(
+            &parent_id,
+            group_id,
+            account_pubkey,
+            &self.shared.database,
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -765,7 +792,7 @@ impl Whitenoise {
                 &parent_id,
                 group_id,
                 &parent.reactions,
-                &self.database,
+                &self.shared.database,
             )
             .await?;
 
@@ -791,13 +818,19 @@ impl Whitenoise {
         mut message: ChatMessage,
         group_id: &GroupId,
     ) -> Result<ChatMessage> {
-        let orphaned_reactions =
-            AggregatedMessage::find_orphaned_reactions(&message.id, group_id, &self.database)
-                .await?;
+        let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
+            &message.id,
+            group_id,
+            &self.shared.database,
+        )
+        .await?;
 
-        let orphaned_deletions =
-            AggregatedMessage::find_orphaned_deletions(&message.id, group_id, &self.database)
-                .await?;
+        let orphaned_deletions = AggregatedMessage::find_orphaned_deletions(
+            &message.id,
+            group_id,
+            &self.shared.database,
+        )
+        .await?;
 
         if !orphaned_reactions.is_empty() || !orphaned_deletions.is_empty() {
             tracing::info!(
@@ -813,7 +846,7 @@ impl Whitenoise {
         for reaction in orphaned_reactions {
             let reaction_emoji = match emoji_utils::validate_and_normalize_reaction(
                 &reaction.content,
-                self.message_aggregator.config().normalize_emoji,
+                self.shared.message_aggregator.config().normalize_emoji,
             ) {
                 Ok(emoji) => emoji,
                 Err(e) => {
@@ -842,7 +875,7 @@ impl Whitenoise {
                 &message.id,
                 group_id,
                 &message.reactions,
-                &self.database,
+                &self.shared.database,
             )
             .await?;
         }
@@ -854,7 +887,7 @@ impl Whitenoise {
                 &message.id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.database,
+                &self.shared.database,
             )
             .await?;
         }
@@ -948,7 +981,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -975,7 +1008,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1006,7 +1039,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1067,7 +1100,7 @@ mod tests {
             &group.mls_group_id,
             &creator_account.pubkey,
             &DeliveryStatus::Sent(1),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1083,7 +1116,7 @@ mod tests {
             &message_id.to_string(),
             &group.mls_group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1193,7 +1226,7 @@ mod tests {
         let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
             &future_message_id.to_string(),
             group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1227,7 +1260,7 @@ mod tests {
             &future_message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1335,7 +1368,7 @@ mod tests {
             &future_message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1482,7 +1515,7 @@ mod tests {
             &group.mls_group_id,
             &creator_account.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1538,7 +1571,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1556,7 +1589,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1611,7 +1644,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1632,7 +1665,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1664,7 +1697,7 @@ mod tests {
             &token_tag.server_pubkey,
             Some(&token_tag.relay_hint),
             &token_tag.encrypted_token.to_base64(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1680,7 +1713,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1690,7 +1723,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1840,7 +1873,7 @@ mod tests {
             &stale_token.server_pubkey,
             Some(&stale_token.relay_hint),
             &stale_token.encrypted_token.to_base64(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1863,7 +1896,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_two.pubkey,
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2065,6 +2098,7 @@ mod tests {
             .await;
 
         let tracked_after_first = whitenoise
+            .shared
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await
@@ -2084,6 +2118,7 @@ mod tests {
 
         // Still tracked — no double-entry, no crash.
         let tracked_after_second = whitenoise
+            .shared
             .event_tracker
             .already_processed_account_event(&event_id, &creator_account.pubkey)
             .await

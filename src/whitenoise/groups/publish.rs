@@ -52,7 +52,8 @@ impl Whitenoise {
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
         let _span = perf_span!("groups::publish_event_with_retry");
-        self.relay_control
+        self.shared
+            .relay_control
             .publish_event_to(event, account_pubkey, relay_urls)
             .await?;
         Ok(())

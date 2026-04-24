@@ -107,7 +107,7 @@ impl Whitenoise {
         match PublishedKeyPackage::find_by_event_id(
             &account.pubkey,
             &key_package_event_id.to_hex(),
-            &self.database,
+            &self.shared.database,
         )
         .await
         {
@@ -176,7 +176,7 @@ impl Whitenoise {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        account_group.save(&self.database).await?;
+        account_group.save(&self.shared.database).await?;
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "New AccountGroup created and saved");
 
         // Now accept the welcome to finalize MLS membership
@@ -396,7 +396,7 @@ impl Whitenoise {
         if let Err(e) = PublishedKeyPackage::mark_consumed(
             &account.pubkey,
             &key_package_event_id.to_hex(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         {
@@ -533,6 +533,7 @@ mod tests {
                 .unwrap(),
         );
         let key_pkg_event = whitenoise
+            .shared
             .relay_control
             .fetch_user_key_package(member_pubkey, &relays_urls)
             .await
@@ -568,6 +569,7 @@ mod tests {
 
         // Use the creator's real keys as signer to build the giftwrap
         let creator_signer = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&creator_account.pubkey)
             .unwrap();
@@ -598,6 +600,7 @@ mod tests {
         welcome_rumor.ensure_id();
 
         let creator_signer = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&creator_account.pubkey)
             .unwrap();
@@ -650,6 +653,7 @@ mod tests {
         welcome_rumor.ensure_id();
 
         let creator_signer = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&creator_account.pubkey)
             .unwrap();
@@ -812,6 +816,7 @@ mod tests {
 
         // Group plane should contain the group
         let plane_count = whitenoise
+            .shared
             .relay_control
             .group_plane_account_group_count(&creator_account.pubkey)
             .await;
@@ -976,6 +981,7 @@ mod tests {
         );
         assert_eq!(
             whitenoise
+                .shared
                 .relay_control
                 .group_plane_account_group_count(&member_account.pubkey)
                 .await,
@@ -1012,6 +1018,7 @@ mod tests {
 
         // The new group must be in the group plane
         let plane_count = whitenoise
+            .shared
             .relay_control
             .group_plane_account_group_count(&member_account.pubkey)
             .await;
@@ -1048,6 +1055,7 @@ mod tests {
 
         // Remove the private key so signer-dependent operations fail
         whitenoise
+            .shared
             .secrets_store
             .remove_private_key_for_pubkey(&account.pubkey)
             .unwrap();
@@ -1088,7 +1096,7 @@ mod tests {
 
         // Corrupt the database by dropping the published_key_packages table
         sqlx::query("DROP TABLE published_key_packages")
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
 

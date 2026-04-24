@@ -59,7 +59,7 @@ impl Whitenoise {
         //    this check, a concurrent second call could see the DB row created
         //    by a first call that hasn't finished activation yet and return
         //    Complete prematurely.
-        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.database).await
+        if let Ok(existing) = Account::find_by_pubkey(&pubkey, &self.shared.database).await
             && !self.account_manager.has_pending_login(&pubkey)
             && self.account_manager.get_session(&pubkey).is_some()
         {
@@ -154,16 +154,17 @@ impl Whitenoise {
             !discovered.found(RelayType::KeyPackage),
         );
 
-        let account = Account::find_by_pubkey(pubkey, &self.database)
+        let account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
         let default_relays = self.load_default_relays().await.map_err(LoginError::from)?;
         let keys = self
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(pubkey)
             .map_err(|e| LoginError::Internal(e.to_string()))?;
         let user = account
-            .user(&self.database)
+            .user(&self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -182,7 +183,7 @@ impl Whitenoise {
         let _publish_span = perf_span!("accounts::login_publish_defaults::publish_missing");
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             if !discovered.found(relay_type) {
-                user.add_relays(&default_relays, relay_type, &self.database)
+                user.add_relays(&default_relays, relay_type, &self.shared.database)
                     .await
                     .map_err(LoginError::from)?;
             } else {
@@ -306,7 +307,7 @@ impl Whitenoise {
             pubkey.to_hex()
         );
 
-        let mut account = Account::find_by_pubkey(pubkey, &self.database)
+        let mut account = Account::find_by_pubkey(pubkey, &self.shared.database)
             .await
             .map_err(LoginError::from)?;
 
@@ -387,13 +388,13 @@ impl Whitenoise {
         self.remove_external_signer(pubkey);
 
         // Clean up the partial account if it exists.
-        if let Ok(account) = Account::find_by_pubkey(pubkey, &self.database).await {
+        if let Ok(account) = Account::find_by_pubkey(pubkey, &self.shared.database).await {
             // Remove relay associations that try_discover_relay_lists may have
             // written to the DB before the user cancelled.  The user_relays table
             // has no CASCADE from accounts, so these rows would otherwise persist
             // as stale data for a subsequent login with the same pubkey.
-            if let Ok(user) = account.user(&self.database).await
-                && let Err(e) = user.remove_all_relays(&self.database).await
+            if let Ok(user) = account.user(&self.shared.database).await
+                && let Err(e) = user.remove_all_relays(&self.shared.database).await
             {
                 tracing::warn!(
                     target: "whitenoise::accounts",
@@ -403,11 +404,14 @@ impl Whitenoise {
                 );
             }
             account
-                .delete(&self.database)
+                .delete(&self.shared.database)
                 .await
                 .map_err(LoginError::from)?;
             // Best-effort removal of the keychain entry.
-            let _ = self.secrets_store.remove_private_key_for_pubkey(pubkey);
+            let _ = self
+                .shared
+                .secrets_store
+                .remove_private_key_for_pubkey(pubkey);
             tracing::info!(
                 target: "whitenoise::accounts",
                 "Cleaned up partial login for {}",
@@ -673,14 +677,14 @@ mod tests {
             .create_base_account_with_private_key(keys)
             .await
             .unwrap();
-        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.database)
+        let account = Account::find_by_pubkey(&keys.public_key(), &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = discovered.relays(relay_type);
             if !relays.is_empty() {
-                user.add_relays(relays, relay_type, &whitenoise.database)
+                user.add_relays(relays, relay_type, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
@@ -706,11 +710,11 @@ mod tests {
             .insert_external_signer(pubkey, keys.clone())
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = discovered.relays(relay_type);
             if !relays.is_empty() {
-                user.add_relays(relays, relay_type, &whitenoise.database)
+                user.add_relays(relays, relay_type, &whitenoise.shared.database)
                     .await
                     .unwrap();
             }
@@ -1205,10 +1209,11 @@ mod tests {
             .create_test_identity_with_keys(&keys)
             .await
             .unwrap();
-        let original_synced_at = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
-            .await
-            .unwrap()
-            .last_synced_at;
+        let original_synced_at =
+            Account::find_by_pubkey(&original.pubkey, &whitenoise.shared.database)
+                .await
+                .unwrap()
+                .last_synced_at;
         assert!(
             original_synced_at.is_some(),
             "create_identity must set last_synced_at"
@@ -1233,7 +1238,7 @@ mod tests {
             "Should return the same account row"
         );
 
-        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.database)
+        let after = Account::find_by_pubkey(&original.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(
@@ -1262,7 +1267,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            Account::find_by_pubkey(&pubkey, &whitenoise.database)
+            Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
                 .await
                 .is_ok()
         );
@@ -1625,12 +1630,12 @@ mod tests {
         )
         .await;
 
-        let account = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let account = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
         let nip65_before = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(
@@ -1645,7 +1650,7 @@ mod tests {
         assert!(!whitenoise.account_manager.has_pending_login(&pubkey));
 
         let nip65_after = user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(
@@ -2434,16 +2439,24 @@ mod tests {
             .unwrap();
         assert!(merged.is_complete(), "Stash must be complete after merge");
 
-        let account = Account::find_by_pubkey(&pubkey, &whitenoise.database)
+        let account = Account::find_by_pubkey(&pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let user = account.user(&whitenoise.database).await.unwrap();
-        user.add_relays(&[inbox_relay], RelayType::Inbox, &whitenoise.database)
-            .await
-            .unwrap();
-        user.add_relays(&[kp_relay], RelayType::KeyPackage, &whitenoise.database)
-            .await
-            .unwrap();
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
+        user.add_relays(
+            &[inbox_relay],
+            RelayType::Inbox,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        user.add_relays(
+            &[kp_relay],
+            RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let result = whitenoise
             .login_publish_default_relays(&pubkey)

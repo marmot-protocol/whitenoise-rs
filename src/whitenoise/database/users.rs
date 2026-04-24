@@ -824,7 +824,7 @@ mod tests {
         use crate::whitenoise::test_utils::create_mock_whitenoise;
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let users = User::all(&whitenoise.database).await.unwrap();
+        let users = User::all(&whitenoise.shared.database).await.unwrap();
         assert!(users.is_empty());
 
         let test_pubkey1 = nostr_sdk::Keys::generate().public_key();
@@ -847,10 +847,10 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let saved1 = user1.save(&whitenoise.database).await.unwrap();
-        let saved2 = user2.save(&whitenoise.database).await.unwrap();
+        let saved1 = user1.save(&whitenoise.shared.database).await.unwrap();
+        let saved2 = user2.save(&whitenoise.shared.database).await.unwrap();
 
-        let all_users = User::all(&whitenoise.database).await.unwrap();
+        let all_users = User::all(&whitenoise.shared.database).await.unwrap();
         assert_eq!(all_users.len(), 2);
 
         let pubkeys: Vec<_> = all_users.iter().map(|u| u.pubkey).collect();
@@ -882,11 +882,11 @@ mod tests {
             metadata_known_at: None,
             updated_at: test_updated_at,
         };
-        let result = user.save(&whitenoise.database).await;
+        let result = user.save(&whitenoise.shared.database).await;
         assert!(result.is_ok());
 
         // Test that we can load it back (this verifies it was saved correctly)
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_user.is_ok());
 
         let loaded = loaded_user.unwrap();
@@ -924,11 +924,11 @@ mod tests {
             updated_at: test_updated_at,
         };
 
-        let result = user.save(&whitenoise.database).await;
+        let result = user.save(&whitenoise.shared.database).await;
         assert!(result.is_ok());
 
         // Verify it was saved correctly by loading it back
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_user.is_ok());
 
         let loaded = loaded_user.unwrap();
@@ -959,9 +959,9 @@ mod tests {
         };
         user.mark_metadata_known_now();
 
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(loaded.metadata_known_at.is_some());
@@ -983,9 +983,9 @@ mod tests {
         };
         user.mark_metadata_known_now();
 
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        let loaded = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(loaded.metadata, Metadata::new());
@@ -1000,7 +1000,7 @@ mod tests {
 
         // Try to load a non-existent user
         let non_existent_pubkey = nostr_sdk::Keys::generate().public_key();
-        let result = User::find_by_pubkey(&non_existent_pubkey, &whitenoise.database).await;
+        let result = User::find_by_pubkey(&non_existent_pubkey, &whitenoise.shared.database).await;
 
         assert!(result.is_err());
         if let Err(WhitenoiseError::UserNotFound) = result {
@@ -1016,7 +1016,7 @@ mod tests {
 
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let result = User::find_by_pubkeys(&[], &whitenoise.database)
+        let result = User::find_by_pubkeys(&[], &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -1029,9 +1029,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let test_pubkey = nostr_sdk::Keys::generate().public_key();
 
-        let (user, created) = User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.database)
-            .await
-            .unwrap();
+        let (user, created) =
+            User::find_or_create_by_pubkey(&test_pubkey, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert!(created);
         assert_eq!(user.metadata, Metadata::new());
@@ -1053,9 +1054,9 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.database)
+        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1083,12 +1084,13 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: chrono::Utc::now(),
             };
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
         }
 
-        let result = User::find_by_pubkeys(&[pubkey1, pubkey2, pubkey3], &whitenoise.database)
-            .await
-            .unwrap();
+        let result =
+            User::find_by_pubkeys(&[pubkey1, pubkey2, pubkey3], &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(result.len(), 3);
 
@@ -1115,12 +1117,14 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        let result =
-            User::find_by_pubkeys(&[existing_pubkey, missing_pubkey], &whitenoise.database)
-                .await
-                .unwrap();
+        let result = User::find_by_pubkeys(
+            &[existing_pubkey, missing_pubkey],
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Should only contain the existing user
         assert_eq!(result.len(), 1);
@@ -1136,7 +1140,7 @@ mod tests {
         let pubkey1 = nostr_sdk::Keys::generate().public_key();
         let pubkey2 = nostr_sdk::Keys::generate().public_key();
 
-        let result = User::find_by_pubkeys(&[pubkey1, pubkey2], &whitenoise.database)
+        let result = User::find_by_pubkeys(&[pubkey1, pubkey2], &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1164,9 +1168,9 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
-        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.database)
+        let result = User::find_by_pubkeys(&[test_pubkey], &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1208,11 +1212,11 @@ mod tests {
         };
 
         // Save the user
-        let save_result = original_user.save(&whitenoise.database).await;
+        let save_result = original_user.save(&whitenoise.shared.database).await;
         assert!(save_result.is_ok());
 
         // Load the user back
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
         assert!(loaded_user.is_ok());
 
         let user = loaded_user.unwrap();
@@ -1287,11 +1291,11 @@ mod tests {
             };
 
             // Save the user
-            let save_result = user.save(&whitenoise.database).await;
+            let save_result = user.save(&whitenoise.shared.database).await;
             assert!(save_result.is_ok(), "Failed to save {}", description);
 
             // Load the user back
-            let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database).await;
+            let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database).await;
             assert!(loaded_user.is_ok(), "Failed to load {}", description);
 
             let loaded = loaded_user.unwrap();
@@ -1354,11 +1358,11 @@ mod tests {
         };
 
         // Save the user first
-        let save_result = user.save(&whitenoise.database).await;
+        let save_result = user.save(&whitenoise.shared.database).await;
         assert!(save_result.is_ok());
 
         // Load the user to get the actual database ID
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1387,9 +1391,9 @@ mod tests {
         };
 
         // Save relays to database
-        relay1.save(&whitenoise.database).await.unwrap();
-        relay2.save(&whitenoise.database).await.unwrap();
-        relay3.save(&whitenoise.database).await.unwrap();
+        relay1.save(&whitenoise.shared.database).await.unwrap();
+        relay2.save(&whitenoise.shared.database).await.unwrap();
+        relay3.save(&whitenoise.shared.database).await.unwrap();
 
         // Insert into user_relays table
         sqlx::query(
@@ -1400,7 +1404,7 @@ mod tests {
         .bind("nip65")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -1412,7 +1416,7 @@ mod tests {
         .bind("nip65")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -1424,13 +1428,13 @@ mod tests {
         .bind("inbox")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // Test loading nostr relays
         let nostr_relays = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1442,7 +1446,7 @@ mod tests {
 
         // Test loading inbox relays
         let inbox_relays = loaded_user
-            .relays(RelayType::Inbox, &whitenoise.database)
+            .relays(RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1451,7 +1455,7 @@ mod tests {
 
         // Test loading key package relays (should be empty)
         let key_package_relays = loaded_user
-            .relays(RelayType::KeyPackage, &whitenoise.database)
+            .relays(RelayType::KeyPackage, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1479,14 +1483,14 @@ mod tests {
         };
 
         // Save the user first
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Test loading relays when none exist
         let result = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1513,8 +1517,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1526,7 +1530,7 @@ mod tests {
             created_at: test_timestamp,
             updated_at: test_timestamp,
         };
-        relay.save(&whitenoise.database).await.unwrap();
+        relay.save(&whitenoise.shared.database).await.unwrap();
 
         // Add the same relay for different types
         for relay_type in ["nip65", "inbox", "key_package"] {
@@ -1538,7 +1542,7 @@ mod tests {
             .bind(relay_type)
             .bind(test_timestamp.timestamp_millis())
             .bind(test_timestamp.timestamp_millis())
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
         }
@@ -1546,7 +1550,7 @@ mod tests {
         // Test each relay type returns the same relay
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = loaded_user
-                .relays(relay_type, &whitenoise.database)
+                .relays(relay_type, &whitenoise.shared.database)
                 .await
                 .unwrap();
 
@@ -1584,13 +1588,13 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user1.save(&whitenoise.database).await.unwrap();
-        user2.save(&whitenoise.database).await.unwrap();
+        user1.save(&whitenoise.shared.database).await.unwrap();
+        user2.save(&whitenoise.shared.database).await.unwrap();
 
-        let loaded_user1 = User::find_by_pubkey(&user1_pubkey, &whitenoise.database)
+        let loaded_user1 = User::find_by_pubkey(&user1_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
-        let loaded_user2 = User::find_by_pubkey(&user2_pubkey, &whitenoise.database)
+        let loaded_user2 = User::find_by_pubkey(&user2_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1611,8 +1615,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        relay1.save(&whitenoise.database).await.unwrap();
-        relay2.save(&whitenoise.database).await.unwrap();
+        relay1.save(&whitenoise.shared.database).await.unwrap();
+        relay2.save(&whitenoise.shared.database).await.unwrap();
 
         // Associate relay1 with user1 and relay2 with user2
         sqlx::query(
@@ -1623,7 +1627,7 @@ mod tests {
         .bind("nip65")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
@@ -1635,17 +1639,17 @@ mod tests {
         .bind("nip65")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // Test that each user gets only their own relays
         let user1_relays = loaded_user1
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         let user2_relays = loaded_user2
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1676,8 +1680,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1686,17 +1690,20 @@ mod tests {
 
         // Pre-create the relay in the database
         let existing_relay = Relay::new(&relay_url);
-        let saved_relay = existing_relay.save(&whitenoise.database).await.unwrap();
+        let saved_relay = existing_relay
+            .save(&whitenoise.shared.database)
+            .await
+            .unwrap();
 
         // Add relay association - should work with existing relay
         let result = loaded_user
-            .add_relay(&saved_relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&saved_relay, RelayType::Nip65, &whitenoise.shared.database)
             .await;
         assert!(result.is_ok());
 
         // Verify the relay was associated
         let user_relays = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(user_relays.len(), 1);
@@ -1723,8 +1730,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1732,7 +1739,7 @@ mod tests {
         let new_relay_url = nostr_sdk::RelayUrl::parse("wss://new-relay.example.com").unwrap();
 
         // Verify relay doesn't exist yet
-        let find_result = Relay::find_by_url(&new_relay_url, &whitenoise.database).await;
+        let find_result = Relay::find_by_url(&new_relay_url, &whitenoise.shared.database).await;
         assert!(find_result.is_err());
 
         // Create the relay (this is what find_or_create_relay would do)
@@ -1743,20 +1750,20 @@ mod tests {
 
         // Add relay association
         let result = loaded_user
-            .add_relay(&new_relay, RelayType::Inbox, &whitenoise.database)
+            .add_relay(&new_relay, RelayType::Inbox, &whitenoise.shared.database)
             .await;
         assert!(result.is_ok());
 
         // Verify the relay was associated
         let user_relays = loaded_user
-            .relays(RelayType::Inbox, &whitenoise.database)
+            .relays(RelayType::Inbox, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(user_relays.len(), 1);
         assert_eq!(user_relays[0].url, new_relay_url);
 
         // Verify relay exists in database (since we created it)
-        let find_result = Relay::find_by_url(&new_relay_url, &whitenoise.database).await;
+        let find_result = Relay::find_by_url(&new_relay_url, &whitenoise.shared.database).await;
         assert!(find_result.is_ok());
     }
 
@@ -1780,8 +1787,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1792,26 +1799,26 @@ mod tests {
             .await
             .unwrap();
         loaded_user
-            .add_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .add_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Verify relay was added
         let user_relays = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(user_relays.len(), 1);
 
         // Remove the relay
         let result = loaded_user
-            .remove_relay(&relay, RelayType::Nip65, &whitenoise.database)
+            .remove_relay(&relay, RelayType::Nip65, &whitenoise.shared.database)
             .await;
         assert!(result.is_ok());
 
         // Verify relay was removed
         let user_relays = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
         assert_eq!(user_relays.len(), 0);
@@ -1837,8 +1844,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1847,7 +1854,11 @@ mod tests {
             nostr_sdk::RelayUrl::parse("wss://non-existent.example.com").unwrap();
         let non_existent_relay = Relay::new(&non_existent_url);
         let result = loaded_user
-            .remove_relay(&non_existent_relay, RelayType::Nip65, &whitenoise.database)
+            .remove_relay(
+                &non_existent_relay,
+                RelayType::Nip65,
+                &whitenoise.shared.database,
+            )
             .await;
 
         assert!(result.is_err());
@@ -1878,19 +1889,19 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
         // Create a relay in the database but don't associate it with the user
         let relay_url = nostr_sdk::RelayUrl::parse("wss://unassociated.example.com").unwrap();
         let relay = Relay::new(&relay_url);
-        let saved_relay = relay.save(&whitenoise.database).await.unwrap();
+        let saved_relay = relay.save(&whitenoise.shared.database).await.unwrap();
 
         // Try to remove the relay - it exists in database but not associated with user
         let result = loaded_user
-            .remove_relay(&saved_relay, RelayType::Nip65, &whitenoise.database)
+            .remove_relay(&saved_relay, RelayType::Nip65, &whitenoise.shared.database)
             .await;
 
         assert!(result.is_err());
@@ -1921,8 +1932,8 @@ mod tests {
             updated_at: test_timestamp,
         };
 
-        user.save(&whitenoise.database).await.unwrap();
-        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.database)
+        user.save(&whitenoise.shared.database).await.unwrap();
+        let loaded_user = User::find_by_pubkey(&test_pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1938,7 +1949,7 @@ mod tests {
             updated_at: relay_updated_at,
         };
 
-        relay.save(&whitenoise.database).await.unwrap();
+        relay.save(&whitenoise.shared.database).await.unwrap();
 
         // Associate with user
         sqlx::query(
@@ -1949,13 +1960,13 @@ mod tests {
         .bind("nip65")
         .bind(test_timestamp.timestamp_millis())
         .bind(test_timestamp.timestamp_millis())
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
         // Load relays and verify all properties
         let relays = loaded_user
-            .relays(RelayType::Nip65, &whitenoise.database)
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
             .await
             .unwrap();
 

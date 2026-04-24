@@ -331,10 +331,11 @@ impl<'a> KeyPackageOps<'a> {
     }
 
     async fn prepare_relays(&self) -> Result<Vec<Relay>> {
-        let user = User::find_by_pubkey(&self.session.account_pubkey, &self.session.database)
-            .await
-            .map_err(|_| WhitenoiseError::AccountNotFound)?;
-        user.relays(RelayType::KeyPackage, &self.session.database)
+        let user =
+            User::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await
+                .map_err(|_| WhitenoiseError::AccountNotFound)?;
+        user.relays(RelayType::KeyPackage, &self.session.shared.database)
             .await
     }
 

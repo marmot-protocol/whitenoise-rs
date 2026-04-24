@@ -3,8 +3,6 @@ use std::sync::{Arc, OnceLock};
 
 use ::rand::RngCore;
 
-use dashmap::DashMap;
-use nostr_sdk::prelude::NostrSigner;
 use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::sync::{
     Mutex, OnceCell,
@@ -44,6 +42,7 @@ pub mod relays;
 pub mod scheduled_tasks;
 pub mod secrets_store;
 pub mod session;
+pub(crate) mod shared;
 mod signer;
 pub mod storage;
 mod streaming;
@@ -146,33 +145,15 @@ impl WhitenoiseConfig {
 
 pub struct Whitenoise {
     pub config: WhitenoiseConfig,
-    pub(crate) database: Arc<Database>,
-    event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
-    content_parser: crate::nostr_manager::parser::ContentParser,
-    relay_control: Arc<RelayControlPlane>,
-    secrets_store: SecretsStore,
-    storage: storage::Storage,
-    message_aggregator: message_aggregator::MessageAggregator,
-    message_stream_manager: Arc<message_streaming::MessageStreamManager>,
-    user_stream_manager: user_streaming::UserStreamManager,
-    chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
-    archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager,
-    notification_stream_manager: notification_streaming::NotificationStreamManager,
+    pub(crate) shared: Arc<shared::SharedServices>,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
-    /// Per-user guards that dedupe targeted discovery resolution for the same pubkey.
-    user_resolution_guards: DashMap<PublicKey, Arc<Mutex<()>>>,
     /// Shutdown signal for scheduled tasks
     scheduler_shutdown: watch::Sender<bool>,
     /// Handles for spawned scheduler tasks
     scheduler_handles: Mutex<Vec<JoinHandle<()>>>,
-    /// External signers for accounts using NIP-55 (Amber) or similar.
-    /// Maps account pubkey to their signer implementation.
-    external_signers: DashMap<PublicKey, Arc<dyn NostrSigner>>,
     /// Per-account session manager. Holds active sessions and pending logins.
     pub(crate) account_manager: session::AccountManager,
-    /// Debounced worker that coalesces discovery subscription rebuilds.
-    discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker,
 }
 
 static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
@@ -191,21 +172,9 @@ impl std::fmt::Debug for Whitenoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Whitenoise")
             .field("config", &self.config)
-            .field("database", &"<REDACTED>")
-            .field("event_tracker", &"<REDACTED>")
-            .field("content_parser", &"<REDACTED>")
-            .field("relay_control", &"<REDACTED>")
-            .field("secrets_store", &"<REDACTED>")
-            .field("storage", &"<REDACTED>")
-            .field("message_aggregator", &"<REDACTED>")
-            .field("message_stream_manager", &"<REDACTED>")
-            .field("user_stream_manager", &"<REDACTED>")
-            .field("chat_list_stream_manager", &"<REDACTED>")
-            .field("archived_chat_list_stream_manager", &"<REDACTED>")
-            .field("notification_stream_manager", &"<REDACTED>")
+            .field("shared", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
-            .field("user_resolution_guards", &"<REDACTED>")
             .field("scheduler_shutdown", &"<REDACTED>")
             .field("scheduler_handles", &"<REDACTED>")
             .field("account_manager", &"<REDACTED>")
@@ -228,30 +197,23 @@ impl Whitenoise {
             session_salt,
         ));
 
+        let shared = Arc::new(shared::SharedServices::new(
+            database,
+            relay_control,
+            components.event_tracker,
+            components.secrets_store,
+            components.storage,
+            components.message_aggregator,
+        ));
+
         Self {
             config,
-            database,
-            event_tracker: components.event_tracker,
-            content_parser: crate::nostr_manager::parser::ContentParser::new(),
-            relay_control,
-            secrets_store: components.secrets_store,
-            storage: components.storage,
-            message_aggregator: components.message_aggregator,
-            message_stream_manager: Arc::new(message_streaming::MessageStreamManager::default()),
-            user_stream_manager: user_streaming::UserStreamManager::default(),
-            chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(),
-            archived_chat_list_stream_manager: chat_list_streaming::ChatListStreamManager::default(
-            ),
-            notification_stream_manager: notification_streaming::NotificationStreamManager::default(
-            ),
+            shared,
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
-            user_resolution_guards: DashMap::new(),
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
-            external_signers: DashMap::new(),
             account_manager: session::AccountManager::default(),
-            discovery_sync_worker: discovery_sync_worker::DiscoverySyncWorker::new(),
         }
     }
 
@@ -491,7 +453,7 @@ impl Whitenoise {
                 scheduler_shutdown,
             },
         );
-        whitenoise.relay_control.start_telemetry_persistors().await;
+        whitenoise.shared.relay_control.start_telemetry_persistors().await;
 
         init_timing::record("core_services");
 
@@ -502,11 +464,11 @@ impl Whitenoise {
         }
 
         // Create default app settings in the database if they don't exist
-        AppSettings::find_or_create_default(&whitenoise.database).await?;
+        AppSettings::find_or_create_default(&whitenoise.shared.database).await?;
 
         init_timing::record("database_seeding");
 
-        whitenoise.relay_control.start_discovery_plane().await?;
+        whitenoise.shared.relay_control.start_discovery_plane().await?;
 
         init_timing::record("discovery_plane");
 
@@ -567,6 +529,7 @@ impl Whitenoise {
             let worker_shutdown_rx = whitenoise_ref.scheduler_shutdown.subscribe();
             let handle = tokio::spawn(async move {
                 whitenoise_ref
+                    .shared
                     .discovery_sync_worker
                     .run(whitenoise_ref, worker_shutdown_rx)
                     .await;
@@ -664,13 +627,13 @@ impl Whitenoise {
         self.account_manager.deactivate_all_inboxes().await;
 
         // Tear down shared relay-control subscriptions (group, ephemeral, telemetry)
-        self.relay_control.shutdown_all().await;
+        self.shared.relay_control.shutdown_all().await;
 
         // Remove database (accounts and media) data
-        self.database.delete_all_data().await?;
+        self.shared.database.delete_all_data().await?;
 
         // Remove storage artifacts (media cache, etc.)
-        self.storage.wipe_all().await?;
+        self.shared.storage.wipe_all().await?;
 
         // Remove MLS related data
         let mls_dir = self.config.data_dir.join("mls");
@@ -753,14 +716,14 @@ impl Whitenoise {
     #[cfg(feature = "integration-tests")]
     #[perf_instrument("whitenoise")]
     pub async fn wipe_database(&self) -> Result<()> {
-        self.database.delete_all_data().await?;
+        self.shared.database.delete_all_data().await?;
         Ok(())
     }
 
     #[cfg(feature = "integration-tests")]
     #[perf_instrument("whitenoise")]
     pub async fn reset_nostr_client(&self) -> Result<()> {
-        self.relay_control.reset_for_tests().await?;
+        self.shared.relay_control.reset_for_tests().await?;
         Ok(())
     }
 }
@@ -914,7 +877,11 @@ pub mod test_utils {
                 scheduler_shutdown,
             },
         );
-        whitenoise.relay_control.start_telemetry_persistors().await;
+        whitenoise
+            .shared
+            .relay_control
+            .start_telemetry_persistors()
+            .await;
 
         (whitenoise, event_receiver, data_temp, logs_temp)
     }
@@ -968,7 +935,7 @@ pub mod test_utils {
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
                 .bind(account_id)
-                .fetch_one(&whitenoise.database.pool)
+                .fetch_one(&whitenoise.shared.database.pool)
                 .await
                 .unwrap();
 
@@ -1149,6 +1116,7 @@ pub mod test_utils {
                     );
 
                     match whitenoise
+                        .shared
                         .relay_control
                         .fetch_user_key_package(publisher_account.pubkey, &relay_urls)
                         .await
@@ -1187,6 +1155,7 @@ pub mod test_utils {
             let relay_urls =
                 Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
             let key_package_event = whitenoise
+                .shared
                 .relay_control
                 .fetch_user_key_package(member_account.pubkey, &relay_urls)
                 .await
@@ -1225,6 +1194,7 @@ pub mod test_utils {
         );
 
         let admin_signer = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&admin_account.pubkey)
             .unwrap();
@@ -1423,7 +1393,12 @@ mod tests {
         #[tokio::test]
         async fn test_whitenoise_initialization() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            assert!(Account::all(&whitenoise.database).await.unwrap().is_empty());
+            assert!(
+                Account::all(&whitenoise.shared.database)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
 
             // Verify directories were created
             assert!(whitenoise.config.data_dir.exists());
@@ -1450,13 +1425,13 @@ mod tests {
             assert!(whitenoise1.config.data_dir.exists());
             assert!(whitenoise2.config.data_dir.exists());
             assert!(
-                Account::all(&whitenoise1.database)
+                Account::all(&whitenoise1.shared.database)
                     .await
                     .unwrap()
                     .is_empty()
             );
             assert!(
-                Account::all(&whitenoise2.database)
+                Account::all(&whitenoise2.shared.database)
                     .await
                     .unwrap()
                     .is_empty()
@@ -1484,12 +1459,13 @@ mod tests {
 
             // Create some test media files in cache
             whitenoise
+                .shared
                 .storage
                 .media_files
                 .store_file("test_image.jpg", b"fake image data")
                 .await
                 .unwrap();
-            let media_cache_dir = whitenoise.storage.media_files.cache_dir();
+            let media_cache_dir = whitenoise.shared.storage.media_files.cache_dir();
             assert!(media_cache_dir.exists());
             let cache_entries: Vec<_> = std::fs::read_dir(media_cache_dir)
                 .unwrap()
@@ -1502,11 +1478,16 @@ mod tests {
             assert!(result.is_ok());
 
             // Verify cleanup
-            assert!(Account::all(&whitenoise.database).await.unwrap().is_empty());
+            assert!(
+                Account::all(&whitenoise.shared.database)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert!(!test_log_file.exists());
 
             // Media cache directory should be removed
-            let media_cache_dir_after = whitenoise.storage.media_files.cache_dir();
+            let media_cache_dir_after = whitenoise.shared.storage.media_files.cache_dir();
             assert!(!media_cache_dir_after.exists());
 
             // MLS directory should be recreated as empty
@@ -1571,7 +1552,7 @@ mod tests {
             group_information::GroupInformation::find_or_create_by_mls_group_id(
                 &group_id,
                 Some(group_information::GroupType::Group),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1614,7 +1595,7 @@ mod tests {
                 &msg1,
                 &group_id,
                 &test_pubkey,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1622,7 +1603,7 @@ mod tests {
                 &msg2,
                 &group_id,
                 &test_pubkey,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1676,7 +1657,7 @@ mod tests {
             };
 
             // Emit an update (will be caught by subscriber during drain phase)
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -1730,7 +1711,7 @@ mod tests {
                 &msg,
                 group_id,
                 &author,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1742,7 +1723,7 @@ mod tests {
             group_information::GroupInformation::find_or_create_by_mls_group_id(
                 group_id,
                 Some(group_information::GroupType::Group),
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -1766,12 +1747,12 @@ mod tests {
             .bind(&hex)
             .bind(now_ms)
             .bind(now_ms)
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
             let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE pubkey = ?")
                 .bind(&hex)
-                .fetch_one(&whitenoise.database.pool)
+                .fetch_one(&whitenoise.shared.database.pool)
                 .await
                 .unwrap();
             // account row (FK target for accounts_groups)
@@ -1784,7 +1765,7 @@ mod tests {
             .bind(user_id)
             .bind(now_ms)
             .bind(now_ms)
-            .execute(&whitenoise.database.pool)
+            .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
             // accounts_groups row
@@ -1792,7 +1773,7 @@ mod tests {
                 pubkey,
                 group_id,
                 None,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -2073,7 +2054,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2164,7 +2145,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2223,7 +2204,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2278,7 +2259,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_a,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2324,7 +2305,7 @@ mod tests {
         /// security check, but does not need a full session to be active.
         async fn create_db_account(whitenoise: &Whitenoise) -> accounts::Account {
             let (account, _keys) = accounts::Account::new(whitenoise, None).await.unwrap();
-            account.save(&whitenoise.database).await.unwrap()
+            account.save(&whitenoise.shared.database).await.unwrap()
         }
 
         /// Core happy-path scenario: user opens the chat (snapshot), scrolls up to load
@@ -2476,14 +2457,14 @@ mod tests {
                 delivery_status: None,
             };
 
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
                     message: new_msg_a.clone(),
                 },
             );
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2672,7 +2653,7 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            whitenoise.message_stream_manager.emit(
+            whitenoise.shared.message_stream_manager.emit(
                 &group_id,
                 message_streaming::MessageUpdate {
                     trigger: message_streaming::UpdateTrigger::NewMessage,
@@ -2797,7 +2778,7 @@ mod tests {
                 updated_at: Utc::now(),
             };
             user.mark_metadata_known_now();
-            let saved_user = user.save(&whitenoise.database).await.unwrap();
+            let saved_user = user.save(&whitenoise.shared.database).await.unwrap();
 
             let subscription = whitenoise.subscribe_to_user(&pubkey).await.unwrap();
 
@@ -2815,7 +2796,7 @@ mod tests {
             assert!(subscription.initial_user.id.is_some());
             assert!(subscription.initial_user.metadata_is_unknown());
 
-            let saved_user = User::find_by_pubkey(&pubkey, &whitenoise.database)
+            let saved_user = User::find_by_pubkey(&pubkey, &whitenoise.shared.database)
                 .await
                 .unwrap();
             assert_eq!(saved_user, subscription.initial_user);
@@ -2891,7 +2872,7 @@ mod tests {
             );
             session
                 .activate_subscriptions(
-                    &whitenoise.relay_control,
+                    &whitenoise.shared.relay_control,
                     &inbox_relays,
                     &[], // empty group specs — simulates the missing group
                     creator_account.since_timestamp(10),
@@ -3287,7 +3268,7 @@ mod tests {
                     &msg,
                     &group.mls_group_id,
                     &creator.pubkey,
-                    &whitenoise.database,
+                    &whitenoise.shared.database,
                 )
                 .await
                 .unwrap();
@@ -3580,7 +3561,7 @@ mod tests {
             // subscription recovery. Registration should still succeed.
             sqlx::query("DELETE FROM users WHERE id = ?")
                 .bind(account.user_id)
-                .execute(&whitenoise.database.pool)
+                .execute(&whitenoise.shared.database.pool)
                 .await
                 .unwrap();
 

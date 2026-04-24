@@ -30,7 +30,7 @@ impl User {
     #[perf_instrument("users")]
     pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
         let kp_relays = self
-            .relays(RelayType::KeyPackage, &whitenoise.database)
+            .relays(RelayType::KeyPackage, &whitenoise.shared.database)
             .await?;
         if !kp_relays.is_empty() {
             return Ok(Relay::urls(&kp_relays));
@@ -42,7 +42,9 @@ impl User {
             self.pubkey
         );
 
-        let nip65_relays = self.relays(RelayType::Nip65, &whitenoise.database).await?;
+        let nip65_relays = self
+            .relays(RelayType::Nip65, &whitenoise.shared.database)
+            .await?;
         if !nip65_relays.is_empty() {
             return Ok(Relay::urls(&nip65_relays));
         }
@@ -89,6 +91,7 @@ impl User {
         }
 
         let event = whitenoise
+            .shared
             .relay_control
             .fetch_user_key_package(self.pubkey, &relay_urls)
             .await?;
@@ -111,7 +114,7 @@ impl User {
         match status {
             KeyPackageStatus::NotFound
                 if self
-                    .relays(RelayType::KeyPackage, &whitenoise.database)
+                    .relays(RelayType::KeyPackage, &whitenoise.shared.database)
                     .await?
                     .is_empty() =>
             {

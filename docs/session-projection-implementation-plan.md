@@ -430,7 +430,7 @@ split phase.
 
 ### Phase 16a: Extract SharedServices while keeping singleton compatibility (~800 LOC)
 
-- [ ] Not started
+- [x] In review in PR #773
 
 <details>
 <summary>Details</summary>

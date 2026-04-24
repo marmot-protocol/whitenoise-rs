@@ -32,7 +32,7 @@ impl Task for MuteExpiryCleanup {
 
     #[perf_instrument("scheduled::mute_expiry_cleanup")]
     async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
-        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.database).await?;
+        let cleared = AccountGroup::clear_expired_mutes(&whitenoise.shared.database).await?;
 
         if cleared.is_empty() {
             tracing::debug!(
@@ -50,7 +50,7 @@ impl Task for MuteExpiryCleanup {
 
         // Emit ChatMuteChanged for each cleared mute so the UI updates.
         for ag in &cleared {
-            match Account::find_by_pubkey(&ag.account_pubkey, &whitenoise.database).await {
+            match Account::find_by_pubkey(&ag.account_pubkey, &whitenoise.shared.database).await {
                 Ok(account) => {
                     whitenoise
                         .emit_chat_list_update(

@@ -150,7 +150,7 @@ impl<'a> MediaOps<'a> {
 
         // Try to get the stored blossom_url from the database
         let blossom_url = if let Some(media_file) =
-            MediaFile::find_by_hash(&self.session.database, &image_hash).await?
+            MediaFile::find_by_hash(&self.session.shared.database, &image_hash).await?
         {
             media_file
                 .blossom_url
@@ -378,7 +378,7 @@ impl<'a> MediaOps<'a> {
         original_file_hash: &[u8; 32],
     ) -> Result<MediaFile> {
         let media_file = MediaFile::find_by_original_hash_and_group(
-            &self.session.database,
+            &self.session.shared.database,
             original_file_hash,
             group_id,
             &self.session.account_pubkey,
@@ -414,6 +414,7 @@ impl<'a> MediaOps<'a> {
         // TODO(phase-16): Remove singleton bridge when storage moves to session.
         let wn = Self::wn()?;
         let cache_path = wn
+            .shared
             .storage
             .media_files
             .store_file(&cached_filename, &decrypted_data)
@@ -423,13 +424,13 @@ impl<'a> MediaOps<'a> {
             WhitenoiseError::MediaCache("MediaFile record missing id".to_string())
         })?;
 
-        MediaFile::update_file_path(&self.session.database, media_file_id, &cache_path).await
+        MediaFile::update_file_path(&self.session.shared.database, media_file_id, &cache_path).await
     }
 
     /// Returns all media files for a group.
     #[perf_instrument("groups")]
     pub async fn get_media_files_for_group(&self, group_id: &GroupId) -> Result<Vec<MediaFile>> {
-        MediaFile::find_by_group(&self.session.database, group_id).await
+        MediaFile::find_by_group(&self.session.shared.database, group_id).await
     }
 
     /// Returns the filesystem path of the cached group image, downloading if needed.
@@ -458,7 +459,7 @@ impl<'a> MediaOps<'a> {
             };
 
         let blossom_url = if let Some(media_file) =
-            MediaFile::find_by_hash(&self.session.database, image_hash).await?
+            MediaFile::find_by_hash(&self.session.shared.database, image_hash).await?
         {
             media_file
                 .blossom_url
@@ -577,7 +578,7 @@ impl<'a> MediaOps<'a> {
         image_key: &[u8; 32],
     ) -> Result<MediaFile> {
         let existing_record_opt =
-            MediaFile::find_by_hash(&self.session.database, image_hash).await?;
+            MediaFile::find_by_hash(&self.session.shared.database, image_hash).await?;
 
         match existing_record_opt {
             Some(existing_record) => {

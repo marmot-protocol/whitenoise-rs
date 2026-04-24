@@ -132,12 +132,14 @@ mod tests {
     async fn test_find_or_create_creates_default_row() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
 
-        let settings =
-            AccountSettings::find_or_create_for_pubkey(&keys.public_key(), &whitenoise.database)
-                .await
-                .unwrap();
+        let settings = AccountSettings::find_or_create_for_pubkey(
+            &keys.public_key(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(settings.id.is_some());
         assert_eq!(settings.account_pubkey, keys.public_key());
@@ -148,16 +150,20 @@ mod tests {
     async fn test_find_or_create_returns_existing_row() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
 
-        let first =
-            AccountSettings::find_or_create_for_pubkey(&keys.public_key(), &whitenoise.database)
-                .await
-                .unwrap();
-        let second =
-            AccountSettings::find_or_create_for_pubkey(&keys.public_key(), &whitenoise.database)
-                .await
-                .unwrap();
+        let first = AccountSettings::find_or_create_for_pubkey(
+            &keys.public_key(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let second = AccountSettings::find_or_create_for_pubkey(
+            &keys.public_key(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(first.id, second.id);
     }
@@ -169,7 +175,7 @@ mod tests {
 
         let enabled = AccountSettings::notifications_enabled_for_pubkey(
             &keys.public_key(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -181,19 +187,19 @@ mod tests {
     async fn test_notifications_enabled_returns_stored_value() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
 
         AccountSettings::update_notifications_enabled(
             &keys.public_key(),
             false,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
         let enabled = AccountSettings::notifications_enabled_for_pubkey(
             &keys.public_key(),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -205,12 +211,12 @@ mod tests {
     async fn test_update_notifications_enabled_toggles_and_returns_updated() {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let keys = Keys::generate();
-        insert_test_account(&whitenoise.database, &keys.public_key()).await;
+        insert_test_account(&whitenoise.shared.database, &keys.public_key()).await;
 
         let disabled = AccountSettings::update_notifications_enabled(
             &keys.public_key(),
             false,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -220,7 +226,7 @@ mod tests {
         let enabled = AccountSettings::update_notifications_enabled(
             &keys.public_key(),
             true,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();

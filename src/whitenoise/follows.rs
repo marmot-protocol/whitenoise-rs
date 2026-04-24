@@ -26,11 +26,12 @@ impl Whitenoise {
     )]
     #[perf_instrument("follows")]
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
-        let (user, newly_created) = User::find_or_create_by_pubkey(pubkey, &self.database).await?;
+        let (user, newly_created) =
+            User::find_or_create_by_pubkey(pubkey, &self.shared.database).await?;
 
         if newly_created {
             self.start_background_user_resolution_if_unknown(user.pubkey);
-            self.discovery_sync_worker.request_rebuild();
+            self.shared.discovery_sync_worker.request_rebuild();
         }
 
         let session = self

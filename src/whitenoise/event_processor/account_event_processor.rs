@@ -99,6 +99,7 @@ impl Whitenoise {
             Ok(()) => {
                 // Record that we processed this event successfully
                 if let Err(e) = self
+                    .shared
                     .event_tracker
                     .track_processed_account_event(&event, &account.pubkey)
                     .await
@@ -121,7 +122,7 @@ impl Whitenoise {
                         if let Err(e) = Account::update_last_synced_max(
                             &account.pubkey,
                             created_ms,
-                            &self.database,
+                            &self.shared.database,
                         )
                         .await
                         {
@@ -155,7 +156,7 @@ impl Whitenoise {
                                 if let Err(e) = Account::update_last_synced_max(
                                     &account.pubkey,
                                     created_ms,
-                                    &self.database,
+                                    &self.shared.database,
                                 )
                                 .await
                                 {
@@ -228,10 +229,12 @@ impl Whitenoise {
 
         let hash_str = &subscription_id[..underscore_pos.unwrap()];
         // Get all accounts and find the one whose hash matches
-        let accounts = Account::all(&self.database).await?;
+        let accounts = Account::all(&self.shared.database).await?;
         for account in accounts.iter() {
-            let pubkey_hash =
-                hash_pubkey_for_subscription_id(self.relay_control.session_salt(), &account.pubkey);
+            let pubkey_hash = hash_pubkey_for_subscription_id(
+                self.shared.relay_control.session_salt(),
+                &account.pubkey,
+            );
             if pubkey_hash == hash_str {
                 return Ok(account.pubkey);
             }
@@ -259,7 +262,7 @@ impl Whitenoise {
             target_pubkey.to_hex()
         );
 
-        Account::find_by_pubkey(&target_pubkey, &self.database).await
+        Account::find_by_pubkey(&target_pubkey, &self.shared.database).await
     }
 
     /// Check if an account event should be skipped (not processed)
@@ -271,6 +274,7 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<Option<&'static str>> {
         let already_processed = match self
+            .shared
             .event_tracker
             .already_processed_account_event(&event.id, &account.pubkey)
             .await
@@ -297,6 +301,7 @@ impl Whitenoise {
             Kind::MlsGroupMessage => false,
             Kind::GiftWrap => false,
             _ => match self
+                .shared
                 .event_tracker
                 .account_published_event(&event.id, &account.pubkey)
                 .await
@@ -455,7 +460,7 @@ mod tests {
 
         // Build the expected subscription hash for this account
         let mut hasher = Sha256::new();
-        hasher.update(whitenoise.relay_control.session_salt());
+        hasher.update(whitenoise.shared.relay_control.session_salt());
         hasher.update(account.pubkey.to_bytes());
         let hash = hasher.finalize();
         let pubkey_hash = format!("{:x}", hash)[..12].to_string();
@@ -474,6 +479,7 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let session = whitenoise.require_session(&account.pubkey).unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -547,6 +553,7 @@ mod tests {
 
         assert!(
             whitenoise
+                .shared
                 .event_tracker
                 .already_processed_account_event(&event.id, &admin_account.pubkey)
                 .await
@@ -555,6 +562,7 @@ mod tests {
         );
         assert!(
             whitenoise
+                .shared
                 .event_tracker
                 .already_processed_account_event(&event.id, &member_account.pubkey)
                 .await
@@ -597,6 +605,7 @@ mod tests {
         let (whitenoise, _d, _l) = create_mock_whitenoise().await;
         let account = whitenoise.create_identity().await.unwrap();
         let keys = whitenoise
+            .shared
             .secrets_store
             .get_nostr_keys_for_pubkey(&account.pubkey)
             .unwrap();
@@ -630,6 +639,7 @@ mod tests {
         // Event must NOT be tracked as processed
         assert!(
             !whitenoise
+                .shared
                 .event_tracker
                 .already_processed_account_event(&event.id, &account.pubkey)
                 .await

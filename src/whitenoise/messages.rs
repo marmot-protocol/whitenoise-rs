@@ -1,6 +1,7 @@
 pub use crate::whitenoise::database::aggregated_messages::PaginationOptions;
 
 use crate::{
+    nostr_manager::parser::ContentParser,
     perf_instrument,
     types::MessageWithTokens,
     whitenoise::{
@@ -164,7 +165,7 @@ impl Whitenoise {
         let mut total_synced = 0;
         let mut total_groups_checked = 0;
 
-        let accounts = Account::all(&self.database).await?;
+        let accounts = Account::all(&self.shared.database).await?;
 
         for account in accounts {
             let mdk = self.create_mdk_for_account(account.pubkey)?;
@@ -215,7 +216,8 @@ impl Whitenoise {
             return Ok(false);
         }
 
-        let cached_count = AggregatedMessage::count_by_group(group_id, &self.database).await?;
+        let cached_count =
+            AggregatedMessage::count_by_group(group_id, &self.shared.database).await?;
 
         if mdk_messages.len() != cached_count {
             tracing::debug!(
@@ -246,7 +248,7 @@ impl Whitenoise {
         }
 
         let cached_ids =
-            AggregatedMessage::get_all_event_ids_by_group(group_id, &self.database).await?;
+            AggregatedMessage::get_all_event_ids_by_group(group_id, &self.shared.database).await?;
 
         let new_events: Vec<Message> = mdk_messages
             .into_iter()
@@ -271,21 +273,27 @@ impl Whitenoise {
             hex::encode(group_id.as_slice())
         );
 
-        let media_files = MediaFile::find_by_group(&self.database, group_id).await?;
+        let media_files = MediaFile::find_by_group(&self.shared.database, group_id).await?;
 
         let processed_messages = self
+            .shared
             .message_aggregator
             .aggregate_messages_for_group(
                 pubkey,
                 group_id,
                 new_events.clone(),
-                &self.content_parser,
+                &ContentParser::new(),
                 media_files,
             )
             .await?;
 
-        AggregatedMessage::save_events(new_events, processed_messages, group_id, &self.database)
-            .await?;
+        AggregatedMessage::save_events(
+            new_events,
+            processed_messages,
+            group_id,
+            &self.shared.database,
+        )
+        .await?;
 
         tracing::debug!(
             target: "whitenoise::cache",
@@ -649,7 +657,7 @@ mod tests {
         // compares total event count (MDK) vs cache count.
         // Cache only has kind 9 from proactive caching, sync fills in the rest.
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(
@@ -675,7 +683,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -716,7 +724,7 @@ mod tests {
 
         // Verify 2 messages already in cache (proactive caching)
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 2);
@@ -737,7 +745,7 @@ mod tests {
 
         // Verify 3 messages in cache
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 3);
@@ -747,7 +755,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -793,7 +801,7 @@ mod tests {
 
         // Cache already has 5 messages from proactive caching
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -803,7 +811,7 @@ mod tests {
 
         // Cache should still have 5 messages
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -813,7 +821,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -832,7 +840,7 @@ mod tests {
         whitenoise.sync_message_cache_on_startup().await.unwrap();
 
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 5);
@@ -1002,7 +1010,7 @@ mod tests {
 
         // Verify kind 9 was cached
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 1, "kind 9 message should be cached");
@@ -1032,7 +1040,7 @@ mod tests {
 
         // Cache count should be 2 (kind 9 + kind 7)
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(
@@ -1045,7 +1053,7 @@ mod tests {
             &chat_result.message.id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1092,7 +1100,7 @@ mod tests {
             &event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1194,7 +1202,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             &DeliveryStatus::Failed("simulated failure".to_string()),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1204,7 +1212,7 @@ mod tests {
             &original_event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1236,7 +1244,7 @@ mod tests {
             &original_event_id.to_string(),
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1254,7 +1262,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1329,7 +1337,7 @@ mod tests {
             &event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1356,9 +1364,9 @@ mod tests {
                 max_publish_attempts: 1,
                 ad_hoc_relay_ttl: std::time::Duration::from_secs(30),
             },
-            whitenoise.database.clone(),
+            whitenoise.shared.database.clone(),
             whitenoise.event_sender.clone(),
-            whitenoise.relay_control.observability().clone(),
+            whitenoise.shared.relay_control.observability().clone(),
         );
 
         ephemeral
@@ -1368,8 +1376,8 @@ mod tests {
                 &unreachable_relays,
                 &event_id,
                 &group.mls_group_id,
-                &whitenoise.database,
-                &whitenoise.message_stream_manager,
+                &whitenoise.shared.database,
+                &whitenoise.shared.message_stream_manager,
             )
             .await;
 
@@ -1378,7 +1386,7 @@ mod tests {
             &event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1450,7 +1458,7 @@ mod tests {
         );
 
         // Delete the cache to simulate stale state
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1502,11 +1510,11 @@ mod tests {
         assert!(!mdk_messages.is_empty());
 
         // Clear the cache entirely
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 0, "Cache should be empty after deletion");
@@ -1522,7 +1530,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1555,9 +1563,10 @@ mod tests {
             .await
             .unwrap();
 
-        let cached_count = AggregatedMessage::count_by_group(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let cached_count =
+            AggregatedMessage::count_by_group(&group_id, &whitenoise.shared.database)
+                .await
+                .unwrap();
         assert_eq!(cached_count, 0);
     }
 
@@ -1597,17 +1606,17 @@ mod tests {
 
         // Verify proactive cache has 4 messages
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 4);
 
         // Clear the cache to simulate a stale/corrupt state
-        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.database)
+        AggregatedMessage::delete_by_group(&group.mls_group_id, &whitenoise.shared.database)
             .await
             .unwrap();
         let cached_count =
-            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.database)
+            AggregatedMessage::count_by_group(&group.mls_group_id, &whitenoise.shared.database)
                 .await
                 .unwrap();
         assert_eq!(cached_count, 0, "Cache should be empty");
@@ -1620,7 +1629,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1693,7 +1702,7 @@ mod tests {
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1705,7 +1714,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1721,7 +1730,7 @@ mod tests {
             &del_event_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1777,7 +1786,7 @@ mod tests {
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1799,7 +1808,7 @@ mod tests {
             &creator.pubkey,
             "+",
             &group.mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -1809,7 +1818,7 @@ mod tests {
             &target_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -1870,7 +1879,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1889,7 +1898,7 @@ mod tests {
             &creator.pubkey,
             "",
             &group.mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -1899,7 +1908,7 @@ mod tests {
             &group.mls_group_id,
             &creator.pubkey,
             None,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -2005,7 +2014,7 @@ mod tests {
             &creator.pubkey,
             "",
             &group.mls_group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -2038,7 +2047,7 @@ mod tests {
             &author,
             "",
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -2099,7 +2108,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -2122,7 +2131,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -2192,7 +2201,7 @@ mod tests {
             &last_id,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap()
@@ -2211,7 +2220,7 @@ mod tests {
         let stream_manager = MessageStreamManager::new();
 
         // Close the pool to force DB errors on find_by_id
-        whitenoise.database.pool.close().await;
+        whitenoise.shared.database.pool.close().await;
 
         cascade_delivery_failure(
             7,
@@ -2220,7 +2229,7 @@ mod tests {
             &author,
             "+",
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;
@@ -2238,7 +2247,7 @@ mod tests {
         let stream_manager = MessageStreamManager::new();
 
         // Close the pool to force DB errors on unmark_deleted
-        whitenoise.database.pool.close().await;
+        whitenoise.shared.database.pool.close().await;
 
         cascade_delivery_failure(
             5,
@@ -2247,7 +2256,7 @@ mod tests {
             &Keys::generate().public_key(),
             "",
             &group_id,
-            &whitenoise.database,
+            &whitenoise.shared.database,
             &stream_manager,
         )
         .await;

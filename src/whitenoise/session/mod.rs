@@ -36,10 +36,8 @@ use crate::relay_control::groups::GroupSubscriptionSpec;
 use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
-use crate::whitenoise::database::Database;
 use crate::whitenoise::database::account::AccountRepositories;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::message_aggregator::AggregatorConfig;
 
 /// Signer slot shared between `AccountSession` and its relay handles.
 ///
@@ -74,11 +72,8 @@ impl AccountInboxState {
 pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
+    pub(crate) shared: Arc<crate::whitenoise::shared::SharedServices>,
     pub(crate) repos: AccountRepositories,
-    pub(crate) database: Arc<Database>,
-    pub(crate) message_stream_manager:
-        Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
-    pub(crate) aggregator_config: AggregatorConfig,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -96,28 +91,24 @@ impl AccountSession {
     pub(crate) async fn new(
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
-        database: Arc<Database>,
-        message_stream_manager: Arc<crate::whitenoise::message_streaming::MessageStreamManager>,
-        aggregator_config: AggregatorConfig,
+        shared: Arc<crate::whitenoise::shared::SharedServices>,
         signer: Option<Arc<dyn NostrSigner>>,
-        ephemeral_plane: crate::relay_control::ephemeral::EphemeralPlane,
-        relay_control: Arc<crate::relay_control::RelayControlPlane>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
         let signer: SharedSigner = Arc::new(RwLock::new(signer));
         let ephemeral = relay_handles::AccountEphemeralHandle::new(
             account_pubkey,
-            ephemeral_plane,
+            shared.relay_control.ephemeral(),
             signer.clone(),
         );
-        let group_handle = relay_handles::AccountGroupHandle::new(account_pubkey, relay_control);
+        let group_handle =
+            relay_handles::AccountGroupHandle::new(account_pubkey, shared.relay_control.clone());
+        let repos = AccountRepositories::new(account_pubkey, shared.database.clone()).await?;
         Ok(Self {
-            repos: AccountRepositories::new(account_pubkey, database.clone()).await?,
             account_pubkey,
             mdk: Arc::new(mdk),
-            database,
-            message_stream_manager,
-            aggregator_config,
+            shared,
+            repos,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
@@ -138,17 +129,7 @@ impl AccountSession {
         } else {
             None
         };
-        Self::new(
-            account.pubkey,
-            mdk,
-            wn.database.clone(),
-            wn.message_stream_manager.clone(),
-            wn.message_aggregator.config().clone(),
-            signer,
-            wn.relay_control.ephemeral(),
-            wn.relay_control.clone(),
-        )
-        .await
+        Self::new(account.pubkey, mdk, wn.shared.clone(), signer).await
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -158,9 +139,13 @@ impl AccountSession {
 
     /// Read the current signer, if any.
     ///
-    /// Uses `try_read` to avoid blocking on the rare concurrent `set_signer`
-    /// write. Returns `None` when the write lock is held; callers fall through
-    /// to the legacy signer lookup which produces the same result.
+    /// Returns `None` in two cases: when no signer is set, and when a
+    /// concurrent `set_signer` write momentarily holds the lock (we
+    /// `try_read` to avoid blocking). Callers must handle `None` on their own
+    /// — some fall back to the legacy signer lookup
+    /// (`Whitenoise::get_signer_for_account`), others treat it as
+    /// `SignerUnavailable` and drop the work (e.g. `handle_giftwrap`). See
+    /// issue #777 for the planned disambiguation.
     pub fn get_signer(&self) -> Option<Arc<dyn NostrSigner>> {
         self.signer.try_read().ok().and_then(|g| g.clone())
     }
@@ -253,7 +238,7 @@ impl AccountSession {
         self.pending_push_token_responses.insert(key, ());
 
         let mdk = Arc::clone(&self.mdk);
-        let database = Arc::clone(&self.database);
+        let database = Arc::clone(&self.shared.database);
         let pending = Arc::clone(&self.pending_push_token_responses);
         let relay_control = Arc::clone(self.group_handle.relay_control());
         let account_pubkey = self.account_pubkey;
@@ -518,8 +503,11 @@ impl AccountManager {
     ///
     /// External-signer accounts get `signer: None` until re-registered.
     /// Local accounts load their signer from the secrets store.
+    // TODO(phase-16b): drop `'static` once the Whitenoise singleton is gone —
+    // `AccountSession::from_account` still needs a static borrow because
+    // singleton-reaching methods are called from spawned tasks.
     pub async fn restore_sessions(&self, wn: &'static Whitenoise) {
-        let accounts = match Account::all(&wn.database).await {
+        let accounts = match Account::all(&wn.shared.database).await {
             Ok(accounts) => accounts,
             Err(e) => {
                 tracing::error!(
@@ -583,10 +571,13 @@ pub(crate) mod test_helpers {
 
     use super::*;
     use crate::relay_control::RelayControlPlane;
-    use crate::relay_control::ephemeral::{EphemeralPlane, EphemeralPlaneConfig};
-    use crate::relay_control::observability::{RelayObservability, RelayObservabilityConfig};
     use crate::whitenoise::accounts::test_utils::create_mdk;
     use crate::whitenoise::database::Database;
+    use crate::whitenoise::event_tracker::WhitenoiseEventTracker;
+    use crate::whitenoise::message_aggregator::MessageAggregator;
+    use crate::whitenoise::secrets_store::SecretsStore;
+    use crate::whitenoise::shared::SharedServices;
+    use crate::whitenoise::storage::Storage;
     use crate::whitenoise::test_utils::insert_test_account;
 
     pub async fn test_db() -> Arc<Database> {
@@ -612,35 +603,39 @@ pub(crate) mod test_helpers {
         // Insert the account row so AccountFollowsRepo can resolve the account id.
         insert_test_account(&db, &pubkey).await;
 
+        let shared = test_shared(db).await;
+        Arc::new(
+            AccountSession::new(pubkey, mdk, shared, None)
+                .await
+                .expect("create test session"),
+        )
+    }
+
+    /// Build a minimal `SharedServices` for tests.
+    ///
+    /// Diverges from `create_mock_whitenoise_internal` in one behavior: this
+    /// does not call `relay_control.start_telemetry_persistors()`. Tests built
+    /// on `test_shared` therefore do not exercise telemetry persistor paths.
+    pub async fn test_shared(db: Arc<Database>) -> Arc<SharedServices> {
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
-        let ephemeral = EphemeralPlane::new(
-            EphemeralPlaneConfig::default(),
-            db.clone(),
-            event_sender.clone(),
-            RelayObservability::new(RelayObservabilityConfig::default()),
-        );
         let relay_control = Arc::new(RelayControlPlane::new(
             db.clone(),
             vec![],
             event_sender,
             [0u8; 16],
         ));
-        let stream_manager =
-            Arc::new(crate::whitenoise::message_streaming::MessageStreamManager::default());
-        Arc::new(
-            AccountSession::new(
-                pubkey,
-                mdk,
-                db,
-                stream_manager,
-                AggregatorConfig::default(),
-                None,
-                ephemeral,
-                relay_control,
-            )
+        let event_tracker = Arc::new(WhitenoiseEventTracker::new(db.clone()));
+        let storage = Storage::new(std::env::temp_dir().as_path())
             .await
-            .expect("create test session"),
-        )
+            .expect("test storage");
+        Arc::new(SharedServices::new(
+            db,
+            relay_control,
+            event_tracker,
+            SecretsStore::new("com.whitenoise.test"),
+            storage,
+            MessageAggregator::new(),
+        ))
     }
 }
 

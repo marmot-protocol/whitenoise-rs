@@ -43,7 +43,8 @@ pub(super) async fn get_group_co_member_pubkeys(
     whitenoise: &Whitenoise,
     searcher_pubkey: &PublicKey,
 ) -> HashSet<PublicKey> {
-    let account = match Account::find_by_pubkey(searcher_pubkey, &whitenoise.database).await {
+    let account = match Account::find_by_pubkey(searcher_pubkey, &whitenoise.shared.database).await
+    {
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(
@@ -56,7 +57,9 @@ pub(super) async fn get_group_co_member_pubkeys(
     };
 
     let groups =
-        match AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.database).await {
+        match AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.shared.database)
+            .await
+        {
             Ok(g) => g,
             Err(e) => {
                 tracing::debug!(
@@ -102,7 +105,12 @@ pub(super) async fn get_group_co_member_pubkeys(
 /// Collect discovery relay URLs to use for user-search queries.
 #[perf_instrument("user_search")]
 async fn connected_relays(whitenoise: &Whitenoise) -> Vec<RelayUrl> {
-    whitenoise.relay_control.discovery().relays().to_vec()
+    whitenoise
+        .shared
+        .relay_control
+        .discovery()
+        .relays()
+        .to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +128,7 @@ pub(super) async fn check_user_table_metadata(
 ) -> (HashMap<PublicKey, Metadata>, Vec<PublicKey>) {
     let mut found: HashMap<PublicKey, Metadata> = HashMap::new();
 
-    let users = User::find_by_pubkeys(pubkeys, &whitenoise.database)
+    let users = User::find_by_pubkeys(pubkeys, &whitenoise.shared.database)
         .await
         .unwrap_or_default();
 
@@ -156,7 +164,7 @@ pub(super) async fn check_cache_metadata(
     let mut cached_pks: HashSet<PublicKey> = HashSet::new();
 
     if let Ok(cached_users) =
-        CachedGraphUser::find_fresh_metadata_batch(pubkeys, &whitenoise.database).await
+        CachedGraphUser::find_fresh_metadata_batch(pubkeys, &whitenoise.shared.database).await
     {
         for cached in &cached_users {
             if let Some(ref m) = cached.metadata {
@@ -197,6 +205,7 @@ pub(super) async fn try_fetch_network_metadata(
         .kinds([Kind::Metadata]);
 
     let events = whitenoise
+        .shared
         .relay_control
         .ephemeral()
         .fetch_events_from(&all_relays, filter)
@@ -231,7 +240,7 @@ pub(super) async fn try_fetch_network_metadata(
                 &pk,
                 &metadata,
                 CONFIDENT_CACHE_TTL_MS,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await;
             found.insert(pk, metadata);
@@ -263,6 +272,7 @@ pub(super) async fn try_fetch_relay_lists(
         .kinds([Kind::RelayList]);
 
     let events = whitenoise
+        .shared
         .relay_control
         .ephemeral()
         .fetch_events_from(&all_relays, filter)
@@ -324,6 +334,7 @@ pub(super) async fn try_fetch_user_relay_metadata(
     let filter = Filter::new().authors([*pubkey]).kinds([Kind::Metadata]);
 
     match whitenoise
+        .shared
         .relay_control
         .ephemeral()
         .fetch_events_from(relays, filter)
@@ -340,7 +351,7 @@ pub(super) async fn try_fetch_user_relay_metadata(
                     pubkey,
                     &metadata,
                     CONFIDENT_CACHE_TTL_MS,
-                    &whitenoise.database,
+                    &whitenoise.shared.database,
                 )
                 .await;
                 UserRelayResult::Found(Box::new(metadata))
@@ -405,8 +416,8 @@ pub(super) async fn check_cached_follows_batch(
 
     // 1. Check local accounts
     for pk in pubkeys {
-        if let Ok(account) = Account::find_by_pubkey(pk, &whitenoise.database).await
-            && let Ok(follows) = account.follows(&whitenoise.database).await
+        if let Ok(account) = Account::find_by_pubkey(pk, &whitenoise.shared.database).await
+            && let Ok(follows) = account.follows(&whitenoise.shared.database).await
         {
             results.insert(*pk, follows.into_iter().map(|u| u.pubkey).collect());
             remaining.remove(pk);
@@ -420,7 +431,7 @@ pub(super) async fn check_cached_follows_batch(
     // 2. Batch query cache (skip entries where follows is None — not yet fetched)
     let remaining_vec: Vec<PublicKey> = remaining.iter().copied().collect();
     if let Ok(cached_users) =
-        CachedGraphUser::find_fresh_follows_batch(&remaining_vec, &whitenoise.database).await
+        CachedGraphUser::find_fresh_follows_batch(&remaining_vec, &whitenoise.shared.database).await
     {
         for cached in cached_users {
             if let Some(follows) = cached.follows {
@@ -462,7 +473,8 @@ pub(super) async fn fetch_network_follows(
             .map(parse_follows_from_event)
             .unwrap_or_default();
 
-        let _ = CachedGraphUser::upsert_follows_only(pk, &follows, &whitenoise.database).await;
+        let _ =
+            CachedGraphUser::upsert_follows_only(pk, &follows, &whitenoise.shared.database).await;
         results.insert(*pk, follows);
     }
 
@@ -566,6 +578,7 @@ async fn fetch_events_with_retries(
         for chunk in &pending_chunks {
             let filter = Filter::new().authors(chunk.clone()).kinds([kind]);
             match whitenoise
+                .shared
                 .relay_control
                 .ephemeral()
                 .fetch_events_from(relays, filter)
@@ -652,14 +665,14 @@ mod tests {
             Some(Metadata::new()),
             Some(vec![follow1]),
         );
-        cached1.upsert(&whitenoise.database).await.unwrap();
+        cached1.upsert(&whitenoise.shared.database).await.unwrap();
 
         let cached2 = CachedGraphUser::new(
             keys2.public_key(),
             Some(Metadata::new()),
             Some(vec![follow2]),
         );
-        cached2.upsert(&whitenoise.database).await.unwrap();
+        cached2.upsert(&whitenoise.shared.database).await.unwrap();
 
         let result =
             get_follows_batch(&whitenoise, &[keys1.public_key(), keys2.public_key()]).await;
@@ -686,7 +699,7 @@ mod tests {
         let cached_follow = Keys::generate().public_key();
         let cached =
             CachedGraphUser::new(cached_pk, Some(Metadata::new()), Some(vec![cached_follow]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let result = get_follows_batch(&whitenoise, &[account.pubkey, cached_pk]).await;
 
@@ -720,7 +733,7 @@ mod tests {
         // Pre-populate cache
         let cached_pk = Keys::generate().public_key();
         let cached = CachedGraphUser::new(cached_pk, Some(Metadata::new()), Some(vec![]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let unknown_pk = Keys::generate().public_key();
 
@@ -753,7 +766,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let result = get_metadata_batch(&whitenoise, &[keys.public_key()]).await;
 
@@ -773,7 +786,7 @@ mod tests {
             Some(Metadata::new().name("Bob").about("From cache")),
             Some(vec![]),
         );
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let result = get_metadata_batch(&whitenoise, &[keys.public_key()]).await;
 
@@ -798,7 +811,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Cache has real metadata
         let cached = CachedGraphUser::new(
@@ -806,7 +819,7 @@ mod tests {
             Some(Metadata::new().name("Alice")),
             Some(vec![]),
         );
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let result = get_metadata_batch(&whitenoise, &[keys.public_key()]).await;
 
@@ -835,7 +848,7 @@ mod tests {
                 metadata_known_at: None,
                 updated_at: chrono::Utc::now(),
             };
-            user.save(&whitenoise.database).await.unwrap();
+            user.save(&whitenoise.shared.database).await.unwrap();
         }
 
         let result =
@@ -867,7 +880,7 @@ mod tests {
                 Some(Metadata::new().name(format!("User{}", i))),
                 Some(vec![]),
             );
-            cached.upsert(&whitenoise.database).await.unwrap();
+            cached.upsert(&whitenoise.shared.database).await.unwrap();
             pubkeys.push(keys.public_key());
         }
 
@@ -893,7 +906,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         // Cached user (tier 2)
         let cached_keys = Keys::generate();
@@ -902,7 +915,7 @@ mod tests {
             Some(Metadata::new().name("FromCache")),
             Some(vec![]),
         );
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let result = get_metadata_batch(
             &whitenoise,
@@ -929,7 +942,7 @@ mod tests {
 
         let pk = Keys::generate().public_key();
         let cached = CachedGraphUser::new(pk, Some(Metadata::new().name("CacheHit")), Some(vec![]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let (found, remaining) = check_cache_metadata(&whitenoise, &[pk]).await;
 
@@ -945,7 +958,7 @@ mod tests {
         let pk = Keys::generate().public_key();
         // Simulate confirmed-absent: Some(Metadata::new()) means "fetched, nothing there"
         let cached = CachedGraphUser::new(pk, Some(Metadata::new()), Some(vec![]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let (found, remaining) = check_cache_metadata(&whitenoise, &[pk]).await;
 
@@ -965,7 +978,7 @@ mod tests {
         let pk = Keys::generate().public_key();
         // metadata = None means "not yet fetched" — should forward to tier 3
         let cached = CachedGraphUser::new(pk, None, Some(vec![]));
-        cached.upsert(&whitenoise.database).await.unwrap();
+        cached.upsert(&whitenoise.shared.database).await.unwrap();
 
         let (found, remaining) = check_cache_metadata(&whitenoise, &[pk]).await;
 
@@ -1001,7 +1014,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let (found, remaining) = check_user_table_metadata(&whitenoise, &[pk]).await;
 
@@ -1022,7 +1035,7 @@ mod tests {
             metadata_known_at: None,
             updated_at: chrono::Utc::now(),
         };
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let (found, remaining) = check_user_table_metadata(&whitenoise, &[pk]).await;
 
@@ -1160,9 +1173,14 @@ mod tests {
 
         // Insert a pending group (user_confirmation = None)
         let group_id = mdk_core::prelude::GroupId::from_slice(&[1, 2, 3]);
-        AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-            .await
-            .unwrap();
+        AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         let result = get_group_co_member_pubkeys(&whitenoise, &account.pubkey).await;
 
@@ -1176,11 +1194,15 @@ mod tests {
 
         // Insert and decline a group
         let group_id = mdk_core::prelude::GroupId::from_slice(&[4, 5, 6]);
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-        ag.update_user_confirmation(false, &whitenoise.database)
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        ag.update_user_confirmation(false, &whitenoise.shared.database)
             .await
             .unwrap();
 
@@ -1197,11 +1219,15 @@ mod tests {
         // Insert and accept a group — group_members() will fail because
         // mock whitenoise has no MLS infrastructure, exercising the error branch
         let group_id = mdk_core::prelude::GroupId::from_slice(&[7, 8, 9]);
-        let (ag, _) =
-            AccountGroup::find_or_create(&account.pubkey, &group_id, None, &whitenoise.database)
-                .await
-                .unwrap();
-        ag.update_user_confirmation(true, &whitenoise.database)
+        let (ag, _) = AccountGroup::find_or_create(
+            &account.pubkey,
+            &group_id,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        ag.update_user_confirmation(true, &whitenoise.shared.database)
             .await
             .unwrap();
 

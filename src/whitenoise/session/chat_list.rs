@@ -74,7 +74,7 @@ impl<'a> ChatListOps<'a> {
         let account_group = AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await?;
         let Some(membership) = account_group else {
@@ -116,7 +116,7 @@ impl<'a> ChatListOps<'a> {
             let infos = GroupInformation::get_by_mls_group_ids_with_mdk(
                 &group_ids,
                 &self.session.mdk,
-                &self.session.database,
+                &self.session.shared.database,
             )
             .await?;
             infos
@@ -127,14 +127,14 @@ impl<'a> ChatListOps<'a> {
 
         let dm_other_users: HashMap<GroupId, PublicKey> = AccountGroup::find_dm_peers_for_account(
             &self.session.account_pubkey,
-            &self.session.database,
+            &self.session.shared.database,
         )
         .await?
         .into_iter()
         .collect();
 
         let last_message_map: HashMap<GroupId, ChatMessageSummary> =
-            AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.database)
+            AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.shared.database)
                 .await?
                 .into_iter()
                 .map(|s| (s.mls_group_id.clone(), s))
@@ -142,7 +142,7 @@ impl<'a> ChatListOps<'a> {
 
         let pubkeys_to_fetch = collect_pubkeys_to_fetch(&dm_other_users, &last_message_map);
         let users_by_pubkey: HashMap<PublicKey, User> =
-            User::find_by_pubkeys(&pubkeys_to_fetch, &self.session.database)
+            User::find_by_pubkeys(&pubkeys_to_fetch, &self.session.shared.database)
                 .await?
                 .into_iter()
                 .map(|u| (u.pubkey, u))
@@ -157,9 +157,11 @@ impl<'a> ChatListOps<'a> {
                 (gid.clone(), ag.last_read_message_id, cleared_ms)
             })
             .collect();
-        let unread_counts =
-            AggregatedMessage::count_unread_for_groups(&group_markers, &self.session.database)
-                .await?;
+        let unread_counts = AggregatedMessage::count_unread_for_groups(
+            &group_markers,
+            &self.session.shared.database,
+        )
+        .await?;
 
         let mut items = assemble_chat_list_items(
             &groups,
@@ -187,13 +189,15 @@ impl<'a> ChatListOps<'a> {
             Ok(wn) => wn,
             Err(_) => return HashMap::new(),
         };
-        let account =
-            match Account::find_by_pubkey(&self.session.account_pubkey, &self.session.database)
-                .await
-            {
-                Ok(account) => account,
-                Err(_) => return HashMap::new(),
-            };
+        let account = match Account::find_by_pubkey(
+            &self.session.account_pubkey,
+            &self.session.shared.database,
+        )
+        .await
+        {
+            Ok(account) => account,
+            Err(_) => return HashMap::new(),
+        };
 
         let group_type_groups: Vec<_> = groups
             .iter()

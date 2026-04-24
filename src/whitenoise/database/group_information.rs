@@ -186,7 +186,8 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let group_id = GroupId::from_slice(&[1; 32]);
 
-        let result = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database).await;
+        let result =
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -202,7 +203,7 @@ mod tests {
         let (group_info, was_created) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -222,7 +223,7 @@ mod tests {
         let (original_group_info, was_created) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::DirectMessage),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -232,7 +233,7 @@ mod tests {
         let (found_group_info, was_created) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::Group), // Different type, but should find existing
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -251,7 +252,7 @@ mod tests {
         let (group_info, was_created) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             None, // Should use default (Group)
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -264,7 +265,7 @@ mod tests {
     async fn test_find_by_mls_group_ids_empty_input() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let result = GroupInformation::find_by_mls_group_ids(&[], &whitenoise.database)
+        let result = GroupInformation::find_by_mls_group_ids(&[], &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -279,7 +280,7 @@ mod tests {
         let (created_group_info, _) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::DirectMessage),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -287,7 +288,7 @@ mod tests {
         // Find it in batch query
         let results = GroupInformation::find_by_mls_group_ids(
             std::slice::from_ref(&group_id),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -309,7 +310,7 @@ mod tests {
         let (group_info1, _) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id1,
             Some(GroupType::Group),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -317,7 +318,7 @@ mod tests {
         let (group_info2, _) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id2,
             Some(GroupType::DirectMessage),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -325,7 +326,7 @@ mod tests {
         // Query for all three (one missing)
         let results = GroupInformation::find_by_mls_group_ids(
             &[group_id1.clone(), group_id2.clone(), group_id3],
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -354,10 +355,12 @@ mod tests {
         let group_id1 = GroupId::from_slice(&[9; 32]);
         let group_id2 = GroupId::from_slice(&[10; 32]);
 
-        let results =
-            GroupInformation::find_by_mls_group_ids(&[group_id1, group_id2], &whitenoise.database)
-                .await
-                .unwrap();
+        let results = GroupInformation::find_by_mls_group_ids(
+            &[group_id1, group_id2],
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(results.is_empty());
     }
@@ -371,14 +374,15 @@ mod tests {
         let (dm_group_info, _) = GroupInformation::find_or_create_by_mls_group_id(
             &group_id,
             Some(GroupType::DirectMessage),
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
 
-        let found_dm = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database)
-            .await
-            .unwrap();
+        let found_dm =
+            GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database)
+                .await
+                .unwrap();
 
         assert_eq!(found_dm.group_type, GroupType::DirectMessage);
         assert_eq!(found_dm.id, dm_group_info.id);
@@ -400,11 +404,11 @@ mod tests {
         .bind("not_a_real_group_type")
         .bind(now_ms)
         .bind(now_ms)
-        .execute(&whitenoise.database.pool)
+        .execute(&whitenoise.shared.database.pool)
         .await
         .unwrap();
 
-        let err = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.database)
+        let err = GroupInformation::find_by_mls_group_id(&group_id, &whitenoise.shared.database)
             .await
             .unwrap_err();
 

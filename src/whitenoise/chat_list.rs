@@ -291,14 +291,17 @@ impl Whitenoise {
         };
 
         let group_info =
-            match GroupInformation::find_by_mls_group_id(group_id, &self.database).await {
+            match GroupInformation::find_by_mls_group_id(group_id, &self.shared.database).await {
                 Ok(info) => info,
                 Err(_) => return Ok(None),
             };
 
-        let account_group =
-            AccountGroup::find_by_account_and_group(&account.pubkey, group_id, &self.database)
-                .await?;
+        let account_group = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            group_id,
+            &self.shared.database,
+        )
+        .await?;
         let Some(account_group) = account_group else {
             return Ok(None);
         };
@@ -311,7 +314,7 @@ impl Whitenoise {
             let other_pk = members.iter().find(|pk| *pk != &account.pubkey).copied();
             match other_pk {
                 Some(pk) => {
-                    let user = User::find_by_pubkey(&pk, &self.database).await.ok();
+                    let user = User::find_by_pubkey(&pk, &self.shared.database).await.ok();
                     (Some(pk), user)
                 }
                 None => (None, None),
@@ -322,7 +325,7 @@ impl Whitenoise {
 
         let last_message_summary = AggregatedMessage::find_last_by_group_ids(
             std::slice::from_ref(group_id),
-            &self.database,
+            &self.shared.database,
         )
         .await?
         .into_iter()
@@ -330,7 +333,7 @@ impl Whitenoise {
         .filter(|s| account_group.is_message_visible(s.created_at));
 
         let last_message = if let Some(mut summary) = last_message_summary {
-            let author_user = User::find_by_pubkey(&summary.author, &self.database)
+            let author_user = User::find_by_pubkey(&summary.author, &self.shared.database)
                 .await
                 .ok();
             summary.author_display_name = resolve_display_name(author_user.as_ref());
@@ -363,7 +366,7 @@ impl Whitenoise {
         let unread_count = AggregatedMessage::count_unread_for_group(
             group_id,
             account_group.last_read_message_id.as_ref(),
-            &self.database,
+            &self.shared.database,
             cleared_ms,
         )
         .await?;
@@ -400,9 +403,11 @@ impl Whitenoise {
         trigger: ChatListUpdateTrigger,
     ) {
         let has_active = self
+            .shared
             .chat_list_stream_manager
             .has_subscribers(&account.pubkey);
         let has_archived = self
+            .shared
             .archived_chat_list_stream_manager
             .has_subscribers(&account.pubkey);
 
@@ -430,24 +435,27 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let account_groups = match AccountGroup::find_by_group(group_id, &self.database).await {
-            Ok(groups) => groups,
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::chat_list_streaming",
-                    "Failed to find accounts in group {}: {}",
-                    hex::encode(group_id.as_slice()),
-                    e
-                );
-                return;
-            }
-        };
+        let account_groups =
+            match AccountGroup::find_by_group(group_id, &self.shared.database).await {
+                Ok(groups) => groups,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::chat_list_streaming",
+                        "Failed to find accounts in group {}: {}",
+                        hex::encode(group_id.as_slice()),
+                        e
+                    );
+                    return;
+                }
+            };
 
         for ag in account_groups {
             let has_active = self
+                .shared
                 .chat_list_stream_manager
                 .has_subscribers(&ag.account_pubkey);
             let has_archived = self
+                .shared
                 .archived_chat_list_stream_manager
                 .has_subscribers(&ag.account_pubkey);
 
@@ -470,7 +478,7 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let account = match Account::find_by_pubkey(pubkey, &self.database).await {
+        let account = match Account::find_by_pubkey(pubkey, &self.shared.database).await {
             Ok(acc) => acc,
             Err(e) => {
                 tracing::warn!(
@@ -483,8 +491,9 @@ impl Whitenoise {
             }
         };
 
-        let has_active = self.chat_list_stream_manager.has_subscribers(pubkey);
+        let has_active = self.shared.chat_list_stream_manager.has_subscribers(pubkey);
         let has_archived = self
+            .shared
             .archived_chat_list_stream_manager
             .has_subscribers(pubkey);
 
@@ -496,10 +505,14 @@ impl Whitenoise {
                     | ChatListUpdateTrigger::ChatDeleted => {
                         // Item is moving between lists or being removed — notify both channels
                         if has_active {
-                            self.chat_list_stream_manager.emit(pubkey, update.clone());
+                            self.shared
+                                .chat_list_stream_manager
+                                .emit(pubkey, update.clone());
                         }
                         if has_archived {
-                            self.archived_chat_list_stream_manager.emit(pubkey, update);
+                            self.shared
+                                .archived_chat_list_stream_manager
+                                .emit(pubkey, update);
                         }
                     }
                     ChatListUpdateTrigger::RemovedFromGroup | ChatListUpdateTrigger::LeftGroup => {
@@ -507,20 +520,24 @@ impl Whitenoise {
                         // archived, in which case the update must reach the archived stream.
                         if update.item.archived_at.is_some() {
                             if has_archived {
-                                self.archived_chat_list_stream_manager.emit(pubkey, update);
+                                self.shared
+                                    .archived_chat_list_stream_manager
+                                    .emit(pubkey, update);
                             }
                         } else if has_active {
-                            self.chat_list_stream_manager.emit(pubkey, update);
+                            self.shared.chat_list_stream_manager.emit(pubkey, update);
                         }
                     }
                     _ => {
                         // Route to the channel matching the item's archive status
                         if update.item.archived_at.is_some() {
                             if has_archived {
-                                self.archived_chat_list_stream_manager.emit(pubkey, update);
+                                self.shared
+                                    .archived_chat_list_stream_manager
+                                    .emit(pubkey, update);
                             }
                         } else if has_active {
-                            self.chat_list_stream_manager.emit(pubkey, update);
+                            self.shared.chat_list_stream_manager.emit(pubkey, update);
                         }
                     }
                 }
@@ -641,11 +658,11 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut member_user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut member_user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         member_user.metadata = Metadata::new();
-        member_user.save(&whitenoise.database).await.unwrap();
+        member_user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -679,11 +696,11 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = Metadata::new().display_name("Bob Display").name("Bob Name");
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -713,11 +730,11 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = Metadata::new().name("Bob Name");
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -746,13 +763,13 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         let mut metadata = Metadata::new().name("Fallback Name");
         metadata.display_name = Some(String::new());
         user.metadata = metadata;
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -898,7 +915,7 @@ mod tests {
             &msg1,
             &group1.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -922,7 +939,7 @@ mod tests {
             &msg2,
             &group2.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -987,13 +1004,13 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = user
             .metadata
             .picture(nostr_sdk::Url::parse("https://example.com/pic.jpg").unwrap());
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -1054,11 +1071,11 @@ mod tests {
         let creator = whitenoise.create_identity().await.unwrap();
         let member = whitenoise.create_identity().await.unwrap();
 
-        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = user.metadata.display_name("Alice");
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
@@ -1091,7 +1108,7 @@ mod tests {
             &msg,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1158,7 +1175,7 @@ mod tests {
             &msg,
             &group1.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1221,11 +1238,11 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         // Set author display name
-        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&creator.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = user.metadata.display_name("Alice");
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let config = create_nostr_group_config_data(vec![creator.pubkey]);
         let group = whitenoise
@@ -1252,7 +1269,7 @@ mod tests {
             &msg,
             &group.mls_group_id,
             &creator.pubkey,
-            &whitenoise.database,
+            &whitenoise.shared.database,
         )
         .await
         .unwrap();
@@ -1277,11 +1294,11 @@ mod tests {
         let member = whitenoise.create_identity().await.unwrap();
 
         // Set other user's display name
-        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.database)
+        let mut user = User::find_by_pubkey(&member.pubkey, &whitenoise.shared.database)
             .await
             .unwrap();
         user.metadata = Metadata::new().display_name("Bob");
-        user.save(&whitenoise.database).await.unwrap();
+        user.save(&whitenoise.shared.database).await.unwrap();
 
         let mut config = create_nostr_group_config_data(vec![creator.pubkey, member.pubkey]);
         config.name = String::new();
@@ -1549,7 +1566,7 @@ mod tests {
                 &msg,
                 &group.mls_group_id,
                 &creator.pubkey,
-                &whitenoise.database,
+                &whitenoise.shared.database,
             )
             .await
             .unwrap();
@@ -2052,9 +2069,11 @@ mod tests {
 
         // Subscribe to both channels
         let mut active_rx = whitenoise
+            .shared
             .chat_list_stream_manager
             .subscribe(&creator.pubkey);
         let mut archived_rx = whitenoise
+            .shared
             .archived_chat_list_stream_manager
             .subscribe(&creator.pubkey);
 
