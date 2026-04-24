@@ -270,24 +270,14 @@ impl Whitenoise {
 
         // Background welcome publishing
         let creator_account_clone = creator_account.clone();
+        let whitenoise = self.arc()?;
         tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(error) => {
-                    tracing::error!(
-                        target: "whitenoise::groups",
-                        "Failed to get Whitenoise instance for background welcome publishing: {}",
-                        error
-                    );
-                    return;
-                }
-            };
-
             let futures = welcome_data
                 .into_iter()
                 .map(|(rumor, member, member_pubkey)| {
                     let signer: Arc<dyn NostrSigner> = signer.clone();
                     let creator = &creator_account_clone;
+                    let whitenoise = &whitenoise;
                     async move {
                         let relays_to_use = whitenoise
                             .resolve_member_delivery_relays(

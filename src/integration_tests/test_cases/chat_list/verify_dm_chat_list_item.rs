@@ -62,7 +62,7 @@ impl TestCase for VerifyDmChatListItemTestCase {
         );
 
         // Verify the DM name comes from the other user's metadata (if set)
-        let other_user_metadata = other_user_account.metadata(context.whitenoise).await?;
+        let other_user_metadata = other_user_account.metadata(&context.whitenoise).await?;
         let expected_name = other_user_metadata
             .display_name
             .filter(|s| !s.is_empty())

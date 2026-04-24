@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{core::*, test_cases::app_settings::*};
 use crate::whitenoise::app_settings::Language;
 use crate::{ThemeMode, Whitenoise, WhitenoiseError};
@@ -8,7 +10,7 @@ pub struct AppSettingsScenario {
 }
 
 impl AppSettingsScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

@@ -310,19 +310,6 @@ impl<'a> MessageOpsForGroup<'a> {
         let author = mdk_message.pubkey;
         let content = mdk_message.content.clone();
 
-        // TODO: Push config should live on AccountSession instead of reaching
-        // back to the singleton. Tracked for Phase 16b.
-        let push_config = match crate::whitenoise::Whitenoise::get_instance() {
-            Ok(wn) => Some(wn.config.clone()),
-            Err(_) => {
-                tracing::debug!(
-                    target: "whitenoise::messages",
-                    "Whitenoise singleton unavailable, push notifications skipped"
-                );
-                None
-            }
-        };
-
         tokio::spawn(async move {
             let ok = ephemeral
                 .publish_message_event(
@@ -338,17 +325,16 @@ impl<'a> MessageOpsForGroup<'a> {
                 .succeeded();
 
             if ok {
-                if let Some(config) = &push_config
-                    && let Err(e) = publish_notification_requests_after_delivery_with(
-                        config,
-                        &shared.database,
-                        &shared.relay_control,
-                        &shared.event_tracker,
-                        &ephemeral,
-                        account_pubkey,
-                        &group_id,
-                    )
-                    .await
+                if let Err(e) = publish_notification_requests_after_delivery_with(
+                    &shared.config,
+                    &shared.database,
+                    &shared.relay_control,
+                    &shared.event_tracker,
+                    &ephemeral,
+                    account_pubkey,
+                    &group_id,
+                )
+                .await
                 {
                     tracing::warn!(
                         target: "whitenoise::push_notifications",

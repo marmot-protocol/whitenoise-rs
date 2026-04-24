@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -81,9 +83,9 @@ impl BenchmarkScenario for UserSearchBenchmark {
     #[allow(deprecated)]
     async fn run_benchmark(
         &mut self,
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<BenchmarkResult, WhitenoiseError> {
-        let mut context = ScenarioContext::new(whitenoise);
+        let mut context = ScenarioContext::new(whitenoise.clone());
 
         tracing::info!("Setting up benchmark: {}", self.name());
         self.setup(&mut context).await?;
@@ -113,7 +115,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             // === Cold search (no cache) ===
             tracing::info!("=== Cold search: '{}' ===", query);
             let cold =
-                run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
+                run_search_timed(&whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
 
             log_timings("Cold", query, &cold);
             all_timings.push(cold.time_to_target.unwrap_or(cold.time_to_complete));
@@ -121,7 +123,7 @@ impl BenchmarkScenario for UserSearchBenchmark {
             // === Warm search (cache populated from cold run) ===
             tracing::info!("=== Warm search: '{}' ===", query);
             let warm =
-                run_search_timed(whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
+                run_search_timed(&whitenoise, query, searcher_pubkey, 0, 2, &expected_pk).await?;
 
             log_timings("Warm", query, &warm);
             all_timings.push(warm.time_to_target.unwrap_or(warm.time_to_complete));

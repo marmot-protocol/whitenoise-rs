@@ -198,7 +198,7 @@ src/integration_tests/
    }
 
    impl YourScenario {
-       pub fn new(whitenoise: &'static Whitenoise) -> Self {
+       pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
            Self {
                context: ScenarioContext::new(whitenoise),
            }
@@ -237,7 +237,7 @@ src/integration_tests/
    ```rust
    // In registry.rs
    impl ScenarioRegistry {
-       pub async fn run_all_scenarios(whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+       pub async fn run_all_scenarios(whitenoise: Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
            // ... existing scenarios ...
            run_scenario!(YourScenario);
 
@@ -304,7 +304,7 @@ pub trait BenchmarkScenario {
     async fn single_iteration(&self, context: &mut ScenarioContext) -> Result<Duration, WhitenoiseError>;
 
     // Default implementation handles all orchestration:
-    async fn run_benchmark(&mut self, whitenoise: &'static Whitenoise) -> Result<BenchmarkResult, WhitenoiseError> {
+    async fn run_benchmark(&mut self, whitenoise: Arc<Whitenoise>) -> Result<BenchmarkResult, WhitenoiseError> {
         // Warmup + benchmark loops + statistics calculation
         // No need to override unless you need custom orchestration
     }

@@ -70,7 +70,7 @@ struct Args {
     ///
     /// `--login` writes the MDK key to `<data-dir>/benchmark_keyring.txt`.
     /// Passing `--seed-nsec <NSEC>` reads that sidecar and injects the key
-    /// back into the mock keyring before `initialize_whitenoise` is called.
+    /// back into the mock keyring before `Whitenoise::new` is called.
     /// The nsec is required so the Nostr private key is also re-seeded (some
     /// startup paths read the account keys from the keyring).
     #[clap(long, value_name = "NSEC")]
@@ -197,7 +197,7 @@ fn save_keyring_sidecar(
 /// Restores keyring entries from the sidecar file written by `save_keyring_sidecar`,
 /// and also re-seeds the Nostr private key.
 ///
-/// Must be called BEFORE `Whitenoise::initialize_whitenoise` so that the MDK
+/// Must be called BEFORE `Whitenoise::new` so that the MDK
 /// DB encryption key is present when `MdkSqliteStorage::new` tries to open the
 /// existing database.
 fn restore_keyring_sidecar(data_dir: &std::path::Path, nsec: &str) -> Result<(), WhitenoiseError> {
@@ -266,19 +266,21 @@ async fn main() -> Result<(), WhitenoiseError> {
 
     // Warm-init runs: restore MDK DB encryption key from the sidecar written by
     // the preceding --login run, and re-seed the Nostr private key. Both must be
-    // in the mock keyring BEFORE initialize_whitenoise opens the encrypted MLS DB.
+    // in the mock keyring BEFORE Whitenoise::new opens the encrypted MLS DB.
     if let Some(ref nsec) = args.seed_nsec {
         restore_keyring_sidecar(&args.data_dir, nsec)?;
     }
 
     let config = WhitenoiseConfig::new(&args.data_dir, &args.logs_dir, KEYRING_SERVICE);
-    if let Err(err) = Whitenoise::initialize_whitenoise(config).await {
-        tracing::error!("Failed to initialize Whitenoise: {}", err);
-        std::process::exit(1);
-    }
+    let whitenoise = match Whitenoise::new(config).await {
+        Ok(wn) => wn,
+        Err(err) => {
+            tracing::error!("Failed to initialize Whitenoise: {}", err);
+            std::process::exit(1);
+        }
+    };
 
     if let Some(ref nsec) = args.login {
-        let whitenoise = Whitenoise::get_instance()?;
         let account = whitenoise.login(nsec.clone()).await?;
         tracing::info!("Logged in as {}", account.pubkey.to_hex());
 
@@ -308,8 +310,6 @@ async fn main() -> Result<(), WhitenoiseError> {
     if args.init_only {
         return Ok(());
     }
-
-    let whitenoise = Whitenoise::get_instance()?;
 
     let results = match args.scenario {
         Some(ref scenario_name) => {

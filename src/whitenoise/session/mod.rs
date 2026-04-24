@@ -20,7 +20,7 @@ pub use self::push::PushOps;
 pub use self::settings::SettingsOps;
 pub use self::social::SocialOps;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
 use mdk_core::prelude::{GroupId, MDK};
@@ -74,6 +74,12 @@ pub struct AccountSession {
     pub account_pubkey: PublicKey,
     pub mdk: Arc<MDK<MdkSqliteStorage>>,
     pub(crate) shared: Arc<crate::whitenoise::shared::SharedServices>,
+    /// Weak back-reference to the owning `Whitenoise`. Held weakly to avoid a
+    /// reference cycle (`Whitenoise` → `AccountManager` → `AccountSession`).
+    /// Upgrade via [`AccountSession::whitenoise`] when a method still needs a
+    /// `Whitenoise`-level helper that has not yet migrated down to session or
+    /// `SharedServices` scope.
+    pub(crate) whitenoise: Weak<Whitenoise>,
     pub(crate) repos: AccountRepositories,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
@@ -93,6 +99,7 @@ impl AccountSession {
         account_pubkey: PublicKey,
         mdk: MDK<MdkSqliteStorage>,
         shared: Arc<crate::whitenoise::shared::SharedServices>,
+        whitenoise: Weak<Whitenoise>,
         signer: Option<Arc<dyn NostrSigner>>,
     ) -> Result<Self> {
         let (cancellation, _) = watch::channel(false);
@@ -109,6 +116,7 @@ impl AccountSession {
             account_pubkey,
             mdk: Arc::new(mdk),
             shared,
+            whitenoise,
             repos,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
@@ -123,14 +131,29 @@ impl AccountSession {
 
     /// Build a session from a persisted account, loading MDK and (for local
     /// accounts) the signer from the secrets store.
-    pub(crate) async fn from_account(account: &Account, wn: &Whitenoise) -> Result<Self> {
+    pub(crate) async fn from_account(account: &Account, wn: &Arc<Whitenoise>) -> Result<Self> {
         let mdk = wn.create_mdk_for_account(account.pubkey)?;
         let signer = if account.has_local_key() {
             Some(wn.get_signer_for_account(account)?)
         } else {
             None
         };
-        Self::new(account.pubkey, mdk, wn.shared.clone(), signer).await
+        Self::new(
+            account.pubkey,
+            mdk,
+            wn.shared.clone(),
+            Arc::downgrade(wn),
+            signer,
+        )
+        .await
+    }
+
+    /// Upgrade the back-reference to the owning `Whitenoise`. Returns
+    /// [`WhitenoiseError::Initialization`] if the owner has been dropped.
+    pub(crate) fn whitenoise(&self) -> Result<Arc<Whitenoise>> {
+        self.whitenoise
+            .upgrade()
+            .ok_or(WhitenoiseError::Initialization)
     }
 
     /// Replace the signer slot (e.g. when an external signer is re-registered).
@@ -509,10 +532,7 @@ impl AccountManager {
     ///
     /// External-signer accounts get `signer: None` until re-registered.
     /// Local accounts load their signer from the secrets store.
-    // TODO(phase-16b): drop `'static` once the Whitenoise singleton is gone —
-    // `AccountSession::from_account` still needs a static borrow because
-    // singleton-reaching methods are called from spawned tasks.
-    pub async fn restore_sessions(&self, wn: &'static Whitenoise) {
+    pub async fn restore_sessions(&self, wn: &Arc<Whitenoise>) {
         let accounts = match Account::all(&wn.shared.database).await {
             Ok(accounts) => accounts,
             Err(e) => {
@@ -611,7 +631,7 @@ pub(crate) mod test_helpers {
 
         let shared = test_shared(db).await;
         Arc::new(
-            AccountSession::new(pubkey, mdk, shared, None)
+            AccountSession::new(pubkey, mdk, shared, Weak::new(), None)
                 .await
                 .expect("create test session"),
         )
@@ -634,7 +654,13 @@ pub(crate) mod test_helpers {
         let storage = Storage::new(std::env::temp_dir().as_path())
             .await
             .expect("test storage");
+        let config = Arc::new(crate::whitenoise::WhitenoiseConfig::new(
+            std::env::temp_dir().as_path(),
+            std::env::temp_dir().as_path(),
+            "com.whitenoise.test",
+        ));
         Arc::new(SharedServices::new(
+            config,
             db,
             relay_control,
             event_tracker,

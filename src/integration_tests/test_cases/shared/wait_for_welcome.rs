@@ -34,7 +34,7 @@ impl TestCase for WaitForWelcomeTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
         let group_id = group.mls_group_id.clone();
-        let wn = context.whitenoise;
+        let wn = &context.whitenoise;
 
         for account_name in &self.account_names {
             let account = context.get_account(account_name)?;

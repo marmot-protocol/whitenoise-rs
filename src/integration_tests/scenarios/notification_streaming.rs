@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{chat_list::CreateDmTestCase, notification_streaming::*, shared::*},
@@ -35,7 +37,7 @@ impl NotificationStreamingScenario {
     const GROUP_NAME: &'static str = "notif_stream_group";
     const DM_NAME: &'static str = "notif_dm";
 
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

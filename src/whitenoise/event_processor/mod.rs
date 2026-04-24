@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nostr_sdk::prelude::*;
 use tokio::sync::mpsc::Receiver;
 
@@ -19,7 +21,7 @@ mod global_event_processor;
 impl Whitenoise {
     /// Start the event processing loop in a background task
     pub(crate) async fn start_event_processing_loop(
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
         receiver: Receiver<ProcessableEvent>,
         shutdown_receiver: Receiver<()>,
     ) {
@@ -38,7 +40,7 @@ impl Whitenoise {
 
     /// Main event processing loop
     async fn process_events(
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
         mut receiver: Receiver<ProcessableEvent>,
         mut shutdown: Receiver<()>,
     ) {

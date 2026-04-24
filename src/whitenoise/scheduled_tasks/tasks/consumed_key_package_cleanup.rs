@@ -41,7 +41,7 @@ impl Task for ConsumedKeyPackageCleanup {
     }
 
     #[perf_instrument("scheduled::consumed_kp_cleanup")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::consumed_key_package_cleanup",
             "Starting consumed key package cleanup"
@@ -58,10 +58,13 @@ impl Task for ConsumedKeyPackageCleanup {
         }
 
         let cleanup_results: Vec<(String, Result<usize, WhitenoiseError>)> = stream::iter(accounts)
-            .map(|account| async move {
-                let pubkey_hex = account.pubkey.to_hex();
-                let result = cleanup_consumed_key_packages(whitenoise, &account).await;
-                (pubkey_hex, result)
+            .map(|account| {
+                let whitenoise = whitenoise.clone();
+                async move {
+                    let pubkey_hex = account.pubkey.to_hex();
+                    let result = cleanup_consumed_key_packages(&whitenoise, &account).await;
+                    (pubkey_hex, result)
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
@@ -193,10 +196,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_no_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let task = ConsumedKeyPackageCleanup;
-        let result = task.execute(whitenoise).await;
+        let result = task.execute(whitenoise.clone()).await;
 
         assert!(result.is_ok());
     }

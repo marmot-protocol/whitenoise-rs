@@ -95,7 +95,7 @@ impl TestCase for KeyPackageLifecycleTestCase {
         // Poll the DB until consumed_at is set.
         let member_pubkey = member.pubkey;
         let kp_event_id_clone = kp_event_id.clone();
-        let wn = context.whitenoise;
+        let wn = &context.whitenoise;
 
         retry_default(
             || {
@@ -133,7 +133,7 @@ impl TestCase for KeyPackageLifecycleTestCase {
 
         // Run the cleanup task
         let task = ConsumedKeyPackageCleanup;
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         // Verify key_material_deleted is now set
         let after_cleanup = context

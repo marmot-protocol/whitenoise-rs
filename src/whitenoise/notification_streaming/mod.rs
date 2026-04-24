@@ -154,26 +154,23 @@ impl Whitenoise {
     ///
     /// The caller is not blocked; settings are checked inside the spawned task.
     pub(crate) fn spawn_new_message_notification_if_enabled(
+        &self,
         account: &Account,
         group_id: &GroupId,
         message: &ChatMessage,
         group_name: Option<String>,
     ) {
+        let Ok(whitenoise) = self.arc() else {
+            tracing::error!(
+                target: "whitenoise::notification_streaming",
+                "Whitenoise instance unavailable for notification"
+            );
+            return;
+        };
         let account = account.clone();
         let group_id = group_id.clone();
         let message = message.clone();
         tokio::spawn(async move {
-            let whitenoise = match Self::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::notification_streaming",
-                        "Failed to get Whitenoise instance for notification: {}",
-                        e
-                    );
-                    return;
-                }
-            };
             whitenoise
                 .emit_new_message_notification_if_enabled(&account, &group_id, &message, group_name)
                 .await;

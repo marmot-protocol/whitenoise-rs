@@ -35,19 +35,6 @@ impl<'a> GroupOps<'a> {
         Self { session }
     }
 
-    // ── Singleton bridge ──────────────────────────────────────────────
-
-    /// Obtain a `&'static Whitenoise` reference via the global singleton.
-    ///
-    /// Several mutation methods need access to relay control, user relay
-    /// lookups, and account-group records that still live on `Whitenoise`.
-    /// This bridge keeps the session API functional while ownership migrates.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
-    fn wn() -> Result<&'static Whitenoise> {
-        Whitenoise::get_instance()
-            .map_err(|_| WhitenoiseError::Internal("Whitenoise singleton unavailable".to_string()))
-    }
-
     // ── Read operations ───────────────────────────────────────────────
 
     /// Return all groups for this account.
@@ -219,7 +206,7 @@ impl<'a> GroupOps<'a> {
         group_id: &GroupId,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
         if let Err(publish_err) = wn
             .publish_event_with_retry(evolution_event, &self.session.account_pubkey, relay_urls)
             .await
@@ -252,7 +239,7 @@ impl<'a> GroupOps<'a> {
     ) -> Result<()> {
         self.ensure_admin(group_id)?;
 
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
         let signer = self
             .session
             .get_signer()
@@ -269,7 +256,7 @@ impl<'a> GroupOps<'a> {
             let (user, newly_created) =
                 User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
 
-            if newly_created && let Err(e) = user.update_relay_lists(wn).await {
+            if newly_created && let Err(e) = user.update_relay_lists(&wn).await {
                 tracing::warn!(
                     target: "whitenoise::session::groups",
                     "Failed to update relay lists for new user {}: {}",
@@ -287,7 +274,7 @@ impl<'a> GroupOps<'a> {
                     "User {} has no relays configured, using account's default relays",
                     user.pubkey
                 );
-                relays_to_use = account.nip65_relays(wn).await?;
+                relays_to_use = account.nip65_relays(&wn).await?;
             }
             let relays_to_use_urls = Relay::urls(&relays_to_use);
             let some_event = wn
@@ -410,7 +397,7 @@ impl<'a> GroupOps<'a> {
         self.publish_and_merge_commit(update_result.evolution_event, group_id, &relay_urls)
             .await?;
 
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
         let account =
             Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
         wn.background_refresh_account_group_subscriptions(&account);
@@ -440,9 +427,9 @@ impl<'a> GroupOps<'a> {
     // TODO(phase-16): Remove singleton bridge when mark_as_left moves to session.
     #[allow(deprecated)] // wn.mark_as_left() deprecated in Phase 12
     pub async fn leave(&self, group_id: &GroupId) -> Result<()> {
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
 
-        let account_group = AccountGroup::get(wn, &self.session.account_pubkey, group_id)
+        let account_group = AccountGroup::get(&wn, &self.session.account_pubkey, group_id)
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)?;
 
@@ -491,7 +478,7 @@ impl<'a> GroupOps<'a> {
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
         let signer = self
             .session
             .get_signer()
@@ -538,7 +525,13 @@ impl<'a> GroupOps<'a> {
         self.finalize_group_records(&group, &member_pubkeys, group_type, &group_name)
             .await?;
 
-        Self::publish_welcomes(welcome_data, signer, self.session.account_pubkey).await;
+        Self::publish_welcomes(
+            wn.clone(),
+            welcome_data,
+            signer,
+            self.session.account_pubkey,
+        )
+        .await;
 
         let account =
             Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
@@ -552,9 +545,9 @@ impl<'a> GroupOps<'a> {
     /// package.
     // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
-        let wn = Self::wn()?;
+        let wn = self.session.whitenoise()?;
         let (user, created) = User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
-        if created && let Err(e) = user.update_relay_lists(wn).await {
+        if created && let Err(e) = user.update_relay_lists(&wn).await {
             tracing::warn!(
                 target: "whitenoise::session::groups",
                 "Failed to update relay lists for new user {}: {}",
@@ -563,7 +556,7 @@ impl<'a> GroupOps<'a> {
             );
         }
 
-        let some_event = user.key_package_event(wn).await?;
+        let some_event = user.key_package_event(&wn).await?;
         let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
             mdk_core::Error::KeyPackage("Does not exist".to_owned()),
         ))?;
@@ -682,24 +675,12 @@ impl<'a> GroupOps<'a> {
     ///
     /// The caller is responsible for deciding whether to `tokio::spawn` this for
     /// fire-and-forget behaviour. The view itself does not spawn.
-    // TODO(phase-16): Replace singleton bridge with session-owned relay_control.
     async fn publish_welcomes(
+        whitenoise: Arc<Whitenoise>,
         welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
         signer: Arc<dyn NostrSigner>,
         creator_pubkey: PublicKey,
     ) {
-        let whitenoise = match Whitenoise::get_instance() {
-            Ok(wn) => wn,
-            Err(error) => {
-                tracing::error!(
-                    target: "whitenoise::session::groups",
-                    "Failed to get Whitenoise instance for welcome publishing: {}",
-                    error
-                );
-                return;
-            }
-        };
-
         let creator_account =
             match Account::find_by_pubkey(&creator_pubkey, &whitenoise.shared.database).await {
                 Ok(account) => account,
@@ -718,6 +699,7 @@ impl<'a> GroupOps<'a> {
             .map(|(rumor, member, member_pubkey)| {
                 let signer = signer.clone();
                 let creator = &creator_account;
+                let whitenoise = &whitenoise;
                 async move {
                     let relays_to_use = whitenoise
                         .resolve_member_delivery_relays(

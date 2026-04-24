@@ -67,20 +67,16 @@ impl Whitenoise {
         let event_pubkey = event.pubkey;
         let tid = crate::perf::current_trace_id();
 
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(instance) => instance,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::handle_relay_list",
-                        "Failed to get Whitenoise instance for relay list refresh {}: {}",
-                        event_pubkey,
-                        error
-                    );
-                    return;
-                }
-            };
+        let Ok(whitenoise) = self.arc() else {
+            tracing::warn!(
+                target: "whitenoise::handle_relay_list",
+                "Whitenoise instance unavailable for relay list refresh {}",
+                event_pubkey
+            );
+            return;
+        };
 
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             let account =
                 match Account::find_by_pubkey(&user_pubkey, &whitenoise.shared.database).await {
                     Ok(account) => Some(account),

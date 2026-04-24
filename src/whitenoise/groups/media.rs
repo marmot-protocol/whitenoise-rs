@@ -55,24 +55,20 @@ impl Whitenoise {
     /// * `group_id` - The MLS group ID
     #[allow(deprecated)]
     pub(crate) fn background_sync_group_image_cache_if_needed(
+        &self,
         account: &Account,
         group_id: &GroupId,
     ) {
+        let Ok(whitenoise) = self.arc() else {
+            tracing::error!(
+                target: "whitenoise::groups::background_sync_group_image_cache_if_needed",
+                "Whitenoise instance unavailable for background image cache"
+            );
+            return;
+        };
         let account_clone = account.clone();
         let group_id_clone = group_id.clone();
         tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::groups::background_sync_group_image_cache_if_needed",
-                        "Failed to get Whitenoise instance for background image cache: {}",
-                        e
-                    );
-                    return;
-                }
-            };
-
             if let Err(e) = whitenoise
                 .sync_group_image_cache_if_needed(&account_clone, &group_id_clone)
                 .await

@@ -200,8 +200,10 @@ impl Whitenoise {
         // All operations are idempotent and failures are logged but don't stop other operations
         let tid = crate::perf::current_trace_id();
         let account_owned = account.clone();
+        let whitenoise = self.arc()?;
         tokio::spawn(crate::perf::with_trace_id(tid, async move {
             Self::background_finalize_welcome(
+                whitenoise,
                 account_owned,
                 group_id,
                 group_name,
@@ -214,26 +216,19 @@ impl Whitenoise {
         Ok(())
     }
 
-    /// Background task wrapper that gets Whitenoise instance and delegates to core logic.
-    /// This thin wrapper exists because tokio::spawn requires 'static lifetime.
+    /// Background task wrapper that holds the `Whitenoise` `Arc` alive while the
+    /// welcome-finalization core logic runs.
     #[perf_instrument("event_handlers")]
     async fn background_finalize_welcome(
+        whitenoise: Arc<Whitenoise>,
         account: Account,
         group_id: GroupId,
         group_name: String,
         key_package_event_id: EventId,
         welcomer_pubkey: PublicKey,
     ) {
-        let Ok(whitenoise) = Whitenoise::get_instance() else {
-            tracing::error!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to get Whitenoise instance"
-            );
-            return;
-        };
-
         Self::finalize_welcome_with_instance(
-            whitenoise,
+            &whitenoise,
             &account,
             &group_id,
             &group_name,

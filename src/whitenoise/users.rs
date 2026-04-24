@@ -464,13 +464,17 @@ impl Whitenoise {
             pubkey
         );
 
+        let Ok(whitenoise) = self.arc() else {
+            tracing::warn!(
+                target: "whitenoise::users::start_background_user_resolution_if_unknown",
+                "Whitenoise instance unavailable; skipping background discovery for {}",
+                pubkey
+            );
+            return;
+        };
         tokio::spawn(async move {
             let _resolution_guard = resolution_guard;
-            let result = async {
-                let whitenoise = Self::get_instance()?;
-                whitenoise.resolve_unknown_user_under_guard(pubkey).await
-            }
-            .await;
+            let result = whitenoise.resolve_unknown_user_under_guard(pubkey).await;
 
             if let Err(error) = result {
                 tracing::warn!(
@@ -671,7 +675,7 @@ mod tests {
         let query_urls: std::collections::HashSet<RelayUrl> =
             Relay::urls(&query_relays).into_iter().collect();
 
-        for url in &whitenoise.config.discovery_relays {
+        for url in &whitenoise.config().discovery_relays {
             assert!(
                 query_urls.contains(url),
                 "Fallback query relays should include discovery relay: {}",

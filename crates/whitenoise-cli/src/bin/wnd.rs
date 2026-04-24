@@ -22,7 +22,7 @@ async fn main() -> whitenoise_cli::Result<()> {
     let config = Config::resolve(args.data_dir.as_ref(), args.logs_dir.as_ref());
 
     let wn_config = WhitenoiseConfig::new(&config.data_dir, &config.logs_dir, KEYRING_SERVICE_ID);
-    Whitenoise::initialize_whitenoise(wn_config).await?;
+    let whitenoise = Whitenoise::new(wn_config).await?;
 
-    server::run(&config).await
+    server::run(&config, whitenoise).await
 }

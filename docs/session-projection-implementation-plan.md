@@ -452,7 +452,7 @@ same PR.
 
 ### Phase 16b: Kill singleton and pass app/shared handles explicitly (~800 LOC)
 
-- [ ] Not started
+- [ ] In review
 
 <details>
 <summary>Details</summary>

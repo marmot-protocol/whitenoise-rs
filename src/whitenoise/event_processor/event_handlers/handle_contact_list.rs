@@ -116,20 +116,16 @@ impl Whitenoise {
 
         let cancel_rx = Some(session.subscribe_cancellation());
 
+        let Ok(whitenoise) = self.arc() else {
+            tracing::error!(
+                target: "whitenoise::handle_contact_list",
+                "Whitenoise instance unavailable for background fetch"
+            );
+            return;
+        };
+
         let tid = crate::perf::current_trace_id();
         tokio::spawn(crate::perf::with_trace_id(tid, async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::handle_contact_list",
-                        "Failed to get Whitenoise instance for background fetch: {}",
-                        e
-                    );
-                    return;
-                }
-            };
-
             tracing::info!(
                 target: "whitenoise::handle_contact_list",
                 "Starting discovery catch-up for {} followed users",
@@ -138,7 +134,7 @@ impl Whitenoise {
 
             whitenoise.shared.discovery_sync_worker.request_rebuild();
 
-            let fetched = Self::fetch_users_batch(whitenoise, &pubkeys, cancel_rx).await;
+            let fetched = Self::fetch_users_batch(&whitenoise, &pubkeys, cancel_rx).await;
 
             tracing::info!(
                 target: "whitenoise::handle_contact_list",

@@ -39,7 +39,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         context.add_account(&self.account_name, account.clone());
 
         // Verify account has key package relays configured
-        let kp_relays = account.key_package_relays(context.whitenoise).await?;
+        let kp_relays = account.key_package_relays(&context.whitenoise).await?;
         assert!(
             !kp_relays.is_empty(),
             "Account should have key package relays configured"
@@ -86,7 +86,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
 
         // Run maintenance
         let task = KeyPackageMaintenance;
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         let after_publish = wait_for_key_packages(
             context,
@@ -138,7 +138,7 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         tracing::info!("✓ Verified 1 expired key package exists");
 
         // Run maintenance - should publish new and delete expired
-        task.execute(context.whitenoise).await?;
+        task.execute(context.whitenoise.clone()).await?;
 
         // Verify rotation: old one deleted, new one published
         let after_rotate = wait_for_key_packages(
@@ -180,7 +180,7 @@ async fn wait_for_key_packages<F>(
 where
     F: Fn(&[Event]) -> bool + Copy,
 {
-    let whitenoise = context.whitenoise;
+    let whitenoise = &context.whitenoise;
     let account = account.clone();
 
     retry(

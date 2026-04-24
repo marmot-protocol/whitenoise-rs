@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::core::*;
 use crate::integration_tests::scenarios::*;
 use crate::{Whitenoise, WhitenoiseError};
@@ -31,7 +33,7 @@ macro_rules! scenario_registry {
         /// Run a single scenario by name
         async fn run_single_scenario(
             name: &str,
-            whitenoise: &'static Whitenoise,
+            whitenoise: Arc<Whitenoise>,
         ) -> Result<(ScenarioResult, Option<WhitenoiseError>), String> {
             match name.to_lowercase().as_str() {
                 $(
@@ -49,12 +51,12 @@ macro_rules! scenario_registry {
 
         /// Run all registered scenarios
         async fn run_all_registered(
-            whitenoise: &'static Whitenoise,
+            whitenoise: Arc<Whitenoise>,
             results: &mut Vec<ScenarioResult>,
             first_error: &mut Option<WhitenoiseError>,
         ) {
             $(
-                let (result, error) = <$scenario_type>::new(whitenoise).execute().await;
+                let (result, error) = <$scenario_type>::new(whitenoise.clone()).execute().await;
                 results.push(result);
                 if error.is_some() && first_error.is_none() {
                     *first_error = error;
@@ -97,7 +99,7 @@ impl ScenarioRegistry {
     /// Run a single scenario by name
     pub async fn run_scenario(
         scenario_name: &str,
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<(), WhitenoiseError> {
         let overall_start = Instant::now();
 
@@ -127,7 +129,7 @@ impl ScenarioRegistry {
         }
     }
 
-    pub async fn run_all_scenarios(whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    pub async fn run_all_scenarios(whitenoise: Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         let overall_start = Instant::now();
         let mut results = Vec::new();
         let mut first_error = None;

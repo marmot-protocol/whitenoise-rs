@@ -52,7 +52,7 @@ impl TestCase for VerifySelfUpdateTestCase {
     async fn run(&self, context: &mut ScenarioContext) -> Result<(), WhitenoiseError> {
         let group = context.get_group(&self.group_name)?;
         let group_id = group.mls_group_id.clone();
-        let wn = context.whitenoise;
+        let wn = &context.whitenoise;
 
         // The self-update runs as a deferred background task after welcome
         // processing. It waits for in-flight messages at the current epoch to

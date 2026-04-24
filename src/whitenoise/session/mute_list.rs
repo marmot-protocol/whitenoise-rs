@@ -353,13 +353,13 @@ impl<'a> MuteListOps<'a> {
         .await
         {
             Ok(Some(group_id)) => {
-                // Reach back to the Whitenoise singleton for the stream managers
+                // Reach back to the Whitenoise handle for the stream managers
                 // that are not yet session-scoped.
                 // TODO(phase-16): Move chat list stream managers to AccountSession.
-                let Ok(wn) = crate::whitenoise::Whitenoise::get_instance() else {
+                let Ok(wn) = self.session.whitenoise() else {
                     tracing::debug!(
                         target: "whitenoise::mute_list",
-                        "Whitenoise singleton unavailable for chat list emit"
+                        "Whitenoise handle unavailable for chat list emit"
                     );
                     return;
                 };

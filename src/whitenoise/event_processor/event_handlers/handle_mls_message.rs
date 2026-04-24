@@ -199,7 +199,7 @@ impl Whitenoise {
                     .cache_chat_message(&account.pubkey, &group_id, &message)
                     .await?;
                 let group_name = mdk.get_group(&group_id).ok().flatten().map(|g| g.name);
-                Whitenoise::spawn_new_message_notification_if_enabled(
+                self.spawn_new_message_notification_if_enabled(
                     account, &group_id, &msg, group_name,
                 );
                 self.emit_message_update(&group_id, UpdateTrigger::NewMessage, msg);
@@ -372,7 +372,7 @@ impl Whitenoise {
 
         self.emit_chat_list_update(account, group_id, ChatListUpdateTrigger::NewLastMessage)
             .await;
-        Self::background_sync_group_image_cache_if_needed(account, group_id);
+        self.background_sync_group_image_cache_if_needed(account, group_id);
 
         Ok(())
     }
@@ -427,7 +427,7 @@ impl Whitenoise {
 
         self.background_refresh_account_group_subscriptions(account);
         if still_active {
-            Self::background_sync_group_image_cache_if_needed(account, mls_group_id);
+            self.background_sync_group_image_cache_if_needed(account, mls_group_id);
         }
 
         Ok(())
