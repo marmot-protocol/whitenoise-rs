@@ -128,21 +128,22 @@ async fn migrate_plaintext_database(
     }
 
     if let Err(err) = validate_encrypted_database(db_path, config).await {
-        if let Err(rollback_err) = remove_file_if_exists(db_path) {
-            return Err(DatabaseError::EncryptionMigration(format!(
-                "Encrypted database validation failed ({err}); rollback from {} to {} failed while removing bad encrypted database: {rollback_err}",
-                backup_path.display(),
-                db_path.display(),
-            )));
+        if let Err(rename_err) = fs::rename(&backup_path, db_path) {
+            remove_file_if_exists(db_path).map_err(|rollback_err| {
+                DatabaseError::EncryptionMigration(format!(
+                    "Encrypted database validation failed ({err}); rollback from {} to {} failed after direct restore failed ({rename_err}) and removing bad encrypted database failed: {rollback_err}",
+                    backup_path.display(),
+                    db_path.display(),
+                ))
+            })?;
+            fs::rename(&backup_path, db_path).map_err(|rollback_err| {
+                DatabaseError::EncryptionMigration(format!(
+                    "Encrypted database validation failed ({err}); rollback from {} to {} failed after direct restore failed ({rename_err}): {rollback_err}",
+                    backup_path.display(),
+                    db_path.display(),
+                ))
+            })?;
         }
-
-        fs::rename(&backup_path, db_path).map_err(|rollback_err| {
-            DatabaseError::EncryptionMigration(format!(
-                "Encrypted database validation failed ({err}); rollback from {} to {} failed: {rollback_err}",
-                backup_path.display(),
-                db_path.display(),
-            ))
-        })?;
         return Err(err);
     }
 
