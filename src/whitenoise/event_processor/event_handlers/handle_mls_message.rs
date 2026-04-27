@@ -57,7 +57,7 @@ impl Whitenoise {
         event: Event,
     ) -> Result<()> {
         tracing::debug!(
-          target: "whitenoise::event_handlers::handle_mls_message",
+          target: "whitenoise::event_processor::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",
           event.id.to_hex(),
           event.kind.as_u16(),
@@ -69,7 +69,7 @@ impl Whitenoise {
         let outcome = match mdk.process_message_with_context(&event) {
             Ok(outcome) => {
                 tracing::debug!(
-                  target: "whitenoise::event_handlers::handle_mls_message",
+                  target: "whitenoise::event_processor::handle_mls_message",
                   "MLS message {} processed - Result variant: {}",
                   event.id.to_hex(),
                   match &outcome.result {
@@ -87,7 +87,7 @@ impl Whitenoise {
             }
             Err(e) => {
                 tracing::error!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message handling failed for account {}: {}",
                     account.pubkey.to_hex(),
                     e
@@ -111,7 +111,7 @@ impl Whitenoise {
 
             if !has_account_group {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::event_handlers::handle_mls_message",
                     group_id = %hex::encode(group_id.as_slice()),
                     account = %account.pubkey.to_hex(),
                     "Skipping outcome handling: no AccountGroup exists \
@@ -158,7 +158,7 @@ impl Whitenoise {
                 .await
             {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     account = %account.pubkey.to_hex(),
                     group_id = %hex::encode(group_id.as_slice()),
                     sender_leaf_index = ?outcome.context.sender_leaf_index,
@@ -283,7 +283,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::PendingProposal { mls_group_id } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Stored pending proposal for group {} (awaiting admin commit)",
                     hex::encode(mls_group_id.as_slice())
                 );
@@ -294,7 +294,7 @@ impl Whitenoise {
                 reason,
             } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Ignored proposal for group {}: {}",
                     hex::encode(mls_group_id.as_slice()),
                     reason
@@ -303,7 +303,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::ExternalJoinProposal { mls_group_id } => {
                 tracing::info!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "Received external join proposal for group {}",
                     hex::encode(mls_group_id.as_slice())
                 );
@@ -315,7 +315,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::Unprocessable { mls_group_id } => {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message unprocessable for group {} (account {}): \
                      event will not be marked processed",
                     hex::encode(mls_group_id.as_slice()),
@@ -327,7 +327,7 @@ impl Whitenoise {
             }
             MessageProcessingResult::PreviouslyFailed => {
                 tracing::warn!(
-                    target: "whitenoise::event_handlers::handle_mls_message",
+                    target: "whitenoise::event_processor::handle_mls_message",
                     "MLS message was previously failed for account {}: \
                      event will not be marked processed",
                     account.pubkey.to_hex()
@@ -358,14 +358,14 @@ impl Whitenoise {
             && !welcome_rumors.is_empty()
         {
             tracing::warn!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 "Auto-committed proposal produced {} welcome rumors that were not delivered",
                 welcome_rumors.len()
             );
         }
 
         tracing::info!(
-            target: "whitenoise::event_handlers::handle_mls_message",
+            target: "whitenoise::event_processor::handle_mls_message",
             "Published auto-committed proposal evolution event for group {}",
             hex::encode(group_id.as_slice())
         );
@@ -386,7 +386,7 @@ impl Whitenoise {
         mls_group_id: &GroupId,
     ) -> Result<()> {
         tracing::info!(
-            target: "whitenoise::event_handlers::handle_mls_message",
+            target: "whitenoise::event_processor::handle_mls_message",
             "Processed commit for group {}",
             hex::encode(mls_group_id.as_slice())
         );
@@ -398,7 +398,7 @@ impl Whitenoise {
 
         if !still_active {
             tracing::info!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 "Account {} was removed from group {} — marking group as removed",
                 account.pubkey.to_hex(),
                 hex::encode(mls_group_id.as_slice())
@@ -417,7 +417,7 @@ impl Whitenoise {
                 .await
         {
             tracing::warn!(
-                target: "whitenoise::event_handlers::handle_mls_message",
+                target: "whitenoise::event_processor::handle_mls_message",
                 account = %account.pubkey.to_hex(),
                 group_id = %hex::encode(mls_group_id.as_slice()),
                 error = %error,
@@ -899,6 +899,8 @@ impl Whitenoise {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
+    use std::time::Duration;
+
     use mdk_core::mip05::{
         ENCRYPTED_TOKEN_LEN, LeafTokenTag, TokenTag, build_token_list_response_rumor,
         build_token_removal_rumor, build_token_request_rumor,
@@ -2189,6 +2191,140 @@ mod tests {
             message_event.is_ok(),
             "Admin should be able to create messages after auto-committed removal: {:?}",
             message_event.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_token_request_does_not_create_second_task() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let _admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        let fake_event_id = EventId::all_zeros();
+        let fake_group_id = GroupId::from_slice(&[1u8; 32]);
+
+        // Pre-insert the key to simulate an in-flight task holding it. This
+        // avoids the race where a spawned task with delay_ms=0 could clear the
+        // key before the assertion runs.
+        whitenoise.insert_pending_token_response_for_test(
+            member_account.pubkey,
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &fake_group_id,
+            &fake_event_id,
+        ));
+
+        // Schedule with the same key hits the duplicate-dedup early-return;
+        // the existing entry must remain intact.
+        whitenoise.schedule_token_response_for_test(
+            member_account.clone(),
+            fake_group_id.clone(),
+            fake_event_id,
+        );
+
+        assert!(
+            whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &fake_group_id,
+                &fake_event_id,
+            ),
+            "pending entry should still be present after duplicate request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_token_response_task_runs_and_clears_pending_entry() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        let token_tag = make_token_tag(22);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, event)
+            .await
+            .unwrap();
+
+        assert!(whitenoise.has_pending_token_response(
+            &member_account.pubkey,
+            &group_id,
+            &request_event_id,
+        ));
+
+        // In tests the spawn delay is 0ms; wait for the spawned task to clear the entry.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !whitenoise.has_pending_token_response(
+                    &member_account.pubkey,
+                    &group_id,
+                    &request_event_id,
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for spawned token-response task to complete");
+    }
+
+    #[tokio::test]
+    async fn test_token_request_dropped_when_semaphore_exhausted() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let admin_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = members[0].0.clone();
+
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
+
+        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
+        let admin_mdk = whitenoise
+            .create_mdk_for_account(admin_account.pubkey)
+            .unwrap();
+
+        // Hold all semaphore permits so the next scheduled response task is dropped.
+        let _guard = whitenoise.exhaust_token_response_semaphore();
+
+        let token_tag = make_token_tag(20);
+        let request =
+            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
+                .unwrap();
+        let request_event_id = request.id.expect("447 rumor must have an event id");
+        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
+
+        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
+        whitenoise
+            .handle_mls_message(&member_session, &member_account, event)
+            .await
+            .unwrap();
+
+        // The task should have been dropped; no pending entry should remain.
+        assert!(
+            !whitenoise.has_pending_token_response(
+                &member_account.pubkey,
+                &group_id,
+                &request_event_id,
+            ),
+            "pending entry should be removed when the concurrency cap is reached"
         );
     }
 

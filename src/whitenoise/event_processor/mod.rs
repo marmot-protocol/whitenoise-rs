@@ -86,7 +86,8 @@ impl Whitenoise {
                                     }
                                     SubscriptionStream::DiscoveryFollowLists
                                     | SubscriptionStream::GroupMessages
-                                    | SubscriptionStream::AccountInboxGiftwraps => {
+                                    | SubscriptionStream::AccountInboxGiftwraps
+                                    | SubscriptionStream::AccountMuteList => {
                                         whitenoise
                                             .process_account_event(event, source, retry_info)
                                             .await;

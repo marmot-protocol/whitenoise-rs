@@ -8,13 +8,14 @@ use nostr_sdk::prelude::*;
 
 use crate::{
     RelayType, perf_instrument, perf_span,
+    relay_control::ephemeral::KeyPackageLookup,
     whitenoise::{
         Whitenoise,
         accounts::Account,
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
-        key_packages::validate_fetched_member_key_package,
+        key_packages::{REQUIRED_MLS_PROPOSAL_TAGS, validate_fetched_member_key_package},
         relays::Relay,
         users::User,
     },
@@ -24,8 +25,10 @@ pub mod blossom_error;
 mod media;
 mod membership;
 mod publish;
+mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
+pub use required_proposals::RequiredProposal;
 
 impl Whitenoise {
     #[perf_instrument("groups")]
@@ -88,10 +91,35 @@ impl Whitenoise {
             );
         }
 
-        let some_event = user.key_package_event(self).await?;
-        let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-            mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-        ))?;
+        let _kp_fetch = perf_span!("groups::fetch_key_package");
+        let lookup = user.key_package_lookup(self).await?;
+        drop(_kp_fetch);
+
+        let event = match lookup {
+            KeyPackageLookup::Found(event) => event,
+            KeyPackageLookup::Incompatible { error } => {
+                if let WhitenoiseError::MissingMlsProposals { missing } = &error {
+                    let missing_self_remove = missing
+                        .iter()
+                        .any(|proposal| proposal == REQUIRED_MLS_PROPOSAL_TAGS[0]);
+                    if missing_self_remove {
+                        return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
+                            member_pubkey: *pk,
+                        });
+                    }
+                }
+
+                return Err(WhitenoiseError::IncompatibleKeyPackage {
+                    member_pubkey: *pk,
+                    reason: error.to_string(),
+                });
+            }
+            KeyPackageLookup::NotFound => {
+                return Err(WhitenoiseError::MdkCoreError(mdk_core::Error::KeyPackage(
+                    "Does not exist".to_owned(),
+                )));
+            }
+        };
 
         validate_fetched_member_key_package(&event, pk)?;
 
@@ -383,6 +411,49 @@ impl Whitenoise {
         session.groups().admins(group_id)
     }
 
+    /// Returns the set of MLS proposal types required by the group's
+    /// `RequiredCapabilities` extension, projected onto the whitenoise mirror
+    /// enum [`RequiredProposal`].
+    ///
+    /// # Arguments
+    /// * `account` - The account that has access to the group
+    /// * `group_id` - The MLS group ID to inspect
+    ///
+    /// # Returns
+    /// * `Ok(BTreeSet<RequiredProposal>)` - The set of required proposal
+    ///   types. An empty set is the LCD outcome for mixed or empty-invitee
+    ///   groups and is **not** an error — it is distinct from
+    ///   [`WhitenoiseError::GroupNotFound`], which means the MLS record is
+    ///   missing.
+    ///
+    /// # Errors
+    /// * `WhitenoiseError::GroupNotFound` - If no MLS record exists for
+    ///   `group_id`
+    /// * `WhitenoiseError` - If loading the group record fails
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let required = wn.group_required_proposals(&account, &group_id).await?;
+    /// if required.contains(&RequiredProposal::SelfRemove) {
+    ///     // Non-admin members can leave without an admin commit.
+    /// }
+    /// ```
+    #[perf_instrument("groups")]
+    pub async fn group_required_proposals(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<BTreeSet<RequiredProposal>> {
+        let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let required = mdk
+            .group_required_proposals(group_id)
+            .map_err(|e| match e {
+                mdk_core::Error::GroupNotFound => WhitenoiseError::GroupNotFound,
+                other => WhitenoiseError::from(other),
+            })?;
+        Ok(required.into_iter().map(RequiredProposal::from).collect())
+    }
+
     #[allow(deprecated)]
     #[perf_instrument("groups")]
     async fn ensure_account_is_group_admin(
@@ -419,40 +490,7 @@ impl Whitenoise {
         let mut users = Vec::new();
 
         for pk in members.iter() {
-            let (user, newly_created) =
-                User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
-
-            if newly_created && let Err(e) = user.update_relay_lists(self).await {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::add_members_to_group",
-                    "Failed to update relay lists for new user {}: {}",
-                    user.pubkey,
-                    e
-                );
-            }
-            let mut relays_to_use = user
-                .relays(RelayType::KeyPackage, &self.shared.database)
-                .await?;
-            if relays_to_use.is_empty() {
-                tracing::warn!(
-                    target: "whitenoise::accounts::groups::add_members_to_group",
-                    "User {} has no relays configured, using account's default relays",
-                    user.pubkey
-                );
-                relays_to_use = account.nip65_relays(self).await?;
-            }
-            let relays_to_use_urls = Relay::urls(&relays_to_use);
-            let some_event = self
-                .shared
-                .relay_control
-                .fetch_user_key_package(*pk, &relays_to_use_urls)
-                .await?;
-            let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
-                mdk_core::Error::KeyPackage("Does not exist".to_owned()),
-            ))?;
-
-            validate_fetched_member_key_package(&event, pk)?;
-
+            let (user, event) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
         }
@@ -653,6 +691,7 @@ impl Whitenoise {
 mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;
+    use crate::whitenoise::database::media_files::MediaFile;
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
@@ -2203,6 +2242,125 @@ mod tests {
         );
     }
 
+    /// MP4 ftyp header only (matches `types::tests::test_detect_non_image_mp4_video`).
+    fn minimal_mp4_fixture() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x18, // Box size
+            b'f', b't', b'y', b'p', // "ftyp"
+            b'i', b's', b'o', b'm', // Brand: isom
+            0x00, 0x00, 0x00, 0x00, // Version
+            b'i', b's', b'o', b'm', // Compatible brands
+            b'm', b'p', b'4', b'2',
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_upload_chat_media_video_stores_original_filename_in_metadata() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let mut blossom_server = mockito::Server::new_async().await;
+        let blossom_url = mock_blossom_url(&blossom_server);
+        let blossom_url_for_response = blossom_url.clone();
+        let _upload_mock = blossom_server
+            .mock("PUT", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let descriptor = mock_blob_descriptor(
+                    &blossom_url_for_response,
+                    request.body().unwrap(),
+                    "video/mp4",
+                );
+                serde_json::to_vec(&descriptor).unwrap()
+            })
+            .create_async()
+            .await;
+
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
+        let member_account = &members[0].0;
+        let member_pubkeys = vec![member_account.pubkey];
+
+        let admin_pubkeys = vec![creator_account.pubkey];
+        let config = create_nostr_group_config_data(admin_pubkeys);
+        let group = whitenoise
+            .create_group(&creator_account, member_pubkeys, config, None)
+            .await
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let expected_basename = "video_picker_ABC123.mp4";
+        let video_path = temp_dir.path().join(expected_basename);
+        tokio::fs::write(&video_path, minimal_mp4_fixture())
+            .await
+            .unwrap();
+        let temp_path = video_path.to_str().unwrap();
+
+        let test_options = MediaProcessingOptions {
+            generate_blurhash: false,
+            ..Default::default()
+        };
+        let result = whitenoise
+            .upload_chat_media(
+                &creator_account,
+                &group.mls_group_id,
+                temp_path,
+                Some(blossom_url),
+                Some(test_options),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "Failed to upload chat video: {:?}",
+            result.unwrap_err()
+        );
+
+        let media_file = result.unwrap();
+        assert_eq!(media_file.mime_type, "video/mp4");
+        assert_eq!(media_file.media_type, "chat_media");
+
+        let metadata = media_file
+            .file_metadata
+            .as_ref()
+            .expect("video uploads must persist FileMetadata for MIP-04 decryption");
+        assert_eq!(
+            metadata.original_filename.as_deref(),
+            Some(expected_basename),
+            "receiver imeta / decrypt must use the same basename the sender encrypted with"
+        );
+        assert!(
+            metadata.dimensions.is_none(),
+            "minimal MP4 fixture has no parsed dimensions unless MDK adds video support"
+        );
+
+        let original_hash_bytes: [u8; 32] = media_file
+            .original_file_hash
+            .as_ref()
+            .expect("chat_media should store original_file_hash")
+            .as_slice()
+            .try_into()
+            .expect("original_file_hash must be 32 bytes");
+
+        let reloaded = MediaFile::find_by_original_hash_and_group(
+            &whitenoise.shared.database,
+            &original_hash_bytes,
+            &group.mls_group_id,
+            &creator_account.pubkey,
+        )
+        .await
+        .unwrap()
+        .expect("MediaFile row should exist after upload");
+
+        assert_eq!(
+            reloaded
+                .file_metadata
+                .as_ref()
+                .and_then(|m| m.original_filename.as_deref()),
+            Some(expected_basename),
+            "filename metadata must round-trip through SQLite for download/decrypt"
+        );
+    }
+
     // ── publish_event_with_retry tests ──────────────────────────────────
 
     #[tokio::test]
@@ -2416,5 +2574,39 @@ mod tests {
             group_before.description, group_after.description,
             "Group description should be unchanged when publish fails"
         );
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_returns_self_remove_for_native_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator_account = whitenoise.create_identity().await.unwrap();
+        let member_account = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator_account.pubkey]);
+        let group = whitenoise
+            .create_group(&creator_account, vec![member_account.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let required = whitenoise
+            .group_required_proposals(&creator_account, &group.mls_group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(required, BTreeSet::from([RequiredProposal::SelfRemove]));
+    }
+
+    #[tokio::test]
+    async fn group_required_proposals_errors_on_missing_group() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let missing_group_id = GroupId::from_slice(&[0; 32]);
+
+        let err = whitenoise
+            .group_required_proposals(&account, &missing_group_id)
+            .await
+            .expect_err("fabricated group ID must error");
+
+        assert!(matches!(err, WhitenoiseError::GroupNotFound));
     }
 }

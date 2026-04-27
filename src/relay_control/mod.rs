@@ -379,6 +379,17 @@ impl RelayControlPlane {
     }
 
     #[perf_instrument("relay")]
+    pub(crate) async fn fetch_user_key_package_lookup(
+        &self,
+        pubkey: PublicKey,
+        relays: &[RelayUrl],
+    ) -> NostrResult<ephemeral::KeyPackageLookup> {
+        self.ephemeral
+            .fetch_user_key_package_lookup(pubkey, relays)
+            .await
+    }
+
+    #[perf_instrument("relay")]
     pub(crate) async fn publish_welcome(
         &self,
         receiver: &PublicKey,
@@ -445,13 +456,14 @@ impl RelayControlPlane {
     #[perf_instrument("relay")]
     pub(crate) async fn publish_key_package_with_signer(
         &self,
+        kind: nostr_sdk::Kind,
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[nostr_sdk::Tag],
         signer: Arc<dyn nostr_sdk::NostrSigner>,
     ) -> NostrResult<nostr_sdk::prelude::Output<nostr_sdk::EventId>> {
         self.ephemeral
-            .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
+            .publish_key_package_with_signer(kind, encoded_key_package, relays, tags, signer)
             .await
     }
 
@@ -556,6 +568,21 @@ pub(crate) enum SubscriptionStream {
     DiscoveryFollowLists,
     GroupMessages,
     AccountInboxGiftwraps,
+    AccountMuteList,
+}
+
+#[cfg(test)]
+impl SubscriptionStream {
+    /// Stable string identifier, used only in tests to assert subscription names.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::DiscoveryUserData => "discovery_user_data",
+            Self::DiscoveryFollowLists => "discovery_follow_lists",
+            Self::GroupMessages => "group_messages",
+            Self::AccountInboxGiftwraps => "account_inbox_giftwraps",
+            Self::AccountMuteList => "account_mute_list",
+        }
+    }
 }
 
 pub(crate) fn hash_pubkey_for_subscription_id(
@@ -600,6 +627,18 @@ mod tests {
     fn test_relay_plane_from_str() {
         assert_eq!("group".parse::<RelayPlane>().unwrap(), RelayPlane::Group);
         assert!("not-a-plane".parse::<RelayPlane>().is_err());
+    }
+
+    #[test]
+    fn test_subscription_stream_as_str() {
+        assert_eq!(
+            SubscriptionStream::AccountInboxGiftwraps.as_str(),
+            "account_inbox_giftwraps"
+        );
+        assert_eq!(
+            SubscriptionStream::AccountMuteList.as_str(),
+            "account_mute_list"
+        );
     }
 
     async fn setup_test_db() -> Database {

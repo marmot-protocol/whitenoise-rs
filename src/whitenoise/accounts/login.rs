@@ -206,6 +206,12 @@ impl Whitenoise {
 
         self.account_manager.remove_session(pubkey);
 
+        // Evict rate-limiter entries for this account to prevent unbounded growth.
+        // Runs after subscription teardown to minimise the repopulation window.
+        self.shared
+            .token_request_timestamps
+            .retain(|(account_pk, _, _, _), _| account_pk != pubkey);
+
         if !ephemeral_warm_relays.is_empty()
             && let Err(error) = self
                 .shared
@@ -288,6 +294,7 @@ mod tests {
 
     use crate::RelayType;
     use crate::whitenoise::accounts::Account;
+    use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::*;
 
@@ -346,36 +353,40 @@ mod tests {
     }
 
     /// Verify that an account has a key package published.
+    #[allow(deprecated)]
     async fn verify_account_key_package_exists(
         whitenoise: &crate::whitenoise::Whitenoise,
         account: &Account,
     ) {
-        let key_package_event = whitenoise
-            .shared
-            .relay_control
-            .fetch_user_key_package(
-                account.pubkey,
-                &Relay::urls(&account.key_package_relays(whitenoise).await.unwrap()),
-            )
+        let key_package_events = whitenoise
+            .fetch_all_key_packages_for_account(account)
             .await
             .unwrap();
 
         assert!(
-            key_package_event.is_some(),
+            !key_package_events.is_empty(),
             "Account should have a key package published to relays"
         );
 
-        if let Some(event) = key_package_event {
+        for event in &key_package_events {
             assert_eq!(
                 event.pubkey, account.pubkey,
                 "Key package should be authored by the account's public key"
             );
-            assert_eq!(
-                event.kind,
-                Kind::MlsKeyPackage,
-                "Event should be a key package (kind 443)"
-            );
         }
+
+        assert!(
+            key_package_events
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND),
+            "Account should publish a canonical key package (kind 30443)"
+        );
+        assert!(
+            key_package_events
+                .iter()
+                .any(|event| event.kind == MLS_KEY_PACKAGE_KIND_LEGACY),
+            "Account should publish a legacy key package twin (kind 443)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -443,7 +454,7 @@ mod tests {
         );
         assert!(
             key_package_events.is_some(),
-            "Key package (kind 443) should be published for new accounts"
+            "Key package (kind 30443) should be published for new accounts"
         );
     }
 
@@ -922,6 +933,71 @@ mod tests {
                 .await
                 .unwrap(),
             "Zero accounts with zero subscriptions should be healthy after logout"
+        );
+    }
+
+    /// Verifies that logging out evicts all rate-limiter entries for that account,
+    /// while preserving entries for other accounts.
+    #[tokio::test]
+    async fn test_logout_evicts_rate_limiter_entries() {
+        use crate::whitenoise::push_notifications::TokenRateKind;
+        use mdk_core::prelude::GroupId;
+
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account_a = whitenoise.create_identity().await.unwrap();
+        let account_b = whitenoise.create_identity().await.unwrap();
+
+        let group_id = GroupId::from_slice(&[1u8; 32]);
+
+        // Seed entries for both accounts
+        whitenoise.shared.token_request_timestamps.insert(
+            (
+                account_a.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request,
+            ),
+            std::time::Instant::now(),
+        );
+        whitenoise.shared.token_request_timestamps.insert(
+            (
+                account_b.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request,
+            ),
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(
+            whitenoise.shared.token_request_timestamps.len(),
+            2,
+            "both entries should be present before logout"
+        );
+
+        whitenoise.logout(&account_a.pubkey).await.unwrap();
+
+        // account_a's entry must be gone
+        assert!(
+            !whitenoise.shared.token_request_timestamps.contains_key(&(
+                account_a.pubkey,
+                group_id.clone(),
+                0,
+                TokenRateKind::Request
+            )),
+            "logout should remove rate-limiter entries for the logged-out account"
+        );
+
+        // account_b's entry must survive
+        assert!(
+            whitenoise.shared.token_request_timestamps.contains_key(&(
+                account_b.pubkey,
+                group_id,
+                0,
+                TokenRateKind::Request
+            )),
+            "logout should not remove rate-limiter entries for other accounts"
         );
     }
 

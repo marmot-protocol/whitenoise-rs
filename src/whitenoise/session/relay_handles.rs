@@ -111,6 +111,7 @@ impl AccountEphemeralHandle {
 
     pub(crate) async fn publish_key_package(
         &self,
+        kind: Kind,
         encoded_key_package: &str,
         relays: &[RelayUrl],
         tags: &[Tag],
@@ -118,7 +119,7 @@ impl AccountEphemeralHandle {
         let signer = self.require_signer().await?;
         Ok(self
             .ephemeral
-            .publish_key_package_with_signer(encoded_key_package, relays, tags, signer)
+            .publish_key_package_with_signer(kind, encoded_key_package, relays, tags, signer)
             .await?)
     }
 

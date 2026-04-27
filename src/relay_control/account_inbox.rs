@@ -141,3 +141,22 @@ impl AccountInboxPlane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::Keys;
+
+    use super::*;
+
+    #[test]
+    fn test_new_sets_account_inbox_defaults() {
+        let config = AccountInboxPlaneConfig::new(Keys::generate().public_key(), Vec::new());
+
+        assert_eq!(config.auth_policy, RelaySessionAuthPolicy::Allowed);
+        assert_eq!(
+            config.reconnect_policy,
+            RelaySessionReconnectPolicy::Conservative
+        );
+        assert_eq!(config.session_config().plane, RelayPlane::AccountInbox);
+    }
+}

@@ -28,8 +28,22 @@ impl PublishedKeyPackagesRepo {
     /// Record a successfully published key package for lifecycle tracking.
     ///
     /// Delegates to `PublishedKeyPackage::create`.
-    pub async fn create(&self, hash_ref: &[u8], event_id: &str) -> Result<()> {
-        Ok(PublishedKeyPackage::create(&self.account_pubkey, hash_ref, event_id, &self.db).await?)
+    pub async fn create(
+        &self,
+        hash_ref: &[u8],
+        event_id: &str,
+        kind: nostr_sdk::Kind,
+        d_tag: Option<&str>,
+    ) -> Result<()> {
+        Ok(PublishedKeyPackage::create(
+            &self.account_pubkey,
+            hash_ref,
+            event_id,
+            kind,
+            d_tag,
+            &self.db,
+        )
+        .await?)
     }
 
     /// Look up a published key package by its event ID.
@@ -66,11 +80,17 @@ impl PublishedKeyPackagesRepo {
         .await?)
     }
 
-    /// Mark a published key package's key material as deleted.
+    /// Mark a published key package's key material as deleted by hash ref.
     ///
-    /// Delegates to `PublishedKeyPackage::mark_key_material_deleted`.
-    pub async fn mark_key_material_deleted(&self, id: i64) -> Result<()> {
-        Ok(PublishedKeyPackage::mark_key_material_deleted(id, &self.db).await?)
+    /// Delegates to `PublishedKeyPackage::mark_key_material_deleted_by_hash_ref`.
+    pub async fn mark_key_material_deleted_by_hash_ref(&self, hash_ref: &[u8]) -> Result<()> {
+        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
+            &self.account_pubkey,
+            hash_ref,
+            &self.db,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Backdate `consumed_at` into the past for testing cleanup eligibility.

@@ -4,6 +4,8 @@
 //! per-group token sharing/removal, MIP-05 message handling, and token
 //! reconciliation — all without threading `account_pubkey` through every call.
 
+use std::time::Instant;
+
 use futures::stream::{self, StreamExt};
 use mdk_core::mip05::{
     Mip05GroupMessage, TokenTag, build_token_removal_rumor, build_token_request_rumor,
@@ -17,8 +19,9 @@ use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::push_notifications::{
-    PushPlatform, PushRegistration, is_push_group_message_kind, publish_push_group_message_with,
-    respond_to_token_request_with, validate_raw_token,
+    PushPlatform, PushRegistration, TOKEN_REQUEST_COOLDOWN, TokenRateKind,
+    is_push_group_message_kind, publish_push_group_message_with, respond_to_token_request_with,
+    validate_raw_token,
 };
 
 /// Maximum number of groups to publish push token events to concurrently.
@@ -30,7 +33,7 @@ pub struct PushOps<'a> {
 }
 
 impl<'a> PushOps<'a> {
-    pub(crate) fn new(session: &'a AccountSession) -> Self {
+    pub(super) fn new(session: &'a AccountSession) -> Self {
         Self { session }
     }
 
@@ -126,6 +129,26 @@ impl<'a> PushOps<'a> {
         Ok(())
     }
 
+    /// Returns a non-sensitive summary of cached push-token state for a group.
+    #[perf_instrument("push_notifications")]
+    pub async fn get_group_debug_info(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::whitenoise::push_notifications::GroupPushDebugInfo> {
+        let cached_tokens = self
+            .session
+            .repos
+            .group_push_tokens
+            .find_by_group(group_id)
+            .await?;
+        let last_token_list_updated_at = cached_tokens.iter().map(|token| token.updated_at).max();
+
+        Ok(crate::whitenoise::push_notifications::GroupPushDebugInfo {
+            total_token_count: cached_tokens.len(),
+            last_token_list_updated_at,
+        })
+    }
+
     // ── Crate-internal API ────────────────────────────────────────────
 
     /// Handles an incoming MIP-05 group message (token request, response, or
@@ -149,6 +172,20 @@ impl<'a> PushOps<'a> {
                         "MIP-05 token request missing sender leaf index".to_string(),
                     )
                 })?;
+
+                if !self.check_token_request_rate(
+                    &message.mls_group_id,
+                    leaf_index,
+                    TokenRateKind::Request,
+                ) {
+                    tracing::debug!(
+                        target: "whitenoise::push_notifications",
+                        group_id = %hex::encode(message.mls_group_id.as_slice()),
+                        leaf_index,
+                        "Dropping rate-limited MIP-05 token request"
+                    );
+                    return Ok(true);
+                }
 
                 self.merge_token_request(
                     &message.mls_group_id,
@@ -177,6 +214,20 @@ impl<'a> PushOps<'a> {
                         "MIP-05 token removal missing sender leaf index".to_string(),
                     )
                 })?;
+
+                if !self.check_token_request_rate(
+                    &message.mls_group_id,
+                    leaf_index,
+                    TokenRateKind::Removal,
+                ) {
+                    tracing::debug!(
+                        target: "whitenoise::push_notifications",
+                        group_id = %hex::encode(message.mls_group_id.as_slice()),
+                        leaf_index,
+                        "Dropping rate-limited MIP-05 token removal"
+                    );
+                    return Ok(true);
+                }
 
                 self.session
                     .repos
@@ -471,6 +522,40 @@ impl<'a> PushOps<'a> {
                 false
             }
         }
+    }
+
+    /// Returns `true` if the request is allowed (not rate-limited).
+    fn check_token_request_rate(
+        &self,
+        group_id: &GroupId,
+        leaf_index: u32,
+        kind: TokenRateKind,
+    ) -> bool {
+        let key = (
+            self.session.account_pubkey,
+            group_id.clone(),
+            leaf_index,
+            kind,
+        );
+        let now = Instant::now();
+        let mut allowed = false;
+
+        self.session
+            .shared
+            .token_request_timestamps
+            .entry(key)
+            .and_modify(|last| {
+                if now.duration_since(*last) >= TOKEN_REQUEST_COOLDOWN {
+                    *last = now;
+                    allowed = true;
+                }
+            })
+            .or_insert_with(|| {
+                allowed = true;
+                now
+            });
+
+        allowed
     }
 
     #[perf_instrument("push_notifications")]

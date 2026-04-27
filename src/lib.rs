@@ -9,17 +9,18 @@ use tracing_subscriber::filter::LevelFilter;
 #[cfg(feature = "benchmark-tests")]
 use crate::integration_tests::benchmarks::PerfTracingLayer;
 
+pub mod ffi;
+pub mod mdk;
 mod nostr_manager;
 pub mod perf;
 pub(crate) mod relay_control;
+mod types;
+pub mod whitenoise;
 
 // Re-export proc macro for ergonomic `#[perf_instrument("prefix")]` usage.
 // Crate-private because the macro expands to `crate::perf_span!(...)` which
 // only resolves inside this crate.
 pub(crate) use whitenoise_macros::perf_instrument;
-pub mod mdk;
-mod types;
-pub mod whitenoise;
 
 // Integration tests module - included when integration-tests feature is enabled
 // This provides IDE support.
@@ -34,8 +35,9 @@ pub mod test_fixtures;
 // Core types
 pub use types::{
     AccountInboxPlaneStateSnapshot, AccountInboxPlanesStateSnapshot, DiscoveryPlaneStateSnapshot,
-    GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ImageType, MessageWithTokens,
-    RelayControlStateSnapshot, RelaySessionRelayStateSnapshot, RelaySessionStateSnapshot,
+    GroupPlaneGroupStateSnapshot, GroupPlaneStateSnapshot, ImageType, ImageTypeError,
+    MessageWithTokens, RelayControlStateSnapshot, RelaySessionRelayStateSnapshot,
+    RelaySessionStateSnapshot,
 };
 pub use whitenoise::{Whitenoise, WhitenoiseConfig};
 
@@ -53,7 +55,7 @@ pub use whitenoise::app_settings::{AppSettings, Language, ThemeMode};
 // Groups and relays
 pub use whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 pub use whitenoise::group_information::{GroupInformation, GroupType};
-pub use whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
+pub use whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership, RequiredProposal};
 pub use whitenoise::relays::{Relay, RelayType};
 
 // Drafts
@@ -62,6 +64,9 @@ pub use whitenoise::drafts::Draft;
 // Media files
 pub use whitenoise::database::aggregated_messages::PaginationOptions;
 pub use whitenoise::database::media_files::{FileMetadata, MediaFile};
+
+// Mute list
+pub use whitenoise::database::mute_list::MuteListEntry;
 
 // Messaging
 pub use whitenoise::message_aggregator::{
@@ -86,7 +91,17 @@ pub use whitenoise::user_streaming::{UserSubscription, UserUpdate, UserUpdateTri
 pub use whitenoise::notification_streaming::{
     NotificationSubscription, NotificationTrigger, NotificationUpdate, NotificationUser,
 };
-pub use whitenoise::push_notifications::{GroupPushToken, PushPlatform, PushRegistration};
+
+// Background notification collection (iOS silent push). The async function
+// is re-exported alongside the result types so Rust callers can drive
+// collection directly without going through the FFI layer.
+pub use whitenoise::background_notifications::{
+    BackgroundNotificationResult, BackgroundNotificationStatus, NotificationDto,
+    NotificationUserDto, collect_notifications_after_push,
+};
+pub use whitenoise::push_notifications::{
+    GroupPushDebugInfo, GroupPushToken, PushPlatform, PushRegistration,
+};
 
 // User search
 pub use whitenoise::user_search::{

@@ -1,12 +1,12 @@
 mod chat_list;
+mod drafts;
 mod groups;
-mod key_packages;
+pub(crate) mod key_packages;
+mod membership;
 pub(crate) mod messages;
+mod mute_list;
 pub(crate) mod push;
 pub(crate) mod relay_handles;
-
-mod drafts;
-mod membership;
 mod settings;
 mod social;
 
@@ -15,6 +15,7 @@ pub use self::drafts::DraftOps;
 pub use self::groups::{GroupOps, MediaOps};
 pub use self::key_packages::KeyPackageOps;
 pub use self::membership::{MembershipOps, MembershipOpsForGroup};
+pub use self::mute_list::MuteListOps;
 pub use self::push::PushOps;
 pub use self::settings::SettingsOps;
 pub use self::social::SocialOps;
@@ -211,6 +212,11 @@ impl AccountSession {
     /// Return a view for chat list read operations scoped to this session.
     pub fn chat_list(&self) -> ChatListOps<'_> {
         ChatListOps::new(self)
+    }
+
+    /// Return a view for mute list (block/unblock) operations scoped to this session.
+    pub fn mute_list(&self) -> MuteListOps<'_> {
+        MuteListOps::new(self)
     }
 
     /// Return a view for push notification operations scoped to this session.
