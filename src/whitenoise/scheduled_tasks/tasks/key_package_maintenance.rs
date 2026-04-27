@@ -13,7 +13,7 @@ use crate::whitenoise::accounts::Account;
 use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::key_packages::{
-    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
+    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_strict,
 };
 use crate::whitenoise::scheduled_tasks::Task;
 
@@ -204,7 +204,7 @@ fn filter_compatible_key_packages(
     packages
         .into_iter()
         .filter(|package| {
-            match validate_marmot_key_package_tags(&package.event, REQUIRED_MLS_CIPHERSUITE_TAG) {
+            match validate_marmot_key_package_strict(&package.event, REQUIRED_MLS_CIPHERSUITE_TAG) {
                 Ok(()) => true,
                 Err(e) => {
                     tracing::debug!(

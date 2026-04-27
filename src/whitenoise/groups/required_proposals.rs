@@ -1,7 +1,20 @@
 // Intentionally not re-exported via `src/mdk.rs` — `RequiredProposal` is the
 // whitenoise-owned mirror; this import is internal only.
+use std::collections::BTreeSet;
+
 use mdk_core::prelude::ProposalType;
 use serde::{Deserialize, Serialize};
+
+/// SelfRemove codepoint (`0x000a`). Used both as a proposal codepoint
+/// ([`RequiredProposal::SelfRemove`]) and an extension codepoint
+/// ([`MlsExtensionId::SelfRemove`]). Per RFC 9420 the two registries are
+/// distinct namespaces that happen to share this value for the SelfRemove
+/// pair.
+pub(crate) const SELF_REMOVE_CODEPOINT: u16 = 0x000a;
+
+/// Marmot NostrGroupData extension codepoint (`0xf2ee`). Matches
+/// `mdk_core::constant::NOSTR_GROUP_DATA_EXTENSION_TYPE`.
+pub(crate) const NOSTR_GROUP_DATA_EXTENSION_CODEPOINT: u16 = 0xf2ee;
 
 /// A whitenoise-owned mirror of the MLS proposal-type registry, restricted to
 /// the capability surface exposed through [`crate::Whitenoise::group_required_proposals`].
@@ -32,6 +45,60 @@ pub enum RequiredProposal {
     Unknown,
 }
 
+/// A whitenoise-owned mirror of the MLS extension-type registry, restricted to
+/// the codepoints surfaced through key-package capability projection
+/// ([`crate::whitenoise::key_packages::marmot_key_package_capabilities`]).
+///
+/// Same wire/policy contract as [`RequiredProposal`]:
+///
+/// 1. Snake-case JSON (`"self_remove"`, `"nostr_group_data"`, `"unknown"`).
+/// 2. `Unknown` is a unit variant — duplicates collapse in any
+///    [`BTreeSet<MlsExtensionId>`].
+///
+/// **No-wildcard policy.** The plan's design called for a
+/// `From<openmls::ExtensionType>` impl mirroring [`RequiredProposal`]'s
+/// `From<ProposalType>`. We diverge: `openmls` is not a top-level dependency of
+/// this crate (only mdk-core uses it) and the projection actually parses
+/// _Nostr-event tag hex strings_, not openmls types. The
+/// [`From<u16>`] impl below is the corresponding no-wildcard surface — every
+/// branch is explicit, including the catch-all `_` arm which fans every other
+/// codepoint (including unmodelled openmls variants like `ApplicationId =
+/// 0x0001`) into [`MlsExtensionId::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MlsExtensionId {
+    /// MIP-03 SelfRemove (`0x000a`) — present as a leaf-node capability when
+    /// the peer can participate in SelfRemove proposals.
+    SelfRemove,
+    /// Marmot NostrGroupData (`0xf2ee`) — Marmot identity extension required by
+    /// every Marmot key package.
+    NostrGroupData,
+    /// Any extension codepoint the whitenoise API does not distinguish today.
+    Unknown,
+}
+
+impl From<u16> for MlsExtensionId {
+    fn from(codepoint: u16) -> Self {
+        match codepoint {
+            SELF_REMOVE_CODEPOINT => Self::SelfRemove,
+            NOSTR_GROUP_DATA_EXTENSION_CODEPOINT => Self::NostrGroupData,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// A KP's advertised capability set, projected from its Nostr-event tags.
+///
+/// Built by [`crate::whitenoise::key_packages::marmot_key_package_capabilities`]
+/// at the validation boundary so callers don't re-walk tags. Both fields are
+/// `BTreeSet`s so duplicates collapse and iteration order is deterministic for
+/// logging and tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct KeyPackageCapabilities {
+    pub proposals: BTreeSet<RequiredProposal>,
+    pub extensions: BTreeSet<MlsExtensionId>,
+}
+
 impl From<ProposalType> for RequiredProposal {
     fn from(pt: ProposalType) -> Self {
         match pt {
@@ -45,6 +112,22 @@ impl From<ProposalType> for RequiredProposal {
             | ProposalType::GroupContextExtensions
             | ProposalType::Grease(_)
             | ProposalType::Custom(_) => Self::Unknown,
+        }
+    }
+}
+
+impl From<u16> for RequiredProposal {
+    /// Maps a raw proposal codepoint to the mirror enum.
+    ///
+    /// Used by the key-package capability projection (which parses Nostr
+    /// `mls_proposals` tag hex strings into `u16`s). The `_` arm is the
+    /// proposal-namespace dual of `MlsExtensionId::Unknown` (a sibling
+    /// crate-private mirror) — every codepoint we don't model collapses
+    /// there.
+    fn from(codepoint: u16) -> Self {
+        match codepoint {
+            SELF_REMOVE_CODEPOINT => Self::SelfRemove,
+            _ => Self::Unknown,
         }
     }
 }

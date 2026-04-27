@@ -11,7 +11,7 @@ use crate::whitenoise::{
 
 #[cfg(test)]
 use crate::whitenoise::key_packages::{
-    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
+    REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_baseline,
 };
 
 /// Status of a user's key package on relays.
@@ -160,7 +160,7 @@ pub(super) fn classify_key_package(event: Option<Event>) -> KeyPackageStatus {
     match event {
         None => KeyPackageStatus::NotFound,
         Some(event) => {
-            if validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok() {
+            if validate_marmot_key_package_baseline(&event, REQUIRED_MLS_CIPHERSUITE_TAG).is_ok() {
                 KeyPackageStatus::Valid(Box::new(event))
             } else {
                 KeyPackageStatus::Incompatible

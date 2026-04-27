@@ -16,8 +16,8 @@ use crate::{
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
         key_packages::{
-            REQUIRED_MLS_CIPHERSUITE_TAG, REQUIRED_MLS_PROPOSAL_TAGS,
-            validate_marmot_key_package_tags,
+            REQUIRED_MLS_CIPHERSUITE_TAG, marmot_key_package_capabilities,
+            validate_marmot_key_package_baseline,
         },
         relays::Relay,
         users::User,
@@ -32,6 +32,7 @@ mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use required_proposals::RequiredProposal;
+pub(crate) use required_proposals::{KeyPackageCapabilities, MlsExtensionId};
 
 impl Whitenoise {
     #[perf_instrument("groups")]
@@ -85,7 +86,7 @@ impl Whitenoise {
             )));
         }
 
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
+        validate_marmot_key_package_baseline(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
             WhitenoiseError::InvalidInput(format!(
                 "Incompatible key package event {} for member {}: {}",
                 event.id, pk, e
@@ -100,7 +101,15 @@ impl Whitenoise {
     ///
     /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
     /// preflight status checks and actual group creation use the same fallback chain.
-    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+    ///
+    /// Returns the user record, the resolved key-package event, and the
+    /// projected [`KeyPackageCapabilities`]. The capability projection is
+    /// computed once at the validation boundary so callers can fold it (e.g.
+    /// `create_group` counts legacy peers) without re-walking the event's tags.
+    async fn resolve_member_key_package(
+        &self,
+        pk: &PublicKey,
+    ) -> Result<(User, Event, KeyPackageCapabilities)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
         if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
@@ -117,18 +126,13 @@ impl Whitenoise {
 
         let event = match lookup {
             KeyPackageLookup::Found(event) => event,
+            // Under the consumer-side baseline validator, missing capability
+            // advertisements (notably SelfRemove) no longer surface as
+            // `Incompatible`; only genuine malformations do. Phase 2 of the
+            // mixed-version-groups plan resurrects the
+            // `KeyPackageMissingSelfRemove` error variant for the
+            // `add_members` strict path.
             KeyPackageLookup::Incompatible { error } => {
-                if let WhitenoiseError::MissingMlsProposals { missing } = &error {
-                    let missing_self_remove = missing
-                        .iter()
-                        .any(|proposal| proposal == REQUIRED_MLS_PROPOSAL_TAGS[0]);
-                    if missing_self_remove {
-                        return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
-                            member_pubkey: *pk,
-                        });
-                    }
-                }
-
                 return Err(WhitenoiseError::IncompatibleKeyPackage {
                     member_pubkey: *pk,
                     reason: error.to_string(),
@@ -143,7 +147,9 @@ impl Whitenoise {
 
         Self::validate_fetched_member_key_package(&event, pk)?;
 
-        Ok((user, event))
+        let capabilities = marmot_key_package_capabilities(&event);
+
+        Ok((user, event, capabilities))
     }
 
     /// Validates and pairs welcome rumors from MLS group creation with their
@@ -347,8 +353,30 @@ impl Whitenoise {
             .iter()
             .map(|pk| self.resolve_member_key_package(pk));
         let resolved_members = try_join_all(member_futures).await?;
-        let (members, key_package_events): (Vec<User>, Vec<Event>) =
-            resolved_members.into_iter().unzip();
+
+        // Fold the per-member capability projections into a single legacy-peer
+        // count as we split the triples. We don't keep `KeyPackageCapabilities`
+        // values around — only the count survives, because Phase 1's only
+        // consumer of the projection is the tracing emit below. (Phase 2 will
+        // consume the projection in `add_members_to_group`.)
+        let mut legacy_peer_count: usize = 0;
+        let mut members: Vec<User> = Vec::with_capacity(resolved_members.len());
+        let mut key_package_events: Vec<Event> = Vec::with_capacity(resolved_members.len());
+        for (user, event, caps) in resolved_members {
+            if !caps.proposals.contains(&RequiredProposal::SelfRemove) {
+                legacy_peer_count += 1;
+            }
+            members.push(user);
+            key_package_events.push(event);
+        }
+
+        if legacy_peer_count > 0 {
+            tracing::info!(
+                target: "whitenoise::accounts::groups::create_group",
+                legacy_peer_count,
+                "creating group with legacy peers; capabilities will be LCD'd by MDK"
+            );
+        }
 
         tracing::debug!(
             target: "whitenoise::accounts::groups::create_group",
@@ -656,9 +684,12 @@ impl Whitenoise {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
 
-        // Fetch key packages for all members
+        // Fetch key packages for all members. Phase 1 ignores the capability
+        // projection (third tuple element); Phase 2 of the mixed-version-groups
+        // plan will use it to pre-validate against the group's required
+        // proposals before calling `mdk.add_members`.
         for pk in members.iter() {
-            let (user, event) = self.resolve_member_key_package(pk).await?;
+            let (user, event, _caps) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
         }
