@@ -93,6 +93,18 @@ impl PublishedKeyPackagesRepo {
         Ok(())
     }
 
+    /// Mark a published key package's key material as deleted by row id.
+    ///
+    /// Delegates to `PublishedKeyPackage::mark_key_material_deleted`, scoped
+    /// to this repository's account so an `id` from another account cannot
+    /// mutate this account's row.
+    pub async fn mark_key_material_deleted(&self, id: i64) -> Result<()> {
+        Ok(
+            PublishedKeyPackage::mark_key_material_deleted(&self.account_pubkey, id, &self.db)
+                .await?,
+        )
+    }
+
     /// Backdate `consumed_at` into the past for testing cleanup eligibility.
     #[cfg(feature = "integration-tests")]
     pub async fn backdate_consumed_at(&self, event_id: &str, age_secs: i64) -> Result<()> {

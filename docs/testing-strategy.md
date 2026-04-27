@@ -5,7 +5,7 @@ Drafted: 2026-04-13
 ## Overview
 
 The session/projection rearchitecture changes how the app is constructed and owned at runtime. This has a direct
-impact on testing: the singleton removal (Phase 12) makes it possible — and necessary — to rethink how integration
+impact on testing: the singleton removal (Phase 16b) makes it possible — and necessary — to rethink how integration
 tests work. This document describes the target testing model and when the transition happens.
 
 ## Three-Tier Testing Model
@@ -25,7 +25,7 @@ async fn test_chat_list_sorts_pinned_first() {
 }
 ```
 
-Run with `cargo test`. Parallel, fast, no infrastructure. This is where the bulk of coverage lives.
+Run with `just test`. Parallel, fast, no infrastructure. This is where the bulk of coverage lives.
 
 ### Tier 2: In-process integration tests (MockRelay)
 
@@ -60,7 +60,8 @@ MockRelay capabilities relevant to our tests:
 - Unresponsive connection simulation (for testing reconnection and timeouts)
 - Multiple independent instances per test (for testing relay topology)
 
-`nostr-relay-builder` is already a transitive dependency via `nostr-sdk` — no new crate to add.
+`nostr-sdk` 0.44.x does not re-export `MockRelay`, so `nostr-relay-builder` must be added explicitly as a
+dev-dependency in `Cargo.toml` to use `nostr_relay_builder::MockRelay` from Tier 2 tests.
 
 ### Tier 3: Docker integration tests (external services only)
 
@@ -78,10 +79,11 @@ Everything else moves to Tier 1 or Tier 2.
 The current integration test suite (~15k LOC, 18 scenarios) depends on the `Whitenoise` singleton and a single shared
 instance. It runs against Docker relay containers.
 
-**During Phases 1–11:** Keep the current integration tests passing as-is. They are the validation step for each
-refactor phase. Don't rewrite them while the refactor is in progress.
+**During Phases 1–16a:** Keep the current integration tests passing as-is. They are the validation step for each
+refactor phase. Phase 16a (PR #773) introduces `Arc<SharedServices>` while preserving the singleton, so don't
+rewrite tests while the refactor is in progress.
 
-**At Phase 12 (singleton removal):** The current tests break because `Whitenoise::get_instance()` no longer exists.
+**At Phase 16b (singleton removal):** The current tests break because `Whitenoise::get_instance()` no longer exists.
 This is the natural inflection point to rewrite them. At this point:
 
 1. Write Tier 1 unit tests for services that were previously only testable via integration tests (account management,
@@ -92,7 +94,7 @@ This is the natural inflection point to rewrite them. At this point:
 4. Keep the `chat_media_upload` scenario on Docker (Tier 3).
 
 **After the transition:**
-- `cargo test` runs Tier 1 + Tier 2. No Docker needed. Developers never need `just docker-up` for routine work.
+- `just test` runs Tier 1 + Tier 2. No Docker needed. Developers never need `just docker-up` for routine work.
 - `just int-test` runs only the Blossom media tests (Tier 3). CI runs this; developers run it when touching media code.
 - The integration test framework (Scenario/TestCase traits, ScenarioContext) is either simplified for Tier 3 or
   replaced entirely — most of its complexity (cleanup via logout-sleep-reset-wipe-sleep) exists because of the

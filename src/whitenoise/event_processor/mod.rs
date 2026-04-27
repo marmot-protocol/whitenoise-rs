@@ -21,7 +21,7 @@ mod global_event_processor;
 impl Whitenoise {
     /// Start the event processing loop in a background task
     pub(crate) async fn start_event_processing_loop(
-        whitenoise: Arc<Whitenoise>,
+        whitenoise: Arc<Self>,
         receiver: Receiver<ProcessableEvent>,
         shutdown_receiver: Receiver<()>,
     ) {
@@ -40,7 +40,7 @@ impl Whitenoise {
 
     /// Main event processing loop
     async fn process_events(
-        whitenoise: Arc<Whitenoise>,
+        whitenoise: Arc<Self>,
         mut receiver: Receiver<ProcessableEvent>,
         mut shutdown: Receiver<()>,
     ) {

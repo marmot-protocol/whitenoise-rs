@@ -56,6 +56,16 @@ impl Whitenoise {
         account: &Account,
         event: Event,
     ) -> Result<()> {
+        if session.account_pubkey != account.pubkey {
+            tracing::error!(
+                target: "whitenoise::event_handlers::handle_mls_message",
+                session_pubkey = %session.account_pubkey.to_hex(),
+                account_pubkey = %account.pubkey.to_hex(),
+                "Refusing to process MLS message: session and account refer to different identities"
+            );
+            return Err(WhitenoiseError::AccountNotFound);
+        }
+
         tracing::debug!(
           target: "whitenoise::event_processor::handle_mls_message",
           "Handling MLS message {} (kind {}) for account: {}",

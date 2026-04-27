@@ -69,7 +69,7 @@ impl Whitenoise {
 
         let Ok(whitenoise) = self.arc() else {
             tracing::warn!(
-                target: "whitenoise::handle_relay_list",
+                target: "whitenoise::event_processor::handle_relay_list",
                 "Whitenoise instance unavailable for relay list refresh {}",
                 event_pubkey
             );
@@ -83,7 +83,7 @@ impl Whitenoise {
                     Err(WhitenoiseError::AccountNotFound) => None,
                     Err(error) => {
                         tracing::warn!(
-                            target: "whitenoise::handle_relay_list",
+                            target: "whitenoise::event_processor::handle_relay_list",
                             "Failed to look up account for relay list refresh {}: {}",
                             event_pubkey,
                             error
@@ -98,7 +98,7 @@ impl Whitenoise {
                 && let Err(error) = whitenoise.refresh_account_subscriptions(&account).await
             {
                 tracing::warn!(
-                    target: "whitenoise::handle_relay_list",
+                    target: "whitenoise::event_processor::handle_relay_list",
                     "Failed to refresh account subscriptions after relay list change for {}: {}",
                     event_pubkey,
                     error

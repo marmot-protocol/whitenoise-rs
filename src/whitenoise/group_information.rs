@@ -108,6 +108,9 @@ impl GroupInformation {
         mls_group_ids: &[GroupId],
         whitenoise: &Whitenoise,
     ) -> Result<Vec<GroupInformation>, WhitenoiseError> {
+        if mls_group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let mdk = whitenoise.create_mdk_for_account(account_pubkey)?;
         Self::get_by_mls_group_ids_with_mdk(mls_group_ids, &mdk, &whitenoise.shared.database).await
     }
