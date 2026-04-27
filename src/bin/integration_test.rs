@@ -6,6 +6,8 @@ use nostr_sdk::RelayUrl;
 use ::whitenoise::integration_tests::registry::ScenarioRegistry;
 use ::whitenoise::*;
 
+const INTEGRATION_WHITENOISE_DB_KEY_ID: &str = "integration.whitenoise.db.key.v1";
+
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
@@ -36,6 +38,7 @@ async fn main() -> Result<(), WhitenoiseError> {
         &args.logs_dir,
         "com.whitenoise.integration-test",
     )
+    .with_database_key_id(INTEGRATION_WHITENOISE_DB_KEY_ID)
     .with_discovery_relays(vec![
         RelayUrl::parse("ws://localhost:8080").unwrap(),
         RelayUrl::parse("ws://localhost:7777").unwrap(),

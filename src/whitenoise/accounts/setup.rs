@@ -77,22 +77,21 @@ impl Whitenoise {
 
         self.discovery_sync_worker.request_rebuild();
 
-        // Subscriptions and key package setup operate on disjoint relay
-        // sessions (group/inbox plane vs ephemeral plane) with no shared
-        // mutable state, so they run concurrently.  Key package setup is
-        // best-effort — the KeyPackageMaintenance scheduler retries failures.
-        let (sub_result, kp_result) = tokio::join!(
-            self.setup_subscriptions(account, inbox_relays),
-            self.setup_key_package(account, is_new_account, key_package_relays),
-        );
-        if let Err(e) = kp_result {
+        self.setup_subscriptions(account, inbox_relays).await?;
+
+        // Key package publish uses the account-scoped ephemeral session that
+        // subscription setup warms. Run it after subscription setup so the
+        // background publish does not race a still-starting relay session.
+        if let Err(e) = self
+            .setup_key_package(account, is_new_account, key_package_relays)
+            .await
+        {
             tracing::warn!(
                 target: "whitenoise::accounts",
                 "Key package setup failed, scheduler will retry: {}",
                 e
             );
         }
-        sub_result?;
 
         tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
         Ok(())
