@@ -527,7 +527,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let user = account.user(&self.shared.database).await?;
         let relay_urls = Relay::urls(relays).into_iter().collect::<HashSet<_>>();
-        user.sync_relay_urls(self, relay_type, &relay_urls, None)
+        user.sync_relay_urls(&self.shared, relay_type, &relay_urls, None)
             .await?;
         Ok(())
     }
@@ -566,7 +566,7 @@ impl Whitenoise {
         let ephemeral = self.shared.relay_control.ephemeral();
         let signer = self.get_signer_for_account(account)?;
         let user = account.user(&self.shared.database).await?;
-        let relays = account.nip65_relays(self).await?;
+        let relays = account.nip65_relays(&self.shared).await?;
 
         tokio::spawn(async move {
             tracing::debug!(target: "whitenoise::accounts", "Background task: Publishing metadata for account: {:?}", account_clone.pubkey);
@@ -602,13 +602,13 @@ impl Whitenoise {
         let relays = if let Some(relays) = relays {
             relays.to_vec()
         } else {
-            account.relays(relay_type, self).await?
+            account.relays(relay_type, &self.shared).await?
         };
         let signer = self.get_signer_for_account(account)?;
         let target_relays = if relay_type == RelayType::Nip65 {
             relays.clone()
         } else {
-            account.nip65_relays(self).await?
+            account.nip65_relays(&self.shared).await?
         };
 
         tokio::spawn(async move {
@@ -639,7 +639,7 @@ impl Whitenoise {
     ) -> Result<()> {
         let account_clone = account.clone();
         let ephemeral = self.shared.relay_control.ephemeral();
-        let relays = account.nip65_relays(self).await?;
+        let relays = account.nip65_relays(&self.shared).await?;
         let signer = self.get_signer_for_account(account)?;
         let follows = account.follows(&self.shared.database).await?;
         let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
@@ -925,7 +925,8 @@ impl Whitenoise {
 
         // Gather all inputs before touching existing subscriptions so that a
         // fallible data-fetch cannot leave the account with no active subs.
-        let inbox_relays: Vec<RelayUrl> = Relay::urls(&account.effective_inbox_relays(self).await?);
+        let inbox_relays: Vec<RelayUrl> =
+            Relay::urls(&account.effective_inbox_relays(&self.shared).await?);
 
         let group_specs = self.extract_group_subscription_specs(account).await?;
 
@@ -1020,8 +1021,10 @@ impl Whitenoise {
         account: &Account,
     ) -> Result<Vec<RelayUrl>> {
         let mut warm_relays: HashSet<RelayUrl> = HashSet::new();
-        warm_relays.extend(Relay::urls(&account.nip65_relays(self).await?));
-        warm_relays.extend(Relay::urls(&account.key_package_relays(self).await?));
+        warm_relays.extend(Relay::urls(&account.nip65_relays(&self.shared).await?));
+        warm_relays.extend(Relay::urls(
+            &account.key_package_relays(&self.shared).await?,
+        ));
 
         Ok(warm_relays.into_iter().collect())
     }
@@ -1035,15 +1038,6 @@ mod tests {
     use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
-
-    #[cfg(feature = "integration-tests")]
-    async fn reset_singleton_whitenoise_for_test(whitenoise: &Whitenoise) {
-        whitenoise.shared.external_signers.clear();
-        whitenoise.account_manager.clear_sessions();
-        whitenoise.account_manager.clear_pending_logins();
-        whitenoise.reset_nostr_client().await.unwrap();
-        whitenoise.wipe_database().await.unwrap();
-    }
 
     #[tokio::test]
     async fn test_active_group_count_no_groups() {
@@ -1152,21 +1146,19 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn test_create_group_after_startup_restore_refreshes_creator_group_plane() {
-        let whitenoise = test_get_whitenoise().await;
-        reset_singleton_whitenoise_for_test(whitenoise).await;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let creator_account = whitenoise.create_identity().await.unwrap();
         let member_account = whitenoise.create_identity().await.unwrap();
-        wait_for_key_package_publication(whitenoise, &[&member_account]).await;
+        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
 
         // Simulate app restart: runtime-only sessions are gone,
         // then startup restores relay subscriptions from persisted accounts.
         whitenoise.account_manager.clear_sessions();
         whitenoise.reset_nostr_client().await.unwrap();
-        let whitenoise_arc = whitenoise.arc().unwrap();
         whitenoise
             .account_manager
-            .restore_sessions(&whitenoise_arc)
+            .restore_sessions(&whitenoise)
             .await;
         whitenoise.setup_accounts_subscriptions().await.unwrap();
 
@@ -1246,7 +1238,7 @@ mod tests {
         .unwrap();
 
         let initial_urls = account
-            .nip65_relays(&whitenoise)
+            .nip65_relays(&whitenoise.shared)
             .await
             .unwrap()
             .into_iter()
@@ -1264,7 +1256,7 @@ mod tests {
             .unwrap();
 
         let stored_urls = account
-            .nip65_relays(&whitenoise)
+            .nip65_relays(&whitenoise.shared)
             .await
             .unwrap()
             .into_iter()

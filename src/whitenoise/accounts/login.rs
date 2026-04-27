@@ -311,28 +311,44 @@ mod tests {
         let default_relay_count = default_relays.len();
 
         assert_eq!(
-            account.nip65_relays(whitenoise).await.unwrap().len(),
+            account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .len(),
             default_relay_count,
             "Account should have default NIP-65 relays configured"
         );
         assert_eq!(
-            account.inbox_relays(whitenoise).await.unwrap().len(),
+            account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .len(),
             default_relay_count,
             "Account should have default inbox relays configured"
         );
         assert_eq!(
-            account.key_package_relays(whitenoise).await.unwrap().len(),
+            account
+                .key_package_relays(&whitenoise.shared)
+                .await
+                .unwrap()
+                .len(),
             default_relay_count,
             "Account should have default key package relays configured"
         );
 
         let default_relays_vec: Vec<RelayUrl> = Relay::urls(&default_relays);
         let nip65_relay_urls: Vec<RelayUrl> =
-            Relay::urls(&account.nip65_relays(whitenoise).await.unwrap());
+            Relay::urls(&account.nip65_relays(&whitenoise.shared).await.unwrap());
         let inbox_relay_urls: Vec<RelayUrl> =
-            Relay::urls(&account.inbox_relays(whitenoise).await.unwrap());
-        let key_package_relay_urls: Vec<RelayUrl> =
-            Relay::urls(&account.key_package_relays(whitenoise).await.unwrap());
+            Relay::urls(&account.inbox_relays(&whitenoise.shared).await.unwrap());
+        let key_package_relay_urls: Vec<RelayUrl> = Relay::urls(
+            &account
+                .key_package_relays(&whitenoise.shared)
+                .await
+                .unwrap(),
+        );
         for default_relay in default_relays_vec.iter() {
             assert!(
                 nip65_relay_urls.contains(default_relay),
@@ -394,11 +410,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    #[ignore]
     async fn test_login_after_delete_all_data() {
-        let whitenoise = test_get_whitenoise().await;
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        let account = setup_login_account(whitenoise).await;
+        let account = setup_login_account(&whitenoise).await;
         whitenoise.delete_all_data().await.unwrap();
         let _acc = whitenoise
             .login(account.1.secret_key().to_secret_hex())
@@ -416,7 +431,7 @@ mod tests {
         // Give the events time to be published and processed
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let nip65_relays = account.nip65_relays(&whitenoise).await.unwrap();
+        let nip65_relays = account.nip65_relays(&whitenoise.shared).await.unwrap();
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         // Check that all three event types were published
         let inbox_events = whitenoise
@@ -438,7 +453,7 @@ mod tests {
             .relay_control
             .fetch_user_key_package(
                 account.pubkey,
-                &Relay::urls(&account.nip65_relays(&whitenoise).await.unwrap()),
+                &Relay::urls(&account.nip65_relays(&whitenoise.shared).await.unwrap()),
             )
             .await
             .unwrap();
@@ -706,7 +721,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let nip65_relays = account.nip65_relays(&whitenoise).await.unwrap();
+        let nip65_relays = account.nip65_relays(&whitenoise.shared).await.unwrap();
         let nip65_relay_urls = Relay::urls(&nip65_relays);
         let fetched_metadata = whitenoise
             .shared

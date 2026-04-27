@@ -242,22 +242,6 @@ impl AccountGroup {
         Ok((account_group, was_created))
     }
 
-    /// Gets an AccountGroup for the given account and group, if it exists.
-    #[perf_instrument("account_groups")]
-    pub async fn get(
-        whitenoise: &Whitenoise,
-        account_pubkey: &PublicKey,
-        mls_group_id: &GroupId,
-    ) -> Result<Option<Self>, WhitenoiseError> {
-        let account_group = Self::find_by_account_and_group(
-            account_pubkey,
-            mls_group_id,
-            &whitenoise.shared.database,
-        )
-        .await?;
-        Ok(account_group)
-    }
-
     /// Gets all visible AccountGroups for the given account.
     /// Visible means: pending or accepted (not declined).
     #[perf_instrument("account_groups")]
@@ -633,7 +617,13 @@ impl Whitenoise {
         group_id: &GroupId,
     ) -> Result<(), WhitenoiseError> {
         // 1. Verify the AccountGroup exists
-        let Some(_account_group) = AccountGroup::get(self, &account.pubkey, group_id).await? else {
+        let Some(_account_group) = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            group_id,
+            &self.shared.database,
+        )
+        .await?
+        else {
             return Err(WhitenoiseError::GroupNotFound);
         };
 
@@ -964,9 +954,13 @@ mod tests {
         let account = whitenoise.create_identity().await.unwrap();
         let group_id = GroupId::from_slice(&[13; 32]);
 
-        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let result = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_none());
     }
@@ -984,9 +978,13 @@ mod tests {
             .unwrap();
 
         // Now get should return it
-        let result = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let result = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(result.is_some());
         let ag = result.unwrap();
@@ -2081,10 +2079,14 @@ mod tests {
         re_save.save(&whitenoise.shared.database).await.unwrap();
 
         // Fetch and confirm muted_until survived
-        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(
             found.is_muted(),
@@ -2127,14 +2129,22 @@ mod tests {
         assert_eq!(cleared.len(), 2);
 
         // Verify DB rows are actually cleared
-        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id1)
-            .await
-            .unwrap()
-            .unwrap();
-        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id2)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag1 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id1,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let ag2 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id2,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(ag1.muted_until.is_none());
         assert!(ag2.muted_until.is_none());
@@ -2163,10 +2173,14 @@ mod tests {
 
         // One expired (set via DB layer), one forever, one future
         let past = Utc::now() - chrono::Duration::seconds(10);
-        let expired_ag = AccountGroup::get(&whitenoise, &account.pubkey, &expired_group)
-            .await
-            .unwrap()
-            .unwrap();
+        let expired_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &expired_group,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         expired_ag
             .update_muted_until(Some(past), &whitenoise.shared.database)
             .await
@@ -2189,14 +2203,22 @@ mod tests {
         assert_eq!(cleared[0].mls_group_id, expired_group);
 
         // Active mutes must be untouched
-        let forever_ag = AccountGroup::get(&whitenoise, &account.pubkey, &forever_group)
-            .await
-            .unwrap()
-            .unwrap();
-        let future_ag = AccountGroup::get(&whitenoise, &account.pubkey, &future_group)
-            .await
-            .unwrap()
-            .unwrap();
+        let forever_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &forever_group,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let future_ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &future_group,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(forever_ag.is_muted_forever());
         assert!(future_ag.is_muted());
@@ -2238,10 +2260,14 @@ mod tests {
         re_save.save(&whitenoise.shared.database).await.unwrap();
 
         // Fetch and confirm removed_at survived
-        let found = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let found = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert!(
             found.is_removed(),
@@ -2387,10 +2413,14 @@ mod tests {
             .unwrap();
         let after = Utc::now();
 
-        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         let cleared_at = ag.chat_cleared_at.expect("chat_cleared_at must be set");
         // Allow 1s tolerance for millisecond truncation in the database layer
@@ -2449,10 +2479,14 @@ mod tests {
             .unwrap();
 
         // Verify last_read_message_id is reset
-        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             ag.last_read_message_id.is_none(),
             "last_read_message_id must be None after clear_chat"
@@ -2479,10 +2513,14 @@ mod tests {
             .clear_chat()
             .await
             .unwrap();
-        let ag1 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag1 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let first_cleared_at = ag1.chat_cleared_at.unwrap();
 
         // Second clear should also succeed
@@ -2494,10 +2532,14 @@ mod tests {
             .clear_chat()
             .await
             .unwrap();
-        let ag2 = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let ag2 = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let second_cleared_at = ag2.chat_cleared_at.unwrap();
 
         assert!(

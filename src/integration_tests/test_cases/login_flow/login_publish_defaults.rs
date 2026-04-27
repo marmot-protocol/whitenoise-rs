@@ -48,7 +48,7 @@ impl TestCase for LoginPublishDefaultsTestCase {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &context.whitenoise)
+                .relays(relay_type, &context.whitenoise.shared)
                 .await?;
             assert!(
                 !relays.is_empty(),

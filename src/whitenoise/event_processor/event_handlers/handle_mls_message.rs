@@ -1923,9 +1923,6 @@ mod tests {
 
     /// Test that auto-committed proposals (e.g., admin auto-commits a
     /// member's self-removal) are published and merged successfully.
-    // TODO(phase-16): publish_and_merge_commit calls Self::wn() which requires the
-    // singleton. Re-enable once relay publishing is threaded through the session.
-    #[ignore]
     #[tokio::test]
     async fn test_handle_mls_message_auto_committed_proposal() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2154,9 +2151,6 @@ mod tests {
     /// Verify MLS state consistency after an auto-committed removal:
     /// the admin can still create messages in the group, confirming
     /// that merge_pending_commit left the state valid.
-    // TODO(phase-16): publish_and_merge_commit calls Self::wn() which requires the
-    // singleton. Re-enable once relay publishing is threaded through the session.
-    #[ignore]
     #[tokio::test]
     async fn test_handle_mls_message_commit_after_auto_committed_proposal() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

@@ -2051,10 +2051,6 @@ mod tests {
         );
     }
 
-    // TODO(phase-16): Re-enable once stream managers are moved into AccountSession.
-    // MembershipOpsForGroup::emit_chat_list_update requires the Whitenoise singleton,
-    // which is unavailable in unit tests. The emit never fires so the channel recv times out.
-    #[ignore]
     #[tokio::test]
     async fn test_archive_chat_emits_to_both_stream_channels() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

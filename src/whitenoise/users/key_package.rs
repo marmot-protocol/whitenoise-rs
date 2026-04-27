@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
 use crate::relay_control::ephemeral::KeyPackageLookup;
 use crate::whitenoise::{
-    Whitenoise,
     error::Result,
     relays::{Relay, RelayType},
+    shared::SharedServices,
     users::User,
 };
 
@@ -34,10 +36,11 @@ impl User {
     /// 3. Whitenoise discovery/fallback relays
     /// 4. Default bootstrap relays from `Relay::defaults()`
     #[perf_instrument("users")]
-    pub async fn key_package_relay_urls(&self, whitenoise: &Whitenoise) -> Result<Vec<RelayUrl>> {
-        let kp_relays = self
-            .relays(RelayType::KeyPackage, &whitenoise.shared.database)
-            .await?;
+    pub async fn key_package_relay_urls(
+        &self,
+        shared: &Arc<SharedServices>,
+    ) -> Result<Vec<RelayUrl>> {
+        let kp_relays = self.relays(RelayType::KeyPackage, &shared.database).await?;
         if !kp_relays.is_empty() {
             return Ok(Relay::urls(&kp_relays));
         }
@@ -48,9 +51,7 @@ impl User {
             self.pubkey
         );
 
-        let nip65_relays = self
-            .relays(RelayType::Nip65, &whitenoise.shared.database)
-            .await?;
+        let nip65_relays = self.relays(RelayType::Nip65, &shared.database).await?;
         if !nip65_relays.is_empty() {
             return Ok(Relay::urls(&nip65_relays));
         }
@@ -61,7 +62,7 @@ impl User {
             self.pubkey
         );
 
-        let fallback_relays = whitenoise.fallback_relay_urls().await;
+        let fallback_relays = shared.fallback_relay_urls().await;
         if !fallback_relays.is_empty() {
             return Ok(fallback_relays);
         }
@@ -83,10 +84,10 @@ impl User {
     ///
     /// # Arguments
     ///
-    /// * `whitenoise` - The Whitenoise instance used to access the Nostr client and database
+    /// * `shared` - Shared services used to access the relay control plane and database
     #[perf_instrument("users")]
-    pub async fn key_package_event(&self, whitenoise: &Whitenoise) -> Result<Option<Event>> {
-        match self.key_package_lookup(whitenoise).await? {
+    pub async fn key_package_event(&self, shared: &Arc<SharedServices>) -> Result<Option<Event>> {
+        match self.key_package_lookup(shared).await? {
             KeyPackageLookup::Found(event) => Ok(Some(event)),
             KeyPackageLookup::Incompatible { .. } | KeyPackageLookup::NotFound => Ok(None),
         }
@@ -95,9 +96,9 @@ impl User {
     #[perf_instrument("users")]
     pub(crate) async fn key_package_lookup(
         &self,
-        whitenoise: &Whitenoise,
+        shared: &Arc<SharedServices>,
     ) -> Result<KeyPackageLookup> {
-        let relay_urls = self.key_package_relay_urls(whitenoise).await?;
+        let relay_urls = self.key_package_relay_urls(shared).await?;
         if relay_urls.is_empty() {
             tracing::warn!(
                 target: "whitenoise::users::key_package",
@@ -107,8 +108,7 @@ impl User {
             return Ok(KeyPackageLookup::NotFound);
         }
 
-        let lookup = whitenoise
-            .shared
+        let lookup = shared
             .relay_control
             .fetch_user_key_package_lookup(self.pubkey, &relay_urls)
             .await?;
@@ -124,14 +124,17 @@ impl User {
     /// relay data yet (e.g. created by a background sync that hasn't finished), this
     /// method will perform a blocking relay sync and retry once.
     #[perf_instrument("users")]
-    pub async fn key_package_status(&self, whitenoise: &Whitenoise) -> Result<KeyPackageStatus> {
-        let lookup = self.key_package_lookup(whitenoise).await?;
+    pub async fn key_package_status(
+        &self,
+        shared: &Arc<SharedServices>,
+    ) -> Result<KeyPackageStatus> {
+        let lookup = self.key_package_lookup(shared).await?;
         let status = classify_key_package_lookup(lookup);
 
         match status {
             KeyPackageStatus::NotFound
                 if self
-                    .relays(RelayType::KeyPackage, &whitenoise.shared.database)
+                    .relays(RelayType::KeyPackage, &shared.database)
                     .await?
                     .is_empty() =>
             {
@@ -140,7 +143,7 @@ impl User {
                     "Key package not found for user {} with empty relay list, syncing relays and retrying",
                     self.pubkey
                 );
-                if let Err(e) = self.update_relay_lists(whitenoise).await {
+                if let Err(e) = self.update_relay_lists(shared).await {
                     tracing::warn!(
                         target: "whitenoise::users::key_package",
                         "Failed to sync relay lists for user {}: {}",
@@ -149,7 +152,7 @@ impl User {
                     );
                     return Ok(KeyPackageStatus::NotFound);
                 }
-                let lookup = self.key_package_lookup(whitenoise).await?;
+                let lookup = self.key_package_lookup(shared).await?;
                 Ok(classify_key_package_lookup(lookup))
             }
             other => Ok(other),

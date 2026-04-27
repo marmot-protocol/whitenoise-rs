@@ -119,7 +119,7 @@ where
 impl AccountGroup {
     /// Finds an AccountGroup by account pubkey and MLS group ID.
     #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn find_by_account_and_group(
+    pub async fn find_by_account_and_group(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         database: &Database,

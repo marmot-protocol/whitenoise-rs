@@ -145,7 +145,7 @@ impl WhitenoiseConfig {
 }
 
 pub struct Whitenoise {
-    pub(crate) shared: Arc<shared::SharedServices>,
+    pub shared: Arc<shared::SharedServices>,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
     /// Shutdown signal for scheduled tasks
@@ -1096,24 +1096,6 @@ pub mod test_utils {
         }
     }
 
-    pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
-        static TEST_SINGLETON: tokio::sync::OnceCell<&'static Whitenoise> =
-            tokio::sync::OnceCell::const_new();
-
-        // Singleton-backed tests can spawn background tasks that outlive the
-        // helper call, so the temp dirs backing the singleton config must stay
-        // alive for the rest of the process.
-        TEST_SINGLETON
-            .get_or_init(|| async {
-                let (config, data_temp, logs_temp) = create_test_config();
-                std::mem::forget(data_temp);
-                std::mem::forget(logs_temp);
-                let arc = Whitenoise::new(config).await.unwrap();
-                &**Box::leak(Box::new(arc))
-            })
-            .await
-    }
-
     pub(crate) async fn setup_login_account(whitenoise: &Whitenoise) -> (Account, Keys) {
         let keys = create_test_keys();
         let account = whitenoise
@@ -1147,7 +1129,10 @@ pub mod test_utils {
                 .create_test_identity_with_keys(&keys)
                 .await
                 .unwrap();
-            let key_package_relays = account.key_package_relays(whitenoise).await.unwrap();
+            let key_package_relays = account
+                .key_package_relays(&whitenoise.shared)
+                .await
+                .unwrap();
             whitenoise
                 .create_and_publish_key_package(&account, &key_package_relays)
                 .await
@@ -1168,7 +1153,7 @@ pub mod test_utils {
                 for publisher_account in publisher_accounts {
                     let relay_urls = Relay::urls(
                         &publisher_account
-                            .key_package_relays(whitenoise)
+                            .key_package_relays(&whitenoise.shared)
                             .await
                             .unwrap(),
                     );
@@ -1210,8 +1195,12 @@ pub mod test_utils {
     ) -> (GroupId, Vec<UnsignedEvent>) {
         let mut key_package_events = Vec::with_capacity(member_accounts.len());
         for member_account in member_accounts {
-            let relay_urls =
-                Relay::urls(&member_account.key_package_relays(whitenoise).await.unwrap());
+            let relay_urls = Relay::urls(
+                &member_account
+                    .key_package_relays(&whitenoise.shared)
+                    .await
+                    .unwrap(),
+            );
             let key_package_event = whitenoise
                 .shared
                 .relay_control
@@ -2358,19 +2347,29 @@ mod tests {
         //   - New messages are NOT in any fetched historical page (they are newer
         //     than the snapshot window and thus beyond the cursor's reach).
 
-        /// Helper: create a minimal account in the DB (no network calls).
-        /// `fetch_aggregated_messages_for_group` requires an account to exist for its
-        /// security check, but does not need a full session to be active.
-        async fn create_db_account(whitenoise: &Whitenoise) -> accounts::Account {
-            let (account, _keys) = accounts::Account::new(whitenoise, None).await.unwrap();
-            account.save(&whitenoise.shared.database).await.unwrap()
+        /// Helper: create a minimal account in the DB plus a registered session
+        /// (no network calls). `subscribe_to_group_messages` and the chat-list
+        /// view both require an `AccountSession` to be present in the manager.
+        async fn create_db_account(whitenoise: &Arc<Whitenoise>) -> accounts::Account {
+            let (account, keys) = accounts::Account::new(whitenoise, None).await.unwrap();
+            whitenoise
+                .shared
+                .secrets_store
+                .store_private_key(&keys)
+                .expect("store keys");
+            let account = account.save(&whitenoise.shared.database).await.unwrap();
+            let session = Arc::new(
+                session::AccountSession::from_account(&account, whitenoise)
+                    .await
+                    .unwrap(),
+            );
+            whitenoise.account_manager.insert_session(session);
+            account
         }
 
         /// Core happy-path scenario: user opens the chat (snapshot), scrolls up to load
         /// older messages (paginated fetch), and concurrently receives new messages
         /// (updates receiver) that land at the bottom.
-        // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-        #[ignore]
         #[tokio::test]
         async fn test_scroll_up_while_receiving_new_messages() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2569,8 +2568,6 @@ mod tests {
 
         /// Exhausting history: after two full pages the third page is empty, confirming
         /// the cursor correctly signals end-of-history to the client.
-        // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-        #[ignore]
         #[tokio::test]
         async fn test_scroll_up_exhausts_history_cleanly() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2637,8 +2634,6 @@ mod tests {
         /// When the user scrolls up through several pages and then a new message arrives,
         /// the live update is still delivered correctly regardless of how many historical
         /// pages have been fetched.  The updates receiver is independent of pagination.
-        // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-        #[ignore]
         #[tokio::test]
         async fn test_live_updates_independent_of_how_many_pages_were_fetched() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2744,8 +2739,6 @@ mod tests {
         /// Tied timestamps across a page boundary: if several messages share the same
         /// `created_at` second and straddle the snapshot boundary, the compound cursor
         /// ensures the page fetch picks up exactly the right set — no duplicates, no gaps.
-        // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-        #[ignore]
         #[tokio::test]
         async fn test_scroll_up_with_tied_timestamps_at_page_boundary() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2924,7 +2917,7 @@ mod tests {
             let signer = whitenoise.get_signer_for_account(&creator_account).unwrap();
             let inbox_relays = crate::whitenoise::relays::Relay::urls(
                 &creator_account
-                    .effective_inbox_relays(&whitenoise)
+                    .effective_inbox_relays(&whitenoise.shared)
                     .await
                     .unwrap(),
             );
@@ -3712,7 +3705,7 @@ mod tests {
         #[tokio::test]
         async fn test_fallback_relay_urls_uses_discovery_plane_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let fallback = whitenoise.fallback_relay_urls().await;
+            let fallback = whitenoise.shared.fallback_relay_urls().await;
             let discovery_urls = whitenoise.config().discovery_relays.clone();
 
             for url in &discovery_urls {
@@ -3730,7 +3723,7 @@ mod tests {
             // A relay URL that was never added to the discovery plane must not appear in fallback.
             let extra_url = RelayUrl::parse("wss://extra.relay.test").unwrap();
 
-            let fallback = whitenoise.fallback_relay_urls().await;
+            let fallback = whitenoise.shared.fallback_relay_urls().await;
             assert!(
                 !fallback.contains(&extra_url),
                 "Fallback should not include a relay that was never added to discovery"
@@ -3740,7 +3733,7 @@ mod tests {
         #[tokio::test]
         async fn test_fallback_relay_urls_deduplicates() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-            let fallback = whitenoise.fallback_relay_urls().await;
+            let fallback = whitenoise.shared.fallback_relay_urls().await;
 
             let unique: HashSet<&RelayUrl> = fallback.iter().collect();
             assert_eq!(

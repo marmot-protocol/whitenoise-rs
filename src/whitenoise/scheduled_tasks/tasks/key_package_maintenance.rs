@@ -574,7 +574,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         let account = whitenoise.create_identity().await.unwrap();
-        let kp_relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let kp_relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let before = whitenoise

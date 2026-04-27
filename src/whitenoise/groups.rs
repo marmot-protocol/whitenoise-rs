@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::{join_all, try_join_all};
 use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
@@ -14,15 +13,16 @@ use crate::{
         accounts::Account,
         accounts_groups::AccountGroup,
         error::{Result, WhitenoiseError},
-        group_information::{GroupInformation, GroupType},
+        group_information::GroupType,
         key_packages::{REQUIRED_MLS_PROPOSAL_TAGS, validate_fetched_member_key_package},
         relays::Relay,
+        shared::SharedServices,
         users::User,
     },
 };
 
 pub mod blossom_error;
-mod media;
+pub(crate) mod media;
 mod membership;
 mod publish;
 mod required_proposals;
@@ -30,24 +30,20 @@ mod required_proposals;
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use required_proposals::RequiredProposal;
 
-impl Whitenoise {
+impl SharedServices {
     #[perf_instrument("groups")]
     pub(crate) async fn resolve_member_delivery_relays(
-        &self,
+        self: &Arc<Self>,
         member: &User,
         fallback_account: &Account,
         context: &'static str,
     ) -> Result<Vec<Relay>> {
-        let inbox_relays = member
-            .relays(RelayType::Inbox, &self.shared.database)
-            .await?;
+        let inbox_relays = member.relays(RelayType::Inbox, &self.database).await?;
         if !inbox_relays.is_empty() {
             return Ok(inbox_relays);
         }
 
-        let nip65_relays = member
-            .relays(RelayType::Nip65, &self.shared.database)
-            .await?;
+        let nip65_relays = member.relays(RelayType::Nip65, &self.database).await?;
         if !nip65_relays.is_empty() {
             return Ok(nip65_relays);
         }
@@ -77,12 +73,14 @@ impl Whitenoise {
 
         Ok(fallback_relays)
     }
+}
 
+impl Whitenoise {
     /// Resolves a single member for group creation: finds or creates the user record,
     /// syncs relay lists for new users, fetches and validates the key package.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.shared.database).await?;
-        if created && let Err(e) = user.update_relay_lists(self).await {
+        if created && let Err(e) = user.update_relay_lists(&self.shared).await {
             tracing::warn!(
                 target: "whitenoise::groups",
                 "Failed to update relay lists for new user {}: {}",
@@ -92,7 +90,7 @@ impl Whitenoise {
         }
 
         let _kp_fetch = perf_span!("groups::fetch_key_package");
-        let lookup = user.key_package_lookup(self).await?;
+        let lookup = user.key_package_lookup(&self.shared).await?;
         drop(_kp_fetch);
 
         let event = match lookup {
@@ -126,62 +124,6 @@ impl Whitenoise {
         Ok((user, event))
     }
 
-    /// Creates local database records for a newly created group.
-    #[allow(deprecated)]
-    #[perf_instrument("groups")]
-    async fn finalize_group_records(
-        &self,
-        group: &group_types::Group,
-        member_pubkeys: &[PublicKey],
-        group_type: Option<GroupType>,
-        group_name: &str,
-        creator_account: &Account,
-    ) -> Result<()> {
-        let group_info = GroupInformation::create_for_group(
-            self,
-            &group.mls_group_id.clone(),
-            group_type,
-            group_name,
-        )
-        .await?;
-
-        let dm_peer = if group_info.group_type == GroupType::DirectMessage {
-            member_pubkeys.first()
-        } else {
-            None
-        };
-
-        let (account_group, _) = AccountGroup::get_or_create(
-            self,
-            &creator_account.pubkey,
-            &group.mls_group_id,
-            dm_peer,
-        )
-        .await?;
-        account_group.accept(self).await?;
-
-        if let Err(error) = self
-            .share_local_push_token_to_group(creator_account, &group.mls_group_id)
-            .await
-        {
-            tracing::warn!(
-                target: "whitenoise::groups",
-                account = %creator_account.pubkey.to_hex(),
-                group = %hex::encode(group.mls_group_id.as_slice()),
-                error = %error,
-                "Failed to share local push token after group creation"
-            );
-        }
-
-        Ok(())
-    }
-
-    // NOTE: Unlike the other deprecated wrappers below (all(), get(), archive_chat(), etc.),
-    // this method retains its own implementation rather than delegating to
-    // `AccountSession::groups().create_group()`. The session path calls `Self::wn()` (the
-    // singleton bridge) which panics in unit tests where no global singleton is registered.
-    // Delegating here would break the existing test suite. Remove this copy when Phase 16
-    // eliminates the singleton.
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::groups().create_group() instead."
@@ -195,134 +137,13 @@ impl Whitenoise {
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        let signer = self.get_signer_for_account(creator_account)?;
-
-        let unique: BTreeSet<&PublicKey> = member_pubkeys.iter().collect();
-        if unique.len() != member_pubkeys.len() {
-            return Err(WhitenoiseError::InvalidInput(
-                "member_pubkeys contains duplicates".to_string(),
-            ));
-        }
-
-        let member_futures = member_pubkeys
-            .iter()
-            .map(|pk| self.resolve_member_key_package(pk));
-        let resolved_members = try_join_all(member_futures).await?;
-        let (members, key_package_events): (Vec<User>, Vec<Event>) =
-            resolved_members.into_iter().unzip();
-
-        let mdk = self.create_mdk_for_account(creator_account.pubkey)?;
-        let group_name = config.name.clone();
-
-        let create_group_result =
-            mdk.create_group(&creator_account.pubkey, key_package_events.clone(), config)?;
-
-        let group = create_group_result.group;
-
-        if create_group_result.welcome_rumors.len() != members.len() {
-            return Err(WhitenoiseError::Internal(
-                "Welcome rumours are missing for some of the members".to_string(),
-            ));
-        }
-
-        let kp_pubkey_by_event_id: std::collections::HashMap<EventId, PublicKey> =
-            key_package_events
-                .iter()
-                .map(|event| (event.id, event.pubkey))
-                .collect();
-
-        let mut members_by_pubkey: std::collections::HashMap<PublicKey, User> = members
-            .into_iter()
-            .map(|member| (member.pubkey, member))
-            .collect();
-
-        let welcome_data: Vec<(UnsignedEvent, User, PublicKey)> = create_group_result
-            .welcome_rumors
-            .into_iter()
-            .map(|rumor| {
-                let kp_event_id = rumor.tags.event_ids().next().ok_or_else(|| {
-                    WhitenoiseError::Internal("No event ID found in welcome rumor".to_string())
-                })?;
-                let member_pubkey = kp_pubkey_by_event_id.get(kp_event_id).copied().ok_or(
-                    WhitenoiseError::Internal(
-                        "No public key found in key package event".to_string(),
-                    ),
-                )?;
-                let member =
-                    members_by_pubkey
-                        .remove(&member_pubkey)
-                        .ok_or(WhitenoiseError::Internal(format!(
-                            "No member record found for welcome target {}",
-                            member_pubkey
-                        )))?;
-                Ok((rumor, member, member_pubkey))
-            })
-            .collect::<Result<_>>()?;
-
-        self.finalize_group_records(
-            &group,
-            &member_pubkeys,
-            group_type,
-            &group_name,
-            creator_account,
-        )
-        .await?;
-
-        // Background welcome publishing
-        let creator_account_clone = creator_account.clone();
-        let whitenoise = self.arc()?;
-        tokio::spawn(async move {
-            let futures = welcome_data
-                .into_iter()
-                .map(|(rumor, member, member_pubkey)| {
-                    let signer: Arc<dyn NostrSigner> = signer.clone();
-                    let creator = &creator_account_clone;
-                    let whitenoise = &whitenoise;
-                    async move {
-                        let relays_to_use = whitenoise
-                            .resolve_member_delivery_relays(
-                                &member,
-                                creator,
-                                "whitenoise::groups::create_group",
-                            )
-                            .await?;
-
-                        let one_month_future =
-                            Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
-
-                        whitenoise
-                            .shared
-                            .relay_control
-                            .publish_welcome(
-                                &member_pubkey,
-                                rumor,
-                                &[Tag::expiration(one_month_future)],
-                                creator.pubkey,
-                                &Relay::urls(&relays_to_use),
-                                signer,
-                            )
-                            .await
-                            .map_err(WhitenoiseError::from)?;
-
-                        Ok::<(), WhitenoiseError>(())
-                    }
-                });
-
-            let results = join_all(futures).await;
-            for result in results {
-                if let Err(error) = result {
-                    tracing::warn!(
-                        target: "whitenoise::groups",
-                        "Background welcome publish failed: {}",
-                        error
-                    );
-                }
-            }
-        });
-
-        self.background_refresh_account_group_subscriptions(creator_account);
-
-        Ok(group)
+        let session = self
+            .session(&creator_account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        session
+            .groups()
+            .create_group(member_pubkeys, config, group_type)
+            .await
     }
 
     #[deprecated(since = "0.0.0", note = "Use AccountSession::groups().all() instead.")]
@@ -531,7 +352,12 @@ impl Whitenoise {
             let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
             let relays_to_use = self
-                .resolve_member_delivery_relays(&user, account, "whitenoise::groups")
+                .shared
+                .resolve_member_delivery_relays(
+                    &user,
+                    account,
+                    "whitenoise::accounts::groups::add_members_to_group",
+                )
                 .await?;
 
             let relay_urls = Relay::urls(&relays_to_use);
@@ -635,9 +461,13 @@ impl Whitenoise {
     #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
-        let account_group = AccountGroup::get(self, &account.pubkey, group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let account_group = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            group_id,
+            &self.shared.database,
+        )
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
 
         if account_group.is_removed() {
             return Err(WhitenoiseError::AlreadyDepartedFromGroup);
@@ -678,6 +508,7 @@ mod tests {
     use super::*;
     use crate::whitenoise::Whitenoise;
     use crate::whitenoise::database::media_files::MediaFile;
+    use crate::whitenoise::group_information::GroupInformation;
     use crate::whitenoise::test_utils::*;
     use mdk_core::media_processing::MediaProcessingOptions;
     use mdk_storage_traits::Secret;
@@ -816,10 +647,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(group_info.mls_group_id, group.mls_group_id);
-        assert_eq!(
-            group_info.group_type,
-            crate::whitenoise::group_information::GroupType::Group
-        );
+        assert_eq!(group_info.group_type, GroupType::Group);
         // Note: participant_count is stored separately and managed by the GroupInformation logic
 
         // Verify group members can be retrieved
@@ -855,10 +683,13 @@ mod tests {
         }
 
         // Verify AccountGroup was created and auto-accepted for the creator
-        let account_group =
-            AccountGroup::get(whitenoise, &creator_account.pubkey, &group.mls_group_id)
-                .await
-                .unwrap();
+        let account_group = AccountGroup::find_by_account_and_group(
+            &creator_account.pubkey,
+            &group.mls_group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(
             account_group.is_some(),
             "AccountGroup should be created for creator"
@@ -973,10 +804,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(group_info.mls_group_id, group.mls_group_id);
-        assert_eq!(
-            group_info.group_type,
-            crate::whitenoise::group_information::GroupType::DirectMessage
-        );
+        assert_eq!(group_info.group_type, GroupType::DirectMessage);
         // DirectMessage groups should have exactly 2 participants (verified via member count below)
 
         // Verify both participants are admins (standard for DM groups)
@@ -1337,6 +1165,7 @@ mod tests {
         .await;
 
         let resolved_relays = whitenoise
+            .shared
             .resolve_member_delivery_relays(
                 &member_user,
                 &fallback_account,
@@ -1380,6 +1209,7 @@ mod tests {
         set_user_relays(&whitenoise, &member_user, RelayType::Inbox, &[]).await;
 
         let resolved_relays = whitenoise
+            .shared
             .resolve_member_delivery_relays(
                 &member_user,
                 &fallback_account,
@@ -1417,6 +1247,7 @@ mod tests {
         .await;
 
         let resolved_relays = whitenoise
+            .shared
             .resolve_member_delivery_relays(
                 &member_user,
                 &fallback_account,
@@ -1448,6 +1279,7 @@ mod tests {
         set_user_relays(&whitenoise, &fallback_user, RelayType::Nip65, &[]).await;
 
         let error = whitenoise
+            .shared
             .resolve_member_delivery_relays(
                 &member_user,
                 &fallback_account,
@@ -1840,10 +1672,6 @@ mod tests {
         );
     }
 
-    // TODO(phase-16): Re-enable once storage moves into AccountSession.
-    // MediaOps::upload_group_image calls Self::wn() for media_files().store_and_record(),
-    // which requires the Whitenoise singleton unavailable in unit tests.
-    #[ignore]
     #[allow(deprecated)]
     #[tokio::test]
     async fn test_upload_group_image() {
@@ -1994,10 +1822,6 @@ mod tests {
         );
     }
 
-    // TODO(phase-16): Re-enable once storage moves into AccountSession.
-    // MediaOps::check_cached_image calls Self::wn() for media_files().find_file_with_prefix(),
-    // which requires the Whitenoise singleton unavailable in unit tests.
-    #[ignore]
     #[allow(deprecated)]
     #[tokio::test]
     async fn test_sync_group_image_cache() {
@@ -2125,10 +1949,6 @@ mod tests {
         );
     }
 
-    // TODO(phase-16): Re-enable once storage moves into AccountSession.
-    // MediaOps::upload_chat_media calls Self::wn() for media_files().store_and_record(),
-    // which requires the Whitenoise singleton unavailable in unit tests.
-    #[ignore]
     #[allow(deprecated)]
     #[tokio::test]
     async fn test_upload_chat_media() {
