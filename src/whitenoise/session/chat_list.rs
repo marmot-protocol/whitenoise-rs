@@ -8,13 +8,12 @@ use nostr_sdk::PublicKey;
 
 use super::AccountSession;
 use crate::perf_instrument;
-use crate::whitenoise::Whitenoise;
-use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list::{
     ChatListItem, assemble_chat_list_items, collect_pubkeys_to_fetch, sort_chat_list,
 };
+use crate::whitenoise::chat_list_streaming::{ChatListUpdate, ChatListUpdateTrigger};
 use crate::whitenoise::error::Result;
 use crate::whitenoise::group_information::{GroupInformation, GroupType};
 use crate::whitenoise::groups::GroupWithMembership;
@@ -60,6 +59,99 @@ impl<'a> ChatListOps<'a> {
             .filter(|gwm| gwm.membership.is_archived())
             .collect();
         self.build_for(archived).await
+    }
+
+    /// Best-effort chat list stream notification for this account.
+    ///
+    /// Builds a chat list item for `group_id` and routes it to the active
+    /// and/or archived stream managers based on `trigger` and the item's
+    /// archive status. Errors are logged, never returned.
+    #[perf_instrument("chat_list")]
+    pub(crate) async fn emit_update(&self, group_id: &GroupId, trigger: ChatListUpdateTrigger) {
+        let pubkey = &self.session.account_pubkey;
+        let has_active = self
+            .session
+            .shared
+            .chat_list_stream_manager
+            .has_subscribers(pubkey);
+        let has_archived = self
+            .session
+            .shared
+            .archived_chat_list_stream_manager
+            .has_subscribers(pubkey);
+        if !has_active && !has_archived {
+            return;
+        }
+
+        match self.build_item(group_id).await {
+            Ok(Some(item)) => {
+                let update = ChatListUpdate { trigger, item };
+                match trigger {
+                    ChatListUpdateTrigger::ChatArchiveChanged
+                    | ChatListUpdateTrigger::ChatDeleted => {
+                        if has_active {
+                            self.session
+                                .shared
+                                .chat_list_stream_manager
+                                .emit(pubkey, update.clone());
+                        }
+                        if has_archived {
+                            self.session
+                                .shared
+                                .archived_chat_list_stream_manager
+                                .emit(pubkey, update);
+                        }
+                    }
+                    ChatListUpdateTrigger::RemovedFromGroup | ChatListUpdateTrigger::LeftGroup => {
+                        if update.item.archived_at.is_some() {
+                            if has_archived {
+                                self.session
+                                    .shared
+                                    .archived_chat_list_stream_manager
+                                    .emit(pubkey, update);
+                            }
+                        } else if has_active {
+                            self.session
+                                .shared
+                                .chat_list_stream_manager
+                                .emit(pubkey, update);
+                        }
+                    }
+                    _ => {
+                        if update.item.archived_at.is_some() {
+                            if has_archived {
+                                self.session
+                                    .shared
+                                    .archived_chat_list_stream_manager
+                                    .emit(pubkey, update);
+                            }
+                        } else if has_active {
+                            self.session
+                                .shared
+                                .chat_list_stream_manager
+                                .emit(pubkey, update);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    target: "whitenoise::session::chat_list",
+                    "Skipped {:?} update for group {} - item not buildable",
+                    trigger,
+                    hex::encode(group_id.as_slice()),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::session::chat_list",
+                    "Failed to build chat list item for {:?} in group {}: {}",
+                    trigger,
+                    hex::encode(group_id.as_slice()),
+                    e
+                );
+            }
+        }
     }
 
     /// Build a single [`ChatListItem`] for a specific group.
@@ -178,40 +270,36 @@ impl<'a> ChatListOps<'a> {
         Ok(items)
     }
 
-    /// Returns an empty map if the singleton is unavailable (e.g. in tests).
     async fn resolve_group_images(
         &self,
         groups: &[group_types::Group],
         group_info_map: &HashMap<GroupId, GroupInformation>,
     ) -> HashMap<GroupId, PathBuf> {
-        // TODO(phase-16b): remove singleton access once media services move to session scope.
-        let wn = match Whitenoise::get_instance() {
-            Ok(wn) => wn,
-            Err(_) => return HashMap::new(),
-        };
-        let account = match Account::find_by_pubkey(
-            &self.session.account_pubkey,
-            &self.session.shared.database,
-        )
-        .await
-        {
-            Ok(account) => account,
-            Err(_) => return HashMap::new(),
-        };
-
-        let group_type_groups: Vec<_> = groups
-            .iter()
-            .filter(|g| {
-                group_info_map
-                    .get(&g.mls_group_id)
-                    .map(|info| info.group_type == GroupType::Group)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-
-        wn.resolve_group_image_paths(&account, &group_type_groups)
-            .await
+        let group_ops = self.session.groups();
+        let media = group_ops.media();
+        let mut paths = HashMap::new();
+        for group in groups.iter().filter(|g| {
+            group_info_map
+                .get(&g.mls_group_id)
+                .map(|info| info.group_type == GroupType::Group)
+                .unwrap_or(false)
+        }) {
+            match media.resolve_group_image_path(group).await {
+                Ok(Some(path)) => {
+                    paths.insert(group.mls_group_id.clone(), path);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::session::chat_list",
+                        "Failed to resolve image for group {}: {}",
+                        hex::encode(group.mls_group_id.as_slice()),
+                        e
+                    );
+                }
+            }
+        }
+        paths
     }
 }
 

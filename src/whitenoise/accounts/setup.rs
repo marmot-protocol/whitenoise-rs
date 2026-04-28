@@ -19,7 +19,8 @@ use super::{Account, ExternalSignerRelaySetup};
 
 impl Whitenoise {
     async fn insert_account_session(&self, account: &Account) -> Result<()> {
-        let session = Arc::new(AccountSession::from_account(account, self).await?);
+        let arc = self.arc()?;
+        let session = Arc::new(AccountSession::from_account(account, &arc).await?);
         self.account_manager.insert_session(session);
         Ok(())
     }
@@ -798,19 +799,14 @@ impl Whitenoise {
             );
             return;
         }
+        let Ok(whitenoise) = self.arc() else {
+            tracing::error!(
+                target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
+                "Whitenoise instance unavailable for background group subscription refresh",
+            );
+            return;
+        };
         let refresh_task = tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(error) => {
-                    tracing::error!(
-                        target: "whitenoise::accounts::background_refresh_account_group_subscriptions",
-                        "Failed to get Whitenoise instance for background group subscription refresh: {}",
-                        error
-                    );
-                    return;
-                }
-            };
-
             if let Err(error) = whitenoise
                 .refresh_account_group_subscriptions_with_cancel(&account_clone, cancel_rx.as_ref())
                 .await
@@ -1167,13 +1163,12 @@ mod tests {
         // then startup restores relay subscriptions from persisted accounts.
         whitenoise.account_manager.clear_sessions();
         whitenoise.reset_nostr_client().await.unwrap();
+        let whitenoise_arc = whitenoise.arc().unwrap();
         whitenoise
             .account_manager
-            .restore_sessions(whitenoise)
+            .restore_sessions(&whitenoise_arc)
             .await;
-        Whitenoise::setup_accounts_subscriptions(whitenoise)
-            .await
-            .unwrap();
+        whitenoise.setup_accounts_subscriptions().await.unwrap();
 
         assert_eq!(
             whitenoise

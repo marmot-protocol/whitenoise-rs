@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{core::*, test_cases::user_discovery::*};
 use crate::{Whitenoise, WhitenoiseError};
 use async_trait::async_trait;
@@ -9,7 +11,7 @@ pub struct UserDiscoveryScenario {
 }
 
 impl UserDiscoveryScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

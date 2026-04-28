@@ -12,7 +12,6 @@ use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
 
 use super::AccountSession;
-use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
@@ -114,28 +113,12 @@ impl<'a> MembershipOpsForGroup<'a> {
             .ok_or(WhitenoiseError::GroupNotFound)
     }
 
-    /// Best-effort chat list stream notification.
-    ///
-    /// Reaches back to the `Whitenoise` singleton for the stream managers that
-    /// are not yet session-scoped.
-    // TODO(phase-16): Move chat list stream managers to AccountSession.
+    /// Best-effort chat list stream notification routed through the session's
+    /// own stream managers.
     async fn emit_chat_list_update(&self, trigger: ChatListUpdateTrigger) {
-        let Ok(wn) = crate::whitenoise::Whitenoise::get_instance() else {
-            tracing::debug!(
-                target: "whitenoise::membership",
-                "Whitenoise singleton unavailable for chat list emit"
-            );
-            return;
-        };
-        let Ok(account) = Account::find_by_pubkey(self.pubkey(), self.db()).await else {
-            tracing::debug!(
-                target: "whitenoise::membership",
-                account = %self.pubkey().to_hex(),
-                "Account row not found for chat list emit"
-            );
-            return;
-        };
-        wn.emit_chat_list_update(&account, self.group_id, trigger)
+        self.session
+            .chat_list()
+            .emit_update(self.group_id, trigger)
             .await;
     }
 

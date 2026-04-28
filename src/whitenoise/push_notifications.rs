@@ -1023,7 +1023,7 @@ impl Whitenoise {
         let database = Arc::clone(&self.shared.database);
         let relay_control = Arc::clone(&self.shared.relay_control);
         let pending = Arc::clone(&self.shared.pending_push_token_responses);
-        let config = self.config.clone();
+        let config = self.config().clone();
         #[cfg(not(test))]
         let delay_ms = ::rand::rng().random_range(1_000..=3_000);
         #[cfg(test)]
@@ -1467,7 +1467,7 @@ mod tests {
         let ephemeral = whitenoise.shared.relay_control.ephemeral();
 
         publish_notification_requests_after_delivery_with(
-            &whitenoise.config,
+            whitenoise.config(),
             &whitenoise.shared.database,
             &whitenoise.shared.relay_control,
             &whitenoise.shared.event_tracker,
@@ -2348,7 +2348,7 @@ mod tests {
         let ephemeral = test_ephemeral_plane(&whitenoise);
 
         publish_notification_requests_after_delivery_with(
-            &whitenoise.config,
+            whitenoise.config(),
             &whitenoise.shared.database,
             &whitenoise.shared.relay_control,
             &whitenoise.shared.event_tracker,

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{shared::*, subscription_processing::*},
@@ -11,7 +13,7 @@ pub struct SubscriptionProcessingScenario {
 }
 
 impl SubscriptionProcessingScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

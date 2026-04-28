@@ -14,12 +14,7 @@ use super::protocol::{MuteDuration, Request, Response};
 
 /// Route a request to the appropriate `Whitenoise` method and produce a response.
 #[allow(deprecated)]
-pub async fn dispatch(req: Request) -> Response {
-    let wn = match Whitenoise::get_instance() {
-        Ok(wn) => wn,
-        Err(e) => return Response::err(format!("whitenoise not initialized: {e}")),
-    };
-
+pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
     match req {
         Request::Ping => Response::ok(serde_json::json!("pong")),
 
@@ -574,23 +569,10 @@ where
 ///
 /// This function takes ownership of the writer and writes response lines until
 /// the stream ends or the client disconnects. The final line has `stream_end: true`.
-pub async fn dispatch_streaming<W>(req: Request, mut writer: W)
+pub async fn dispatch_streaming<W>(req: Request, mut writer: W, wn: &Whitenoise)
 where
     W: AsyncWriteExt + Unpin + Send,
 {
-    let wn = match Whitenoise::get_instance() {
-        Ok(wn) => wn,
-        Err(e) => {
-            let _ = write_response(
-                &mut writer,
-                &Response::err(format!("whitenoise not initialized: {e}")),
-            )
-            .await;
-            write_stream_end(&mut writer).await;
-            return;
-        }
-    };
-
     match req {
         Request::MessagesSubscribe {
             account,

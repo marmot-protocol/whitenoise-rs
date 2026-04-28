@@ -243,6 +243,29 @@ impl PublishedKeyPackage {
 
         Ok(result.rows_affected())
     }
+
+    /// Marks a single key package row's key material as deleted by row id.
+    ///
+    /// Called after the maintenance task successfully deletes the local MLS
+    /// key material. Rows are never deleted — the table serves as an audit trail.
+    /// Scoped by `account_pubkey` so a stray `id` from another account cannot
+    /// mutate this account's row.
+    #[perf_instrument("db::published_key_packages")]
+    pub(crate) async fn mark_key_material_deleted(
+        account_pubkey: &PublicKey,
+        id: i64,
+        database: &Database,
+    ) -> Result<(), DatabaseError> {
+        sqlx::query(
+            "UPDATE published_key_packages SET key_material_deleted = 1
+             WHERE id = ? AND account_pubkey = ?",
+        )
+        .bind(id)
+        .bind(account_pubkey.to_hex())
+        .execute(&database.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -882,6 +905,41 @@ mod tests {
 
         assert!(canonical.key_material_deleted);
         assert!(legacy.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_mark_key_material_deleted_rejects_cross_account_id() {
+        let db = setup_test_db().await;
+        let owner = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+
+        PublishedKeyPackage::create(
+            &owner,
+            &[1, 2, 3],
+            "owner_event",
+            MLS_KEY_PACKAGE_KIND,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+        let pkg = PublishedKeyPackage::find_by_event_id(&owner, "owner_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        PublishedKeyPackage::mark_key_material_deleted(&other, pkg.id, &db)
+            .await
+            .unwrap();
+
+        let pkg = PublishedKeyPackage::find_by_event_id(&owner, "owner_event", &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !pkg.key_material_deleted,
+            "Mismatched account_pubkey must not mutate the row"
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::benchmarks::core::json_output::ScenarioThresholds;
 use crate::integration_tests::benchmarks::scenarios::{
     AddMembersPerformanceBenchmark, GroupCreationBenchmark, IdentityCreationBenchmark,
@@ -36,12 +38,12 @@ macro_rules! benchmark_registry {
 
         /// Run all registered benchmarks
         async fn run_all_registered(
-            whitenoise: &'static Whitenoise,
+            whitenoise: Arc<Whitenoise>,
             results: &mut Vec<BenchmarkResult>,
             first_error: &mut Option<WhitenoiseError>,
         ) {
             $(
-                match $scenario.run_benchmark(whitenoise).await {
+                match $scenario.run_benchmark(whitenoise.clone()).await {
                     Ok(result) => results.push(result),
                     Err(e) => {
                         tracing::error!("Benchmark '{}' failed: {}", $name, e);
@@ -109,7 +111,7 @@ impl BenchmarkRegistry {
     /// Run a single benchmark scenario by name, returning the result.
     pub async fn run_scenario(
         scenario_name: &str,
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
 
@@ -130,7 +132,7 @@ impl BenchmarkRegistry {
 
     /// Run all registered benchmarks, returning results for those that succeeded.
     pub async fn run_all_benchmarks(
-        whitenoise: &'static Whitenoise,
+        whitenoise: Arc<Whitenoise>,
     ) -> Result<Vec<BenchmarkResult>, WhitenoiseError> {
         let overall_start = Instant::now();
         let mut results = Vec::new();

@@ -90,7 +90,7 @@ impl TestCase for LoginCustomRelayTestCase {
         // Verify relays were stored.
         let relays = result
             .account
-            .relays(RelayType::Nip65, context.whitenoise)
+            .relays(RelayType::Nip65, &context.whitenoise)
             .await?;
         assert!(
             !relays.is_empty(),

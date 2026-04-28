@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use ::rand::RngCore;
 use nostr_sdk::{PublicKey, RelayUrl};
@@ -145,7 +145,6 @@ impl WhitenoiseConfig {
 }
 
 pub struct Whitenoise {
-    pub config: WhitenoiseConfig,
     pub(crate) shared: Arc<shared::SharedServices>,
     event_sender: Sender<ProcessableEvent>,
     shutdown_sender: Sender<()>,
@@ -155,17 +154,26 @@ pub struct Whitenoise {
     scheduler_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Per-account session manager. Holds active sessions and pending logins.
     pub(crate) account_manager: session::AccountManager,
+    /// Weak self-reference installed at construction via [`Arc::new_cyclic`].
+    /// Methods that take `&self` but need to hand out an `Arc<Whitenoise>` (for
+    /// example to stamp a back-reference into a freshly constructed
+    /// `AccountSession`) upgrade this. Never upgrade in a context that expects
+    /// the instance to outlive the holder.
+    pub(crate) this: Weak<Whitenoise>,
 }
 
-static GLOBAL_WHITENOISE: OnceCell<Whitenoise> = OnceCell::const_new();
-
-/// Serializes callers of [`Whitenoise::ensure_initialized`] so two concurrent
-/// invokers cannot both observe an uninitialized singleton and both drive
-/// [`Whitenoise::initialize_whitenoise`]. The mutex is only held across the
-/// check-and-possibly-init; once `GLOBAL_WHITENOISE` is populated, subsequent
-/// callers acquire it, observe the populated singleton, and release it
-/// immediately without doing work.
-static ENSURE_INITIALIZED_LOCK: Mutex<()> = Mutex::const_new(());
+/// Process-lifetime cache used exclusively by [`Whitenoise::ensure_initialized`]
+/// to support iOS silent-push handlers that may fire concurrently across
+/// process wake-ups. Holds a clone of the `Arc<Whitenoise>` produced by the
+/// first successful initialization so subsequent callers observe the same
+/// instance instead of double-initializing.
+///
+/// This is **not** a general-purpose access path — `Arc<Whitenoise>` ownership
+/// flows through explicit handles everywhere else (the FFI boundary, sessions,
+/// scheduled tasks). `tokio::sync::OnceCell::get_or_try_init` serializes
+/// concurrent first-callers internally, replacing the previous
+/// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
+static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
 
 struct WhitenoiseComponents {
     event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
@@ -180,7 +188,7 @@ struct WhitenoiseComponents {
 impl std::fmt::Debug for Whitenoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Whitenoise")
-            .field("config", &self.config)
+            .field("config", self.config())
             .field("shared", &"<REDACTED>")
             .field("event_sender", &"<REDACTED>")
             .field("shutdown_sender", &"<REDACTED>")
@@ -196,7 +204,7 @@ impl Whitenoise {
         config: WhitenoiseConfig,
         database: Arc<Database>,
         components: WhitenoiseComponents,
-    ) -> Self {
+    ) -> Arc<Self> {
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
         let relay_control = Arc::new(RelayControlPlane::new(
@@ -207,6 +215,7 @@ impl Whitenoise {
         ));
 
         let shared = Arc::new(shared::SharedServices::new(
+            Arc::new(config),
             database,
             relay_control,
             components.event_tracker,
@@ -215,15 +224,28 @@ impl Whitenoise {
             components.message_aggregator,
         ));
 
-        Self {
-            config,
+        Arc::new_cyclic(|weak: &Weak<Self>| Self {
             shared,
             event_sender: components.event_sender,
             shutdown_sender: components.shutdown_sender,
             scheduler_shutdown: components.scheduler_shutdown,
             scheduler_handles: Mutex::new(Vec::new()),
             account_manager: session::AccountManager::default(),
-        }
+            this: weak.clone(),
+        })
+    }
+
+    /// Access the runtime configuration. The `WhitenoiseConfig` value is held
+    /// behind `Arc<SharedServices>` so every session observes the same instance.
+    pub fn config(&self) -> &WhitenoiseConfig {
+        &self.shared.config
+    }
+
+    /// Upgrade the weak self-reference stamped during [`Arc::new_cyclic`].
+    /// Returns [`WhitenoiseError::Initialization`] if the backing `Arc` has
+    /// already been dropped (only possible mid-drop).
+    pub(crate) fn arc(&self) -> Result<Arc<Self>> {
+        self.this.upgrade().ok_or(WhitenoiseError::Initialization)
     }
 
     /// Initializes the keyring-core credential store.
@@ -334,7 +356,7 @@ impl Whitenoise {
     ///
     /// This is a convenience alias for external callers (e.g. the integration
     /// test binary) that need to set up the mock store before
-    /// `initialize_whitenoise()` is called.  In practice
+    /// `Whitenoise::new` is called.  In practice
     /// `initialize_keyring_store()` already uses the mock store in test builds,
     /// so this simply ensures it has been called.
     ///
@@ -359,22 +381,25 @@ impl Whitenoise {
     ) -> core::result::Result<MDK<MdkSqliteStorage>, AccountError> {
         Account::create_mdk(
             pubkey,
-            &self.config.data_dir,
-            &self.config.keyring_service_id,
+            &self.shared.config.data_dir,
+            &self.shared.config.keyring_service_id,
         )
     }
 
-    /// Initializes the Whitenoise application with the provided configuration.
+    /// Constructs a fully-initialized `Whitenoise` instance and returns it
+    /// wrapped in `Arc<Self>`.
     ///
-    /// This method sets up the necessary data and log directories, configures logging,
-    /// initializes the database, creates event processing channels, sets up the Nostr client,
-    /// loads existing accounts, and starts the event processing loop.
+    /// This is the authoritative constructor: it sets up data and log
+    /// directories, initializes logging and the database, seeds default
+    /// relays and settings, spawns the event-processing loop, scheduled
+    /// tasks, discovery sync worker, and session subscriptions.
     ///
-    /// # Arguments
-    ///
-    /// * `config` - A [`WhitenoiseConfig`] struct specifying the data and log directories.
+    /// Callers own the returned `Arc` for the lifetime of the process (or the
+    /// test) and drop it to tear the instance down. Sessions and event
+    /// handlers receive their own `Arc<Whitenoise>` clones internally via the
+    /// weak self-reference stamped at construction.
     #[perf_instrument("whitenoise")]
-    pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
+    pub async fn new(config: WhitenoiseConfig) -> Result<Arc<Self>> {
         init_timing::start();
 
         // Ensure keyring-core has a credential store before any MDK or
@@ -398,24 +423,23 @@ impl Whitenoise {
 
         init_timing::record("keyring_and_channels");
 
-        let whitenoise_res: Result<&'static Whitenoise> = GLOBAL_WHITENOISE.get_or_try_init(|| async {
-        let data_dir = &config.data_dir;
-        let logs_dir = &config.logs_dir;
+        let data_dir = config.data_dir.clone();
+        let logs_dir = config.logs_dir.clone();
 
         // Setup directories. Path context is preserved via tracing; the
         // io::Error itself flows through `WhitenoiseError::Filesystem` so
         // callers can distinguish filesystem failures.
-        std::fs::create_dir_all(data_dir).inspect_err(|e| {
+        std::fs::create_dir_all(&data_dir).inspect_err(|e| {
             tracing::error!(
-                target: "whitenoise::initialize_whitenoise",
+                target: "whitenoise::new",
                 ?data_dir,
                 error = %e,
                 "Failed to create data directory"
             );
         })?;
-        std::fs::create_dir_all(logs_dir).inspect_err(|e| {
+        std::fs::create_dir_all(&logs_dir).inspect_err(|e| {
             tracing::error!(
-                target: "whitenoise::initialize_whitenoise",
+                target: "whitenoise::new",
                 ?logs_dir,
                 error = %e,
                 "Failed to create logs directory"
@@ -423,9 +447,9 @@ impl Whitenoise {
         })?;
 
         // Only initialize tracing once
-        init_tracing(logs_dir);
+        init_tracing(&logs_dir);
 
-        tracing::debug!(target: "whitenoise::initialize_whitenoise", "Logging initialized in directory: {:?}", logs_dir);
+        tracing::debug!(target: "whitenoise::new", "Logging initialized in directory: {:?}", logs_dir);
 
         init_timing::record("directories_and_logging");
 
@@ -441,14 +465,15 @@ impl Whitenoise {
         let secrets_store = SecretsStore::new(&keyring_service_id);
 
         // Create Storage
-        let storage = storage::Storage::new(data_dir).await?;
+        let storage = storage::Storage::new(&data_dir).await?;
 
         // Create message aggregator - always initialize, use custom config if provided
-        let message_aggregator = if let Some(aggregator_config) = config.message_aggregator_config.clone() {
-            message_aggregator::MessageAggregator::with_config(aggregator_config)
-        } else {
-            message_aggregator::MessageAggregator::new()
-        };
+        let message_aggregator =
+            if let Some(aggregator_config) = config.message_aggregator_config.clone() {
+                message_aggregator::MessageAggregator::with_config(aggregator_config)
+            } else {
+                message_aggregator::MessageAggregator::new()
+            };
         let whitenoise = Self::from_components(
             config,
             database,
@@ -462,7 +487,11 @@ impl Whitenoise {
                 scheduler_shutdown,
             },
         );
-        whitenoise.shared.relay_control.start_telemetry_persistors().await;
+        whitenoise
+            .shared
+            .relay_control
+            .start_telemetry_persistors()
+            .await;
 
         init_timing::record("core_services");
 
@@ -477,44 +506,48 @@ impl Whitenoise {
 
         init_timing::record("database_seeding");
 
-        whitenoise.shared.relay_control.start_discovery_plane().await?;
+        whitenoise
+            .shared
+            .relay_control
+            .start_discovery_plane()
+            .await?;
 
         init_timing::record("discovery_plane");
 
-        Ok(whitenoise)
-        }).await;
-
-        let whitenoise_ref = whitenoise_res?;
-
         tracing::info!(
-            target: "whitenoise::initialize_whitenoise",
+            target: "whitenoise::new",
             "Synchronizing message cache with MDK..."
         );
         // Synchronize message cache BEFORE starting event processor
         // This eliminates race conditions between startup sync and real-time cache updates
-        whitenoise_ref.sync_message_cache_on_startup().await?;
+        whitenoise.sync_message_cache_on_startup().await?;
         tracing::info!(
-            target: "whitenoise::initialize_whitenoise",
+            target: "whitenoise::new",
             "Message cache synchronization complete"
         );
 
         init_timing::record("message_cache_sync");
 
         // Backfill dm_peer_pubkey for existing DM groups missing it
-        if let Err(e) = whitenoise_ref.backfill_dm_peer_pubkeys().await {
+        if let Err(e) = whitenoise.backfill_dm_peer_pubkeys().await {
             tracing::warn!(
-                target: "whitenoise::initialize_whitenoise",
+                target: "whitenoise::new",
                 "DM peer pubkey backfill failed (non-fatal): {}",
                 e
             );
         }
 
         tracing::debug!(
-            target: "whitenoise::initialize_whitenoise",
+            target: "whitenoise::new",
             "Starting event processing loop for loaded accounts"
         );
 
-        Self::start_event_processing_loop(whitenoise_ref, event_receiver, shutdown_receiver).await;
+        Self::start_event_processing_loop(
+            Arc::clone(&whitenoise),
+            event_receiver,
+            shutdown_receiver,
+        )
+        .await;
 
         // Register and start scheduled background tasks
         let tasks: Vec<Arc<dyn scheduled_tasks::Task>> = vec![
@@ -526,50 +559,52 @@ impl Whitenoise {
             Arc::new(scheduled_tasks::MuteExpiryCleanup),
         ];
         let scheduler_handles = scheduled_tasks::start_scheduled_tasks(
-            whitenoise_ref,
+            Arc::clone(&whitenoise),
             scheduler_shutdown_rx,
             None,
             tasks,
         );
-        *whitenoise_ref.scheduler_handles.lock().await = scheduler_handles;
+        *whitenoise.scheduler_handles.lock().await = scheduler_handles;
 
-        // Spawn discovery sync worker (must happen after GLOBAL_WHITENOISE is set)
+        // Spawn discovery sync worker
         {
-            let worker_shutdown_rx = whitenoise_ref.scheduler_shutdown.subscribe();
+            let worker_shutdown_rx = whitenoise.scheduler_shutdown.subscribe();
+            let worker_whitenoise = Arc::clone(&whitenoise);
             let handle = tokio::spawn(async move {
-                whitenoise_ref
+                let wn = Arc::clone(&worker_whitenoise);
+                worker_whitenoise
                     .shared
                     .discovery_sync_worker
-                    .run(whitenoise_ref, worker_shutdown_rx)
+                    .run(wn, worker_shutdown_rx)
                     .await;
             });
-            whitenoise_ref.scheduler_handles.lock().await.push(handle);
+            whitenoise.scheduler_handles.lock().await.push(handle);
         }
 
         init_timing::record("background_tasks");
 
         // Restore account sessions for all persisted accounts before setting up
         // subscriptions so that each account has an MDK instance ready.
-        whitenoise_ref
+        whitenoise
             .account_manager
-            .restore_sessions(whitenoise_ref)
+            .restore_sessions(&whitenoise)
             .await;
 
         init_timing::record("session_restore");
 
         // Fetch events and setup subscriptions after event processing has started
-        Self::setup_all_subscriptions(whitenoise_ref).await?;
+        whitenoise.setup_all_subscriptions().await?;
 
         init_timing::record("subscription_setup");
 
         tracing::debug!(
-            target: "whitenoise::initialize_whitenoise",
+            target: "whitenoise::new",
             "Completed initialization for all loaded accounts"
         );
 
         init_timing::report();
 
-        Ok(())
+        Ok(whitenoise)
     }
 
     /// Buffer (in seconds) used when resubscribing after a teardown/rebuild
@@ -578,20 +613,6 @@ impl Whitenoise {
     /// Any events fetched that were already processed are deduplicated by the
     /// event tracker.
     const RESUBSCRIBE_BUFFER_SECS: u64 = 60;
-    /// Returns a reference to the global Whitenoise singleton instance.
-    ///
-    /// This method provides access to the globally initialized Whitenoise instance that was
-    /// created by [`Whitenoise::initialize_whitenoise`]. The instance is stored as a static singleton
-    /// using [`tokio::sync::OnceCell`] to ensure async-safe thread-safe access and single initialization.
-    ///
-    /// This method is particularly useful for accessing the Whitenoise instance from different
-    /// parts of the application without passing references around, such as in event handlers,
-    /// background tasks, or API endpoints.
-    pub fn get_instance() -> Result<&'static Self> {
-        GLOBAL_WHITENOISE
-            .get()
-            .ok_or(WhitenoiseError::Initialization)
-    }
 
     /// Ensures the global Whitenoise singleton is initialized, returning a reference to it.
     ///
@@ -604,34 +625,22 @@ impl Whitenoise {
     ///
     /// # Concurrency
     ///
-    /// Concurrent callers are serialized through a module-private mutex so that
-    /// exactly one caller drives [`initialize_whitenoise`] on cold start; all others
-    /// observe the populated singleton and return immediately. This guarantees the
-    /// documented "never start duplicate event processors or background tasks"
-    /// contract even when multiple iOS silent-push handlers run concurrently on
-    /// different threads.
+    /// Concurrent callers are serialized through `OnceCell::get_or_try_init`
+    /// so that exactly one caller drives [`Whitenoise::new`] on cold start;
+    /// all others wait on the same future and observe the populated cell.
+    /// This guarantees the documented "never start duplicate event processors
+    /// or background tasks" contract even when multiple iOS silent-push
+    /// handlers run concurrently on different threads.
     ///
-    /// Note: this does not protect against a caller invoking [`initialize_whitenoise`]
-    /// directly in parallel with `ensure_initialized`. Outside of this background
-    /// push path, init is expected to be serialized by the caller (e.g. a single
-    /// Flutter cold-start path).
-    ///
-    /// [`initialize_whitenoise`]: Self::initialize_whitenoise
-    pub async fn ensure_initialized(config: WhitenoiseConfig) -> Result<&'static Self> {
-        // Fast path: already initialized. Avoids taking the lock in the warm case,
-        // which is the common case once the app has been running.
-        if let Some(instance) = GLOBAL_WHITENOISE.get() {
-            return Ok(instance);
-        }
-
-        // Cold / contested path: take the lock and re-check under it. Only the
-        // first holder observes `is_none()` and drives initialization; later
-        // holders see the now-populated cell and fall through.
-        let _guard = ENSURE_INITIALIZED_LOCK.lock().await;
-        if GLOBAL_WHITENOISE.get().is_none() {
-            Self::initialize_whitenoise(config).await?;
-        }
-        Self::get_instance()
+    /// Note: this does not protect against a caller invoking [`Whitenoise::new`]
+    /// directly in parallel with `ensure_initialized`. Outside of this
+    /// background push path, init is expected to be serialized by the caller
+    /// (e.g. a single Flutter cold-start path).
+    pub async fn ensure_initialized(config: WhitenoiseConfig) -> Result<Arc<Self>> {
+        let arc = GLOBAL_WHITENOISE
+            .get_or_try_init(|| async { Self::new(config).await })
+            .await?;
+        Ok(Arc::clone(arc))
     }
 
     /// Gracefully shuts down all background tasks without deleting data.
@@ -642,9 +651,9 @@ impl Whitenoise {
     /// # Example
     ///
     /// ```rust,no_run
-    /// # use whitenoise::Whitenoise;
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let whitenoise = Whitenoise::get_instance()?;
+    /// # use whitenoise::{Whitenoise, WhitenoiseConfig};
+    /// # async fn example(config: WhitenoiseConfig) -> Result<(), Box<dyn std::error::Error>> {
+    /// let whitenoise = Whitenoise::new(config).await?;
     /// whitenoise.shutdown().await?;
     /// # Ok(())
     /// # }
@@ -686,7 +695,7 @@ impl Whitenoise {
         self.shared.storage.wipe_all().await?;
 
         // Remove MLS related data
-        let mls_dir = self.config.data_dir.join("mls");
+        let mls_dir = self.shared.config.data_dir.join("mls");
         if mls_dir.exists() {
             tracing::debug!(
                 target: "whitenoise::delete_all_data",
@@ -699,8 +708,8 @@ impl Whitenoise {
         tokio::fs::create_dir_all(&mls_dir).await?;
 
         // Remove logs
-        if self.config.logs_dir.exists() {
-            for entry in std::fs::read_dir(&self.config.logs_dir)? {
+        if self.shared.config.logs_dir.exists() {
+            for entry in std::fs::read_dir(&self.shared.config.logs_dir)? {
                 let entry = entry?;
                 let path = entry.path();
                 if path.is_file() {
@@ -874,7 +883,7 @@ pub mod test_utils {
     ///   - `TempDir`: The temporary directory for data storage
     ///   - `TempDir`: The temporary directory for log storage
     async fn create_mock_whitenoise_internal() -> (
-        Whitenoise,
+        Arc<Whitenoise>,
         mpsc::Receiver<ProcessableEvent>,
         TempDir,
         TempDir,
@@ -936,7 +945,7 @@ pub mod test_utils {
         (whitenoise, event_receiver, data_temp, logs_temp)
     }
 
-    pub(crate) async fn create_mock_whitenoise() -> (Whitenoise, TempDir, TempDir) {
+    pub(crate) async fn create_mock_whitenoise() -> (Arc<Whitenoise>, TempDir, TempDir) {
         let (whitenoise, _event_receiver, data_temp, logs_temp) =
             create_mock_whitenoise_internal().await;
         (whitenoise, data_temp, logs_temp)
@@ -1088,22 +1097,21 @@ pub mod test_utils {
     }
 
     pub(crate) async fn test_get_whitenoise() -> &'static Whitenoise {
-        static TEST_SINGLETON_CONFIG: OnceLock<WhitenoiseConfig> = OnceLock::new();
+        static TEST_SINGLETON: tokio::sync::OnceCell<&'static Whitenoise> =
+            tokio::sync::OnceCell::const_new();
 
         // Singleton-backed tests can spawn background tasks that outlive the
         // helper call, so the temp dirs backing the singleton config must stay
         // alive for the rest of the process.
-        let config = TEST_SINGLETON_CONFIG
-            .get_or_init(|| {
+        TEST_SINGLETON
+            .get_or_init(|| async {
                 let (config, data_temp, logs_temp) = create_test_config();
                 std::mem::forget(data_temp);
                 std::mem::forget(logs_temp);
-                config
+                let arc = Whitenoise::new(config).await.unwrap();
+                &**Box::leak(Box::new(arc))
             })
-            .clone();
-
-        Whitenoise::initialize_whitenoise(config).await.unwrap();
-        Whitenoise::get_instance().unwrap()
+            .await
     }
 
     pub(crate) async fn setup_login_account(whitenoise: &Whitenoise) -> (Account, Keys) {
@@ -1404,7 +1412,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_initialize_whitenoise_rejects_empty_keyring_service_id() {
+        async fn test_new_rejects_empty_keyring_service_id() {
             use tempfile::TempDir;
 
             let data_temp = TempDir::new().unwrap();
@@ -1414,7 +1422,7 @@ mod tests {
 
             // Test empty string
             config.keyring_service_id = "".to_string();
-            let result = Whitenoise::initialize_whitenoise(config.clone()).await;
+            let result = Whitenoise::new(config.clone()).await;
             assert!(result.is_err());
             assert!(
                 result
@@ -1425,7 +1433,7 @@ mod tests {
 
             // Test whitespace only
             config.keyring_service_id = "   ".to_string();
-            let result = Whitenoise::initialize_whitenoise(config).await;
+            let result = Whitenoise::new(config).await;
             assert!(result.is_err());
             assert!(
                 result
@@ -1451,8 +1459,8 @@ mod tests {
             );
 
             // Verify directories were created
-            assert!(whitenoise.config.data_dir.exists());
-            assert!(whitenoise.config.logs_dir.exists());
+            assert!(whitenoise.config().data_dir.exists());
+            assert!(whitenoise.config().logs_dir.exists());
         }
 
         #[tokio::test]
@@ -1472,8 +1480,8 @@ mod tests {
             let (whitenoise2, _data_temp2, _logs_temp2) = create_mock_whitenoise().await;
 
             // Both should have valid configurations (they'll be different temp dirs, which is fine)
-            assert!(whitenoise1.config.data_dir.exists());
-            assert!(whitenoise2.config.data_dir.exists());
+            assert!(whitenoise1.config().data_dir.exists());
+            assert!(whitenoise2.config().data_dir.exists());
             assert!(
                 Account::all(&whitenoise1.shared.database)
                     .await
@@ -1498,8 +1506,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
             // Create test files in the whitenoise directories
-            let test_data_file = whitenoise.config.data_dir.join("test_data.txt");
-            let test_log_file = whitenoise.config.logs_dir.join("test_log.txt");
+            let test_data_file = whitenoise.config().data_dir.join("test_data.txt");
+            let test_log_file = whitenoise.config().logs_dir.join("test_log.txt");
             tokio::fs::write(&test_data_file, "test data")
                 .await
                 .unwrap();
@@ -1541,7 +1549,7 @@ mod tests {
             assert!(!media_cache_dir_after.exists());
 
             // MLS directory should be recreated as empty
-            let mls_dir = whitenoise.config.data_dir.join("mls");
+            let mls_dir = whitenoise.config().data_dir.join("mls");
             assert!(mls_dir.exists());
             assert!(mls_dir.is_dir());
         }
@@ -3705,7 +3713,7 @@ mod tests {
         async fn test_fallback_relay_urls_uses_discovery_plane_relays() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let fallback = whitenoise.fallback_relay_urls().await;
-            let discovery_urls = whitenoise.config.discovery_relays.clone();
+            let discovery_urls = whitenoise.config().discovery_relays.clone();
 
             for url in &discovery_urls {
                 assert!(

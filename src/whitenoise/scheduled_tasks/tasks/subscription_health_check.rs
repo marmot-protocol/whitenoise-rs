@@ -28,7 +28,7 @@ impl Task for SubscriptionHealthCheck {
     }
 
     #[perf_instrument("scheduled::subscription_health_check")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         whitenoise.ensure_all_subscriptions().await
     }
 }

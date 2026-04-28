@@ -1,8 +1,10 @@
 //! Generic keyed broadcast hub for per-key streaming channels.
 //!
-//! Provides lazy channel creation and automatic cleanup when all receivers
-//! are dropped. Used as the backing implementation for message, chat list,
-//! and user stream managers.
+//! Provides lazy channel creation. Cleanup is also lazy: a stream entry is
+//! retained after its last receiver is dropped and is only removed on the
+//! next [`BroadcastHub::emit`] for that key, when [`broadcast::Sender::send`]
+//! detects no live receivers. Used as the backing implementation for message,
+//! chat list, and user stream managers.
 
 use std::fmt::Debug;
 use std::hash::Hash;

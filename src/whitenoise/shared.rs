@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 
 use crate::mdk::GroupId;
 use crate::relay_control::RelayControlPlane;
+use crate::whitenoise::WhitenoiseConfig;
 use crate::whitenoise::chat_list_streaming::ChatListStreamManager;
 use crate::whitenoise::database::Database;
 use crate::whitenoise::discovery_sync_worker::DiscoverySyncWorker;
@@ -30,6 +31,7 @@ use crate::whitenoise::user_streaming::UserStreamManager;
 /// `AccountSession`. Lifecycle plumbing (event and shutdown channels, scheduler
 /// handles, account registry) stays on `Whitenoise` itself.
 pub(crate) struct SharedServices {
+    pub(crate) config: Arc<WhitenoiseConfig>,
     pub(crate) database: Arc<Database>,
     pub(crate) relay_control: Arc<RelayControlPlane>,
     pub(crate) event_tracker: Arc<dyn EventTracker>,
@@ -72,6 +74,7 @@ impl SharedServices {
     /// managers, registries, and the discovery worker use their defaults —
     /// callers never need to supply them.
     pub(crate) fn new(
+        config: Arc<WhitenoiseConfig>,
         database: Arc<Database>,
         relay_control: Arc<RelayControlPlane>,
         event_tracker: Arc<dyn EventTracker>,
@@ -80,6 +83,7 @@ impl SharedServices {
         message_aggregator: MessageAggregator,
     ) -> Self {
         Self {
+            config,
             database,
             relay_control,
             event_tracker,

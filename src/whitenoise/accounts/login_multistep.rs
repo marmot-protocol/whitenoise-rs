@@ -375,7 +375,9 @@ impl Whitenoise {
     /// login is pending this is a no-op and returns `Ok(())`.
     pub async fn login_cancel(&self, pubkey: &PublicKey) -> core::result::Result<(), LoginError> {
         // Only clean up if there was actually a pending login for this pubkey.
-        if self.account_manager.take_pending_login(pubkey).is_none() {
+        // Peek without consuming so a fallible cleanup below doesn't strand
+        // the partial-login state (a retry would otherwise become a no-op).
+        if !self.account_manager.has_pending_login(pubkey) {
             tracing::debug!(
                 target: "whitenoise::accounts",
                 "No pending login for {}, nothing to cancel",
@@ -418,6 +420,11 @@ impl Whitenoise {
                 pubkey.to_hex()
             );
         }
+
+        // All fallible cleanup succeeded — now consume the marker so a retry
+        // (if anything still went wrong upstream) is a no-op rather than a
+        // re-run of destructive cleanup.
+        self.account_manager.take_pending_login(pubkey);
         Ok(())
     }
 

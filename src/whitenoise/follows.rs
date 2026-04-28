@@ -26,6 +26,10 @@ impl Whitenoise {
     )]
     #[perf_instrument("follows")]
     pub async fn follow_user(&self, account: &Account, pubkey: &PublicKey) -> Result<()> {
+        let session = self
+            .session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+
         let (user, newly_created) =
             User::find_or_create_by_pubkey(pubkey, &self.shared.database).await?;
 
@@ -34,9 +38,6 @@ impl Whitenoise {
             self.shared.discovery_sync_worker.request_rebuild();
         }
 
-        let session = self
-            .session(&account.pubkey)
-            .ok_or(WhitenoiseError::AccountNotFound)?;
         session.social().add_follow(&user).await?;
         self.background_publish_account_follow_list(account).await?;
         Ok(())

@@ -67,27 +67,23 @@ impl Whitenoise {
         let event_pubkey = event.pubkey;
         let tid = crate::perf::current_trace_id();
 
-        tokio::spawn(crate::perf::with_trace_id(tid, async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(instance) => instance,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "whitenoise::handle_relay_list",
-                        "Failed to get Whitenoise instance for relay list refresh {}: {}",
-                        event_pubkey,
-                        error
-                    );
-                    return;
-                }
-            };
+        let Ok(whitenoise) = self.arc() else {
+            tracing::warn!(
+                target: "whitenoise::event_processor::handle_relay_list",
+                "Whitenoise instance unavailable for relay list refresh {}",
+                event_pubkey
+            );
+            return;
+        };
 
+        tokio::spawn(crate::perf::with_trace_id(tid, async move {
             let account =
                 match Account::find_by_pubkey(&user_pubkey, &whitenoise.shared.database).await {
                     Ok(account) => Some(account),
                     Err(WhitenoiseError::AccountNotFound) => None,
                     Err(error) => {
                         tracing::warn!(
-                            target: "whitenoise::handle_relay_list",
+                            target: "whitenoise::event_processor::handle_relay_list",
                             "Failed to look up account for relay list refresh {}: {}",
                             event_pubkey,
                             error
@@ -102,7 +98,7 @@ impl Whitenoise {
                 && let Err(error) = whitenoise.refresh_account_subscriptions(&account).await
             {
                 tracing::warn!(
-                    target: "whitenoise::handle_relay_list",
+                    target: "whitenoise::event_processor::handle_relay_list",
                     "Failed to refresh account subscriptions after relay list change for {}: {}",
                     event_pubkey,
                     error

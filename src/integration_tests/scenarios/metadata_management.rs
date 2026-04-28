@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::integration_tests::{
     core::*,
     test_cases::{metadata_management::*, shared::*},
@@ -10,7 +12,7 @@ pub struct MetadataManagementScenario {
 }
 
 impl MetadataManagementScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

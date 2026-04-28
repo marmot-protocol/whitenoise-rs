@@ -20,7 +20,7 @@ impl TestCase for FetchMetadataTestCase {
         tracing::info!("Fetching metadata for account: {}", self.account_name);
 
         let account = context.get_account(&self.account_name)?;
-        let metadata = account.metadata(context.whitenoise).await?;
+        let metadata = account.metadata(&context.whitenoise).await?;
 
         assert!(
             metadata.name.is_none(),

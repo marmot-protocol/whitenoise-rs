@@ -31,7 +31,7 @@ impl Task for MuteExpiryCleanup {
     }
 
     #[perf_instrument("scheduled::mute_expiry_cleanup")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         let cleared = AccountGroup::clear_expired_mutes(&whitenoise.shared.database).await?;
 
         if cleared.is_empty() {

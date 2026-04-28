@@ -279,15 +279,15 @@ impl Whitenoise {
     }
 
     /// Like [`Self::create_and_publish_key_package`], but the relay publish
-    /// runs in a background task so the caller isn't blocked by network latency.
+    /// Creates a key package, publishes it to the configured relays, and
+    /// records the published event in the database.
     ///
     /// The MLS key material is always created synchronously (local, fast).
-    /// Only the relay broadcast + DB tracking are deferred.  If the global
-    /// [`Whitenoise`] singleton isn't available (unit tests), the publish
-    /// runs inline as a fallback.
-    ///
-    /// Failures are non-fatal — the `KeyPackageMaintenance` scheduler
-    /// (10-min interval) retries any that didn't land.
+    /// The relay broadcast + DB tracking run inline so that callers can rely
+    /// on the package being durably published (or surfaced as a warning) by
+    /// the time this function returns. Failures are non-fatal — the
+    /// `KeyPackageMaintenance` scheduler (10-min interval) retries any that
+    /// didn't land.
     pub(crate) async fn create_key_package_and_background_publish(
         &self,
         account: &Account,
@@ -297,21 +297,15 @@ impl Whitenoise {
         let relay_urls = Relay::urls(relays);
         let signer = self.get_signer_for_account(account)?;
 
-        if Whitenoise::get_instance().is_ok() {
+        // In unit tests publish synchronously so assertions can observe the
+        // published event without awaiting a spawned task. In production the
+        // spawn path keeps account creation responsive while the scheduler
+        // retries any publish that didn't land.
+        #[cfg(not(test))]
+        if let Ok(wn) = self.arc() {
             let account = account.clone();
             tokio::spawn(async move {
-                let wn = match Whitenoise::get_instance() {
-                    Ok(wn) => wn,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "whitenoise::key_packages",
-                            "Failed to get Whitenoise instance for background key package publish: {}",
-                            e
-                        );
-                        return;
-                    }
-                };
-                match wn
+                if let Err(e) = wn
                     .publish_key_package_pair_to_relays(
                         &account,
                         &key_package_data,
@@ -320,30 +314,27 @@ impl Whitenoise {
                     )
                     .await
                 {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "whitenoise::key_packages",
-                            "Background key package publish failed, scheduler will retry: {}",
-                            e
-                        );
-                    }
-                }
-            });
-        } else {
-            // Synchronous fallback (unit tests or pre-initialization).
-            match self
-                .publish_key_package_pair_to_relays(account, &key_package_data, &relay_urls, signer)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
-                        "Key package publish failed, scheduler will retry: {}",
+                        "Background key package publish failed, scheduler will retry: {}",
                         e
                     );
                 }
+            });
+            return Ok(());
+        }
+
+        match self
+            .publish_key_package_pair_to_relays(account, &key_package_data, &relay_urls, signer)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Key package publish failed, scheduler will retry: {}",
+                    e
+                );
             }
         }
 

@@ -55,7 +55,7 @@ impl Whitenoise {
         let fallback_relays = fallback_account.nip65_relays(self).await?;
         if fallback_relays.is_empty() {
             tracing::error!(
-                target: "whitenoise::accounts::groups::relay_selection",
+                target: "whitenoise::groups",
                 context = context,
                 "User {} has no inbox or NIP-65 relays and account {} has no fallback relays configured",
                 member.pubkey,
@@ -67,7 +67,7 @@ impl Whitenoise {
             });
         } else {
             tracing::warn!(
-                target: "whitenoise::accounts::groups::relay_selection",
+                target: "whitenoise::groups",
                 context = context,
                 "User {} has no inbox or NIP-65 relays, using account {} fallback relays",
                 member.pubkey,
@@ -270,24 +270,14 @@ impl Whitenoise {
 
         // Background welcome publishing
         let creator_account_clone = creator_account.clone();
+        let whitenoise = self.arc()?;
         tokio::spawn(async move {
-            let whitenoise = match Whitenoise::get_instance() {
-                Ok(wn) => wn,
-                Err(error) => {
-                    tracing::error!(
-                        target: "whitenoise::groups",
-                        "Failed to get Whitenoise instance for background welcome publishing: {}",
-                        error
-                    );
-                    return;
-                }
-            };
-
             let futures = welcome_data
                 .into_iter()
                 .map(|(rumor, member, member_pubkey)| {
                     let signer: Arc<dyn NostrSigner> = signer.clone();
                     let creator = &creator_account_clone;
+                    let whitenoise = &whitenoise;
                     async move {
                         let relays_to_use = whitenoise
                             .resolve_member_delivery_relays(
@@ -541,11 +531,7 @@ impl Whitenoise {
             let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
             let relays_to_use = self
-                .resolve_member_delivery_relays(
-                    &user,
-                    account,
-                    "whitenoise::accounts::groups::add_members_to_group",
-                )
+                .resolve_member_delivery_relays(&user, account, "whitenoise::groups")
                 .await?;
 
             let relay_urls = Relay::urls(&relays_to_use);

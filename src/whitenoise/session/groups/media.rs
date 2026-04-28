@@ -95,16 +95,13 @@ impl<'a> MediaOps<'a> {
         Self { session }
     }
 
-    // ── Singleton bridge ─────────────────────────────────────────────
-
-    /// Obtain a `&'static Whitenoise` reference via the global singleton.
-    ///
-    /// Methods that need `storage`, `media_files()`, or `config` still reach
-    /// the singleton until those fields migrate to `SharedServices`.
-    // TODO(phase-16): Remove singleton bridge when storage and config move to session.
-    fn wn() -> Result<&'static Whitenoise> {
-        Whitenoise::get_instance()
-            .map_err(|_| WhitenoiseError::Internal("Whitenoise singleton unavailable".to_string()))
+    /// Construct a `MediaFiles` orchestrator over the session's shared storage
+    /// and database. Mirrors the `Whitenoise::media_files()` helper.
+    fn media_files(&self) -> crate::whitenoise::media_files::MediaFiles<'_> {
+        crate::whitenoise::media_files::MediaFiles::new(
+            &self.session.shared.storage,
+            &self.session.shared.database,
+        )
     }
 
     // ── Constants ─────────────────────────────────────────────────────
@@ -249,28 +246,16 @@ impl<'a> MediaOps<'a> {
             scheme_version: None,
         };
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        match Self::wn() {
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::session::groups::media",
-                    "Failed to get singleton for image cache ({}). Image will be downloaded on next access.",
-                    e
-                );
-            }
-            Ok(wn) => {
-                if let Err(e) = wn
-                    .media_files()
-                    .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "whitenoise::session::groups::media",
-                        "Failed to cache uploaded group image: {}. Image will be downloaded on next access.",
-                        e
-                    );
-                }
-            }
+        if let Err(e) = self
+            .media_files()
+            .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
+            .await
+        {
+            tracing::warn!(
+                target: "whitenoise::session::groups::media",
+                "Failed to cache uploaded group image: {}. Image will be downloaded on next access.",
+                e
+            );
         }
 
         Ok((
@@ -358,9 +343,7 @@ impl<'a> MediaOps<'a> {
             scheme_version: Some("mip04-v2"),
         };
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        wn.media_files()
+        self.media_files()
             .store_and_record(
                 &self.session.account_pubkey,
                 group_id,
@@ -411,9 +394,8 @@ impl<'a> MediaOps<'a> {
         let hash_hex = hex::encode(&media_file.encrypted_file_hash);
         let cached_filename = format!("{}.{}", hash_hex, media_detection.extension());
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        let cache_path = wn
+        let cache_path = self
+            .session
             .shared
             .storage
             .media_files
@@ -555,9 +537,7 @@ impl<'a> MediaOps<'a> {
 
     /// Checks whether a group image is already cached on disk.
     async fn check_cached_image(&self, hash_hex: &str) -> Result<Option<PathBuf>> {
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        let media_files = wn.media_files();
+        let media_files = self.media_files();
         if let Some(cached_path) = media_files.find_file_with_prefix(hash_hex).await {
             tracing::debug!(
                 target: "whitenoise::session::groups::media",
@@ -622,9 +602,7 @@ impl<'a> MediaOps<'a> {
             scheme_version: existing_record.scheme_version.as_deref(),
         };
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        wn.media_files()
+        self.media_files()
             .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
             .await
     }
@@ -674,9 +652,7 @@ impl<'a> MediaOps<'a> {
             scheme_version: None,
         };
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        wn.media_files()
+        self.media_files()
             .record_in_database(&self.session.account_pubkey, group_id, cached_path, upload)
             .await
     }
@@ -714,9 +690,7 @@ impl<'a> MediaOps<'a> {
             scheme_version: None,
         };
 
-        // TODO(phase-16): Remove singleton bridge when storage moves to session.
-        let wn = Self::wn()?;
-        wn.media_files()
+        self.media_files()
             .store_and_record(&self.session.account_pubkey, group_id, &filename, upload)
             .await
     }

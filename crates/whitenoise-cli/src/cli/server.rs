@@ -2,6 +2,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17,7 +18,7 @@ use super::protocol::{Request, Response};
 /// Start the daemon: bind the socket, accept connections, dispatch requests.
 ///
 /// Returns when a shutdown signal is received or the listener fails.
-pub async fn run(config: &Config) -> crate::cli::Result<()> {
+pub async fn run(config: &Config, whitenoise: Arc<Whitenoise>) -> crate::cli::Result<()> {
     let socket_path = config.socket_path();
     let pid_path = config.pid_path();
 
@@ -42,7 +43,7 @@ pub async fn run(config: &Config) -> crate::cli::Result<()> {
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, _addr)) => {
-                        tokio::spawn(handle_connection(stream));
+                        tokio::spawn(handle_connection(stream, Arc::clone(&whitenoise)));
                     }
                     Err(e) => {
                         tracing::error!("accept error: {e}");
@@ -57,8 +58,7 @@ pub async fn run(config: &Config) -> crate::cli::Result<()> {
     }
 
     // Cleanup
-    let wn = Whitenoise::get_instance()?;
-    wn.shutdown().await?;
+    whitenoise.shutdown().await?;
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&pid_path);
     tracing::info!("daemon stopped");
@@ -66,7 +66,7 @@ pub async fn run(config: &Config) -> crate::cli::Result<()> {
 }
 
 /// Handle a single client connection: read one request line, dispatch, respond.
-async fn handle_connection(stream: tokio::net::UnixStream) {
+async fn handle_connection(stream: tokio::net::UnixStream, whitenoise: Arc<Whitenoise>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -98,9 +98,9 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
     };
 
     if req.is_streaming() {
-        dispatch::dispatch_streaming(req, writer).await;
+        dispatch::dispatch_streaming(req, writer, &whitenoise).await;
     } else {
-        let response = dispatch::dispatch(req).await;
+        let response = dispatch::dispatch(req, &whitenoise).await;
         let mut buf = serde_json::to_vec(&response).unwrap_or_default();
         buf.push(b'\n');
         let _ = writer.write_all(&buf).await;

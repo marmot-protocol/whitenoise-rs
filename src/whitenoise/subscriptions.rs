@@ -9,7 +9,7 @@ use crate::whitenoise::users::User;
 
 impl Whitenoise {
     #[perf_instrument("whitenoise")]
-    pub async fn setup_all_subscriptions(whitenoise_ref: &'static Whitenoise) -> Result<()> {
+    pub async fn setup_all_subscriptions(&self) -> Result<()> {
         // Global (discovery plane) and per-account (inbox + group planes) subscriptions
         // operate on completely disjoint relay sessions with no shared mutable state,
         // so they can run concurrently. Using join! (not try_join!) ensures both run
@@ -21,11 +21,8 @@ impl Whitenoise {
         // generation counter and returns Ok. This is intentional — the periodic
         // ensure_all_subscriptions task self-heals discovery within minutes.
         let (global_result, accounts_result) = tokio::join!(
-            whitenoise_ref
-                .shared
-                .discovery_sync_worker
-                .request_rebuild_and_wait(),
-            Self::setup_accounts_subscriptions(whitenoise_ref),
+            self.shared.discovery_sync_worker.request_rebuild_and_wait(),
+            self.setup_accounts_subscriptions(),
         );
         global_result?;
         accounts_result?;
@@ -82,17 +79,12 @@ impl Whitenoise {
     }
 
     #[perf_instrument("whitenoise")]
-    pub(super) async fn setup_accounts_subscriptions(
-        whitenoise_ref: &'static Whitenoise,
-    ) -> Result<()> {
-        let accounts = Account::all(&whitenoise_ref.shared.database).await?;
+    pub(super) async fn setup_accounts_subscriptions(&self) -> Result<()> {
+        let accounts = Account::all(&self.shared.database).await?;
         for account in accounts {
-            let inbox_relays = account.effective_inbox_relays(whitenoise_ref).await?;
+            let inbox_relays = account.effective_inbox_relays(self).await?;
             // Setup subscriptions for this account
-            match whitenoise_ref
-                .setup_subscriptions(&account, &inbox_relays)
-                .await
-            {
+            match self.setup_subscriptions(&account, &inbox_relays).await {
                 Ok(()) => {
                     tracing::debug!(
                         target: "whitenoise::setup_accounts_subscriptions",

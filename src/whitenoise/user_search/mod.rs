@@ -158,30 +158,11 @@ impl Whitenoise {
         let radius_start = params.radius_start;
         let radius_end = params.radius_end;
 
+        let whitenoise = self.arc()?;
         let tid = crate::perf::current_trace_id();
         tokio::spawn(crate::perf::with_trace_id(tid, async move {
-            // Get singleton instance inside spawned task (follows existing pattern in groups.rs)
-            let whitenoise = match Self::get_instance() {
-                Ok(wn) => wn,
-                Err(e) => {
-                    tracing::error!(
-                        target: "whitenoise::user_search",
-                        "Failed to get Whitenoise instance: {}",
-                        e
-                    );
-                    let _ = tx.send(UserSearchUpdate {
-                        trigger: SearchUpdateTrigger::Error {
-                            message: "Internal error: failed to get application instance"
-                                .to_string(),
-                        },
-                        new_results: vec![],
-                        total_result_count: 0,
-                    });
-                    return;
-                }
-            };
             search_task(
-                whitenoise,
+                &whitenoise,
                 tx,
                 query,
                 searcher_pubkey,

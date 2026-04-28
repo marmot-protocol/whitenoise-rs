@@ -45,7 +45,7 @@ impl DiscoverySyncWorker {
     /// Runs the worker loop. This is the production entry point.
     pub(crate) async fn run(
         &self,
-        whitenoise: &'static crate::whitenoise::Whitenoise,
+        whitenoise: std::sync::Arc<crate::whitenoise::Whitenoise>,
         shutdown_rx: watch::Receiver<bool>,
     ) {
         self.run_with(shutdown_rx, || whitenoise.sync_discovery_subscriptions())

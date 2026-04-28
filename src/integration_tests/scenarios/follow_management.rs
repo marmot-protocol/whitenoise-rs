@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,7 +16,7 @@ pub struct FollowManagementScenario {
 }
 
 impl FollowManagementScenario {
-    pub fn new(whitenoise: &'static Whitenoise) -> Self {
+    pub fn new(whitenoise: Arc<Whitenoise>) -> Self {
         Self {
             context: ScenarioContext::new(whitenoise),
         }

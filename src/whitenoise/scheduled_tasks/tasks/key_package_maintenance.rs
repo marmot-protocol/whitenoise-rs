@@ -42,7 +42,7 @@ impl Task for KeyPackageMaintenance {
     }
 
     #[perf_instrument("scheduled::key_package_maintenance")]
-    async fn execute(&self, whitenoise: &'static Whitenoise) -> Result<(), WhitenoiseError> {
+    async fn execute(&self, whitenoise: std::sync::Arc<Whitenoise>) -> Result<(), WhitenoiseError> {
         tracing::debug!(
             target: "whitenoise::scheduler::key_package_maintenance",
             "Starting key package maintenance"
@@ -59,7 +59,10 @@ impl Task for KeyPackageMaintenance {
         }
 
         let results: Vec<MaintenanceResult> = stream::iter(accounts)
-            .map(|account| async move { maintain_key_packages(whitenoise, &account).await })
+            .map(|account| {
+                let whitenoise = whitenoise.clone();
+                async move { maintain_key_packages(&whitenoise, &account).await }
+            })
             .buffer_unordered(MAX_CONCURRENT_ACCOUNTS)
             .collect()
             .await;
@@ -383,6 +386,7 @@ mod tests {
     use crate::whitenoise::key_packages::{
         MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY,
     };
+    use crate::whitenoise::relays::Relay;
     use crate::whitenoise::test_utils::create_mock_whitenoise;
     use nostr_sdk::prelude::*;
 
@@ -411,10 +415,47 @@ mod tests {
             .unwrap()
     }
 
+    /// Publishes a key package without the encoding tag for testing outdated package rotation.
+    async fn publish_outdated_key_package(
+        whitenoise: &Whitenoise,
+        account: &crate::whitenoise::accounts::Account,
+        relays: &[Relay],
+    ) -> Result<EventId, crate::whitenoise::error::WhitenoiseError> {
+        let key_package_data = whitenoise.encoded_key_package(account, relays).await?;
+
+        let nsec = whitenoise.export_account_nsec(account).await?;
+        let secret_key =
+            SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
+        let keys = Keys::new(secret_key);
+
+        let tags_without_encoding: Vec<Tag> = key_package_data
+            .tags_443
+            .into_iter()
+            .filter(|tag| tag.kind() != TagKind::Custom("encoding".into()))
+            .collect();
+
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &key_package_data.content)
+            .tags(tags_without_encoding)
+            .sign_with_keys(&keys)
+            .map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
+
+        let event_id = event.id;
+
+        let client = Client::default();
+        for relay in relays {
+            client.add_relay(relay.url.as_str()).await?;
+        }
+        client.connect().await;
+        client.set_signer(keys).await;
+        client.send_event(&event).await?;
+        client.disconnect().await;
+
+        Ok(event_id)
+    }
+
     #[tokio::test]
     async fn test_execute_republishes_when_local_key_material_is_missing() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -451,7 +492,7 @@ mod tests {
 
         // Validate the precondition for this regression: the relay event still
         // exists, but this device no longer has any live local state for it.
-        let live_before = find_live_published_key_packages(whitenoise, &account, before)
+        let live_before = find_live_published_key_packages(&whitenoise, &account, before)
             .await
             .unwrap();
         assert!(
@@ -460,14 +501,14 @@ mod tests {
         );
 
         let task = KeyPackageMaintenance;
-        task.execute(whitenoise).await.unwrap();
+        task.execute(whitenoise.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let after = whitenoise
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
-        let live_after = find_live_published_key_packages(whitenoise, &account, after)
+        let live_after = find_live_published_key_packages(&whitenoise, &account, after)
             .await
             .unwrap();
         assert!(
@@ -479,7 +520,6 @@ mod tests {
     #[tokio::test]
     async fn test_execute_republishes_when_only_consumed_key_packages_remain() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let account = whitenoise.create_identity().await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -504,7 +544,7 @@ mod tests {
 
         // Validate the precondition for this regression: the relay event still
         // exists, but the tracked package has already been consumed locally.
-        let live_before = find_live_published_key_packages(whitenoise, &account, before)
+        let live_before = find_live_published_key_packages(&whitenoise, &account, before)
             .await
             .unwrap();
         assert!(
@@ -513,19 +553,85 @@ mod tests {
         );
 
         let task = KeyPackageMaintenance;
-        task.execute(whitenoise).await.unwrap();
+        task.execute(whitenoise.clone()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let after = whitenoise
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
-        let live_after = find_live_published_key_packages(whitenoise, &account, after)
+        let live_after = find_live_published_key_packages(&whitenoise, &account, after)
             .await
             .unwrap();
         assert!(
             !live_after.is_empty(),
             "Maintenance should publish a fresh key package when only consumed packages remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_republishes_when_outdated_and_only_consumed_valid_packages_remain() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+
+        let account = whitenoise.create_identity().await.unwrap();
+        let kp_relays = account.key_package_relays(&whitenoise).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let before = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "Should start with exactly one valid key package"
+        );
+
+        PublishedKeyPackage::mark_consumed(
+            &account.pubkey,
+            &before[0].id.to_hex(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+
+        publish_outdated_key_package(&whitenoise, &account, &kp_relays)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let packages = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+        assert_eq!(
+            packages.len(),
+            2,
+            "Should have one valid and one outdated package"
+        );
+
+        let live_before = find_live_published_key_packages(&whitenoise, &account, packages.clone())
+            .await
+            .unwrap();
+        assert!(
+            live_before.is_empty(),
+            "Consumed valid packages plus outdated packages should still count as no live local state"
+        );
+
+        let task = KeyPackageMaintenance;
+        task.execute(whitenoise.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let after = whitenoise
+            .fetch_all_key_packages_for_account(&account)
+            .await
+            .unwrap();
+        let live_after = find_live_published_key_packages(&whitenoise, &account, after)
+            .await
+            .unwrap();
+        assert!(
+            !live_after.is_empty(),
+            "Maintenance should publish a fresh key package when outdated packages coexist with only consumed valid ones"
         );
     }
 
@@ -541,10 +647,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_no_accounts() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let whitenoise: &'static Whitenoise = Box::leak(Box::new(whitenoise));
 
         let task = KeyPackageMaintenance;
-        let result = task.execute(whitenoise).await;
+        let result = task.execute(whitenoise.clone()).await;
 
         // Should succeed - just logs "No accounts found, skipping"
         assert!(result.is_ok());
