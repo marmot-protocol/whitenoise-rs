@@ -113,11 +113,22 @@ impl GlobalMigrationRunner {
 
         if sqlx_table_exists {
             super::MIGRATOR.run(global_db).await.map_err(|e| {
-                tracing::error!(
-                    target: "whitenoise::database::rust_migrations",
-                    "SQLx catch-up failed (existing install may need manual intervention): {e}"
-                );
-                DatabaseError::Sqlx(e.into())
+                if matches!(e, sqlx::migrate::MigrateError::VersionMismatch(_)) {
+                    tracing::error!(
+                        target: "whitenoise::database::rust_migrations",
+                        "SQLx migration checksum mismatch — a db_migrations/ file was modified \
+                         after it was already applied. Your database cannot be automatically \
+                         recovered. To fix: back up your data directory, delete the database \
+                         file, and restart the app to create a fresh database. Error: {e}"
+                    );
+                } else {
+                    tracing::error!(
+                        target: "whitenoise::database::rust_migrations",
+                        "SQLx catch-up failed \
+                         (existing install may need manual intervention): {e}"
+                    );
+                }
+                DatabaseError::Migration(e)
             })?;
         }
 
