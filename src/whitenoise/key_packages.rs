@@ -12,21 +12,28 @@ use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
 use crate::whitenoise::relays::Relay;
 
-/// Maximum number of fetch-delete rounds before giving up. This prevents
-/// infinite loops when relays keep returning the same key packages after
-/// deletion (e.g., because they don't support NIP-09 deletion).
-const MAX_DELETE_ROUNDS: u32 = 10;
-
 /// The ciphersuite currently required by Marmot key package tags.
 pub(crate) const REQUIRED_MLS_CIPHERSUITE_TAG: &str = "0x0001";
+
+/// Current Nostr event kind for MLS KeyPackage events.
+pub(crate) const MLS_KEY_PACKAGE_KIND: Kind = Kind::Custom(30443);
+
+/// Legacy Nostr event kind for MLS KeyPackage events.
+pub(crate) const MLS_KEY_PACKAGE_KIND_LEGACY: Kind = Kind::Custom(443);
 
 /// Required extension IDs that must appear in `mls_extensions` tags.
 const REQUIRED_MLS_EXTENSION_TAGS: [&str; 2] = ["0x000a", "0xf2ee"];
 
+/// Required proposal IDs that must appear in `mls_proposals` tags.
+pub(crate) const REQUIRED_MLS_PROPOSAL_TAGS: [&str; 1] = ["0x000a"];
+
+/// Tag name containing supported MLS proposal IDs.
+pub(crate) const MLS_PROPOSALS_TAG_KEY: &str = "mls_proposals";
+
 /// Checks if a key package event has the required encoding tag.
 ///
 /// Per MIP-00/MIP-02, key packages must have an explicit `["encoding", "base64"]` tag.
-/// Key packages without this tag are considered outdated and should be rotated.
+/// Key packages without this tag are incompatible with current clients.
 ///
 /// # Arguments
 ///
@@ -49,11 +56,15 @@ pub(crate) fn validate_marmot_key_package_tags(
     event: &Event,
     expected_ciphersuite: &str,
 ) -> Result<()> {
-    if event.kind != Kind::MlsKeyPackage {
+    if !is_key_package_kind(event.kind) {
         return Err(WhitenoiseError::InvalidEventKind {
-            expected: Kind::MlsKeyPackage.to_string(),
+            expected: format!("{MLS_KEY_PACKAGE_KIND} or {MLS_KEY_PACKAGE_KIND_LEGACY}"),
             got: event.kind.to_string(),
         });
+    }
+
+    if event.kind == MLS_KEY_PACKAGE_KIND && event.tags.identifier().is_none() {
+        return Err(WhitenoiseError::MissingKeyPackageDTag);
     }
 
     if !has_encoding_tag(event) {
@@ -86,7 +97,32 @@ pub(crate) fn validate_marmot_key_package_tags(
         });
     }
 
+    let missing_proposals = missing_required_mls_proposals(event);
+
+    if !missing_proposals.is_empty() {
+        return Err(WhitenoiseError::MissingMlsProposals {
+            missing: missing_proposals,
+        });
+    }
+
     Ok(())
+}
+
+pub(crate) fn missing_required_mls_proposals(event: &Event) -> Vec<String> {
+    let proposals: HashSet<String> =
+        normalized_tag_values(event, TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()))
+            .into_iter()
+            .collect();
+
+    REQUIRED_MLS_PROPOSAL_TAGS
+        .into_iter()
+        .filter(|required| !proposals.contains(*required))
+        .map(|required| required.to_string())
+        .collect()
+}
+
+pub(crate) fn is_key_package_kind(kind: Kind) -> bool {
+    kind == MLS_KEY_PACKAGE_KIND || kind == MLS_KEY_PACKAGE_KIND_LEGACY
 }
 
 fn normalized_tag_values(event: &Event, tag_kind: TagKind<'_>) -> Vec<String> {
@@ -98,27 +134,6 @@ fn normalized_tag_values(event: &Event, tag_kind: TagKind<'_>) -> Vec<String> {
         .flat_map(|value| value.split(|c: char| c == ',' || c.is_ascii_whitespace()))
         .filter(|part| !part.is_empty())
         .map(|part| part.to_ascii_lowercase())
-        .collect()
-}
-
-/// Returns key packages that are missing the required encoding tag.
-///
-/// These outdated packages were published before the MIP-00/MIP-02 encoding tag
-/// requirement was enforced. They should be deleted and replaced with new
-/// key packages that include the proper `["encoding", "base64"]` tag.
-///
-/// # Arguments
-///
-/// * `packages` - The key package events to check
-///
-/// # Returns
-///
-/// A vector of key package events that are missing the encoding tag.
-pub(crate) fn find_outdated_packages(packages: &[Event]) -> Vec<Event> {
-    packages
-        .iter()
-        .filter(|p| !has_encoding_tag(p))
-        .cloned()
         .collect()
 }
 
@@ -157,7 +172,7 @@ pub(crate) fn filter_key_package_events_for_account(
     let mut dropped_wrong_author = 0;
 
     for event in events {
-        if event.kind != Kind::MlsKeyPackage {
+        if !is_key_package_kind(event.kind) {
             dropped_wrong_kind += 1;
             continue;
         }
@@ -232,16 +247,13 @@ impl Whitenoise {
 
         let key_package_data = self.encoded_key_package(account, &relays).await?;
         let relay_urls = Relay::urls(&relays);
-        let event_id = self
-            .publish_key_package_to_relays(
-                &key_package_data.content,
-                &relay_urls,
-                &key_package_data.tags_443,
-                std::sync::Arc::new(signer),
-            )
-            .await?;
-        self.track_published_key_package(account, &key_package_data.hash_ref, &event_id)
-            .await;
+        self.publish_key_package_pair_to_relays(
+            account,
+            &key_package_data,
+            &relay_urls,
+            std::sync::Arc::new(signer),
+        )
+        .await?;
         Ok(())
     }
 
@@ -300,22 +312,15 @@ impl Whitenoise {
                     }
                 };
                 match wn
-                    .publish_key_package_to_relays(
-                        &key_package_data.content,
+                    .publish_key_package_pair_to_relays(
+                        &account,
+                        &key_package_data,
                         &relay_urls,
-                        &key_package_data.tags_443,
                         signer,
                     )
                     .await
                 {
-                    Ok(event_id) => {
-                        wn.track_published_key_package(
-                            &account,
-                            &key_package_data.hash_ref,
-                            &event_id,
-                        )
-                        .await;
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         tracing::warn!(
                             target: "whitenoise::key_packages",
@@ -328,22 +333,10 @@ impl Whitenoise {
         } else {
             // Synchronous fallback (unit tests or pre-initialization).
             match self
-                .publish_key_package_to_relays(
-                    &key_package_data.content,
-                    &relay_urls,
-                    &key_package_data.tags_443,
-                    signer,
-                )
+                .publish_key_package_pair_to_relays(account, &key_package_data, &relay_urls, signer)
                 .await
             {
-                Ok(event_id) => {
-                    self.track_published_key_package(
-                        account,
-                        &key_package_data.hash_ref,
-                        &event_id,
-                    )
-                    .await;
-                }
+                Ok(()) => {}
                 Err(e) => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
@@ -351,6 +344,67 @@ impl Whitenoise {
                         e
                     );
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[perf_instrument("key_packages")]
+    async fn publish_key_package_pair_to_relays(
+        &self,
+        account: &Account,
+        key_package_data: &KeyPackageEventData,
+        relay_urls: &[RelayUrl],
+        signer: std::sync::Arc<dyn NostrSigner>,
+    ) -> Result<()> {
+        let canonical_event_id = self
+            .publish_key_package_to_relays(
+                MLS_KEY_PACKAGE_KIND,
+                &key_package_data.content,
+                relay_urls,
+                &key_package_data.tags_30443,
+                signer.clone(),
+            )
+            .await?;
+
+        self.track_published_key_package(
+            account,
+            &key_package_data.hash_ref,
+            &canonical_event_id,
+            MLS_KEY_PACKAGE_KIND,
+            Some(&key_package_data.d_tag),
+        )
+        .await;
+
+        match self
+            .publish_key_package_to_relays(
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                &key_package_data.content,
+                relay_urls,
+                &key_package_data.tags_443,
+                signer,
+            )
+            .await
+        {
+            Ok(legacy_event_id) => {
+                self.track_published_key_package(
+                    account,
+                    &key_package_data.hash_ref,
+                    &legacy_event_id,
+                    MLS_KEY_PACKAGE_KIND_LEGACY,
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Published canonical kind:30443 key package for account {} but failed \
+                     to publish legacy kind:443 twin: {}",
+                    account.pubkey.to_hex(),
+                    e,
+                );
             }
         }
 
@@ -365,6 +419,7 @@ impl Whitenoise {
     #[perf_instrument("key_packages")]
     async fn publish_key_package_to_relays(
         &self,
+        kind: Kind,
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
@@ -373,7 +428,7 @@ impl Whitenoise {
         let result = self
             .shared
             .relay_control
-            .publish_key_package_with_signer(encoded_key_package, relay_urls, tags, signer)
+            .publish_key_package_with_signer(kind, encoded_key_package, relay_urls, tags, signer)
             .await?;
 
         if result.success.is_empty() {
@@ -384,7 +439,8 @@ impl Whitenoise {
 
         tracing::debug!(
             target: "whitenoise::key_packages",
-            "Published key package to {} relay(s)",
+            "Published kind:{} key package to {} relay(s)",
+            kind.as_u16(),
             result.success.len(),
         );
 
@@ -398,11 +454,15 @@ impl Whitenoise {
         account: &Account,
         hash_ref: &[u8],
         event_id: &EventId,
+        kind: Kind,
+        d_tag: Option<&str>,
     ) {
         if let Err(e) = PublishedKeyPackage::create(
             &account.pubkey,
             hash_ref,
             &event_id.to_hex(),
+            kind,
+            d_tag,
             &self.shared.database,
         )
         .await
@@ -471,53 +531,58 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
+        let published_package = match PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &event_id.to_hex(),
+            &self.shared.database,
+        )
+        .await
+        {
+            Ok(package) => package,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Failed to look up published key package for event {}: {}",
+                    event_id,
+                    e
+                );
+                None
+            }
+        };
+
         // Delete local MLS key material using the hash_ref stored at publish time.
         // This avoids a relay round-trip to fetch and parse the key package event.
         if delete_mls_stored_keys {
-            match PublishedKeyPackage::find_by_event_id(
-                &account.pubkey,
-                &event_id.to_hex(),
-                &self.shared.database,
-            )
-            .await
-            {
-                Ok(Some(pkg)) if !pkg.key_material_deleted => {
+            match &published_package {
+                Some(pkg) if !pkg.key_material_deleted => {
                     let mdk = self.create_mdk_for_account(account.pubkey)?;
                     mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)?;
-                    if let Err(e) = PublishedKeyPackage::mark_key_material_deleted(
-                        pkg.id,
+                    if let Err(e) = PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
+                        &account.pubkey,
+                        &pkg.key_package_hash_ref,
                         &self.shared.database,
                     )
                     .await
                     {
                         tracing::warn!(
                             target: "whitenoise::key_packages",
-                            "Deleted key material but failed to mark record {}: {}",
-                            pkg.id,
+                            "Deleted key material but failed to mark hash_ref group: {}",
                             e
                         );
                     }
                 }
-                Ok(Some(_)) => {
+                Some(_) => {
                     tracing::debug!(
                         target: "whitenoise::key_packages",
                         "Key material already deleted for event {}, skipping local deletion",
                         event_id
                     );
                 }
-                Ok(None) => {
+                None => {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
                         "No published key package record found for event {}, cannot delete local key material",
                         event_id
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "whitenoise::key_packages",
-                        "Failed to look up published key package for event {}: {}",
-                        event_id,
-                        e
                     );
                 }
             }
@@ -529,13 +594,70 @@ impl Whitenoise {
         }
 
         let key_package_relays_urls = Relay::urls(&key_package_relays);
+        let event_ids = self
+            .key_package_event_ids_for_deletion(account, event_id, published_package.as_ref())
+            .await;
 
         let result = self
             .shared
             .relay_control
-            .publish_event_deletion_with_signer(event_id, &key_package_relays_urls, signer)
+            .publish_batch_event_deletion_with_signer(&event_ids, &key_package_relays_urls, signer)
             .await?;
         Ok(!result.success.is_empty())
+    }
+
+    async fn key_package_event_ids_for_deletion(
+        &self,
+        account: &Account,
+        event_id: &EventId,
+        published_package: Option<&PublishedKeyPackage>,
+    ) -> Vec<EventId> {
+        let mut seen = HashSet::new();
+        let mut event_ids = Vec::new();
+        if seen.insert(*event_id) {
+            event_ids.push(*event_id);
+        }
+
+        let Some(package) = published_package else {
+            return event_ids;
+        };
+
+        match PublishedKeyPackage::find_by_hash_ref(
+            &account.pubkey,
+            &package.key_package_hash_ref,
+            &self.shared.database,
+        )
+        .await
+        {
+            Ok(packages) => {
+                for package in packages {
+                    match EventId::from_hex(&package.event_id) {
+                        Ok(package_event_id) if seen.insert(package_event_id) => {
+                            event_ids.push(package_event_id);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "whitenoise::key_packages",
+                                "Skipping invalid tracked key package event id {}: {}",
+                                package.event_id,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Failed to find key package hash_ref twins for event {}: {}",
+                    event_id,
+                    e
+                );
+            }
+        }
+
+        event_ids
     }
 
     /// Finds and returns all key package events for the given account from its key package relays.
@@ -574,25 +696,20 @@ impl Whitenoise {
             .await
     }
 
-    /// Deletes all key package events from relays for the given account.
+    /// Deletes all legacy key package events from relays for the given account.
     ///
-    /// This method finds all key package events authored by the account and publishes
-    /// a batch deletion event to efficiently remove them from the relays. It then verifies
-    /// the deletions by refetching and returns the actual count of deleted key packages.
-    /// Optionally, it can also delete the MLS stored keys from local storage.
+    /// This developer-facing cleanup keeps canonical replaceable kind:30443 key packages
+    /// intact and only removes legacy kind:443 copies. Shared local MLS key material
+    /// is not deleted from this legacy-only path because kind:443 and kind:30443
+    /// twins can reference the same `hash_ref`.
     ///
     /// Automatically uses the appropriate signer for the account:
     /// - For external accounts (Amber/NIP-55): uses the registered external signer
     /// - For local accounts: uses keys from the secrets store
     ///
-    /// # Arguments
-    ///
-    /// * `account` - The account to delete key packages for
-    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
-    ///
     /// # Returns
     ///
-    /// Returns the number of key packages that were successfully deleted.
+    /// Returns the number of legacy key packages that were successfully deleted.
     ///
     /// # Errors
     ///
@@ -613,101 +730,40 @@ impl Whitenoise {
             .await
     }
 
-    /// Deletes all key package events from relays using an external signer.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().delete_legacy() instead."
+    )]
+    #[perf_instrument("key_packages")]
+    pub async fn delete_legacy_key_packages_for_account(&self, account: &Account) -> Result<usize> {
+        let session = self.require_session(&account.pubkey)?;
+        session.key_packages().delete_legacy().await
+    }
+
+    /// Deletes all legacy key package events from relays using an external signer.
     ///
     /// This is used for external signer accounts (like Amber/NIP-55) where the
     /// private key is not available locally. The signer is used to sign the
     /// deletion events before publishing.
     ///
-    /// # Arguments
-    ///
-    /// * `account` - The account to delete key packages for
-    /// * `delete_mls_stored_keys` - Whether to also delete MLS keys from local storage
-    /// * `signer` - The external signer to use for signing deletion events
-    ///
     /// # Returns
     ///
-    /// Returns the number of key packages that were successfully deleted.
+    /// Returns the number of legacy key packages that were successfully deleted.
+    #[deprecated(
+        since = "0.0.0",
+        note = "Use AccountSession::key_packages().delete_legacy() instead. The session carries the signer."
+    )]
     #[perf_instrument("key_packages")]
-    pub async fn delete_all_key_packages_for_account_with_signer(
+    pub async fn delete_legacy_key_packages_for_account_with_signer(
         &self,
         account: &Account,
-        delete_mls_stored_keys: bool,
         signer: impl NostrSigner + 'static,
     ) -> Result<usize> {
-        self.delete_all_key_packages_loop(
-            account,
-            delete_mls_stored_keys,
-            std::sync::Arc::new(signer),
-        )
-        .await
-    }
-
-    /// Loops fetch-delete rounds until no key packages remain on relays, up to
-    /// [`MAX_DELETE_ROUNDS`]. This handles NIP-01 pagination: relays may return
-    /// only a subset of key packages per query, so a single fetch-delete pass
-    /// can leave packages behind.
-    #[perf_instrument("key_packages")]
-    async fn delete_all_key_packages_loop(
-        &self,
-        account: &Account,
-        delete_mls_stored_keys: bool,
-        signer: std::sync::Arc<dyn NostrSigner>,
-    ) -> Result<usize> {
-        let mut total_deleted = 0;
-
-        for round in 0..MAX_DELETE_ROUNDS {
-            let key_package_events = self.fetch_all_key_packages_for_account(account).await?;
-
-            if key_package_events.is_empty() {
-                tracing::info!(
-                    target: "whitenoise::key_packages",
-                    "All key packages deleted for account {} \
-                     ({} total across {} round(s))",
-                    account.pubkey.to_hex(),
-                    total_deleted,
-                    round + 1,
-                );
-                return Ok(total_deleted);
-            }
-
-            tracing::debug!(
-                target: "whitenoise::key_packages",
-                "Round {}: found {} remaining key package(s) for account {}",
-                round + 1,
-                key_package_events.len(),
-                account.pubkey.to_hex(),
-            );
-
-            let batch_size = key_package_events.len();
-
-            let deleted = self
-                .delete_key_packages_for_account_internal(
-                    account,
-                    key_package_events,
-                    delete_mls_stored_keys,
-                    1,
-                    signer.clone(),
-                )
-                .await?;
-
-            total_deleted += deleted;
-
-            // If nothing was deleted this round, relays are not
-            // cooperating (e.g. they don't support NIP-09 deletion).
-            if deleted == 0 {
-                tracing::warn!(
-                    target: "whitenoise::key_packages",
-                    "Round {} deleted 0 key packages despite {} found \
-                     — relays may not support deletion",
-                    round + 1,
-                    batch_size,
-                );
-                break;
-            }
-        }
-
-        Ok(total_deleted)
+        // The session already carries the correct signer, so the explicit
+        // signer argument is ignored in the delegation path.
+        let _ = signer;
+        let session = self.require_session(&account.pubkey)?;
+        session.key_packages().delete_legacy().await
     }
 
     /// Deletes the specified key package events from relays for the given account.
@@ -780,7 +836,8 @@ impl Whitenoise {
 
         // Delete from local storage on initial attempt only
         if delete_mls_stored_keys {
-            self.delete_key_packages_from_storage(account, &key_package_events, original_count)?;
+            self.delete_key_packages_from_storage(account, &key_package_events, original_count)
+                .await?;
         }
 
         let mut pending_ids: Vec<EventId> = key_package_events.iter().map(|e| e.id).collect();
@@ -854,16 +911,75 @@ impl Whitenoise {
         Ok(Relay::urls(&key_package_relays))
     }
 
-    fn delete_key_packages_from_storage(
+    async fn delete_key_packages_from_storage(
         &self,
         account: &Account,
         key_package_events: &[Event],
         initial_count: usize,
     ) -> Result<()> {
         let mdk = self.create_mdk_for_account(account.pubkey)?;
+        let mut deleted_hash_refs = HashSet::new();
+        let mut deleted_untracked_contents = HashSet::new();
         let mut storage_delete_count = 0;
 
         for event in key_package_events {
+            match PublishedKeyPackage::find_by_event_id(
+                &account.pubkey,
+                &event.id.to_hex(),
+                &self.shared.database,
+            )
+            .await
+            {
+                Ok(Some(pkg)) => {
+                    if !deleted_hash_refs.insert(pkg.key_package_hash_ref.clone()) {
+                        continue;
+                    }
+
+                    match mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)
+                    {
+                        Ok(()) => {
+                            storage_delete_count += 1;
+                            if let Err(e) =
+                                PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
+                                    &account.pubkey,
+                                    &pkg.key_package_hash_ref,
+                                    &self.shared.database,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    target: "whitenoise::key_packages",
+                                    "Deleted key material but failed to mark hash_ref group: {}",
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "whitenoise::key_packages",
+                                "Failed to delete key package from storage for event {}: {}",
+                                event.id,
+                                e
+                            );
+                        }
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "whitenoise::key_packages",
+                        "Failed to look up published key package for event {}: {}",
+                        event.id,
+                        e
+                    );
+                }
+            }
+
+            if !deleted_untracked_contents.insert(event.content.clone()) {
+                continue;
+            }
+
             match mdk.parse_key_package(event) {
                 Ok(key_package) => match mdk.delete_key_package_from_storage(&key_package) {
                     Ok(_) => storage_delete_count += 1,
@@ -964,7 +1080,9 @@ impl Whitenoise {
     ///
     /// Integration-test helper for cases that manually publish custom key
     /// package events (for example with a backdated timestamp) and still need
-    /// maintenance to treat them as locally-owned packages.
+    /// maintenance to treat them as locally-owned packages. Callers pass the
+    /// event kind explicitly so canonical and legacy test fixtures match the
+    /// event that was actually published.
     #[deprecated(
         since = "0.0.0",
         note = "Use AccountSession::key_packages().track_published_for_testing() instead."
@@ -975,10 +1093,19 @@ impl Whitenoise {
         account_pubkey: &nostr_sdk::PublicKey,
         hash_ref: &[u8],
         event_id: &str,
+        kind: Kind,
+        d_tag: Option<&str>,
     ) -> Result<()> {
-        PublishedKeyPackage::create(account_pubkey, hash_ref, event_id, &self.shared.database)
-            .await
-            .map_err(WhitenoiseError::from)
+        PublishedKeyPackage::create(
+            account_pubkey,
+            hash_ref,
+            event_id,
+            kind,
+            d_tag,
+            &self.shared.database,
+        )
+        .await
+        .map_err(WhitenoiseError::from)
     }
 
     /// Backdates the `consumed_at` timestamp for a published key package.
@@ -997,20 +1124,29 @@ impl Whitenoise {
         event_id: &str,
         age_secs: i64,
     ) -> Result<()> {
+        let package =
+            PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.shared.database)
+                .await?
+                .ok_or_else(|| {
+                    WhitenoiseError::Internal(format!(
+                        "Published key package not found: {event_id}"
+                    ))
+                })?;
+
         sqlx::query(
             "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
-             WHERE account_pubkey = ? AND event_id = ?",
+             WHERE account_pubkey = ? AND key_package_hash_ref = ?",
         )
         .bind(age_secs)
         .bind(account_pubkey.to_hex())
-        .bind(event_id)
+        .bind(&package.key_package_hash_ref)
         .execute(&self.shared.database.pool)
         .await
         .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
 
         tracing::debug!(
             target: "whitenoise::key_packages",
-            "Backdated consumed_at by {}s for KP event {} (TEST ONLY)",
+            "Backdated consumed_at by {}s for KP hash_ref group containing event {} (TEST ONLY)",
             age_secs,
             event_id
         );
@@ -1027,6 +1163,7 @@ mod tests {
 
     use super::*;
     use crate::whitenoise::accounts::AccountType;
+    use crate::whitenoise::session::key_packages::MAX_DELETE_ROUNDS;
     use crate::whitenoise::test_utils::*;
 
     fn create_local_account_struct() -> Account {
@@ -1055,7 +1192,13 @@ mod tests {
 
     /// Creates a persisted account with a key package relay and stored keys.
     async fn create_account_with_relay(whitenoise: &Whitenoise) -> Account {
+        let (account, _keys) = create_account_with_relay_and_keys(whitenoise).await;
+        account
+    }
+
+    async fn create_account_with_relay_and_keys(whitenoise: &Whitenoise) -> (Account, Keys) {
         let (account, keys) = create_test_account(whitenoise).await;
+        let account = account.save(&whitenoise.shared.database).await.unwrap();
         whitenoise
             .shared
             .secrets_store
@@ -1076,7 +1219,7 @@ mod tests {
         )
         .await
         .unwrap();
-        account
+        (account, keys)
     }
 
     #[tokio::test]
@@ -1303,15 +1446,15 @@ mod tests {
 
     /// Creates a mock key package event with the encoding tag
     fn create_key_package_event_with_encoding_tag(keys: &Keys) -> Event {
-        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "test_content")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .sign_with_keys(keys)
             .unwrap()
     }
 
-    /// Creates a mock key package event without the encoding tag (outdated)
+    /// Creates a mock key package event without the encoding tag.
     fn create_key_package_event_without_encoding_tag(keys: &Keys) -> Event {
-        EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "test_content")
             .sign_with_keys(keys)
             .unwrap()
     }
@@ -1321,7 +1464,7 @@ mod tests {
         ciphersuite: &str,
         extensions: &[&str],
     ) -> Event {
-        EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
                 [ciphersuite],
@@ -1329,6 +1472,10 @@ mod tests {
             .tag(Tag::custom(
                 TagKind::Custom("mls_extensions".into()),
                 extensions.iter().copied(),
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
             ))
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .sign_with_keys(keys)
@@ -1340,6 +1487,26 @@ mod tests {
         EventBuilder::new(Kind::TextNote, "test_content")
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn test_legacy_key_package_events_filters_to_kind_443() {
+        let keys = Keys::generate();
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let text_note = create_non_key_package_event(&keys);
+
+        let filtered: Vec<Event> = vec![canonical, legacy.clone(), text_note]
+            .into_iter()
+            .filter(|e| e.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, legacy.id);
     }
 
     #[test]
@@ -1368,7 +1535,7 @@ mod tests {
     fn test_has_encoding_tag_returns_false_for_wrong_value() {
         let keys = Keys::generate();
         // Create event with encoding tag but wrong value
-        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "test_content")
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["hex"]))
             .sign_with_keys(&keys)
             .unwrap();
@@ -1390,6 +1557,63 @@ mod tests {
 
         let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
         assert!(result.is_ok(), "Expected valid compatibility tags");
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_tags_accepts_current_kind() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "dGVzdF9jb250ZW50")
+            .tag(Tag::identifier(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(
+            result.is_ok(),
+            "Expected current kind key package to validate"
+        );
+    }
+
+    #[test]
+    fn test_validate_marmot_key_package_tags_rejects_current_kind_without_d_tag() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MissingKeyPackageDTag)
+        ));
     }
 
     #[test]
@@ -1429,7 +1653,7 @@ mod tests {
     #[test]
     fn test_validate_marmot_key_package_tags_rejects_invalid_base64_content() {
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::MlsKeyPackage, "not-base64$$$")
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-base64$$$")
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
                 [REQUIRED_MLS_CIPHERSUITE_TAG],
@@ -1437,6 +1661,10 @@ mod tests {
             .tag(Tag::custom(
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
             ))
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .sign_with_keys(&keys)
@@ -1459,6 +1687,10 @@ mod tests {
                 TagKind::Custom("mls_extensions".into()),
                 ["0x000a", "0xf2ee"],
             ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x000a"],
+            ))
             .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
             .sign_with_keys(&keys)
             .unwrap();
@@ -1474,7 +1706,7 @@ mod tests {
     #[test]
     fn test_validate_marmot_key_package_tags_rejects_missing_encoding_tag() {
         let keys = Keys::generate();
-        let event = EventBuilder::new(Kind::MlsKeyPackage, "dGVzdF9jb250ZW50")
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
                 TagKind::Custom("mls_ciphersuite".into()),
                 [REQUIRED_MLS_CIPHERSUITE_TAG],
@@ -1492,65 +1724,31 @@ mod tests {
     }
 
     #[test]
-    fn test_find_outdated_packages_returns_only_packages_without_tag() {
+    fn test_validate_marmot_key_package_tags_rejects_missing_self_remove_proposal() {
         let keys = Keys::generate();
-        let with_tag = create_key_package_event_with_encoding_tag(&keys);
-        let without_tag = create_key_package_event_without_encoding_tag(&keys);
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
+            .tag(Tag::custom(
+                TagKind::Custom("mls_ciphersuite".into()),
+                [REQUIRED_MLS_CIPHERSUITE_TAG],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom("mls_extensions".into()),
+                ["0x000a", "0xf2ee"],
+            ))
+            .tag(Tag::custom(
+                TagKind::Custom(MLS_PROPOSALS_TAG_KEY.into()),
+                ["0x0001"],
+            ))
+            .tag(Tag::custom(TagKind::Custom("encoding".into()), ["base64"]))
+            .sign_with_keys(&keys)
+            .unwrap();
 
-        let packages = vec![with_tag.clone(), without_tag.clone()];
-        let outdated = find_outdated_packages(&packages);
-
-        assert_eq!(
-            outdated.len(),
-            1,
-            "Should find exactly one outdated package"
-        );
-        assert_eq!(
-            outdated[0].id, without_tag.id,
-            "Outdated package should be the one without encoding tag"
-        );
-    }
-
-    #[test]
-    fn test_find_outdated_packages_returns_empty_when_all_have_tag() {
-        let keys = Keys::generate();
-        let event1 = create_key_package_event_with_encoding_tag(&keys);
-        let event2 = create_key_package_event_with_encoding_tag(&keys);
-
-        let packages = vec![event1, event2];
-        let outdated = find_outdated_packages(&packages);
-
-        assert!(
-            outdated.is_empty(),
-            "Should return empty when all packages have encoding tag"
-        );
-    }
-
-    #[test]
-    fn test_find_outdated_packages_returns_all_when_none_have_tag() {
-        let keys = Keys::generate();
-        let event1 = create_key_package_event_without_encoding_tag(&keys);
-        let event2 = create_key_package_event_without_encoding_tag(&keys);
-
-        let packages = vec![event1, event2];
-        let outdated = find_outdated_packages(&packages);
-
-        assert_eq!(
-            outdated.len(),
-            2,
-            "Should return all packages when none have encoding tag"
-        );
-    }
-
-    #[test]
-    fn test_find_outdated_packages_handles_empty_list() {
-        let packages: Vec<Event> = vec![];
-        let outdated = find_outdated_packages(&packages);
-
-        assert!(
-            outdated.is_empty(),
-            "Should return empty when given empty list"
-        );
+        let result = validate_marmot_key_package_tags(&event, REQUIRED_MLS_CIPHERSUITE_TAG);
+        assert!(result.is_err(), "Expected missing SelfRemove to fail");
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::MissingMlsProposals { .. })
+        ));
     }
 
     #[test]
@@ -1636,7 +1834,7 @@ mod tests {
     fn test_has_encoding_tag_with_multiple_tags() {
         let keys = Keys::generate();
         // Create event with multiple tags including encoding tag
-        let event = EventBuilder::new(Kind::MlsKeyPackage, "test_content")
+        let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "test_content")
             .tag(Tag::custom(
                 TagKind::Custom("mls_protocol_version".into()),
                 ["1.0"],
@@ -1753,14 +1951,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_all_key_packages_without_signer_fails() {
+    async fn test_delete_legacy_key_packages_without_signer_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Account without keys in secrets store — signer resolution fails
         let account = create_local_account_struct();
 
         let result = whitenoise
-            .delete_all_key_packages_for_account(&account, false)
+            .delete_legacy_key_packages_for_account(&account)
             .await;
 
         assert!(result.is_err(), "Should fail when no signer is available");
@@ -1772,7 +1970,7 @@ mod tests {
     // Regression introduced in Phase 14 when delete_all_key_packages was migrated to session.
     #[ignore]
     #[tokio::test]
-    async fn test_delete_all_key_packages_without_relays_fails() {
+    async fn test_delete_legacy_key_packages_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Create an account with keys stored but no key package relays.
@@ -1786,7 +1984,7 @@ mod tests {
             .expect("Should store keys");
 
         let result = whitenoise
-            .delete_all_key_packages_for_account(&account, false)
+            .delete_legacy_key_packages_for_account(&account)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -1798,13 +1996,13 @@ mod tests {
     // TODO(phase-16): Same as test_delete_all_key_packages_without_relays_fails above.
     #[ignore]
     #[tokio::test]
-    async fn test_delete_all_key_packages_with_signer_without_relays_fails() {
+    async fn test_delete_legacy_key_packages_with_signer_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, _keys) = create_test_account(&whitenoise).await;
         let signer_keys = Keys::generate();
 
         let result = whitenoise
-            .delete_all_key_packages_for_account_with_signer(&account, false, signer_keys)
+            .delete_legacy_key_packages_for_account_with_signer(&account, signer_keys)
             .await;
         assert!(result.is_err());
         assert!(matches!(
@@ -1826,6 +2024,141 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_key_packages_from_storage_deduplicates_hash_ref_twins() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_account_with_relay_and_keys(&whitenoise).await;
+        let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let key_package_data = whitenoise
+            .encoded_key_package(&account, &relays)
+            .await
+            .unwrap();
+
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, &key_package_data.content)
+            .tags(key_package_data.tags_30443.to_vec())
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, &key_package_data.content)
+            .tags(key_package_data.tags_443.to_vec())
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &key_package_data.hash_ref,
+            &canonical.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND,
+            Some(&key_package_data.d_tag),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &key_package_data.hash_ref,
+            &legacy.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+
+        let invalid_untracked = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let duplicate_untracked =
+            EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
+                .sign_with_keys(&keys)
+                .unwrap();
+
+        whitenoise
+            .delete_key_packages_from_storage(
+                &account,
+                &[
+                    canonical.clone(),
+                    legacy.clone(),
+                    invalid_untracked,
+                    duplicate_untracked,
+                ],
+                4,
+            )
+            .await
+            .unwrap();
+
+        let canonical_record = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &canonical.id.to_hex(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let legacy_record = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &legacy.id.to_hex(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(canonical_record.key_material_deleted);
+        assert!(legacy_record.key_material_deleted);
+    }
+
+    #[tokio::test]
+    async fn test_key_package_event_ids_for_deletion_includes_hash_ref_twins() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let (account, keys) = create_account_with_relay_and_keys(&whitenoise).await;
+        let hash_ref = vec![1, 2, 3];
+
+        let canonical = EventBuilder::new(MLS_KEY_PACKAGE_KIND, "canonical")
+            .tag(Tag::identifier("delete-twins"))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let legacy = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "legacy")
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            &canonical.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND,
+            Some("delete-twins"),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        PublishedKeyPackage::create(
+            &account.pubkey,
+            &hash_ref,
+            &legacy.id.to_hex(),
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+
+        let canonical_record = PublishedKeyPackage::find_by_event_id(
+            &account.pubkey,
+            &canonical.id.to_hex(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let event_ids = whitenoise
+            .key_package_event_ids_for_deletion(&account, &canonical.id, Some(&canonical_record))
+            .await;
+
+        assert_eq!(event_ids.len(), 2);
+        assert!(event_ids.contains(&canonical.id));
+        assert!(event_ids.contains(&legacy.id));
     }
 
     #[tokio::test]

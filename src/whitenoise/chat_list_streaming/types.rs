@@ -34,6 +34,9 @@ pub enum ChatListUpdateTrigger {
     /// Emitted to both active and archived channels since the group
     /// could be in either state at the time of deletion.
     ChatDeleted,
+    /// A user was blocked or unblocked. The DM chat with that user should
+    /// refresh to show/hide the block banner and swap the input area.
+    UserBlockChanged,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,4 +48,75 @@ pub struct ChatListUpdate {
 pub struct ChatListSubscription {
     pub initial_items: Vec<ChatListItem>,
     pub updates: broadcast::Receiver<ChatListUpdate>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_trigger_derives_copy_and_eq() {
+        let trigger = ChatListUpdateTrigger::NewGroup;
+        let copied = trigger; // Copy trait allows implicit copy
+        assert_eq!(trigger, copied);
+
+        let trigger2 = ChatListUpdateTrigger::NewLastMessage;
+        assert_ne!(trigger, trigger2);
+    }
+
+    #[test]
+    fn update_trigger_serialization_roundtrip() {
+        let triggers = [
+            ChatListUpdateTrigger::NewGroup,
+            ChatListUpdateTrigger::NewLastMessage,
+            ChatListUpdateTrigger::LastMessageDeleted,
+            ChatListUpdateTrigger::ChatArchiveChanged,
+            ChatListUpdateTrigger::RemovedFromGroup,
+            ChatListUpdateTrigger::ChatMuteChanged,
+            ChatListUpdateTrigger::LeftGroup,
+            ChatListUpdateTrigger::ChatCleared,
+            ChatListUpdateTrigger::ChatDeleted,
+            ChatListUpdateTrigger::UserBlockChanged,
+        ];
+
+        for trigger in triggers {
+            let serialized = serde_json::to_string(&trigger).expect("serialize");
+            let deserialized: ChatListUpdateTrigger =
+                serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(trigger, deserialized);
+        }
+    }
+
+    #[test]
+    fn update_trigger_debug_output() {
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::NewGroup);
+        assert!(debug_str.contains("NewGroup"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::NewLastMessage);
+        assert!(debug_str.contains("NewLastMessage"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::LastMessageDeleted);
+        assert!(debug_str.contains("LastMessageDeleted"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatArchiveChanged);
+        assert!(debug_str.contains("ChatArchiveChanged"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::RemovedFromGroup);
+        assert!(debug_str.contains("RemovedFromGroup"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatMuteChanged);
+        assert!(debug_str.contains("ChatMuteChanged"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::LeftGroup);
+        assert!(debug_str.contains("LeftGroup"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatCleared);
+        assert!(debug_str.contains("ChatCleared"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::ChatDeleted);
+        assert!(debug_str.contains("ChatDeleted"));
+
+        let debug_str = format!("{:?}", ChatListUpdateTrigger::UserBlockChanged);
+        assert!(debug_str.contains("UserBlockChanged"));
+    }
 }

@@ -26,7 +26,7 @@ pub struct MessageOps<'a> {
 }
 
 impl<'a> MessageOps<'a> {
-    pub(crate) fn new(session: &'a AccountSession) -> Self {
+    pub(super) fn new(session: &'a AccountSession) -> Self {
         Self { session }
     }
 

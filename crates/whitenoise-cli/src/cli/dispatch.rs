@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate};
+use mdk_core::prelude::{GroupId, NostrGroupConfigData, NostrGroupDataUpdate, group_types};
 use nostr_sdk::{PublicKey, RelayUrl, Timestamp};
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 use whitenoise::{
-    AccountGroup, KeyPackageStatus, Language, PaginationOptions, RelayType, ThemeMode, Whitenoise,
+    AccountGroup, KeyPackageStatus, Language, PaginationOptions, RelayType, RequiredProposal,
+    ThemeMode, Whitenoise,
 };
 
 use super::protocol::{MuteDuration, Request, Response};
@@ -393,6 +395,22 @@ pub async fn dispatch(req: Request) -> Response {
         },
 
         Request::UsersShow { pubkey } => match users_show(wn, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::BlockUser { account, pubkey } => match block_user(wn, &account, &pubkey).await {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::UnblockUser { account, pubkey } => match unblock_user(wn, &account, &pubkey).await
+        {
+            Ok(resp) => resp,
+            Err(resp) => resp,
+        },
+
+        Request::BlockedUsers { account } => match blocked_users(wn, &account).await {
             Ok(resp) => resp,
             Err(resp) => resp,
         },
@@ -976,6 +994,12 @@ async fn add_members(
     Ok(Response::ok(serde_json::json!(null)))
 }
 
+#[derive(Serialize)]
+struct GroupShowResponse {
+    group: group_types::Group,
+    required_proposals: Vec<RequiredProposal>,
+}
+
 #[allow(deprecated)]
 async fn get_group(
     wn: &Whitenoise,
@@ -988,7 +1012,16 @@ async fn get_group(
         .group(&account, &group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
-    Ok(to_response(&group))
+    let required_proposals = wn
+        .group_required_proposals(&account, &group_id)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?
+        .into_iter()
+        .collect();
+    Ok(to_response(&GroupShowResponse {
+        group,
+        required_proposals,
+    }))
 }
 
 #[allow(deprecated)]
@@ -1249,6 +1282,52 @@ async fn follows_check(
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "following": following })))
+}
+
+async fn block_user(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    wn.block_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn unblock_user(
+    wn: &Whitenoise,
+    account_str: &str,
+    pubkey_str: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let pubkey = parse_pubkey(pubkey_str)?;
+    wn.unblock_user(&account, &pubkey)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+    Ok(Response::ok(serde_json::json!(null)))
+}
+
+async fn blocked_users(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
+    let entries = wn
+        .get_blocked_users(&account)
+        .await
+        .map_err(|e| Response::err(e.to_string()))?;
+
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "pubkey": entry.muted_pubkey.to_hex(),
+                "is_private": entry.is_private,
+            })
+        })
+        .collect();
+
+    Ok(Response::ok(serde_json::json!({ "blocked_users": list })))
 }
 
 #[allow(deprecated)]
@@ -1871,7 +1950,6 @@ async fn unreact_to_message(
 }
 
 #[allow(deprecated)]
-#[perf_instrument("dispatch")]
 async fn upload_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1952,7 +2030,6 @@ fn build_imeta_tag(media_file: &whitenoise::MediaFile) -> Result<nostr_sdk::Tag,
 }
 
 #[allow(deprecated)]
-#[perf_instrument("dispatch")]
 async fn download_media(
     wn: &Whitenoise,
     account_str: &str,
@@ -1978,7 +2055,6 @@ async fn download_media(
 }
 
 #[allow(deprecated)]
-#[perf_instrument("dispatch")]
 async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
     let group_id = parse_group_id(group_id_hex)?;
 
@@ -2173,7 +2249,7 @@ async fn keys_delete(
 async fn keys_delete_all(wn: &Whitenoise, account_str: &str) -> Result<Response, Response> {
     let account = find_account(wn, account_str).await?;
     let count = wn
-        .delete_all_key_packages_for_account(&account, true)
+        .delete_legacy_key_packages_for_account(&account)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     Ok(Response::ok(serde_json::json!({ "deleted_count": count })))
@@ -2209,6 +2285,9 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
 #[cfg(test)]
 mod tests {
     use nostr_sdk::ToBech32;
+    use std::collections::BTreeSet;
+
+    use crate::whitenoise::test_utils::{create_mock_whitenoise, create_nostr_group_config_data};
 
     use super::*;
 
@@ -2273,6 +2352,40 @@ mod tests {
     fn to_response_string() {
         let resp = to_response(&"hello");
         assert_eq!(resp.result.unwrap(), serde_json::json!("hello"));
+    }
+
+    // --- get_group ---
+
+    #[tokio::test]
+    async fn get_group_returns_nested_shape_with_required_proposals() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let creator = whitenoise.create_identity().await.unwrap();
+        let member = whitenoise.create_identity().await.unwrap();
+
+        let config = create_nostr_group_config_data(vec![creator.pubkey]);
+        let group = whitenoise
+            .create_group(&creator, vec![member.pubkey], config, None)
+            .await
+            .unwrap();
+
+        let response = get_group(
+            &whitenoise,
+            &creator.pubkey.to_hex(),
+            &hex::encode(group.mls_group_id.as_slice()),
+        )
+        .await
+        .expect("get_group succeeds for a valid account and group");
+
+        let value = response.result.expect("response carries a result");
+        let obj = value.as_object().expect("result serializes as an object");
+
+        let keys: BTreeSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(keys, BTreeSet::from(["group", "required_proposals"]));
+
+        assert_eq!(
+            obj["required_proposals"],
+            serde_json::json!(["self_remove"]),
+        );
     }
 
     // --- parse_relay_type ---

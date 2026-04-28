@@ -9,17 +9,21 @@ use nostr_sdk::prelude::*;
 use super::AccountSession;
 use crate::RelayType;
 use crate::perf_instrument;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::{Result, WhitenoiseError};
-use crate::whitenoise::key_packages::filter_key_package_events_for_account;
+use crate::whitenoise::key_packages::{
+    MLS_KEY_PACKAGE_KIND_LEGACY, filter_key_package_events_for_account,
+};
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::users::User;
+
+#[cfg(feature = "integration-tests")]
+use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 
 /// Maximum number of relay publish attempts before giving up.
 const MAX_PUBLISH_ATTEMPTS: u32 = 3;
 
 /// Maximum number of fetch-delete rounds before giving up.
-const MAX_DELETE_ROUNDS: u32 = 10;
+pub(crate) const MAX_DELETE_ROUNDS: u32 = 10;
 
 /// View over [`AccountSession`] for key package lifecycle operations.
 ///
@@ -64,6 +68,7 @@ impl<'a> KeyPackageOps<'a> {
 
             match self
                 .publish_to_relays(
+                    MLS_KEY_PACKAGE_KIND_LEGACY,
                     &key_package_data.content,
                     &relay_urls,
                     &key_package_data.tags_443,
@@ -99,6 +104,7 @@ impl<'a> KeyPackageOps<'a> {
         let relay_urls = Relay::urls(relays);
         let event_id = self
             .publish_to_relays(
+                MLS_KEY_PACKAGE_KIND_LEGACY,
                 &key_package_data.content,
                 &relay_urls,
                 &key_package_data.tags_443,
@@ -208,6 +214,65 @@ impl<'a> KeyPackageOps<'a> {
         Ok(total_deleted)
     }
 
+    /// Fetches and deletes legacy (kind 443) key packages in rounds until none
+    /// remain on relays, up to 10 rounds.
+    ///
+    /// This is the session-scoped equivalent of both
+    /// `Whitenoise::delete_legacy_key_packages_for_account` and
+    /// `Whitenoise::delete_legacy_key_packages_for_account_with_signer` — the
+    /// session already carries the correct signer, so no explicit signer
+    /// argument is needed.
+    #[perf_instrument("key_packages")]
+    pub async fn delete_legacy(&self) -> Result<usize> {
+        let mut total_deleted = 0;
+
+        for round in 0..MAX_DELETE_ROUNDS {
+            let all_events = self.fetch_all().await?;
+            let legacy_events: Vec<Event> = all_events
+                .into_iter()
+                .filter(|e| e.kind == MLS_KEY_PACKAGE_KIND_LEGACY)
+                .collect();
+
+            if legacy_events.is_empty() {
+                tracing::info!(
+                    target: "whitenoise::key_packages",
+                    "All legacy key packages deleted for account {} \
+                     ({} total across {} round(s))",
+                    self.session.account_pubkey.to_hex(),
+                    total_deleted,
+                    round + 1,
+                );
+                return Ok(total_deleted);
+            }
+
+            tracing::debug!(
+                target: "whitenoise::key_packages",
+                "Round {}: found {} remaining legacy key package(s) for account {}",
+                round + 1,
+                legacy_events.len(),
+                self.session.account_pubkey.to_hex(),
+            );
+
+            let batch_size = legacy_events.len();
+            let deleted = self.delete_batch(legacy_events, false, 1).await?;
+
+            total_deleted += deleted;
+
+            if deleted == 0 {
+                tracing::warn!(
+                    target: "whitenoise::key_packages",
+                    "Round {} deleted 0 legacy key packages despite {} found \
+                     — relays may not support deletion",
+                    round + 1,
+                    batch_size,
+                );
+                break;
+            }
+        }
+
+        Ok(total_deleted)
+    }
+
     /// Delete specific key package events from relays with retry.
     /// Storage deletion happens only on the initial attempt.
     #[perf_instrument("key_packages")]
@@ -294,6 +359,7 @@ impl<'a> KeyPackageOps<'a> {
     #[perf_instrument("key_packages")]
     async fn publish_to_relays(
         &self,
+        kind: Kind,
         encoded_key_package: &str,
         relay_urls: &[RelayUrl],
         tags: &[Tag],
@@ -301,7 +367,7 @@ impl<'a> KeyPackageOps<'a> {
         let result = self
             .session
             .ephemeral
-            .publish_key_package(encoded_key_package, relay_urls, tags)
+            .publish_key_package(kind, encoded_key_package, relay_urls, tags)
             .await?;
 
         if result.success.is_empty() {
@@ -319,7 +385,12 @@ impl<'a> KeyPackageOps<'a> {
             .session
             .repos
             .published_key_packages
-            .create(hash_ref, &event_id.to_hex())
+            .create(
+                hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
             .await
         {
             tracing::warn!(
@@ -365,13 +436,12 @@ impl<'a> KeyPackageOps<'a> {
                     .session
                     .repos
                     .published_key_packages
-                    .mark_key_material_deleted(pkg.id)
+                    .mark_key_material_deleted_by_hash_ref(&pkg.key_package_hash_ref)
                     .await
                 {
                     tracing::warn!(
                         target: "whitenoise::key_packages",
-                        "Deleted key material but failed to mark record {}: {}",
-                        pkg.id,
+                        "Deleted key material but failed to mark hash_ref group: {}",
                         e
                     );
                 }
@@ -460,7 +530,7 @@ impl<'a> KeyPackageOps<'a> {
         self.session
             .repos
             .published_key_packages
-            .create(hash_ref, event_id)
+            .create(hash_ref, event_id, MLS_KEY_PACKAGE_KIND_LEGACY, None)
             .await
     }
 
@@ -482,6 +552,7 @@ impl<'a> KeyPackageOps<'a> {
 mod tests {
     use nostr_sdk::{EventId, Keys, RelayUrl};
 
+    use super::MLS_KEY_PACKAGE_KIND_LEGACY;
     use crate::whitenoise::session::test_helpers::test_session;
 
     #[tokio::test]
@@ -506,7 +577,12 @@ mod tests {
         session
             .repos
             .published_key_packages
-            .create(&kp_data.hash_ref, &event_id.to_hex())
+            .create(
+                &kp_data.hash_ref,
+                &event_id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
             .await
             .expect("seed published_key_packages row");
 

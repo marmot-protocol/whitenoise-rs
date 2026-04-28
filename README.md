@@ -6,7 +6,7 @@ A secure, private, and decentralized chat app built on Nostr, using the MLS prot
 
 White Noise aims to be the most secure private chat app on Nostr, with a focus on privacy and security. Under the hood, it uses the [Messaging Layer Security](https://www.rfc-editor.org/rfc/rfc9420.html) (MLS) protocol to manage group communications in a highly secure way. Nostr is used as the transport protocol and as the framework for the ongoing conversation in each chat.
 
-This crate is the core library that powers our [Flutter app](https://github.com/marmot-protocol/whitenoise). It is front-end agnostic and will allow for CLI and other interfaces to operate groups in the future.
+This crate is the core library that powers our [Flutter app](https://github.com/marmot-protocol/whitenoise). It is front-end agnostic and also ships a Unix-style **command-line interface** — see [CLI](#cli) below.
 
 ## Status
 
@@ -15,6 +15,39 @@ This crate is the core library that powers our [Flutter app](https://github.com/
 ## The Spec
 
 White Noise implements the [Marmot protocol](https://github.com/marmot-protocol/marmot), which brings MLS group messaging to Nostr.
+
+## CLI
+
+White Noise ships a Unix-style CLI split into two binaries (both gated behind the `cli` cargo feature):
+
+- **`wnd`** — long-running daemon that owns the `Whitenoise` singleton (database, Nostr client, MLS state, relay subscriptions). Listens on a Unix domain socket.
+- **`wn`** — thin, stateless client. Sends one JSON request over the socket and prints the response. Supports streaming commands, `--json` output, and multi-account flows (`--account <npub>` or `WN_ACCOUNT`).
+
+Install both binaries to `~/.cargo/bin`:
+
+```sh
+just install-cli
+# or, equivalently:
+cargo install --path . --features cli
+```
+
+Or build from source without installing:
+
+```sh
+cargo build --release --features cli --bin wn --bin wnd
+```
+
+Quick tour:
+
+```sh
+wn daemon start              # spawn wnd in the background (or run `wnd` directly to foreground it)
+wn create-identity           # create a Nostr keypair
+wn login                     # log in with an nsec (reads the secret from the terminal)
+wn groups list               # see your MLS groups
+wn messages subscribe <id>   # stream live messages from a group
+```
+
+See [`crates/whitenoise-cli/src/cli/README.md`](crates/whitenoise-cli/src/cli/README.md) for the full command reference, IPC protocol, and architecture notes.
 
 ## Releases
 
@@ -51,9 +84,11 @@ To get started contributing you'll need to have the [Rust](https://www.rust-lang
 1. Clone the repo: `git clone https://github.com/marmot-protocol/whitenoise-rs.git` and `cd whitenoise-rs`.
 1. Install recommended development tools: `just install-tools` (optional but recommended)
 1. Start the development services (two Nostr relays, a Blossom server, and a local Transponder instance):
+
    ```bash
    just docker-up
    ```
+
 1. Now you can run the integration tests with `just int-test`.
 
 `just docker-up` will auto-generate `dev/transponder/.env` if it is missing, wait for the local
@@ -69,6 +104,7 @@ just install-tools
 ```
 
 This installs:
+
 - **cargo-nextest**: Faster parallel test runner
 - **cargo-audit**: Security vulnerability scanner
 - **cargo-outdated**: Check for outdated dependencies
