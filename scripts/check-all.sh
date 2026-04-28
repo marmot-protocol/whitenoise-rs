@@ -7,6 +7,7 @@ echo "🚀 Running all checks"
 echo "===================="
 echo
 
+./scripts/check-frozen-migrations.sh
 ./scripts/check-fmt.sh check
 ./scripts/check-docs.sh
 ./scripts/check-clippy.sh
