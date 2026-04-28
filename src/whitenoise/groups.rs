@@ -128,12 +128,11 @@ impl Whitenoise {
 
         let event = match lookup {
             KeyPackageLookup::Found(event) => event,
-            // Under the consumer-side baseline validator, missing capability
-            // advertisements (notably SelfRemove) no longer surface as
-            // `Incompatible`; only genuine malformations do. Phase 2 of the
-            // mixed-version-groups plan resurrects the
-            // `KeyPackageMissingSelfRemove` error variant for the
-            // `add_members` strict path.
+            // The consumer-side baseline validator no longer treats missing
+            // capability advertisements (notably SelfRemove) as `Incompatible`
+            // — only genuine malformations do. The
+            // `KeyPackageMissingSelfRemove` error variant survives because
+            // `add_members_to_group`'s strict-add path still produces it.
             KeyPackageLookup::Incompatible { error } => {
                 return Err(WhitenoiseError::IncompatibleKeyPackage {
                     member_pubkey: *pk,
@@ -358,9 +357,8 @@ impl Whitenoise {
 
         // Fold the per-member capability projections into a single legacy-peer
         // count as we split the triples. We don't keep `KeyPackageCapabilities`
-        // values around — only the count survives, because Phase 1's only
-        // consumer of the projection is the tracing emit below. (Phase 2 will
-        // consume the projection in `add_members_to_group`.)
+        // values around — only the count survives, because the projection's
+        // only consumer here is the tracing emit below.
         let mut legacy_peer_count: usize = 0;
         let mut members: Vec<User> = Vec::with_capacity(resolved_members.len());
         let mut key_package_events: Vec<Event> = Vec::with_capacity(resolved_members.len());
@@ -697,11 +695,11 @@ impl Whitenoise {
             member_caps.push((*pk, caps));
         }
 
-        // Phase 2 pre-validation: check each invitee's advertised proposals
-        // against the group's `RequiredCapabilities` BEFORE invoking MDK so we
-        // can attribute the rejection to the offending member. MDK's typed
-        // error (`InviteeMissingRequiredProposal`) is a unit variant carrying
-        // no attribution; we keep it as defense-in-depth via
+        // Pre-validate each invitee's advertised proposals against the group's
+        // `RequiredCapabilities` BEFORE invoking MDK so we can attribute the
+        // rejection to the offending member. MDK's typed error
+        // (`InviteeMissingRequiredProposal`) is a unit variant carrying no
+        // attribution; we keep it as defense-in-depth via
         // `map_mdk_add_members_error`.
         //
         // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`

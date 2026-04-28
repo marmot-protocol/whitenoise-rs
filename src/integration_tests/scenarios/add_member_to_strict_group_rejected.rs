@@ -1,21 +1,20 @@
 //! `add_member_to_strict_group_rejected` scenario.
 //!
-//! Verifies the Phase 2 strict-add error path from the mixed-version-groups
-//! plan: once a group has been created with all-modern initial members, MDK's
-//! lowest-common-denominator logic computes
-//! `RequiredProposals = {SelfRemove}` for the group. WhiteNoise's
-//! `add_members_to_group` must therefore reject a subsequent invitation of a
-//! peer whose published key package does not advertise SelfRemove, returning
-//! the typed [`crate::WhitenoiseError::KeyPackageMissingSelfRemove`] variant
-//! attributed to the offending member.
+//! When a group is created with all-modern initial members, MDK's
+//! lowest-common-denominator logic computes `RequiredProposals = {SelfRemove}`
+//! for the group. `add_members_to_group` must then reject a subsequent
+//! invitation of a peer whose published key package does not advertise
+//! SelfRemove, returning the typed
+//! [`crate::WhitenoiseError::KeyPackageMissingSelfRemove`] variant attributed
+//! to the offending member.
 //!
 //! **Scope.** The legacy fixture rewrites only the Nostr-event capability
 //! tags; the underlying MLS LeafNode bytes (built by MDK) still advertise the
 //! full capability set. That doesn't affect this test's assertion path —
-//! WhiteNoise's pre-check reads from the projected `KeyPackageCapabilities`
-//! (Nostr-tag level) and fires before MDK ever sees the LeafNode bytes. The
-//! MDK defense-in-depth fallback is unreachable from this fixture by
-//! construction and is covered by the unit test
+//! `add_members_to_group`'s pre-check reads from the projected
+//! `KeyPackageCapabilities` (Nostr-tag level) and fires before MDK ever sees
+//! the LeafNode bytes. The MDK defense-in-depth fallback is unreachable from
+//! this fixture by construction and is covered by the unit test
 //! `map_invitee_missing_required_proposal_yields_group_rejected_member`.
 
 use std::collections::BTreeSet;
@@ -117,9 +116,6 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
             legacy_pubkey.to_hex(),
         );
 
-        // Attempt to add the legacy peer. The Phase 2 pre-check must reject
-        // with the typed `KeyPackageMissingSelfRemove` variant naming the
-        // legacy peer.
         let result = self
             .context
             .whitenoise
@@ -136,7 +132,7 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
                     )));
                 }
                 tracing::info!(
-                    "Phase 2 pre-check rejected legacy peer {} as expected",
+                    "Pre-check rejected legacy peer {} as expected",
                     member_pubkey.to_hex()
                 );
                 Ok(())

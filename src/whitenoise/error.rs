@@ -194,11 +194,10 @@ pub enum WhitenoiseError {
     /// The invitee's published key package does not advertise the SelfRemove
     /// proposal that the existing group's `RequiredCapabilities` mandates.
     ///
-    /// **Only Phase 2's `add_members_to_group` pre-validation produces this
-    /// variant.** The `create_group` path no longer surfaces this — see
-    /// [`Self::IncompatibleKeyPackage`] for genuine malformations and the
-    /// `RequiredProposal::SelfRemove` LCD policy in
-    /// `whitenoise::groups::required_proposals` for the silent-downgrade
+    /// **Only `add_members_to_group`'s pre-validation produces this variant.**
+    /// `create_group` does not — see [`Self::IncompatibleKeyPackage`] for
+    /// genuine malformations and the `RequiredProposal::SelfRemove` LCD policy
+    /// in `whitenoise::groups::required_proposals` for the silent-downgrade
     /// outcome.
     #[error(
         "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
@@ -210,8 +209,8 @@ pub enum WhitenoiseError {
     /// `RequiredCapabilities`.
     ///
     /// `member_pubkey` carries the offending member when the rejection comes
-    /// from WhiteNoise's per-member pre-check (Phase 2's primary path); it is
-    /// `None` when the rejection comes from MDK's defense-in-depth fallback
+    /// from WhiteNoise's per-member pre-check; it is `None` when the rejection
+    /// comes from MDK's defense-in-depth fallback
     /// (`mdk_core::Error::InviteeMissingRequiredProposal`), which is a unit
     /// variant carrying no attribution.
     #[error(

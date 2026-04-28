@@ -1,9 +1,8 @@
 //! `create_group_with_legacy_member` scenario.
 //!
-//! Verifies the Phase 1 unblock from the mixed-version-groups plan: a peer
-//! whose published Nostr key-package event omits the SelfRemove proposal
-//! advertisement (legacy capability profile) can be invited to a fresh group
-//! without preflight rejection on the WhiteNoise side.
+//! A peer whose published Nostr key-package event omits the SelfRemove
+//! proposal advertisement (legacy capability profile) can be invited to a
+//! fresh group without preflight rejection on the WhiteNoise side.
 //!
 //! **Scope.** The fixture rewrites only the Nostr-event capability tags; the
 //! underlying MLS LeafNode bytes (built by MDK) still advertise the full
@@ -11,8 +10,7 @@
 //! group's `RequiredCapabilities`. The assertion is therefore limited to the
 //! unblock — `create_group` returns `Ok` and the legacy member appears in the
 //! resulting group's member list. End-to-end LCD verification needs real
-//! legacy LeafNode bytes (recorded from an older MDK) and is out of scope for
-//! this plan.
+//! legacy LeafNode bytes (recorded from an older MDK) and is out of scope.
 
 use std::collections::BTreeSet;
 
@@ -85,9 +83,10 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
             peer_pubkey.to_hex(),
         );
 
-        // Create the group as A inviting B. Phase 1's exit criterion: this
-        // call must succeed (no `KeyPackageMissingSelfRemove` /
-        // `IncompatibleKeyPackage` rejection from preflight).
+        // A invites B; the call must succeed without
+        // `KeyPackageMissingSelfRemove` / `IncompatibleKeyPackage` rejection
+        // from preflight even though B's published KP advertises no SelfRemove
+        // proposal.
         CreateGroupTestCase::basic()
             .with_name("legacy_member_group")
             .with_members("legacy_creator", vec!["legacy_peer"])

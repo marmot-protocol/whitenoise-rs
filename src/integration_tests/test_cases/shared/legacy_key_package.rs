@@ -55,8 +55,8 @@ const NOSTR_GROUP_DATA_TAG: &str = "0xf2ee";
 /// result, MDK's LCD logic (which reads from MLS bytes, not Nostr tags) will
 /// not actually downgrade the resulting group's `RequiredCapabilities` for
 /// this fixture. The fixture is sufficient to exercise WhiteNoise's
-/// consumer-side preflight softening (Phase 1), but end-to-end LCD
-/// verification needs real legacy LeafNode bytes recorded from an older MDK.
+/// consumer-side preflight softening, but end-to-end LCD verification needs
+/// real legacy LeafNode bytes recorded from an older MDK.
 pub(crate) async fn publish_legacy_capability_key_package(
     context: &ScenarioContext,
     account: &crate::Account,
