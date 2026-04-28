@@ -89,31 +89,7 @@ pub(crate) fn validate_marmot_key_package_strict(
     event: &Event,
     expected_ciphersuite: &str,
 ) -> Result<()> {
-    if !is_key_package_kind(event.kind) {
-        return Err(WhitenoiseError::InvalidEventKind {
-            expected: format!("{MLS_KEY_PACKAGE_KIND} or {MLS_KEY_PACKAGE_KIND_LEGACY}"),
-            got: event.kind.to_string(),
-        });
-    }
-
-    if event.kind == MLS_KEY_PACKAGE_KIND && event.tags.identifier().is_none() {
-        return Err(WhitenoiseError::MissingKeyPackageDTag);
-    }
-
-    if !has_encoding_tag(event) {
-        return Err(WhitenoiseError::MissingEncodingTag);
-    }
-
-    Base64::decode_vec(&event.content)?;
-
-    let expected_ciphersuite = expected_ciphersuite.to_ascii_lowercase();
-    let advertised_ciphersuites = normalized_tag_values(event, TagKind::MlsCiphersuite);
-    if !advertised_ciphersuites.contains(&expected_ciphersuite) {
-        return Err(WhitenoiseError::IncompatibleMlsCiphersuite {
-            expected: expected_ciphersuite,
-            advertised: advertised_ciphersuites,
-        });
-    }
+    validate_key_package_structure(event, expected_ciphersuite)?;
 
     let extensions: HashSet<String> = normalized_tag_values(event, TagKind::MlsExtensions)
         .into_iter()
@@ -141,26 +117,12 @@ pub(crate) fn validate_marmot_key_package_strict(
     Ok(())
 }
 
-/// Consumer-side preflight: validates only the **hard** Marmot KP requirements.
-///
-/// Performs:
-/// - event kind (current `30443` or legacy `443`)
-/// - `d`-tag presence on the current kind
-/// - `encoding=base64` tag
-/// - base64-decodable `event.content`
-/// - ciphersuite match
-/// - presence of the [`REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG`] (`0xf2ee`)
-///
-/// Does **not** check the SelfRemove proposal advertisement, nor the
-/// SelfRemove extension codepoint. Capability advertisements are surfaced via
-/// [`marmot_key_package_capabilities`] instead. Use this on every consumer-side
-/// path (key-package fetch, group creation, group membership). For self-publish
-/// lifecycle paths (where we want strict enforcement of our own KPs), use
-/// [`validate_marmot_key_package_strict`].
-pub(crate) fn validate_marmot_key_package_baseline(
-    event: &Event,
-    expected_ciphersuite: &str,
-) -> Result<()> {
+/// Structural checks shared by [`validate_marmot_key_package_strict`] and
+/// [`validate_marmot_key_package_baseline`]: event kind, current-kind `d`-tag,
+/// encoding tag, base64-decodable content, and ciphersuite match. Returns
+/// `Ok` when the KP clears that floor; callers add their own extension and
+/// proposal policy on top.
+fn validate_key_package_structure(event: &Event, expected_ciphersuite: &str) -> Result<()> {
     if !is_key_package_kind(event.kind) {
         return Err(WhitenoiseError::InvalidEventKind {
             expected: format!("{MLS_KEY_PACKAGE_KIND} or {MLS_KEY_PACKAGE_KIND_LEGACY}"),
@@ -186,6 +148,31 @@ pub(crate) fn validate_marmot_key_package_baseline(
             advertised: advertised_ciphersuites,
         });
     }
+
+    Ok(())
+}
+
+/// Consumer-side preflight: validates only the **hard** Marmot KP requirements.
+///
+/// Performs:
+/// - event kind (current `30443` or legacy `443`)
+/// - `d`-tag presence on the current kind
+/// - `encoding=base64` tag
+/// - base64-decodable `event.content`
+/// - ciphersuite match
+/// - presence of the [`REQUIRED_MARMOT_IDENTITY_EXTENSION_TAG`] (`0xf2ee`)
+///
+/// Does **not** check the SelfRemove proposal advertisement, nor the
+/// SelfRemove extension codepoint. Capability advertisements are surfaced via
+/// [`marmot_key_package_capabilities`] instead. Use this on every consumer-side
+/// path (key-package fetch, group creation, group membership). For self-publish
+/// lifecycle paths (where we want strict enforcement of our own KPs), use
+/// [`validate_marmot_key_package_strict`].
+pub(crate) fn validate_marmot_key_package_baseline(
+    event: &Event,
+    expected_ciphersuite: &str,
+) -> Result<()> {
+    validate_key_package_structure(event, expected_ciphersuite)?;
 
     let extensions: HashSet<String> = normalized_tag_values(event, TagKind::MlsExtensions)
         .into_iter()
