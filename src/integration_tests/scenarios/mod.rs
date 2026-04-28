@@ -1,4 +1,5 @@
 pub mod account_management;
+pub mod add_member_to_strict_group_rejected;
 pub mod advanced_messaging;
 pub mod app_settings;
 pub mod basic_messaging;
@@ -19,6 +20,7 @@ pub mod user_discovery;
 pub mod user_search;
 
 pub use account_management::*;
+pub use add_member_to_strict_group_rejected::*;
 pub use advanced_messaging::*;
 pub use app_settings::*;
 pub use basic_messaging::*;

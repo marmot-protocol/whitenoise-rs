@@ -191,10 +191,40 @@ pub enum WhitenoiseError {
     #[error("Missing required mls_proposals [{}]", missing.join(", "))]
     MissingMlsProposals { missing: Vec<String> },
 
+    /// The invitee's published key package does not advertise the SelfRemove
+    /// proposal that the existing group's `RequiredCapabilities` mandates.
+    ///
+    /// **Only Phase 2's `add_members_to_group` pre-validation produces this
+    /// variant.** The `create_group` path no longer surfaces this — see
+    /// [`Self::IncompatibleKeyPackage`] for genuine malformations and the
+    /// `RequiredProposal::SelfRemove` LCD policy in
+    /// `whitenoise::groups::required_proposals` for the silent-downgrade
+    /// outcome.
     #[error(
         "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
     )]
     KeyPackageMissingSelfRemove { member_pubkey: PublicKey },
+
+    /// MDK or our pre-validation rejected an `add_members_to_group` invitee
+    /// because their published key package does not satisfy the group's
+    /// `RequiredCapabilities`.
+    ///
+    /// `member_pubkey` carries the offending member when the rejection comes
+    /// from WhiteNoise's per-member pre-check (Phase 2's primary path); it is
+    /// `None` when the rejection comes from MDK's defense-in-depth fallback
+    /// (`mdk_core::Error::InviteeMissingRequiredProposal`), which is a unit
+    /// variant carrying no attribution.
+    #[error(
+        "Group rejected member{}: {reason}",
+        match member_pubkey {
+            Some(pk) => format!(" {pk}"),
+            None => String::new(),
+        }
+    )]
+    GroupRejectedMember {
+        member_pubkey: Option<PublicKey>,
+        reason: String,
+    },
 
     #[error(
         "Cannot add this user yet. Their key package is incompatible with this app version ({reason}). Ask them to update White Noise and open the app so it can publish a new key package."

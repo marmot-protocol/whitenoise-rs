@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use mdk_core::prelude::ProposalType;
+use nostr_sdk::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
 
 /// SelfRemove codepoint (`0x000a`). Used both as a proposal codepoint
@@ -132,11 +133,40 @@ impl From<u16> for RequiredProposal {
     }
 }
 
+/// Pre-validates a list of resolved members against a group's required
+/// proposal set, returning the first member whose advertised
+/// [`KeyPackageCapabilities::proposals`] do not cover `required` (along with
+/// the first missing proposal).
+///
+/// This powers `Whitenoise::add_members_to_group`'s per-member pre-check —
+/// a fold over data already produced by `resolve_member_key_package`. The
+/// helper is extracted so the routing logic (which selects between
+/// [`crate::WhitenoiseError::KeyPackageMissingSelfRemove`] and
+/// [`crate::WhitenoiseError::GroupRejectedMember`] based on the missing
+/// proposal) stays trivially testable without spinning up a Whitenoise
+/// instance.
+///
+/// Iteration order over `members` is preserved; iteration over each member's
+/// missing proposals is `BTreeSet`-ordered (deterministic for tests).
+/// Returns `None` when every member's proposals cover `required`.
+pub(crate) fn find_member_missing_required_proposal(
+    members: &[(PublicKey, KeyPackageCapabilities)],
+    required: &BTreeSet<RequiredProposal>,
+) -> Option<(PublicKey, RequiredProposal)> {
+    for (pubkey, caps) in members {
+        if let Some(missing) = required.difference(&caps.proposals).next() {
+            return Some((*pubkey, *missing));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use mdk_core::prelude::ProposalType;
+    use nostr_sdk::Keys;
 
     use super::*;
 
@@ -223,5 +253,58 @@ mod tests {
             source.into_iter().map(RequiredProposal::from).collect();
 
         assert_eq!(mapped, BTreeSet::from([RequiredProposal::Unknown]));
+    }
+
+    fn caps_with(proposals: BTreeSet<RequiredProposal>) -> KeyPackageCapabilities {
+        KeyPackageCapabilities {
+            proposals,
+            extensions: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn find_missing_returns_member_lacking_self_remove() {
+        let legacy_pk = Keys::generate().public_key();
+        let members = vec![(legacy_pk, caps_with(BTreeSet::new()))];
+        let required = BTreeSet::from([RequiredProposal::SelfRemove]);
+
+        assert_eq!(
+            find_member_missing_required_proposal(&members, &required),
+            Some((legacy_pk, RequiredProposal::SelfRemove)),
+        );
+    }
+
+    #[test]
+    fn find_missing_returns_none_when_all_members_cover_required() {
+        let pk_a = Keys::generate().public_key();
+        let pk_b = Keys::generate().public_key();
+        let modern = caps_with(BTreeSet::from([RequiredProposal::SelfRemove]));
+        let members = vec![(pk_a, modern.clone()), (pk_b, modern)];
+        let required = BTreeSet::from([RequiredProposal::SelfRemove]);
+
+        assert_eq!(
+            find_member_missing_required_proposal(&members, &required),
+            None,
+        );
+    }
+
+    #[test]
+    fn find_missing_returns_non_self_remove_proposal_when_thats_whats_missing() {
+        // Synthetic capability shape: member advertises SelfRemove but the
+        // group's required set demands an Unknown (future) proposal. The
+        // helper must surface the missing proposal verbatim so the caller
+        // routes it to `GroupRejectedMember` rather than the SelfRemove-
+        // specific variant.
+        let pk = Keys::generate().public_key();
+        let members = vec![(
+            pk,
+            caps_with(BTreeSet::from([RequiredProposal::SelfRemove])),
+        )];
+        let required = BTreeSet::from([RequiredProposal::Unknown]);
+
+        assert_eq!(
+            find_member_missing_required_proposal(&members, &required),
+            Some((pk, RequiredProposal::Unknown)),
+        );
     }
 }

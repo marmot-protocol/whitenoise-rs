@@ -80,6 +80,7 @@ scenario_registry! {
     "advanced-messaging" => AdvancedMessagingScenario,
     "group-membership" => GroupMembershipScenario,
     "create-group-with-legacy-member" => CreateGroupWithLegacyMemberScenario,
+    "add-member-to-strict-group-rejected" => AddMemberToStrictGroupRejectedScenario,
     "chat-media-upload" => ChatMediaUploadScenario,
     "user-discovery" => UserDiscoveryScenario,
     "scheduler" => SchedulerScenario,
@@ -209,6 +210,7 @@ mod tests {
         assert!(parse_scenario_name("advanced-messaging").is_ok());
         assert!(parse_scenario_name("group-membership").is_ok());
         assert!(parse_scenario_name("create-group-with-legacy-member").is_ok());
+        assert!(parse_scenario_name("add-member-to-strict-group-rejected").is_ok());
         assert!(parse_scenario_name("chat-media-upload").is_ok());
         assert!(parse_scenario_name("user-discovery").is_ok());
         assert!(parse_scenario_name("scheduler").is_ok());
@@ -245,7 +247,7 @@ mod tests {
     fn test_get_all_scenario_names() {
         // Test that all scenario names are returned
         let names = get_all_scenario_names();
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 20);
         assert!(names.contains(&"account-management"));
         assert!(names.contains(&"basic-messaging"));
         assert!(names.contains(&"drafts"));
@@ -256,5 +258,6 @@ mod tests {
         assert!(names.contains(&"chat-list-streaming"));
         assert!(names.contains(&"notification-streaming"));
         assert!(names.contains(&"create-group-with-legacy-member"));
+        assert!(names.contains(&"add-member-to-strict-group-rejected"));
     }
 }

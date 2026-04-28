@@ -32,7 +32,9 @@ mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use required_proposals::RequiredProposal;
-pub(crate) use required_proposals::{KeyPackageCapabilities, MlsExtensionId};
+pub(crate) use required_proposals::{
+    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
+};
 
 impl Whitenoise {
     #[perf_instrument("groups")]
@@ -683,21 +685,46 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
+        let mut member_caps: Vec<(PublicKey, KeyPackageCapabilities)> =
+            Vec::with_capacity(members.len());
 
-        // Fetch key packages for all members. Phase 1 ignores the capability
-        // projection (third tuple element); Phase 2 of the mixed-version-groups
-        // plan will use it to pre-validate against the group's required
-        // proposals before calling `mdk.add_members`.
+        // Resolve key packages for all members. The third tuple element is the
+        // per-member capability projection used by the pre-check below.
         for pk in members.iter() {
-            let (user, event, _caps) = self.resolve_member_key_package(pk).await?;
+            let (user, event, caps) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
+            member_caps.push((*pk, caps));
+        }
+
+        // Phase 2 pre-validation: check each invitee's advertised proposals
+        // against the group's `RequiredCapabilities` BEFORE invoking MDK so we
+        // can attribute the rejection to the offending member. MDK's typed
+        // error (`InviteeMissingRequiredProposal`) is a unit variant carrying
+        // no attribution; we keep it as defense-in-depth via
+        // `map_mdk_add_members_error`.
+        let required = self.group_required_proposals(account, group_id).await?;
+        if !required.is_empty()
+            && let Some((member_pubkey, missing)) =
+                find_member_missing_required_proposal(&member_caps, &required)
+        {
+            return Err(match missing {
+                RequiredProposal::SelfRemove => {
+                    WhitenoiseError::KeyPackageMissingSelfRemove { member_pubkey }
+                }
+                other => WhitenoiseError::GroupRejectedMember {
+                    member_pubkey: Some(member_pubkey),
+                    reason: format!("does not advertise {other:?}"),
+                },
+            });
         }
 
         let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
         let _mls_add = perf_span!("groups::mls_add_members");
-        let update_result = mdk.add_members(group_id, &key_package_events)?;
+        let update_result = mdk
+            .add_members(group_id, &key_package_events)
+            .map_err(map_mdk_add_members_error)?;
         drop(_mls_add);
 
         let evolution_event = update_result.evolution_event;
@@ -925,6 +952,37 @@ impl Whitenoise {
         self.background_refresh_account_group_subscriptions(account);
 
         Ok(())
+    }
+}
+
+/// Defense-in-depth mapping for `mdk.add_members` errors.
+///
+/// `add_members_to_group` pre-validates each invitee's
+/// [`KeyPackageCapabilities`] against the group's
+/// [`Whitenoise::group_required_proposals`] before invoking MDK, so an
+/// `InviteeMissingRequiredProposal` from MDK means the pre-check missed an
+/// edge case (e.g. an `openmls` enforcement rule that diverges from our
+/// projection). We surface it as
+/// [`WhitenoiseError::GroupRejectedMember`] with no member attribution
+/// (the MDK variant is a unit, no payload) and emit a `warn!` so the gap
+/// is visible in logs.
+///
+/// All other MDK errors keep their pre-existing `WhitenoiseError::from`
+/// pass-through.
+fn map_mdk_add_members_error(err: mdk_core::Error) -> WhitenoiseError {
+    match err {
+        mdk_core::Error::InviteeMissingRequiredProposal => {
+            tracing::warn!(
+                target: "whitenoise::accounts::groups::add_members",
+                "MDK rejected add despite passing pre-validation; pre-check has a gap"
+            );
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey: None,
+                reason: "invitee KeyPackage is missing a proposal type required by the group"
+                    .to_string(),
+            }
+        }
+        other => WhitenoiseError::from(other),
     }
 }
 
@@ -2791,5 +2849,41 @@ mod tests {
             .expect_err("fabricated group ID must error");
 
         assert!(matches!(err, WhitenoiseError::GroupNotFound));
+    }
+
+    #[test]
+    fn map_invitee_missing_required_proposal_yields_group_rejected_member() {
+        // Defense-in-depth: if MDK still rejects an `add_members` call after
+        // our pre-check passed, the typed unit variant
+        // `InviteeMissingRequiredProposal` (no member attribution) maps to
+        // `WhitenoiseError::GroupRejectedMember { member_pubkey: None, .. }`.
+        let mapped = map_mdk_add_members_error(mdk_core::Error::InviteeMissingRequiredProposal);
+
+        match mapped {
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey,
+                reason,
+            } => {
+                assert_eq!(member_pubkey, None);
+                assert!(
+                    !reason.is_empty(),
+                    "GroupRejectedMember reason must be non-empty for FFI rendering"
+                );
+            }
+            other => panic!("expected GroupRejectedMember, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_other_mdk_errors_passes_through_unchanged() {
+        // Non-`InviteeMissingRequiredProposal` MDK errors keep their existing
+        // `WhitenoiseError::from` mapping (variant `MdkCoreError`).
+        let mapped =
+            map_mdk_add_members_error(mdk_core::Error::Group("some unrelated error".to_owned()));
+
+        assert!(
+            matches!(mapped, WhitenoiseError::MdkCoreError(_)),
+            "expected MdkCoreError pass-through, got: {mapped:?}"
+        );
     }
 }
