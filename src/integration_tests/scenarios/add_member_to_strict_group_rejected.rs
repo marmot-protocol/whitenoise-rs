@@ -48,13 +48,15 @@ impl Scenario for AddMemberToStrictGroupRejectedScenario {
     async fn run_scenario(&mut self) -> Result<(), WhitenoiseError> {
         // Three accounts: A creates the group with B (both modern, so LCD
         // fires `{SelfRemove}`); C is the legacy peer A later tries to invite.
-        CreateAccountsTestCase::with_names(vec![
-            "strict_creator",
-            "strict_modern_peer",
-            "strict_legacy_peer",
-        ])
-        .execute(&mut self.context)
-        .await?;
+        // C is constructed via the no-initial-KP path so the legacy fixture
+        // below is the *only* publisher of C's key packages — no
+        // auto-published modern KP to shadow the legacy variant.
+        CreateAccountsTestCase::with_names(vec!["strict_creator", "strict_modern_peer"])
+            .execute(&mut self.context)
+            .await?;
+        CreateLegacyPeerAccountTestCase::with_name("strict_legacy_peer")
+            .execute(&mut self.context)
+            .await?;
 
         // Create the group with A + B. Both publish modern key packages via
         // the standard scheduler path, so MDK's LCD computes

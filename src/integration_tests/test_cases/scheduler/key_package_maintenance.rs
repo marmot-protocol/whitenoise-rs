@@ -8,7 +8,88 @@ use crate::whitenoise::scheduled_tasks::{KeyPackageMaintenance, Task};
 use async_trait::async_trait;
 use nostr_sdk::prelude::*;
 
-const MAX_RELAY_KEY_PACKAGE_DELETE_ROUNDS: u32 = 10;
+/// Maximum number of fetch+delete rounds before giving up. Each round can
+/// only clear what a single relay query returns (NIP-01 pagination), so a
+/// modest bound is enough to handle realistic relay behaviour without
+/// looping forever if a relay refuses to honour deletion requests.
+const MAX_DELETE_ROUNDS: u32 = 10;
+
+/// Deletes every key package event on the account's configured key-package
+/// relays, looping until the relays return an empty set or
+/// [`MAX_DELETE_ROUNDS`] is exhausted.
+///
+/// Private to this test: the scheduler maintenance test is the only consumer
+/// that needs to clear an account's relay-published KPs. The legacy KP
+/// fixture used to also use this helper, but that fixture now relies on
+/// [`crate::Whitenoise::create_identity_without_initial_key_package`] so
+/// nothing pre-exists to delete.
+///
+/// `delete_mls_stored_keys`, when `true`, is forwarded to the very first
+/// deletion round so the locally cached MDK private key for any KP we
+/// remove gets cleaned up too. Subsequent rounds always pass `false` —
+/// the local key state for those KPs is already gone after round 0.
+///
+/// Returns the total number of key packages deleted across all rounds.
+async fn delete_all_relay_key_packages_for_test_setup(
+    context: &ScenarioContext,
+    account: &crate::Account,
+    delete_mls_stored_keys: bool,
+) -> Result<usize, WhitenoiseError> {
+    let mut total_deleted = 0;
+
+    for round in 0..MAX_DELETE_ROUNDS {
+        let key_packages = context
+            .whitenoise
+            .fetch_all_key_packages_for_account(account)
+            .await?;
+
+        if key_packages.is_empty() {
+            return Ok(total_deleted);
+        }
+
+        let key_package_count = key_packages.len();
+        let delete_mls_stored_keys_this_round = delete_mls_stored_keys && round == 0;
+        let deleted = context
+            .whitenoise
+            .delete_key_packages_for_account(
+                account,
+                key_packages,
+                delete_mls_stored_keys_this_round,
+                1,
+            )
+            .await?;
+
+        total_deleted += deleted;
+
+        if deleted == 0 {
+            tracing::warn!(
+                target: "whitenoise::integration_tests::key_package_cleanup",
+                "Deleted 0 key package(s) despite {} remaining after {} relay cleanup round(s)",
+                key_package_count,
+                round + 1,
+            );
+            break;
+        }
+    }
+
+    // Cap-exhaustion / stalled-deletion path: re-check rather than silently
+    // claiming success. A test fixture that proceeds with a polluted relay
+    // pushes the real failure to a downstream wait or assert and turns a
+    // clear setup error into a flake.
+    let remaining = context
+        .whitenoise
+        .fetch_all_key_packages_for_account(account)
+        .await?;
+    if !remaining.is_empty() {
+        return Err(WhitenoiseError::Internal(format!(
+            "key-package cleanup exhausted {MAX_DELETE_ROUNDS} round(s) with \
+             {} event(s) still present on relays",
+            remaining.len()
+        )));
+    }
+
+    Ok(total_deleted)
+}
 
 /// Verifies the key package maintenance task handles both cases:
 /// 1. Publishes key packages when none exist
@@ -207,50 +288,6 @@ where
         description,
     )
     .await
-}
-
-async fn delete_all_relay_key_packages_for_test_setup(
-    context: &ScenarioContext,
-    account: &crate::Account,
-    delete_mls_stored_keys: bool,
-) -> Result<usize, WhitenoiseError> {
-    let mut total_deleted = 0;
-
-    for round in 0..MAX_RELAY_KEY_PACKAGE_DELETE_ROUNDS {
-        let key_packages = context
-            .whitenoise
-            .fetch_all_key_packages_for_account(account)
-            .await?;
-
-        if key_packages.is_empty() {
-            return Ok(total_deleted);
-        }
-
-        let key_package_count = key_packages.len();
-        let delete_mls_stored_keys_this_round = delete_mls_stored_keys && round == 0;
-        let deleted = context
-            .whitenoise
-            .delete_key_packages_for_account(
-                account,
-                key_packages,
-                delete_mls_stored_keys_this_round,
-                1,
-            )
-            .await?;
-
-        total_deleted += deleted;
-
-        if deleted == 0 {
-            tracing::warn!(
-                "Deleted 0 key package(s) despite {} remaining after {} relay cleanup round(s)",
-                key_package_count,
-                round + 1,
-            );
-            break;
-        }
-    }
-
-    Ok(total_deleted)
 }
 
 /// Publishes a key package with a backdated timestamp using test infrastructure.

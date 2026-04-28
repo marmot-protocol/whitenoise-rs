@@ -1966,7 +1966,6 @@ mod tests {
         // Multiple unrecognised codepoints in the same set must collapse to a
         // single `Unknown` (BTreeSet semantics on the unit variant). Malformed
         // hex strings are silently dropped.
-        use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId};
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -2000,7 +1999,6 @@ mod tests {
         // omits the SelfRemove proposal/extension entirely. The projection
         // must report an empty proposal set and a single NostrGroupData
         // extension.
-        use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId};
         let keys = Keys::generate();
         let event = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "dGVzdF9jb250ZW50")
             .tag(Tag::custom(
@@ -2031,7 +2029,6 @@ mod tests {
         // A fully-equipped (modern) KP advertises both the SelfRemove proposal
         // and both Marmot extensions. The projection returns the corresponding
         // mirror values.
-        use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
         let keys = Keys::generate();
         let event = create_key_package_event_with_compatibility_tags(
             &keys,

@@ -703,10 +703,25 @@ impl Whitenoise {
         // error (`InviteeMissingRequiredProposal`) is a unit variant carrying
         // no attribution; we keep it as defense-in-depth via
         // `map_mdk_add_members_error`.
+        //
+        // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`
+        // is a unit variant: distinct unmodelled MLS proposal codepoints all
+        // collapse to the same value on both sides of the comparison, so a set
+        // difference on `Unknown` would yield false negatives (a group requiring
+        // proposal X and a member advertising only proposal Y both project to
+        // `{Unknown}`, masking the mismatch). MDK's leaf-node validation is
+        // authoritative for those cases — `map_mdk_add_members_error` translates
+        // its `InviteeMissingRequiredProposal` into the same defense-in-depth
+        // error path.
         let required = self.group_required_proposals(account, group_id).await?;
-        if !required.is_empty()
+        let modeled_required: BTreeSet<RequiredProposal> = required
+            .iter()
+            .copied()
+            .filter(|p| !matches!(p, RequiredProposal::Unknown))
+            .collect();
+        if !modeled_required.is_empty()
             && let Some((member_pubkey, missing)) =
-                find_member_missing_required_proposal(&member_caps, &required)
+                find_member_missing_required_proposal(&member_caps, &modeled_required)
         {
             return Err(match missing {
                 RequiredProposal::SelfRemove => {

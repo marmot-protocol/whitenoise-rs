@@ -10,7 +10,7 @@
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
-use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG};
+use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
 use crate::whitenoise::relays::Relay;
 use nostr_sdk::prelude::*;
 
@@ -34,6 +34,18 @@ const NOSTR_GROUP_DATA_TAG: &str = "0xf2ee";
 /// scheduler), so it lands as a single canonical KP for `account`.
 ///
 /// Returns the published event id.
+///
+/// # Caller responsibility: legacy KP must be the only published KP
+///
+/// Resolvers prefer modern (`valid_current`) key packages over legacy
+/// (`valid_legacy`) in
+/// `EphemeralPlane::key_package_lookup_from_events`, so any pre-existing
+/// modern KP for `account` will silently shadow the legacy variant this
+/// fixture publishes. To avoid the shadowing, construct the legacy peer's
+/// account via
+/// [`crate::Whitenoise::create_identity_without_initial_key_package`]
+/// rather than the standard `create_identity`, so the account starts with no
+/// auto-published KP and this fixture is the *sole* publisher.
 ///
 /// # Limitations
 ///
@@ -87,13 +99,25 @@ pub(crate) async fn publish_legacy_capability_key_package(
         })
         .collect();
 
-    let mut tags: Vec<Tag> = vec![
-        Tag::custom(
-            TagKind::Custom("mls_ciphersuite".into()),
-            [REQUIRED_MLS_CIPHERSUITE_TAG],
-        ),
-        Tag::custom(TagKind::Custom("encoding".into()), ["base64"]),
-    ];
+    // Start from MDK's full tag set (carries `mls_protocol_version`,
+    // `mls_ciphersuite`, `encoding`, `relays`, `client`, etc.) and substitute
+    // only the two capability tags we want to control. Inheriting the
+    // baseline is what keeps this fixture honest: if MDK adds a new mandatory
+    // tag tomorrow, we get it for free instead of silently producing a KP
+    // that downstream MDK refuses to parse.
+    let mut tags: Vec<Tag> = key_package_data
+        .tags_443
+        .iter()
+        .filter(|tag| {
+            !matches!(
+                tag.kind(),
+                TagKind::Custom(name)
+                    if name == "mls_extensions" || name == "mls_proposals"
+            )
+        })
+        .cloned()
+        .collect();
+
     if !extension_values.is_empty() {
         tags.push(Tag::custom(
             TagKind::Custom("mls_extensions".into()),
@@ -104,14 +128,6 @@ pub(crate) async fn publish_legacy_capability_key_package(
         tags.push(Tag::custom(
             TagKind::Custom("mls_proposals".into()),
             proposal_values.iter().copied(),
-        ));
-    }
-    // Mirror the relay tags MDK normally emits (one `relays` tag per URL)
-    // so the published KP carries a parseable relay hint.
-    for relay in relays {
-        tags.push(Tag::custom(
-            TagKind::Custom("relays".into()),
-            [relay.url.as_str()],
         ));
     }
 

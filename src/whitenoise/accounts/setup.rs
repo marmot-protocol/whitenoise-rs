@@ -97,6 +97,48 @@ impl Whitenoise {
         Ok(())
     }
 
+    /// Activation path for brand-new local accounts created via
+    /// `create_identity` / `create_identity_without_initial_key_package`.
+    ///
+    /// Identical to [`Self::activate_account`] when
+    /// `publish_initial_key_package` is `true`. When `false`, the initial
+    /// key-package publish is skipped — used by integration-test fixtures
+    /// that want to be the sole publisher of the account's key packages.
+    #[perf_instrument("accounts")]
+    pub(super) async fn activate_new_account(
+        &self,
+        account: &Account,
+        relays: &[Relay],
+        publish_initial_key_package: bool,
+    ) -> Result<()> {
+        self.replace_background_task_cancellation_channel(account.pubkey);
+
+        self.discovery_sync_worker.request_rebuild();
+
+        self.setup_subscriptions(account, relays).await?;
+
+        if publish_initial_key_package {
+            // Key package publish uses the account-scoped ephemeral session that
+            // subscription setup warms. Run it after subscription setup so the
+            // background publish does not race a still-starting relay session.
+            if let Err(e) = self.setup_key_package(account, true, relays).await {
+                tracing::warn!(
+                    target: "whitenoise::accounts",
+                    "Key package setup failed, scheduler will retry: {}",
+                    e
+                );
+            }
+        } else {
+            tracing::debug!(
+                target: "whitenoise::accounts",
+                "Skipping initial key package publish for new account (integration-test fixture)"
+            );
+        }
+
+        tracing::debug!(target: "whitenoise::accounts", "Account activation complete");
+        Ok(())
+    }
+
     /// Activates an account without publishing anything (for external signer accounts).
     /// This sets up relay connections and subscriptions but skips key package publishing.
     #[perf_instrument("accounts")]

@@ -42,8 +42,14 @@ impl Scenario for CreateGroupWithLegacyMemberScenario {
     }
 
     async fn run_scenario(&mut self) -> Result<(), WhitenoiseError> {
-        // A creates the group, B is the "legacy" peer.
-        CreateAccountsTestCase::with_names(vec!["legacy_creator", "legacy_peer"])
+        // A creates the group, B is the "legacy" peer. B is constructed via
+        // the no-initial-KP path so the legacy fixture below is the *only*
+        // publisher of B's key packages — no auto-published modern KP to
+        // shadow the legacy variant.
+        CreateAccountsTestCase::with_names(vec!["legacy_creator"])
+            .execute(&mut self.context)
+            .await?;
+        CreateLegacyPeerAccountTestCase::with_name("legacy_peer")
             .execute(&mut self.context)
             .await?;
 
