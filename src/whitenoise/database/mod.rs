@@ -37,6 +37,8 @@ pub mod user_relays;
 pub mod users;
 pub mod utils;
 
+pub mod rust_migrations;
+
 pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| sqlx::migrate!("./db_migrations"));
 
 const DB_ACQUIRE_TIMEOUT_SECS: u64 = 5;
@@ -124,8 +126,10 @@ impl Database {
 
         let pool = Self::create_connection_pool(&db_url).await?;
 
-        // Automatically run migrations
-        MIGRATOR.run(&pool).await?;
+        // Run Rust migration framework (handles SQLx catch-up for existing installs).
+        rust_migrations::global::GLOBAL_RUST_MIGRATOR
+            .run(&pool)
+            .await?;
 
         Ok(Self {
             pool,
@@ -187,7 +191,9 @@ impl Database {
     /// This method is idempotent - it's safe to call multiple times.
     /// Only new migrations will be applied.
     pub async fn migrate_up(&self) -> Result<(), DatabaseError> {
-        MIGRATOR.run(&self.pool).await?;
+        rust_migrations::global::GLOBAL_RUST_MIGRATOR
+            .run(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -222,7 +228,7 @@ impl Database {
             "SELECT name FROM sqlite_master
              WHERE type='table'
              AND name NOT LIKE 'sqlite_%'
-             AND name != '_sqlx_migrations'",
+             AND name NOT IN ('_sqlx_migrations', '_rust_migrations')",
         )
         .fetch_all(&mut *txn)
         .await?;
