@@ -29,6 +29,9 @@ pub enum WhitenoiseError {
     #[error("Configuration error: {0}")]
     Configuration(String),
 
+    #[error("Keyring storage unavailable: {0}")]
+    KeyringUnavailable(String),
+
     #[error("Contact list error: {0}")]
     ContactList(String),
 

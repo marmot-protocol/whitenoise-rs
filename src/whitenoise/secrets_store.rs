@@ -52,7 +52,8 @@ impl SecretsStore {
     /// * The Entry creation fails
     /// * Setting the password in the keyring fails
     pub fn store_private_key(&self, keys: &Keys) -> Result<(), SecretsStoreError> {
-        let entry = Entry::new(&self.service_name, keys.public_key().to_hex().as_str())
+        let entry = self
+            .entry_for_user(keys.public_key().to_hex().as_str())
             .map_err(map_keyring_error)?;
         entry
             .set_password(keys.secret_key().to_secret_hex().as_str())
@@ -84,8 +85,9 @@ impl SecretsStore {
     /// * Parsing the private key into a `Keys` object fails
     pub fn get_nostr_keys_for_pubkey(&self, pubkey: &PublicKey) -> Result<Keys, SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        let entry =
-            Entry::new(&self.service_name, hex_pubkey.as_str()).map_err(map_keyring_error)?;
+        let entry = self
+            .entry_for_user(hex_pubkey.as_str())
+            .map_err(map_keyring_error)?;
 
         match entry.get_password() {
             Ok(private_key) => Keys::parse(&private_key).map_err(SecretsStoreError::KeyError),
@@ -118,14 +120,45 @@ impl SecretsStore {
         pubkey: &PublicKey,
     ) -> Result<(), SecretsStoreError> {
         let hex_pubkey = pubkey.to_hex();
-        let entry =
-            Entry::new(&self.service_name, hex_pubkey.as_str()).map_err(map_keyring_error)?;
+        let entry = self
+            .entry_for_user(hex_pubkey.as_str())
+            .map_err(map_keyring_error)?;
 
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(KeyringError::NoEntry) => Ok(()),
             Err(e) => Err(map_keyring_error(e)),
         }
+    }
+
+    fn entry_for_user(&self, user: &str) -> keyring_core::Result<Entry> {
+        keyring_entry_for_user(&self.service_name, user)
+    }
+}
+
+fn keyring_entry_for_user(service: &str, user: &str) -> keyring_core::Result<Entry> {
+    #[cfg(all(
+        target_os = "linux",
+        not(test),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    ))]
+    {
+        let modifiers = std::collections::HashMap::from([(
+            "target",
+            super::keyring_store::LINUX_SECRET_SERVICE_TARGET,
+        )]);
+        Entry::new_with_modifiers(service, user, &modifiers)
+    }
+
+    #[cfg(not(all(
+        target_os = "linux",
+        not(test),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )))]
+    {
+        Entry::new(service, user)
     }
 }
 

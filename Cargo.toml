@@ -39,6 +39,7 @@ nostr-sdk = { version = "0.44", features = [
     "nip47",
     "nip59",
 ] }
+once_cell = "1"
 
 # LOCAL MDK FOR DEVELOPMENT
 # mdk-core = { version = "0.7.1", path="../mdk/crates/mdk-core" }
@@ -114,7 +115,9 @@ windows-native-keyring-store = "1"
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-native-keyring-store = "1"
+# Keep the v0.5-and-earlier by-service layout for upgraded Android installs.
+# The v1 default Store uses named stores and cannot see existing MDK DB keys.
+android-native-keyring-store = { version = "1", features = ["legacy"] }
 
 [dev-dependencies]
 mockito = "1.2"

@@ -5569,6 +5569,7 @@ dependencies = [
  "mockito",
  "nostr-blossom",
  "nostr-sdk",
+ "once_cell",
  "rand 0.9.2",
  "reqwest 0.13.2",
  "rpassword",
