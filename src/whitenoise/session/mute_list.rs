@@ -353,32 +353,10 @@ impl<'a> MuteListOps<'a> {
         .await
         {
             Ok(Some(group_id)) => {
-                // Reach back to the Whitenoise handle for the stream managers
-                // that are not yet session-scoped.
-                // TODO(phase-16): Move chat list stream managers to AccountSession.
-                let Ok(wn) = self.session.whitenoise() else {
-                    tracing::debug!(
-                        target: "whitenoise::mute_list",
-                        "Whitenoise handle unavailable for chat list emit"
-                    );
-                    return;
-                };
-                let Ok(account) =
-                    Account::find_by_pubkey(&self.session.account_pubkey, self.db()).await
-                else {
-                    tracing::debug!(
-                        target: "whitenoise::mute_list",
-                        account = %self.session.account_pubkey.to_hex(),
-                        "Account row not found for chat list emit"
-                    );
-                    return;
-                };
-                wn.emit_chat_list_update(
-                    &account,
-                    &group_id,
-                    ChatListUpdateTrigger::UserBlockChanged,
-                )
-                .await;
+                self.session
+                    .chat_list()
+                    .emit_update(&group_id, ChatListUpdateTrigger::UserBlockChanged)
+                    .await;
             }
             Ok(None) => {}
             Err(e) => {

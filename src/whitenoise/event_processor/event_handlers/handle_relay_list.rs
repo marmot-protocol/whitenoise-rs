@@ -40,7 +40,7 @@ impl Whitenoise {
         let relay_urls = crate::nostr_manager::utils::relay_urls_from_event(&event);
         let event_created_at = Some(timestamp_to_datetime(event.created_at)?);
         let relays_changed = user
-            .sync_relay_urls(self, relay_type, &relay_urls, event_created_at)
+            .sync_relay_urls(&self.shared, relay_type, &relay_urls, event_created_at)
             .await?;
 
         if relays_changed {

@@ -157,11 +157,11 @@ impl Whitenoise {
 
         let mut relay_types_by_url: HashMap<RelayUrl, HashSet<RelayType>> = HashMap::new();
         for (relay_type, relays) in [
-            (RelayType::Nip65, account.nip65_relays(self).await?),
-            (RelayType::Inbox, account.inbox_relays(self).await?),
+            (RelayType::Nip65, account.nip65_relays(&self.shared).await?),
+            (RelayType::Inbox, account.inbox_relays(&self.shared).await?),
             (
                 RelayType::KeyPackage,
-                account.key_package_relays(self).await?,
+                account.key_package_relays(&self.shared).await?,
             ),
         ] {
             for relay in relays {

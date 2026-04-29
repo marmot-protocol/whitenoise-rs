@@ -1137,10 +1137,11 @@ async fn respond_to_invite(
     let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
-    let ag = AccountGroup::get(wn, &account.pubkey, &group_id)
-        .await
-        .map_err(|e| Response::err(e.to_string()))?
-        .ok_or_else(|| Response::err("group not found for this account"))?;
+    let ag =
+        AccountGroup::find_by_account_and_group(&account.pubkey, &group_id, &wn.shared.database)
+            .await
+            .map_err(|e| Response::err(e.to_string()))?
+            .ok_or_else(|| Response::err("group not found for this account"))?;
 
     if accept {
         ag.accept(wn).await
@@ -1503,7 +1504,7 @@ async fn relays_list(
     let mut relay_types: HashMap<RelayUrl, Vec<String>> = HashMap::new();
     for rt in &types_to_query {
         let relays = account
-            .relays(*rt, wn)
+            .relays(*rt, &wn.shared)
             .await
             .map_err(|e| Response::err(e.to_string()))?;
         let type_str: String = (*rt).into();
@@ -1576,7 +1577,7 @@ async fn relays_remove(
     let relay_type = parse_relay_type(type_str)?;
     let relay_url = parse_relay_url(url_str)?;
     let relay = account
-        .relays(relay_type, wn)
+        .relays(relay_type, &wn.shared)
         .await
         .map_err(|e| Response::err(e.to_string()))?
         .into_iter()
@@ -2245,7 +2246,7 @@ async fn keys_check(wn: &Whitenoise, pubkey_str: &str) -> Result<Response, Respo
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     let status = user
-        .key_package_status(wn)
+        .key_package_status(&wn.shared)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
     let result = match status {

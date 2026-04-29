@@ -239,7 +239,7 @@ impl Whitenoise {
         account: &Account,
         signer: impl NostrSigner + 'static,
     ) -> Result<()> {
-        let relays = account.key_package_relays(self).await?;
+        let relays = account.key_package_relays(&self.shared).await?;
 
         if relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
@@ -579,7 +579,7 @@ impl Whitenoise {
             }
         }
 
-        let key_package_relays = account.key_package_relays(self).await?;
+        let key_package_relays = account.key_package_relays(&self.shared).await?;
         if key_package_relays.is_empty() {
             return Ok(false);
         }
@@ -893,7 +893,7 @@ impl Whitenoise {
 
     #[perf_instrument("key_packages")]
     async fn prepare_key_package_relay_urls(&self, account: &Account) -> Result<Vec<RelayUrl>> {
-        let key_package_relays = account.key_package_relays(self).await?;
+        let key_package_relays = account.key_package_relays(&self.shared).await?;
 
         if key_package_relays.is_empty() {
             return Err(WhitenoiseError::AccountMissingKeyPackageRelays);
@@ -1181,20 +1181,36 @@ mod tests {
         }
     }
 
-    /// Creates a persisted account with a key package relay and stored keys.
-    async fn create_account_with_relay(whitenoise: &Whitenoise) -> Account {
-        let (account, _keys) = create_account_with_relay_and_keys(whitenoise).await;
-        account
-    }
-
-    async fn create_account_with_relay_and_keys(whitenoise: &Whitenoise) -> (Account, Keys) {
-        let (account, keys) = create_test_account(whitenoise).await;
-        let account = account.save(&whitenoise.shared.database).await.unwrap();
+    /// Persists the account, stores its keys, and registers an `AccountSession`
+    /// so the deprecated key-package wrappers (which require a session) can
+    /// find one. Returns the persisted account.
+    async fn register_session_with_keys(
+        whitenoise: &std::sync::Arc<Whitenoise>,
+        account: Account,
+        keys: &Keys,
+    ) -> Account {
         whitenoise
             .shared
             .secrets_store
-            .store_private_key(&keys)
+            .store_private_key(keys)
             .expect("Should store keys");
+        let account = account
+            .save(&whitenoise.shared.database)
+            .await
+            .expect("Should save account");
+        let session = std::sync::Arc::new(
+            crate::whitenoise::session::AccountSession::from_account(&account, whitenoise)
+                .await
+                .unwrap(),
+        );
+        whitenoise.account_manager.insert_session(session);
+        account
+    }
+
+    /// Creates a persisted account with a key package relay, stored keys, and
+    /// a registered session.
+    async fn create_account_with_relay(whitenoise: &std::sync::Arc<Whitenoise>) -> Account {
+        let (account, keys) = create_test_account(whitenoise).await;
         let user = account.user(&whitenoise.shared.database).await.unwrap();
         // Use a loopback IP so connection refusal is instant (no DNS lookup).
         let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
@@ -1210,6 +1226,30 @@ mod tests {
         )
         .await
         .unwrap();
+        register_session_with_keys(whitenoise, account, &keys).await
+    }
+
+    /// Like [`create_account_with_relay`] but also returns the generated keys
+    /// for tests that need to sign events as the account.
+    async fn create_account_with_relay_and_keys(
+        whitenoise: &std::sync::Arc<Whitenoise>,
+    ) -> (Account, Keys) {
+        let (account, keys) = create_test_account(whitenoise).await;
+        let user = account.user(&whitenoise.shared.database).await.unwrap();
+        let relay = crate::whitenoise::relays::Relay::find_or_create_by_url(
+            &RelayUrl::parse("ws://127.0.0.1:1").unwrap(),
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        user.add_relay(
+            &relay,
+            crate::RelayType::KeyPackage,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
+        let account = register_session_with_keys(whitenoise, account, &keys).await;
         (account, keys)
     }
 
@@ -1410,16 +1450,13 @@ mod tests {
         }
     }
 
-    // TODO(phase-16): Re-enable once User row creation is guaranteed before session key-package ops.
-    // KeyPackageOps::prepare_relays returns AccountNotFound instead of AccountMissingKeyPackageRelays
-    // for accounts without a User row. Regression from Phase 14 session migration.
-    #[ignore]
     #[tokio::test]
     async fn test_publish_key_package_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
         // Create an account without any key package relays using test helper
-        let (account, _keys) = create_test_account(&whitenoise).await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         // Attempt to publish key package without relays
         let result = whitenoise.publish_key_package_for_account(&account).await;
@@ -1893,7 +1930,10 @@ mod tests {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let account = create_account_with_relay(&whitenoise).await;
 
-        let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         // Pause time so exponential backoff sleeps complete instantly.
         tokio::time::pause();
         let result = whitenoise
@@ -1917,12 +1957,11 @@ mod tests {
         assert!(result.is_err(), "Should fail when relay is unreachable");
     }
 
-    // TODO(phase-16): Same root cause as test_publish_key_package_without_relays_fails above.
-    #[ignore]
     #[tokio::test]
     async fn test_fetch_all_key_packages_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         let result = whitenoise
             .fetch_all_key_packages_for_account(&account)
@@ -1955,11 +1994,6 @@ mod tests {
         assert!(result.is_err(), "Should fail when no signer is available");
     }
 
-    // TODO(phase-16): Re-enable once User row creation is guaranteed before session key-package ops.
-    // KeyPackageOps::prepare_relays calls User::find_by_pubkey which returns AccountNotFound
-    // for accounts without a User row, rather than AccountMissingKeyPackageRelays.
-    // Regression introduced in Phase 14 when delete_all_key_packages was migrated to session.
-    #[ignore]
     #[tokio::test]
     async fn test_delete_legacy_key_packages_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -1968,11 +2002,7 @@ mod tests {
         // Keys are needed because the convergence loop resolves the signer
         // before fetching key packages from relays.
         let (account, keys) = create_test_account(&whitenoise).await;
-        whitenoise
-            .shared
-            .secrets_store
-            .store_private_key(&keys)
-            .expect("Should store keys");
+        let account = register_session_with_keys(&whitenoise, account, &keys).await;
 
         let result = whitenoise
             .delete_legacy_key_packages_for_account(&account)
@@ -1984,12 +2014,11 @@ mod tests {
         ));
     }
 
-    // TODO(phase-16): Same as test_delete_all_key_packages_without_relays_fails above.
-    #[ignore]
     #[tokio::test]
     async fn test_delete_legacy_key_packages_with_signer_without_relays_fails() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_with_keys(&whitenoise, account, &keys).await;
         let signer_keys = Keys::generate();
 
         let result = whitenoise
@@ -2002,9 +2031,6 @@ mod tests {
         ));
     }
 
-    // TODO(phase-16): Same root cause as test_delete_all_key_packages_without_relays_fails.
-    // delete_key_packages_for_account delegates to session which fails when storage is unavailable.
-    #[ignore]
     #[tokio::test]
     async fn test_delete_key_packages_with_empty_events_returns_zero() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2021,7 +2047,10 @@ mod tests {
     async fn test_delete_key_packages_from_storage_deduplicates_hash_ref_twins() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let (account, keys) = create_account_with_relay_and_keys(&whitenoise).await;
-        let relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let key_package_data = whitenoise
             .encoded_key_package(&account, &relays)
             .await

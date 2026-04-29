@@ -1,5 +1,3 @@
-use nostr_sdk::RelayUrl;
-
 use crate::perf_instrument;
 use crate::types::RelayControlStateSnapshot;
 use crate::whitenoise::Whitenoise;
@@ -82,7 +80,7 @@ impl Whitenoise {
     pub(super) async fn setup_accounts_subscriptions(&self) -> Result<()> {
         let accounts = Account::all(&self.shared.database).await?;
         for account in accounts {
-            let inbox_relays = account.effective_inbox_relays(self).await?;
+            let inbox_relays = account.effective_inbox_relays(&self.shared).await?;
             // Setup subscriptions for this account
             match self.setup_subscriptions(&account, &inbox_relays).await {
                 Ok(()) => {
@@ -332,31 +330,5 @@ impl Whitenoise {
         .map_err(WhitenoiseError::from)?;
 
         Ok(())
-    }
-
-    /// Returns the union of default relays and currently connected relays.
-    ///
-    /// Used as the fallback relay set when a user has no stored NIP-65 relays.
-    /// Discovery fallback is owned by the discovery plane rather than whatever
-    /// other relays happen to be connected for unrelated workloads.
-    #[perf_instrument("whitenoise")]
-    pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
-        self.shared.relay_control.discovery().relays().to_vec()
-    }
-
-    /// Returns the NIP-65 relay URLs for the given account, falling back to
-    /// discovery plane relays when no NIP-65 relays are stored.
-    ///
-    /// Use this for publishing or fetching the account's own replaceable events
-    /// (e.g. kind 10000 mute list, kind 10002 relay list).
-    #[perf_instrument("whitenoise")]
-    pub(crate) async fn account_relay_urls(
-        &self,
-        account: &crate::whitenoise::accounts::Account,
-    ) -> Vec<RelayUrl> {
-        match account.nip65_relays(self).await {
-            Ok(relays) if !relays.is_empty() => crate::whitenoise::relays::Relay::urls(&relays),
-            _ => self.fallback_relay_urls().await,
-        }
     }
 }

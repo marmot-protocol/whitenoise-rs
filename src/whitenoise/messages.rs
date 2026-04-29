@@ -420,10 +420,6 @@ mod tests {
     }
 
     /// Test edge cases: empty content, long content, different event kinds
-    // TODO(phase-16): Re-enable once singleton dependency is removed from message sending.
-    // send_message delegates through session, which requires Whitenoise singleton for relay ops.
-    // Pre-existing regression on arch-refactor branch.
-    #[ignore]
     #[tokio::test]
     async fn test_send_message_to_group_edge_cases() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -469,19 +465,23 @@ mod tests {
             long_content.len()
         );
 
-        // Test supported event kinds (7=reaction needs an e-tag, so skip here; 5=deletion is fine)
-        for kind in [5, 9] {
-            let result = whitenoise
-                .send_message_to_group(
-                    &creator_account,
-                    &group.mls_group_id,
-                    format!("Kind {}", kind),
-                    kind,
-                    None,
-                )
-                .await;
-            assert!(result.is_ok(), "Message with kind {} should succeed", kind);
-        }
+        // Test supported event kinds. Kinds 5 (deletion) and 7 (reaction) both
+        // require an `e`-tag pointing at a target message, so they're exercised
+        // separately; here we only validate the no-tag chat-message kind.
+        let result = whitenoise
+            .send_message_to_group(
+                &creator_account,
+                &group.mls_group_id,
+                "Kind 9".to_string(),
+                9,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "Message with kind 9 should succeed: {:?}",
+            result.err()
+        );
 
         // Unsupported kind should fail
         let result = whitenoise

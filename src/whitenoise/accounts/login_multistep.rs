@@ -1398,7 +1398,7 @@ mod tests {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -1425,7 +1425,11 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(result.account.pubkey, pubkey);
 
-        let nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        let nip65 = result
+            .account
+            .nip65_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(
             !nip65.is_empty(),
             "Expected NIP-65 relays to be stored after login"
@@ -1706,7 +1710,7 @@ mod tests {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -1815,7 +1819,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
 
-        let stored_nip65 = result.account.nip65_relays(&whitenoise).await.unwrap();
+        let stored_nip65 = result
+            .account
+            .nip65_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(
             stored_nip65.len(),
             1,
@@ -1829,7 +1837,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1838,7 +1846,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1875,7 +1883,11 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
 
-        let stored_inbox = result.account.inbox_relays(&whitenoise).await.unwrap();
+        let stored_inbox = result
+            .account
+            .inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert_eq!(stored_inbox.len(), 1);
         assert_eq!(
             stored_inbox[0].url, inbox_url,
@@ -1884,7 +1896,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1893,7 +1905,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1932,7 +1944,7 @@ mod tests {
 
         let stored_kp = result
             .account
-            .key_package_relays(&whitenoise)
+            .key_package_relays(&whitenoise.shared)
             .await
             .unwrap();
         assert_eq!(stored_kp.len(), 1);
@@ -1943,7 +1955,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1951,7 +1963,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1992,19 +2004,29 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2046,14 +2068,19 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2063,7 +2090,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2107,21 +2134,26 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
             "NIP-65 must get defaults"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2385,17 +2417,27 @@ mod tests {
         assert_eq!(result.account.pubkey, pubkey);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_relay.url
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_relay.url
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2472,17 +2514,27 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
-            RelayUrl::parse("ws://localhost:7777").unwrap()
-        );
-        assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             RelayUrl::parse("ws://localhost:7777").unwrap()
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
+            RelayUrl::parse("ws://localhost:7777").unwrap()
+        );
+        assert_eq!(
+            result
+                .account
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2606,7 +2658,7 @@ mod tests {
         for relay_type in [RelayType::Nip65, RelayType::Inbox, RelayType::KeyPackage] {
             let relays = result
                 .account
-                .relays(relay_type, &whitenoise)
+                .relays(relay_type, &whitenoise.shared)
                 .await
                 .unwrap();
             assert!(
@@ -2714,14 +2766,19 @@ mod tests {
         assert_eq!(result.status, LoginStatus::Complete);
 
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must not be overwritten"
         );
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2730,7 +2787,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2769,14 +2826,19 @@ mod tests {
         assert_eq!(result.account.account_type, AccountType::External);
 
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must not be overwritten"
         );
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2785,7 +2847,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2825,7 +2887,7 @@ mod tests {
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2835,7 +2897,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2844,7 +2906,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2886,19 +2948,29 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -2940,14 +3012,19 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, LoginStatus::Complete);
         assert_eq!(
-            result.account.nip65_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .nip65_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             nip65_url,
             "NIP-65 must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -2957,7 +3034,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3001,21 +3078,26 @@ mod tests {
         assert!(
             !result
                 .account
-                .nip65_relays(&whitenoise)
+                .nip65_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
             "NIP-65 must receive defaults"
         );
         assert_eq!(
-            result.account.inbox_relays(&whitenoise).await.unwrap()[0].url,
+            result
+                .account
+                .inbox_relays(&whitenoise.shared)
+                .await
+                .unwrap()[0]
+                .url,
             inbox_url,
             "Inbox must be preserved"
         );
         assert_eq!(
             result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()[0]
                 .url,
@@ -3263,7 +3345,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .inbox_relays(&whitenoise)
+                .inbox_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3272,7 +3354,7 @@ mod tests {
         assert!(
             !result
                 .account
-                .key_package_relays(&whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap()
                 .is_empty(),

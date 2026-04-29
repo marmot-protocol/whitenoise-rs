@@ -709,9 +709,12 @@ mod tests {
             "External account should not have stored private key"
         );
 
-        let nip65 = account.nip65_relays(&whitenoise).await.unwrap();
-        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
-        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        let nip65 = account.nip65_relays(&whitenoise.shared).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise.shared).await.unwrap();
+        let kp = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
 
         assert!(!nip65.is_empty(), "Should have NIP-65 relays");
         assert!(!inbox.is_empty(), "Should have inbox relays");

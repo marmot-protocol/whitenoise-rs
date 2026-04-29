@@ -149,7 +149,7 @@ async fn check_and_republish(
     relay_type: RelayType,
 ) -> MaintenanceResult {
     // 1. Read local relay config from DB
-    let local_relays = match account.relays(relay_type, whitenoise).await {
+    let local_relays = match account.relays(relay_type, &whitenoise.shared).await {
         Ok(relays) => relays,
         Err(e) => return MaintenanceResult::Error(e),
     };
@@ -167,7 +167,7 @@ async fn check_and_republish(
     // 2. Determine where to look for the event on the network.
     //    Use NIP-65 relays as the source, falling back to the relay list's own
     //    relays when NIP-65 is empty (e.g. the account only has inbox/kp relays).
-    let source_relays = match account.nip65_relays(whitenoise).await {
+    let source_relays = match account.nip65_relays(&whitenoise.shared).await {
         Ok(nip65) if !nip65.is_empty() => nip65,
         Ok(_) => local_relays.clone(),
         Err(e) => {
@@ -380,17 +380,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify local relay config exists
-        let inbox_relays = account.inbox_relays(&whitenoise).await.unwrap();
+        let inbox_relays = account.inbox_relays(&whitenoise.shared).await.unwrap();
         assert!(!inbox_relays.is_empty(), "Account should have inbox relays");
 
-        let kp_relays = account.key_package_relays(&whitenoise).await.unwrap();
+        let kp_relays = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(
             !kp_relays.is_empty(),
             "Account should have key package relays"
         );
 
         // Verify relay lists are discoverable on the network before maintenance
-        let nip65_urls = Relay::urls(&account.nip65_relays(&whitenoise).await.unwrap());
+        let nip65_urls = Relay::urls(&account.nip65_relays(&whitenoise.shared).await.unwrap());
 
         assert!(
             wait_for_relay_list_on_network(&whitenoise, &account, RelayType::Inbox, &nip65_urls)
@@ -456,8 +459,11 @@ mod tests {
         let account = account.save(&whitenoise.shared.database).await.unwrap();
 
         // Verify no local relays exist
-        let inbox = account.inbox_relays(&whitenoise).await.unwrap();
-        let kp = account.key_package_relays(&whitenoise).await.unwrap();
+        let inbox = account.inbox_relays(&whitenoise.shared).await.unwrap();
+        let kp = account
+            .key_package_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         assert!(inbox.is_empty(), "Should have no inbox relays");
         assert!(kp.is_empty(), "Should have no key package relays");
 

@@ -535,7 +535,7 @@ mod tests {
         // Fetch a real key package event for the member from relays
         let relays_urls = Relay::urls(
             &creator_account
-                .key_package_relays(whitenoise)
+                .key_package_relays(&whitenoise.shared)
                 .await
                 .unwrap(),
         );
@@ -742,9 +742,13 @@ mod tests {
         assert!(!groups.is_empty(), "Member should have at least one group");
 
         let group_id = &groups[0].mls_group_id;
-        let account_group = AccountGroup::get(&whitenoise, &member_account.pubkey, group_id)
-            .await
-            .unwrap();
+        let account_group = AccountGroup::find_by_account_and_group(
+            &member_account.pubkey,
+            group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         assert!(
             account_group.is_some(),
@@ -856,9 +860,13 @@ mod tests {
         .await;
 
         // Verify AccountGroup still exists and is pending
-        let account_group = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let account_group = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(account_group.is_some(), "AccountGroup should exist");
         assert!(
             account_group.unwrap().is_pending(),
@@ -1079,9 +1087,13 @@ mod tests {
         .await;
 
         // AccountGroup must still exist
-        let ag = AccountGroup::get(&whitenoise, &account.pubkey, &group_id)
-            .await
-            .unwrap();
+        let ag = AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            &group_id,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert!(ag.is_some(), "AccountGroup must survive missing signer");
     }
 

@@ -13,7 +13,6 @@ use mdk_core::prelude::*;
 use nostr_sdk::prelude::*;
 
 use super::AccountSession;
-use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::AccountGroup;
 use crate::whitenoise::error::{Result, WhitenoiseError};
@@ -21,6 +20,7 @@ use crate::whitenoise::group_information::{GroupInformation, GroupType};
 use crate::whitenoise::groups::{GroupWithInfoAndMembership, GroupWithMembership};
 use crate::whitenoise::key_packages::validate_fetched_member_key_package;
 use crate::whitenoise::relays::{Relay, RelayType};
+use crate::whitenoise::shared::SharedServices;
 use crate::whitenoise::users::User;
 
 /// View over [`AccountSession`] for group operations.
@@ -199,16 +199,17 @@ impl<'a> GroupOps<'a> {
     /// If all publish attempts fail, the pending commit is cleared via
     /// `clear_pending_commit`, rolling back the MLS group to its pre-commit
     /// state.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     pub(crate) async fn publish_and_merge_commit(
         &self,
         evolution_event: Event,
         group_id: &GroupId,
         relay_urls: &[RelayUrl],
     ) -> Result<()> {
-        let wn = self.session.whitenoise()?;
-        if let Err(publish_err) = wn
-            .publish_event_with_retry(evolution_event, &self.session.account_pubkey, relay_urls)
+        if let Err(publish_err) = self
+            .session
+            .shared
+            .relay_control
+            .publish_event_to(evolution_event, &self.session.account_pubkey, relay_urls)
             .await
         {
             if let Err(clear_err) = self.session.mdk.clear_pending_commit(group_id) {
@@ -219,7 +220,7 @@ impl<'a> GroupOps<'a> {
                     clear_err,
                 );
             }
-            return Err(publish_err);
+            return Err(publish_err.into());
         }
         self.session.mdk.merge_pending_commit(group_id)?;
         Ok(())
@@ -231,7 +232,6 @@ impl<'a> GroupOps<'a> {
     ///
     /// Performs the complete workflow: fetch key packages, add members via MDK,
     /// publish evolution event, merge commit, and send welcome messages.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     pub async fn add_members(
         &self,
         group_id: &GroupId,
@@ -239,24 +239,23 @@ impl<'a> GroupOps<'a> {
     ) -> Result<()> {
         self.ensure_admin(group_id)?;
 
-        let wn = self.session.whitenoise()?;
+        let shared = &self.session.shared;
         let signer = self
             .session
             .get_signer()
             .ok_or(WhitenoiseError::SignerUnavailable(
                 self.session.account_pubkey,
             ))?;
-        let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
+        let database = &shared.database;
+        let account = Account::find_by_pubkey(&self.session.account_pubkey, database).await?;
 
         let mut key_package_events: Vec<Event> = Vec::new();
         let mut users = Vec::new();
 
         for pk in member_pubkeys.iter() {
-            let (user, newly_created) =
-                User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
+            let (user, newly_created) = User::find_or_create_by_pubkey(pk, database).await?;
 
-            if newly_created && let Err(e) = user.update_relay_lists(&wn).await {
+            if newly_created && let Err(e) = user.update_relay_lists(shared).await {
                 tracing::warn!(
                     target: "whitenoise::session::groups",
                     "Failed to update relay lists for new user {}: {}",
@@ -265,19 +264,18 @@ impl<'a> GroupOps<'a> {
                 );
             }
 
-            let mut relays_to_use = user
-                .relays(RelayType::KeyPackage, &wn.shared.database)
-                .await?;
+            let mut relays_to_use = user.relays(RelayType::KeyPackage, database).await?;
             if relays_to_use.is_empty() {
                 tracing::warn!(
                     target: "whitenoise::session::groups",
                     "User {} has no relays configured, using account's default relays",
                     user.pubkey
                 );
-                relays_to_use = account.nip65_relays(&wn).await?;
+                relays_to_use = account.nip65_relays(shared).await?;
             }
             let relays_to_use_urls = Relay::urls(&relays_to_use);
-            let some_event = wn
+            let some_event = self
+                .session
                 .shared
                 .relay_control
                 .fetch_user_key_package(*pk, &relays_to_use_urls)
@@ -338,7 +336,7 @@ impl<'a> GroupOps<'a> {
 
             let one_month_future = Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
-            let relays_to_use = wn
+            let relays_to_use = shared
                 .resolve_member_delivery_relays(
                     &user,
                     &account,
@@ -348,7 +346,8 @@ impl<'a> GroupOps<'a> {
 
             let relay_urls = Relay::urls(&relays_to_use);
 
-            wn.shared
+            self.session
+                .shared
                 .relay_control
                 .publish_welcome(
                     &member_pubkey,
@@ -383,7 +382,6 @@ impl<'a> GroupOps<'a> {
     ///
     /// Creates an MLS group-data update proposal, publishes the evolution
     /// event, merges the pending commit, and refreshes subscriptions.
-    // TODO(phase-16): Remove singleton bridge when background_refresh moves to session.
     pub async fn update_group_data(
         &self,
         group_id: &GroupId,
@@ -397,10 +395,15 @@ impl<'a> GroupOps<'a> {
         self.publish_and_merge_commit(update_result.evolution_event, group_id, &relay_urls)
             .await?;
 
-        let wn = self.session.whitenoise()?;
         let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
-        wn.background_refresh_account_group_subscriptions(&account);
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        // background_refresh_account_group_subscriptions still genuinely needs
+        // Whitenoise (account_manager + tokio::spawn). Inline upgrade keeps the
+        // back-ref scoped to a single call rather than a function-wide binding.
+        self.session
+            .whitenoise()?
+            .background_refresh_account_group_subscriptions(&account);
         Ok(())
     }
 
@@ -424,14 +427,16 @@ impl<'a> GroupOps<'a> {
     /// After the proposal is successfully published, the group is
     /// optimistically marked as departed locally. When another member
     /// auto-commits the proposal, the resulting commit converges local state.
-    // TODO(phase-16): Remove singleton bridge when mark_as_left moves to session.
-    #[allow(deprecated)] // wn.mark_as_left() deprecated in Phase 12
     pub async fn leave(&self, group_id: &GroupId) -> Result<()> {
-        let wn = self.session.whitenoise()?;
+        let database = &self.session.shared.database;
 
-        let account_group = AccountGroup::get(&wn, &self.session.account_pubkey, group_id)
-            .await?
-            .ok_or(WhitenoiseError::GroupNotFound)?;
+        let account_group = AccountGroup::find_by_account_and_group(
+            &self.session.account_pubkey,
+            group_id,
+            database,
+        )
+        .await?
+        .ok_or(WhitenoiseError::GroupNotFound)?;
 
         if account_group.is_removed() {
             return Err(WhitenoiseError::AlreadyDepartedFromGroup);
@@ -440,17 +445,25 @@ impl<'a> GroupOps<'a> {
         let relay_urls = self.ensure_relays(group_id)?;
         let update_result = self.session.mdk.leave_group(group_id)?;
 
-        wn.publish_event_with_retry(
-            update_result.evolution_event,
-            &self.session.account_pubkey,
-            &relay_urls,
-        )
-        .await?;
+        self.session
+            .shared
+            .relay_control
+            .publish_event_to(
+                update_result.evolution_event,
+                &self.session.account_pubkey,
+                &relay_urls,
+            )
+            .await?;
 
-        let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
+        let account = Account::find_by_pubkey(&self.session.account_pubkey, database).await?;
 
-        if let Err(error) = wn.mark_as_left(&account, group_id).await {
+        if let Err(error) = self
+            .session
+            .membership()
+            .for_group(group_id)
+            .mark_as_left()
+            .await
+        {
             tracing::warn!(
                 target: "whitenoise::session::groups",
                 account_pubkey = %self.session.account_pubkey,
@@ -459,7 +472,12 @@ impl<'a> GroupOps<'a> {
             );
         }
 
-        wn.background_refresh_account_group_subscriptions(&account);
+        // background_refresh_account_group_subscriptions still genuinely needs
+        // Whitenoise (account_manager + tokio::spawn). Inline upgrade keeps the
+        // back-ref scoped to a single call rather than a function-wide binding.
+        self.session
+            .whitenoise()?
+            .background_refresh_account_group_subscriptions(&account);
 
         Ok(())
     }
@@ -471,14 +489,12 @@ impl<'a> GroupOps<'a> {
     /// Welcome messages are delivered inline after the group is committed locally.
     /// If welcome delivery fails for a member, the failure is logged but does not
     /// prevent `Ok(group)` from being returned.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     pub async fn create_group(
         &self,
         member_pubkeys: Vec<PublicKey>,
         config: NostrGroupConfigData,
         group_type: Option<GroupType>,
     ) -> Result<group_types::Group> {
-        let wn = self.session.whitenoise()?;
         let signer = self
             .session
             .get_signer()
@@ -526,7 +542,7 @@ impl<'a> GroupOps<'a> {
             .await?;
 
         Self::publish_welcomes(
-            wn.clone(),
+            self.session.shared.clone(),
             welcome_data,
             signer,
             self.session.account_pubkey,
@@ -534,8 +550,14 @@ impl<'a> GroupOps<'a> {
         .await;
 
         let account =
-            Account::find_by_pubkey(&self.session.account_pubkey, &wn.shared.database).await?;
-        wn.background_refresh_account_group_subscriptions(&account);
+            Account::find_by_pubkey(&self.session.account_pubkey, &self.session.shared.database)
+                .await?;
+        // background_refresh_account_group_subscriptions still genuinely needs
+        // Whitenoise (account_manager + tokio::spawn). Inline upgrade keeps the
+        // back-ref scoped to a single call rather than a function-wide binding.
+        self.session
+            .whitenoise()?
+            .background_refresh_account_group_subscriptions(&account);
 
         Ok(group)
     }
@@ -543,11 +565,10 @@ impl<'a> GroupOps<'a> {
     /// Resolves a single member for group creation: finds or creates the user
     /// record, syncs relay lists for new users, fetches and validates the key
     /// package.
-    // TODO(phase-16): Remove singleton bridge when relay_control moves to session.
     async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
-        let wn = self.session.whitenoise()?;
-        let (user, created) = User::find_or_create_by_pubkey(pk, &wn.shared.database).await?;
-        if created && let Err(e) = user.update_relay_lists(&wn).await {
+        let shared = &self.session.shared;
+        let (user, created) = User::find_or_create_by_pubkey(pk, &shared.database).await?;
+        if created && let Err(e) = user.update_relay_lists(shared).await {
             tracing::warn!(
                 target: "whitenoise::session::groups",
                 "Failed to update relay lists for new user {}: {}",
@@ -556,7 +577,7 @@ impl<'a> GroupOps<'a> {
             );
         }
 
-        let some_event = user.key_package_event(&wn).await?;
+        let some_event = user.key_package_event(shared).await?;
         let event = some_event.ok_or(WhitenoiseError::MdkCoreError(
             mdk_core::Error::KeyPackage("Does not exist".to_owned()),
         ))?;
@@ -614,7 +635,6 @@ impl<'a> GroupOps<'a> {
 
     /// Creates local database records for a newly created group:
     /// GroupInformation and AccountGroup (auto-accepted for the creator).
-    // TODO(phase-16): Remove singleton bridge when push ops fully on session.
     async fn finalize_group_records(
         &self,
         group: &group_types::Group,
@@ -676,32 +696,32 @@ impl<'a> GroupOps<'a> {
     /// The caller is responsible for deciding whether to `tokio::spawn` this for
     /// fire-and-forget behaviour. The view itself does not spawn.
     async fn publish_welcomes(
-        whitenoise: Arc<Whitenoise>,
+        shared: Arc<SharedServices>,
         welcome_data: Vec<(UnsignedEvent, User, PublicKey)>,
         signer: Arc<dyn NostrSigner>,
         creator_pubkey: PublicKey,
     ) {
-        let creator_account =
-            match Account::find_by_pubkey(&creator_pubkey, &whitenoise.shared.database).await {
-                Ok(account) => account,
-                Err(error) => {
-                    tracing::error!(
-                        target: "whitenoise::session::groups",
-                        "Failed to find creator account for welcome publishing: {}",
-                        error
-                    );
-                    return;
-                }
-            };
+        let creator_account = match Account::find_by_pubkey(&creator_pubkey, &shared.database).await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::error!(
+                    target: "whitenoise::session::groups",
+                    "Failed to find creator account for welcome publishing: {}",
+                    error
+                );
+                return;
+            }
+        };
 
         let futures = welcome_data
             .into_iter()
             .map(|(rumor, member, member_pubkey)| {
                 let signer = signer.clone();
                 let creator = &creator_account;
-                let whitenoise = &whitenoise;
+                let shared = &shared;
                 async move {
-                    let relays_to_use = whitenoise
+                    let relays_to_use = shared
                         .resolve_member_delivery_relays(
                             &member,
                             creator,
@@ -712,8 +732,7 @@ impl<'a> GroupOps<'a> {
                     let one_month_future =
                         Timestamp::now() + Duration::from_secs(30 * 24 * 60 * 60);
 
-                    whitenoise
-                        .shared
+                    shared
                         .relay_control
                         .publish_welcome(
                             &member_pubkey,

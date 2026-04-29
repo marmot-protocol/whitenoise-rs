@@ -66,7 +66,7 @@ impl TestCase for LoginTestCase {
 
         assert_eq!(account.pubkey, expected_pubkey);
         let relays = account
-            .relays(RelayType::Nip65, &context.whitenoise)
+            .relays(RelayType::Nip65, &context.whitenoise.shared)
             .await?;
         assert_eq!(relays.len(), self.relays.len());
         for relay in relays {

@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dashmap::DashMap;
-use nostr_sdk::PublicKey;
 use nostr_sdk::prelude::NostrSigner;
+use nostr_sdk::{PublicKey, RelayUrl};
 use tokio::sync::Mutex;
 
 #[cfg(test)]
@@ -12,6 +12,7 @@ use nostr_sdk::EventId;
 use tokio::sync::Semaphore;
 
 use crate::mdk::GroupId;
+use crate::perf_instrument;
 use crate::relay_control::RelayControlPlane;
 use crate::whitenoise::WhitenoiseConfig;
 use crate::whitenoise::chat_list_streaming::ChatListStreamManager;
@@ -30,9 +31,9 @@ use crate::whitenoise::user_streaming::UserStreamManager;
 /// Held behind `Arc<SharedServices>` on `Whitenoise` and on every
 /// `AccountSession`. Lifecycle plumbing (event and shutdown channels, scheduler
 /// handles, account registry) stays on `Whitenoise` itself.
-pub(crate) struct SharedServices {
+pub struct SharedServices {
     pub(crate) config: Arc<WhitenoiseConfig>,
-    pub(crate) database: Arc<Database>,
+    pub database: Arc<Database>,
     pub(crate) relay_control: Arc<RelayControlPlane>,
     pub(crate) event_tracker: Arc<dyn EventTracker>,
     pub(crate) secrets_store: SecretsStore,
@@ -106,5 +107,15 @@ impl SharedServices {
                 super::push_notifications::MAX_CONCURRENT_TOKEN_RESPONSE_TASKS,
             )),
         }
+    }
+
+    /// Returns the union of default relays and currently connected relays.
+    ///
+    /// Used as the fallback relay set when a user has no stored NIP-65 relays.
+    /// Discovery fallback is owned by the discovery plane rather than whatever
+    /// other relays happen to be connected for unrelated workloads.
+    #[perf_instrument("whitenoise")]
+    pub(crate) async fn fallback_relay_urls(&self) -> Vec<RelayUrl> {
+        self.relay_control.discovery().relays().to_vec()
     }
 }

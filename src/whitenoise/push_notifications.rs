@@ -1094,7 +1094,13 @@ impl Whitenoise {
         if group_state != GroupState::Active {
             return false;
         }
-        match AccountGroup::get(self, &account.pubkey, group_id).await {
+        match AccountGroup::find_by_account_and_group(
+            &account.pubkey,
+            group_id,
+            &self.shared.database,
+        )
+        .await
+        {
             Ok(Some(ag)) => ag.is_accepted() && !ag.is_removed(),
             Ok(None) => false,
             Err(error) => {
@@ -1994,8 +2000,6 @@ mod tests {
         assert!(cached_tokens.is_empty());
     }
 
-    // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-    #[ignore]
     #[tokio::test]
     async fn test_publish_notification_requests_after_delivery_publishes_expected_446_tokens() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2012,7 +2016,10 @@ mod tests {
             &member_account,
         )
         .await;
-        let server_inbox_relays = server_account.inbox_relays(&whitenoise).await.unwrap();
+        let server_inbox_relays = server_account
+            .inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let server_relay_urls = Relay::urls(&server_inbox_relays);
 
         wait_for_user_inbox_relays_on_network(
@@ -2101,8 +2108,6 @@ mod tests {
         assert_eq!(parsed.tokens, vec![recipient_token]);
     }
 
-    // TODO(phase-16): Pre-existing failure on arch-refactor. Requires singleton for relay ops.
-    #[ignore]
     #[tokio::test]
     async fn test_reaction_delivery_publishes_expected_446_tokens() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
@@ -2119,7 +2124,10 @@ mod tests {
             &member_account,
         )
         .await;
-        let server_inbox_relays = server_account.inbox_relays(&whitenoise).await.unwrap();
+        let server_inbox_relays = server_account
+            .inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let server_relay_urls = Relay::urls(&server_inbox_relays);
 
         wait_for_user_inbox_relays_on_network(
@@ -2231,7 +2239,10 @@ mod tests {
         let sender_account = whitenoise.create_identity().await.unwrap();
         let mut server_accounts = setup_multiple_test_accounts(&whitenoise, 1).await;
         let (server_account, server_keys) = server_accounts.remove(0);
-        let server_inbox_relays = server_account.inbox_relays(&whitenoise).await.unwrap();
+        let server_inbox_relays = server_account
+            .inbox_relays(&whitenoise.shared)
+            .await
+            .unwrap();
         let server_relay_urls = Relay::urls(&server_inbox_relays);
 
         wait_for_user_inbox_relays_on_network(

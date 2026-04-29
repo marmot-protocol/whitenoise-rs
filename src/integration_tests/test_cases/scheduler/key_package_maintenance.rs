@@ -39,7 +39,9 @@ impl TestCase for KeyPackageMaintenanceTestCase {
         context.add_account(&self.account_name, account.clone());
 
         // Verify account has key package relays configured
-        let kp_relays = account.key_package_relays(&context.whitenoise).await?;
+        let kp_relays = account
+            .key_package_relays(&context.whitenoise.shared)
+            .await?;
         assert!(
             !kp_relays.is_empty(),
             "Account should have key package relays configured"
