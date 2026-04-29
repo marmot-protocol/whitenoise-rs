@@ -147,11 +147,12 @@ fn format_storage_access_error(inner: &dyn std::error::Error) -> String {
     #[cfg(target_os = "linux")]
     {
         format!(
-            "Platform keyring is not available. On Linux, White Noise uses the kernel \
-             keyutils subsystem (keyctl) to store secret keys. This error typically \
-             occurs on headless systems, in SSH sessions, or in containers where no \
-             session keyring is active. Try running `keyctl session` before starting \
-             the daemon, or ensure your init system provides a session keyring. \
+            "Platform keyring is not available. On Linux, White Noise uses the D-Bus \
+             Secret Service to store secret keys. This error typically occurs on \
+             headless systems, in SSH sessions, in containers, or when no Secret \
+             Service implementation such as GNOME Keyring or KWallet is running and \
+             unlocked. Start and unlock a Secret Service provider before starting \
+             White Noise. \
              (Original error: {inner})"
         )
     }

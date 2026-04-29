@@ -319,10 +319,15 @@ impl Whitenoise {
     /// binaries require real platform keychain entitlements.
     ///
     /// This function is safe to call multiple times; only the first call has
-    /// an effect.
+    /// an effect. If another crate or host application has already configured
+    /// a `keyring-core` default store, that store is preserved.
     fn initialize_keyring_store() {
         static KEYRING_STORE_INIT: OnceLock<()> = OnceLock::new();
         KEYRING_STORE_INIT.get_or_init(|| {
+            if keyring_core::get_default_store().is_some() {
+                return;
+            }
+
             // Use the mock (in-memory) store in test, integration-test, and
             // benchmark-test builds so that `cargo test` and unsigned `cargo run`
             // binaries never require real platform keychain entitlements.
@@ -383,8 +388,8 @@ impl Whitenoise {
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    let store = linux_keyutils_keyring_store::Store::new()
-                        .expect("Failed to create Linux keyutils credential store");
+                    let store = zbus_secret_service_keyring_store::Store::new()
+                        .expect("Failed to create Linux Secret Service credential store");
                     keyring_core::set_default_store(store);
                 }
                 #[cfg(target_os = "android")]
