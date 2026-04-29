@@ -137,29 +137,7 @@ impl SecretsStore {
 }
 
 fn keyring_entry_for_user(service: &str, user: &str) -> keyring_core::Result<Entry> {
-    #[cfg(all(
-        target_os = "linux",
-        not(test),
-        not(feature = "integration-tests"),
-        not(feature = "benchmark-tests")
-    ))]
-    {
-        let modifiers = std::collections::HashMap::from([(
-            "target",
-            super::keyring_store::LINUX_SECRET_SERVICE_TARGET,
-        )]);
-        Entry::new_with_modifiers(service, user, &modifiers)
-    }
-
-    #[cfg(not(all(
-        target_os = "linux",
-        not(test),
-        not(feature = "integration-tests"),
-        not(feature = "benchmark-tests")
-    )))]
-    {
-        Entry::new(service, user)
-    }
+    Entry::new(service, user)
 }
 
 /// Maps a `keyring_core::Error` to a `SecretsStoreError`, distinguishing

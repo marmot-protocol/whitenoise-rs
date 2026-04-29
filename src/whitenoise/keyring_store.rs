@@ -165,7 +165,7 @@ impl LegacyMigrationCredential {
 
     fn migrate_legacy_secret(&self, secret: Vec<u8>) -> Result<Vec<u8>> {
         self.primary.set_secret(&secret)?;
-        let _ = Self::delete_entry(&self.legacy);
+        Self::delete_entry(&self.legacy)?;
         Ok(secret)
     }
 }
@@ -323,6 +323,81 @@ mod tests {
         }
     }
 
+    struct DeleteFailureStore {
+        secret: Vec<u8>,
+    }
+
+    impl fmt::Debug for DeleteFailureStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DeleteFailureStore").finish()
+        }
+    }
+
+    impl CredentialStoreApi for DeleteFailureStore {
+        fn vendor(&self) -> String {
+            "delete-failure-store".to_string()
+        }
+
+        fn id(&self) -> String {
+            "delete-failure-store".to_string()
+        }
+
+        fn build(
+            &self,
+            service: &str,
+            user: &str,
+            _modifiers: Option<&HashMap<&str, &str>>,
+        ) -> Result<Entry> {
+            Ok(Entry::new_with_credential(Arc::new(
+                DeleteFailureCredential {
+                    service: service.to_string(),
+                    user: user.to_string(),
+                    secret: self.secret.clone(),
+                },
+            )))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeleteFailureCredential {
+        service: String,
+        user: String,
+        secret: Vec<u8>,
+    }
+
+    impl CredentialApi for DeleteFailureCredential {
+        fn set_secret(&self, _secret: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_secret(&self) -> Result<Vec<u8>> {
+            Ok(self.secret.clone())
+        }
+
+        fn delete_credential(&self) -> Result<()> {
+            Err(Error::Invalid(
+                "legacy delete".to_string(),
+                "failed".to_string(),
+            ))
+        }
+
+        fn get_credential(&self) -> Result<Option<Arc<Credential>>> {
+            Ok(None)
+        }
+
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            Some((self.service.clone(), self.user.clone()))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     fn owned_map(modifiers: Option<&HashMap<&str, &str>>) -> HashMap<String, String> {
         modifiers
             .into_iter()
@@ -420,5 +495,30 @@ mod tests {
             .unwrap();
 
         assert_eq!(entry.get_secret().unwrap(), b"primary-db-key");
+    }
+
+    #[test]
+    fn legacy_migration_store_returns_error_when_legacy_delete_fails() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy_secret = b"legacy-db-key".to_vec();
+        let legacy = Arc::new(DeleteFailureStore {
+            secret: legacy_secret.clone(),
+        });
+        let store = LegacyMigrationCredentialStore::new(primary.clone(), legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let result = entry.get_secret();
+
+        assert!(matches!(result, Err(Error::Invalid(field, _)) if field == "legacy delete"));
+        assert_eq!(
+            primary
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            legacy_secret
+        );
     }
 }
