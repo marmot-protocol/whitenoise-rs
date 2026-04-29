@@ -69,7 +69,7 @@ pub struct SharedDatabase {
 impl SharedDatabase {
     /// Open (or create) the shared database at `db_path`.
     ///
-    /// Runs all pending migrations in `./db_migrations` on first open.
+    /// Runs all pending Rust migrations on first open.
     pub async fn new(db_path: PathBuf) -> Result<Self, DatabaseError> {
         let inner = Database::new(db_path).await?;
         Ok(Self { inner })

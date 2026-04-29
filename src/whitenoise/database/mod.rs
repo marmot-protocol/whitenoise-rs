@@ -1,12 +1,11 @@
 use std::{
     path::PathBuf,
-    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
 use sqlx::{
     ConnectOptions, Sqlite, SqlitePool,
-    migrate::{MigrateDatabase, Migrator},
+    migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
@@ -37,7 +36,7 @@ pub mod user_relays;
 pub mod users;
 pub mod utils;
 
-pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| sqlx::migrate!("./db_migrations"));
+pub mod rust_migrations;
 
 const DB_ACQUIRE_TIMEOUT_SECS: u64 = 5;
 const DB_MAX_CONNECTIONS: u32 = 10;
@@ -47,8 +46,6 @@ const DB_BUSY_TIMEOUT_MS: u32 = 5000;
 pub enum DatabaseError {
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("Migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
     #[error("File system error: {0}")]
     FileSystem(#[from] std::io::Error),
     #[error("Invalid timestamp: {timestamp} cannot be converted to DateTime")]
@@ -124,8 +121,10 @@ impl Database {
 
         let pool = Self::create_connection_pool(&db_url).await?;
 
-        // Automatically run migrations
-        MIGRATOR.run(&pool).await?;
+        // Run Rust migration framework (handles SQLx catch-up for existing installs).
+        rust_migrations::global::GLOBAL_RUST_MIGRATOR
+            .run(&pool)
+            .await?;
 
         Ok(Self {
             pool,
@@ -187,7 +186,9 @@ impl Database {
     /// This method is idempotent - it's safe to call multiple times.
     /// Only new migrations will be applied.
     pub async fn migrate_up(&self) -> Result<(), DatabaseError> {
-        MIGRATOR.run(&self.pool).await?;
+        rust_migrations::global::GLOBAL_RUST_MIGRATOR
+            .run(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -222,7 +223,7 @@ impl Database {
             "SELECT name FROM sqlite_master
              WHERE type='table'
              AND name NOT LIKE 'sqlite_%'
-             AND name != '_sqlx_migrations'",
+             AND name NOT IN ('_sqlx_migrations', '_rust_migrations')",
         )
         .fetch_all(&mut *txn)
         .await?;
