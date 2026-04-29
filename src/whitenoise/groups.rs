@@ -16,8 +16,8 @@ use crate::{
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
         key_packages::{
-            REQUIRED_MLS_CIPHERSUITE_TAG, REQUIRED_MLS_PROPOSAL_TAGS,
-            validate_marmot_key_package_tags,
+            REQUIRED_MLS_CIPHERSUITE_TAG, marmot_key_package_capabilities,
+            validate_marmot_key_package_baseline,
         },
         relays::Relay,
         users::User,
@@ -32,6 +32,9 @@ mod required_proposals;
 
 pub use membership::{GroupWithInfoAndMembership, GroupWithMembership};
 pub use required_proposals::RequiredProposal;
+pub(crate) use required_proposals::{
+    KeyPackageCapabilities, MlsExtensionId, find_member_missing_required_proposal,
+};
 
 impl Whitenoise {
     #[perf_instrument("groups")]
@@ -85,7 +88,7 @@ impl Whitenoise {
             )));
         }
 
-        validate_marmot_key_package_tags(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
+        validate_marmot_key_package_baseline(event, REQUIRED_MLS_CIPHERSUITE_TAG).map_err(|e| {
             WhitenoiseError::InvalidInput(format!(
                 "Incompatible key package event {} for member {}: {}",
                 event.id, pk, e
@@ -100,7 +103,15 @@ impl Whitenoise {
     ///
     /// Key-package relay resolution is delegated to [`User::key_package_event`] so that
     /// preflight status checks and actual group creation use the same fallback chain.
-    async fn resolve_member_key_package(&self, pk: &PublicKey) -> Result<(User, Event)> {
+    ///
+    /// Returns the user record, the resolved key-package event, and the
+    /// projected [`KeyPackageCapabilities`]. The capability projection is
+    /// computed once at the validation boundary so callers can fold it (e.g.
+    /// `create_group` counts legacy peers) without re-walking the event's tags.
+    async fn resolve_member_key_package(
+        &self,
+        pk: &PublicKey,
+    ) -> Result<(User, Event, KeyPackageCapabilities)> {
         let (user, created) = User::find_or_create_by_pubkey(pk, &self.database).await?;
         if created && let Err(e) = user.update_relay_lists(self).await {
             tracing::warn!(
@@ -117,18 +128,12 @@ impl Whitenoise {
 
         let event = match lookup {
             KeyPackageLookup::Found(event) => event,
+            // The consumer-side baseline validator no longer treats missing
+            // capability advertisements (notably SelfRemove) as `Incompatible`
+            // — only genuine malformations do. The
+            // `KeyPackageMissingSelfRemove` error variant survives because
+            // `add_members_to_group`'s strict-add path still produces it.
             KeyPackageLookup::Incompatible { error } => {
-                if let WhitenoiseError::MissingMlsProposals { missing } = &error {
-                    let missing_self_remove = missing
-                        .iter()
-                        .any(|proposal| proposal == REQUIRED_MLS_PROPOSAL_TAGS[0]);
-                    if missing_self_remove {
-                        return Err(WhitenoiseError::KeyPackageMissingSelfRemove {
-                            member_pubkey: *pk,
-                        });
-                    }
-                }
-
                 return Err(WhitenoiseError::IncompatibleKeyPackage {
                     member_pubkey: *pk,
                     reason: error.to_string(),
@@ -143,7 +148,9 @@ impl Whitenoise {
 
         Self::validate_fetched_member_key_package(&event, pk)?;
 
-        Ok((user, event))
+        let capabilities = marmot_key_package_capabilities(&event);
+
+        Ok((user, event, capabilities))
     }
 
     /// Validates and pairs welcome rumors from MLS group creation with their
@@ -347,8 +354,29 @@ impl Whitenoise {
             .iter()
             .map(|pk| self.resolve_member_key_package(pk));
         let resolved_members = try_join_all(member_futures).await?;
-        let (members, key_package_events): (Vec<User>, Vec<Event>) =
-            resolved_members.into_iter().unzip();
+
+        // Fold the per-member capability projections into a single legacy-peer
+        // count as we split the triples. We don't keep `KeyPackageCapabilities`
+        // values around — only the count survives, because the projection's
+        // only consumer here is the tracing emit below.
+        let mut legacy_peer_count: usize = 0;
+        let mut members: Vec<User> = Vec::with_capacity(resolved_members.len());
+        let mut key_package_events: Vec<Event> = Vec::with_capacity(resolved_members.len());
+        for (user, event, caps) in resolved_members {
+            if !caps.proposals.contains(&RequiredProposal::SelfRemove) {
+                legacy_peer_count += 1;
+            }
+            members.push(user);
+            key_package_events.push(event);
+        }
+
+        if legacy_peer_count > 0 {
+            tracing::info!(
+                target: "whitenoise::accounts::groups::create_group",
+                legacy_peer_count,
+                "creating group with legacy peers; capabilities will be LCD'd by MDK"
+            );
+        }
 
         tracing::debug!(
             target: "whitenoise::accounts::groups::create_group",
@@ -655,18 +683,61 @@ impl Whitenoise {
         let signer = self.get_signer_for_account(account)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut users = Vec::new();
+        let mut member_caps: Vec<(PublicKey, KeyPackageCapabilities)> =
+            Vec::with_capacity(members.len());
 
-        // Fetch key packages for all members
+        // Resolve key packages for all members. The third tuple element is the
+        // per-member capability projection used by the pre-check below.
         for pk in members.iter() {
-            let (user, event) = self.resolve_member_key_package(pk).await?;
+            let (user, event, caps) = self.resolve_member_key_package(pk).await?;
             key_package_events.push(event);
             users.push(user);
+            member_caps.push((*pk, caps));
+        }
+
+        // Pre-validate each invitee's advertised proposals against the group's
+        // `RequiredCapabilities` BEFORE invoking MDK so we can attribute the
+        // rejection to the offending member. MDK's typed error
+        // (`InviteeMissingRequiredProposal`) is a unit variant carrying no
+        // attribution; we keep it as defense-in-depth via
+        // `map_mdk_add_members_error`.
+        //
+        // Only pre-check proposals we model explicitly. `RequiredProposal::Unknown`
+        // is a unit variant: distinct unmodelled MLS proposal codepoints all
+        // collapse to the same value on both sides of the comparison, so a set
+        // difference on `Unknown` would yield false negatives (a group requiring
+        // proposal X and a member advertising only proposal Y both project to
+        // `{Unknown}`, masking the mismatch). MDK's leaf-node validation is
+        // authoritative for those cases — `map_mdk_add_members_error` translates
+        // its `InviteeMissingRequiredProposal` into the same defense-in-depth
+        // error path.
+        let required = self.group_required_proposals(account, group_id).await?;
+        let modeled_required: BTreeSet<RequiredProposal> = required
+            .iter()
+            .copied()
+            .filter(|p| !matches!(p, RequiredProposal::Unknown))
+            .collect();
+        if !modeled_required.is_empty()
+            && let Some((member_pubkey, missing)) =
+                find_member_missing_required_proposal(&member_caps, &modeled_required)
+        {
+            return Err(match missing {
+                RequiredProposal::SelfRemove => {
+                    WhitenoiseError::KeyPackageMissingSelfRemove { member_pubkey }
+                }
+                other => WhitenoiseError::GroupRejectedMember {
+                    member_pubkey: Some(member_pubkey),
+                    reason: format!("does not advertise {other:?}"),
+                },
+            });
         }
 
         let relay_urls = Self::ensure_group_relays(&mdk, group_id)?;
 
         let _mls_add = perf_span!("groups::mls_add_members");
-        let update_result = mdk.add_members(group_id, &key_package_events)?;
+        let update_result = mdk
+            .add_members(group_id, &key_package_events)
+            .map_err(map_mdk_add_members_error)?;
         drop(_mls_add);
 
         let evolution_event = update_result.evolution_event;
@@ -894,6 +965,37 @@ impl Whitenoise {
         self.background_refresh_account_group_subscriptions(account);
 
         Ok(())
+    }
+}
+
+/// Defense-in-depth mapping for `mdk.add_members` errors.
+///
+/// `add_members_to_group` pre-validates each invitee's
+/// [`KeyPackageCapabilities`] against the group's
+/// [`Whitenoise::group_required_proposals`] before invoking MDK, so an
+/// `InviteeMissingRequiredProposal` from MDK means the pre-check missed an
+/// edge case (e.g. an `openmls` enforcement rule that diverges from our
+/// projection). We surface it as
+/// [`WhitenoiseError::GroupRejectedMember`] with no member attribution
+/// (the MDK variant is a unit, no payload) and emit a `warn!` so the gap
+/// is visible in logs.
+///
+/// All other MDK errors keep their pre-existing `WhitenoiseError::from`
+/// pass-through.
+fn map_mdk_add_members_error(err: mdk_core::Error) -> WhitenoiseError {
+    match err {
+        mdk_core::Error::InviteeMissingRequiredProposal => {
+            tracing::warn!(
+                target: "whitenoise::accounts::groups::add_members",
+                "MDK rejected add despite passing pre-validation; pre-check has a gap"
+            );
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey: None,
+                reason: "invitee KeyPackage is missing a proposal type required by the group"
+                    .to_string(),
+            }
+        }
+        other => WhitenoiseError::from(other),
     }
 }
 
@@ -2760,5 +2862,41 @@ mod tests {
             .expect_err("fabricated group ID must error");
 
         assert!(matches!(err, WhitenoiseError::GroupNotFound));
+    }
+
+    #[test]
+    fn map_invitee_missing_required_proposal_yields_group_rejected_member() {
+        // Defense-in-depth: if MDK still rejects an `add_members` call after
+        // our pre-check passed, the typed unit variant
+        // `InviteeMissingRequiredProposal` (no member attribution) maps to
+        // `WhitenoiseError::GroupRejectedMember { member_pubkey: None, .. }`.
+        let mapped = map_mdk_add_members_error(mdk_core::Error::InviteeMissingRequiredProposal);
+
+        match mapped {
+            WhitenoiseError::GroupRejectedMember {
+                member_pubkey,
+                reason,
+            } => {
+                assert_eq!(member_pubkey, None);
+                assert!(
+                    !reason.is_empty(),
+                    "GroupRejectedMember reason must be non-empty for FFI rendering"
+                );
+            }
+            other => panic!("expected GroupRejectedMember, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_other_mdk_errors_passes_through_unchanged() {
+        // Non-`InviteeMissingRequiredProposal` MDK errors keep their existing
+        // `WhitenoiseError::from` mapping (variant `MdkCoreError`).
+        let mapped =
+            map_mdk_add_members_error(mdk_core::Error::Group("some unrelated error".to_owned()));
+
+        assert!(
+            matches!(mapped, WhitenoiseError::MdkCoreError(_)),
+            "expected MdkCoreError pass-through, got: {mapped:?}"
+        );
     }
 }

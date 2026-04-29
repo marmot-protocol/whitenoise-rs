@@ -16,14 +16,53 @@ impl Whitenoise {
         let keys = Keys::generate();
         tracing::debug!(target: "whitenoise::accounts", "Generated new keypair: {}", keys.public_key().to_hex());
 
-        let account = self.create_identity_with_keys(&keys).await?;
+        let account = self.create_identity_with_keys_inner(&keys, true).await?;
 
         tracing::debug!(target: "whitenoise::accounts", "Successfully created new identity: {}", account.pubkey.to_hex());
         Ok(account)
     }
 
+    /// Creates a new identity that intentionally skips the initial key-package
+    /// publish.
+    ///
+    /// **Integration-test only.** Production accounts must publish a key
+    /// package as part of `create_identity` so other peers can reach them.
+    /// This entry point exists for fixtures (e.g. the legacy-capability KP
+    /// fixture) that need to be the *sole* publisher of an account's key
+    /// packages so the test controls exactly which capability profile lands
+    /// on the relays. Skipping the auto-publish here means the fixture's
+    /// hand-crafted KP is the only one resolvers can find — no
+    /// delete-and-republish gymnastics required.
+    ///
+    /// Aside from skipping the KP publish, behaviour matches `create_identity`:
+    /// keys are stored, the account record is persisted, default relay lists
+    /// are configured and published, and subscriptions are activated.
+    #[cfg(feature = "integration-tests")]
     #[perf_instrument("accounts")]
-    async fn create_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
+    pub async fn create_identity_without_initial_key_package(&self) -> Result<Account> {
+        let keys = Keys::generate();
+        tracing::debug!(
+            target: "whitenoise::accounts",
+            "Generated new keypair (no-initial-KP variant): {}",
+            keys.public_key().to_hex()
+        );
+
+        let account = self.create_identity_with_keys_inner(&keys, false).await?;
+
+        tracing::debug!(
+            target: "whitenoise::accounts",
+            "Successfully created new identity without initial key package: {}",
+            account.pubkey.to_hex()
+        );
+        Ok(account)
+    }
+
+    #[perf_instrument("accounts")]
+    async fn create_identity_with_keys_inner(
+        &self,
+        keys: &Keys,
+        publish_initial_key_package: bool,
+    ) -> Result<Account> {
         let mut account = self.create_base_account_with_private_key(keys).await?;
         tracing::debug!(target: "whitenoise::accounts", "Keys stored in secret store and account saved to database");
 
@@ -42,7 +81,7 @@ impl Whitenoise {
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Relays setup");
 
-        self.activate_account(&account, true, &relays, &relays)
+        self.activate_new_account(&account, &relays, publish_initial_key_package)
             .await?;
         tracing::debug!(target: "whitenoise::accounts", "Account persisted and activated");
 
@@ -51,7 +90,7 @@ impl Whitenoise {
 
     #[cfg(test)]
     pub(crate) async fn create_test_identity_with_keys(&self, keys: &Keys) -> Result<Account> {
-        self.create_identity_with_keys(keys).await
+        self.create_identity_with_keys_inner(keys, true).await
     }
 
     /// Logs in an existing user using a private key (nsec or hex format).
