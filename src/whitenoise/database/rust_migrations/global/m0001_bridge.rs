@@ -53,8 +53,8 @@ impl GlobalMigration for Migration {
             // Mapping: Rust v N (N >= 2) corresponds to SQLx version N + 36
             // (m0002 ↔ 0038, m0003 ↔ 0039, ..., m0011 ↔ 0047).
             // This prevents duplicate schema changes when a user upgrades
-            // from a master release (which shipped SQLx 0038-0046) to an
-            // architecture refactor release (which uses Rust migrations instead).
+            // from a master release (which shipped SQLx 0038-0046) to a release
+            // after the architecture refactor (which uses Rust migrations instead).
             let mut stamped = 0u32;
             for rust_version in 2..=11_i64 {
                 let sqlx_equivalent = rust_version + 36;
@@ -72,6 +72,14 @@ impl GlobalMigration for Migration {
                     .await?;
                     stamped += 1;
                 }
+            }
+
+            if max_version > 47 {
+                tracing::warn!(
+                    target: "whitenoise::database::rust_migrations",
+                    "SQLx version {max_version} exceeds expected maximum (47); \
+                     all Rust conversions were auto-stamped"
+                );
             }
 
             tracing::info!(
@@ -143,8 +151,16 @@ mod tests {
         let runner = GlobalMigrationRunner::new(vec![Box::new(Migration)]);
         runner.run(&pool).await.unwrap();
 
-        // Verify core tables exist.
-        for table in &["accounts", "users", "aggregated_messages", "media_files"] {
+        // Verify core tables exist (spot-check across fresh_schema.sql).
+        for table in &[
+            "accounts",
+            "users",
+            "aggregated_messages",
+            "media_files",
+            "relay_status",
+            "message_delivery_status",
+            "published_key_packages",
+        ] {
             let exists: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master \
                  WHERE type='table' AND name='{table}')"
