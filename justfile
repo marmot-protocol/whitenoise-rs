@@ -336,17 +336,12 @@ check-docs:
 check-dead-code-allows:
     @bash scripts/check-dead-code-allows.sh
 
-# Check that db_migrations/ is frozen (no new SQL files)
-check-frozen-migrations:
-    @bash scripts/check-frozen-migrations.sh
-
 # Check all (fast checks before running tests)
 check:
     @bash scripts/check-all.sh
 
 # Pre-commit checks: quiet mode with minimal output (recommended for agents/CI)
 precommit:
-    @just _run-quiet "check-frozen-migrations"  "frozen migrations"
     @just _run-quiet "check-fmt"                "fmt"
     @just _run-quiet "check-docs"               "docs"
     @just _run-quiet "check-clippy"             "clippy"
@@ -360,7 +355,6 @@ precommit-verbose: check test int-test
 
 # Quick pre-commit: quiet mode, skip integration tests (recommended for agents/CI)
 precommit-quick:
-    @just _run-quiet "check-frozen-migrations"  "frozen migrations"
     @just _run-quiet "check-fmt"                "fmt"
     @just _run-quiet "check-docs"               "docs"
     @just _run-quiet "check-clippy"             "clippy"

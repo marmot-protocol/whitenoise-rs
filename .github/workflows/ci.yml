@@ -48,18 +48,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
 
-  # Guard: no new SQL files in the frozen db_migrations/ directory
-  frozen-migrations:
-    name: Frozen Migrations Guard
-    needs: changes
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check frozen migrations
-        run: bash scripts/check-frozen-migrations.sh
-
   # Quick checks that fail fast
   fmt:
     name: Format Check

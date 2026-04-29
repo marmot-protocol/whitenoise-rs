@@ -95,42 +95,11 @@ impl GlobalMigrationRunner {
 
     /// Run all pending global migrations.
     ///
-    /// 1. If `_sqlx_migrations` exists, runs `MIGRATOR.run()` to catch up
-    ///    any missing SQLx migrations (idempotent, skipped for fresh installs).
-    /// 2. Creates `_rust_migrations` tracking table if needed.
-    /// 3. Applies pending Rust migrations in version order, each in its own
+    /// 1. Creates `_rust_migrations` tracking table if needed.
+    /// 2. Applies pending Rust migrations in version order, each in its own
     ///    transaction.
     pub async fn run(&self, global_db: &SqlitePool) -> Result<(), DatabaseError> {
         let start = Instant::now();
-
-        // Pre-step: catch up SQLx migrations for existing installs.
-        let sqlx_table_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='_sqlx_migrations')",
-        )
-        .fetch_one(global_db)
-        .await?;
-
-        if sqlx_table_exists {
-            super::MIGRATOR.run(global_db).await.map_err(|e| {
-                if matches!(e, sqlx::migrate::MigrateError::VersionMismatch(_)) {
-                    tracing::error!(
-                        target: "whitenoise::database::rust_migrations",
-                        "SQLx migration checksum mismatch — a db_migrations/ file was modified \
-                         after it was already applied. Your database cannot be automatically \
-                         recovered. To fix: back up your data directory, delete the database \
-                         file, and restart the app to create a fresh database. Error: {e}"
-                    );
-                } else {
-                    tracing::error!(
-                        target: "whitenoise::database::rust_migrations",
-                        "SQLx catch-up failed \
-                         (existing install may need manual intervention): {e}"
-                    );
-                }
-                DatabaseError::Migration(e)
-            })?;
-        }
 
         // Ensure tracking table exists.
         sqlx::query(CREATE_TRACKING_TABLE)

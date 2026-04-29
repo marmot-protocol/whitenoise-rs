@@ -1,12 +1,11 @@
 use std::{
     path::PathBuf,
-    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
 use sqlx::{
     ConnectOptions, Sqlite, SqlitePool,
-    migrate::{MigrateDatabase, Migrator},
+    migrate::MigrateDatabase,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
@@ -39,8 +38,6 @@ pub mod utils;
 
 pub mod rust_migrations;
 
-pub static MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| sqlx::migrate!("./db_migrations"));
-
 const DB_ACQUIRE_TIMEOUT_SECS: u64 = 5;
 const DB_MAX_CONNECTIONS: u32 = 10;
 const DB_BUSY_TIMEOUT_MS: u32 = 5000;
@@ -49,8 +46,6 @@ const DB_BUSY_TIMEOUT_MS: u32 = 5000;
 pub enum DatabaseError {
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("Migration error: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
     #[error("File system error: {0}")]
     FileSystem(#[from] std::io::Error),
     #[error("Invalid timestamp: {timestamp} cannot be converted to DateTime")]

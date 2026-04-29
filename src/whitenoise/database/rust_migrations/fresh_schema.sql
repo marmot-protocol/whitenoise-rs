@@ -1,8 +1,6 @@
--- Consolidated schema for fresh installs.
--- Generated from all SQLx migrations (0001-0045) against a throwaway SQLite DB.
--- This is a one-time snapshot: it does NOT need updating when subsequent Rust
--- migrations add schema changes, because fresh installs run the bridge first
--- and then all Rust migrations in order.
+-- Consolidated base schema for fresh installs.
+-- Generated from SQLx migrations 0001-0037 (last shipped in v2026.3.23).
+-- Subsequent schema changes are applied by Rust migrations m0002+.
 
 CREATE TABLE "accounts" (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +60,6 @@ CREATE TABLE app_settings (
     language TEXT NOT NULL DEFAULT 'en'
 );
 
--- Seed the default app_settings row (originally from migration 0007).
 INSERT OR IGNORE INTO app_settings (theme_mode) VALUES ('system');
 
 CREATE TABLE group_information (
@@ -168,7 +165,7 @@ CREATE TABLE aggregated_messages (
 CREATE INDEX idx_aggregated_messages_message_id ON aggregated_messages(message_id);
 CREATE INDEX idx_aggregated_messages_group ON aggregated_messages(mls_group_id, created_at);
 CREATE INDEX idx_aggregated_messages_kind_group
-    ON aggregated_messages(kind, mls_group_id, created_at DESC, message_id DESC);
+    ON aggregated_messages(kind, mls_group_id, created_at);
 
 CREATE TABLE accounts_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,10 +181,6 @@ CREATE TABLE accounts_groups (
     pin_order INTEGER DEFAULT NULL,
     dm_peer_pubkey TEXT DEFAULT NULL,
     archived_at INTEGER DEFAULT NULL,
-    removed_at INTEGER DEFAULT NULL,
-    muted_until INTEGER DEFAULT NULL,
-    self_removed INTEGER NOT NULL DEFAULT 0 CHECK (self_removed IN (0, 1)),
-    chat_cleared_at INTEGER DEFAULT NULL,
     FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE,
     UNIQUE(account_pubkey, mls_group_id)
 );
@@ -258,6 +251,19 @@ CREATE INDEX idx_cached_graph_users_metadata_updated_at ON cached_graph_users(me
 CREATE INDEX idx_cached_graph_users_follows_updated_at ON cached_graph_users(follows_updated_at);
 CREATE INDEX idx_cached_graph_users_metadata_expires_at ON cached_graph_users(metadata_expires_at);
 
+CREATE TABLE message_delivery_status (
+    message_id   TEXT NOT NULL,
+    mls_group_id BLOB NOT NULL,
+    status       TEXT NOT NULL,
+    PRIMARY KEY (message_id, mls_group_id),
+    FOREIGN KEY (message_id, mls_group_id)
+        REFERENCES aggregated_messages(message_id, mls_group_id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_mds_group_status
+    ON message_delivery_status (mls_group_id, status);
+
 CREATE TABLE relay_status (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     relay_url TEXT NOT NULL,
@@ -306,62 +312,3 @@ CREATE INDEX idx_relay_events_scope_time
     ON relay_events (relay_url, plane, account_pubkey, occurred_at DESC);
 CREATE INDEX idx_relay_events_kind_time
     ON relay_events (telemetry_kind, occurred_at DESC);
-
-CREATE TABLE push_registrations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_pubkey TEXT NOT NULL,
-    platform TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
-    raw_token TEXT NOT NULL CHECK (
-        length(trim(raw_token, ' ' || char(9) || char(10) || char(13))) > 0
-    ),
-    server_pubkey TEXT NOT NULL,
-    relay_hint TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    last_shared_at INTEGER,
-    FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE
-);
-
-CREATE UNIQUE INDEX idx_push_registrations_account_pubkey
-    ON push_registrations(account_pubkey);
-CREATE INDEX idx_push_registrations_server_pubkey
-    ON push_registrations(server_pubkey);
-
-CREATE TABLE group_push_tokens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account_pubkey TEXT NOT NULL,
-    mls_group_id BLOB NOT NULL,
-    member_pubkey TEXT NOT NULL,
-    leaf_index INTEGER NOT NULL CHECK (leaf_index >= 0),
-    server_pubkey TEXT NOT NULL,
-    relay_hint TEXT,
-    encrypted_token TEXT NOT NULL CHECK (
-        length(trim(encrypted_token, ' ' || char(9) || char(10) || char(13))) > 0
-    ),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE
-);
-
-CREATE UNIQUE INDEX idx_group_push_tokens_account_group_leaf
-    ON group_push_tokens(account_pubkey, mls_group_id, leaf_index);
-CREATE INDEX idx_group_push_tokens_account_group
-    ON group_push_tokens(account_pubkey, mls_group_id);
-CREATE INDEX idx_group_push_tokens_account_group_member
-    ON group_push_tokens(account_pubkey, mls_group_id, member_pubkey);
-CREATE INDEX idx_group_push_tokens_account_server
-    ON group_push_tokens(account_pubkey, server_pubkey);
-
-CREATE TABLE message_delivery_status (
-    message_id      TEXT NOT NULL,
-    mls_group_id    BLOB NOT NULL,
-    account_pubkey  TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    PRIMARY KEY (message_id, mls_group_id, account_pubkey),
-    FOREIGN KEY (message_id, mls_group_id)
-        REFERENCES aggregated_messages(message_id, mls_group_id)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX idx_mds_group_account_status
-    ON message_delivery_status (mls_group_id, account_pubkey, status);
