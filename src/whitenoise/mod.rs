@@ -38,7 +38,14 @@ pub mod group_information;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
-#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "linux", target_os = "android"),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    )
+))]
 mod keyring_store;
 pub mod media_files;
 pub mod message_aggregator;
