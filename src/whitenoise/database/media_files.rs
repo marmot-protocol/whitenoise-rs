@@ -198,6 +198,7 @@ impl MediaFile {
              INNER JOIN media_blobs b
                 ON b.encrypted_file_hash = r.encrypted_file_hash
              WHERE r.encrypted_file_hash = ?
+             ORDER BY r.created_at ASC, r.id ASC
              LIMIT 1",
         )
         .bind(&encrypted_file_hash_hex)
@@ -252,7 +253,12 @@ impl MediaFile {
             "INSERT INTO media_blobs
                 (encrypted_file_hash, file_path, mime_type, blossom_url, created_at)
             VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (encrypted_file_hash) DO NOTHING",
+            ON CONFLICT (encrypted_file_hash) DO UPDATE SET
+                blossom_url = COALESCE(excluded.blossom_url, media_blobs.blossom_url),
+                file_path = CASE
+                    WHEN excluded.file_path != '' THEN excluded.file_path
+                    ELSE media_blobs.file_path
+                END",
         )
         .bind(&encrypted_file_hash_hex)
         .bind(file_path_str)
