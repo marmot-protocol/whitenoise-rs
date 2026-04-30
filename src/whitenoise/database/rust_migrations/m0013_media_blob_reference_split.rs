@@ -39,6 +39,16 @@ impl GlobalMigration for Migration {
         .await?;
 
         // 2. Create account-scoped media reference table.
+        //
+        //    Logically this belongs in the per-account database, but
+        //    AccountDatabase is not wired into production init yet (Phase 18a).
+        //    All production queries JOIN media_references with media_blobs on
+        //    a single pool, so the table must live on shared until the
+        //    account-DB wiring lands (Phase 18c+). At that point a local
+        //    migration extracts it and a follow-up global drops it from shared.
+        //
+        //    The FK to media_blobs is omitted: once this table moves to the
+        //    account DB the FK would be cross-database and unenforced anyway.
         sqlx::query(
             "CREATE TABLE media_references (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,9 +62,7 @@ impl GlobalMigration for Migration {
                 nonce               TEXT,
                 scheme_version      TEXT,
                 created_at          INTEGER NOT NULL,
-                UNIQUE(mls_group_id, encrypted_file_hash, account_pubkey),
-                FOREIGN KEY (encrypted_file_hash)
-                    REFERENCES media_blobs(encrypted_file_hash)
+                UNIQUE(mls_group_id, encrypted_file_hash, account_pubkey)
             )",
         )
         .execute(&mut *tx)
@@ -130,11 +138,6 @@ impl GlobalMigration for Migration {
         )
         .execute(&mut *tx)
         .await?;
-
-        // 5. Drop old table and its indexes.
-        sqlx::query("DROP TABLE media_files")
-            .execute(&mut *tx)
-            .await?;
 
         Ok(())
     }
@@ -237,15 +240,6 @@ mod tests {
         let split_only = Migrator::new(vec![Box::new(Migration)], vec![]);
         split_only.run(&pool, None).await.unwrap();
 
-        // media_files should be gone.
-        let tables: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(tables.is_empty(), "media_files should be dropped");
-
         // media_blobs: 2 rows (deduplicated by hash).
         let blob_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_blobs")
             .fetch_one(&pool)
@@ -293,5 +287,17 @@ mod tests {
         .unwrap();
         let accounts: Vec<&str> = shared_refs.iter().map(|(a,)| a.as_str()).collect();
         assert_eq!(accounts, vec![acct_a.as_str(), acct_b.as_str()]);
+
+        // media_files should still exist (dropped in a future migration).
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !tables.is_empty(),
+            "media_files should still exist after m0013"
+        );
     }
 }
