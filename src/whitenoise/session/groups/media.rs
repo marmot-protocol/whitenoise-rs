@@ -315,19 +315,18 @@ impl<'a> MediaOps<'a> {
         let hash_hex = hex::encode(prepared.encrypted_hash);
         let cached_filename = format!("{}.{}", hash_hex, media_detection.extension());
 
-        let file_metadata = if prepared.dimensions.is_some()
-            || prepared.blurhash.is_some()
-            || prepared.thumbhash.is_some()
-        {
-            Some(FileMetadata {
-                original_filename: Some(prepared.filename.clone()),
-                dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
-                blurhash: prepared.blurhash.clone(),
-                thumbhash: prepared.thumbhash.clone(),
-            })
-        } else {
-            None
-        };
+        // MIP-04 always carries a filename, and the receiver needs it on the
+        // download side to derive the same encryption parameters. Always
+        // persist FileMetadata so MIP-04 decryption has the basename even when
+        // dimensions/blurhash/thumbhash aren't extracted (e.g. minimal video
+        // fixtures without parsed dimensions). Mirrors `store_media_references`,
+        // which always populates the metadata.
+        let file_metadata = Some(FileMetadata {
+            original_filename: Some(prepared.filename.clone()),
+            dimensions: prepared.dimensions.map(|(w, h)| format!("{}x{}", w, h)),
+            blurhash: prepared.blurhash.clone(),
+            thumbhash: prepared.thumbhash.clone(),
+        });
 
         let upload = MediaFileUpload {
             data: &file_data,
