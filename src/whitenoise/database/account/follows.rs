@@ -65,7 +65,18 @@ impl AccountFollowsRepo {
         if pubkeys.is_empty() {
             return Ok(Vec::new());
         }
-        User::find_by_pubkeys(&pubkeys, &self.shared_db).await
+        let users = User::find_by_pubkeys(&pubkeys, &self.shared_db).await?;
+        if users.len() < pubkeys.len() {
+            tracing::debug!(
+                target: "whitenoise::database::account::follows",
+                followed = pubkeys.len(),
+                resolved = users.len(),
+                missing = pubkeys.len() - users.len(),
+                "Some followed pubkeys have no User row yet (metadata not fetched); \
+                 use follow_pubkeys() for the full follow set"
+            );
+        }
+        Ok(users)
     }
 
     /// Return whether this account follows `target_pubkey`.

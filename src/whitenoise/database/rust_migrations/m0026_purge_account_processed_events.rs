@@ -18,10 +18,11 @@ impl GlobalMigration for Migration {
 
     /// `processed_events` keeps NULL-scoped rows in the shared DB; only the
     /// account-scoped rows have been moved out by v19. This deletion runs
-    /// after every account on disk has applied v19 locally (the unified
-    /// timeline guarantees v19 < v26 ordering, and the boot-time second pass
-    /// of the migrator ensures it doesn't fire ahead of locals for accounts
-    /// that have never logged in).
+    /// after every account on disk has applied v19 locally — the unified
+    /// timeline guarantees v19 < v26 ordering, and `MIGRATOR.run_all` at
+    /// boot (driven by `Whitenoise::enumerate_account_pools`) walks every
+    /// per-account file in lockstep with shared so v26 cannot fire ahead
+    /// of v19 for any account, including ones that have never logged in.
     async fn run_global(&self, tx: &mut SqliteConnection) -> Result<(), DatabaseError> {
         let table_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
