@@ -121,7 +121,18 @@ async fn cleanup_consumed_key_packages(
     whitenoise: &Whitenoise,
     account: &Account,
 ) -> Result<usize, WhitenoiseError> {
-    let session = whitenoise.require_session(&account.pubkey)?;
+    // Skip dormant accounts: cleanup reads/writes the per-account DB via
+    // the session, so an account with no active session has nothing to
+    // clean up this tick. Returning Ok(0) instead of erroring keeps the
+    // scheduler quiet.
+    let Some(session) = whitenoise.session(&account.pubkey) else {
+        tracing::debug!(
+            target: "whitenoise::scheduler::consumed_kp_cleanup",
+            "Account {} has no active session, skipping",
+            account.pubkey.to_hex()
+        );
+        return Ok(0);
+    };
     let eligible = session
         .repos
         .published_key_packages

@@ -35,8 +35,14 @@ where
         let event_id_hex: String = row.try_get("event_id")?;
 
         // `account_pubkey` is only present in the shared schema. Per-account
-        // rows decode it as `None`.
-        let account_pubkey_hex: Option<String> = row.try_get("account_pubkey").unwrap_or(None);
+        // rows have no such column, so swallow `ColumnNotFound` as `None`;
+        // propagate any other error so corrupt rows don't get silently
+        // re-cast as global-scoped events.
+        let account_pubkey_hex: Option<String> = match row.try_get("account_pubkey") {
+            Ok(val) => val,
+            Err(sqlx::Error::ColumnNotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
 
         let event_id =
             EventId::from_hex(&event_id_hex).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;

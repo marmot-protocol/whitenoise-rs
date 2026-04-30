@@ -1,11 +1,13 @@
-//! Per-account database wrapper — future home of the account-scoped SQLite file.
+//! Per-account database wrapper — owns the account-scoped SQLite file.
 //!
-//! This is a scaffold for the Phase 18 database split. See
-//! `docs/session-projection-implementation-plan.md` for the full table
-//! ownership audit and migration plan.
+//! See `docs/session-projection-implementation-plan.md` for the full table
+//! ownership audit and the per-phase migration plan.
 //!
-//! **Current status:** thin newtype over [`Database`]. No tables have moved
-//! yet; the physical split happens in Phases 18b–18e.
+//! **Current status (Phase 18c shipped):** physically separate file per
+//! account holding `account_settings`, `drafts`, `published_key_packages`,
+//! `published_events`, `account_follows`, and the account-scoped subset of
+//! `processed_events`. Phase 18d will move membership and push tables;
+//! 18e moves message projections.
 
 use std::path::PathBuf;
 

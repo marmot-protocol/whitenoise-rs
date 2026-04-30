@@ -292,10 +292,7 @@ mod tests {
     use nostr_sdk::prelude::*;
 
     use crate::whitenoise::{
-        accounts::{Account, AccountType},
-        database::processed_events::ProcessedEvent,
-        test_utils::*,
-        utils::timestamp_to_datetime,
+        database::processed_events::ProcessedEvent, test_utils::*, utils::timestamp_to_datetime,
     };
 
     /// Helper to build a contact list event (Kind 3) with specified contacts
@@ -549,38 +546,34 @@ mod tests {
         assert_eq!(follows2[0].pubkey, contact2);
     }
 
-    /// Verifies that an Account with `id: None` still triggers an error even
-    /// when a valid session exists. The handler checks `account.id` early and
-    /// returns `AccountNotFound` before doing any work.
+    /// Verifies the cross-account write guard: passing an `Account` whose
+    /// pubkey differs from the supplied `session.account_pubkey` must error
+    /// before any write. Phase 18c moved follow storage into the per-account
+    /// DB owned by the session, so a mis-wired caller mixing account A's
+    /// record with B's session would otherwise silently write A's follows
+    /// into B's file. Replaces the old `id: None` guard test (the early
+    /// `account.id` check was removed in Phase 18c when integer FKs went
+    /// away).
     #[tokio::test]
-    async fn test_handle_contact_list_requires_saved_account() {
+    async fn test_handle_contact_list_rejects_account_session_pubkey_mismatch() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
-        // Create a real identity (which has a session) then fabricate an
-        // Account struct with id: None to simulate the unsaved-account path.
-        let real_account = whitenoise.create_identity().await.unwrap();
-        let session = whitenoise.require_session(&real_account.pubkey).unwrap();
+        let account_a = whitenoise.create_identity().await.unwrap();
+        let account_b = whitenoise.create_identity().await.unwrap();
+        let session_b = whitenoise.require_session(&account_b.pubkey).unwrap();
 
-        let unsaved_account = Account {
-            id: None,
-            pubkey: real_account.pubkey,
-            user_id: 0,
-            account_type: AccountType::Local,
-            last_synced_at: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-
-        let keys = whitenoise
+        let keys_a = whitenoise
             .shared
             .secrets_store
-            .get_nostr_keys_for_pubkey(&real_account.pubkey)
+            .get_nostr_keys_for_pubkey(&account_a.pubkey)
             .unwrap();
-        let event = build_contact_list_event(&keys, &[Keys::generate().public_key()], None).await;
+        let event = build_contact_list_event(&keys_a, &[Keys::generate().public_key()], None).await;
 
+        // account_a paired with session_b — guard in update_follows_from_event
+        // should reject before any per-account write.
         assert!(
             whitenoise
-                .handle_contact_list(&session, &unsaved_account, event)
+                .handle_contact_list(&session_b, &account_a, event)
                 .await
                 .is_err()
         );
