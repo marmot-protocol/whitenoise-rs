@@ -101,12 +101,16 @@ impl AccountDatabase {
     /// file, but the freshness check on local-version space — not raw row
     /// presence — keeps the behaviour correct across the transition.
     pub async fn run_account_migrations(&self, shared: &SqlitePool) -> Result<(), DatabaseError> {
+        let pubkey_hex = self.account_pubkey.to_hex();
         rust_migrations::MIGRATOR
-            .run(
-                shared,
-                Some((&self.inner.pool, self.account_pubkey.to_hex().as_str())),
-            )
-            .await
+            .run(shared, Some((&self.inner.pool, pubkey_hex.as_str())))
+            .await?;
+        tracing::info!(
+            target: "whitenoise::database::account_db",
+            account = %pubkey_hex,
+            "Per-account migrations applied"
+        );
+        Ok(())
     }
 }
 

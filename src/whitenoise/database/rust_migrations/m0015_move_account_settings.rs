@@ -37,13 +37,26 @@ impl LocalMigration for Migration {
 
         // Copy this account's row from shared DB, if any. Tolerant of missing
         // shared.account_settings (fresh install, or table already dropped by
-        // the post-local cleanup migration).
+        // the post-local cleanup migration). If the source table is missing
+        // because v21 dropped it before this v15 ran for the current account
+        // (a sequencing bug — `MIGRATOR.run_all` at boot is supposed to make
+        // this impossible), log a warn so the data loss isn't silent.
         let shared_table_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
              WHERE type='table' AND name='account_settings')",
         )
         .fetch_one(global_db)
         .await?;
+
+        if !shared_table_exists {
+            tracing::warn!(
+                target: "whitenoise::database::rust_migrations::m0015",
+                account = account_pubkey,
+                "shared.account_settings is missing; skipping local copy. \
+                 Expected only on fresh installs or when v21 already dropped \
+                 the table — flag this if it appears for an upgrading account."
+            );
+        }
 
         if shared_table_exists {
             let row: Option<(i64, i64, i64)> = sqlx::query_as(

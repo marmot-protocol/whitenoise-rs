@@ -49,6 +49,11 @@ impl LocalMigration for Migration {
         .await?;
 
         if !shared_table_exists {
+            tracing::warn!(
+                target: "whitenoise::database::rust_migrations::m0018",
+                account = account_pubkey,
+                "shared.published_events is missing; skipping local copy"
+            );
             return Ok(());
         }
 
