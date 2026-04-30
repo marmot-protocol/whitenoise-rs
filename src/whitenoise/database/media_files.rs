@@ -416,8 +416,13 @@ impl MediaFile {
     /// Updates the file_path for an existing media file record
     ///
     /// This method is called after downloading and caching a media file to update
-    /// the database record with the local file path. It performs an atomic update
-    /// and returns the complete updated record.
+    /// the database record with the local file path.
+    ///
+    /// NOTE: This mutates the shared `media_blobs` row, which affects every
+    /// account referencing the same `encrypted_file_hash`. This is correct
+    /// while all accounts share a single `media_cache` directory. If Phase 18c
+    /// introduces per-account storage directories, this assumption must be
+    /// revisited.
     ///
     /// # Arguments
     /// * `database` - The database connection
@@ -444,11 +449,13 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
+        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
+
         // Look up the encrypted_file_hash from the reference row.
         let hash: String =
             sqlx::query_scalar("SELECT encrypted_file_hash FROM media_references WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&database.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(DatabaseError::Sqlx)?
                 .ok_or_else(|| {
@@ -459,7 +466,7 @@ impl MediaFile {
         sqlx::query("UPDATE media_blobs SET file_path = ? WHERE encrypted_file_hash = ?")
             .bind(path_str)
             .bind(&hash)
-            .execute(&database.pool)
+            .execute(&mut *tx)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
@@ -475,9 +482,11 @@ impl MediaFile {
              WHERE r.id = ?",
         )
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(DatabaseError::Sqlx)?;
+
+        tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
         Ok(row)
     }
