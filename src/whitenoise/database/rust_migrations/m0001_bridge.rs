@@ -12,7 +12,7 @@ const EXPECTED_SQLX_VERSION: i64 = 37;
 
 /// Consolidated schema DDL for fresh installs (covers 0001-0037).
 /// Subsequent schema changes come from Rust migrations m0002+.
-const FRESH_SCHEMA_SQL: &str = include_str!("../fresh_schema.sql");
+const FRESH_SCHEMA_SQL: &str = include_str!("fresh_schema.sql");
 
 pub struct Migration;
 
@@ -108,8 +108,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::whitenoise::database::rust_migrations::GlobalMigrationRunner;
-    use crate::whitenoise::database::rust_migrations::global::all_global_migrations;
+    use crate::whitenoise::database::rust_migrations::{Migrator, all_global_migrations};
 
     async fn create_pool(dir: &TempDir, name: &str) -> SqlitePool {
         let path = dir.path().join(name);
@@ -148,8 +147,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pool = create_pool(&dir, "fresh.db").await;
 
-        let runner = GlobalMigrationRunner::new(vec![Box::new(Migration)]);
-        runner.run(&pool).await.unwrap();
+        let runner = Migrator::new(vec![Box::new(Migration)], vec![]);
+        runner.run(&pool, None).await.unwrap();
 
         // Verify core tables exist (spot-check across fresh_schema.sql).
         for table in &[
@@ -197,8 +196,8 @@ mod tests {
             .unwrap();
         seed_sqlx_migrations(&pool, EXPECTED_SQLX_VERSION).await;
 
-        let runner = GlobalMigrationRunner::new(vec![Box::new(Migration)]);
-        runner.run(&pool).await.unwrap();
+        let runner = Migrator::new(vec![Box::new(Migration)], vec![]);
+        runner.run(&pool, None).await.unwrap();
 
         // Bridge should pass through without error; no auto-stamps at version 37.
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
@@ -233,10 +232,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let pool = create_pool(&dir, "idempotent.db").await;
 
-        let runner = GlobalMigrationRunner::new(vec![Box::new(Migration)]);
+        let runner = Migrator::new(vec![Box::new(Migration)], vec![]);
 
-        runner.run(&pool).await.unwrap();
-        runner.run(&pool).await.unwrap();
+        runner.run(&pool, None).await.unwrap();
+        runner.run(&pool, None).await.unwrap();
 
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
             .fetch_one(&pool)
@@ -303,8 +302,8 @@ mod tests {
         .unwrap();
 
         // Run the full migration framework.
-        let runner = GlobalMigrationRunner::new(all_global_migrations());
-        runner.run(&pool).await.unwrap();
+        let runner = Migrator::new(all_global_migrations(), vec![]);
+        runner.run(&pool, None).await.unwrap();
 
         // Bridge (v1) + auto-stamped v2-v10 + actually-ran v11 = 11 total.
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
@@ -355,8 +354,8 @@ mod tests {
         seed_sqlx_migrations(&pool, 37).await;
 
         // Run full framework — all conversions should execute, none stamped.
-        let runner = GlobalMigrationRunner::new(all_global_migrations());
-        runner.run(&pool).await.unwrap();
+        let runner = Migrator::new(all_global_migrations(), vec![]);
+        runner.run(&pool, None).await.unwrap();
 
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
             .fetch_one(&pool)
@@ -423,8 +422,8 @@ mod tests {
         .await
         .unwrap();
 
-        let runner = GlobalMigrationRunner::new(all_global_migrations());
-        runner.run(&pool).await.unwrap();
+        let runner = Migrator::new(all_global_migrations(), vec![]);
+        runner.run(&pool, None).await.unwrap();
 
         // v2-v6 stamped (SQLx 38-42), v7-v11 executed.
         let stamped: Vec<(i64,)> = sqlx::query_as(

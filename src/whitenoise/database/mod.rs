@@ -122,9 +122,9 @@ impl Database {
         let pool = Self::create_connection_pool(&db_url).await?;
 
         // Run Rust migration framework (handles SQLx catch-up for existing installs).
-        rust_migrations::global::GLOBAL_RUST_MIGRATOR
-            .run(&pool)
-            .await?;
+        // Shared-only mode: locals are skipped here. Per-account migration
+        // wiring lands in Phase 18b+ along with physical account DB files.
+        rust_migrations::MIGRATOR.run(&pool, None).await?;
 
         Ok(Self {
             pool,
@@ -186,9 +186,7 @@ impl Database {
     /// This method is idempotent - it's safe to call multiple times.
     /// Only new migrations will be applied.
     pub async fn migrate_up(&self) -> Result<(), DatabaseError> {
-        rust_migrations::global::GLOBAL_RUST_MIGRATOR
-            .run(&self.pool)
-            .await?;
+        rust_migrations::MIGRATOR.run(&self.pool, None).await?;
         Ok(())
     }
 
