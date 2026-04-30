@@ -27,7 +27,7 @@ impl LocalMigration for Migration {
             "CREATE TABLE IF NOT EXISTS published_events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id    TEXT NOT NULL UNIQUE
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
@@ -104,7 +104,7 @@ mod tests {
             "CREATE TABLE published_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 account_pubkey TEXT NOT NULL,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(event_id, account_pubkey)

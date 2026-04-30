@@ -139,6 +139,18 @@ fn summarize_maintenance_results(results: Vec<MaintenanceResult>) -> Maintenance
 #[allow(deprecated)]
 #[perf_instrument("scheduled::key_package_maintenance")]
 async fn maintain_key_packages(whitenoise: &Whitenoise, account: &Account) -> MaintenanceResult {
+    // Skip dormant accounts: maintenance reads/writes the per-account DB via
+    // the session, so an account with no active session has nothing for the
+    // scheduler to do this tick.
+    if whitenoise.session(&account.pubkey).is_none() {
+        tracing::debug!(
+            target: "whitenoise::scheduler::key_package_maintenance",
+            "Account {} has no active session, skipping",
+            account.pubkey.to_hex()
+        );
+        return MaintenanceResult::Skipped;
+    }
+
     let packages = match whitenoise.fetch_all_key_packages_for_account(account).await {
         Ok(packages) => packages,
         Err(WhitenoiseError::AccountMissingKeyPackageRelays) => {

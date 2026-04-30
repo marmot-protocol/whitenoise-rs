@@ -683,6 +683,16 @@ impl Whitenoise {
             .flatten();
         let new_token_tag = pending_registration.token_tag()?;
 
+        // Validate the session and notification preference BEFORE persisting
+        // the upsert. If the session lookup fails, we don't want a stale
+        // push_registrations row to outlive the missing session.
+        let notifications_enabled = self
+            .require_session(&account.pubkey)?
+            .repos
+            .settings
+            .notifications_enabled()
+            .await?;
+
         let registration = PushRegistration::upsert(
             &account.pubkey,
             platform,
@@ -692,13 +702,6 @@ impl Whitenoise {
             &self.shared.database,
         )
         .await?;
-
-        let notifications_enabled = self
-            .require_session(&account.pubkey)?
-            .repos
-            .settings
-            .notifications_enabled()
-            .await?;
 
         if previous_token_tag.is_some() && new_token_tag.is_none() {
             if let Err(error) = self

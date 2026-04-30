@@ -21,7 +21,7 @@ impl GlobalMigration for Migration {
             "CREATE TABLE processed_events_new (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id            TEXT NOT NULL
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 account_pubkey      TEXT,
                 created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 event_created_at    INTEGER DEFAULT NULL,
@@ -125,7 +125,7 @@ mod tests {
              CREATE TABLE processed_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 account_id INTEGER,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 event_created_at INTEGER DEFAULT NULL,

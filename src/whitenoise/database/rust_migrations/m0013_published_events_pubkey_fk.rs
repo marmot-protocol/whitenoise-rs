@@ -21,7 +21,7 @@ impl GlobalMigration for Migration {
             "CREATE TABLE published_events_new (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id        TEXT NOT NULL
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 account_pubkey  TEXT NOT NULL,
                 created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (account_pubkey) REFERENCES accounts(pubkey) ON DELETE CASCADE,
@@ -93,7 +93,7 @@ mod tests {
              CREATE TABLE published_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL
-                    CHECK (length(event_id) = 64 AND event_id GLOB '[0-9a-fA-F]*'),
+                    CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
                 account_id INTEGER NOT NULL,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,

@@ -607,30 +607,41 @@ impl Whitenoise {
 
         // Restore account sessions for all persisted accounts before setting up
         // subscriptions so that each account has an MDK instance ready.
-        whitenoise
+        let restore_outcome = whitenoise
             .account_manager
             .restore_sessions(&whitenoise)
             .await;
 
-        // Re-run the unified migrator on the shared DB AFTER session restore.
+        // Re-run the unified migrator on the shared DB AFTER session restore —
+        // but only when every persisted account restored successfully.
+        //
         // `Database::new` already ran globals once at boot (before sessions
         // existed), but any global drop migration whose data lives in a
         // per-account DB must NOT advance until every account on disk has
         // applied its corresponding local copy migration. Restoring sessions
         // opens each per-account DB and runs its locals; this second pass on
         // the shared DB then commits drops/purges that became eligible.
-        // For accounts that never log in: their per-account file is created on
-        // first session bring-up, so their local copy still runs before any
-        // global drop sees their data — but we re-run here defensively to
-        // catch globals queued behind locals applied during this session
-        // restore.
-        if let Err(error) = crate::whitenoise::database::rust_migrations::MIGRATOR
-            .run(&whitenoise.shared.database.pool, None)
-            .await
-        {
-            tracing::error!(
+        //
+        // If any account failed to restore, its locals never ran. Firing the
+        // drop globals now would permanently delete the rows still in shared
+        // for that account. Defer to the next boot — the data stays safe in
+        // shared.sqlite until every account migrates cleanly.
+        if restore_outcome.all_succeeded() {
+            if let Err(error) = crate::whitenoise::database::rust_migrations::MIGRATOR
+                .run(&whitenoise.shared.database.pool, None)
+                .await
+            {
+                tracing::error!(
+                    target: "whitenoise::new",
+                    "Post-restore migrator pass failed: {error}"
+                );
+            }
+        } else {
+            tracing::warn!(
                 target: "whitenoise::new",
-                "Post-restore migrator pass failed: {error}"
+                "{} account(s) failed to restore; skipping post-restore migrator pass to \
+                 prevent data loss. Drops will retry on the next successful boot.",
+                restore_outcome.err_count()
             );
         }
 
@@ -1323,9 +1334,11 @@ pub mod test_utils {
             .unwrap()
             .expect("member should have group after welcome")
             .name;
+        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
         Whitenoise::finalize_welcome_with_instance(
             whitenoise,
             member_account,
+            &member_session,
             &group_id,
             &group_name,
             EventId::all_zeros(),

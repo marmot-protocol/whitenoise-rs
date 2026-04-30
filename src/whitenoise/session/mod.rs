@@ -571,7 +571,14 @@ impl AccountManager {
     ///
     /// External-signer accounts get `signer: None` until re-registered.
     /// Local accounts load their signer from the secrets store.
-    pub async fn restore_sessions(&self, wn: &Arc<Whitenoise>) {
+    ///
+    /// Returns the number of accounts that failed to restore. Callers that
+    /// gate post-restore migrations on full success (e.g. the
+    /// `MIGRATOR.run(&shared, None)` second pass that commits per-account
+    /// drop migrations) should skip those operations when this is non-zero,
+    /// because failed restores mean some local copy migrations did not run
+    /// and dropping the corresponding shared rows would lose data.
+    pub async fn restore_sessions(&self, wn: &Arc<Whitenoise>) -> RestoreSessionsOutcome {
         let accounts = match Account::all(&wn.shared.database).await {
             Ok(accounts) => accounts,
             Err(e) => {
@@ -580,7 +587,7 @@ impl AccountManager {
                     "Failed to load accounts for session restore: {}",
                     e
                 );
-                return;
+                return RestoreSessionsOutcome::AccountListFailed;
             }
         };
 
@@ -611,6 +618,38 @@ impl AccountManager {
             ok_count,
             err_count,
         );
+
+        RestoreSessionsOutcome::Completed {
+            ok_count,
+            err_count,
+        }
+    }
+}
+
+/// Outcome of [`AccountManager::restore_sessions`]. Used by
+/// `Whitenoise::new` to decide whether the post-restore migrator pass is
+/// safe to fire (it is not when any account failed to copy out of shared).
+#[derive(Debug, Clone, Copy)]
+pub enum RestoreSessionsOutcome {
+    /// `Account::all` failed before any sessions were attempted; treat as
+    /// "all accounts failed" for safety.
+    AccountListFailed,
+    /// Restore loop ran. `err_count == 0` means every persisted account is
+    /// now active and its locals have been applied.
+    Completed { ok_count: usize, err_count: usize },
+}
+
+impl RestoreSessionsOutcome {
+    /// True iff every persisted account restored successfully.
+    pub fn all_succeeded(&self) -> bool {
+        matches!(self, Self::Completed { err_count: 0, .. })
+    }
+
+    pub fn err_count(&self) -> usize {
+        match self {
+            Self::AccountListFailed => usize::MAX,
+            Self::Completed { err_count, .. } => *err_count,
+        }
     }
 }
 

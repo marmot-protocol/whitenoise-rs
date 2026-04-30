@@ -349,6 +349,14 @@ impl Whitenoise {
         relay_urls: &[RelayUrl],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
+        // Resolve the session up front. Tracking the published key package
+        // writes to the per-account DB, and if the session is missing
+        // (e.g. the user logged out mid-publish) we'd lose that tracking
+        // record while the relay-side publish still happened. Better to
+        // fail loud before any network publish than write to relays without
+        // a local audit trail.
+        let session = self.require_session(&account.pubkey)?;
+
         let canonical_event_id = self
             .publish_key_package_to_relays(
                 MLS_KEY_PACKAGE_KIND,
@@ -359,8 +367,8 @@ impl Whitenoise {
             )
             .await?;
 
-        self.track_published_key_package(
-            account,
+        Self::track_published_key_package(
+            &session,
             &key_package_data.hash_ref,
             &canonical_event_id,
             MLS_KEY_PACKAGE_KIND,
@@ -379,8 +387,8 @@ impl Whitenoise {
             .await
         {
             Ok(legacy_event_id) => {
-                self.track_published_key_package(
-                    account,
+                Self::track_published_key_package(
+                    &session,
                     &key_package_data.hash_ref,
                     &legacy_event_id,
                     MLS_KEY_PACKAGE_KIND_LEGACY,
@@ -439,22 +447,17 @@ impl Whitenoise {
     }
 
     /// Records a successfully published key package in the lifecycle tracking table.
+    ///
+    /// Caller resolves the session beforehand so this can't lose a tracking
+    /// record because the session went away between publish and track.
     #[perf_instrument("key_packages")]
     async fn track_published_key_package(
-        &self,
-        account: &Account,
+        session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
         hash_ref: &[u8],
         event_id: &EventId,
         kind: Kind,
         d_tag: Option<&str>,
     ) {
-        let Some(session) = self.session(&account.pubkey) else {
-            tracing::warn!(
-                target: "whitenoise::key_packages",
-                "Published key package but no session found for account, cannot track it"
-            );
-            return;
-        };
         if let Err(e) = session
             .repos
             .published_key_packages

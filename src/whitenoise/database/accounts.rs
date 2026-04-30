@@ -178,6 +178,14 @@ impl Account {
         session: &crate::whitenoise::session::AccountSession,
         database: &Database,
     ) -> Result<Vec<nostr_sdk::PublicKey>, WhitenoiseError> {
+        // Reject cross-account writes: the per-account DB write goes through
+        // `session.repos.follows`, so the session's pubkey must match the
+        // Account this method was called on. Catching this here prevents a
+        // mis-wired caller from quietly writing follows into the wrong file.
+        if self.pubkey != session.account_pubkey {
+            return Err(WhitenoiseError::InvalidPublicKey);
+        }
+
         // Deduplicate contacts.
         let unique_contacts: Vec<_> = contacts
             .into_iter()
@@ -195,7 +203,11 @@ impl Account {
             let (_user, newly_created) = User::find_or_create_by_pubkey_tx(pubkey, &mut tx).await?;
             if newly_created {
                 newly_created_users.push(*pubkey);
-                tracing::debug!("Created new user for follow: {}", pubkey.to_hex());
+                tracing::debug!(
+                    target: "whitenoise::database::accounts",
+                    "Created new user for follow: {}",
+                    pubkey.to_hex()
+                );
             }
         }
         tx.commit().await.map_err(DatabaseError::Sqlx)?;
