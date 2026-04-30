@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::whitenoise::{
     Whitenoise, WhitenoiseConfig,
-    account_settings::AccountSettings,
     accounts::Account,
     accounts_groups::AccountGroup,
     database::Database,
@@ -694,11 +693,12 @@ impl Whitenoise {
         )
         .await?;
 
-        let notifications_enabled = AccountSettings::notifications_enabled_for_pubkey(
-            &account.pubkey,
-            &self.shared.database,
-        )
-        .await?;
+        let notifications_enabled = self
+            .require_session(&account.pubkey)?
+            .repos
+            .settings
+            .notifications_enabled()
+            .await?;
 
         if previous_token_tag.is_some() && new_token_tag.is_none() {
             if let Err(error) = self
@@ -1588,6 +1588,7 @@ mod tests {
             whitenoise.shared.database.clone(),
             whitenoise.event_sender.clone(),
             whitenoise.shared.relay_control.observability().clone(),
+            whitenoise.shared.event_tracker.clone(),
         )
     }
 

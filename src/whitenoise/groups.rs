@@ -543,6 +543,7 @@ mod tests {
         let creator_account = whitenoise.create_identity().await.unwrap();
 
         // Setup member accounts
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let mut member_pubkeys = Vec::new();
         for _ in 0..2 {
             let member_account = whitenoise.create_identity().await.unwrap();
@@ -550,8 +551,10 @@ mod tests {
                 User::find_by_pubkey(&member_account.pubkey, &whitenoise.shared.database)
                     .await
                     .unwrap();
-            creator_account
-                .follow_user(&member_user, &whitenoise.shared.database)
+            creator_session
+                .repos
+                .follows
+                .add(&member_user)
                 .await
                 .unwrap();
             member_pubkeys.push(member_account.pubkey);

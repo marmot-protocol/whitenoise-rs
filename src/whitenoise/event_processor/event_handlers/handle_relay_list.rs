@@ -15,13 +15,10 @@ use crate::{
 impl Whitenoise {
     #[perf_instrument("event_handlers")]
     pub async fn handle_relay_list(&self, event: Event) -> Result<()> {
-        // Check if we've already processed this specific event from this author
-        let already_processed = ProcessedEvent::exists(
-            &event.id,
-            None, // Global events (relay lists)
-            &self.shared.database,
-        )
-        .await?;
+        // Check if we've already processed this specific event from this author.
+        // Relay-list events are global-scoped (any user, not bound to an account).
+        let already_processed =
+            ProcessedEvent::exists_global(&event.id, &self.shared.database).await?;
 
         if already_processed {
             tracing::debug!(
@@ -47,10 +44,10 @@ impl Whitenoise {
             self.handle_subscriptions_refresh(&user, &event).await;
         }
 
-        // Track this processed event
-        ProcessedEvent::create(
+        // Track this processed event (global scope — relay-list events are not
+        // bound to an account).
+        ProcessedEvent::create_global(
             &event.id,
-            None, // Global events (relay lists)
             event_created_at,
             Some(event.kind),
             Some(&event.pubkey),
@@ -159,7 +156,7 @@ mod tests {
         whitenoise.handle_relay_list(event.clone()).await.unwrap();
 
         // Event should be recorded exactly once
-        let processed = ProcessedEvent::exists(&event.id, None, &whitenoise.shared.database)
+        let processed = ProcessedEvent::exists_global(&event.id, &whitenoise.shared.database)
             .await
             .unwrap();
         assert!(processed);

@@ -530,21 +530,84 @@ shared blobs intact when still referenced.
 
 ### Phase 18c: Move simple account tables to account DB (~800 LOC)
 
-- [ ] Not started
+- [x] Completed
 
 <details>
 <summary>Details</summary>
 
-Move tables with limited cross-table behavior first:
-- `account_settings`
-- `account_follows`
-- `drafts`
-- `published_key_packages`
-- `published_events`
-- account-scoped `processed_events`
+Six tables moved out of shared into per-account DB files. Migration timeline:
 
-Repos switch from `Arc<Database>` to `Arc<AccountDatabase>`. Drop `account_pubkey` columns where the DB file is the
-scope.
+| v   | Kind   | Migration                                         |
+| --- | ------ | ------------------------------------------------- |
+| 13  | global | `published_events.account_id → account_pubkey`    |
+| 14  | global | `processed_events.account_id → account_pubkey`    |
+| 15  | local  | move `account_settings`                           |
+| 16  | local  | move `drafts`                                     |
+| 17  | local  | move `published_key_packages`                     |
+| 18  | local  | move `published_events`                           |
+| 19  | local  | move account-scoped `processed_events`            |
+| 20  | local  | move `account_follows`                            |
+| 21  | global | drop shared `account_settings`                    |
+| 22  | global | drop shared `drafts`                              |
+| 23  | global | drop shared `published_key_packages`              |
+| 24  | global | drop shared `published_events`                    |
+| 25  | global | drop shared `account_follows`                     |
+| 26  | global | purge account-scoped rows from `processed_events` |
+
+**Unified-timeline ordering.** Globals and locals share one version space.
+`Migrator::run` walks them in version order, so a "global drop" at v21 is
+guaranteed to run only after the corresponding v15 local copy has been
+applied for whichever account-DB pool is being migrated. Cross-scope races
+that the segregated-sequence design used to allow (drop ahead of copy) are
+prevented by construction — see
+`m0026_purge_account_processed_events.rs:run_global` doc and the Migrator
+docs in `rust_migrations/mod.rs`.
+
+**Deferred-drop guarantee for never-logged-in accounts.** `Database::new`
+runs globals on the shared pool at boot, before any per-account DB exists.
+For accounts that never log in after upgrade, the per-account file is
+created on first session bring-up and runs locals at that point. To stop a
+boot-time global drop from racing ahead of a still-pending local copy, the
+app re-runs `MIGRATOR.run(&shared.pool, None)` once `restore_sessions`
+returns (see `Whitenoise::new` in `src/whitenoise/mod.rs`). For accounts
+that never log in *and* never had data in the moved tables, the drop is
+safe — there's nothing to lose. For accounts that had data and never log
+in: it stays in shared until the account either logs in (running its
+locals first) or the account row is removed entirely.
+
+**`account_follows` schema simplification.** Old: `(account_id INT FK,
+user_id INT FK)` joining shared `users` to recover the followed pubkey.
+New: `(pubkey TEXT PRIMARY KEY, created_at INT, updated_at INT)` — store
+the followed pubkey directly. No FK to shared `users`; richer views resolve
+pubkeys to `User` rows in shared on demand via
+`User::find_by_pubkeys`. Follow lists rarely exceed 1000 entries, so a
+two-step pubkey-then-batch-resolve is fine.
+
+**Event tracker rerouting.** `WhitenoiseEventTracker` now holds
+`Weak<Whitenoise>` so account-scoped ops (`track_published_event`,
+`track_processed_account_event`, etc.) look up the publisher's session and
+write to its `account_db`. `EventTracker::global_published_event` iterates
+every active session's per-account DB (1–3 accounts in practice; cost is
+negligible) since shared no longer carries a global index of all
+publications.
+
+**Repos and ops.**
+
+- `src/whitenoise/database/account/follows.rs` — `AccountFollowsRepo` now
+  wraps `Arc<AccountDatabase>` + `Arc<Database>`. Methods: `follow_pubkeys`,
+  `all`, `is_following`, `add` / `add_pubkey`, `remove` / `remove_pubkey`,
+  `replace_all`.
+- `src/whitenoise/database/published_events.rs` — `PublishedEvent::create` /
+  `exists` take `&AccountDatabase` (no pubkey arg).
+- `src/whitenoise/database/processed_events.rs` — split into
+  `create_global` / `exists_global` / `newest_global_event_timestamp_for_kind`
+  / `newest_relay_event_timestamp` (shared DB) and `create_for_account` /
+  `exists_for_account` / `newest_contact_list_timestamp` (per-account DB).
+
+**Removed APIs.** `Account::follows`, `is_following_user`, `follow_user`,
+`unfollow_user` deleted (callers migrated to `session.repos.follows.*` /
+`session.social()`). `Account::update_follows_from_event` now takes
+`&AccountSession` so it can rewrite the per-account follow set.
 
 **Validation:** `just precommit-quick`, upgrade migration tests.
 

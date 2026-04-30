@@ -38,7 +38,18 @@ use crate::types::AccountInboxPlaneStateSnapshot;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::{Account, DiscoveredRelayLists};
 use crate::whitenoise::database::account::AccountRepositories;
+use crate::whitenoise::database::account_db::AccountDatabase;
 use crate::whitenoise::error::{Result, WhitenoiseError};
+
+/// Returns the per-account SQLite path under the given data directory.
+pub(crate) fn account_db_path(
+    data_dir: &std::path::Path,
+    account_pubkey: &PublicKey,
+) -> std::path::PathBuf {
+    data_dir
+        .join("accounts")
+        .join(format!("{}.db", account_pubkey.to_hex()))
+}
 
 /// Signer slot shared between `AccountSession` and its relay handles.
 ///
@@ -81,6 +92,10 @@ pub struct AccountSession {
     /// `SharedServices` scope.
     pub(crate) whitenoise: Weak<Whitenoise>,
     pub(crate) repos: AccountRepositories,
+    /// Per-account SQLite database. Holds the account's local-scoped tables
+    /// (account_settings today; more in 18d/18e). The account is implicit —
+    /// the file is the scope.
+    pub(crate) account_db: Arc<AccountDatabase>,
     pub(crate) signer: SharedSigner,
     contact_list_guard: Arc<Semaphore>,
     cancellation: watch::Sender<bool>,
@@ -111,13 +126,24 @@ impl AccountSession {
         );
         let group_handle =
             relay_handles::AccountGroupHandle::new(account_pubkey, shared.relay_control.clone());
-        let repos = AccountRepositories::new(account_pubkey, shared.database.clone()).await?;
+
+        let db_path = account_db_path(&shared.config.data_dir, &account_pubkey);
+        let account_db = Arc::new(AccountDatabase::new(account_pubkey, db_path).await?);
+        account_db
+            .run_account_migrations(&shared.database.pool)
+            .await?;
+
+        let repos =
+            AccountRepositories::new(account_pubkey, shared.database.clone(), account_db.clone())
+                .await?;
+
         Ok(Self {
             account_pubkey,
             mdk: Arc::new(mdk),
             shared,
             whitenoise,
             repos,
+            account_db,
             signer,
             contact_list_guard: Arc::new(Semaphore::new(1)),
             cancellation,
@@ -446,6 +472,19 @@ impl AccountManager {
         self.sessions.get(pubkey).map(|r| r.clone())
     }
 
+    /// Snapshot every active session.
+    ///
+    /// Convenient for callers that need to iterate per-account state (e.g.
+    /// the event tracker checking each account's `published_events`). Holds
+    /// no lock after returning.
+    pub fn sessions_iter(&self) -> impl Iterator<Item = Arc<AccountSession>> {
+        self.sessions
+            .iter()
+            .map(|e| e.value().clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     pub fn remove_session(&self, pubkey: &PublicKey) -> Option<Arc<AccountSession>> {
         let removed = self.sessions.remove(pubkey).map(|(_, s)| s);
         if removed.is_some() {
@@ -644,13 +683,16 @@ pub(crate) mod test_helpers {
     /// on `test_shared` therefore do not exercise telemetry persistor paths.
     pub async fn test_shared(db: Arc<Database>) -> Arc<SharedServices> {
         let (event_sender, _) = tokio::sync::mpsc::channel(1);
+        let event_tracker = Arc::new(WhitenoiseEventTracker::detached(db.clone()));
+        let event_tracker_dyn: Arc<dyn crate::whitenoise::event_tracker::EventTracker> =
+            event_tracker.clone();
         let relay_control = Arc::new(RelayControlPlane::new(
             db.clone(),
             vec![],
             event_sender,
             [0u8; 16],
+            event_tracker_dyn,
         ));
-        let event_tracker = Arc::new(WhitenoiseEventTracker::new(db.clone()));
         let storage = Storage::new(std::env::temp_dir().as_path())
             .await
             .expect("test storage");
@@ -846,6 +888,30 @@ mod tests {
         session.cancel();
         rx.changed().await.expect("channel not dropped");
         assert!(*rx.borrow(), "should be cancelled after cancel()");
+    }
+
+    #[tokio::test]
+    async fn account_db_file_is_created_and_migrations_run() {
+        let pk = test_pubkey();
+        let session = test_session(pk).await;
+
+        let path = session.account_db.path();
+        assert!(path.exists(), "per-account DB file should be on disk");
+
+        // The local migration runner creates `_rust_migrations` even with no
+        // migrations registered.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type='table' AND name='_rust_migrations')",
+        )
+        .fetch_one(&session.account_db.inner.pool)
+        .await
+        .unwrap();
+        assert!(exists, "tracking table should exist in per-account DB");
+
+        // Cleanup: the AccountDatabase pool is closed when the session drops,
+        // but the file lingers under /tmp. Try to remove it; non-fatal.
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

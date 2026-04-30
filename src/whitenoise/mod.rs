@@ -175,8 +175,13 @@ pub struct Whitenoise {
 /// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
 static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
 
+/// Marker carried in [`WhitenoiseComponents`] to defer construction of the
+/// standard [`WhitenoiseEventTracker`] until inside `Arc::new_cyclic`, where
+/// the `Weak<Whitenoise>` is available.
+struct UseWhitenoiseEventTracker;
+
 struct WhitenoiseComponents {
-    event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
+    event_tracker: UseWhitenoiseEventTracker,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
@@ -207,31 +212,52 @@ impl Whitenoise {
     ) -> Arc<Self> {
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
-        let relay_control = Arc::new(RelayControlPlane::new(
-            database.clone(),
-            config.discovery_relays.clone(),
-            components.event_sender.clone(),
-            session_salt,
-        ));
+        let discovery_relays = config.discovery_relays.clone();
 
-        let shared = Arc::new(shared::SharedServices::new(
-            Arc::new(config),
-            database,
-            relay_control,
-            components.event_tracker,
-            components.secrets_store,
-            components.storage,
-            components.message_aggregator,
-        ));
+        let WhitenoiseComponents {
+            event_tracker,
+            secrets_store,
+            storage,
+            message_aggregator,
+            event_sender,
+            shutdown_sender,
+            scheduler_shutdown,
+        } = components;
 
-        Arc::new_cyclic(|weak: &Weak<Self>| Self {
-            shared,
-            event_sender: components.event_sender,
-            shutdown_sender: components.shutdown_sender,
-            scheduler_shutdown: components.scheduler_shutdown,
-            scheduler_handles: Mutex::new(Vec::new()),
-            account_manager: session::AccountManager::default(),
-            this: weak.clone(),
+        let config = Arc::new(config);
+
+        Arc::new_cyclic(move |weak: &Weak<Self>| {
+            let UseWhitenoiseEventTracker = event_tracker;
+            let event_tracker_arc: std::sync::Arc<dyn event_tracker::EventTracker> =
+                Arc::new(WhitenoiseEventTracker::new(database.clone(), weak.clone()));
+
+            let relay_control = Arc::new(RelayControlPlane::new(
+                database.clone(),
+                discovery_relays,
+                event_sender.clone(),
+                session_salt,
+                event_tracker_arc.clone(),
+            ));
+
+            let shared = Arc::new(shared::SharedServices::new(
+                config,
+                database,
+                relay_control,
+                event_tracker_arc,
+                secrets_store,
+                storage,
+                message_aggregator,
+            ));
+
+            Self {
+                shared,
+                event_sender,
+                shutdown_sender,
+                scheduler_shutdown,
+                scheduler_handles: Mutex::new(Vec::new()),
+                account_manager: session::AccountManager::default(),
+                this: weak.clone(),
+            }
         })
     }
 
@@ -457,10 +483,6 @@ impl Whitenoise {
 
         init_timing::record("database");
 
-        // Create the event tracker.
-        let event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
-            Arc::new(WhitenoiseEventTracker::new(database.clone()));
-
         // Create SecretsStore backed by the platform keyring-core store
         let secrets_store = SecretsStore::new(&keyring_service_id);
 
@@ -478,7 +500,7 @@ impl Whitenoise {
             config,
             database,
             WhitenoiseComponents {
-                event_tracker,
+                event_tracker: UseWhitenoiseEventTracker,
                 secrets_store,
                 storage,
                 message_aggregator,
@@ -589,6 +611,28 @@ impl Whitenoise {
             .account_manager
             .restore_sessions(&whitenoise)
             .await;
+
+        // Re-run the unified migrator on the shared DB AFTER session restore.
+        // `Database::new` already ran globals once at boot (before sessions
+        // existed), but any global drop migration whose data lives in a
+        // per-account DB must NOT advance until every account on disk has
+        // applied its corresponding local copy migration. Restoring sessions
+        // opens each per-account DB and runs its locals; this second pass on
+        // the shared DB then commits drops/purges that became eligible.
+        // For accounts that never log in: their per-account file is created on
+        // first session bring-up, so their local copy still runs before any
+        // global drop sees their data — but we re-run here defensively to
+        // catch globals queued behind locals applied during this session
+        // restore.
+        if let Err(error) = crate::whitenoise::database::rust_migrations::MIGRATOR
+            .run(&whitenoise.shared.database.pool, None)
+            .await
+        {
+            tracing::error!(
+                target: "whitenoise::new",
+                "Post-restore migrator pass failed: {error}"
+            );
+        }
 
         init_timing::record("session_restore");
 
@@ -914,10 +958,6 @@ pub mod test_utils {
         let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
         let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
 
-        // Create the event tracker.
-        let test_event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
-            Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone()));
-
         // Create Storage
         let storage = storage::Storage::new(data_temp.path()).await.unwrap();
 
@@ -927,7 +967,7 @@ pub mod test_utils {
             config,
             database,
             WhitenoiseComponents {
-                event_tracker: test_event_tracker,
+                event_tracker: UseWhitenoiseEventTracker,
                 secrets_store,
                 storage,
                 message_aggregator,

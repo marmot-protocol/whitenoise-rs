@@ -1367,6 +1367,7 @@ mod tests {
             whitenoise.shared.database.clone(),
             whitenoise.event_sender.clone(),
             whitenoise.shared.relay_control.observability().clone(),
+            whitenoise.shared.event_tracker.clone(),
         );
 
         ephemeral

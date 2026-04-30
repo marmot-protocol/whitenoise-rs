@@ -33,15 +33,14 @@ impl Whitenoise {
         event: Event,
     ) -> Result<()> {
         let _permit = session.acquire_contact_list_permit().await?;
-        let account_id = account.id.ok_or(WhitenoiseError::AccountNotFound)?;
 
-        if self.should_skip_contact_list(&event, account_id).await? {
+        if self.should_skip_contact_list(session, &event).await? {
             return Ok(());
         }
 
         let contacts = crate::nostr_manager::utils::pubkeys_from_event(&event);
         let newly_created = account
-            .update_follows_from_event(contacts.clone(), &self.shared.database)
+            .update_follows_from_event(contacts.clone(), session, &self.shared.database)
             .await?;
 
         self.schedule_background_user_fetch(session, &contacts);
@@ -63,8 +62,12 @@ impl Whitenoise {
     }
 
     #[perf_instrument("event_handlers")]
-    async fn should_skip_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
-        if ProcessedEvent::exists(&event.id, Some(account_id), &self.shared.database).await? {
+    async fn should_skip_contact_list(
+        &self,
+        session: &Arc<AccountSession>,
+        event: &Event,
+    ) -> Result<bool> {
+        if ProcessedEvent::exists_for_account(&event.id, &session.account_db).await? {
             tracing::debug!(
                 target: "whitenoise::handle_contact_list",
                 "Skipping already processed event {}",
@@ -73,7 +76,7 @@ impl Whitenoise {
             return Ok(true);
         }
 
-        if self.is_stale_contact_list(event, account_id).await? {
+        if self.is_stale_contact_list(session, event).await? {
             return Ok(true);
         }
 
@@ -81,11 +84,14 @@ impl Whitenoise {
     }
 
     #[perf_instrument("event_handlers")]
-    async fn is_stale_contact_list(&self, event: &Event, account_id: i64) -> Result<bool> {
+    async fn is_stale_contact_list(
+        &self,
+        session: &Arc<AccountSession>,
+        event: &Event,
+    ) -> Result<bool> {
         let event_time = timestamp_to_datetime(event.created_at)?;
         let newest_time =
-            ProcessedEvent::newest_contact_list_timestamp(account_id, &self.shared.database)
-                .await?;
+            ProcessedEvent::newest_contact_list_timestamp(&session.account_db).await?;
 
         match newest_time {
             Some(newest) if event_time.timestamp_millis() <= newest.timestamp_millis() => {
@@ -335,7 +341,7 @@ mod tests {
             .unwrap();
 
         // Verify follows were created and deduplicated
-        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
+        let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 2, "Duplicates should be deduplicated");
 
         let follow_pubkeys: Vec<PublicKey> = follows.iter().map(|u| u.pubkey).collect();
@@ -343,19 +349,17 @@ mod tests {
         assert!(follow_pubkeys.contains(&contact2));
 
         // Verify event was tracked as processed
-        let account_id = account.id.unwrap();
         assert!(
-            ProcessedEvent::exists(&event.id, Some(account_id), &whitenoise.shared.database)
+            ProcessedEvent::exists_for_account(&event.id, &session.account_db)
                 .await
                 .unwrap()
         );
 
         // Verify timestamp was recorded for future ordering checks
-        let newest_timestamp =
-            ProcessedEvent::newest_contact_list_timestamp(account_id, &whitenoise.shared.database)
-                .await
-                .unwrap()
-                .unwrap();
+        let newest_timestamp = ProcessedEvent::newest_contact_list_timestamp(&session.account_db)
+            .await
+            .unwrap()
+            .unwrap();
         let expected = timestamp_to_datetime(timestamp).unwrap();
         assert_eq!(
             newest_timestamp.timestamp_millis(),
@@ -388,7 +392,7 @@ mod tests {
             .unwrap();
 
         // Should still have exactly 1 follow
-        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
+        let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 1);
     }
 
@@ -426,7 +430,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
+        let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, current_contact, "Older event ignored");
 
@@ -438,7 +442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
+        let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(
             follows[0].pubkey, current_contact,
@@ -470,14 +474,7 @@ mod tests {
             .handle_contact_list(&session, &account, first_event)
             .await
             .unwrap();
-        assert_eq!(
-            account
-                .follows(&whitenoise.shared.database)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(session.repos.follows.all().await.unwrap().len(), 1);
 
         // Process newer event - should replace
         let second_event = build_contact_list_event(&keys, &[second_contact], Some(t2)).await;
@@ -486,7 +483,7 @@ mod tests {
             .await
             .unwrap();
 
-        let follows = account.follows(&whitenoise.shared.database).await.unwrap();
+        let follows = session.repos.follows.all().await.unwrap();
         assert_eq!(follows.len(), 1);
         assert_eq!(follows[0].pubkey, second_contact);
 
@@ -498,11 +495,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            account
-                .follows(&whitenoise.shared.database)
-                .await
-                .unwrap()
-                .is_empty(),
+            session.repos.follows.all().await.unwrap().is_empty(),
             "Empty contact list should clear follows"
         );
     }
@@ -547,8 +540,8 @@ mod tests {
             .await
             .unwrap();
 
-        let follows1 = account1.follows(&whitenoise.shared.database).await.unwrap();
-        let follows2 = account2.follows(&whitenoise.shared.database).await.unwrap();
+        let follows1 = session1.repos.follows.all().await.unwrap();
+        let follows2 = session2.repos.follows.all().await.unwrap();
 
         assert_eq!(follows1.len(), 1);
         assert_eq!(follows2.len(), 1);

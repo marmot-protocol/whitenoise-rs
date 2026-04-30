@@ -295,10 +295,12 @@ impl Database {
 
     /// Delete all data for an account's association with a group.
     ///
-    /// Removes the per-account row and data (accounts_groups, drafts, push tokens,
+    /// Removes the per-account row and data (accounts_groups, push tokens,
     /// media files). If no other accounts reference this group after the deletion,
     /// also removes shared data (group_information, which cascades to
-    /// aggregated_messages and drafts).
+    /// aggregated_messages). Per-account drafts (Phase 18c) live in each
+    /// account's per-account DB file and are dropped with that file at full
+    /// account deletion.
     ///
     /// Returns `true` if shared group data was also deleted (i.e., this was the
     /// last account).
@@ -328,14 +330,8 @@ impl Database {
         .execute(&mut *txn)
         .await?;
 
-        sqlx::query(
-            "DELETE FROM drafts
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
+        // Drafts moved to per-account DB in Phase 18c — the account-DB file
+        // is removed when the account is fully deleted, so no cleanup here.
 
         sqlx::query(
             "DELETE FROM group_push_tokens
@@ -366,7 +362,9 @@ impl Database {
 
         if last_account {
             // 3. Delete shared data (group_information cascades to
-            //    aggregated_messages and drafts via FK)
+            //    aggregated_messages via FK; per-account drafts live in
+            //    each account's per-account DB and are removed with that
+            //    file when an account is fully deleted)
             sqlx::query("DELETE FROM group_information WHERE mls_group_id = ?")
                 .bind(mls_group_id.as_slice())
                 .execute(&mut *txn)

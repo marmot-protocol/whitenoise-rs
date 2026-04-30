@@ -1,12 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use nostr_sdk::prelude::*;
 
 use crate::perf_instrument;
 use crate::whitenoise::{
-    accounts::Account,
+    Whitenoise,
     database::{Database, processed_events::ProcessedEvent, published_events::PublishedEvent},
     utils::timestamp_to_datetime,
 };
@@ -71,7 +70,7 @@ impl EventTracker for NoEventTracker {
         _event_id: &EventId,
         _pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(()) // Do nothing
+        Ok(())
     }
 
     async fn account_published_event(
@@ -79,14 +78,14 @@ impl EventTracker for NoEventTracker {
         _event_id: &EventId,
         _pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false) // Do nothing
+        Ok(false)
     }
 
     async fn global_published_event(
         &self,
         _event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false) // Do nothing
+        Ok(false)
     }
 
     async fn track_processed_account_event(
@@ -94,7 +93,7 @@ impl EventTracker for NoEventTracker {
         _event: &Event,
         _pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(()) // Do nothing
+        Ok(())
     }
 
     async fn already_processed_account_event(
@@ -102,58 +101,70 @@ impl EventTracker for NoEventTracker {
         _event_id: &EventId,
         _pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false) // Do nothing
+        Ok(false)
     }
 
     async fn track_processed_global_event(
         &self,
         _event: &Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(()) // Do nothing
+        Ok(())
     }
 
     async fn already_processed_global_event(
         &self,
         _event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(false) // Do nothing
+        Ok(false)
     }
 }
 
-/// Database-backed event tracker with dependency injection.
+/// Database-backed event tracker.
 ///
-/// Caches `PublicKey → account_id` mappings to avoid redundant
-/// `Account::find_by_pubkey()` queries on every event.  The cache is
-/// append-only — accounts are never deleted during a session.
+/// Account-scoped operations route through registered sessions on
+/// `Whitenoise::account_manager` (the per-account `published_events` and
+/// `processed_events` tables live in each account's per-account DB after
+/// Phase 18c). Global-scoped operations use the shared DB directly. Holds a
+/// `Weak<Whitenoise>` to avoid the cycle
+/// `Whitenoise -> SharedServices -> EventTracker -> Whitenoise`.
 pub struct WhitenoiseEventTracker {
     database: Arc<Database>,
-    account_id_cache: DashMap<PublicKey, i64>,
+    whitenoise: Weak<Whitenoise>,
 }
 
 impl WhitenoiseEventTracker {
-    pub fn new(database: Arc<Database>) -> Self {
+    pub fn new(database: Arc<Database>, whitenoise: Weak<Whitenoise>) -> Self {
         Self {
             database,
-            account_id_cache: DashMap::new(),
+            whitenoise,
         }
     }
 
-    /// Resolve account_id from pubkey, using the cache to avoid repeated DB lookups.
-    #[perf_instrument("event_tracker")]
-    async fn resolve_account_id(
+    /// Convenience helper for tests and bootstrap paths that don't have a
+    /// `Whitenoise` yet. Account-scoped DB ops will silently no-op until a
+    /// session can be located via [`Self::set_whitenoise`] equivalent paths;
+    /// callers should prefer [`Self::new`] in production code.
+    #[cfg(test)]
+    pub fn detached(database: Arc<Database>) -> Self {
+        Self {
+            database,
+            whitenoise: Weak::new(),
+        }
+    }
+
+    fn with_whitenoise<F, T>(&self, f: F) -> Option<T>
+    where
+        F: FnOnce(Arc<Whitenoise>) -> T,
+    {
+        self.whitenoise.upgrade().map(f)
+    }
+
+    fn account_db_for(
         &self,
         pubkey: &PublicKey,
-    ) -> std::result::Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(id) = self.account_id_cache.get(pubkey) {
-            return Ok(*id);
-        }
-        let account = Account::find_by_pubkey(pubkey, &self.database).await?;
-        let account_id = account.id.ok_or_else(|| {
-            Box::new(crate::WhitenoiseError::ResolveAccountId)
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        self.account_id_cache.insert(*pubkey, account_id);
-        Ok(account_id)
+    ) -> Option<Arc<crate::whitenoise::database::account_db::AccountDatabase>> {
+        self.with_whitenoise(|wn| wn.session(pubkey).map(|s| s.account_db.clone()))
+            .flatten()
     }
 }
 
@@ -165,10 +176,18 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let account_id = self.resolve_account_id(pubkey).await?;
-        PublishedEvent::create(event_id, account_id, &self.database)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        if let Some(account_db) = self.account_db_for(pubkey) {
+            PublishedEvent::create(event_id, &account_db)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        } else {
+            tracing::warn!(
+                target: "whitenoise::event_tracker",
+                pubkey = %pubkey,
+                event_id = %event_id,
+                "track_published_event: no session for account; skipping"
+            );
+        }
         Ok(())
     }
 
@@ -178,10 +197,12 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let account_id = self.resolve_account_id(pubkey).await?;
-        PublishedEvent::exists(event_id, Some(account_id), &self.database)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        match self.account_db_for(pubkey) {
+            Some(account_db) => PublishedEvent::exists(event_id, &account_db)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            None => Ok(false),
+        }
     }
 
     #[perf_instrument("event_tracker")]
@@ -189,9 +210,25 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        PublishedEvent::exists(event_id, None, &self.database)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        // Iterate every active session's per-account DB. Number of logged-in
+        // accounts is small (1–3); the iteration cost is negligible.
+        let Some(wn) = self.whitenoise.upgrade() else {
+            return Ok(false);
+        };
+        let sessions: Vec<_> = wn
+            .account_manager
+            .sessions_iter()
+            .map(|s| s.account_db.clone())
+            .collect();
+        for account_db in sessions {
+            let exists = PublishedEvent::exists(event_id, &account_db)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            if exists {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[perf_instrument("event_tracker")]
@@ -200,17 +237,25 @@ impl EventTracker for WhitenoiseEventTracker {
         event: &Event,
         pubkey: &PublicKey,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let account_id = self.resolve_account_id(pubkey).await?;
-        ProcessedEvent::create(
-            &event.id,
-            Some(account_id),
-            Some(timestamp_to_datetime(event.created_at)?),
-            Some(event.kind),
-            Some(&event.pubkey),
-            &self.database,
-        )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        if let Some(account_db) = self.account_db_for(pubkey) {
+            ProcessedEvent::create_for_account(
+                &event.id,
+                Some(timestamp_to_datetime(event.created_at)?),
+                Some(event.kind),
+                Some(&event.pubkey),
+                &account_db,
+            )
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        } else {
+            tracing::warn!(
+                target: "whitenoise::event_tracker",
+                pubkey = %pubkey,
+                event_id = %event.id,
+                "track_processed_account_event: no session for account; skipping"
+            );
+        }
+        Ok(())
     }
 
     #[perf_instrument("event_tracker")]
@@ -219,10 +264,12 @@ impl EventTracker for WhitenoiseEventTracker {
         event_id: &EventId,
         pubkey: &PublicKey,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let account_id = self.resolve_account_id(pubkey).await?;
-        ProcessedEvent::exists(event_id, Some(account_id), &self.database)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        match self.account_db_for(pubkey) {
+            Some(account_db) => ProcessedEvent::exists_for_account(event_id, &account_db)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            None => Ok(false),
+        }
     }
 
     #[perf_instrument("event_tracker")]
@@ -230,9 +277,8 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event: &Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        ProcessedEvent::create(
+        ProcessedEvent::create_global(
             &event.id,
-            None,
             Some(timestamp_to_datetime(event.created_at)?),
             Some(event.kind),
             Some(&event.pubkey),
@@ -247,7 +293,7 @@ impl EventTracker for WhitenoiseEventTracker {
         &self,
         event_id: &EventId,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        ProcessedEvent::exists(event_id, None, &self.database)
+        ProcessedEvent::exists_global(event_id, &self.database)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
@@ -274,51 +320,14 @@ mod tests {
         (database, temp_dir)
     }
 
-    /// Creates a test account by inserting directly into the database.
-    /// This satisfies the foreign key constraints without requiring full Whitenoise setup.
-    async fn create_test_account(db: &Database, pubkey: &PublicKey) {
-        // Create test user first
-        let now = chrono::Utc::now().timestamp_millis();
-        sqlx::query(
-            "INSERT INTO users (pubkey, metadata, created_at, updated_at) VALUES (?, '{}', ?, ?)",
-        )
-        .bind(pubkey.to_hex())
-        .bind(now)
-        .bind(now)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-
-        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE pubkey = ?")
-            .bind(pubkey.to_hex())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-
-        // Create account linked to user
-        sqlx::query(
-            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(pubkey.to_hex())
-        .bind(user_id)
-        .bind(now)
-        .bind(now)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    }
-
     mod no_event_tracker {
         use super::*;
 
-        /// Tests all NoEventTracker methods - track operations succeed,
-        /// check operations return false (no-op behavior).
         #[tokio::test]
         async fn all_methods_return_expected_noop_values() {
             let tracker = NoEventTracker;
             let event = create_test_event().await;
 
-            // Track operations should succeed (Ok(()))
             assert!(
                 tracker
                     .track_published_event(&event.id, &event.pubkey)
@@ -333,7 +342,6 @@ mod tests {
             );
             assert!(tracker.track_processed_global_event(&event).await.is_ok());
 
-            // Check operations should return false (nothing tracked)
             assert!(
                 !tracker
                     .account_published_event(&event.id, &event.pubkey)
@@ -362,17 +370,44 @@ mod tests {
         #[tokio::test]
         async fn construction_works() {
             let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
+            let tracker = WhitenoiseEventTracker::detached(database);
             let _ = tracker;
+        }
+
+        /// Without a `Whitenoise` upgrade, account-scoped DB ops are no-ops.
+        #[tokio::test]
+        async fn detached_tracker_account_ops_are_noops() {
+            let (database, _temp_dir) = create_test_database().await;
+            let tracker = WhitenoiseEventTracker::detached(database);
+            let event = create_test_event().await;
+
+            assert!(
+                tracker
+                    .track_published_event(&event.id, &event.pubkey)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                !tracker
+                    .account_published_event(&event.id, &event.pubkey)
+                    .await
+                    .unwrap()
+            );
+            assert!(!tracker.global_published_event(&event.id).await.unwrap());
+            assert!(
+                !tracker
+                    .already_processed_account_event(&event.id, &event.pubkey)
+                    .await
+                    .unwrap()
+            );
         }
 
         #[tokio::test]
         async fn track_and_check_global_processed_event() {
             let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
+            let tracker = WhitenoiseEventTracker::detached(database);
             let event = create_test_event().await;
 
-            // Initially not processed
             assert!(
                 !tracker
                     .already_processed_global_event(&event.id)
@@ -380,171 +415,14 @@ mod tests {
                     .unwrap()
             );
 
-            // Track it
             tracker.track_processed_global_event(&event).await.unwrap();
 
-            // Now it should be marked as processed
             assert!(
                 tracker
                     .already_processed_global_event(&event.id)
                     .await
                     .unwrap()
             );
-        }
-
-        #[tokio::test]
-        async fn track_and_check_global_published_event() {
-            let (database, _temp_dir) = create_test_database().await;
-
-            // Create an account first (required for published events)
-            let keys = Keys::generate();
-            create_test_account(&database, &keys.public_key()).await;
-
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = EventBuilder::text_note("test").sign(&keys).await.unwrap();
-
-            // Initially not published
-            assert!(!tracker.global_published_event(&event.id).await.unwrap());
-
-            // Track it
-            tracker
-                .track_published_event(&event.id, &event.pubkey)
-                .await
-                .unwrap();
-
-            // Now it should be marked as published
-            assert!(tracker.global_published_event(&event.id).await.unwrap());
-        }
-
-        #[tokio::test]
-        async fn track_and_check_account_events() {
-            let (database, _temp_dir) = create_test_database().await;
-
-            // Create an account
-            let keys = Keys::generate();
-            create_test_account(&database, &keys.public_key()).await;
-
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = EventBuilder::text_note("test").sign(&keys).await.unwrap();
-
-            // Initially not processed or published for this account
-            assert!(
-                !tracker
-                    .already_processed_account_event(&event.id, &event.pubkey)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !tracker
-                    .account_published_event(&event.id, &event.pubkey)
-                    .await
-                    .unwrap()
-            );
-
-            // Track processed
-            tracker
-                .track_processed_account_event(&event, &event.pubkey)
-                .await
-                .unwrap();
-            assert!(
-                tracker
-                    .already_processed_account_event(&event.id, &event.pubkey)
-                    .await
-                    .unwrap()
-            );
-
-            // Track published
-            tracker
-                .track_published_event(&event.id, &event.pubkey)
-                .await
-                .unwrap();
-            assert!(
-                tracker
-                    .account_published_event(&event.id, &event.pubkey)
-                    .await
-                    .unwrap()
-            );
-        }
-
-        #[tokio::test]
-        async fn track_published_event_fails_when_account_not_found() {
-            let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = create_test_event().await;
-
-            // No account created - should error
-            let result = tracker
-                .track_published_event(&event.id, &event.pubkey)
-                .await;
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn account_published_event_fails_when_account_not_found() {
-            let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = create_test_event().await;
-
-            // No account created - should error
-            let result = tracker
-                .account_published_event(&event.id, &event.pubkey)
-                .await;
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn track_processed_account_event_fails_when_account_not_found() {
-            let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = create_test_event().await;
-
-            // No account created - should error
-            let result = tracker
-                .track_processed_account_event(&event, &event.pubkey)
-                .await;
-            assert!(result.is_err());
-        }
-
-        #[tokio::test]
-        async fn resolve_account_id_uses_cache_on_second_call() {
-            let (database, _temp_dir) = create_test_database().await;
-            let keys = Keys::generate();
-            create_test_account(&database, &keys.public_key()).await;
-
-            let tracker = WhitenoiseEventTracker::new(database.clone());
-
-            // First call populates the cache
-            let id1 = tracker
-                .resolve_account_id(&keys.public_key())
-                .await
-                .unwrap();
-
-            // Remove the account from the DB so only the cache can serve it
-            sqlx::query("DELETE FROM accounts WHERE pubkey = ?")
-                .bind(keys.public_key().to_hex())
-                .execute(&database.pool)
-                .await
-                .unwrap();
-
-            // Second call should succeed via cache
-            let id2 = tracker
-                .resolve_account_id(&keys.public_key())
-                .await
-                .unwrap();
-            assert_eq!(id1, id2);
-        }
-
-        #[tokio::test]
-        async fn already_processed_account_event_fails_when_account_not_found() {
-            let (database, _temp_dir) = create_test_database().await;
-            let tracker = WhitenoiseEventTracker::new(database);
-            let event = create_test_event().await;
-
-            // No account created - should error
-            let result = tracker
-                .already_processed_account_event(&event.id, &event.pubkey)
-                .await;
-            assert!(result.is_err());
         }
     }
 }

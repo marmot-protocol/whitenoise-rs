@@ -10,7 +10,6 @@ use nostr_sdk::{Event, Timestamp};
 use crate::perf_instrument;
 use crate::whitenoise::Whitenoise;
 use crate::whitenoise::accounts::Account;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::WhitenoiseError;
 use crate::whitenoise::key_packages::{
     REQUIRED_MLS_CIPHERSUITE_TAG, validate_marmot_key_package_tags,
@@ -267,15 +266,15 @@ async fn find_live_published_key_packages(
     account: &Account,
     packages: Vec<Event>,
 ) -> Result<Vec<LivePublishedKeyPackage>, WhitenoiseError> {
+    let session = whitenoise.require_session(&account.pubkey)?;
     let mut our_packages = Vec::new();
 
     for event in packages {
-        match PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &event.id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await?
+        match session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event.id.to_hex())
+            .await?
         {
             Some(pkg) if !pkg.key_material_deleted && pkg.consumed_at.is_none() => our_packages
                 .push(LivePublishedKeyPackage {
@@ -382,7 +381,6 @@ async fn rotate_expired_packages(
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
     use crate::whitenoise::key_packages::{
         MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, MLS_PROPOSALS_TAG_KEY,
     };
@@ -470,25 +468,24 @@ mod tests {
             "Should start with the canonical and legacy key package twins"
         );
 
-        let tracked = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &before[0].id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        let tracked = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&before[0].id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
 
         let mdk = whitenoise.create_mdk_for_account(account.pubkey).unwrap();
         mdk.delete_key_package_from_storage_by_hash_ref(&tracked.key_package_hash_ref)
             .unwrap();
-        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
-            &account.pubkey,
-            &tracked.key_package_hash_ref,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .mark_key_material_deleted_by_hash_ref(&tracked.key_package_hash_ref)
+            .await
+            .unwrap();
 
         // Validate the precondition for this regression: the relay event still
         // exists, but this device no longer has any live local state for it.
@@ -534,13 +531,14 @@ mod tests {
             "Should start with the canonical and legacy key package twins"
         );
 
-        PublishedKeyPackage::mark_consumed(
-            &account.pubkey,
-            &before[0].id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .repos
+            .published_key_packages
+            .mark_consumed(&before[0].id.to_hex())
+            .await
+            .unwrap();
 
         // Validate the precondition for this regression: the relay event still
         // exists, but the tracked package has already been consumed locally.
@@ -590,13 +588,14 @@ mod tests {
             "Should start with exactly one valid key package"
         );
 
-        PublishedKeyPackage::mark_consumed(
-            &account.pubkey,
-            &before[0].id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        whitenoise
+            .require_session(&account.pubkey)
+            .unwrap()
+            .repos
+            .published_key_packages
+            .mark_consumed(&before[0].id.to_hex())
+            .await
+            .unwrap();
 
         publish_outdated_key_package(&whitenoise, &account, &kp_relays)
             .await

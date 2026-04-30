@@ -315,11 +315,14 @@ mod tests {
 
     fn test_ephemeral_plane(database: Arc<Database>) -> EphemeralPlane {
         let (event_sender, _) = tokio::sync::mpsc::channel(16);
+        let tracker: Arc<dyn crate::whitenoise::event_tracker::EventTracker> =
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker);
         EphemeralPlane::new(
             crate::relay_control::ephemeral::EphemeralPlaneConfig::default(),
             database,
             event_sender,
             RelayObservability::new(RelayObservabilityConfig::default()),
+            tracker,
         )
     }
 
@@ -380,7 +383,15 @@ mod tests {
     async fn group_handle_delegates_group_count() {
         let db = test_db().await;
         let (event_sender, _) = tokio::sync::mpsc::channel(16);
-        let relay_control = Arc::new(RelayControlPlane::new(db, vec![], event_sender, [0u8; 16]));
+        let tracker: Arc<dyn crate::whitenoise::event_tracker::EventTracker> =
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker);
+        let relay_control = Arc::new(RelayControlPlane::new(
+            db,
+            vec![],
+            event_sender,
+            [0u8; 16],
+            tracker,
+        ));
         let pk = Keys::generate().public_key();
         let handle = AccountGroupHandle::new(pk, relay_control);
 

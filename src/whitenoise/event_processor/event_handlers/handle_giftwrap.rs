@@ -11,7 +11,6 @@ use crate::{
         accounts::Account,
         accounts_groups::AccountGroup,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::published_key_packages::PublishedKeyPackage,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
         session::AccountSession,
@@ -104,12 +103,11 @@ impl Whitenoise {
 
         // Pre-check: do we have this key package and is its key material still available?
         // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
-        match PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &key_package_event_id.to_hex(),
-            &self.shared.database,
-        )
-        .await
+        match session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&key_package_event_id.to_hex())
+            .await
         {
             Ok(Some(pkg)) if pkg.key_material_deleted => {
                 tracing::warn!(
@@ -132,7 +130,7 @@ impl Whitenoise {
                     "Failed to look up key package: {}, rejecting Welcome",
                     e
                 );
-                return Err(e.into());
+                return Err(e);
             }
         }
 
@@ -400,18 +398,27 @@ impl Whitenoise {
     ) -> Result<()> {
         // Mark the key package as consumed so the maintenance task knows
         // to clean up local key material after the quiet period.
-        if let Err(e) = PublishedKeyPackage::mark_consumed(
-            &account.pubkey,
-            &key_package_event_id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "whitenoise::event_processor::process_welcome::background",
-                "Failed to mark key package as consumed: {}",
-                e
-            );
+        match whitenoise.session(&account.pubkey) {
+            Some(session) => {
+                if let Err(e) = session
+                    .repos
+                    .published_key_packages
+                    .mark_consumed(&key_package_event_id.to_hex())
+                    .await
+                {
+                    tracing::warn!(
+                        target: "whitenoise::event_processor::process_welcome::background",
+                        "Failed to mark key package as consumed: {}",
+                        e
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    target: "whitenoise::event_processor::process_welcome::background",
+                    "No session found for account, cannot mark key package as consumed"
+                );
+            }
         }
 
         // Publish new key package first so the account is never left with zero
@@ -1113,9 +1120,10 @@ mod tests {
         let giftwrap_event =
             build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
 
-        // Corrupt the database by dropping the published_key_packages table
+        // Corrupt the per-account database by dropping the published_key_packages
+        // table. The table lives in the account DB after the 18c split.
         sqlx::query("DROP TABLE published_key_packages")
-            .execute(&whitenoise.shared.database.pool)
+            .execute(&member_session.account_db.inner.pool)
             .await
             .unwrap();
 

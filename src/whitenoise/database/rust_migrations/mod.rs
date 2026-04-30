@@ -20,6 +20,20 @@ mod m0011_delivery_status_account_scope;
 mod m0012_bootstrap;
 mod m0013_media_blob_reference_split;
 mod m0014_drop_media_files;
+mod m0013_published_events_pubkey_fk;
+mod m0014_processed_events_pubkey_fk;
+mod m0015_move_account_settings;
+mod m0016_move_drafts;
+mod m0017_move_published_key_packages;
+mod m0018_move_published_events;
+mod m0019_move_processed_events;
+mod m0020_move_account_follows;
+mod m0021_drop_shared_account_settings;
+mod m0022_drop_shared_drafts;
+mod m0023_drop_shared_published_key_packages;
+mod m0024_drop_shared_published_events;
+mod m0025_drop_shared_account_follows;
+mod m0026_purge_account_processed_events;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -38,12 +52,28 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0011_delivery_status_account_scope::Migration),
         Box::new(m0013_media_blob_reference_split::Migration),
         Box::new(m0014_drop_media_files::Migration),
+        Box::new(m0013_published_events_pubkey_fk::Migration),
+        Box::new(m0014_processed_events_pubkey_fk::Migration),
+        Box::new(m0021_drop_shared_account_settings::Migration),
+        Box::new(m0022_drop_shared_drafts::Migration),
+        Box::new(m0023_drop_shared_published_key_packages::Migration),
+        Box::new(m0024_drop_shared_published_events::Migration),
+        Box::new(m0025_drop_shared_account_follows::Migration),
+        Box::new(m0026_purge_account_processed_events::Migration),
     ]
 }
 
 /// All local migrations, in version order.
 pub fn all_local_migrations() -> Vec<Box<dyn LocalMigration>> {
-    vec![Box::new(m0012_bootstrap::Migration)]
+    vec![
+        Box::new(m0012_bootstrap::Migration),
+        Box::new(m0015_move_account_settings::Migration),
+        Box::new(m0016_move_drafts::Migration),
+        Box::new(m0017_move_published_key_packages::Migration),
+        Box::new(m0018_move_published_events::Migration),
+        Box::new(m0019_move_processed_events::Migration),
+        Box::new(m0020_move_account_follows::Migration),
+    ]
 }
 
 /// A migration that runs against the shared (cross-account) database.

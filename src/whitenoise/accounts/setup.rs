@@ -8,7 +8,6 @@ use tokio::sync::watch;
 use crate::RelayType;
 use crate::perf_instrument;
 use crate::relay_control::groups::GroupSubscriptionSpec;
-use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::relays::Relay;
 use crate::whitenoise::session::AccountSession;
@@ -174,12 +173,14 @@ impl Whitenoise {
     /// and still has live local key material.
     #[perf_instrument("accounts")]
     async fn is_own_key_package(&self, pubkey: &PublicKey, event_id: &EventId) -> bool {
-        match PublishedKeyPackage::find_by_event_id(
-            pubkey,
-            &event_id.to_hex(),
-            &self.shared.database,
-        )
-        .await
+        let Some(session) = self.session(pubkey) else {
+            return false;
+        };
+        match session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event_id.to_hex())
+            .await
         {
             Ok(Some(pkg)) => !pkg.key_material_deleted,
             Ok(None) => false,
@@ -641,8 +642,8 @@ impl Whitenoise {
         let ephemeral = self.shared.relay_control.ephemeral();
         let relays = account.nip65_relays(&self.shared).await?;
         let signer = self.get_signer_for_account(account)?;
-        let follows = account.follows(&self.shared.database).await?;
-        let follows_pubkeys = follows.iter().map(|f| f.pubkey).collect::<Vec<_>>();
+        let session = self.require_session(&account.pubkey)?;
+        let follows_pubkeys = session.repos.follows.follow_pubkeys().await?;
         let created_at = Timestamp::now();
 
         tokio::spawn(async move {
@@ -1034,7 +1035,6 @@ impl Whitenoise {
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::whitenoise::database::published_key_packages::PublishedKeyPackage;
     use crate::whitenoise::key_packages::{MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY};
     use crate::whitenoise::test_utils::*;
     use mdk_core::prelude::*;
@@ -1272,10 +1272,37 @@ mod tests {
         assert!(!stored_urls.contains(&stale_relay.url));
     }
 
+    /// Persist `account`, store its keys in the secrets store, and register
+    /// an `AccountSession` so per-account DB-backed lookups (like
+    /// `is_own_key_package`) can find the session.
+    async fn register_session_for_test(
+        whitenoise: &std::sync::Arc<Whitenoise>,
+        account: Account,
+        keys: &Keys,
+    ) -> Account {
+        whitenoise
+            .shared
+            .secrets_store
+            .store_private_key(keys)
+            .expect("Should store keys");
+        let account = account
+            .save(&whitenoise.shared.database)
+            .await
+            .expect("Should save account");
+        let session = std::sync::Arc::new(
+            crate::whitenoise::session::AccountSession::from_account(&account, whitenoise)
+                .await
+                .unwrap(),
+        );
+        whitenoise.account_manager.insert_session(session);
+        account
+    }
+
     #[tokio::test]
     async fn test_is_own_key_package_returns_false_for_unknown_event() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_for_test(&whitenoise, account, &keys).await;
 
         let event_id = EventId::all_zeros();
         assert!(
@@ -1288,34 +1315,37 @@ mod tests {
     #[tokio::test]
     async fn test_is_own_key_package_returns_true_for_tracked_kp() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.shared.database).await.unwrap();
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_for_test(&whitenoise, account, &keys).await;
+        let session = whitenoise.session(&account.pubkey).unwrap();
 
         // Use valid 64-char hex strings as event IDs.
         let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let canonical_event_hex =
             "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let hash_ref = [1, 2, 3];
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            legacy_event_hex,
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            canonical_event_hex,
-            MLS_KEY_PACKAGE_KIND,
-            Some("canonical-d-tag"),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                legacy_event_hex,
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                canonical_event_hex,
+                MLS_KEY_PACKAGE_KIND,
+                Some("canonical-d-tag"),
+            )
+            .await
+            .unwrap();
 
         let event_id = EventId::parse(legacy_event_hex).unwrap();
         assert!(
@@ -1335,41 +1365,43 @@ mod tests {
     #[tokio::test]
     async fn test_is_own_key_package_returns_false_when_key_material_deleted() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let (account, _keys) = create_test_account(&whitenoise).await;
-        account.save(&whitenoise.shared.database).await.unwrap();
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_for_test(&whitenoise, account, &keys).await;
+        let session = whitenoise.session(&account.pubkey).unwrap();
 
         let legacy_event_hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let canonical_event_hex =
             "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
         let hash_ref = [1, 2, 3];
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            legacy_event_hex,
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            canonical_event_hex,
-            MLS_KEY_PACKAGE_KIND,
-            Some("canonical-d-tag"),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                legacy_event_hex,
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                canonical_event_hex,
+                MLS_KEY_PACKAGE_KIND,
+                Some("canonical-d-tag"),
+            )
+            .await
+            .unwrap();
 
-        PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
-            &account.pubkey,
-            &hash_ref,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .mark_key_material_deleted_by_hash_ref(&hash_ref)
+            .await
+            .unwrap();
 
         let event_id = EventId::parse(legacy_event_hex).unwrap();
         assert!(
@@ -1387,12 +1419,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_own_key_package_returns_false_on_db_error() {
+    async fn test_is_own_key_package_returns_false_for_unknown_account() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        // No session registered for this pubkey — the per-account DB lookup
+        // path returns false because there's nothing to look up against.
         let pubkey = Keys::generate().public_key();
-
-        // Close the pool to simulate a database error
-        whitenoise.shared.database.pool.close().await;
 
         let event_id = EventId::all_zeros();
         assert!(!whitenoise.is_own_key_package(&pubkey, &event_id).await);
