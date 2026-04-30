@@ -205,6 +205,75 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    /// Enumerate every persisted account that has either a row in
+    /// `shared.accounts` or a per-account DB file under `<data_dir>/accounts/`,
+    /// open each one without running migrations, and return the pool plus its
+    /// hex pubkey.
+    ///
+    /// Used at boot before [`crate::whitenoise::database::rust_migrations::MIGRATOR::run_all`]
+    /// so the unified timeline can apply per-account local copies in lockstep
+    /// with the shared global drops that depend on them.
+    ///
+    /// Resilient to fresh installs (no `accounts` table yet) and to accounts
+    /// that exist in shared but have no per-account file yet (the file is
+    /// created by `open_without_migrations` so the bootstrap can stamp it
+    /// later).
+    async fn enumerate_account_pools(
+        shared: &Database,
+        data_dir: &Path,
+    ) -> Result<Vec<(sqlx::SqlitePool, String)>> {
+        use std::collections::HashSet;
+
+        let accounts_dir = data_dir.join("accounts");
+        std::fs::create_dir_all(&accounts_dir)?;
+
+        // Best-effort read of `accounts.pubkey`. Fresh installs (no table yet)
+        // return an empty list; that's fine — there's nothing to migrate.
+        let mut pubkeys: HashSet<String> =
+            match sqlx::query_scalar::<_, String>("SELECT pubkey FROM accounts")
+                .fetch_all(&shared.pool)
+                .await
+            {
+                Ok(rows) => rows.into_iter().collect(),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "whitenoise::new",
+                        "No accounts table yet (fresh install or pre-bridge): {e}"
+                    );
+                    HashSet::new()
+                }
+            };
+
+        // Also include any per-account DB files on disk that aren't in
+        // `shared.accounts` — orphan files still deserve their own migration
+        // pass so a stale row never gets dropped without copying.
+        if let Ok(entries) = std::fs::read_dir(&accounts_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    pubkeys.insert(stem.to_string());
+                }
+            }
+        }
+
+        let mut pools = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let path = accounts_dir.join(format!("{pubkey}.db"));
+            let db = Database::open_without_migrations(path).await?;
+            pools.push((db.pool, pubkey));
+        }
+
+        tracing::info!(
+            target: "whitenoise::new",
+            "Enumerated {} per-account database(s) for migration lockstep",
+            pools.len()
+        );
+        Ok(pools)
+    }
+
     fn from_components(
         config: WhitenoiseConfig,
         database: Arc<Database>,
@@ -479,7 +548,30 @@ impl Whitenoise {
 
         init_timing::record("directories_and_logging");
 
-        let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
+        // Open shared without running migrations yet. The unified migration
+        // timeline contains global drops (v21–v26) that depend on per-account
+        // local copies (v15–v20) running first. If we let `Database::new` walk
+        // the timeline now (with `account = None`), locals get skipped and the
+        // drops fire on shared rows that were never copied to per-account DBs
+        // — losing every existing account's data on the first 18c boot.
+        //
+        // Instead: open shared and every persisted account's DB unmigrated,
+        // then call `MIGRATOR.run_all` so the framework walks one version at
+        // a time, applying each local to every account in lockstep with its
+        // surrounding globals. This is the X→A→Y ordering the unified
+        // timeline was designed for.
+        let database =
+            Arc::new(Database::open_without_migrations(data_dir.join("whitenoise.sqlite")).await?);
+
+        let account_pools = Self::enumerate_account_pools(&database, &data_dir).await?;
+        crate::whitenoise::database::rust_migrations::MIGRATOR
+            .run_all(&database.pool, &account_pools)
+            .await?;
+        // Drop the per-account pools now that migrations are committed; sessions
+        // will re-open them on bring-up. `run_account_migrations` is then a
+        // no-op on already-stamped versions and only fires the bootstrap (v12)
+        // for any account file created post-boot (e.g. fresh login).
+        drop(account_pools);
 
         init_timing::record("database");
 
@@ -607,43 +699,15 @@ impl Whitenoise {
 
         // Restore account sessions for all persisted accounts before setting up
         // subscriptions so that each account has an MDK instance ready.
-        let restore_outcome = whitenoise
+        // Migrations were already applied in lockstep across shared and every
+        // on-disk per-account file via `MIGRATOR.run_all` at the top of
+        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
+        // already-stamped versions. Only newly-created accounts (e.g. first
+        // login post-boot) need it to fire the bootstrap migration.
+        let _ = whitenoise
             .account_manager
             .restore_sessions(&whitenoise)
             .await;
-
-        // Re-run the unified migrator on the shared DB AFTER session restore —
-        // but only when every persisted account restored successfully.
-        //
-        // `Database::new` already ran globals once at boot (before sessions
-        // existed), but any global drop migration whose data lives in a
-        // per-account DB must NOT advance until every account on disk has
-        // applied its corresponding local copy migration. Restoring sessions
-        // opens each per-account DB and runs its locals; this second pass on
-        // the shared DB then commits drops/purges that became eligible.
-        //
-        // If any account failed to restore, its locals never ran. Firing the
-        // drop globals now would permanently delete the rows still in shared
-        // for that account. Defer to the next boot — the data stays safe in
-        // shared.sqlite until every account migrates cleanly.
-        if restore_outcome.all_succeeded() {
-            if let Err(error) = crate::whitenoise::database::rust_migrations::MIGRATOR
-                .run(&whitenoise.shared.database.pool, None)
-                .await
-            {
-                tracing::error!(
-                    target: "whitenoise::new",
-                    "Post-restore migrator pass failed: {error}"
-                );
-            }
-        } else {
-            tracing::warn!(
-                target: "whitenoise::new",
-                "{} account(s) failed to restore; skipping post-restore migrator pass to \
-                 prevent data loss. Drops will retry on the next successful boot.",
-                restore_outcome.err_count()
-            );
-        }
 
         init_timing::record("session_restore");
 

@@ -31,17 +31,38 @@ impl GlobalMigration for Migration {
         .execute(&mut *tx)
         .await?;
 
-        // Copy with JOIN to translate account_id → pubkey. Rows whose accounts
-        // row was already deleted (orphaned by a prior bug) are dropped — the
-        // FK had ON DELETE CASCADE so this should never happen in practice.
+        // Snapshot row counts so we can log how many were translated vs.
+        // dropped as orphans (rows whose `account_id` had no matching
+        // `accounts.id` row — should be 0 in practice because the original
+        // FK had ON DELETE CASCADE, but log if it ever happens).
+        let original_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM published_events")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // LEFT JOIN preserves row count visibility; the WHERE filter then
+        // excludes orphans cleanly so the new table's NOT NULL constraint on
+        // account_pubkey is respected.
         sqlx::query(
             "INSERT INTO published_events_new (id, event_id, account_pubkey, created_at)
              SELECT pe.id, pe.event_id, a.pubkey, pe.created_at
              FROM published_events pe
-             INNER JOIN accounts a ON a.id = pe.account_id",
+             LEFT JOIN accounts a ON a.id = pe.account_id
+             WHERE a.pubkey IS NOT NULL",
         )
         .execute(&mut *tx)
         .await?;
+
+        let copied_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM published_events_new")
+            .fetch_one(&mut *tx)
+            .await?;
+        let dropped = original_count - copied_count;
+        if dropped > 0 {
+            tracing::warn!(
+                target: "whitenoise::database::rust_migrations::m0013",
+                "Dropped {dropped} orphaned published_events row(s) with no matching account \
+                 (out of {original_count} total)"
+            );
+        }
 
         sqlx::query("DROP TABLE published_events")
             .execute(&mut *tx)

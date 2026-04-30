@@ -85,15 +85,37 @@ pub struct Database {
 }
 
 impl Database {
+    /// Open or create the SQLite file at `db_path` and run the unified
+    /// migrator in shared-only mode (`account = None`).
+    ///
+    /// **Unsafe for the shared DB once the unified timeline contains local
+    /// migrations** (Phase 18c+): in shared-only mode the migrator skips
+    /// locals but advances past their version numbers, so any global drop
+    /// migration sitting after a local will fire before the local has run
+    /// for any account on disk. Use [`Self::open_without_migrations`] +
+    /// `MIGRATOR.run_all` instead when there are accounts to migrate; the
+    /// latter walks every per-account DB in lockstep with shared.
+    ///
+    /// Safe to use for: per-account DB files (no globals advance against the
+    /// per-account pool because globals run against shared); fresh installs
+    /// where shared has no data yet (drops are no-ops on empty tables); test
+    /// helpers that want a one-shot fully-migrated DB.
     pub async fn new(db_path: PathBuf) -> Result<Self, DatabaseError> {
-        // Create parent directories if they don't exist
+        let db = Self::open_without_migrations(db_path).await?;
+        rust_migrations::MIGRATOR.run(&db.pool, None).await?;
+        Ok(db)
+    }
+
+    /// Open or create the SQLite file at `db_path` without running any
+    /// migrations. Pair with `MIGRATOR.run_all` (or
+    /// `AccountDatabase::run_account_migrations`) to apply the timeline.
+    pub(crate) async fn open_without_migrations(db_path: PathBuf) -> Result<Self, DatabaseError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let db_url = format!("sqlite://{}", db_path.display());
 
-        // Create database if it doesn't exist
         tracing::debug!("Checking if DB exists...{:?}", db_url);
         match Sqlite::database_exists(&db_url).await {
             Ok(true) => {
@@ -120,11 +142,6 @@ impl Database {
         }
 
         let pool = Self::create_connection_pool(&db_url).await?;
-
-        // Run Rust migration framework (handles SQLx catch-up for existing installs).
-        // Shared-only mode: locals are skipped here. Per-account migration
-        // wiring lands in Phase 18b+ along with physical account DB files.
-        rust_migrations::MIGRATOR.run(&pool, None).await?;
 
         Ok(Self {
             pool,
