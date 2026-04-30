@@ -148,12 +148,20 @@ impl AccountEphemeralHandle {
     }
 
     /// Fetch all key package events for this account from the given relays.
+    ///
+    /// Requests both the canonical Marmot kind (30443) and the legacy
+    /// nostr-sdk `Kind::MlsKeyPackage` (= 443). Relays may have either or
+    /// both depending on the publishing client; filtering for only one would
+    /// silently drop key packages from peers that publish the other.
     pub(crate) async fn fetch_key_packages_from_relays(
         &self,
         relays: &[RelayUrl],
     ) -> Result<Vec<Event>> {
         let filter = Filter::new()
-            .kind(Kind::MlsKeyPackage)
+            .kinds([
+                crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND,
+                crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY,
+            ])
             .author(self.account_pubkey);
 
         let fetched = self.ephemeral.fetch_events_from(relays, filter).await?;

@@ -1105,13 +1105,17 @@ pub mod test_utils {
         whitenoise: &Whitenoise,
         account: &Account,
     ) -> usize {
-        let account_id = account.id.expect("account must be persisted");
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_one(&whitenoise.shared.database.pool)
-                .await
-                .unwrap();
+        // Phase 18c moved `published_events` into the per-account DB; the
+        // table no longer exists in shared. Read from the session's account_db
+        // (it has no `account_pubkey`/`account_id` filter — the file is the
+        // scope).
+        let session = whitenoise
+            .session(&account.pubkey)
+            .expect("account must have an active session");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM published_events")
+            .fetch_one(&session.account_db.inner.pool)
+            .await
+            .unwrap();
 
         usize::try_from(count.0).unwrap()
     }
