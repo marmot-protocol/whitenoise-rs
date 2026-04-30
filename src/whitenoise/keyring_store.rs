@@ -375,6 +375,13 @@ mod tests {
         }
 
         fn get_secret(&self) -> Result<Vec<u8>> {
+            if self.secret.is_empty() {
+                return Err(Error::Invalid(
+                    "legacy get".to_string(),
+                    "failed".to_string(),
+                ));
+            }
+
             Ok(self.secret.clone())
         }
 
@@ -420,6 +427,23 @@ mod tests {
     }
 
     #[test]
+    fn targeted_store_delegates_metadata_to_inner_store() {
+        let inner = Arc::new(RecordingStore::default());
+        assert!(format!("{inner:?}").contains("RecordingStore"));
+        let store: Arc<CredentialStore> =
+            TargetedCredentialStore::new(inner, LINUX_SECRET_SERVICE_TARGET);
+
+        assert_eq!(store.vendor(), "test-store");
+        assert_eq!(store.id(), "test-store");
+        assert!(matches!(
+            store.persistence(),
+            CredentialPersistence::UntilDelete
+        ));
+        assert!(store.as_any().is::<TargetedCredentialStore>());
+        assert!(format!("{store:?}").contains("TargetedCredentialStore"));
+    }
+
+    #[test]
     fn build_preserves_explicit_target() {
         let inner = Arc::new(RecordingStore::default());
         let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
@@ -448,9 +472,41 @@ mod tests {
     }
 
     #[test]
+    fn search_preserves_explicit_target() {
+        let inner = Arc::new(RecordingStore::default());
+        let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let spec = HashMap::from([("service", "service"), ("target", "explicit")]);
+
+        store.search(&spec).unwrap();
+
+        assert_eq!(
+            inner.last_search_spec("target"),
+            Some("explicit".to_string())
+        );
+    }
+
+    #[test]
     fn target_is_non_default_for_wsl() {
         assert_eq!(LINUX_SECRET_SERVICE_TARGET, "whitenoise");
         assert_ne!(LINUX_SECRET_SERVICE_TARGET, "default");
+    }
+
+    #[test]
+    fn legacy_migration_store_delegates_metadata_and_search_to_primary() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let store: Arc<CredentialStore> = LegacyMigrationCredentialStore::new(primary, legacy);
+        let spec = HashMap::from([("service", "com.whitenoise.app")]);
+
+        assert!(store.vendor().contains("with legacy migration from"));
+        assert!(store.id().contains("with legacy migration"));
+        assert!(matches!(
+            store.persistence(),
+            CredentialPersistence::ProcessOnly
+        ));
+        assert!(store.as_any().is::<LegacyMigrationCredentialStore>());
+        assert!(format!("{store:?}").contains("LegacyMigrationCredentialStore"));
+        assert!(store.search(&spec).unwrap().is_empty());
     }
 
     #[test]
@@ -498,6 +554,129 @@ mod tests {
     }
 
     #[test]
+    fn legacy_migration_store_sets_primary_secret() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary.clone(), legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        entry.set_secret(b"new-db-key").unwrap();
+
+        assert_eq!(
+            primary
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"new-db-key"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_store_returns_legacy_get_error() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = Arc::new(DeleteFailureStore { secret: Vec::new() });
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let result = entry.get_secret();
+
+        assert!(matches!(result, Err(Error::Invalid(field, _)) if field == "legacy get"));
+    }
+
+    #[test]
+    fn legacy_migration_credential_exposes_specifiers_and_debug() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"primary-db-key")
+            .unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+
+        assert_eq!(
+            entry.get_credential().unwrap().get_secret().unwrap(),
+            b"primary-db-key"
+        );
+        assert_eq!(
+            entry.get_specifiers(),
+            Some((
+                "com.whitenoise.app".to_string(),
+                "whitenoise.db.key.v1".to_string()
+            ))
+        );
+        assert!(entry.as_any().is::<LegacyMigrationCredential>());
+        assert!(format!("{entry:?}").contains("LegacyMigrationCredential"));
+    }
+
+    #[test]
+    fn legacy_migration_store_deletes_primary_and_legacy_entries() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let primary_entry = primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let legacy_entry = legacy
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        primary_entry.set_secret(b"primary-db-key").unwrap();
+        legacy_entry.set_secret(b"legacy-db-key").unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+
+        entry.delete_credential().unwrap();
+        assert!(matches!(primary_entry.get_secret(), Err(Error::NoEntry)));
+        assert!(matches!(legacy_entry.get_secret(), Err(Error::NoEntry)));
+    }
+
+    #[test]
+    fn legacy_migration_store_delete_returns_no_entry_when_both_stores_are_empty() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let result = entry.delete_credential();
+
+        assert!(matches!(result, Err(Error::NoEntry)));
+    }
+
+    #[test]
+    fn legacy_migration_store_delete_returns_error_when_legacy_delete_fails() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = Arc::new(DeleteFailureStore {
+            secret: b"legacy-db-key".to_vec(),
+        });
+        let store = LegacyMigrationCredentialStore::new(primary.clone(), legacy);
+        let primary_entry = primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        primary_entry.set_secret(b"primary-db-key").unwrap();
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let result = entry.delete_credential();
+
+        assert!(matches!(result, Err(Error::Invalid(field, _)) if field == "legacy delete"));
+        assert!(matches!(primary_entry.get_secret(), Err(Error::NoEntry)));
+    }
+
+    #[test]
     fn legacy_migration_store_returns_error_when_legacy_delete_fails() {
         let primary = keyring_core::mock::Store::new().unwrap();
         let legacy_secret = b"legacy-db-key".to_vec();
@@ -520,5 +699,56 @@ mod tests {
                 .unwrap(),
             legacy_secret
         );
+    }
+
+    #[test]
+    fn test_credential_methods_are_wired_for_store_boundaries() {
+        let credential = TestCredential;
+
+        credential.set_secret(b"secret").unwrap();
+        assert!(matches!(credential.get_secret(), Err(Error::NoEntry)));
+        credential.delete_credential().unwrap();
+        assert!(credential.get_credential().unwrap().is_none());
+        assert_eq!(credential.get_specifiers(), None);
+        assert!(credential.as_any().is::<TestCredential>());
+        assert!(format!("{credential:?}").contains("TestCredential"));
+    }
+
+    #[test]
+    fn delete_failure_store_reports_metadata_and_specifiers() {
+        let store = DeleteFailureStore {
+            secret: b"legacy-db-key".to_vec(),
+        };
+
+        assert_eq!(store.vendor(), "delete-failure-store");
+        assert_eq!(store.id(), "delete-failure-store");
+        assert!(store.as_any().is::<DeleteFailureStore>());
+        assert!(format!("{store:?}").contains("DeleteFailureStore"));
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+
+        entry.set_secret(b"ignored").unwrap();
+        assert_eq!(entry.get_secret().unwrap(), b"legacy-db-key");
+        assert_eq!(
+            entry.get_credential().unwrap().get_secret().unwrap(),
+            b"legacy-db-key"
+        );
+        assert_eq!(
+            entry.get_specifiers(),
+            Some((
+                "com.whitenoise.app".to_string(),
+                "whitenoise.db.key.v1".to_string()
+            ))
+        );
+        assert!(entry.as_any().is::<DeleteFailureCredential>());
+
+        let credential = DeleteFailureCredential {
+            service: "com.whitenoise.app".to_string(),
+            user: "whitenoise.db.key.v1".to_string(),
+            secret: b"legacy-db-key".to_vec(),
+        };
+        assert!(format!("{credential:?}").contains("DeleteFailureCredential"));
     }
 }

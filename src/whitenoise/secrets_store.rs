@@ -252,6 +252,50 @@ mod tests {
     }
 
     #[test]
+    fn test_get_private_key_maps_keyring_read_errors() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let entry = keyring_entry_for_user(
+            secrets_store.service_name.as_str(),
+            pubkey.to_hex().as_str(),
+        )
+        .unwrap();
+        entry.set_secret(&[0xff]).unwrap();
+
+        let result = secrets_store.get_nostr_keys_for_pubkey(&pubkey);
+
+        assert!(matches!(result, Err(SecretsStoreError::KeyringError(_))));
+    }
+
+    #[test]
+    fn test_remove_private_key_maps_keyring_delete_errors() {
+        let secrets_store = create_test_secrets_store();
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let entry = keyring_entry_for_user(
+            secrets_store.service_name.as_str(),
+            pubkey.to_hex().as_str(),
+        )
+        .unwrap();
+        entry
+            .set_password(keys.secret_key().to_secret_hex().as_str())
+            .unwrap();
+        let mock = entry
+            .as_any()
+            .downcast_ref::<keyring_core::mock::Cred>()
+            .unwrap();
+        mock.set_error(KeyringError::Invalid(
+            "delete".to_string(),
+            "failed".to_string(),
+        ));
+
+        let result = secrets_store.remove_private_key_for_pubkey(&pubkey);
+
+        assert!(matches!(result, Err(SecretsStoreError::KeyringError(_))));
+    }
+
+    #[test]
     fn test_store_multiple_keys() {
         let secrets_store = create_test_secrets_store();
 
@@ -283,41 +327,23 @@ mod tests {
     #[test]
     fn test_map_keyring_error_no_default_store() {
         let err = map_keyring_error(KeyringError::NoDefaultStore);
-        assert!(
-            matches!(err, SecretsStoreError::KeyringNotInitialized(_)),
-            "Expected KeyringNotInitialized, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringNotInitialized(_)));
     }
 
     #[test]
     fn test_map_keyring_error_no_storage_access() {
         let inner = std::io::Error::other("KeyRevoked");
         let err = map_keyring_error(KeyringError::NoStorageAccess(Box::new(inner)));
-        assert!(
-            matches!(err, SecretsStoreError::KeyringUnavailable(_)),
-            "Expected KeyringUnavailable, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringUnavailable(_)));
         let msg = err.to_string();
-        assert!(
-            msg.contains("Platform keyring is not available"),
-            "Expected actionable guidance, got: {msg}"
-        );
-        assert!(
-            msg.contains("KeyRevoked"),
-            "Expected original error in message, got: {msg}"
-        );
+        assert!(msg.contains("Platform keyring is not available"));
+        assert!(msg.contains("KeyRevoked"));
     }
 
     #[test]
     fn test_map_keyring_error_other() {
         let err = map_keyring_error(KeyringError::NoEntry);
-        assert!(
-            matches!(err, SecretsStoreError::KeyringError(_)),
-            "Expected KeyringError, got: {:?}",
-            err
-        );
+        assert!(matches!(err, SecretsStoreError::KeyringError(_)));
     }
 
     #[test]

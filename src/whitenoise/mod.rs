@@ -380,12 +380,7 @@ impl Whitenoise {
         // The real store is reserved for production builds (no feature flags).
         #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
         {
-            let store = keyring_core::mock::Store::new().map_err(|e| {
-                WhitenoiseError::KeyringUnavailable(format!(
-                    "Failed to create mock credential store: {e}"
-                ))
-            })?;
-            keyring_core::set_default_store(store);
+            Self::set_default_keyring_store(keyring_core::mock::Store::new(), "mock")?;
         }
 
         #[cfg(all(
@@ -400,23 +395,19 @@ impl Whitenoise {
             // profile with application-groups entitlement).
             #[cfg(all(target_os = "macos", feature = "cli"))]
             {
-                let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| {
-                    WhitenoiseError::KeyringUnavailable(format!(
-                        "Failed to create macOS Keychain credential store: {e}"
-                    ))
-                })?;
-                keyring_core::set_default_store(store);
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::keychain::Store::new(),
+                    "macOS Keychain",
+                )?;
             }
             // Intel Macs (non-CLI): use the regular Keychain store.
             // Protected Data store is not available on x86_64.
             #[cfg(all(target_os = "macos", target_arch = "x86_64", not(feature = "cli")))]
             {
-                let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| {
-                    WhitenoiseError::KeyringUnavailable(format!(
-                        "Failed to create macOS Keychain credential store: {e}"
-                    ))
-                })?;
-                keyring_core::set_default_store(store);
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::keychain::Store::new(),
+                    "macOS Keychain",
+                )?;
             }
             // Apple Silicon (non-CLI): use the Protected Data store (audit #630).
             // Requires code-signing with a provisioning profile that includes the
@@ -424,39 +415,31 @@ impl Whitenoise {
             // build pipeline satisfies this.
             #[cfg(all(target_os = "macos", target_arch = "aarch64", not(feature = "cli")))]
             {
-                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
-                    WhitenoiseError::KeyringUnavailable(format!(
-                        "Failed to create macOS protected-data credential store: {e}"
-                    ))
-                })?;
-                keyring_core::set_default_store(store);
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::protected::Store::new(),
+                    "macOS protected-data",
+                )?;
             }
             #[cfg(target_os = "ios")]
             {
-                let store = apple_native_keyring_store::protected::Store::new().map_err(|e| {
-                    WhitenoiseError::KeyringUnavailable(format!(
-                        "Failed to create iOS protected-data credential store: {e}"
-                    ))
-                })?;
-                keyring_core::set_default_store(store);
+                Self::set_default_keyring_store(
+                    apple_native_keyring_store::protected::Store::new(),
+                    "iOS protected-data",
+                )?;
             }
             #[cfg(target_os = "windows")]
             {
-                let store = windows_native_keyring_store::Store::new().map_err(|e| {
-                    WhitenoiseError::KeyringUnavailable(format!(
-                        "Failed to create Windows credential store: {e}"
-                    ))
-                })?;
-                keyring_core::set_default_store(store);
+                Self::set_default_keyring_store(
+                    windows_native_keyring_store::Store::new(),
+                    "Windows",
+                )?;
             }
             #[cfg(target_os = "linux")]
             {
-                let store: Arc<keyring_core::CredentialStore> =
-                    zbus_secret_service_keyring_store::Store::new().map_err(|e| {
-                        WhitenoiseError::KeyringUnavailable(format!(
-                            "Failed to create Linux Secret Service credential store: {e}"
-                        ))
-                    })?;
+                let store = Self::create_keyring_store(
+                    zbus_secret_service_keyring_store::Store::new(),
+                    "Linux Secret Service",
+                )?;
                 keyring_core::set_default_store(keyring_store::TargetedCredentialStore::new(
                     store,
                     keyring_store::LINUX_SECRET_SERVICE_TARGET,
@@ -464,18 +447,14 @@ impl Whitenoise {
             }
             #[cfg(target_os = "android")]
             {
-                let primary: Arc<keyring_core::CredentialStore> =
-                    android_native_keyring_store::Store::new().map_err(|e| {
-                        WhitenoiseError::KeyringUnavailable(format!(
-                            "Failed to create Android credential store: {e}"
-                        ))
-                    })?;
-                let legacy: Arc<keyring_core::CredentialStore> =
-                    android_native_keyring_store::LegacyStore::from_ndk_context().map_err(|e| {
-                        WhitenoiseError::KeyringUnavailable(format!(
-                            "Failed to create legacy Android credential store: {e}"
-                        ))
-                    })?;
+                let primary = Self::create_keyring_store(
+                    android_native_keyring_store::Store::new(),
+                    "Android",
+                )?;
+                let legacy = Self::create_keyring_store(
+                    android_native_keyring_store::LegacyStore::from_ndk_context(),
+                    "legacy Android",
+                )?;
                 keyring_core::set_default_store(
                     keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
                 );
@@ -496,6 +475,33 @@ impl Whitenoise {
             }
         }
 
+        Ok(())
+    }
+
+    fn create_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = store.map_err(|e| {
+            WhitenoiseError::KeyringUnavailable(format!(
+                "Failed to create {store_name} credential store: {e}"
+            ))
+        })?;
+        Ok(store)
+    }
+
+    fn set_default_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<()>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = Self::create_keyring_store(store, store_name)?;
+        keyring_core::set_default_store(store);
         Ok(())
     }
 
@@ -1459,7 +1465,7 @@ pub mod test_utils {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::test_utils::*;
     use super::*;
@@ -1492,15 +1498,7 @@ mod tests {
 
         assert!(second.is_ok());
 
-        let third = init.initialize_with(
-            || false,
-            || {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                Err(WhitenoiseError::KeyringUnavailable(
-                    "should not run after success".to_string(),
-                ))
-            },
-        );
+        let third = init.initialize_with(|| false, || panic!("initializer ran after success"));
 
         assert!(third.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -1509,18 +1507,28 @@ mod tests {
     #[test]
     fn keyring_store_init_preserves_existing_default_store() {
         let init = KeyringStoreInit::new();
-        let initializer_called = AtomicBool::new(false);
 
-        let result = init.initialize_with(
-            || true,
-            || {
-                initializer_called.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-        );
+        let result = init.initialize_with(|| true, || panic!("initializer ran for existing store"));
 
         assert!(result.is_ok());
-        assert!(!initializer_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn create_keyring_store_maps_creation_error() {
+        let result = Whitenoise::create_keyring_store::<keyring_core::mock::Store>(
+            Err(keyring_core::Error::Invalid(
+                "store".to_string(),
+                "boom".to_string(),
+            )),
+            "test",
+        );
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::KeyringUnavailable(msg))
+                if msg.contains("Failed to create test credential store")
+                    && msg.contains("boom")
+        ));
     }
 
     // Configuration Tests
