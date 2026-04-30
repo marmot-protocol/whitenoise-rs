@@ -594,12 +594,17 @@ mod tests {
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
+        // create_identity publishes canonical (30443) + legacy (443) twins,
+        // and the fetch filter requests both kinds. Phase 18c stopped
+        // silently dropping kind 30443 from this query.
         assert_eq!(
             before.len(),
-            1,
-            "Should start with exactly one valid key package"
+            2,
+            "Should start with canonical + legacy key package twins"
         );
 
+        // mark_consumed walks every twin sharing the hash_ref, so consuming
+        // either of the two fetched events covers both.
         whitenoise
             .require_session(&account.pubkey)
             .unwrap()
@@ -618,10 +623,11 @@ mod tests {
             .fetch_all_key_packages_for_account(&account)
             .await
             .unwrap();
+        // Original canonical (replaced — still 1) + original legacy + outdated legacy = 3.
         assert_eq!(
             packages.len(),
-            2,
-            "Should have one valid and one outdated package"
+            3,
+            "Should have canonical + original legacy + outdated legacy"
         );
 
         let live_before = find_live_published_key_packages(&whitenoise, &account, packages.clone())

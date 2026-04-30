@@ -905,6 +905,19 @@ impl Whitenoise {
         group_id: &GroupId,
         request_event_id: &EventId,
     ) -> bool {
+        // Production code now writes to the per-session map; the legacy
+        // shared-services map (kept under #[cfg(test)] for the
+        // `insert_pending_token_response_for_test` shim) is never populated
+        // by real handlers. Read from the session first, then fall back to
+        // the legacy map for tests that still seed via the shim.
+        if let Some(session) = self.session(account_pubkey)
+            && session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), *request_event_id))
+        {
+            return true;
+        }
+
         self.shared.pending_push_token_responses.contains_key(&(
             *account_pubkey,
             group_id.clone(),

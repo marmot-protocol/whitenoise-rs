@@ -2291,46 +2291,15 @@ mod tests {
         .expect("timed out waiting for spawned token-response task to complete");
     }
 
-    #[tokio::test]
-    async fn test_token_request_dropped_when_semaphore_exhausted() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let admin_account = whitenoise.create_identity().await.unwrap();
-        let members = setup_multiple_test_accounts(&whitenoise, 1).await;
-        let member_account = members[0].0.clone();
-
-        wait_for_key_package_publication(&whitenoise, &[&member_account]).await;
-
-        let group_id = setup_two_member_group(&whitenoise, &admin_account, &member_account).await;
-        let admin_mdk = whitenoise
-            .create_mdk_for_account(admin_account.pubkey)
-            .unwrap();
-
-        // Hold all semaphore permits so the next scheduled response task is dropped.
-        let _guard = whitenoise.exhaust_token_response_semaphore();
-
-        let token_tag = make_token_tag(20);
-        let request =
-            build_token_request_rumor(admin_account.pubkey, Timestamp::now(), vec![token_tag])
-                .unwrap();
-        let request_event_id = request.id.expect("447 rumor must have an event id");
-        let event = admin_mdk.create_message(&group_id, request, None).unwrap();
-
-        let member_session = whitenoise.require_session(&member_account.pubkey).unwrap();
-        whitenoise
-            .handle_mls_message(&member_session, &member_account, event)
-            .await
-            .unwrap();
-
-        // The task should have been dropped; no pending entry should remain.
-        assert!(
-            !whitenoise.has_pending_token_response(
-                &member_account.pubkey,
-                &group_id,
-                &request_event_id,
-            ),
-            "pending entry should be removed when the concurrency cap is reached"
-        );
-    }
+    // Note: `test_token_request_dropped_when_semaphore_exhausted` was removed
+    // in Phase 18c. It exercised a token-response concurrency cap that only
+    // existed on the legacy `Whitenoise::schedule_pending_token_response` test
+    // fixture (which writes to `SharedServices::pending_push_token_responses`,
+    // a `#[cfg(test)]` map). Production token-response scheduling moved to
+    // `AccountSession::schedule_pending_token_response` in Phase 12 and never
+    // had a cap. The test passed pre-18c only because `has_pending_token_response`
+    // was reading the wrong map; once it correctly checks the session map,
+    // the assertion's premise (cap drops the entry) no longer holds.
 
     /// Verify `extract_group_id` returns the correct group ID for every variant
     /// that carries one, and `None` for `PreviouslyFailed`.
