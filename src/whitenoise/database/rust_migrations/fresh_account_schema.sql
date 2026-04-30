@@ -1,0 +1,21 @@
+-- Account-database baseline schema.
+--
+-- Loaded by `m0012_bootstrap.rs` whenever a new account database is opened
+-- for the first time. Captures the per-account schema at the bootstrap's
+-- BASELINE_VERSION, so new accounts skip replaying historical local
+-- data-migration logic that only matters for accounts upgraded from older
+-- installs (mirror of `global/fresh_schema.sql` for the local timeline).
+--
+-- Phase 18a status: intentionally empty. No tables have been moved out of
+-- the shared database yet. When Phase 18b begins moving account-scoped
+-- tables (`account_settings`, `drafts`, `accounts_groups`, …), populate
+-- this file with their `CREATE TABLE` / index DDL as of the current
+-- baseline.
+--
+-- Rebaselining: when a future local migration does data extraction against
+-- transient shared schema, consider rebaselining — bump
+-- `BASELINE_VERSION` in `m0012_bootstrap.rs`, update this file to the
+-- post-extraction schema, and add the now-skipped versions to
+-- `STAMPED_PRIOR_LOCAL_VERSIONS`. New accounts then skip those locals
+-- entirely instead of trying to replay them against shared state that may
+-- have moved on.

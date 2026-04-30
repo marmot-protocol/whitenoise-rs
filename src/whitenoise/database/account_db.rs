@@ -10,8 +10,9 @@
 use std::path::PathBuf;
 
 use nostr_sdk::PublicKey;
+use sqlx::SqlitePool;
 
-use crate::whitenoise::database::{Database, DatabaseError};
+use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 
 /// A connection to a per-account SQLite database.
 ///
@@ -98,6 +99,28 @@ impl AccountDatabase {
     pub fn path(&self) -> &PathBuf {
         &self.inner.path
     }
+
+    /// Run pending local migrations against this account's DB.
+    ///
+    /// Must be called by the wiring whenever this `AccountDatabase` is
+    /// opened (login or first-time create). Walks the unified migration
+    /// timeline applying any pending globals to `shared` and any pending
+    /// locals to this account's pool — including the new-account
+    /// bootstrap on a freshly-created per-user file.
+    ///
+    /// Phase 18b+ entry point: per-user DB files become physically
+    /// separate, so this is the natural place to fire the bootstrap.
+    /// Currently (Phase 18a) account and shared resolve to the same SQLite
+    /// file, but the freshness check on local-version space — not raw row
+    /// presence — keeps the behaviour correct across the transition.
+    pub async fn run_account_migrations(&self, shared: &SqlitePool) -> Result<(), DatabaseError> {
+        rust_migrations::MIGRATOR
+            .run(
+                shared,
+                Some((&self.inner.pool, self.account_pubkey.to_hex().as_str())),
+            )
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +162,53 @@ mod tests {
         // Second open — migrations already applied.
         let db = AccountDatabase::new(test_pubkey(), path).await;
         assert!(db.is_ok(), "expected Ok on second open, got {db:?}");
+    }
+
+    /// Opening an account DB and then running `run_account_migrations`
+    /// against a separate shared DB stamps the bootstrap (v=12) onto the
+    /// account's `_rust_migrations` — proving the per-user-DB-creation
+    /// hook fires the new-accounts-only timeline as designed.
+    #[tokio::test]
+    async fn test_run_account_migrations_fires_bootstrap_on_fresh_per_user_db() {
+        let dir = TempDir::new().expect("temp dir");
+        let shared_path = dir.path().join("shared.db");
+        let account_path = dir.path().join(format!("{}.db", test_pubkey().to_hex()));
+
+        // Open shared first so it has globals 1..=11 stamped against
+        // `shared.db` (the realistic Phase 18b ordering).
+        let shared = Database::new(shared_path).await.expect("open shared");
+
+        // Open the per-user DB; `Database::new` runs globals against this
+        // pool too (as today). The bootstrap must still fire.
+        let account = AccountDatabase::new(test_pubkey(), account_path)
+            .await
+            .expect("open account");
+
+        account
+            .run_account_migrations(&shared.pool)
+            .await
+            .expect("run account migrations");
+
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations WHERE version = 12")
+                .fetch_one(&account.inner.pool)
+                .await
+                .expect("query account tracking table");
+        assert_eq!(
+            count, 1,
+            "bootstrap (v=12) must be recorded on the per-user DB"
+        );
+
+        // Description should be the bootstrap's regular one, not an
+        // auto-stamp marker — proving `run_local` actually executed.
+        let (desc,): (String,) =
+            sqlx::query_as("SELECT description FROM _rust_migrations WHERE version = 12")
+                .fetch_one(&account.inner.pool)
+                .await
+                .unwrap();
+        assert!(
+            !desc.contains("auto-stamped"),
+            "bootstrap must run (not stamp) on a fresh per-user file; got desc: {desc}"
+        );
     }
 }
