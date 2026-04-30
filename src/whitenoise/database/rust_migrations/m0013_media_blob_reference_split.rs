@@ -288,7 +288,7 @@ mod tests {
         let accounts: Vec<&str> = shared_refs.iter().map(|(a,)| a.as_str()).collect();
         assert_eq!(accounts, vec![acct_a.as_str(), acct_b.as_str()]);
 
-        // media_files should still exist (dropped in a future migration).
+        // media_files should still exist (dropped by m0014).
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'",
         )

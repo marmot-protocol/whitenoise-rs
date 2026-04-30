@@ -19,6 +19,7 @@ mod m0010_published_kp_kind_metadata;
 mod m0011_delivery_status_account_scope;
 mod m0012_bootstrap;
 mod m0013_media_blob_reference_split;
+mod m0014_drop_media_files;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -36,6 +37,7 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0010_published_kp_kind_metadata::Migration),
         Box::new(m0011_delivery_status_account_scope::Migration),
         Box::new(m0013_media_blob_reference_split::Migration),
+        Box::new(m0014_drop_media_files::Migration),
     ]
 }
 
