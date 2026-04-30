@@ -98,24 +98,24 @@ impl GlobalMigration for Migration {
             SELECT
                 encrypted_file_hash,
                 COALESCE(
-                    NULLIF(
-                        (SELECT mf2.file_path
-                         FROM media_files mf2
-                         WHERE mf2.encrypted_file_hash = mf.encrypted_file_hash
-                           AND mf2.file_path != ''
-                         LIMIT 1),
-                        NULL
-                    ),
+                    (SELECT mf2.file_path
+                     FROM media_files mf2
+                     WHERE mf2.encrypted_file_hash = mf.encrypted_file_hash
+                       AND mf2.file_path != ''
+                     ORDER BY mf2.created_at ASC
+                     LIMIT 1),
                     ''
                 ),
                 (SELECT mf3.mime_type
                  FROM media_files mf3
                  WHERE mf3.encrypted_file_hash = mf.encrypted_file_hash
+                 ORDER BY mf3.created_at ASC
                  LIMIT 1),
                 (SELECT mf4.blossom_url
                  FROM media_files mf4
                  WHERE mf4.encrypted_file_hash = mf.encrypted_file_hash
                    AND mf4.blossom_url IS NOT NULL
+                 ORDER BY mf4.created_at ASC
                  LIMIT 1),
                 MIN(created_at)
             FROM media_files mf
