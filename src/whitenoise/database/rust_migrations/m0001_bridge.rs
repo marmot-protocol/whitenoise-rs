@@ -305,12 +305,15 @@ mod tests {
         let runner = Migrator::new(all_global_migrations(), vec![]);
         runner.run(&pool, None).await.unwrap();
 
-        // Bridge (v1) + auto-stamped v2-v10 + actually-ran v11 = 11 total.
+        let expected = all_global_migrations().len() as i64;
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 11, "should have all 11 migration versions recorded");
+        assert_eq!(
+            count, expected,
+            "should have all migration versions recorded"
+        );
 
         // Verify v2-v10 are stamped (not executed).
         let stamped: Vec<(i64, String)> = sqlx::query_as(
@@ -357,11 +360,12 @@ mod tests {
         let runner = Migrator::new(all_global_migrations(), vec![]);
         runner.run(&pool, None).await.unwrap();
 
+        let expected = all_global_migrations().len() as i64;
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 11, "all 11 migrations should be recorded");
+        assert_eq!(count, expected, "all migrations should be recorded");
 
         // None should be auto-stamped.
         let stamped: Vec<(i64,)> = sqlx::query_as(
@@ -440,10 +444,11 @@ mod tests {
             "v2-v6 should be auto-stamped for SQLx 42"
         );
 
+        let expected = all_global_migrations().len() as i64;
         let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(total, 11, "all 11 migrations should be recorded");
+        assert_eq!(total, expected, "all migrations should be recorded");
     }
 }
