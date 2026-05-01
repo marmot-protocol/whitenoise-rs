@@ -6,11 +6,11 @@
 -- data-migration logic that only matters for accounts upgraded from older
 -- installs (mirror of `global/fresh_schema.sql` for the local timeline).
 --
--- Phase 18a status: intentionally empty. No tables have been moved out of
--- the shared database yet. When Phase 18b begins moving account-scoped
--- tables (`account_settings`, `drafts`, `accounts_groups`, …), populate
--- this file with their `CREATE TABLE` / index DDL as of the current
--- baseline.
+-- Phase 18a/18b status: intentionally empty. `media_references` is
+-- logically account-scoped but lives on the shared DB until
+-- `AccountDatabase` is wired into production init (Phase 18c+). When
+-- that wiring lands, add the `media_references` DDL here and create a
+-- local migration to extract it from shared.
 --
 -- Rebaselining: when a future local migration does data extraction against
 -- transient shared schema, consider rebaselining — bump

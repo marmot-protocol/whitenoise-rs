@@ -209,12 +209,16 @@ impl Database {
 
     /// Inner implementation of delete_all_data
     async fn delete_all_data_inner(&self) -> Result<(), DatabaseError> {
-        let mut txn = self.pool.begin().await?;
+        // Acquire a single connection so the PRAGMA and transaction share the
+        // same session. PRAGMA foreign_keys cannot be changed inside a
+        // transaction in SQLite, so we set it before BEGIN.
+        let mut conn = self.pool.acquire().await?;
 
-        // Disable foreign key constraints temporarily to allow deleting in any order
         sqlx::query("PRAGMA foreign_keys = OFF")
-            .execute(&mut *txn)
+            .execute(&mut *conn)
             .await?;
+
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
         // Get all user tables (excluding SQLite system tables and migration tracking)
         let tables: Vec<(String,)> = sqlx::query_as(
@@ -223,14 +227,14 @@ impl Database {
              AND name NOT LIKE 'sqlite_%'
              AND name NOT IN ('_sqlx_migrations', '_rust_migrations')",
         )
-        .fetch_all(&mut *txn)
+        .fetch_all(&mut *conn)
         .await?;
 
         // Delete all rows from each table (preserves schema)
         for (table_name,) in &tables {
             let delete_query = format!("DELETE FROM {}", table_name);
             sqlx::query(sqlx::AssertSqlSafe(delete_query))
-                .execute(&mut *txn)
+                .execute(&mut *conn)
                 .await?;
         }
 
@@ -240,16 +244,16 @@ impl Database {
             // Ignore errors - table might not have auto-increment
             let _ = sqlx::query("DELETE FROM sqlite_sequence WHERE name = ?")
                 .bind(table_name)
-                .execute(&mut *txn)
+                .execute(&mut *conn)
                 .await;
         }
 
-        // Re-enable foreign key constraints
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(&mut *txn)
-            .await?;
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
 
-        txn.commit().await?;
+        // Re-enable foreign key constraints.
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await?;
 
         Ok(())
     }
@@ -343,7 +347,7 @@ impl Database {
         .await?;
 
         sqlx::query(
-            "DELETE FROM media_files
+            "DELETE FROM media_references
              WHERE account_pubkey = ? AND mls_group_id = ?",
         )
         .bind(&pubkey_hex)
@@ -373,7 +377,7 @@ impl Database {
                 .execute(&mut *txn)
                 .await?;
 
-            sqlx::query("DELETE FROM media_files WHERE mls_group_id = ?")
+            sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
                 .bind(mls_group_id.as_slice())
                 .execute(&mut *txn)
                 .await?;
@@ -470,9 +474,9 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
 
-        // Check that the media_files table exists (from migration 0002)
+        // Check that the media_blobs table exists
         let result =
-            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='media_files'")
+            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name='media_blobs'")
                 .fetch_optional(&db.pool)
                 .await;
 
@@ -530,10 +534,15 @@ mod tests {
             .await
             .expect("Failed to insert test account");
 
-        sqlx::query("INSERT INTO media_files (mls_group_id, account_pubkey, file_path, original_file_hash, encrypted_file_hash, mime_type, media_type, created_at) VALUES (x'deadbeef', 'test-pubkey', '/path/test.jpg', NULL, 'testhash', 'image/jpeg', 'test', 1234567890)")
+        sqlx::query("INSERT INTO media_blobs (encrypted_file_hash, file_path, mime_type, created_at) VALUES ('testhash', '/path/test.jpg', 'image/jpeg', 1234567890)")
             .execute(&db.pool)
             .await
-            .expect("Failed to insert test media file");
+            .expect("Failed to insert test media blob");
+
+        sqlx::query("INSERT INTO media_references (mls_group_id, account_pubkey, encrypted_file_hash, media_type, created_at) VALUES (x'deadbeef', 'test-pubkey', 'testhash', 'test', 1234567890)")
+            .execute(&db.pool)
+            .await
+            .expect("Failed to insert test media reference");
 
         // Verify data exists
         let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
@@ -548,11 +557,17 @@ mod tests {
             .expect("Failed to count accounts");
         assert_eq!(account_count.0, 1);
 
-        let media_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files")
+        let blob_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_blobs")
             .fetch_one(&db.pool)
             .await
-            .expect("Failed to count media files");
-        assert_eq!(media_count.0, 1);
+            .expect("Failed to count media blobs");
+        assert_eq!(blob_count.0, 1);
+
+        let ref_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_references")
+            .fetch_one(&db.pool)
+            .await
+            .expect("Failed to count media references");
+        assert_eq!(ref_count.0, 1);
 
         // Delete all data
         let result = db.delete_all_data().await;
@@ -571,11 +586,17 @@ mod tests {
             .expect("Failed to count accounts after deletion");
         assert_eq!(account_count.0, 0);
 
-        let media_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files")
+        let blob_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_blobs")
             .fetch_one(&db.pool)
             .await
-            .expect("Failed to count media files after deletion");
-        assert_eq!(media_count.0, 0);
+            .expect("Failed to count media blobs after deletion");
+        assert_eq!(blob_count.0, 0);
+
+        let ref_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_references")
+            .fetch_one(&db.pool)
+            .await
+            .expect("Failed to count media references after deletion");
+        assert_eq!(ref_count.0, 0);
     }
 
     #[tokio::test]
@@ -698,7 +719,8 @@ mod tests {
 
         let table_names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
         assert!(table_names.contains(&"accounts".to_string()));
-        assert!(table_names.contains(&"media_files".to_string()));
+        assert!(table_names.contains(&"media_blobs".to_string()));
+        assert!(table_names.contains(&"media_references".to_string()));
         assert!(table_names.contains(&"app_settings".to_string()));
     }
 

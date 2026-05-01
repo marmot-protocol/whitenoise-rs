@@ -190,12 +190,15 @@ impl MediaFile {
         let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
 
         let row_opt = sqlx::query_as::<_, Self>(
-            "SELECT id, mls_group_id, account_pubkey, file_path,
-                    original_file_hash, encrypted_file_hash,
-                    mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, nonce, scheme_version, created_at
-             FROM media_files
-             WHERE encrypted_file_hash = ?
+            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
+                    r.original_file_hash, r.encrypted_file_hash,
+                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
+                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
+             FROM media_references r
+             INNER JOIN media_blobs b
+                ON b.encrypted_file_hash = r.encrypted_file_hash
+             WHERE r.encrypted_file_hash = ?
+             ORDER BY r.created_at ASC, r.id ASC
              LIMIT 1",
         )
         .bind(&encrypted_file_hash_hex)
@@ -243,58 +246,75 @@ impl MediaFile {
 
         let account_pubkey_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, Self>(
-            "INSERT INTO media_files (
-                mls_group_id, account_pubkey, file_path,
-                original_file_hash, encrypted_file_hash,
-                mime_type, media_type, blossom_url, nostr_key,
-                file_metadata, nonce, scheme_version, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (mls_group_id, encrypted_file_hash, account_pubkey)
-            DO NOTHING
-            RETURNING id, mls_group_id, account_pubkey, file_path,
-                      original_file_hash, encrypted_file_hash,
-                      mime_type, media_type, blossom_url, nostr_key,
-                      file_metadata, nonce, scheme_version, created_at",
+        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
+
+        // Upsert blob (shared, deduplicated by hash).
+        sqlx::query(
+            "INSERT INTO media_blobs
+                (encrypted_file_hash, file_path, mime_type, blossom_url, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (encrypted_file_hash) DO UPDATE SET
+                blossom_url = COALESCE(excluded.blossom_url, media_blobs.blossom_url),
+                file_path = CASE
+                    WHEN excluded.file_path != '' THEN excluded.file_path
+                    ELSE media_blobs.file_path
+                END",
         )
-        .bind(mls_group_id.as_slice())
-        .bind(&account_pubkey_hex)
-        .bind(file_path_str)
-        .bind(original_file_hash_hex.as_ref())
         .bind(&encrypted_file_hash_hex)
+        .bind(file_path_str)
         .bind(params.mime_type)
-        .bind(params.media_type)
         .bind(params.blossom_url)
-        .bind(params.nostr_key)
-        .bind(file_metadata_json)
-        .bind(params.nonce)
-        .bind(params.scheme_version)
         .bind(now_ms)
-        .fetch_optional(&database.pool)
+        .execute(&mut *tx)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        if let Some(row) = row_opt {
-            return Ok(row);
-        }
+        // Upsert reference (account-scoped).
+        sqlx::query(
+            "INSERT INTO media_references (
+                mls_group_id, account_pubkey, encrypted_file_hash,
+                media_type, nostr_key, file_metadata,
+                original_file_hash, nonce, scheme_version, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (mls_group_id, encrypted_file_hash, account_pubkey)
+            DO NOTHING",
+        )
+        .bind(mls_group_id.as_slice())
+        .bind(&account_pubkey_hex)
+        .bind(&encrypted_file_hash_hex)
+        .bind(params.media_type)
+        .bind(params.nostr_key)
+        .bind(file_metadata_json)
+        .bind(original_file_hash_hex.as_ref())
+        .bind(params.nonce)
+        .bind(params.scheme_version)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
 
-        // Conflict occurred - select existing row
+        // Whether inserted or conflict, select the joined row.
         let existing = sqlx::query_as::<_, Self>(
-            "SELECT id, mls_group_id, account_pubkey, file_path,
-                    original_file_hash, encrypted_file_hash,
-                    mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, nonce, scheme_version, created_at
-             FROM media_files
-             WHERE mls_group_id = ? AND encrypted_file_hash = ? AND account_pubkey = ?
+            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
+                    r.original_file_hash, r.encrypted_file_hash,
+                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
+                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
+             FROM media_references r
+             INNER JOIN media_blobs b
+                ON b.encrypted_file_hash = r.encrypted_file_hash
+             WHERE r.mls_group_id = ? AND r.encrypted_file_hash = ?
+               AND r.account_pubkey = ?
              LIMIT 1",
         )
         .bind(mls_group_id.as_slice())
         .bind(&encrypted_file_hash_hex)
         .bind(&account_pubkey_hex)
-        .fetch_one(&database.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(DatabaseError::Sqlx)?;
+
+        tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
         Ok(existing)
     }
@@ -313,12 +333,14 @@ impl MediaFile {
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
         let rows = sqlx::query_as::<_, Self>(
-            "SELECT id, mls_group_id, account_pubkey, file_path,
-                    original_file_hash, encrypted_file_hash,
-                    mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, nonce, scheme_version, created_at
-             FROM media_files
-             WHERE mls_group_id = ?",
+            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
+                    r.original_file_hash, r.encrypted_file_hash,
+                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
+                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
+             FROM media_references r
+             INNER JOIN media_blobs b
+                ON b.encrypted_file_hash = r.encrypted_file_hash
+             WHERE r.mls_group_id = ?",
         )
         .bind(group_id.as_slice())
         .fetch_all(&database.pool)
@@ -370,12 +392,15 @@ impl MediaFile {
         let account_hex = account_pubkey.to_hex();
 
         let row_opt = sqlx::query_as::<_, Self>(
-            "SELECT id, mls_group_id, account_pubkey, file_path,
-                    original_file_hash, encrypted_file_hash,
-                    mime_type, media_type, blossom_url, nostr_key,
-                    file_metadata, nonce, scheme_version, created_at
-             FROM media_files
-             WHERE original_file_hash = ? AND mls_group_id = ? AND account_pubkey = ?
+            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
+                    r.original_file_hash, r.encrypted_file_hash,
+                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
+                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
+             FROM media_references r
+             INNER JOIN media_blobs b
+                ON b.encrypted_file_hash = r.encrypted_file_hash
+             WHERE r.original_file_hash = ? AND r.mls_group_id = ?
+               AND r.account_pubkey = ?
              LIMIT 1",
         )
         .bind(&hash_hex)
@@ -391,8 +416,13 @@ impl MediaFile {
     /// Updates the file_path for an existing media file record
     ///
     /// This method is called after downloading and caching a media file to update
-    /// the database record with the local file path. It performs an atomic update
-    /// and returns the complete updated record.
+    /// the database record with the local file path.
+    ///
+    /// NOTE: This mutates the shared `media_blobs` row, which affects every
+    /// account referencing the same `encrypted_file_hash`. This is correct
+    /// while all accounts share a single `media_cache` directory. If Phase 18c
+    /// introduces per-account storage directories, this assumption must be
+    /// revisited.
     ///
     /// # Arguments
     /// * `database` - The database connection
@@ -419,36 +449,55 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
+        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
+
+        // Look up the encrypted_file_hash from the reference row.
+        let hash: String =
+            sqlx::query_scalar("SELECT encrypted_file_hash FROM media_references WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(DatabaseError::Sqlx)?
+                .ok_or_else(|| {
+                    WhitenoiseError::MediaCache(format!("MediaFile with id {} not found", id))
+                })?;
+
+        // Update the shared blob's file_path.
+        sqlx::query("UPDATE media_blobs SET file_path = ? WHERE encrypted_file_hash = ?")
+            .bind(path_str)
+            .bind(&hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+
+        // Return the joined record.
         let row = sqlx::query_as::<_, Self>(
-            "UPDATE media_files
-             SET file_path = ?
-             WHERE id = ?
-             RETURNING id, mls_group_id, account_pubkey, file_path,
-                       original_file_hash, encrypted_file_hash,
-                       mime_type, media_type, blossom_url, nostr_key,
-                       file_metadata, nonce, scheme_version, created_at",
+            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
+                    r.original_file_hash, r.encrypted_file_hash,
+                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
+                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
+             FROM media_references r
+             INNER JOIN media_blobs b
+                ON b.encrypted_file_hash = r.encrypted_file_hash
+             WHERE r.id = ?",
         )
-        .bind(path_str)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => {
-                WhitenoiseError::MediaCache(format!("MediaFile with id {} not found", id))
-            }
-            _ => DatabaseError::Sqlx(e).into(),
-        })?;
+        .map_err(DatabaseError::Sqlx)?;
+
+        tx.commit().await.map_err(DatabaseError::Sqlx)?;
 
         Ok(row)
     }
 
-    /// Returns all distinct non-empty file paths referenced by media_files records.
+    /// Returns all distinct non-empty file paths referenced by media_blobs records.
     #[perf_instrument("db::media_files")]
     pub(crate) async fn all_referenced_file_paths(
         database: &Database,
     ) -> Result<Vec<String>, WhitenoiseError> {
         let paths: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT file_path FROM media_files WHERE file_path != ''")
+            sqlx::query_scalar("SELECT DISTINCT file_path FROM media_blobs WHERE file_path != ''")
                 .fetch_all(&database.pool)
                 .await
                 .map_err(DatabaseError::Sqlx)?;
@@ -1549,16 +1598,17 @@ mod tests {
 
         assert_eq!(found2.id, saved_file2.id);
         assert_eq!(found2.account_pubkey, account2_pubkey);
-        assert_eq!(found2.file_path, file_path2);
+        // file_path comes from the shared blob (first writer wins).
+        assert_eq!(found2.file_path, file_path1);
 
-        // Verify the two records are different
+        // Verify the two references are distinct records sharing the same blob.
         assert_ne!(
             found1.id, found2.id,
-            "Different accounts should have different records"
+            "Different accounts should have different reference records"
         );
-        assert_ne!(
+        assert_eq!(
             found1.file_path, found2.file_path,
-            "Each account should have their own file_path"
+            "Both accounts share the same blob, so file_path should match"
         );
 
         // Verify a third account cannot find records for the other accounts
@@ -1636,6 +1686,69 @@ mod tests {
         );
         assert_eq!(retrieved.original_filename, Some("photo.jpg".to_string()));
         assert_eq!(retrieved.dimensions, Some("800x600".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_shared_blobs_survive_reference_deletion() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::new(db_path).await.unwrap();
+
+        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
+        let account1 = PublicKey::from_slice(&[10u8; 32]).unwrap();
+        let account2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
+        let encrypted_hash = [42u8; 32];
+        let file_path = temp_dir.path().join("shared.jpg");
+
+        create_test_account(&db, &account1).await;
+        create_test_account(&db, &account2).await;
+
+        // Both accounts save a reference to the same blob.
+        for acct in [&account1, &account2] {
+            MediaFile::save(
+                &db,
+                &group_id,
+                acct,
+                MediaFileParams {
+                    file_path: &file_path,
+                    original_file_hash: None,
+                    encrypted_file_hash: &encrypted_hash,
+                    mime_type: "image/jpeg",
+                    media_type: "chat_media",
+                    blossom_url: None,
+                    nostr_key: None,
+                    file_metadata: None,
+                    nonce: None,
+                    scheme_version: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Delete account1's reference.
+        sqlx::query("DELETE FROM media_references WHERE account_pubkey = ? AND mls_group_id = ?")
+            .bind(account1.to_hex())
+            .bind(group_id.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Blob must still exist.
+        let blob_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM media_blobs WHERE encrypted_file_hash = ?")
+                .bind(hex::encode(encrypted_hash))
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            blob_count.0, 1,
+            "Shared blob must survive reference deletion"
+        );
+
+        // Account2 can still find the media.
+        let found = MediaFile::find_by_hash(&db, &encrypted_hash).await.unwrap();
+        assert!(found.is_some(), "Account2 should still see the media file");
     }
 
     #[tokio::test]

@@ -512,7 +512,7 @@ boundary.
 
 ### Phase 18b: Media blob/reference split (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #787
 
 <details>
 <summary>Details</summary>
