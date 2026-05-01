@@ -84,7 +84,7 @@ use database::*;
 use error::{Result, WhitenoiseError};
 use event_tracker::WhitenoiseEventTracker;
 use relays::*;
-use secrets_store::SecretsStore;
+use secrets_store::{SecretsStore, SecretsStoreError};
 #[cfg(test)]
 use users::User;
 
@@ -485,9 +485,9 @@ impl Whitenoise {
         S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
     {
         let store = store.map_err(|e| {
-            WhitenoiseError::KeyringUnavailable(format!(
+            WhitenoiseError::SecretsStore(SecretsStoreError::KeyringUnavailable(format!(
                 "Failed to create {store_name} credential store: {e}"
-            ))
+            )))
         })?;
         Ok(store)
     }
@@ -1505,13 +1505,16 @@ mod tests {
             || false,
             || {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                Err(WhitenoiseError::KeyringUnavailable(
-                    "transient failure".to_string(),
-                ))
+                Err(SecretsStoreError::KeyringUnavailable("transient failure".to_string()).into())
             },
         );
 
-        assert!(matches!(first, Err(WhitenoiseError::KeyringUnavailable(_))));
+        assert!(matches!(
+            first,
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(_)
+            ))
+        ));
 
         let second = init.initialize_with(
             || false,
@@ -1558,7 +1561,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(WhitenoiseError::KeyringUnavailable(msg))
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(msg)
+            ))
                 if msg.contains("Failed to create test credential store")
                     && msg.contains("boom")
         ));
