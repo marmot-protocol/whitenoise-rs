@@ -4,6 +4,21 @@ use sqlx::{SqliteConnection, SqlitePool};
 use crate::whitenoise::database::DatabaseError;
 use crate::whitenoise::database::rust_migrations::LocalMigration;
 
+/// Temporary carrier for rows read from the shared `media_references` table
+/// during migration. Not used outside this module.
+#[derive(sqlx::FromRow)]
+struct SharedRefRow {
+    mls_group_id: Vec<u8>,
+    encrypted_file_hash: String,
+    media_type: String,
+    nostr_key: Option<String>,
+    file_metadata: Option<Vec<u8>>,
+    original_file_hash: Option<String>,
+    nonce: Option<String>,
+    scheme_version: Option<String>,
+    created_at: i64,
+}
+
 pub struct Migration;
 
 #[async_trait]
@@ -78,17 +93,7 @@ impl LocalMigration for Migration {
         // Read rows from shared via the global_db pool, then insert into the
         // per-account transaction. Can't use cross-DB SQL because the local
         // migration runs against the per-account pool.
-        let rows: Vec<(
-            Vec<u8>,         // mls_group_id
-            String,          // encrypted_file_hash
-            String,          // media_type
-            Option<String>,  // nostr_key
-            Option<Vec<u8>>, // file_metadata
-            Option<String>,  // original_file_hash
-            Option<String>,  // nonce
-            Option<String>,  // scheme_version
-            i64,             // created_at
-        )> = sqlx::query_as(
+        let rows: Vec<SharedRefRow> = sqlx::query_as(
             "SELECT mls_group_id, encrypted_file_hash, media_type, nostr_key,
                     file_metadata, original_file_hash, nonce, scheme_version, created_at
              FROM media_references
@@ -98,22 +103,22 @@ impl LocalMigration for Migration {
         .fetch_all(global_db)
         .await?;
 
-        for row in &rows {
+        for r in &rows {
             sqlx::query(
                 "INSERT OR IGNORE INTO media_references
                     (mls_group_id, encrypted_file_hash, media_type, nostr_key,
                      file_metadata, original_file_hash, nonce, scheme_version, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
-            .bind(&row.0)
-            .bind(&row.1)
-            .bind(&row.2)
-            .bind(&row.3)
-            .bind(&row.4)
-            .bind(&row.5)
-            .bind(&row.6)
-            .bind(&row.7)
-            .bind(row.8)
+            .bind(&r.mls_group_id)
+            .bind(&r.encrypted_file_hash)
+            .bind(&r.media_type)
+            .bind(&r.nostr_key)
+            .bind(&r.file_metadata)
+            .bind(&r.original_file_hash)
+            .bind(&r.nonce)
+            .bind(&r.scheme_version)
+            .bind(r.created_at)
             .execute(&mut *tx)
             .await?;
         }
