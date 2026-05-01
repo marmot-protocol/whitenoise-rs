@@ -133,7 +133,7 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             || async {
                 let files = context
                     .whitenoise
-                    .get_media_files_for_group(&group.mls_group_id)
+                    .get_media_files_for_group(receiver_account, &group.mls_group_id)
                     .await?;
 
                 // Filter to media files for receiver account with matching original_file_hash

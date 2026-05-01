@@ -1812,8 +1812,14 @@ mod tests {
         );
 
         // Verify the nostr_key (upload keypair) was stored in the database
+        let session = whitenoise
+            .account_manager
+            .get_session(&creator_account.pubkey)
+            .unwrap();
         let media_file = crate::whitenoise::database::media_files::MediaFile::find_by_hash(
+            &session.account_db.inner.pool,
             &whitenoise.shared.database,
+            &creator_account.pubkey,
             &hash,
         )
         .await
@@ -2150,11 +2156,16 @@ mod tests {
             .try_into()
             .expect("original_file_hash must be 32 bytes");
 
+        let session = whitenoise
+            .account_manager
+            .get_session(&creator_account.pubkey)
+            .unwrap();
         let reloaded = MediaFile::find_by_original_hash_and_group(
+            &session.account_db.inner.pool,
             &whitenoise.shared.database,
+            &creator_account.pubkey,
             &original_hash_bytes,
             &group.mls_group_id,
-            &creator_account.pubkey,
         )
         .await
         .unwrap()

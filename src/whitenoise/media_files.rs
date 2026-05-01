@@ -7,6 +7,7 @@ use mdk_core::{
     prelude::MdkStorageProvider,
 };
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 
 pub use crate::whitenoise::database::media_files::MediaFile;
 use crate::{
@@ -136,7 +137,10 @@ pub(crate) struct MediaFileUpload<'a> {
 /// - Encryption/decryption (caller's responsibility)
 pub struct MediaFiles<'a> {
     storage: &'a Storage,
-    database: &'a Database,
+    /// Shared database — holds `media_blobs` (content-addressed, cross-account).
+    shared_db: &'a Database,
+    /// Per-account database pool — holds `media_references` (account-scoped).
+    account_pool: &'a SqlitePool,
 }
 
 impl<'a> MediaFiles<'a> {
@@ -144,9 +148,18 @@ impl<'a> MediaFiles<'a> {
     ///
     /// # Arguments
     /// * `storage` - Reference to the storage layer
-    /// * `database` - Reference to the database
-    pub(crate) fn new(storage: &'a Storage, database: &'a Database) -> Self {
-        Self { storage, database }
+    /// * `shared_db` - Reference to the shared database (media_blobs)
+    /// * `account_pool` - Reference to the per-account database pool (media_references)
+    pub(crate) fn new(
+        storage: &'a Storage,
+        shared_db: &'a Database,
+        account_pool: &'a SqlitePool,
+    ) -> Self {
+        Self {
+            storage,
+            shared_db,
+            account_pool,
+        }
     }
 
     /// Stores a file and records it in the database in one operation
@@ -207,7 +220,8 @@ impl<'a> MediaFiles<'a> {
         upload: MediaFileUpload<'_>,
     ) -> Result<MediaFile> {
         let media_file = MediaFile::save(
-            self.database,
+            self.account_pool,
+            self.shared_db,
             group_id,
             account_pubkey,
             MediaFileParams {
@@ -365,7 +379,7 @@ impl<'a> MediaFiles<'a> {
     pub(crate) async fn cleanup_orphaned_files(&self) -> Result<u64> {
         // 1. Get all distinct file paths referenced in the database
         let referenced_paths: Vec<String> =
-            MediaFile::all_referenced_file_paths(self.database).await?;
+            MediaFile::all_referenced_file_paths(self.shared_db).await?;
 
         let referenced: HashSet<PathBuf> =
             referenced_paths.into_iter().map(PathBuf::from).collect();
@@ -464,7 +478,8 @@ impl<'a> MediaFiles<'a> {
             // Create MediaFile record (without file yet - empty path until downloaded)
             // Store nonce and scheme_version for MDK decryption
             MediaFile::save(
-                self.database,
+                self.account_pool,
+                self.shared_db,
                 group_id,
                 account_pubkey,
                 MediaFileParams {
@@ -498,24 +513,45 @@ impl<'a> MediaFiles<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::whitenoise::database::account_db::AccountDatabase;
+
     use super::*;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_store_and_record() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+    struct TestCtx {
+        shared: Database,
+        account_pool: SqlitePool,
+        pubkey: PublicKey,
+        storage: Storage,
+        _dir: TempDir,
+    }
 
-        let media_files = MediaFiles::new(&storage, &db);
-
-        let group_id = GroupId::from_slice(&[1u8; 8]);
+    async fn setup() -> TestCtx {
+        let dir = TempDir::new().unwrap();
         let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
-        let encrypted_file_hash = [3u8; 32];
-        let test_data = b"test file content";
+        let shared = Database::new(dir.path().join("shared.db")).await.unwrap();
+        let account_db = AccountDatabase::new(pubkey, dir.path().join("account.db"))
+            .await
+            .unwrap();
+        account_db
+            .run_account_migrations(&shared.pool)
+            .await
+            .unwrap();
 
-        // Create test account to satisfy foreign key constraint
+        // FK constraints
+        create_test_account(&shared, &pubkey).await;
+
+        let storage = Storage::new(dir.path()).await.unwrap();
+        TestCtx {
+            shared,
+            account_pool: account_db.inner.pool,
+            pubkey,
+            storage,
+            _dir: dir,
+        }
+    }
+
+    async fn create_test_account(db: &Database, pubkey: &PublicKey) {
         sqlx::query("INSERT INTO users (pubkey, created_at, updated_at) VALUES (?, ?, ?)")
             .bind(pubkey.to_hex())
             .bind(chrono::Utc::now().timestamp())
@@ -531,7 +567,8 @@ mod tests {
             .unwrap();
 
         sqlx::query(
-            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?)",
         )
         .bind(pubkey.to_hex())
         .bind(user_id)
@@ -540,8 +577,17 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+    }
 
-        // Store and record
+    #[tokio::test]
+    async fn test_store_and_record() {
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
+
+        let group_id = GroupId::from_slice(&[1u8; 8]);
+        let encrypted_file_hash = [3u8; 32];
+        let test_data = b"test file content";
+
         let upload = MediaFileUpload {
             data: test_data,
             original_file_hash: None,
@@ -555,18 +601,15 @@ mod tests {
             scheme_version: None,
         };
         let media_file = media_files
-            .store_and_record(&pubkey, &group_id, "test.jpg", upload)
+            .store_and_record(&t.pubkey, &group_id, "test.jpg", upload)
             .await
             .unwrap();
 
-        // Verify file exists on disk
         assert!(media_file.file_path.exists());
-
-        // Verify file content is correct
         let content = tokio::fs::read(&media_file.file_path).await.unwrap();
         assert_eq!(content, test_data);
 
-        // Verify idempotency: calling store_and_record again should succeed
+        // Idempotency
         let upload2 = MediaFileUpload {
             data: test_data,
             original_file_hash: None,
@@ -580,31 +623,24 @@ mod tests {
             scheme_version: None,
         };
         let media_file2 = media_files
-            .store_and_record(&pubkey, &group_id, "test.jpg", upload2)
+            .store_and_record(&t.pubkey, &group_id, "test.jpg", upload2)
             .await
             .unwrap();
 
-        // Should return the same path
         assert_eq!(media_file.file_path, media_file2.file_path);
     }
 
     #[tokio::test]
     async fn test_find_file_with_prefix() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
 
-        let media_files = MediaFiles::new(&storage, &db);
-
-        // Store files directly via storage
-        storage
+        t.storage
             .media_files
             .store_file("abc123.jpg", b"jpeg data")
             .await
             .unwrap();
 
-        // Find by prefix
         let found = media_files.find_file_with_prefix("abc123").await.unwrap();
         assert!(found.to_string_lossy().contains("abc123"));
     }
@@ -780,55 +816,22 @@ mod tests {
         assert!(thumbhash.is_none());
     }
 
-    /// Helper: creates a user + account row so media_files FK constraints pass
-    async fn create_test_account(db: &Database, pubkey: &PublicKey) {
-        sqlx::query("INSERT INTO users (pubkey, created_at, updated_at) VALUES (?, ?, ?)")
-            .bind(pubkey.to_hex())
-            .bind(chrono::Utc::now().timestamp())
-            .bind(chrono::Utc::now().timestamp())
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE pubkey = ?")
-            .bind(pubkey.to_hex())
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-
-        sqlx::query(
-            "INSERT INTO accounts (pubkey, user_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(pubkey.to_hex())
-        .bind(user_id)
-        .bind(chrono::Utc::now().timestamp())
-        .bind(chrono::Utc::now().timestamp())
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn test_cleanup_orphaned_files_deletes_unreferenced() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let t = setup().await;
 
-        // Put a file on disk with no DB record
-        storage
+        t.storage
             .media_files
             .store_file("orphan.jpg", b"orphan data")
             .await
             .unwrap();
 
-        let media_files = MediaFiles::new(&storage, &db);
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
         let deleted = media_files.cleanup_orphaned_files().await.unwrap();
 
         assert_eq!(deleted, 1);
         assert!(
-            storage
+            t.storage
                 .media_files
                 .find_file_with_prefix("orphan")
                 .await
@@ -838,18 +841,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_orphaned_files_keeps_referenced() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
 
         let group_id = GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
-        create_test_account(&db, &pubkey).await;
-
-        let media_files = MediaFiles::new(&storage, &db);
-
-        // Store file and record it in DB
         let upload = MediaFileUpload {
             data: b"referenced data",
             original_file_hash: None,
@@ -863,7 +858,7 @@ mod tests {
             scheme_version: None,
         };
         let record = media_files
-            .store_and_record(&pubkey, &group_id, "referenced.jpg", upload)
+            .store_and_record(&t.pubkey, &group_id, "referenced.jpg", upload)
             .await
             .unwrap();
 
@@ -875,18 +870,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_orphaned_files_mixed() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
 
         let group_id = GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
-        create_test_account(&db, &pubkey).await;
-
-        let media_files = MediaFiles::new(&storage, &db);
-
-        // Store a referenced file (has DB record)
         let upload = MediaFileUpload {
             data: b"keep me",
             original_file_hash: None,
@@ -900,12 +887,11 @@ mod tests {
             scheme_version: None,
         };
         let kept = media_files
-            .store_and_record(&pubkey, &group_id, "keep.png", upload)
+            .store_and_record(&t.pubkey, &group_id, "keep.png", upload)
             .await
             .unwrap();
 
-        // Store an orphan file (no DB record)
-        storage
+        t.storage
             .media_files
             .store_file("orphan.png", b"delete me")
             .await
@@ -916,7 +902,7 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(kept.file_path.exists());
         assert!(
-            storage
+            t.storage
                 .media_files
                 .find_file_with_prefix("orphan")
                 .await
@@ -926,12 +912,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_orphaned_files_empty_cache() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-        let storage = Storage::new(temp_dir.path()).await.unwrap();
-
-        let media_files = MediaFiles::new(&storage, &db);
+        let t = setup().await;
+        let media_files = MediaFiles::new(&t.storage, &t.shared, &t.account_pool);
         let deleted = media_files.cleanup_orphaned_files().await.unwrap();
 
         assert_eq!(deleted, 0);

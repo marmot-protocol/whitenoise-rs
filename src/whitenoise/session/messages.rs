@@ -363,9 +363,13 @@ impl<'a> MessageOpsForGroup<'a> {
         &self,
         mdk_message: &mdk_core::prelude::message_types::Message,
     ) -> Result<()> {
-        let media_files =
-            crate::whitenoise::media_files::MediaFile::find_by_group(self.db(), self.group_id)
-                .await?;
+        let media_files = crate::whitenoise::media_files::MediaFile::find_by_group(
+            &self.session.account_db.inner.pool,
+            self.db(),
+            self.pubkey(),
+            self.group_id,
+        )
+        .await?;
 
         let chat_message = self
             .session

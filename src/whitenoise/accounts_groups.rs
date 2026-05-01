@@ -631,14 +631,26 @@ impl Whitenoise {
         //    (MDK state and DB data are needed for build_chat_list_item)
         let chat_list_item = self.build_chat_list_item(account, group_id).await;
 
-        // 3. Delete all DB data in a transaction (fallible — must run before
+        // 3. Look up session for account-DB access
+        let session = self
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+
+        // 4. Delete all DB data in a transaction (fallible — must run before
         //    non-rollbackable MDK cleanup so a DB failure leaves state intact)
         self.shared
             .database
             .delete_chat_data(&account.pubkey, group_id)
             .await?;
 
-        // 4. Delete MDK group state for this account (best-effort)
+        // 4b. Delete per-account media_references for this group
+        sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
+            .bind(group_id.as_slice())
+            .execute(&session.account_db.inner.pool)
+            .await?;
+
+        // 5. Delete MDK group state for this account (best-effort)
         match self.create_mdk_for_account(account.pubkey) {
             Ok(mdk) => {
                 if let Err(e) = mdk.delete_group(group_id) {
@@ -658,10 +670,11 @@ impl Whitenoise {
             }
         }
 
-        // 5. Clean up orphaned media files from disk
+        // 6. Clean up orphaned media files from disk
         let media_files = crate::whitenoise::media_files::MediaFiles::new(
             &self.shared.storage,
             &self.shared.database,
+            &session.account_db.inner.pool,
         );
         if let Err(e) = media_files.cleanup_orphaned_files().await {
             tracing::warn!(

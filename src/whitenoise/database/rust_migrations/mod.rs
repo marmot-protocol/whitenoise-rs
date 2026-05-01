@@ -34,6 +34,8 @@ mod m0025_drop_shared_published_key_packages;
 mod m0026_drop_shared_published_events;
 mod m0027_drop_shared_account_follows;
 mod m0028_purge_account_processed_events;
+mod m0029_move_media_references;
+mod m0030_drop_shared_media_references;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -60,6 +62,7 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0026_drop_shared_published_events::Migration),
         Box::new(m0027_drop_shared_account_follows::Migration),
         Box::new(m0028_purge_account_processed_events::Migration),
+        Box::new(m0030_drop_shared_media_references::Migration),
     ]
 }
 
@@ -73,6 +76,7 @@ pub fn all_local_migrations() -> Vec<Box<dyn LocalMigration>> {
         Box::new(m0020_move_published_events::Migration),
         Box::new(m0021_move_processed_events::Migration),
         Box::new(m0022_move_account_follows::Migration),
+        Box::new(m0029_move_media_references::Migration),
     ]
 }
 

@@ -273,7 +273,17 @@ impl Whitenoise {
             hex::encode(group_id.as_slice())
         );
 
-        let media_files = MediaFile::find_by_group(&self.shared.database, group_id).await?;
+        let session = self
+            .account_manager
+            .get_session(pubkey)
+            .ok_or_else(|| crate::whitenoise::error::WhitenoiseError::AccountNotFound)?;
+        let media_files = MediaFile::find_by_group(
+            &session.account_db.inner.pool,
+            &self.shared.database,
+            pubkey,
+            group_id,
+        )
+        .await?;
 
         let processed_messages = self
             .shared

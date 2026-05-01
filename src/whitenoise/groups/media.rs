@@ -149,11 +149,22 @@ impl Whitenoise {
         note = "Use AccountSession::groups().media().get_media_files_for_group() instead."
     )]
     #[perf_instrument("media")]
-    pub async fn get_media_files_for_group(&self, group_id: &GroupId) -> Result<Vec<MediaFile>> {
-        // NOTE: Cannot delegate through session.groups().media() — this wrapper has no `account`
-        // parameter and therefore no session to look up. Both paths query the same DB table;
-        // this divergence is harmless until the method signature is updated in phase 15+.
-        MediaFile::find_by_group(&self.shared.database, group_id).await
+    pub async fn get_media_files_for_group(
+        &self,
+        account: &Account,
+        group_id: &GroupId,
+    ) -> Result<Vec<MediaFile>> {
+        let session = self
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        MediaFile::find_by_group(
+            &session.account_db.inner.pool,
+            &self.shared.database,
+            &account.pubkey,
+            group_id,
+        )
+        .await
     }
 
     #[deprecated(note = "Use AccountSession::groups().media().get_group_image_path() instead.")]

@@ -279,7 +279,7 @@ pub enum Request {
         file_hash: String,
     },
     #[serde(rename = "list_media")]
-    ListMedia { group_id: String },
+    ListMedia { account: String, group_id: String },
 
     // Streaming
     #[serde(rename = "messages_subscribe")]

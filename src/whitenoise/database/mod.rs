@@ -92,7 +92,7 @@ impl Database {
     /// migrations** (Phase 18c+): in shared-only mode the migrator skips
     /// locals but advances past their version numbers, so any global drop
     /// migration sitting after a local will fire before the local has run
-    /// for any account on disk. Use [`Self::open_without_migrations`] +
+    /// for any account on disk. Use `open_without_migrations` +
     /// `MIGRATOR.run_all` instead when there are accounts to migrate; the
     /// latter walks every per-account DB in lockstep with shared.
     ///
@@ -359,14 +359,8 @@ impl Database {
         .execute(&mut *txn)
         .await?;
 
-        sqlx::query(
-            "DELETE FROM media_references
-             WHERE account_pubkey = ? AND mls_group_id = ?",
-        )
-        .bind(&pubkey_hex)
-        .bind(mls_group_id.as_slice())
-        .execute(&mut *txn)
-        .await?;
+        // media_references now live in the per-account DB; the caller
+        // (delete_chat) deletes them there.
 
         // 2. Check if any other accounts still reference this group
         let (remaining,): (i64,) =
@@ -388,11 +382,6 @@ impl Database {
                 .await?;
 
             sqlx::query("DELETE FROM group_push_tokens WHERE mls_group_id = ?")
-                .bind(mls_group_id.as_slice())
-                .execute(&mut *txn)
-                .await?;
-
-            sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
                 .bind(mls_group_id.as_slice())
                 .execute(&mut *txn)
                 .await?;
@@ -554,10 +543,8 @@ mod tests {
             .await
             .expect("Failed to insert test media blob");
 
-        sqlx::query("INSERT INTO media_references (mls_group_id, account_pubkey, encrypted_file_hash, media_type, created_at) VALUES (x'deadbeef', 'test-pubkey', 'testhash', 'test', 1234567890)")
-            .execute(&db.pool)
-            .await
-            .expect("Failed to insert test media reference");
+        // media_references now lives in per-account DBs (moved by v29, dropped
+        // from shared by v30), so we only verify shared tables here.
 
         // Verify data exists
         let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
@@ -577,12 +564,6 @@ mod tests {
             .await
             .expect("Failed to count media blobs");
         assert_eq!(blob_count.0, 1);
-
-        let ref_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_references")
-            .fetch_one(&db.pool)
-            .await
-            .expect("Failed to count media references");
-        assert_eq!(ref_count.0, 1);
 
         // Delete all data
         let result = db.delete_all_data().await;
@@ -606,12 +587,6 @@ mod tests {
             .await
             .expect("Failed to count media blobs after deletion");
         assert_eq!(blob_count.0, 0);
-
-        let ref_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_references")
-            .fetch_one(&db.pool)
-            .await
-            .expect("Failed to count media references after deletion");
-        assert_eq!(ref_count.0, 0);
     }
 
     #[tokio::test]
@@ -735,7 +710,9 @@ mod tests {
         let table_names: Vec<String> = tables.into_iter().map(|t| t.0).collect();
         assert!(table_names.contains(&"accounts".to_string()));
         assert!(table_names.contains(&"media_blobs".to_string()));
-        assert!(table_names.contains(&"media_references".to_string()));
+        // media_references was moved to per-account DBs (v29) and dropped
+        // from shared (v30), so it should NOT exist here.
+        assert!(!table_names.contains(&"media_references".to_string()));
         assert!(table_names.contains(&"app_settings".to_string()));
     }
 

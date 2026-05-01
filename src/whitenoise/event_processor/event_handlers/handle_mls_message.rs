@@ -193,13 +193,22 @@ impl Whitenoise {
         inner_event: UnsignedEvent,
         message: Message,
     ) -> Result<()> {
+        let session = self
+            .account_manager
+            .get_session(&account.pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let media_files = crate::whitenoise::media_files::MediaFiles::new(
+            &self.shared.storage,
+            &self.shared.database,
+            &session.account_db.inner.pool,
+        );
+
         let parsed_references = {
             let media_manager = mdk.media_manager(group_id.clone());
-            self.media_files()
-                .parse_imeta_tags_from_event(&inner_event, &media_manager)?
+            media_files.parse_imeta_tags_from_event(&inner_event, &media_manager)?
         };
 
-        self.media_files()
+        media_files
             .store_parsed_media_references(&group_id, &account.pubkey, parsed_references)
             .await?;
 
@@ -499,7 +508,17 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<ChatMessage> {
-        let media_files = MediaFile::find_by_group(&self.shared.database, group_id).await?;
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
+        let media_files = MediaFile::find_by_group(
+            &session.account_db.inner.pool,
+            &self.shared.database,
+            account_pubkey,
+            group_id,
+        )
+        .await?;
 
         let mut chat_message = self
             .shared
