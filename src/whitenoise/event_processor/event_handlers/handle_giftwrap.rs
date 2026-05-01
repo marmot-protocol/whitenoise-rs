@@ -11,7 +11,6 @@ use crate::{
         accounts::Account,
         accounts_groups::AccountGroup,
         chat_list_streaming::ChatListUpdateTrigger,
-        database::published_key_packages::PublishedKeyPackage,
         error::{Result, WhitenoiseError},
         group_information::{GroupInformation, GroupType},
         session::AccountSession,
@@ -104,12 +103,11 @@ impl Whitenoise {
 
         // Pre-check: do we have this key package and is its key material still available?
         // This avoids expensive MLS crypto operations when the KP is unknown or deleted.
-        match PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &key_package_event_id.to_hex(),
-            &self.shared.database,
-        )
-        .await
+        match session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&key_package_event_id.to_hex())
+            .await
         {
             Ok(Some(pkg)) if pkg.key_material_deleted => {
                 tracing::warn!(
@@ -132,7 +130,7 @@ impl Whitenoise {
                     "Failed to look up key package: {}, rejecting Welcome",
                     e
                 );
-                return Err(e.into());
+                return Err(e);
             }
         }
 
@@ -197,14 +195,24 @@ impl Whitenoise {
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "Auto-accepted welcome, MLS membership finalized");
 
         // Spawn background task for remaining operations (DB writes, network calls)
-        // All operations are idempotent and failures are logged but don't stop other operations
+        // All operations are idempotent and failures are logged but don't stop other operations.
+        //
+        // Capture the `Arc<AccountSession>` here rather than re-resolving it
+        // inside the spawned task. If the user logs out between Welcome
+        // acceptance and the background rotation step, the session would
+        // disappear from the registry and `mark_consumed()` would silently
+        // skip — leaving the per-account `published_key_packages` row
+        // without `consumed_at`, which the maintenance task uses to decide
+        // when to delete key material.
         let tid = crate::perf::current_trace_id();
         let account_owned = account.clone();
+        let session_owned = session.clone();
         let whitenoise = self.arc()?;
         tokio::spawn(crate::perf::with_trace_id(tid, async move {
             Self::background_finalize_welcome(
                 whitenoise,
                 account_owned,
+                session_owned,
                 group_id,
                 group_name,
                 key_package_event_id,
@@ -222,6 +230,7 @@ impl Whitenoise {
     async fn background_finalize_welcome(
         whitenoise: Arc<Whitenoise>,
         account: Account,
+        session: Arc<AccountSession>,
         group_id: GroupId,
         group_name: String,
         key_package_event_id: EventId,
@@ -230,6 +239,7 @@ impl Whitenoise {
         Self::finalize_welcome_with_instance(
             &whitenoise,
             &account,
+            &session,
             &group_id,
             &group_name,
             key_package_event_id,
@@ -257,6 +267,7 @@ impl Whitenoise {
     pub(crate) async fn finalize_welcome_with_instance(
         whitenoise: &Whitenoise,
         account: &Account,
+        session: &Arc<AccountSession>,
         group_id: &GroupId,
         group_name: &str,
         key_package_event_id: EventId,
@@ -293,7 +304,7 @@ impl Whitenoise {
         // --- Step 2: independent operations (run concurrently regardless of subscription status) ---
         let (group_info_result, key_rotation_result, image_sync_result, welcomer_user_result) = tokio::join!(
             Self::create_group_info(whitenoise, group_id, group_name),
-            Self::rotate_key_package(whitenoise, account, key_package_event_id),
+            Self::rotate_key_package(whitenoise, account, session, key_package_event_id),
             Self::sync_group_image(whitenoise, account, group_id),
             Self::ensure_welcomer_user_exists(whitenoise, welcomer_pubkey),
         );
@@ -396,16 +407,18 @@ impl Whitenoise {
     async fn rotate_key_package(
         whitenoise: &Whitenoise,
         account: &Account,
+        session: &Arc<AccountSession>,
         key_package_event_id: EventId,
     ) -> Result<()> {
         // Mark the key package as consumed so the maintenance task knows
-        // to clean up local key material after the quiet period.
-        if let Err(e) = PublishedKeyPackage::mark_consumed(
-            &account.pubkey,
-            &key_package_event_id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
+        // to clean up local key material after the quiet period. Uses the
+        // captured session reference so logout between Welcome accept and
+        // this rotation cannot drop the consumed-at write.
+        if let Err(e) = session
+            .repos
+            .published_key_packages
+            .mark_consumed(&key_package_event_id.to_hex())
+            .await
         {
             tracing::warn!(
                 target: "whitenoise::event_processor::process_welcome::background",
@@ -847,11 +860,13 @@ mod tests {
             .await
             .unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         // Run finalize_welcome_with_instance - it should complete without panic
         // Some operations may fail (e.g., group not in MLS) but the function handles errors gracefully
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
+            &session,
             &group_id,
             group_name,
             EventId::all_zeros(),
@@ -887,10 +902,12 @@ mod tests {
             .await
             .unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         // Run twice - should not panic
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
+            &session,
             &group_id,
             group_name,
             EventId::all_zeros(),
@@ -901,6 +918,7 @@ mod tests {
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
+            &session,
             &group_id,
             group_name,
             EventId::all_zeros(),
@@ -947,10 +965,12 @@ mod tests {
         let group_id = group.mls_group_id.clone();
         let epoch_after_welcome = group.epoch;
 
+        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
         // Run finalize_welcome_with_instance which includes perform_self_update
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &member_account,
+            &member_session,
             &group_id,
             &group.name,
             EventId::all_zeros(),
@@ -1020,10 +1040,12 @@ mod tests {
         assert!(!groups.is_empty(), "Member should have a group in MDK");
         let group = &groups[0];
 
+        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
         // Run finalize_welcome_with_instance
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &member_account,
+            &member_session,
             &group.mls_group_id,
             &group.name,
             EventId::all_zeros(),
@@ -1075,10 +1097,12 @@ mod tests {
             .remove_private_key_for_pubkey(&account.pubkey)
             .unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         // Should complete without panic despite missing signer
         Whitenoise::finalize_welcome_with_instance(
             &whitenoise,
             &account,
+            &session,
             &group_id,
             "Test Group",
             EventId::all_zeros(),
@@ -1113,9 +1137,10 @@ mod tests {
         let giftwrap_event =
             build_welcome_giftwrap(&whitenoise, &creator_account, member_account.pubkey).await;
 
-        // Corrupt the database by dropping the published_key_packages table
+        // Corrupt the per-account database by dropping the published_key_packages
+        // table. The table lives in the account DB after the 18c split.
         sqlx::query("DROP TABLE published_key_packages")
-            .execute(&whitenoise.shared.database.pool)
+            .execute(&member_session.account_db.inner.pool)
             .await
             .unwrap();
 

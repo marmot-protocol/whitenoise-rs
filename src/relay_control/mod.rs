@@ -67,6 +67,7 @@ impl RelayControlPlane {
         discovery_relays: Vec<RelayUrl>,
         event_sender: Sender<ProcessableEvent>,
         session_salt: [u8; 16],
+        event_tracker: Arc<dyn crate::whitenoise::event_tracker::EventTracker>,
     ) -> Self {
         let observability = observability::RelayObservability::new(
             observability::RelayObservabilityConfig::default(),
@@ -81,6 +82,7 @@ impl RelayControlPlane {
             database.clone(),
             event_sender.clone(),
             observability.clone(),
+            event_tracker,
         );
 
         Self {
@@ -661,8 +663,13 @@ mod tests {
     async fn test_telemetry_persistor_records_events_and_status() {
         let database = Arc::new(setup_test_db().await);
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
-        let relay_control =
-            RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
+        let relay_control = RelayControlPlane::new(
+            database.clone(),
+            Vec::new(),
+            event_sender,
+            [1; 16],
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker),
+        );
         let (telemetry_sender, telemetry_receiver) = broadcast::channel(8);
         relay_control
             .spawn_telemetry_persistor("test", telemetry_receiver)
@@ -782,7 +789,13 @@ mod tests {
     async fn test_snapshot_includes_ephemeral_plane() {
         let database = Arc::new(setup_test_db().await);
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
-        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+        let relay_control = RelayControlPlane::new(
+            database,
+            Vec::new(),
+            event_sender,
+            [1; 16],
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker),
+        );
 
         let snapshot = relay_control.snapshot(vec![]).await;
 
@@ -795,8 +808,13 @@ mod tests {
     async fn test_spawn_telemetry_persistor_replaces_same_key() {
         let database = Arc::new(setup_test_db().await);
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
-        let relay_control =
-            RelayControlPlane::new(database.clone(), Vec::new(), event_sender, [1; 16]);
+        let relay_control = RelayControlPlane::new(
+            database.clone(),
+            Vec::new(),
+            event_sender,
+            [1; 16],
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker),
+        );
         let relay_url = RelayUrl::parse("wss://relay.example.com").unwrap();
         let (sender1, receiver1) = broadcast::channel(8);
         let (sender2, receiver2) = broadcast::channel(8);
@@ -859,7 +877,13 @@ mod tests {
     async fn test_shutdown_all_clears_all_ephemeral_scopes() {
         let database = Arc::new(setup_test_db().await);
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
-        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+        let relay_control = RelayControlPlane::new(
+            database,
+            Vec::new(),
+            event_sender,
+            [1; 16],
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker),
+        );
         let anonymous_relay = RelayUrl::parse("ws://127.0.0.1:1").unwrap();
         let account_relay = RelayUrl::parse("ws://127.0.0.1:2").unwrap();
         let account_pubkey = nostr_sdk::Keys::generate().public_key();
@@ -886,7 +910,13 @@ mod tests {
     async fn test_shutdown_all_resets_telemetry_persistor_start_gate() {
         let database = Arc::new(setup_test_db().await);
         let (event_sender, _) = tokio::sync::mpsc::channel(8);
-        let relay_control = RelayControlPlane::new(database, Vec::new(), event_sender, [1; 16]);
+        let relay_control = RelayControlPlane::new(
+            database,
+            Vec::new(),
+            event_sender,
+            [1; 16],
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker),
+        );
 
         relay_control.start_telemetry_persistors().await;
         assert!(

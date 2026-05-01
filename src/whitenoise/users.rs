@@ -102,8 +102,10 @@ impl User {
         newly_created: bool,
         database: &crate::whitenoise::database::Database,
     ) -> Result<bool> {
-        // Check if we've already processed this specific event from this author
-        let already_processed = ProcessedEvent::exists(&event.id, None, database)
+        // Check if we've already processed this specific event from this author.
+        // Metadata events live in the global-scoped table — author identity is
+        // tracked via the `author` column, not `account_pubkey`.
+        let already_processed = ProcessedEvent::exists_global(&event.id, database)
             .await
             .map_err(WhitenoiseError::Database)?;
 
@@ -142,7 +144,7 @@ impl User {
 
         // Check timestamp against most recent processed metadata event for this specific user
         let newest_processed_timestamp =
-            ProcessedEvent::newest_event_timestamp_for_kind(None, 0, Some(&self.pubkey), database)
+            ProcessedEvent::newest_global_event_timestamp_for_kind(0, Some(&self.pubkey), database)
                 .await
                 .map_err(WhitenoiseError::Database)?;
 
@@ -1358,11 +1360,10 @@ mod tests {
             let event = create_test_metadata_event(None).await;
 
             // First, create a processed event entry
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
                 &whitenoise.shared.database,
             )
@@ -1442,11 +1443,10 @@ mod tests {
             user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create an older processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &old_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(old_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
                 &whitenoise.shared.database,
             )
@@ -1477,11 +1477,10 @@ mod tests {
             user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &old_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(old_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
                 &whitenoise.shared.database,
             )
@@ -1515,11 +1514,10 @@ mod tests {
             user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a newer processed event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &newer_event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(newer_event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
                 &whitenoise.shared.database,
             )
@@ -1553,11 +1551,10 @@ mod tests {
             user.save(&whitenoise.shared.database).await.unwrap();
 
             // Create a processed event entry for this exact event
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &event.id,
-                None, // Global events
                 Some(timestamp_to_datetime(event.created_at).unwrap()),
-                Some(Kind::Metadata), // Metadata kind
+                Some(Kind::Metadata),
                 Some(&user.pubkey),
                 &whitenoise.shared.database,
             )
@@ -1749,9 +1746,8 @@ mod tests {
                 .unwrap();
 
             let newer_timestamp = Utc::now();
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(newer_timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),
@@ -1809,9 +1805,8 @@ mod tests {
                 .unwrap();
 
             let old_timestamp = Utc::now() - Duration::hours(2);
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(old_timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),
@@ -1869,9 +1864,8 @@ mod tests {
                 .unwrap();
 
             let timestamp = Utc::now() - Duration::hours(1);
-            ProcessedEvent::create(
+            ProcessedEvent::create_global(
                 &EventId::all_zeros(),
-                None,
                 Some(timestamp),
                 Some(Kind::from(10002)),
                 Some(&test_pubkey),

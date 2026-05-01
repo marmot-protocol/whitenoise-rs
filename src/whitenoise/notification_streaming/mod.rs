@@ -180,7 +180,11 @@ impl Whitenoise {
     /// Returns whether notifications are enabled for `account`. Fail-open on error.
     #[perf_instrument("notification_streaming")]
     async fn are_notifications_enabled(&self, account: &Account) -> bool {
-        AccountSettings::notifications_enabled_for_pubkey(&account.pubkey, &self.shared.database)
+        let Some(session) = self.session(&account.pubkey) else {
+            // No active session → no per-account DB to read. Fail-open.
+            return true;
+        };
+        AccountSettings::notifications_enabled(&session.account_db)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -500,13 +504,14 @@ mod tests {
         let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Disable notifications
-        AccountSettings::update_notifications_enabled(
-            &account.pubkey,
-            false,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .repos
+            .settings
+            .update_notifications_enabled(false)
+            .await
+            .unwrap();
 
         let external_sender = Keys::generate().public_key();
         let message = create_test_message(external_sender, "Should not arrive");
@@ -562,13 +567,14 @@ mod tests {
         let mut rx = whitenoise.shared.notification_stream_manager.subscribe();
 
         // Disable notifications
-        AccountSettings::update_notifications_enabled(
-            &account.pubkey,
-            false,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        whitenoise
+            .session(&account.pubkey)
+            .unwrap()
+            .repos
+            .settings
+            .update_notifications_enabled(false)
+            .await
+            .unwrap();
 
         let welcomer = Keys::generate().public_key();
         let group_id = GroupId::from_slice(&[13u8; 32]);

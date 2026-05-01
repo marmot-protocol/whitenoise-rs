@@ -27,6 +27,7 @@ pub use self::push_registrations::PushRegistrationsRepo;
 pub use self::settings::AccountSettingsRepo;
 
 use crate::whitenoise::database::Database;
+use crate::whitenoise::database::account_db::AccountDatabase;
 
 /// All per-account repositories, bundled together for ergonomic access from
 /// [`AccountSession`](crate::whitenoise::session::AccountSession).
@@ -47,19 +48,18 @@ pub struct AccountRepositories {
 }
 
 impl AccountRepositories {
-    /// Construct repositories for `account_pubkey` backed by `db`.
-    ///
-    /// Returns an error if no account row exists for `account_pubkey` (required
-    /// by [`AccountFollowsRepo`] to resolve the integer account id).
+    /// Construct repositories for `account_pubkey` backed by `db` (shared) and
+    /// `account_db` (per-account).
     pub(crate) async fn new(
         account_pubkey: PublicKey,
         db: Arc<Database>,
+        account_db: Arc<AccountDatabase>,
     ) -> crate::whitenoise::error::Result<Self> {
         Ok(Self {
-            drafts: DraftsRepo::new(account_pubkey, db.clone()),
-            settings: AccountSettingsRepo::new(account_pubkey, db.clone()),
-            follows: AccountFollowsRepo::new(account_pubkey, db.clone()).await?,
-            published_key_packages: PublishedKeyPackagesRepo::new(account_pubkey, db.clone()),
+            drafts: DraftsRepo::new(account_db.clone()),
+            settings: AccountSettingsRepo::new(account_db.clone()),
+            follows: AccountFollowsRepo::new(account_db.clone(), db.clone()),
+            published_key_packages: PublishedKeyPackagesRepo::new(account_db),
             push_registrations: PushRegistrationsRepo::new(account_pubkey, db.clone()),
             group_push_tokens: GroupPushTokensRepo::new(account_pubkey, db),
         })

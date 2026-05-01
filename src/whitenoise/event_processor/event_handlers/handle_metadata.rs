@@ -189,9 +189,8 @@ mod tests {
         };
         user.save(&whitenoise.shared.database).await.unwrap();
 
-        ProcessedEvent::create(
+        ProcessedEvent::create_global(
             &event.id,
-            None,
             Some(Utc::now()),
             Some(Kind::Metadata),
             Some(&keys.public_key()),

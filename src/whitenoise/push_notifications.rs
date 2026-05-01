@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::whitenoise::{
     Whitenoise, WhitenoiseConfig,
-    account_settings::AccountSettings,
     accounts::Account,
     accounts_groups::AccountGroup,
     database::Database,
@@ -684,18 +683,22 @@ impl Whitenoise {
             .flatten();
         let new_token_tag = pending_registration.token_tag()?;
 
+        // Validate the session and notification preference BEFORE persisting
+        // the upsert. If the session lookup fails, we don't want a stale
+        // push_registrations row to outlive the missing session.
+        let notifications_enabled = self
+            .require_session(&account.pubkey)?
+            .repos
+            .settings
+            .notifications_enabled()
+            .await?;
+
         let registration = PushRegistration::upsert(
             &account.pubkey,
             platform,
             raw_token,
             server_pubkey,
             relay_hint,
-            &self.shared.database,
-        )
-        .await?;
-
-        let notifications_enabled = AccountSettings::notifications_enabled_for_pubkey(
-            &account.pubkey,
             &self.shared.database,
         )
         .await?;
@@ -902,6 +905,19 @@ impl Whitenoise {
         group_id: &GroupId,
         request_event_id: &EventId,
     ) -> bool {
+        // Production code now writes to the per-session map; the legacy
+        // shared-services map (kept under #[cfg(test)] for the
+        // `insert_pending_token_response_for_test` shim) is never populated
+        // by real handlers. Read from the session first, then fall back to
+        // the legacy map for tests that still seed via the shim.
+        if let Some(session) = self.session(account_pubkey)
+            && session
+                .pending_push_token_responses
+                .contains_key(&(group_id.clone(), *request_event_id))
+        {
+            return true;
+        }
+
         self.shared.pending_push_token_responses.contains_key(&(
             *account_pubkey,
             group_id.clone(),
@@ -1588,6 +1604,7 @@ mod tests {
             whitenoise.shared.database.clone(),
             whitenoise.event_sender.clone(),
             whitenoise.shared.relay_control.observability().clone(),
+            whitenoise.shared.event_tracker.clone(),
         )
     }
 

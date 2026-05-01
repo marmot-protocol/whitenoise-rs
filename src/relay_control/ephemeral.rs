@@ -16,10 +16,10 @@ use crate::{
     perf_instrument,
     types::{EphemeralPlaneStateSnapshot, ProcessableEvent},
     whitenoise::{
-        accounts::Account,
         aggregated_message::AggregatedMessage,
-        database::{Database, published_events::PublishedEvent},
+        database::Database,
         error::WhitenoiseError,
+        event_tracker::EventTracker,
         key_packages::{
             MLS_KEY_PACKAGE_KIND, MLS_KEY_PACKAGE_KIND_LEGACY, REQUIRED_MLS_CIPHERSUITE_TAG,
             is_key_package_kind, validate_marmot_key_package_tags,
@@ -71,11 +71,25 @@ impl Default for EphemeralPlaneConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct EphemeralPlane {
     config: EphemeralPlaneConfig,
-    database: Arc<Database>,
     executor: EphemeralExecutor,
+    /// Used to record successful publishes against the publisher's per-account
+    /// `published_events` table (post-Phase 18c the table lives there, not in
+    /// shared). Routed via the trait so the plane doesn't need a
+    /// `Weak<Whitenoise>`.
+    event_tracker: Arc<dyn EventTracker>,
+}
+
+impl std::fmt::Debug for EphemeralPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EphemeralPlane")
+            .field("config", &self.config)
+            .field("executor", &self.executor)
+            .field("event_tracker", &"<dyn EventTracker>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,8 +130,10 @@ impl EphemeralPlane {
         database: Arc<Database>,
         event_sender: Sender<ProcessableEvent>,
         observability: RelayObservability,
+        event_tracker: Arc<dyn EventTracker>,
     ) -> Self {
         Self {
+            event_tracker,
             executor: EphemeralExecutor::new(
                 EphemeralExecutorConfig {
                     timeout: config.timeout,
@@ -125,12 +141,11 @@ impl EphemeralPlane {
                     auth_policy: config.auth_policy,
                     ad_hoc_relay_ttl: config.ad_hoc_relay_ttl,
                 },
-                database.clone(),
+                database,
                 event_sender,
                 observability,
             ),
             config,
-            database,
         }
     }
 
@@ -690,16 +705,8 @@ impl EphemeralPlane {
         event_id: &EventId,
         account_pubkey: &PublicKey,
     ) -> Result<()> {
-        let account = Account::find_by_pubkey(account_pubkey, &self.database)
-            .await
-            .map_err(|error| NostrManagerError::FailedToTrackPublishedEvent(error.to_string()))?;
-        let account_id = account.id.ok_or_else(|| {
-            NostrManagerError::FailedToTrackPublishedEvent(
-                "Account missing id while tracking ephemeral publish".to_string(),
-            )
-        })?;
-
-        PublishedEvent::create(event_id, account_id, &self.database)
+        self.event_tracker
+            .track_published_event(event_id, account_pubkey)
             .await
             .map_err(|error| NostrManagerError::FailedToTrackPublishedEvent(error.to_string()))?;
 
@@ -981,11 +988,14 @@ mod tests {
 
     fn test_plane(database: Arc<Database>, config: EphemeralPlaneConfig) -> EphemeralPlane {
         let (event_sender, _) = mpsc::channel(16);
+        let tracker: Arc<dyn crate::whitenoise::event_tracker::EventTracker> =
+            Arc::new(crate::whitenoise::event_tracker::NoEventTracker);
         EphemeralPlane::new(
             config,
             database,
             event_sender,
             RelayObservability::new(RelayObservabilityConfig::default()),
+            tracker,
         )
     }
 

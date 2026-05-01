@@ -175,8 +175,13 @@ pub struct Whitenoise {
 /// `ENSURE_INITIALIZED_LOCK` mutex without losing the race-free guarantee.
 static GLOBAL_WHITENOISE: OnceCell<Arc<Whitenoise>> = OnceCell::const_new();
 
+/// Marker carried in [`WhitenoiseComponents`] to defer construction of the
+/// standard [`WhitenoiseEventTracker`] until inside `Arc::new_cyclic`, where
+/// the `Weak<Whitenoise>` is available.
+struct UseWhitenoiseEventTracker;
+
 struct WhitenoiseComponents {
-    event_tracker: std::sync::Arc<dyn event_tracker::EventTracker>,
+    event_tracker: UseWhitenoiseEventTracker,
     secrets_store: SecretsStore,
     storage: storage::Storage,
     message_aggregator: message_aggregator::MessageAggregator,
@@ -200,6 +205,75 @@ impl std::fmt::Debug for Whitenoise {
 }
 
 impl Whitenoise {
+    /// Enumerate every persisted account that has either a row in
+    /// `shared.accounts` or a per-account DB file under `<data_dir>/accounts/`,
+    /// open each one without running migrations, and return the pool plus its
+    /// hex pubkey.
+    ///
+    /// Used at boot before [`crate::whitenoise::database::rust_migrations::MIGRATOR::run_all`]
+    /// so the unified timeline can apply per-account local copies in lockstep
+    /// with the shared global drops that depend on them.
+    ///
+    /// Resilient to fresh installs (no `accounts` table yet) and to accounts
+    /// that exist in shared but have no per-account file yet (the file is
+    /// created by `open_without_migrations` so the bootstrap can stamp it
+    /// later).
+    async fn enumerate_account_pools(
+        shared: &Database,
+        data_dir: &Path,
+    ) -> Result<Vec<(sqlx::SqlitePool, String)>> {
+        use std::collections::HashSet;
+
+        let accounts_dir = data_dir.join("accounts");
+        std::fs::create_dir_all(&accounts_dir)?;
+
+        // Best-effort read of `accounts.pubkey`. Fresh installs (no table yet)
+        // return an empty list; that's fine — there's nothing to migrate.
+        let mut pubkeys: HashSet<String> =
+            match sqlx::query_scalar::<_, String>("SELECT pubkey FROM accounts")
+                .fetch_all(&shared.pool)
+                .await
+            {
+                Ok(rows) => rows.into_iter().collect(),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "whitenoise::new",
+                        "No accounts table yet (fresh install or pre-bridge): {e}"
+                    );
+                    HashSet::new()
+                }
+            };
+
+        // Also include any per-account DB files on disk that aren't in
+        // `shared.accounts` — orphan files still deserve their own migration
+        // pass so a stale row never gets dropped without copying.
+        if let Ok(entries) = std::fs::read_dir(&accounts_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("db") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    pubkeys.insert(stem.to_string());
+                }
+            }
+        }
+
+        let mut pools = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let path = accounts_dir.join(format!("{pubkey}.db"));
+            let db = Database::open_without_migrations(path).await?;
+            pools.push((db.pool, pubkey));
+        }
+
+        tracing::info!(
+            target: "whitenoise::new",
+            "Enumerated {} per-account database(s) for migration lockstep",
+            pools.len()
+        );
+        Ok(pools)
+    }
+
     fn from_components(
         config: WhitenoiseConfig,
         database: Arc<Database>,
@@ -207,31 +281,52 @@ impl Whitenoise {
     ) -> Arc<Self> {
         let mut session_salt = [0u8; 16];
         ::rand::rng().fill_bytes(&mut session_salt);
-        let relay_control = Arc::new(RelayControlPlane::new(
-            database.clone(),
-            config.discovery_relays.clone(),
-            components.event_sender.clone(),
-            session_salt,
-        ));
+        let discovery_relays = config.discovery_relays.clone();
 
-        let shared = Arc::new(shared::SharedServices::new(
-            Arc::new(config),
-            database,
-            relay_control,
-            components.event_tracker,
-            components.secrets_store,
-            components.storage,
-            components.message_aggregator,
-        ));
+        let WhitenoiseComponents {
+            event_tracker,
+            secrets_store,
+            storage,
+            message_aggregator,
+            event_sender,
+            shutdown_sender,
+            scheduler_shutdown,
+        } = components;
 
-        Arc::new_cyclic(|weak: &Weak<Self>| Self {
-            shared,
-            event_sender: components.event_sender,
-            shutdown_sender: components.shutdown_sender,
-            scheduler_shutdown: components.scheduler_shutdown,
-            scheduler_handles: Mutex::new(Vec::new()),
-            account_manager: session::AccountManager::default(),
-            this: weak.clone(),
+        let config = Arc::new(config);
+
+        Arc::new_cyclic(move |weak: &Weak<Self>| {
+            let UseWhitenoiseEventTracker = event_tracker;
+            let event_tracker_arc: std::sync::Arc<dyn event_tracker::EventTracker> =
+                Arc::new(WhitenoiseEventTracker::new(database.clone(), weak.clone()));
+
+            let relay_control = Arc::new(RelayControlPlane::new(
+                database.clone(),
+                discovery_relays,
+                event_sender.clone(),
+                session_salt,
+                event_tracker_arc.clone(),
+            ));
+
+            let shared = Arc::new(shared::SharedServices::new(
+                config,
+                database,
+                relay_control,
+                event_tracker_arc,
+                secrets_store,
+                storage,
+                message_aggregator,
+            ));
+
+            Self {
+                shared,
+                event_sender,
+                shutdown_sender,
+                scheduler_shutdown,
+                scheduler_handles: Mutex::new(Vec::new()),
+                account_manager: session::AccountManager::default(),
+                this: weak.clone(),
+            }
         })
     }
 
@@ -453,13 +548,32 @@ impl Whitenoise {
 
         init_timing::record("directories_and_logging");
 
-        let database = Arc::new(Database::new(data_dir.join("whitenoise.sqlite")).await?);
+        // Open shared without running migrations yet. The unified migration
+        // timeline contains global drops (v21–v26) that depend on per-account
+        // local copies (v15–v20) running first. If we let `Database::new` walk
+        // the timeline now (with `account = None`), locals get skipped and the
+        // drops fire on shared rows that were never copied to per-account DBs
+        // — losing every existing account's data on the first 18c boot.
+        //
+        // Instead: open shared and every persisted account's DB unmigrated,
+        // then call `MIGRATOR.run_all` so the framework walks one version at
+        // a time, applying each local to every account in lockstep with its
+        // surrounding globals. This is the X→A→Y ordering the unified
+        // timeline was designed for.
+        let database =
+            Arc::new(Database::open_without_migrations(data_dir.join("whitenoise.sqlite")).await?);
+
+        let account_pools = Self::enumerate_account_pools(&database, &data_dir).await?;
+        crate::whitenoise::database::rust_migrations::MIGRATOR
+            .run_all(&database.pool, &account_pools)
+            .await?;
+        // Drop the per-account pools now that migrations are committed; sessions
+        // will re-open them on bring-up. `run_account_migrations` is then a
+        // no-op on already-stamped versions and only fires the bootstrap (v12)
+        // for any account file created post-boot (e.g. fresh login).
+        drop(account_pools);
 
         init_timing::record("database");
-
-        // Create the event tracker.
-        let event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
-            Arc::new(WhitenoiseEventTracker::new(database.clone()));
 
         // Create SecretsStore backed by the platform keyring-core store
         let secrets_store = SecretsStore::new(&keyring_service_id);
@@ -478,7 +592,7 @@ impl Whitenoise {
             config,
             database,
             WhitenoiseComponents {
-                event_tracker,
+                event_tracker: UseWhitenoiseEventTracker,
                 secrets_store,
                 storage,
                 message_aggregator,
@@ -585,7 +699,12 @@ impl Whitenoise {
 
         // Restore account sessions for all persisted accounts before setting up
         // subscriptions so that each account has an MDK instance ready.
-        whitenoise
+        // Migrations were already applied in lockstep across shared and every
+        // on-disk per-account file via `MIGRATOR.run_all` at the top of
+        // `Whitenoise::new`, so `run_account_migrations` here is a no-op for
+        // already-stamped versions. Only newly-created accounts (e.g. first
+        // login post-boot) need it to fire the bootstrap migration.
+        let _ = whitenoise
             .account_manager
             .restore_sessions(&whitenoise)
             .await;
@@ -914,10 +1033,6 @@ pub mod test_utils {
         let (shutdown_sender, _shutdown_receiver) = mpsc::channel(1);
         let (scheduler_shutdown, _scheduler_shutdown_rx) = watch::channel(false);
 
-        // Create the event tracker.
-        let test_event_tracker: std::sync::Arc<dyn event_tracker::EventTracker> =
-            Arc::new(event_tracker::WhitenoiseEventTracker::new(database.clone()));
-
         // Create Storage
         let storage = storage::Storage::new(data_temp.path()).await.unwrap();
 
@@ -927,7 +1042,7 @@ pub mod test_utils {
             config,
             database,
             WhitenoiseComponents {
-                event_tracker: test_event_tracker,
+                event_tracker: UseWhitenoiseEventTracker,
                 secrets_store,
                 storage,
                 message_aggregator,
@@ -990,13 +1105,17 @@ pub mod test_utils {
         whitenoise: &Whitenoise,
         account: &Account,
     ) -> usize {
-        let account_id = account.id.expect("account must be persisted");
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM published_events WHERE account_id = ?")
-                .bind(account_id)
-                .fetch_one(&whitenoise.shared.database.pool)
-                .await
-                .unwrap();
+        // Phase 18c moved `published_events` into the per-account DB; the
+        // table no longer exists in shared. Read from the session's account_db
+        // (it has no `account_pubkey`/`account_id` filter — the file is the
+        // scope).
+        let session = whitenoise
+            .session(&account.pubkey)
+            .expect("account must have an active session");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM published_events")
+            .fetch_one(&session.account_db.inner.pool)
+            .await
+            .unwrap();
 
         usize::try_from(count.0).unwrap()
     }
@@ -1283,9 +1402,11 @@ pub mod test_utils {
             .unwrap()
             .expect("member should have group after welcome")
             .name;
+        let member_session = whitenoise.session(&member_account.pubkey).unwrap();
         Whitenoise::finalize_welcome_with_instance(
             whitenoise,
             member_account,
+            &member_session,
             &group_id,
             &group_name,
             EventId::all_zeros(),

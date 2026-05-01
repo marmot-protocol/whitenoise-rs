@@ -98,10 +98,21 @@ impl GroupInformation {
         match Self::find_by_mls_group_id(mls_group_id, database).await {
             Ok(group_info) => Ok((group_info, false)),
             Err(WhitenoiseError::SqlxError(sqlx::Error::RowNotFound)) => {
-                let group_info =
-                    Self::insert_new(mls_group_id, group_type.unwrap_or_default(), database)
-                        .await?;
-                Ok((group_info, true))
+                match Self::insert_new(mls_group_id, group_type.unwrap_or_default(), database).await
+                {
+                    Ok(group_info) => Ok((group_info, true)),
+                    // TOCTOU: a concurrent caller (e.g. the giftwrap
+                    // background-finalize task) may have inserted the row
+                    // between our SELECT and INSERT. Re-find and treat as
+                    // existing rather than panicking on UNIQUE violation.
+                    Err(WhitenoiseError::SqlxError(sqlx::Error::Database(db_err)))
+                        if db_err.is_unique_violation() =>
+                    {
+                        let existing = Self::find_by_mls_group_id(mls_group_id, database).await?;
+                        Ok((existing, false))
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }

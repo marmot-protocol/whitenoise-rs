@@ -414,12 +414,12 @@ pub(super) async fn check_cached_follows_batch(
     let mut results: HashMap<PublicKey, Vec<PublicKey>> = HashMap::new();
     let mut remaining: HashSet<PublicKey> = pubkeys.iter().copied().collect();
 
-    // 1. Check local accounts
+    // 1. Check local accounts (per-account follow lists live in their session DB).
     for pk in pubkeys {
-        if let Ok(account) = Account::find_by_pubkey(pk, &whitenoise.shared.database).await
-            && let Ok(follows) = account.follows(&whitenoise.shared.database).await
+        if let Some(session) = whitenoise.session(pk)
+            && let Ok(follows) = session.repos.follows.follow_pubkeys().await
         {
-            results.insert(*pk, follows.into_iter().map(|u| u.pubkey).collect());
+            results.insert(*pk, follows);
             remaining.remove(pk);
         }
     }

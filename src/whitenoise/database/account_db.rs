@@ -1,11 +1,13 @@
-//! Per-account database wrapper — future home of the account-scoped SQLite file.
+//! Per-account database wrapper — owns the account-scoped SQLite file.
 //!
-//! This is a scaffold for the Phase 18 database split. See
-//! `docs/session-projection-implementation-plan.md` for the full table
-//! ownership audit and migration plan.
+//! See `docs/session-projection-implementation-plan.md` for the full table
+//! ownership audit and the per-phase migration plan.
 //!
-//! **Current status:** thin newtype over [`Database`]. No tables have moved
-//! yet; the physical split happens in Phases 18b–18e.
+//! **Current status (Phase 18c shipped):** physically separate file per
+//! account holding `account_settings`, `drafts`, `published_key_packages`,
+//! `published_events`, `account_follows`, and the account-scoped subset of
+//! `processed_events`. Phase 18d will move membership and push tables;
+//! 18e moves message projections.
 
 use std::path::PathBuf;
 
@@ -28,28 +30,18 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 ///
 /// # Cross-scope FK audit
 ///
-/// These FKs cross the account/shared boundary and will require
-/// application-level enforcement after the physical split in Phases 18b–18e:
+/// These FKs cross the account/shared boundary and require application-level
+/// enforcement after the physical split. Phase 18c moved
+/// `account_settings`, `drafts`, `published_key_packages`, `published_events`,
+/// and `account_follows` out of shared (their FKs are no longer relevant).
+/// Phase 18d/18e will move the rest.
 ///
-/// ## Integer-keyed FKs (require schema migration before split)
-///
-/// These use `accounts(id)` (integer rowid) as the FK target. Integer IDs
-/// from `shared.sqlite` won't transfer meaningfully to per-account files,
-/// so these tables need a schema migration to switch to pubkey-keyed FKs
-/// before the physical split:
-///
-/// - `published_events.account_id → accounts(id)` (migration 0011)
-/// - `processed_events.account_id → accounts(id)` (migration 0012)
-///
-/// ## Pubkey-keyed FKs (application-level enforcement only)
+/// ## Pubkey-keyed FKs (application-level enforcement only — Phase 18d)
 ///
 /// - `accounts_groups.account_pubkey → accounts.pubkey` (migration 0018)
-/// - `account_settings.account_pubkey → accounts.pubkey`
 /// - `media_files.account_pubkey → accounts.pubkey` (migration 0015)
 /// - `push_registrations.account_pubkey → accounts.pubkey` (migration 0039)
 /// - `group_push_tokens.account_pubkey → accounts.pubkey` (migration 0041)
-/// - `published_key_packages.account_pubkey → accounts.pubkey` (migration 0029)
-/// - `drafts.account_pubkey → accounts.pubkey` (migration 0028)
 ///
 /// ## Cross-scope data references (no schema FK, but logical dependency)
 ///
@@ -57,9 +49,6 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 ///   (`group_information` is shared; `aggregated_messages` is account-scoped)
 /// - `media_references.encrypted_file_hash → media_blobs.hash`
 ///   (`media_blobs` is shared; `media_references` is account-scoped)
-/// - `drafts.mls_group_id → group_information.mls_group_id`
-///   (`group_information` is shared; `drafts` is account-scoped;
-///   migration 0028)
 ///
 /// ## Intra-account FKs (no cross-boundary issue)
 ///
@@ -114,12 +103,16 @@ impl AccountDatabase {
     /// file, but the freshness check on local-version space — not raw row
     /// presence — keeps the behaviour correct across the transition.
     pub async fn run_account_migrations(&self, shared: &SqlitePool) -> Result<(), DatabaseError> {
+        let pubkey_hex = self.account_pubkey.to_hex();
         rust_migrations::MIGRATOR
-            .run(
-                shared,
-                Some((&self.inner.pool, self.account_pubkey.to_hex().as_str())),
-            )
-            .await
+            .run(shared, Some((&self.inner.pool, pubkey_hex.as_str())))
+            .await?;
+        tracing::info!(
+            target: "whitenoise::database::account_db",
+            account = %pubkey_hex,
+            "Per-account migrations applied"
+        );
+        Ok(())
     }
 }
 

@@ -349,6 +349,14 @@ impl Whitenoise {
         relay_urls: &[RelayUrl],
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<()> {
+        // Resolve the session up front. Tracking the published key package
+        // writes to the per-account DB, and if the session is missing
+        // (e.g. the user logged out mid-publish) we'd lose that tracking
+        // record while the relay-side publish still happened. Better to
+        // fail loud before any network publish than write to relays without
+        // a local audit trail.
+        let session = self.require_session(&account.pubkey)?;
+
         let canonical_event_id = self
             .publish_key_package_to_relays(
                 MLS_KEY_PACKAGE_KIND,
@@ -359,8 +367,8 @@ impl Whitenoise {
             )
             .await?;
 
-        self.track_published_key_package(
-            account,
+        Self::track_published_key_package(
+            &session,
             &key_package_data.hash_ref,
             &canonical_event_id,
             MLS_KEY_PACKAGE_KIND,
@@ -379,8 +387,8 @@ impl Whitenoise {
             .await
         {
             Ok(legacy_event_id) => {
-                self.track_published_key_package(
-                    account,
+                Self::track_published_key_package(
+                    &session,
                     &key_package_data.hash_ref,
                     &legacy_event_id,
                     MLS_KEY_PACKAGE_KIND_LEGACY,
@@ -439,24 +447,22 @@ impl Whitenoise {
     }
 
     /// Records a successfully published key package in the lifecycle tracking table.
+    ///
+    /// Caller resolves the session beforehand so this can't lose a tracking
+    /// record because the session went away between publish and track.
     #[perf_instrument("key_packages")]
     async fn track_published_key_package(
-        &self,
-        account: &Account,
+        session: &std::sync::Arc<crate::whitenoise::session::AccountSession>,
         hash_ref: &[u8],
         event_id: &EventId,
         kind: Kind,
         d_tag: Option<&str>,
     ) {
-        if let Err(e) = PublishedKeyPackage::create(
-            &account.pubkey,
-            hash_ref,
-            &event_id.to_hex(),
-            kind,
-            d_tag,
-            &self.shared.database,
-        )
-        .await
+        if let Err(e) = session
+            .repos
+            .published_key_packages
+            .create(hash_ref, &event_id.to_hex(), kind, d_tag)
+            .await
         {
             tracing::warn!(
                 target: "whitenoise::key_packages",
@@ -522,12 +528,12 @@ impl Whitenoise {
         delete_mls_stored_keys: bool,
         signer: std::sync::Arc<dyn NostrSigner>,
     ) -> Result<bool> {
-        let published_package = match PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &event_id.to_hex(),
-            &self.shared.database,
-        )
-        .await
+        let session = self.require_session(&account.pubkey)?;
+        let published_package = match session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&event_id.to_hex())
+            .await
         {
             Ok(package) => package,
             Err(e) => {
@@ -548,12 +554,11 @@ impl Whitenoise {
                 Some(pkg) if !pkg.key_material_deleted => {
                     let mdk = self.create_mdk_for_account(account.pubkey)?;
                     mdk.delete_key_package_from_storage_by_hash_ref(&pkg.key_package_hash_ref)?;
-                    if let Err(e) = PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
-                        &account.pubkey,
-                        &pkg.key_package_hash_ref,
-                        &self.shared.database,
-                    )
-                    .await
+                    if let Err(e) = session
+                        .repos
+                        .published_key_packages
+                        .mark_key_material_deleted_by_hash_ref(&pkg.key_package_hash_ref)
+                        .await
                     {
                         tracing::warn!(
                             target: "whitenoise::key_packages",
@@ -613,12 +618,19 @@ impl Whitenoise {
             return event_ids;
         };
 
-        match PublishedKeyPackage::find_by_hash_ref(
-            &account.pubkey,
-            &package.key_package_hash_ref,
-            &self.shared.database,
-        )
-        .await
+        let Some(session) = self.session(&account.pubkey) else {
+            tracing::warn!(
+                target: "whitenoise::key_packages",
+                "No session found for account, cannot find key package hash_ref twins"
+            );
+            return event_ids;
+        };
+
+        match session
+            .repos
+            .published_key_packages
+            .find_by_hash_ref(&package.key_package_hash_ref)
+            .await
         {
             Ok(packages) => {
                 for package in packages {
@@ -908,18 +920,18 @@ impl Whitenoise {
         key_package_events: &[Event],
         initial_count: usize,
     ) -> Result<()> {
+        let session = self.require_session(&account.pubkey)?;
         let mdk = self.create_mdk_for_account(account.pubkey)?;
         let mut deleted_hash_refs = HashSet::new();
         let mut deleted_untracked_contents = HashSet::new();
         let mut storage_delete_count = 0;
 
         for event in key_package_events {
-            match PublishedKeyPackage::find_by_event_id(
-                &account.pubkey,
-                &event.id.to_hex(),
-                &self.shared.database,
-            )
-            .await
+            match session
+                .repos
+                .published_key_packages
+                .find_by_event_id(&event.id.to_hex())
+                .await
             {
                 Ok(Some(pkg)) => {
                     if !deleted_hash_refs.insert(pkg.key_package_hash_ref.clone()) {
@@ -930,12 +942,10 @@ impl Whitenoise {
                     {
                         Ok(()) => {
                             storage_delete_count += 1;
-                            if let Err(e) =
-                                PublishedKeyPackage::mark_key_material_deleted_by_hash_ref(
-                                    &account.pubkey,
-                                    &pkg.key_package_hash_ref,
-                                    &self.shared.database,
-                                )
+                            if let Err(e) = session
+                                .repos
+                                .published_key_packages
+                                .mark_key_material_deleted_by_hash_ref(&pkg.key_package_hash_ref)
                                 .await
                             {
                                 tracing::warn!(
@@ -1062,9 +1072,11 @@ impl Whitenoise {
         account_pubkey: &nostr_sdk::PublicKey,
         event_id: &str,
     ) -> Result<Option<PublishedKeyPackage>> {
-        PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.shared.database)
+        self.require_session(account_pubkey)?
+            .repos
+            .published_key_packages
+            .find_by_event_id(event_id)
             .await
-            .map_err(WhitenoiseError::from)
     }
 
     /// Records a published key package in the lifecycle tracking table.
@@ -1087,16 +1099,11 @@ impl Whitenoise {
         kind: Kind,
         d_tag: Option<&str>,
     ) -> Result<()> {
-        PublishedKeyPackage::create(
-            account_pubkey,
-            hash_ref,
-            event_id,
-            kind,
-            d_tag,
-            &self.shared.database,
-        )
-        .await
-        .map_err(WhitenoiseError::from)
+        self.require_session(account_pubkey)?
+            .repos
+            .published_key_packages
+            .create(hash_ref, event_id, kind, d_tag)
+            .await
     }
 
     /// Backdates the `consumed_at` timestamp for a published key package.
@@ -1115,25 +1122,11 @@ impl Whitenoise {
         event_id: &str,
         age_secs: i64,
     ) -> Result<()> {
-        let package =
-            PublishedKeyPackage::find_by_event_id(account_pubkey, event_id, &self.shared.database)
-                .await?
-                .ok_or_else(|| {
-                    WhitenoiseError::Internal(format!(
-                        "Published key package not found: {event_id}"
-                    ))
-                })?;
-
-        sqlx::query(
-            "UPDATE published_key_packages SET consumed_at = unixepoch() - ?
-             WHERE account_pubkey = ? AND key_package_hash_ref = ?",
-        )
-        .bind(age_secs)
-        .bind(account_pubkey.to_hex())
-        .bind(&package.key_package_hash_ref)
-        .execute(&self.shared.database.pool)
-        .await
-        .map_err(crate::whitenoise::database::DatabaseError::Sqlx)?;
+        self.require_session(account_pubkey)?
+            .repos
+            .published_key_packages
+            .backdate_consumed_at(event_id, age_secs)
+            .await?;
 
         tracing::debug!(
             target: "whitenoise::key_packages",
@@ -2065,26 +2058,29 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &canonical.id.to_hex(),
-            MLS_KEY_PACKAGE_KIND,
-            Some(&key_package_data.d_tag),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &key_package_data.hash_ref,
-            &legacy.id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &key_package_data.hash_ref,
+                &canonical.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some(&key_package_data.d_tag),
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &key_package_data.hash_ref,
+                &legacy.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
 
         let invalid_untracked = EventBuilder::new(MLS_KEY_PACKAGE_KIND_LEGACY, "not-a-key-package")
             .sign_with_keys(&keys)
@@ -2108,22 +2104,20 @@ mod tests {
             .await
             .unwrap();
 
-        let canonical_record = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &canonical.id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let legacy_record = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &legacy.id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let canonical_record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&canonical.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy_record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&legacy.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert!(canonical_record.key_material_deleted);
         assert!(legacy_record.key_material_deleted);
@@ -2143,35 +2137,37 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            &canonical.id.to_hex(),
-            MLS_KEY_PACKAGE_KIND,
-            Some("delete-twins"),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        PublishedKeyPackage::create(
-            &account.pubkey,
-            &hash_ref,
-            &legacy.id.to_hex(),
-            MLS_KEY_PACKAGE_KIND_LEGACY,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                &canonical.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND,
+                Some("delete-twins"),
+            )
+            .await
+            .unwrap();
+        session
+            .repos
+            .published_key_packages
+            .create(
+                &hash_ref,
+                &legacy.id.to_hex(),
+                MLS_KEY_PACKAGE_KIND_LEGACY,
+                None,
+            )
+            .await
+            .unwrap();
 
-        let canonical_record = PublishedKeyPackage::find_by_event_id(
-            &account.pubkey,
-            &canonical.id.to_hex(),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let canonical_record = session
+            .repos
+            .published_key_packages
+            .find_by_event_id(&canonical.id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
         let event_ids = whitenoise
             .key_package_event_ids_for_deletion(&account, &canonical.id, Some(&canonical_record))
             .await;
@@ -2202,7 +2198,8 @@ mod tests {
         // Account exists but has no key package relays. The internal method
         // streams events first (which returns empty without a real relay),
         // so it returns Ok(false) — no event found, nothing to delete.
-        let (account, _keys) = create_test_account(&whitenoise).await;
+        let (account, keys) = create_test_account(&whitenoise).await;
+        let account = register_session_with_keys(&whitenoise, account, &keys).await;
         let signer_keys = Keys::generate();
         let event_id = EventId::all_zeros();
 
