@@ -71,7 +71,7 @@ impl MediaCmd {
                 group_id,
                 file_hash,
             } => download(socket, json, account_flag, group_id, file_hash).await,
-            Self::List { group_id } => list(socket, json, group_id).await,
+            Self::List { group_id } => list(socket, json, account_flag, group_id).await,
         }
     }
 }
@@ -102,8 +102,21 @@ async fn upload(
     output::print_and_exit(&resp, json)
 }
 
-async fn list(socket: &Path, json: bool, group_id: String) -> crate::cli::Result<()> {
-    let resp = client::send(socket, &Request::ListMedia { group_id }).await?;
+async fn list(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: String,
+) -> crate::cli::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::ListMedia {
+            account: pubkey,
+            group_id,
+        },
+    )
+    .await?;
     output::print_and_exit(&resp, json)
 }
 

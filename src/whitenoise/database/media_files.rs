@@ -1,11 +1,14 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use mdk_core::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
-use std::path::{Path, PathBuf};
+use sqlx::{Row, SqlitePool};
 
-use super::{Database, DatabaseError, utils::parse_timestamp};
+use super::{Database, DatabaseError};
 use crate::perf_instrument;
 use crate::whitenoise::error::WhitenoiseError;
 
@@ -93,141 +96,236 @@ pub struct MediaFile {
     pub created_at: DateTime<Utc>,
 }
 
-impl<'r, R> sqlx::FromRow<'r, R> for MediaFile
-where
-    R: sqlx::Row,
-    &'r str: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    fn from_row(row: &'r R) -> std::result::Result<Self, sqlx::Error> {
-        let id: i64 = row.try_get("id")?;
-        let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
-        let account_pubkey_str: String = row.try_get("account_pubkey")?;
-        let file_path_str: String = row.try_get("file_path")?;
+/// Data from a `media_references` row (per-account DB).
+struct ReferenceRow {
+    id: i64,
+    mls_group_id: Vec<u8>,
+    encrypted_file_hash: String,
+    original_file_hash: Option<String>,
+    media_type: String,
+    nostr_key: Option<String>,
+    file_metadata: Option<String>,
+    nonce: Option<String>,
+    scheme_version: Option<String>,
+    created_at: i64,
+}
 
-        // Parse MLS group ID
-        let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
+/// Data from a `media_blobs` row (shared DB).
+#[derive(Clone)]
+struct BlobRow {
+    file_path: String,
+    mime_type: String,
+    blossom_url: Option<String>,
+}
 
-        // Parse account pubkey
-        let account_pubkey =
-            PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "account_pubkey".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // Parse file path
-        let file_path = PathBuf::from(file_path_str);
-
-        // Parse encrypted_file_hash from hex (required)
-        let encrypted_file_hash_hex: String = row.try_get("encrypted_file_hash")?;
-        let encrypted_file_hash =
-            hex::decode(encrypted_file_hash_hex).map_err(|e| sqlx::Error::ColumnDecode {
+impl MediaFile {
+    /// Assemble a `MediaFile` from a reference row (account DB) and a blob
+    /// row (shared DB). The `account_pubkey` is the owning account — it is
+    /// implicit in the per-account database file (no column in the table).
+    fn assemble(
+        r: ReferenceRow,
+        b: BlobRow,
+        account_pubkey: PublicKey,
+    ) -> std::result::Result<Self, WhitenoiseError> {
+        let mls_group_id = GroupId::from_slice(&r.mls_group_id);
+        let encrypted_file_hash = hex::decode(&r.encrypted_file_hash).map_err(|e| {
+            DatabaseError::Sqlx(sqlx::Error::ColumnDecode {
                 index: "encrypted_file_hash".to_string(),
                 source: Box::new(e),
-            })?;
-
-        // Parse original_file_hash from hex (optional - NULL for old records and group images)
-        let original_file_hash: Option<Vec<u8>> = row
-            .try_get::<Option<String>, _>("original_file_hash")?
-            .and_then(|hex| hex::decode(&hex).ok());
-
-        let mime_type: String = row.try_get("mime_type")?;
-        let media_type: String = row.try_get("media_type")?;
-        let blossom_url: Option<String> = row.try_get("blossom_url")?;
-        let nostr_key: Option<String> = row.try_get("nostr_key")?;
-
-        // Deserialize file_metadata from JSON stored as TEXT/BLOB
-        // We can't use Json<T> directly here because our generic FromRow implementation
-        // doesn't constrain the database type, so we deserialize manually
-        let file_metadata: Option<FileMetadata> = row
-            .try_get::<Option<String>, _>("file_metadata")?
-            .and_then(|json_str| serde_json::from_str(&json_str).ok());
-
-        let nonce: Option<String> = row.try_get("nonce")?;
-        let scheme_version: Option<String> = row.try_get("scheme_version")?;
-
-        let created_at = parse_timestamp(row, "created_at")?;
+            })
+        })?;
+        let original_file_hash = r
+            .original_file_hash
+            .and_then(|hex_str| hex::decode(&hex_str).ok());
+        let file_metadata: Option<FileMetadata> =
+            r.file_metadata.and_then(|s| serde_json::from_str(&s).ok());
+        let created_at = match chrono::DateTime::from_timestamp_millis(r.created_at) {
+            Some(ts) => ts,
+            None => {
+                tracing::warn!(
+                    target: "whitenoise::database::media_files",
+                    encrypted_file_hash = %r.encrypted_file_hash,
+                    raw_millis = r.created_at,
+                    "media_references.created_at out of range, falling back to MIN_UTC",
+                );
+                chrono::DateTime::<Utc>::MIN_UTC
+            }
+        };
 
         Ok(Self {
-            id: Some(id),
+            id: Some(r.id),
             mls_group_id,
             account_pubkey,
-            file_path,
+            file_path: PathBuf::from(b.file_path),
             original_file_hash,
             encrypted_file_hash,
-            mime_type,
-            media_type,
-            blossom_url,
-            nostr_key,
+            mime_type: b.mime_type,
+            media_type: r.media_type,
+            blossom_url: b.blossom_url,
+            nostr_key: r.nostr_key,
             file_metadata,
-            nonce,
-            scheme_version,
+            nonce: r.nonce,
+            scheme_version: r.scheme_version,
             created_at,
         })
+    }
+
+    /// Read a `ReferenceRow` from a SQLite row.
+    fn ref_from_row(
+        row: &sqlx::sqlite::SqliteRow,
+    ) -> std::result::Result<ReferenceRow, sqlx::Error> {
+        Ok(ReferenceRow {
+            id: row.try_get("id")?,
+            mls_group_id: row.try_get("mls_group_id")?,
+            encrypted_file_hash: row.try_get("encrypted_file_hash")?,
+            original_file_hash: row.try_get("original_file_hash")?,
+            media_type: row.try_get("media_type")?,
+            nostr_key: row.try_get("nostr_key")?,
+            file_metadata: row.try_get("file_metadata")?,
+            nonce: row.try_get("nonce")?,
+            scheme_version: row.try_get("scheme_version")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    /// Read a `BlobRow` from a SQLite row.
+    fn blob_from_row(row: &sqlx::sqlite::SqliteRow) -> std::result::Result<BlobRow, sqlx::Error> {
+        Ok(BlobRow {
+            file_path: row.try_get("file_path")?,
+            mime_type: row.try_get("mime_type")?,
+            blossom_url: row.try_get("blossom_url")?,
+        })
+    }
+
+    /// Fetch the blob for a given encrypted_file_hash from the shared DB.
+    async fn fetch_blob(
+        shared_pool: &SqlitePool,
+        encrypted_file_hash_hex: &str,
+    ) -> std::result::Result<Option<BlobRow>, DatabaseError> {
+        let row = sqlx::query(
+            "SELECT file_path, mime_type, blossom_url
+             FROM media_blobs
+             WHERE encrypted_file_hash = ?",
+        )
+        .bind(encrypted_file_hash_hex)
+        .fetch_optional(shared_pool)
+        .await
+        .map_err(DatabaseError::Sqlx)?;
+
+        match row {
+            Some(r) => Ok(Some(Self::blob_from_row(&r).map_err(DatabaseError::Sqlx)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Batch-fetch blob rows for a set of encrypted file hashes in one query.
+    async fn fetch_blobs_batch(
+        shared_pool: &SqlitePool,
+        hashes: &[&str],
+    ) -> std::result::Result<HashMap<String, BlobRow>, DatabaseError> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Deduplicate hashes — multiple references can point to the same blob.
+        let unique: std::collections::HashSet<&str> = hashes.iter().copied().collect();
+
+        // Use QueryBuilder for a single IN-clause query with proper binds.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT encrypted_file_hash, file_path, mime_type, blossom_url \
+             FROM media_blobs \
+             WHERE encrypted_file_hash IN (",
+        );
+        let mut separated = qb.separated(", ");
+        for hash in &unique {
+            separated.push_bind(*hash);
+        }
+        separated.push_unseparated(")");
+
+        let rows = qb
+            .build()
+            .fetch_all(shared_pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let hash: String = row
+                .try_get("encrypted_file_hash")
+                .map_err(DatabaseError::Sqlx)?;
+            let blob = BlobRow {
+                file_path: row.try_get("file_path").map_err(DatabaseError::Sqlx)?,
+                mime_type: row.try_get("mime_type").map_err(DatabaseError::Sqlx)?,
+                blossom_url: row.try_get("blossom_url").map_err(DatabaseError::Sqlx)?,
+            };
+            map.insert(hash, blob);
+        }
+
+        Ok(map)
     }
 }
 
 impl MediaFile {
-    /// Finds a media file by its encrypted file hash
+    /// Finds a media file by its encrypted file hash.
     ///
-    /// Returns the first matching media file for any group/account combination.
-    /// This is useful for retrieving stored metadata (like blossom_url) when you
-    /// only have the encrypted hash.
+    /// Reads the reference from the **account** pool and the blob from the
+    /// **shared** pool, combining them in Rust.
     ///
     /// # Arguments
-    /// * `database` - The database connection
+    /// * `account_pool` - Per-account database pool (holds `media_references`)
+    /// * `shared_db` - Shared database (holds `media_blobs`)
+    /// * `account_pubkey` - The owning account (implicit in the per-account DB)
     /// * `encrypted_file_hash` - The SHA-256 hash of the encrypted file
-    ///
-    /// # Returns
-    /// The MediaFile if found, None otherwise
     #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_hash(
-        database: &Database,
+        account_pool: &SqlitePool,
+        shared_db: &Database,
+        account_pubkey: &PublicKey,
         encrypted_file_hash: &[u8; 32],
     ) -> Result<Option<Self>, WhitenoiseError> {
-        let encrypted_file_hash_hex = hex::encode(encrypted_file_hash);
+        let hash_hex = hex::encode(encrypted_file_hash);
 
-        let row_opt = sqlx::query_as::<_, Self>(
-            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
-                    r.original_file_hash, r.encrypted_file_hash,
-                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
-                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
-             FROM media_references r
-             INNER JOIN media_blobs b
-                ON b.encrypted_file_hash = r.encrypted_file_hash
-             WHERE r.encrypted_file_hash = ?
-             ORDER BY r.created_at ASC, r.id ASC
+        let ref_row = sqlx::query(
+            "SELECT id, mls_group_id, encrypted_file_hash, original_file_hash,
+                    media_type, nostr_key, file_metadata, nonce, scheme_version, created_at
+             FROM media_references
+             WHERE encrypted_file_hash = ?
+             ORDER BY created_at ASC, id ASC
              LIMIT 1",
         )
-        .bind(&encrypted_file_hash_hex)
-        .fetch_optional(&database.pool)
+        .bind(&hash_hex)
+        .fetch_optional(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row_opt)
+        let ref_row = match ref_row {
+            Some(r) => Self::ref_from_row(&r).map_err(DatabaseError::Sqlx)?,
+            None => return Ok(None),
+        };
+
+        let blob = match Self::fetch_blob(&shared_db.pool, &hash_hex).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Self::assemble(ref_row, blob, *account_pubkey)?))
     }
 
-    /// Saves a cached media file to the database
+    /// Saves a cached media file to the database.
     ///
-    /// Inserts a new row or ignores if the record already exists
-    /// (based on unique constraint on mls_group_id, encrypted_file_hash, account_pubkey)
+    /// Upserts the blob on the **shared** pool and inserts the reference on the
+    /// **account** pool. Returns the assembled `MediaFile`.
     ///
     /// # Arguments
-    /// * `database` - The database connection
+    /// * `account_pool` - Per-account database pool (holds `media_references`)
+    /// * `shared_db` - Shared database (holds `media_blobs`)
     /// * `mls_group_id` - The MLS group ID
     /// * `account_pubkey` - The account public key accessing this media
     /// * `params` - Media file parameters (path, hashes, mime type, etc.)
-    ///
-    /// # Returns
-    /// The MediaFile with the database-assigned ID
-    ///
-    /// # Errors
-    /// Returns a [`WhitenoiseError`] if the database operation fails.
     #[perf_instrument("db::media_files")]
     pub(crate) async fn save(
-        database: &Database,
+        account_pool: &SqlitePool,
+        shared_db: &Database,
         mls_group_id: &GroupId,
         account_pubkey: &PublicKey,
         params: MediaFileParams<'_>,
@@ -240,15 +338,9 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
-        // Wrap file_metadata in Json for automatic serialization
-        // Only store if not empty (optimization)
         let file_metadata_json = params.file_metadata.filter(|m| !m.is_empty()).map(Json);
 
-        let account_pubkey_hex = account_pubkey.to_hex();
-
-        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
-
-        // Upsert blob (shared, deduplicated by hash).
+        // Upsert blob on shared DB.
         sqlx::query(
             "INSERT INTO media_blobs
                 (encrypted_file_hash, file_path, mime_type, blossom_url, created_at)
@@ -265,23 +357,22 @@ impl MediaFile {
         .bind(params.mime_type)
         .bind(params.blossom_url)
         .bind(now_ms)
-        .execute(&mut *tx)
+        .execute(&shared_db.pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        // Upsert reference (account-scoped).
+        // Upsert reference on account DB (no account_pubkey column).
         sqlx::query(
             "INSERT INTO media_references (
-                mls_group_id, account_pubkey, encrypted_file_hash,
+                mls_group_id, encrypted_file_hash,
                 media_type, nostr_key, file_metadata,
                 original_file_hash, nonce, scheme_version, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (mls_group_id, encrypted_file_hash, account_pubkey)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (mls_group_id, encrypted_file_hash)
             DO NOTHING",
         )
         .bind(mls_group_id.as_slice())
-        .bind(&account_pubkey_hex)
         .bind(&encrypted_file_hash_hex)
         .bind(params.media_type)
         .bind(params.nostr_key)
@@ -290,158 +381,148 @@ impl MediaFile {
         .bind(params.nonce)
         .bind(params.scheme_version)
         .bind(now_ms)
-        .execute(&mut *tx)
+        .execute(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        // Whether inserted or conflict, select the joined row.
-        let existing = sqlx::query_as::<_, Self>(
-            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
-                    r.original_file_hash, r.encrypted_file_hash,
-                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
-                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
-             FROM media_references r
-             INNER JOIN media_blobs b
-                ON b.encrypted_file_hash = r.encrypted_file_hash
-             WHERE r.mls_group_id = ? AND r.encrypted_file_hash = ?
-               AND r.account_pubkey = ?
+        // Read back the reference from the account DB.
+        let ref_row = sqlx::query(
+            "SELECT id, mls_group_id, encrypted_file_hash, original_file_hash,
+                    media_type, nostr_key, file_metadata, nonce, scheme_version, created_at
+             FROM media_references
+             WHERE mls_group_id = ? AND encrypted_file_hash = ?
              LIMIT 1",
         )
         .bind(mls_group_id.as_slice())
         .bind(&encrypted_file_hash_hex)
-        .bind(&account_pubkey_hex)
-        .fetch_one(&mut *tx)
+        .fetch_one(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
+        let ref_row = Self::ref_from_row(&ref_row).map_err(DatabaseError::Sqlx)?;
 
-        tx.commit().await.map_err(DatabaseError::Sqlx)?;
+        // Read back the blob from the shared DB.
+        let blob = Self::fetch_blob(&shared_db.pool, &encrypted_file_hash_hex)
+            .await?
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache(format!(
+                    "missing media_blobs row for hash {encrypted_file_hash_hex}"
+                ))
+            })?;
 
-        Ok(existing)
+        Self::assemble(ref_row, blob, *account_pubkey)
     }
 
-    /// Finds all media files for a specific MLS group
+    /// Finds all media files for a specific MLS group.
     ///
-    /// Returns a Vec of MediaFile records for the group.
-    /// This leverages the indexed mls_group_id column for efficient retrieval.
-    ///
-    /// # Arguments
-    /// * `database` - Database connection
-    /// * `group_id` - The MLS group ID to fetch media files for
+    /// Reads references from the **account** pool and blobs from the **shared**
+    /// pool, assembling the results in Rust.
     #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_group(
-        database: &Database,
+        account_pool: &SqlitePool,
+        shared_db: &Database,
+        account_pubkey: &PublicKey,
         group_id: &GroupId,
     ) -> Result<Vec<Self>, WhitenoiseError> {
-        let rows = sqlx::query_as::<_, Self>(
-            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
-                    r.original_file_hash, r.encrypted_file_hash,
-                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
-                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
-             FROM media_references r
-             INNER JOIN media_blobs b
-                ON b.encrypted_file_hash = r.encrypted_file_hash
-             WHERE r.mls_group_id = ?",
+        let ref_rows = sqlx::query(
+            "SELECT id, mls_group_id, encrypted_file_hash, original_file_hash,
+                    media_type, nostr_key, file_metadata, nonce, scheme_version, created_at
+             FROM media_references
+             WHERE mls_group_id = ?",
         )
         .bind(group_id.as_slice())
-        .fetch_all(&database.pool)
+        .fetch_all(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(rows)
+        let mut refs: Vec<ReferenceRow> = Vec::with_capacity(ref_rows.len());
+        for row in &ref_rows {
+            refs.push(Self::ref_from_row(row).map_err(DatabaseError::Sqlx)?);
+        }
+
+        // Batch-fetch all blobs in one query instead of N round-trips.
+        let hashes: Vec<&str> = refs
+            .iter()
+            .map(|r| r.encrypted_file_hash.as_str())
+            .collect();
+        let blob_map = Self::fetch_blobs_batch(&shared_db.pool, &hashes).await?;
+
+        let mut result = Vec::with_capacity(refs.len());
+        for r in refs {
+            let blob = match blob_map.get(&r.encrypted_file_hash) {
+                Some(b) => b.clone(),
+                None => {
+                    tracing::warn!(
+                        target: "whitenoise::database::media_files",
+                        encrypted_file_hash = %r.encrypted_file_hash,
+                        "media_blobs row missing for referenced hash; skipping entry",
+                    );
+                    continue;
+                }
+            };
+            result.push(Self::assemble(r, blob, *account_pubkey)?);
+        }
+
+        Ok(result)
     }
 
-    /// Finds a media file by original hash, group ID, and account (MIP-04 compliant lookup)
+    /// Finds a media file by original hash and group ID (MIP-04 compliant lookup).
     ///
-    /// This is the primary lookup method for media files referenced in imeta tags,
-    /// as MIP-04 requires the 'x' field to contain the original content hash.
-    ///
-    /// The query is scoped to a specific group and account for security and correctness.
-    /// In multi-account setups, the same file hash can exist in the same group but with
-    /// separate records per account, so we must filter by account_pubkey to prevent
-    /// cross-account cache corruption.
+    /// The account scope is implicit in the per-account database file.
     ///
     /// # Arguments
-    /// * `database` - The database connection
+    /// * `account_pool` - Per-account database pool (holds `media_references`)
+    /// * `shared_db` - Shared database (holds `media_blobs`)
+    /// * `account_pubkey` - The owning account
     /// * `original_file_hash` - The SHA-256 hash of the decrypted file content
     /// * `group_id` - The MLS group ID to scope the search to
-    /// * `account_pubkey` - The account public key (ensures account-scoped lookup)
-    ///
-    /// # Returns
-    /// * `Ok(Some(MediaFile))` - The matching media file for this account
-    /// * `Ok(None)` - No matching media file found for this account
-    /// * `Err(WhitenoiseError)` - Database error
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Look up media file from imeta tag
-    /// let original_hash = hex::decode(&imeta_x_field)?;
-    /// if let Some(media_file) = MediaFile::find_by_original_hash_and_group(
-    ///     &db, &original_hash, &group_id, &account_pubkey
-    /// ).await? {
-    ///     // Download and decrypt the file
-    /// }
-    /// ```
     #[perf_instrument("db::media_files")]
     pub(crate) async fn find_by_original_hash_and_group(
-        database: &Database,
+        account_pool: &SqlitePool,
+        shared_db: &Database,
+        account_pubkey: &PublicKey,
         original_file_hash: &[u8; 32],
         group_id: &GroupId,
-        account_pubkey: &PublicKey,
     ) -> Result<Option<Self>, WhitenoiseError> {
         let hash_hex = hex::encode(original_file_hash);
-        let account_hex = account_pubkey.to_hex();
 
-        let row_opt = sqlx::query_as::<_, Self>(
-            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
-                    r.original_file_hash, r.encrypted_file_hash,
-                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
-                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
-             FROM media_references r
-             INNER JOIN media_blobs b
-                ON b.encrypted_file_hash = r.encrypted_file_hash
-             WHERE r.original_file_hash = ? AND r.mls_group_id = ?
-               AND r.account_pubkey = ?
+        let ref_row = sqlx::query(
+            "SELECT id, mls_group_id, encrypted_file_hash, original_file_hash,
+                    media_type, nostr_key, file_metadata, nonce, scheme_version, created_at
+             FROM media_references
+             WHERE original_file_hash = ? AND mls_group_id = ?
              LIMIT 1",
         )
         .bind(&hash_hex)
         .bind(group_id.as_slice())
-        .bind(&account_hex)
-        .fetch_optional(&database.pool)
+        .fetch_optional(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        Ok(row_opt)
+        let ref_row = match ref_row {
+            Some(r) => Self::ref_from_row(&r).map_err(DatabaseError::Sqlx)?,
+            None => return Ok(None),
+        };
+
+        let blob = match Self::fetch_blob(&shared_db.pool, &ref_row.encrypted_file_hash).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+
+        Ok(Some(Self::assemble(ref_row, blob, *account_pubkey)?))
     }
 
-    /// Updates the file_path for an existing media file record
+    /// Updates the file_path for an existing media file record.
     ///
-    /// This method is called after downloading and caching a media file to update
-    /// the database record with the local file path.
+    /// Reads the `encrypted_file_hash` from the **account** pool's reference
+    /// row, then updates the **shared** blob's `file_path`.
     ///
     /// NOTE: This mutates the shared `media_blobs` row, which affects every
-    /// account referencing the same `encrypted_file_hash`. This is correct
-    /// while all accounts share a single `media_cache` directory. If Phase 18c
-    /// introduces per-account storage directories, this assumption must be
-    /// revisited.
-    ///
-    /// # Arguments
-    /// * `database` - The database connection
-    /// * `id` - The media file ID to update
-    /// * `new_path` - The new file path to set
-    ///
-    /// # Returns
-    /// * `Ok(MediaFile)` - The updated media file record
-    /// * `Err(WhitenoiseError)` - If the record doesn't exist or database error
-    ///
-    /// # Example
-    /// ```ignore
-    /// // After downloading and caching a file
-    /// let cached_path = PathBuf::from("/cache/media/abc123.jpg");
-    /// let updated = MediaFile::update_file_path(&db, media_file.id.unwrap(), &cached_path).await?;
-    /// ```
+    /// account referencing the same `encrypted_file_hash`.
     #[perf_instrument("db::media_files")]
     pub(crate) async fn update_file_path(
-        database: &Database,
+        account_pool: &SqlitePool,
+        shared_db: &Database,
+        account_pubkey: &PublicKey,
         id: i64,
         new_path: &Path,
     ) -> Result<Self, WhitenoiseError> {
@@ -449,13 +530,11 @@ impl MediaFile {
             .to_str()
             .ok_or_else(|| WhitenoiseError::MediaCache("Invalid file path".to_string()))?;
 
-        let mut tx = database.pool.begin().await.map_err(DatabaseError::Sqlx)?;
-
-        // Look up the encrypted_file_hash from the reference row.
+        // Look up the encrypted_file_hash from the account-DB reference row.
         let hash: String =
             sqlx::query_scalar("SELECT encrypted_file_hash FROM media_references WHERE id = ?")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(account_pool)
                 .await
                 .map_err(DatabaseError::Sqlx)?
                 .ok_or_else(|| {
@@ -466,39 +545,42 @@ impl MediaFile {
         sqlx::query("UPDATE media_blobs SET file_path = ? WHERE encrypted_file_hash = ?")
             .bind(path_str)
             .bind(&hash)
-            .execute(&mut *tx)
+            .execute(&shared_db.pool)
             .await
             .map_err(DatabaseError::Sqlx)?;
 
-        // Return the joined record.
-        let row = sqlx::query_as::<_, Self>(
-            "SELECT r.id, r.mls_group_id, r.account_pubkey, b.file_path,
-                    r.original_file_hash, r.encrypted_file_hash,
-                    b.mime_type, r.media_type, b.blossom_url, r.nostr_key,
-                    r.file_metadata, r.nonce, r.scheme_version, r.created_at
-             FROM media_references r
-             INNER JOIN media_blobs b
-                ON b.encrypted_file_hash = r.encrypted_file_hash
-             WHERE r.id = ?",
+        // Read back the reference.
+        let ref_row = sqlx::query(
+            "SELECT id, mls_group_id, encrypted_file_hash, original_file_hash,
+                    media_type, nostr_key, file_metadata, nonce, scheme_version, created_at
+             FROM media_references
+             WHERE id = ?",
         )
         .bind(id)
-        .fetch_one(&mut *tx)
+        .fetch_one(account_pool)
         .await
         .map_err(DatabaseError::Sqlx)?;
+        let ref_row = Self::ref_from_row(&ref_row).map_err(DatabaseError::Sqlx)?;
 
-        tx.commit().await.map_err(DatabaseError::Sqlx)?;
+        let blob = Self::fetch_blob(&shared_db.pool, &hash)
+            .await?
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache(format!("missing media_blobs row for hash {hash}"))
+            })?;
 
-        Ok(row)
+        Self::assemble(ref_row, blob, *account_pubkey)
     }
 
     /// Returns all distinct non-empty file paths referenced by media_blobs records.
+    ///
+    /// Reads from the **shared** database only (blobs are shared across accounts).
     #[perf_instrument("db::media_files")]
     pub(crate) async fn all_referenced_file_paths(
-        database: &Database,
+        shared_db: &Database,
     ) -> Result<Vec<String>, WhitenoiseError> {
         let paths: Vec<String> =
             sqlx::query_scalar("SELECT DISTINCT file_path FROM media_blobs WHERE file_path != ''")
-                .fetch_all(&database.pool)
+                .fetch_all(&shared_db.pool)
                 .await
                 .map_err(DatabaseError::Sqlx)?;
         Ok(paths)
@@ -523,15 +605,73 @@ impl MediaFile {
     pub fn is_document(&self) -> bool {
         self.mime_type == "application/pdf"
     }
+
+    /// Deletes all per-account `media_references` rows for a given group.
+    pub(crate) async fn delete_references_for_group(
+        account_pool: &SqlitePool,
+        group_id: &GroupId,
+    ) -> Result<(), WhitenoiseError> {
+        sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
+            .bind(group_id.as_slice())
+            .execute(account_pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::whitenoise::database::account_db::AccountDatabase;
     use tempfile::TempDir;
 
+    /// Test fixture: shared DB (media_blobs) + account DB (media_references).
+    struct TestDbs {
+        shared: Database,
+        account_pool: SqlitePool,
+        account_pubkey: PublicKey,
+        _dir: TempDir,
+    }
+
+    async fn setup_test_dbs() -> TestDbs {
+        let dir = TempDir::new().unwrap();
+        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
+        let shared = Database::new(dir.path().join("shared.db")).await.unwrap();
+        let account_db = AccountDatabase::new(pubkey, dir.path().join("account.db"))
+            .await
+            .unwrap();
+        account_db
+            .run_account_migrations(&shared.pool)
+            .await
+            .unwrap();
+
+        // Create user+account in shared DB for FK constraints
+        create_test_account(&shared, &pubkey).await;
+
+        TestDbs {
+            shared,
+            account_pool: account_db.inner.pool,
+            account_pubkey: pubkey,
+            _dir: dir,
+        }
+    }
+
+    /// Set up a second account against the same shared DB.
+    async fn add_account(shared: &Database, dir: &TempDir, pubkey: &PublicKey) -> SqlitePool {
+        let account_db =
+            AccountDatabase::new(*pubkey, dir.path().join(format!("{}.db", pubkey.to_hex())))
+                .await
+                .unwrap();
+        account_db
+            .run_account_migrations(&shared.pool)
+            .await
+            .unwrap();
+        create_test_account(shared, pubkey).await;
+        account_db.inner.pool
+    }
+
     async fn create_test_account(db: &Database, pubkey: &PublicKey) {
-        // Create test user and account to satisfy foreign key constraints
         sqlx::query("INSERT INTO users (pubkey, created_at, updated_at) VALUES (?, ?, ?)")
             .bind(pubkey.to_hex())
             .bind(chrono::Utc::now().timestamp())
@@ -560,25 +700,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_media_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-
-        // Create a test group ID
+        let t = setup_test_dbs().await;
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = [3u8; 32];
-        let file_path = temp_dir.path().join("test.jpg");
+        let file_path = t._dir.path().join("test.jpg");
 
-        // Create test account to satisfy foreign key constraint
-        create_test_account(&db, &pubkey).await;
-
-        // Save media - the save method returns the persisted record
-        // Group images don't have original_file_hash (they use key/nonce encryption)
         let media_file = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path,
                 original_file_hash: None,
@@ -595,7 +726,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify the returned record has correct data
         assert!(media_file.id.is_some());
         assert!(media_file.id.unwrap() > 0);
         assert_eq!(media_file.encrypted_file_hash, encrypted_file_hash.to_vec());
@@ -603,29 +733,23 @@ mod tests {
         assert_eq!(media_file.mime_type, "image/jpeg");
         assert_eq!(media_file.media_type, "group_image");
         assert_eq!(media_file.mls_group_id, group_id);
-        assert_eq!(media_file.account_pubkey, pubkey);
+        assert_eq!(media_file.account_pubkey, t.account_pubkey);
     }
 
     #[tokio::test]
     async fn test_upsert_on_conflict() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
-        // Create a test group ID
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[2u8; 32]).unwrap();
         let encrypted_file_hash = [3u8; 32];
-        let file_path = temp_dir.path().join("test.jpg");
-
-        // Create test account to satisfy foreign key constraint
-        create_test_account(&db, &pubkey).await;
+        let file_path = t._dir.path().join("test.jpg");
 
         // Save media first time
         let first_save = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path,
                 original_file_hash: None,
@@ -647,9 +771,10 @@ mod tests {
 
         // Save same media again (should trigger conflict and return existing row)
         let second_save = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path,
                 original_file_hash: None,
@@ -671,30 +796,26 @@ mod tests {
 
         // Both saves should return the same ID (existing row)
         assert_eq!(first_id, second_id);
-        // Original blossom_url should be preserved
+        // The blob upsert uses COALESCE — a non-null blossom_url in the
+        // second save replaces the existing one.
         assert_eq!(
             second_save.blossom_url,
-            Some("https://example.com/blob1".to_string())
+            Some("https://example.com/blob2".to_string())
         );
     }
 
     #[tokio::test]
     async fn test_find_by_hash_returns_first_match() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
+        let pubkey2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
+        let pool2 = add_account(&t.shared, &t._dir, &pubkey2).await;
 
-        // Test with multiple records having same encrypted hash (different groups/accounts)
+        // Test with two accounts having the same encrypted hash in different groups
         let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
         let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
-        let pubkey1 = PublicKey::from_slice(&[10u8; 32]).unwrap();
-        let pubkey2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
         let encrypted_file_hash = [42u8; 32];
-        let file_path1 = temp_dir.path().join("test1.jpg");
-        let file_path2 = temp_dir.path().join("test2.jpg");
-
-        create_test_account(&db, &pubkey1).await;
-        create_test_account(&db, &pubkey2).await;
+        let file_path1 = t._dir.path().join("test1.jpg");
+        let file_path2 = t._dir.path().join("test2.jpg");
 
         // Create metadata for first record
         let metadata = FileMetadata::new()
@@ -702,11 +823,12 @@ mod tests {
             .with_dimensions("1920x1080".to_string())
             .with_blurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string());
 
-        // Save first record with metadata
+        // Save first record (account 1) with metadata
         let first_save = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id1,
-            &pubkey1,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path1,
                 original_file_hash: None,
@@ -723,9 +845,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Save second record with same encrypted hash but different details
+        // Save second record (account 2) with same encrypted hash but different group
         MediaFile::save(
-            &db,
+            &pool2,
+            &t.shared,
             &group_id2,
             &pubkey2,
             MediaFileParams {
@@ -744,24 +867,30 @@ mod tests {
         .await
         .unwrap();
 
-        // Find by hash should return the first inserted record
-        let found = MediaFile::find_by_hash(&db, &encrypted_file_hash)
-            .await
-            .unwrap();
+        // find_by_hash for account 1 returns account 1's record
+        let found = MediaFile::find_by_hash(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &encrypted_file_hash,
+        )
+        .await
+        .unwrap();
 
         assert!(found.is_some());
         let media_file = found.unwrap();
 
-        // Verify it returns the first record
         assert_eq!(media_file.id, first_save.id);
         assert_eq!(media_file.encrypted_file_hash, encrypted_file_hash.to_vec());
         assert_eq!(media_file.mls_group_id, group_id1);
-        assert_eq!(media_file.account_pubkey, pubkey1);
+        assert_eq!(media_file.account_pubkey, t.account_pubkey);
         assert_eq!(media_file.mime_type, "image/jpeg");
         assert_eq!(media_file.media_type, "group_image");
+        // Account 2's save upserted the shared blob with its URL, so the
+        // latest non-null blossom_url wins (COALESCE in the upsert).
         assert_eq!(
             media_file.blossom_url,
-            Some("https://blossom.example.com/hash42".to_string())
+            Some("https://another-server.com/hash42".to_string())
         );
 
         // Verify metadata is preserved
@@ -780,68 +909,66 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_hash_not_found() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let nonexistent_hash = [99u8; 32];
 
         // Try to find a hash that doesn't exist
-        let found = MediaFile::find_by_hash(&db, &nonexistent_hash)
-            .await
-            .unwrap();
+        let found = MediaFile::find_by_hash(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &nonexistent_hash,
+        )
+        .await
+        .unwrap();
 
         assert!(found.is_none());
     }
 
     #[tokio::test]
     async fn test_find_by_group_empty_result() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let nonexistent_group_id = mdk_core::GroupId::from_slice(&[99u8; 8]);
 
         // Try to find media for a group that doesn't exist
-        let media_files = MediaFile::find_by_group(&db, &nonexistent_group_id)
-            .await
-            .unwrap();
+        let media_files = MediaFile::find_by_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &nonexistent_group_id,
+        )
+        .await
+        .unwrap();
 
         assert!(media_files.is_empty());
     }
 
     #[tokio::test]
     async fn test_find_by_group_multiple_files_and_group_isolation() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
+        let pubkey2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
+        let pool2 = add_account(&t.shared, &t._dir, &pubkey2).await;
 
         let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
         let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
-        let pubkey1 = PublicKey::from_slice(&[10u8; 32]).unwrap();
-        let pubkey2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
-
-        create_test_account(&db, &pubkey1).await;
-        create_test_account(&db, &pubkey2).await;
 
         // Create metadata for one file
         let metadata = FileMetadata::new()
             .with_filename("image1.jpg".to_string())
             .with_dimensions("1920x1080".to_string());
 
-        // Save multiple media files for group 1 (different accounts)
-        // For chat_media, we have both original and encrypted hashes
+        // Save one media file for group 1 under account 1
         let original_hash1a = [11u8; 32];
         let encrypted_hash1a = [111u8; 32];
-        let original_hash1b = [12u8; 32];
-        let encrypted_hash1b = [121u8; 32];
-        let file_path1a = temp_dir.path().join("group1_file1.jpg");
-        let file_path1b = temp_dir.path().join("group1_file2.png");
+        let file_path1a = t._dir.path().join("group1_file1.jpg");
 
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id1,
-            &pubkey1,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path1a,
                 original_file_hash: Some(&original_hash1a),
@@ -858,8 +985,14 @@ mod tests {
         .await
         .unwrap();
 
+        // Save one media file for group 1 under account 2
+        let original_hash1b = [12u8; 32];
+        let encrypted_hash1b = [121u8; 32];
+        let file_path1b = t._dir.path().join("group1_file2.png");
+
         MediaFile::save(
-            &db,
+            &pool2,
+            &t.shared,
             &group_id1,
             &pubkey2,
             MediaFileParams {
@@ -878,15 +1011,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Save one media file for group 2
+        // Save one media file for group 2 under account 1
         let original_hash2 = [22u8; 32];
         let encrypted_hash2 = [222u8; 32];
-        let file_path2 = temp_dir.path().join("group2_file.jpg");
+        let file_path2 = t._dir.path().join("group2_file.jpg");
 
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id2,
-            &pubkey1,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path2,
                 original_file_hash: Some(&original_hash2),
@@ -903,70 +1037,69 @@ mod tests {
         .await
         .unwrap();
 
-        // Test: Find all media files for group 1
-        let media_files_group1 = MediaFile::find_by_group(&db, &group_id1).await.unwrap();
-
-        // Should return both files from group 1 regardless of account
-        assert_eq!(media_files_group1.len(), 2);
-
-        // Verify we got both files from group 1 (checking encrypted_file_hash)
-        let encrypted_hashes1: Vec<Vec<u8>> = media_files_group1
-            .iter()
-            .map(|mf| mf.encrypted_file_hash.clone())
-            .collect();
-        assert!(encrypted_hashes1.contains(&encrypted_hash1a.to_vec()));
-        assert!(encrypted_hashes1.contains(&encrypted_hash1b.to_vec()));
-        assert!(!encrypted_hashes1.contains(&encrypted_hash2.to_vec())); // Should not contain group 2 file
-
-        // Verify all files have correct group_id
-        assert!(
-            media_files_group1
-                .iter()
-                .all(|mf| mf.mls_group_id == group_id1)
-        );
-
-        // Verify metadata is preserved for the file that has it
-        let file_with_metadata = media_files_group1
-            .iter()
-            .find(|mf| mf.encrypted_file_hash == encrypted_hash1a.to_vec())
-            .unwrap();
-        assert!(file_with_metadata.file_metadata.is_some());
+        // Each account's find_by_group only returns that account's references.
+        // Account 1 sees: group1 file1 and group2 file
+        let acct1_group1 =
+            MediaFile::find_by_group(&t.account_pool, &t.shared, &t.account_pubkey, &group_id1)
+                .await
+                .unwrap();
+        assert_eq!(acct1_group1.len(), 1);
         assert_eq!(
-            file_with_metadata
+            acct1_group1[0].encrypted_file_hash,
+            encrypted_hash1a.to_vec()
+        );
+        assert_eq!(acct1_group1[0].mls_group_id, group_id1);
+        assert!(acct1_group1[0].original_file_hash.is_some());
+
+        // Verify metadata is preserved for account 1's file
+        assert!(acct1_group1[0].file_metadata.is_some());
+        assert_eq!(
+            acct1_group1[0]
                 .file_metadata
                 .as_ref()
                 .unwrap()
                 .original_filename,
             Some("image1.jpg".to_string())
         );
-        // Verify chat_media has both hashes
-        assert!(file_with_metadata.original_file_hash.is_some());
 
-        // Test: Find all media files for group 2
-        let media_files_group2 = MediaFile::find_by_group(&db, &group_id2).await.unwrap();
-
-        // Should return only one file from group 2
-        assert_eq!(media_files_group2.len(), 1);
+        // Account 2 sees: group1 file2 only
+        let acct2_group1 = MediaFile::find_by_group(&pool2, &t.shared, &pubkey2, &group_id1)
+            .await
+            .unwrap();
+        assert_eq!(acct2_group1.len(), 1);
         assert_eq!(
-            media_files_group2[0].encrypted_file_hash,
+            acct2_group1[0].encrypted_file_hash,
+            encrypted_hash1b.to_vec()
+        );
+        assert_eq!(acct2_group1[0].mls_group_id, group_id1);
+        assert!(acct2_group1[0].original_file_hash.is_some());
+
+        // Account 1 sees group 2 file
+        let acct1_group2 =
+            MediaFile::find_by_group(&t.account_pool, &t.shared, &t.account_pubkey, &group_id2)
+                .await
+                .unwrap();
+        assert_eq!(acct1_group2.len(), 1);
+        assert_eq!(
+            acct1_group2[0].encrypted_file_hash,
             encrypted_hash2.to_vec()
         );
-        assert_eq!(media_files_group2[0].mls_group_id, group_id2);
-        // Verify chat_media has original_file_hash
-        assert!(media_files_group2[0].original_file_hash.is_some());
+        assert_eq!(acct1_group2[0].mls_group_id, group_id2);
+        assert!(acct1_group2[0].original_file_hash.is_some());
 
-        // Verify groups are properly isolated
-        assert_ne!(
-            media_files_group1.len(),
-            media_files_group2.len(),
-            "Different groups should have different file counts"
-        );
-        let encrypted_hashes2: Vec<Vec<u8>> = media_files_group2
+        // Account 2 sees nothing in group 2
+        let acct2_group2 = MediaFile::find_by_group(&pool2, &t.shared, &pubkey2, &group_id2)
+            .await
+            .unwrap();
+        assert!(acct2_group2.is_empty());
+
+        // Cross-group isolation: account 1's group 1 results don't include group 2 hashes
+        let encrypted_hashes_acct1_group1: Vec<Vec<u8>> = acct1_group1
             .iter()
             .map(|mf| mf.encrypted_file_hash.clone())
             .collect();
-        assert!(!encrypted_hashes2.contains(&encrypted_hash1a.to_vec()));
-        assert!(!encrypted_hashes2.contains(&encrypted_hash1b.to_vec()));
+        assert!(!encrypted_hashes_acct1_group1.contains(&encrypted_hash2.to_vec()));
+        assert!(!encrypted_hashes_acct1_group1.contains(&encrypted_hash1b.to_vec()));
     }
 
     #[test]
@@ -1246,18 +1379,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_file_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
         let original_hash = [11u8; 32];
         let encrypted_hash = [111u8; 32];
-        let initial_path = temp_dir.path().join("initial.jpg");
-        let new_path = temp_dir.path().join("updated.jpg");
-
-        create_test_account(&db, &pubkey).await;
+        let initial_path = t._dir.path().join("initial.jpg");
+        let new_path = t._dir.path().join("updated.jpg");
 
         // Create metadata to verify it's preserved
         let metadata = FileMetadata::new()
@@ -1266,9 +1394,10 @@ mod tests {
 
         // Create initial media file record
         let media_file = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &initial_path,
                 original_file_hash: Some(&original_hash),
@@ -1293,9 +1422,15 @@ mod tests {
         assert_eq!(media_file.encrypted_file_hash, encrypted_hash.to_vec());
 
         // Update the file path
-        let updated = MediaFile::update_file_path(&db, original_id, &new_path)
-            .await
-            .unwrap();
+        let updated = MediaFile::update_file_path(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            original_id,
+            &new_path,
+        )
+        .await
+        .unwrap();
 
         // Verify path was updated
         assert_eq!(updated.file_path, new_path);
@@ -1305,7 +1440,7 @@ mod tests {
 
         // Verify all other fields remain unchanged
         assert_eq!(updated.mls_group_id, group_id);
-        assert_eq!(updated.account_pubkey, pubkey);
+        assert_eq!(updated.account_pubkey, t.account_pubkey);
         assert_eq!(updated.original_file_hash, Some(original_hash.to_vec()));
         assert_eq!(updated.encrypted_file_hash, encrypted_hash.to_vec());
         assert_eq!(updated.mime_type, "image/jpeg");
@@ -1322,11 +1457,16 @@ mod tests {
         );
 
         // Verify the update persisted by fetching again
-        let fetched =
-            MediaFile::find_by_original_hash_and_group(&db, &original_hash, &group_id, &pubkey)
-                .await
-                .unwrap()
-                .unwrap();
+        let fetched = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &original_hash,
+            &group_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
         assert_eq!(fetched.file_path, new_path);
         assert_eq!(fetched.id, Some(original_id));
@@ -1334,15 +1474,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_file_path_not_found() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let nonexistent_id = 99999;
-        let new_path = temp_dir.path().join("new.jpg");
+        let new_path = t._dir.path().join("new.jpg");
 
         // Try to update a nonexistent record
-        let result = MediaFile::update_file_path(&db, nonexistent_id, &new_path).await;
+        let result = MediaFile::update_file_path(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            nonexistent_id,
+            &new_path,
+        )
+        .await;
 
         assert!(result.is_err());
         match result {
@@ -1355,22 +1500,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_original_hash_and_group() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
-        // Create test data
         let group_id1 = mdk_core::GroupId::from_slice(&[1u8; 8]);
         let group_id2 = mdk_core::GroupId::from_slice(&[2u8; 8]);
-        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
         let original_hash1 = [11u8; 32];
         let original_hash2 = [12u8; 32];
         let encrypted_hash1 = [111u8; 32];
         let encrypted_hash2 = [121u8; 32];
-        let file_path1 = temp_dir.path().join("chat_media1.jpg");
-        let file_path2 = temp_dir.path().join("chat_media2.png");
-
-        create_test_account(&db, &pubkey).await;
+        let file_path1 = t._dir.path().join("chat_media1.jpg");
+        let file_path2 = t._dir.path().join("chat_media2.png");
 
         // Create metadata for first file
         let metadata = FileMetadata::new()
@@ -1379,9 +1518,10 @@ mod tests {
 
         // Save first chat media file in group 1 with original hash
         let saved_file1 = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id1,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path1,
                 original_file_hash: Some(&original_hash1),
@@ -1400,9 +1540,10 @@ mod tests {
 
         // Save second chat media file in group 2 with different original hash
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id2,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path2,
                 original_file_hash: Some(&original_hash2),
@@ -1421,11 +1562,12 @@ mod tests {
 
         // Save a group image (without original_file_hash) in group 1
         let encrypted_hash_group_image = [99u8; 32];
-        let file_path_group_image = temp_dir.path().join("group_image.jpg");
+        let file_path_group_image = t._dir.path().join("group_image.jpg");
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id1,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path_group_image,
                 original_file_hash: None, // Group images don't have original_file_hash
@@ -1443,10 +1585,15 @@ mod tests {
         .unwrap();
 
         // Test 1: Find file with correct original hash, group, and account
-        let found =
-            MediaFile::find_by_original_hash_and_group(&db, &original_hash1, &group_id1, &pubkey)
-                .await
-                .unwrap();
+        let found = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &original_hash1,
+            &group_id1,
+        )
+        .await
+        .unwrap();
 
         assert!(
             found.is_some(),
@@ -1462,10 +1609,15 @@ mod tests {
         assert!(media_file.file_metadata.is_some());
 
         // Test 2: Should not find file with correct hash and account but wrong group
-        let not_found =
-            MediaFile::find_by_original_hash_and_group(&db, &original_hash1, &group_id2, &pubkey)
-                .await
-                .unwrap();
+        let not_found = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &original_hash1,
+            &group_id2,
+        )
+        .await
+        .unwrap();
 
         assert!(
             not_found.is_none(),
@@ -1474,18 +1626,28 @@ mod tests {
 
         // Test 3: Should not find file with wrong hash but correct group and account
         let wrong_hash = [255u8; 32];
-        let not_found =
-            MediaFile::find_by_original_hash_and_group(&db, &wrong_hash, &group_id1, &pubkey)
-                .await
-                .unwrap();
+        let not_found = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &wrong_hash,
+            &group_id1,
+        )
+        .await
+        .unwrap();
 
         assert!(not_found.is_none(), "Should not find file with wrong hash");
 
         // Test 4: Find second file in different group with same account
-        let found =
-            MediaFile::find_by_original_hash_and_group(&db, &original_hash2, &group_id2, &pubkey)
-                .await
-                .unwrap();
+        let found = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &original_hash2,
+            &group_id2,
+        )
+        .await
+        .unwrap();
 
         assert!(found.is_some(), "Should find second file in group 2");
         let media_file2 = found.unwrap();
@@ -1497,12 +1659,17 @@ mod tests {
         assert_eq!(media_file2.mime_type, "image/png");
 
         // Test 5: Verify this method is MIP-04 specific (uses original_file_hash)
-        // The group image has no original_file_hash, so it should not be found
+        // The group image has no original_file_hash, so it should not be found by a random hash
         let nonexistent_hash = [100u8; 32];
-        let not_found =
-            MediaFile::find_by_original_hash_and_group(&db, &nonexistent_hash, &group_id1, &pubkey)
-                .await
-                .unwrap();
+        let not_found = MediaFile::find_by_original_hash_and_group(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &nonexistent_hash,
+            &group_id1,
+        )
+        .await
+        .unwrap();
 
         assert!(
             not_found.is_none(),
@@ -1512,27 +1679,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_by_original_hash_and_group_multi_account() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
-
-        // Create test data for multi-account scenario
-        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let account1_pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
+        let t = setup_test_dbs().await;
         let account2_pubkey = PublicKey::from_slice(&[20u8; 32]).unwrap();
+        let pool2 = add_account(&t.shared, &t._dir, &account2_pubkey).await;
+
+        let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
         let original_hash = [11u8; 32]; // Same media file
         let encrypted_hash = [111u8; 32]; // Same encrypted hash
-        let file_path1 = temp_dir.path().join("account1_media.jpg");
-        let file_path2 = temp_dir.path().join("account2_media.jpg");
-
-        create_test_account(&db, &account1_pubkey).await;
-        create_test_account(&db, &account2_pubkey).await;
+        let file_path1 = t._dir.path().join("account1_media.jpg");
+        let file_path2 = t._dir.path().join("account2_media.jpg");
 
         // Account 1 saves media file (e.g., after uploading)
         let saved_file1 = MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &account1_pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path1,
                 original_file_hash: Some(&original_hash),
@@ -1551,7 +1713,8 @@ mod tests {
 
         // Account 2 saves reference to same media file (e.g., after receiving message)
         let saved_file2 = MediaFile::save(
-            &db,
+            &pool2,
+            &t.shared,
             &group_id,
             &account2_pubkey,
             MediaFileParams {
@@ -1572,25 +1735,29 @@ mod tests {
 
         // Verify that querying with account1 returns account1's record
         let found1 = MediaFile::find_by_original_hash_and_group(
-            &db,
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
             &original_hash,
             &group_id,
-            &account1_pubkey,
         )
         .await
         .unwrap()
         .expect("Should find account1's record");
 
         assert_eq!(found1.id, saved_file1.id);
-        assert_eq!(found1.account_pubkey, account1_pubkey);
-        assert_eq!(found1.file_path, file_path1);
+        assert_eq!(found1.account_pubkey, t.account_pubkey);
+        // file_path comes from the shared blob; account 2's save overwrote it
+        // (last non-empty writer wins in the blob upsert).
+        assert_eq!(found1.file_path, file_path2);
 
         // Verify that querying with account2 returns account2's record (not account1's!)
         let found2 = MediaFile::find_by_original_hash_and_group(
-            &db,
+            &pool2,
+            &t.shared,
+            &account2_pubkey,
             &original_hash,
             &group_id,
-            &account2_pubkey,
         )
         .await
         .unwrap()
@@ -1598,27 +1765,28 @@ mod tests {
 
         assert_eq!(found2.id, saved_file2.id);
         assert_eq!(found2.account_pubkey, account2_pubkey);
-        // file_path comes from the shared blob (first writer wins).
-        assert_eq!(found2.file_path, file_path1);
+        assert_eq!(found2.file_path, file_path2);
 
-        // Verify the two references are distinct records sharing the same blob.
+        // Verify the two references belong to different accounts but share the
+        // same blob (IDs can collide since they're in separate per-account DBs).
         assert_ne!(
-            found1.id, found2.id,
-            "Different accounts should have different reference records"
+            found1.account_pubkey, found2.account_pubkey,
+            "Different accounts should have different account_pubkey"
         );
         assert_eq!(
             found1.file_path, found2.file_path,
             "Both accounts share the same blob, so file_path should match"
         );
 
-        // Verify a third account cannot find records for the other accounts
+        // Verify a third account (with its own pool) cannot find records for the other accounts
         let account3_pubkey = PublicKey::from_slice(&[30u8; 32]).unwrap();
-        create_test_account(&db, &account3_pubkey).await;
+        let pool3 = add_account(&t.shared, &t._dir, &account3_pubkey).await;
         let not_found = MediaFile::find_by_original_hash_and_group(
-            &db,
+            &pool3,
+            &t.shared,
+            &account3_pubkey,
             &original_hash,
             &group_id,
-            &account3_pubkey,
         )
         .await
         .unwrap();
@@ -1631,16 +1799,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_metadata_with_thumbhash() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
         let encrypted_hash = [42u8; 32];
-        let file_path = temp_dir.path().join("test.jpg");
-
-        create_test_account(&db, &pubkey).await;
+        let file_path = t._dir.path().join("test.jpg");
 
         // Save with both blurhash and thumbhash
         let metadata = FileMetadata::new()
@@ -1650,9 +1813,10 @@ mod tests {
             .with_thumbhash("3OcRJYB4d3h/iIeHeEh3eIhw+j2w".to_string());
 
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path,
                 original_file_hash: None,
@@ -1670,10 +1834,15 @@ mod tests {
         .unwrap();
 
         // Retrieve and verify both hashes are persisted
-        let found = MediaFile::find_by_hash(&db, &encrypted_hash)
-            .await
-            .unwrap()
-            .expect("Should find the saved media file");
+        let found = MediaFile::find_by_hash(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &encrypted_hash,
+        )
+        .await
+        .unwrap()
+        .expect("Should find the saved media file");
 
         let retrieved = found.file_metadata.expect("Should have file_metadata");
         assert_eq!(
@@ -1690,55 +1859,70 @@ mod tests {
 
     #[tokio::test]
     async fn test_shared_blobs_survive_reference_deletion() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
+        let account2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
+        let pool2 = add_account(&t.shared, &t._dir, &account2).await;
 
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let account1 = PublicKey::from_slice(&[10u8; 32]).unwrap();
-        let account2 = PublicKey::from_slice(&[20u8; 32]).unwrap();
         let encrypted_hash = [42u8; 32];
-        let file_path = temp_dir.path().join("shared.jpg");
+        let file_path = t._dir.path().join("shared.jpg");
 
-        create_test_account(&db, &account1).await;
-        create_test_account(&db, &account2).await;
+        // Account 1 saves a reference to the blob.
+        MediaFile::save(
+            &t.account_pool,
+            &t.shared,
+            &group_id,
+            &t.account_pubkey,
+            MediaFileParams {
+                file_path: &file_path,
+                original_file_hash: None,
+                encrypted_file_hash: &encrypted_hash,
+                mime_type: "image/jpeg",
+                media_type: "chat_media",
+                blossom_url: None,
+                nostr_key: None,
+                file_metadata: None,
+                nonce: None,
+                scheme_version: None,
+            },
+        )
+        .await
+        .unwrap();
 
-        // Both accounts save a reference to the same blob.
-        for acct in [&account1, &account2] {
-            MediaFile::save(
-                &db,
-                &group_id,
-                acct,
-                MediaFileParams {
-                    file_path: &file_path,
-                    original_file_hash: None,
-                    encrypted_file_hash: &encrypted_hash,
-                    mime_type: "image/jpeg",
-                    media_type: "chat_media",
-                    blossom_url: None,
-                    nostr_key: None,
-                    file_metadata: None,
-                    nonce: None,
-                    scheme_version: None,
-                },
-            )
-            .await
-            .unwrap();
-        }
+        // Account 2 saves a reference to the same blob.
+        MediaFile::save(
+            &pool2,
+            &t.shared,
+            &group_id,
+            &account2,
+            MediaFileParams {
+                file_path: &file_path,
+                original_file_hash: None,
+                encrypted_file_hash: &encrypted_hash,
+                mime_type: "image/jpeg",
+                media_type: "chat_media",
+                blossom_url: None,
+                nostr_key: None,
+                file_metadata: None,
+                nonce: None,
+                scheme_version: None,
+            },
+        )
+        .await
+        .unwrap();
 
-        // Delete account1's reference.
-        sqlx::query("DELETE FROM media_references WHERE account_pubkey = ? AND mls_group_id = ?")
-            .bind(account1.to_hex())
+        // Delete account1's reference from its own per-account pool.
+        sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
             .bind(group_id.as_slice())
-            .execute(&db.pool)
+            .execute(&t.account_pool)
             .await
             .unwrap();
 
-        // Blob must still exist.
+        // Blob must still exist in the shared DB.
         let blob_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM media_blobs WHERE encrypted_file_hash = ?")
                 .bind(hex::encode(encrypted_hash))
-                .fetch_one(&db.pool)
+                .fetch_one(&t.shared.pool)
                 .await
                 .unwrap();
         assert_eq!(
@@ -1746,23 +1930,20 @@ mod tests {
             "Shared blob must survive reference deletion"
         );
 
-        // Account2 can still find the media.
-        let found = MediaFile::find_by_hash(&db, &encrypted_hash).await.unwrap();
+        // Account 2 can still find the media via its own pool.
+        let found = MediaFile::find_by_hash(&pool2, &t.shared, &account2, &encrypted_hash)
+            .await
+            .unwrap();
         assert!(found.is_some(), "Account2 should still see the media file");
     }
 
     #[tokio::test]
     async fn test_file_metadata_without_thumbhash_backwards_compat() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db = Database::new(db_path).await.unwrap();
+        let t = setup_test_dbs().await;
 
         let group_id = mdk_core::GroupId::from_slice(&[1u8; 8]);
-        let pubkey = PublicKey::from_slice(&[10u8; 32]).unwrap();
         let encrypted_hash = [42u8; 32];
-        let file_path = temp_dir.path().join("test.jpg");
-
-        create_test_account(&db, &pubkey).await;
+        let file_path = t._dir.path().join("test.jpg");
 
         // Save with only blurhash (simulating old client behavior)
         let metadata = FileMetadata::new()
@@ -1770,9 +1951,10 @@ mod tests {
             .with_blurhash("LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_string());
 
         MediaFile::save(
-            &db,
+            &t.account_pool,
+            &t.shared,
             &group_id,
-            &pubkey,
+            &t.account_pubkey,
             MediaFileParams {
                 file_path: &file_path,
                 original_file_hash: None,
@@ -1790,10 +1972,15 @@ mod tests {
         .unwrap();
 
         // Retrieve and verify thumbhash is None while blurhash is present
-        let found = MediaFile::find_by_hash(&db, &encrypted_hash)
-            .await
-            .unwrap()
-            .expect("Should find the saved media file");
+        let found = MediaFile::find_by_hash(
+            &t.account_pool,
+            &t.shared,
+            &t.account_pubkey,
+            &encrypted_hash,
+        )
+        .await
+        .unwrap()
+        .expect("Should find the saved media file");
 
         let retrieved = found.file_metadata.expect("Should have file_metadata");
         assert_eq!(

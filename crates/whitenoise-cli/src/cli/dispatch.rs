@@ -520,10 +520,12 @@ pub async fn dispatch(req: Request, wn: &Whitenoise) -> Response {
             Err(resp) => resp,
         },
 
-        Request::ListMedia { group_id } => match list_media(wn, &group_id).await {
-            Ok(resp) => resp,
-            Err(resp) => resp,
-        },
+        Request::ListMedia { account, group_id } => {
+            match list_media(wn, &account, &group_id).await {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            }
+        }
 
         // Streaming commands should be routed through dispatch_streaming
         Request::MessagesSubscribe { .. }
@@ -2038,11 +2040,16 @@ async fn download_media(
 }
 
 #[allow(deprecated)]
-async fn list_media(wn: &Whitenoise, group_id_hex: &str) -> Result<Response, Response> {
+async fn list_media(
+    wn: &Whitenoise,
+    account_str: &str,
+    group_id_hex: &str,
+) -> Result<Response, Response> {
+    let account = find_account(wn, account_str).await?;
     let group_id = parse_group_id(group_id_hex)?;
 
     let files = wn
-        .get_media_files_for_group(&group_id)
+        .get_media_files_for_group(&account, &group_id)
         .await
         .map_err(|e| Response::err(e.to_string()))?;
 

@@ -12,8 +12,8 @@ use crate::whitenoise::error::Result;
 use crate::whitenoise::streaming_error::{StreamKind, StreamingError};
 use crate::whitenoise::users::User;
 use crate::whitenoise::{
-    aggregated_message, chat_list, chat_list_streaming, media_files, message_aggregator,
-    message_streaming, notification_streaming, user_streaming,
+    aggregated_message, chat_list, chat_list_streaming, message_aggregator, message_streaming,
+    notification_streaming, user_streaming,
 };
 
 impl Whitenoise {
@@ -312,14 +312,6 @@ impl Whitenoise {
         notification_streaming::NotificationSubscription {
             updates: self.shared.notification_stream_manager.subscribe(),
         }
-    }
-
-    /// Get a MediaFiles orchestrator for coordinating storage and database operations
-    ///
-    /// This provides high-level methods that coordinate between the storage layer
-    /// (filesystem) and database layer (metadata) for media files.
-    pub(crate) fn media_files(&self) -> media_files::MediaFiles<'_> {
-        media_files::MediaFiles::new(&self.shared.storage, &self.shared.database)
     }
 }
 
