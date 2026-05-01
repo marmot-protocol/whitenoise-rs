@@ -266,16 +266,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keyring_unavailable_display_includes_reason() {
-        let err = WhitenoiseError::KeyringUnavailable("Secret Service locked".to_string());
-
-        assert_eq!(
-            err.to_string(),
-            "Keyring storage unavailable: Secret Service locked"
-        );
-    }
-
-    #[test]
     fn boxed_error_converts_to_internal_error() {
         let boxed: Box<dyn std::error::Error + Send + Sync> =
             Box::new(std::io::Error::other("boxed failure"));

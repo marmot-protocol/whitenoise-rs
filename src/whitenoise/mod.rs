@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
 
 use ::rand::RngCore;
 
@@ -38,6 +36,8 @@ pub mod group_information;
 pub mod groups;
 mod init_timing;
 pub mod key_packages;
+// Platform keyring wrappers are only needed where we install a custom
+// keyring-core default store, plus tests that exercise those wrappers.
 #[cfg(any(
     test,
     all(
@@ -451,13 +451,12 @@ impl Whitenoise {
                     android_native_keyring_store::Store::new(),
                     "Android",
                 )?;
-                let legacy = Self::create_keyring_store(
+                let store = Self::create_legacy_migration_keyring_store(
+                    primary,
                     android_native_keyring_store::LegacyStore::from_ndk_context(),
                     "legacy Android",
-                )?;
-                keyring_core::set_default_store(
-                    keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
                 );
+                keyring_core::set_default_store(store);
             }
             #[cfg(not(any(
                 target_os = "macos",
@@ -491,6 +490,29 @@ impl Whitenoise {
             ))
         })?;
         Ok(store)
+    }
+
+    #[cfg(any(test, target_os = "android"))]
+    fn create_legacy_migration_keyring_store<S>(
+        primary: Arc<keyring_core::CredentialStore>,
+        legacy: keyring_core::Result<Arc<S>>,
+        legacy_store_name: &str,
+    ) -> Arc<keyring_core::CredentialStore>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        match Self::create_keyring_store(legacy, legacy_store_name) {
+            Ok(legacy) => keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
+            Err(err) => {
+                tracing::warn!(
+                    target: "whitenoise::keyring_store",
+                    error = %err,
+                    store = legacy_store_name,
+                    "Failed to create legacy keyring store; continuing with primary store only"
+                );
+                primary
+            }
+        }
     }
 
     fn set_default_keyring_store<S>(
@@ -552,10 +574,6 @@ impl Whitenoise {
     pub async fn initialize_whitenoise(config: WhitenoiseConfig) -> Result<()> {
         init_timing::start();
 
-        // Ensure keyring-core has a credential store before any MDK or
-        // SecretsStore operations attempt to create or read keyring entries.
-        Self::initialize_keyring_store()?;
-
         // Validate keyring_service_id is not empty or whitespace
         let keyring_service_id = config.keyring_service_id.trim().to_string();
         if keyring_service_id.is_empty() {
@@ -563,6 +581,10 @@ impl Whitenoise {
                 "keyring_service_id cannot be empty or whitespace".to_string(),
             ));
         }
+
+        // Ensure keyring-core has a credential store before any MDK or
+        // SecretsStore operations attempt to create or read keyring entries.
+        Self::initialize_keyring_store()?;
 
         // Create event processing channels
         let (event_sender, event_receiver) = mpsc::channel(2000);
@@ -956,6 +978,7 @@ impl Whitenoise {
 
 #[cfg(test)]
 pub mod test_utils {
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -1467,6 +1490,8 @@ pub mod test_utils {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use keyring_core::api::CredentialStoreApi;
+
     use super::test_utils::*;
     use super::*;
     use database::aggregated_messages::PaginationOptions;
@@ -1505,12 +1530,20 @@ mod tests {
     }
 
     #[test]
-    fn keyring_store_init_preserves_existing_default_store() {
+    fn keyring_store_init_skips_initializer_when_default_store_exists() {
         let init = KeyringStoreInit::new();
+        let attempts = AtomicUsize::new(0);
 
-        let result = init.initialize_with(|| true, || panic!("initializer ran for existing store"));
+        let result = init.initialize_with(
+            || true,
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
 
         assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1529,6 +1562,34 @@ mod tests {
                 if msg.contains("Failed to create test credential store")
                     && msg.contains("boom")
         ));
+    }
+
+    #[test]
+    fn legacy_migration_keyring_store_falls_back_to_primary_when_legacy_store_creation_fails() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"primary-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store::<keyring_core::mock::Store>(
+            primary,
+            Err(keyring_core::Error::Invalid(
+                "legacy Android".to_string(),
+                "missing NDK context".to_string(),
+            )),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"primary-db-key"
+        );
     }
 
     // Configuration Tests

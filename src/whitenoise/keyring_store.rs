@@ -172,7 +172,9 @@ impl LegacyMigrationCredential {
 
 impl CredentialApi for LegacyMigrationCredential {
     fn set_secret(&self, secret: &[u8]) -> Result<()> {
-        self.primary.set_secret(secret)
+        self.primary.set_secret(secret)?;
+        Self::delete_entry(&self.legacy)?;
+        Ok(())
     }
 
     fn get_secret(&self) -> Result<Vec<u8>> {
@@ -207,7 +209,7 @@ impl CredentialApi for LegacyMigrationCredential {
     }
 
     fn get_credential(&self) -> Result<Option<Arc<Credential>>> {
-        self.get_secret().map(|_| None)
+        Ok(None)
     }
 
     fn get_specifiers(&self) -> Option<(String, String)> {
@@ -572,6 +574,62 @@ mod tests {
                 .unwrap(),
             b"new-db-key"
         );
+    }
+
+    #[test]
+    fn legacy_migration_store_set_secret_removes_stale_legacy_secret() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let legacy_entry = legacy
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        legacy_entry.set_secret(b"stale-legacy-db-key").unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary.clone(), legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        entry.set_secret(b"new-primary-db-key").unwrap();
+
+        assert_eq!(entry.get_secret().unwrap(), b"new-primary-db-key");
+        assert_eq!(
+            primary
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"new-primary-db-key"
+        );
+        assert!(matches!(legacy_entry.get_secret(), Err(Error::NoEntry)));
+    }
+
+    #[test]
+    fn legacy_migration_store_get_credential_does_not_migrate_legacy_secret() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let primary_entry = primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let legacy_entry = legacy
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        legacy_entry.set_secret(b"legacy-db-key").unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap();
+        let credential = entry.get_credential().unwrap();
+
+        assert!(matches!(primary_entry.get_secret(), Err(Error::NoEntry)));
+        assert_eq!(legacy_entry.get_secret().unwrap(), b"legacy-db-key");
+        assert_eq!(credential.get_secret().unwrap(), b"legacy-db-key");
+        assert_eq!(
+            primary_entry.get_secret().unwrap(),
+            b"legacy-db-key",
+            "migration should happen on the explicit secret read"
+        );
+        assert!(matches!(legacy_entry.get_secret(), Err(Error::NoEntry)));
     }
 
     #[test]
