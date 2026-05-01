@@ -9,15 +9,15 @@ pub struct Migration;
 #[async_trait]
 impl GlobalMigration for Migration {
     fn version(&self) -> u32 {
-        22
+        27
     }
 
     fn description(&self) -> &'static str {
-        "Drop shared drafts (moved to per-account DB at v16)"
+        "Drop shared account_follows (moved to per-account DB at v22)"
     }
 
     async fn run_global(&self, tx: &mut SqliteConnection) -> Result<(), DatabaseError> {
-        sqlx::query("DROP TABLE IF EXISTS drafts")
+        sqlx::query("DROP TABLE IF EXISTS account_follows")
             .execute(&mut *tx)
             .await?;
         Ok(())
@@ -34,7 +34,7 @@ mod tests {
     #[tokio::test]
     async fn drops_table_when_present() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE drafts (id INTEGER PRIMARY KEY)")
+        sqlx::query("CREATE TABLE account_follows (id INTEGER PRIMARY KEY)")
             .execute(&pool)
             .await
             .unwrap();
@@ -46,7 +46,7 @@ mod tests {
 
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='drafts')",
+             WHERE type='table' AND name='account_follows')",
         )
         .fetch_one(&pool)
         .await

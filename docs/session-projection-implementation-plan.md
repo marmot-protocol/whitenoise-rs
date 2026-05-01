@@ -539,28 +539,28 @@ Six tables moved out of shared into per-account DB files. Migration timeline:
 
 | v   | Kind   | Migration                                         |
 | --- | ------ | ------------------------------------------------- |
-| 13  | global | `published_events.account_id → account_pubkey`    |
-| 14  | global | `processed_events.account_id → account_pubkey`    |
-| 15  | local  | move `account_settings`                           |
-| 16  | local  | move `drafts`                                     |
-| 17  | local  | move `published_key_packages`                     |
-| 18  | local  | move `published_events`                           |
-| 19  | local  | move account-scoped `processed_events`            |
-| 20  | local  | move `account_follows`                            |
-| 21  | global | drop shared `account_settings`                    |
-| 22  | global | drop shared `drafts`                              |
-| 23  | global | drop shared `published_key_packages`              |
-| 24  | global | drop shared `published_events`                    |
-| 25  | global | drop shared `account_follows`                     |
-| 26  | global | purge account-scoped rows from `processed_events` |
+| 15  | global | `published_events.account_id → account_pubkey`    |
+| 16  | global | `processed_events.account_id → account_pubkey`    |
+| 17  | local  | move `account_settings`                           |
+| 18  | local  | move `drafts`                                     |
+| 19  | local  | move `published_key_packages`                     |
+| 20  | local  | move `published_events`                           |
+| 21  | local  | move account-scoped `processed_events`            |
+| 22  | local  | move `account_follows`                            |
+| 23  | global | drop shared `account_settings`                    |
+| 24  | global | drop shared `drafts`                              |
+| 25  | global | drop shared `published_key_packages`              |
+| 26  | global | drop shared `published_events`                    |
+| 27  | global | drop shared `account_follows`                     |
+| 28  | global | purge account-scoped rows from `processed_events` |
 
 **Unified-timeline ordering.** Globals and locals share one version space.
-`Migrator::run` walks them in version order, so a "global drop" at v21 is
-guaranteed to run only after the corresponding v15 local copy has been
+`Migrator::run` walks them in version order, so a "global drop" at v23 is
+guaranteed to run only after the corresponding v17 local copy has been
 applied for whichever account-DB pool is being migrated. Cross-scope races
 that the segregated-sequence design used to allow (drop ahead of copy) are
 prevented by construction — see
-`m0026_purge_account_processed_events.rs:run_global` doc and the Migrator
+`m0028_purge_account_processed_events.rs:run_global` doc and the Migrator
 docs in `rust_migrations/mod.rs`.
 
 **Deferred-drop guarantee for never-logged-in accounts.** `Database::new`

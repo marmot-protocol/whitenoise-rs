@@ -9,11 +9,11 @@ pub struct Migration;
 #[async_trait]
 impl LocalMigration for Migration {
     fn version(&self) -> u32 {
-        19
+        20
     }
 
     fn description(&self) -> &'static str {
-        "Move account-scoped processed_events into per-account database"
+        "Move published_events into per-account database"
     }
 
     async fn run_local(
@@ -22,67 +22,55 @@ impl LocalMigration for Migration {
         global_db: &SqlitePool,
         account_pubkey: &str,
     ) -> Result<(), DatabaseError> {
-        // Per-account schema: drops the `account_pubkey` column and the
-        // `idx_processed_events_global_unique` partial index, since this file
-        // only stores account-scoped rows. Author column stays nullable for
-        // any future per-account author-keyed lookups.
+        // Per-account schema: no account_pubkey column (the file is the scope).
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS processed_events (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id            TEXT NOT NULL UNIQUE
+            "CREATE TABLE IF NOT EXISTS published_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id    TEXT NOT NULL UNIQUE
                     CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
-                created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                event_created_at    INTEGER DEFAULT NULL,
-                event_kind          INTEGER DEFAULT NULL,
-                author              TEXT DEFAULT NULL
+                created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_processed_events_kind_timestamp
-                ON processed_events(event_kind, event_created_at)",
-        )
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_published_events_event_id ON published_events(event_id)")
+            .execute(&mut *tx)
+            .await?;
 
+        // Copy this account's rows from shared DB, if any. Tolerant of missing
+        // shared.published_events (fresh install, or table already dropped by
+        // the post-local cleanup migration).
         let shared_table_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='processed_events')",
+             WHERE type='table' AND name='published_events')",
         )
         .fetch_one(global_db)
         .await?;
 
         if !shared_table_exists {
             tracing::warn!(
-                target: "whitenoise::database::rust_migrations::m0019",
+                target: "whitenoise::database::rust_migrations::m0018",
                 account = account_pubkey,
-                "shared.processed_events is missing; skipping local copy"
+                "shared.published_events is missing; skipping local copy"
             );
             return Ok(());
         }
 
-        type Row = (String, String, Option<i64>, Option<i64>, Option<String>);
+        type Row = (String, String);
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT event_id, created_at, event_created_at, event_kind, author \
-             FROM processed_events WHERE account_pubkey = ?",
+            "SELECT event_id, created_at FROM published_events WHERE account_pubkey = ?",
         )
         .bind(account_pubkey)
         .fetch_all(global_db)
         .await?;
 
-        for (event_id, created_at, event_created_at, event_kind, author) in rows {
+        for (event_id, created_at) in rows {
             sqlx::query(
-                "INSERT OR IGNORE INTO processed_events \
-                    (event_id, created_at, event_created_at, event_kind, author) \
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO published_events (event_id, created_at) VALUES (?, ?)",
             )
             .bind(event_id)
             .bind(created_at)
-            .bind(event_created_at)
-            .bind(event_kind)
-            .bind(author)
             .execute(&mut *tx)
             .await?;
         }
@@ -118,24 +106,14 @@ mod tests {
 
     async fn seed_global(global: &SqlitePool) {
         sqlx::query(
-            "CREATE TABLE processed_events (
+            "CREATE TABLE published_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL
                     CHECK (length(event_id) = 64 AND event_id NOT GLOB '*[^0-9a-fA-F]*'),
-                account_pubkey TEXT,
+                account_pubkey TEXT NOT NULL,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                event_created_at INTEGER DEFAULT NULL,
-                event_kind INTEGER DEFAULT NULL,
-                author TEXT DEFAULT NULL,
                 UNIQUE(event_id, account_pubkey)
             )",
-        )
-        .execute(global)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_processed_events_global_unique
-                ON processed_events(event_id) WHERE account_pubkey IS NULL",
         )
         .execute(global)
         .await
@@ -143,38 +121,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_copies_only_this_accounts_rows() {
+    async fn migration_copies_account_rows_only() {
         let (local, global, _dir) = pools().await;
         let pubkey = "ab".repeat(32);
         let other_pubkey = "cd".repeat(32);
         seed_global(&global).await;
 
-        // Account-scoped row for our account.
-        sqlx::query(
-            "INSERT INTO processed_events (event_id, account_pubkey, event_kind) VALUES (?, ?, 3)",
-        )
-        .bind("11".repeat(32))
-        .bind(&pubkey)
-        .execute(&global)
-        .await
-        .unwrap();
-        // Account-scoped row for a different account.
-        sqlx::query(
-            "INSERT INTO processed_events (event_id, account_pubkey, event_kind) VALUES (?, ?, 3)",
-        )
-        .bind("22".repeat(32))
-        .bind(&other_pubkey)
-        .execute(&global)
-        .await
-        .unwrap();
-        // Global row (NULL account) — must NOT be copied.
-        sqlx::query(
-            "INSERT INTO processed_events (event_id, account_pubkey, event_kind) VALUES (?, NULL, 0)",
-        )
-        .bind("33".repeat(32))
-        .execute(&global)
-        .await
-        .unwrap();
+        for (acc, evt) in &[
+            (&pubkey, "11".repeat(32)),
+            (&pubkey, "22".repeat(32)),
+            (&other_pubkey, "33".repeat(32)),
+        ] {
+            sqlx::query("INSERT INTO published_events (event_id, account_pubkey) VALUES (?, ?)")
+                .bind(evt)
+                .bind(acc)
+                .execute(&global)
+                .await
+                .unwrap();
+        }
 
         Migrator::new(vec![], vec![Box::new(Migration)])
             .run(&global, Some((&local, &pubkey)))
@@ -182,12 +146,14 @@ mod tests {
             .unwrap();
 
         let event_ids: Vec<(String,)> =
-            sqlx::query_as("SELECT event_id FROM processed_events ORDER BY event_id")
+            sqlx::query_as("SELECT event_id FROM published_events ORDER BY event_id")
                 .fetch_all(&local)
                 .await
                 .unwrap();
-        assert_eq!(event_ids.len(), 1);
-        assert_eq!(event_ids[0].0, "11".repeat(32));
+        assert_eq!(
+            event_ids.iter().map(|(e,)| e.as_str()).collect::<Vec<_>>(),
+            vec!["11".repeat(32).as_str(), "22".repeat(32).as_str()]
+        );
     }
 
     #[tokio::test]
@@ -202,7 +168,7 @@ mod tests {
 
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='processed_events')",
+             WHERE type='table' AND name='published_events')",
         )
         .fetch_one(&local)
         .await

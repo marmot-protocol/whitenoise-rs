@@ -9,7 +9,7 @@ pub struct Migration;
 #[async_trait]
 impl GlobalMigration for Migration {
     fn version(&self) -> u32 {
-        13
+        15
     }
 
     fn description(&self) -> &'static str {

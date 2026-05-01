@@ -9,20 +9,20 @@ pub struct Migration;
 #[async_trait]
 impl GlobalMigration for Migration {
     fn version(&self) -> u32 {
-        26
+        28
     }
 
     fn description(&self) -> &'static str {
-        "Purge account-scoped rows from shared processed_events (moved at v19)"
+        "Purge account-scoped rows from shared processed_events (moved at v21)"
     }
 
     /// `processed_events` keeps NULL-scoped rows in the shared DB; only the
-    /// account-scoped rows have been moved out by v19. This deletion runs
-    /// after every account on disk has applied v19 locally — the unified
-    /// timeline guarantees v19 < v26 ordering, and `MIGRATOR.run_all` at
+    /// account-scoped rows have been moved out by v21. This deletion runs
+    /// after every account on disk has applied v21 locally — the unified
+    /// timeline guarantees v21 < v28 ordering, and `MIGRATOR.run_all` at
     /// boot (driven by `Whitenoise::enumerate_account_pools`) walks every
-    /// per-account file in lockstep with shared so v26 cannot fire ahead
-    /// of v19 for any account, including ones that have never logged in.
+    /// per-account file in lockstep with shared so v28 cannot fire ahead
+    /// of v21 for any account, including ones that have never logged in.
     async fn run_global(&self, tx: &mut SqliteConnection) -> Result<(), DatabaseError> {
         let table_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \

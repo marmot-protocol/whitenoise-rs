@@ -9,19 +9,15 @@ pub struct Migration;
 #[async_trait]
 impl GlobalMigration for Migration {
     fn version(&self) -> u32 {
-        21
+        24
     }
 
     fn description(&self) -> &'static str {
-        "Drop shared account_settings (moved to per-account DB at v15)"
+        "Drop shared drafts (moved to per-account DB at v18)"
     }
 
-    /// Runs after every account's v15 local copy completes (the unified
-    /// timeline guarantees v15 runs before v21). At app boot we re-run the
-    /// migrator after `restore_sessions` so this drop is committed only once
-    /// every persisted account has run its v15 copy locally.
     async fn run_global(&self, tx: &mut SqliteConnection) -> Result<(), DatabaseError> {
-        sqlx::query("DROP TABLE IF EXISTS account_settings")
+        sqlx::query("DROP TABLE IF EXISTS drafts")
             .execute(&mut *tx)
             .await?;
         Ok(())
@@ -38,7 +34,7 @@ mod tests {
     #[tokio::test]
     async fn drops_table_when_present() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE TABLE account_settings (id INTEGER PRIMARY KEY)")
+        sqlx::query("CREATE TABLE drafts (id INTEGER PRIMARY KEY)")
             .execute(&pool)
             .await
             .unwrap();
@@ -50,7 +46,7 @@ mod tests {
 
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-             WHERE type='table' AND name='account_settings')",
+             WHERE type='table' AND name='drafts')",
         )
         .fetch_one(&pool)
         .await

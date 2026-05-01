@@ -9,7 +9,7 @@ pub struct Migration;
 #[async_trait]
 impl LocalMigration for Migration {
     fn version(&self) -> u32 {
-        20
+        22
     }
 
     fn description(&self) -> &'static str {
