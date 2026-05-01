@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::perf_instrument;
 use crate::whitenoise::{
     Whitenoise, accounts::Account, chat_list_streaming::ChatListUpdateTrigger, database::Database,
-    error::WhitenoiseError,
+    database::media_files::MediaFile, error::WhitenoiseError,
 };
 
 /// Represents the relationship between an account and an MLS group.
@@ -645,10 +645,7 @@ impl Whitenoise {
             .await?;
 
         // 4b. Delete per-account media_references for this group
-        sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
-            .bind(group_id.as_slice())
-            .execute(&session.account_db.inner.pool)
-            .await?;
+        MediaFile::delete_references_for_group(&session.account_db.inner.pool, group_id).await?;
 
         // 5. Delete MDK group state for this account (best-effort)
         match self.create_mdk_for_account(account.pubkey) {

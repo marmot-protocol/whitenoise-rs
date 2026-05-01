@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, Utc};
 use mdk_core::GroupId;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 use sqlx::{Row, SqlitePool};
-use std::path::{Path, PathBuf};
 
 use super::{Database, DatabaseError};
 use crate::perf_instrument;
@@ -109,6 +111,7 @@ struct ReferenceRow {
 }
 
 /// Data from a `media_blobs` row (shared DB).
+#[derive(Clone)]
 struct BlobRow {
     file_path: String,
     mime_type: String,
@@ -136,8 +139,18 @@ impl MediaFile {
             .and_then(|hex_str| hex::decode(&hex_str).ok());
         let file_metadata: Option<FileMetadata> =
             r.file_metadata.and_then(|s| serde_json::from_str(&s).ok());
-        let created_at = chrono::DateTime::from_timestamp_millis(r.created_at)
-            .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+        let created_at = match chrono::DateTime::from_timestamp_millis(r.created_at) {
+            Some(ts) => ts,
+            None => {
+                tracing::warn!(
+                    target: "whitenoise::database::media_files",
+                    encrypted_file_hash = %r.encrypted_file_hash,
+                    raw_millis = r.created_at,
+                    "media_references.created_at out of range, falling back to MIN_UTC",
+                );
+                chrono::DateTime::<Utc>::MIN_UTC
+            }
+        };
 
         Ok(Self {
             id: Some(r.id),
@@ -204,6 +217,52 @@ impl MediaFile {
             None => Ok(None),
         }
     }
+
+    /// Batch-fetch blob rows for a set of encrypted file hashes in one query.
+    async fn fetch_blobs_batch(
+        shared_pool: &SqlitePool,
+        hashes: &[&str],
+    ) -> std::result::Result<HashMap<String, BlobRow>, DatabaseError> {
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Deduplicate hashes — multiple references can point to the same blob.
+        let unique: std::collections::HashSet<&str> = hashes.iter().copied().collect();
+
+        // Use QueryBuilder for a single IN-clause query with proper binds.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT encrypted_file_hash, file_path, mime_type, blossom_url \
+             FROM media_blobs \
+             WHERE encrypted_file_hash IN (",
+        );
+        let mut separated = qb.separated(", ");
+        for hash in &unique {
+            separated.push_bind(*hash);
+        }
+        separated.push_unseparated(")");
+
+        let rows = qb
+            .build()
+            .fetch_all(shared_pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+
+        let mut map = HashMap::with_capacity(rows.len());
+        for row in &rows {
+            let hash: String = row
+                .try_get("encrypted_file_hash")
+                .map_err(DatabaseError::Sqlx)?;
+            let blob = BlobRow {
+                file_path: row.try_get("file_path").map_err(DatabaseError::Sqlx)?,
+                mime_type: row.try_get("mime_type").map_err(DatabaseError::Sqlx)?,
+                blossom_url: row.try_get("blossom_url").map_err(DatabaseError::Sqlx)?,
+            };
+            map.insert(hash, blob);
+        }
+
+        Ok(map)
+    }
 }
 
 impl MediaFile {
@@ -244,13 +303,10 @@ impl MediaFile {
             None => return Ok(None),
         };
 
-        let blob = Self::fetch_blob(&shared_db.pool, &hash_hex)
-            .await?
-            .unwrap_or(BlobRow {
-                file_path: String::new(),
-                mime_type: String::new(),
-                blossom_url: None,
-            });
+        let blob = match Self::fetch_blob(&shared_db.pool, &hash_hex).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
 
         Ok(Some(Self::assemble(ref_row, blob, *account_pubkey)?))
     }
@@ -347,11 +403,11 @@ impl MediaFile {
         // Read back the blob from the shared DB.
         let blob = Self::fetch_blob(&shared_db.pool, &encrypted_file_hash_hex)
             .await?
-            .unwrap_or(BlobRow {
-                file_path: String::new(),
-                mime_type: String::new(),
-                blossom_url: None,
-            });
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache(format!(
+                    "missing media_blobs row for hash {encrypted_file_hash_hex}"
+                ))
+            })?;
 
         Self::assemble(ref_row, blob, *account_pubkey)
     }
@@ -378,16 +434,31 @@ impl MediaFile {
         .await
         .map_err(DatabaseError::Sqlx)?;
 
-        let mut result = Vec::with_capacity(ref_rows.len());
+        let mut refs: Vec<ReferenceRow> = Vec::with_capacity(ref_rows.len());
         for row in &ref_rows {
-            let r = Self::ref_from_row(row).map_err(DatabaseError::Sqlx)?;
-            let blob = Self::fetch_blob(&shared_db.pool, &r.encrypted_file_hash)
-                .await?
-                .unwrap_or(BlobRow {
-                    file_path: String::new(),
-                    mime_type: String::new(),
-                    blossom_url: None,
-                });
+            refs.push(Self::ref_from_row(row).map_err(DatabaseError::Sqlx)?);
+        }
+
+        // Batch-fetch all blobs in one query instead of N round-trips.
+        let hashes: Vec<&str> = refs
+            .iter()
+            .map(|r| r.encrypted_file_hash.as_str())
+            .collect();
+        let blob_map = Self::fetch_blobs_batch(&shared_db.pool, &hashes).await?;
+
+        let mut result = Vec::with_capacity(refs.len());
+        for r in refs {
+            let blob = match blob_map.get(&r.encrypted_file_hash) {
+                Some(b) => b.clone(),
+                None => {
+                    tracing::warn!(
+                        target: "whitenoise::database::media_files",
+                        encrypted_file_hash = %r.encrypted_file_hash,
+                        "media_blobs row missing for referenced hash; skipping entry",
+                    );
+                    continue;
+                }
+            };
             result.push(Self::assemble(r, blob, *account_pubkey)?);
         }
 
@@ -432,13 +503,10 @@ impl MediaFile {
             None => return Ok(None),
         };
 
-        let blob = Self::fetch_blob(&shared_db.pool, &ref_row.encrypted_file_hash)
-            .await?
-            .unwrap_or(BlobRow {
-                file_path: String::new(),
-                mime_type: String::new(),
-                blossom_url: None,
-            });
+        let blob = match Self::fetch_blob(&shared_db.pool, &ref_row.encrypted_file_hash).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
 
         Ok(Some(Self::assemble(ref_row, blob, *account_pubkey)?))
     }
@@ -496,11 +564,9 @@ impl MediaFile {
 
         let blob = Self::fetch_blob(&shared_db.pool, &hash)
             .await?
-            .unwrap_or(BlobRow {
-                file_path: String::new(),
-                mime_type: String::new(),
-                blossom_url: None,
-            });
+            .ok_or_else(|| {
+                WhitenoiseError::MediaCache(format!("missing media_blobs row for hash {hash}"))
+            })?;
 
         Self::assemble(ref_row, blob, *account_pubkey)
     }
@@ -538,6 +604,19 @@ impl MediaFile {
     /// Check if this media file is a document
     pub fn is_document(&self) -> bool {
         self.mime_type == "application/pdf"
+    }
+
+    /// Deletes all per-account `media_references` rows for a given group.
+    pub(crate) async fn delete_references_for_group(
+        account_pool: &SqlitePool,
+        group_id: &GroupId,
+    ) -> Result<(), WhitenoiseError> {
+        sqlx::query("DELETE FROM media_references WHERE mls_group_id = ?")
+            .bind(group_id.as_slice())
+            .execute(account_pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+        Ok(())
     }
 }
 
