@@ -237,6 +237,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingStore {
         build_modifiers: Mutex<Vec<HashMap<String, String>>>,
+        credentials: Mutex<HashMap<(String, String), Arc<RecordingCredential>>>,
         search_specs: Mutex<Vec<HashMap<String, String>>>,
     }
 
@@ -272,15 +273,26 @@ mod tests {
 
         fn build(
             &self,
-            _service: &str,
-            _user: &str,
+            service: &str,
+            user: &str,
             modifiers: Option<&HashMap<&str, &str>>,
         ) -> Result<Entry> {
             self.build_modifiers
                 .lock()
                 .unwrap()
                 .push(owned_map(modifiers));
-            Ok(Entry::new_with_credential(Arc::new(TestCredential)))
+            let mut credentials = self.credentials.lock().unwrap();
+            let credential = credentials
+                .entry((service.to_string(), user.to_string()))
+                .or_insert_with(|| {
+                    Arc::new(RecordingCredential {
+                        service: service.to_string(),
+                        user: user.to_string(),
+                        secret: Mutex::new(None),
+                    })
+                })
+                .clone();
+            Ok(Entry::new_with_credential(credential))
         }
 
         fn search(&self, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
@@ -289,6 +301,43 @@ mod tests {
                 .unwrap()
                 .push(owned_map(Some(spec)));
             Ok(Vec::new())
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingCredential {
+        service: String,
+        user: String,
+        secret: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl CredentialApi for RecordingCredential {
+        fn set_secret(&self, secret: &[u8]) -> Result<()> {
+            *self.secret.lock().unwrap() = Some(secret.to_vec());
+            Ok(())
+        }
+
+        fn get_secret(&self) -> Result<Vec<u8>> {
+            self.secret.lock().unwrap().clone().ok_or(Error::NoEntry)
+        }
+
+        fn delete_credential(&self) -> Result<()> {
+            match self.secret.lock().unwrap().take() {
+                Some(_) => Ok(()),
+                None => Err(Error::NoEntry),
+            }
+        }
+
+        fn get_credential(&self) -> Result<Option<Arc<Credential>>> {
+            Ok(None)
+        }
+
+        fn get_specifiers(&self) -> Option<(String, String)> {
+            Some((self.service.clone(), self.user.clone()))
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -491,6 +540,30 @@ mod tests {
     fn target_is_non_default_for_wsl() {
         assert_eq!(LINUX_SECRET_SERVICE_TARGET, "whitenoise");
         assert_ne!(LINUX_SECRET_SERVICE_TARGET, "default");
+    }
+
+    #[test]
+    fn targeted_primary_store_migrates_legacy_secret() {
+        let primary_inner = Arc::new(RecordingStore::default());
+        let primary: Arc<CredentialStore> =
+            TargetedCredentialStore::new(primary_inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let legacy = keyring_core::mock::Store::new().unwrap();
+        let legacy_entry = legacy
+            .build("com.whitenoise.app", "mdk.db.key.pubkey", None)
+            .unwrap();
+        legacy_entry.set_secret(b"legacy-mdk-key").unwrap();
+        let store = LegacyMigrationCredentialStore::new(primary, legacy);
+
+        let entry = store
+            .build("com.whitenoise.app", "mdk.db.key.pubkey", None)
+            .unwrap();
+
+        assert_eq!(entry.get_secret().unwrap(), b"legacy-mdk-key");
+        assert_eq!(
+            primary_inner.last_build_modifier("target"),
+            Some(LINUX_SECRET_SERVICE_TARGET.to_string())
+        );
+        assert!(matches!(legacy_entry.get_secret(), Err(Error::NoEntry)));
     }
 
     #[test]

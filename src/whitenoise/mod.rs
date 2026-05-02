@@ -436,14 +436,20 @@ impl Whitenoise {
             }
             #[cfg(target_os = "linux")]
             {
-                let store = Self::create_keyring_store(
+                let primary = Self::create_keyring_store(
                     zbus_secret_service_keyring_store::Store::new(),
                     "Linux Secret Service",
                 )?;
-                keyring_core::set_default_store(keyring_store::TargetedCredentialStore::new(
-                    store,
+                let primary = keyring_store::TargetedCredentialStore::new(
+                    primary,
                     keyring_store::LINUX_SECRET_SERVICE_TARGET,
-                ));
+                );
+                let store = Self::create_legacy_migration_keyring_store(
+                    primary,
+                    linux_keyutils_keyring_store::Store::new(),
+                    "legacy Linux keyutils",
+                );
+                keyring_core::set_default_store(store);
             }
             #[cfg(target_os = "android")]
             {
@@ -492,7 +498,7 @@ impl Whitenoise {
         Ok(store)
     }
 
-    #[cfg(any(test, target_os = "android"))]
+    #[cfg(any(test, target_os = "android", target_os = "linux"))]
     fn create_legacy_migration_keyring_store<S>(
         primary: Arc<keyring_core::CredentialStore>,
         legacy: keyring_core::Result<Arc<S>>,

@@ -112,6 +112,9 @@ apple-native-keyring-store = { version = "1", features = ["protected"] }
 windows-native-keyring-store = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Secret Service is the durable Linux store. Keyutils is retained only as a
+# legacy migration source for users upgrading from the old Linux backend.
+linux-keyutils-keyring-store = "1"
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
