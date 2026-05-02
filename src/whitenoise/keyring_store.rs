@@ -567,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn recording_store_credentials_preserve_entry_state() {
+        let store = RecordingStore::default();
+        let entry = store
+            .build("com.whitenoise.app", "mdk.db.key.pubkey", None)
+            .unwrap();
+
+        assert!(matches!(entry.get_secret(), Err(Error::NoEntry)));
+
+        entry.set_secret(b"primary-mdk-key").unwrap();
+        assert_eq!(entry.get_secret().unwrap(), b"primary-mdk-key");
+        let rebuilt_entry = store
+            .build("com.whitenoise.app", "mdk.db.key.pubkey", None)
+            .unwrap();
+        assert_eq!(rebuilt_entry.get_secret().unwrap(), b"primary-mdk-key");
+        assert_eq!(
+            entry.get_specifiers(),
+            Some((
+                "com.whitenoise.app".to_string(),
+                "mdk.db.key.pubkey".to_string()
+            ))
+        );
+        let credential = entry
+            .as_any()
+            .downcast_ref::<RecordingCredential>()
+            .unwrap();
+        assert!(credential.get_credential().unwrap().is_none());
+        assert!(format!("{credential:?}").contains("RecordingCredential"));
+
+        entry.delete_credential().unwrap();
+        assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
+    }
+
+    #[test]
     fn legacy_migration_store_delegates_metadata_and_search_to_primary() {
         let primary = keyring_core::mock::Store::new().unwrap();
         let legacy = keyring_core::mock::Store::new().unwrap();
