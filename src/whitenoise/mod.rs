@@ -498,7 +498,14 @@ impl Whitenoise {
         Ok(store)
     }
 
-    #[cfg(any(test, target_os = "android", target_os = "linux"))]
+    #[cfg(any(
+        test,
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(feature = "integration-tests"),
+            not(feature = "benchmark-tests")
+        )
+    ))]
     fn create_legacy_migration_keyring_store<S>(
         primary: Arc<keyring_core::CredentialStore>,
         legacy: keyring_core::Result<Arc<S>>,
