@@ -9,17 +9,17 @@ const FRESH_ACCOUNT_SCHEMA: &str = include_str!("fresh_account_schema.sql");
 /// The unified-timeline version this bootstrap occupies.
 ///
 /// Locals share the version space with globals; this is the next free slot
-/// after the existing globals at 1..=11.
-const BOOTSTRAP_VERSION: u32 = 12;
+/// after the existing v30 global (`m0030_drop_shared_media_references`).
+const BOOTSTRAP_VERSION: u32 = 31;
 
 /// Local versions strictly less than `BOOTSTRAP_VERSION` whose effect is
 /// already captured in `fresh_account_schema.sql`. Stamped into a fresh
 /// account's `_rust_migrations` table so the runner skips them.
 ///
-/// Empty until we rebaseline. To rebaseline: update the schema file, bump
-/// the bootstrap to a higher version (or replace this file with a newer
-/// bootstrap migration), and list the now-skipped versions here.
-const STAMPED_PRIOR_LOCAL_VERSIONS: &[u32] = &[];
+/// To rebaseline further: update the schema file, bump the bootstrap to a
+/// higher version (or replace this file with a newer bootstrap migration),
+/// and append the now-skipped versions here.
+const STAMPED_PRIOR_LOCAL_VERSIONS: &[u32] = &[17, 18, 19, 20, 21, 22, 29];
 
 /// Bootstrap a fresh account database with the schema represented by
 /// `fresh_account_schema.sql` and stamp any prior local versions whose
@@ -137,7 +137,7 @@ mod tests {
             .fetch_one(&account)
             .await
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 1 + STAMPED_PRIOR_LOCAL_VERSIONS.len() as i64);
     }
 
     /// Synthesises a rebaseline scenario: the bootstrap's stamping path is
