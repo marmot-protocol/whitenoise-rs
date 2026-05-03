@@ -6,7 +6,7 @@ use crate::{
     whitenoise::{
         accounts::{AccountError, LoginError},
         database::DatabaseError,
-        groups::blossom_error::BlossomError,
+        groups::{RequiredProposal, blossom_error::BlossomError},
         message_aggregator::ProcessingError,
         secrets_store::SecretsStoreError,
         streaming_error::StreamingError,
@@ -203,6 +203,15 @@ pub enum WhitenoiseError {
         "Cannot add this user yet. Their key package was published by an older app version and does not advertise SelfRemove support. Ask them to update White Noise and open the app so it can publish a new key package."
     )]
     KeyPackageMissingSelfRemove { member_pubkey: PublicKey },
+
+    #[error(
+        "upgrade blocked: {} member(s) do not advertise the {proposal:?} proposal",
+        blockers.len()
+    )]
+    CapabilityUpgradeBlocked {
+        proposal: RequiredProposal,
+        blockers: Vec<PublicKey>,
+    },
 
     /// MDK or our pre-validation rejected an `add_members_to_group` invitee
     /// because their published key package does not satisfy the group's

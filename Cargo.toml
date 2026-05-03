@@ -132,7 +132,7 @@ tokio = { version = "1.44", features = ["test-util"] }
 [features]
 default = []
 cli = ["clap", "dirs", "rpassword"]
-integration-tests = ["clap"]
+integration-tests = ["clap", "mdk-core/test-utils"]
 benchmark-tests = ["integration-tests", "indicatif"]
 
 [[bin]]
