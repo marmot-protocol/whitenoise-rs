@@ -69,6 +69,8 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0027_drop_shared_account_follows::Migration),
         Box::new(m0028_purge_account_processed_events::Migration),
         Box::new(m0030_drop_shared_media_references::Migration),
+        // Note: version 31 is occupied by m0012_bootstrap (BOOTSTRAP_VERSION = 31).
+        // No m0031 file exists because the bootstrap migration claims that slot.
         Box::new(m0033_drop_shared_push_registrations::Migration),
         Box::new(m0035_drop_shared_group_push_tokens::Migration),
         Box::new(m0037_drop_shared_accounts_groups::Migration),

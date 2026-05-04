@@ -95,7 +95,7 @@ impl PushRegistration {
             "SELECT platform, raw_token, server_pubkey, relay_hint,
                     created_at, updated_at, last_shared_at
              FROM push_registrations
-             LIMIT 1",
+             WHERE id = 1",
         )
         .fetch_optional(pool)
         .await?;

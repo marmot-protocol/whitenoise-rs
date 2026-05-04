@@ -695,6 +695,14 @@ impl Whitenoise {
         // 4c. Delete per-account media_references for this group
         MediaFile::delete_references_for_group(&session.account_db.inner.pool, group_id).await?;
 
+        // 4d. Delete per-account drafts for this group (best-effort)
+        if let Err(e) = session.repos.drafts.delete(group_id).await {
+            tracing::warn!(
+                target: "whitenoise::accounts_groups",
+                "Failed to delete draft during delete_chat: {e}"
+            );
+        }
+
         // 5. Delete MDK group state for this account (best-effort)
         match self.create_mdk_for_account(account.pubkey) {
             Ok(mdk) => {

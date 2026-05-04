@@ -78,6 +78,7 @@ impl<'a> MembershipOps<'a> {
         .ok_or(WhitenoiseError::GroupNotFound)?;
 
         let message_created_at_ms = message.created_at.timestamp_millis();
+        // Phase 18e: switch to account pool once aggregated_messages moves.
         let current_marker_ts = match &account_group.last_read_message_id {
             Some(marker_id) => AggregatedMessage::created_at_ms_for_message(
                 marker_id,

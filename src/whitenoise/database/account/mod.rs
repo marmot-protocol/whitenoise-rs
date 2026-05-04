@@ -2,8 +2,9 @@
 //!
 //! This module exposes a small set of account-scoped repositories that wrap the
 //! existing DB functions. Each repository stores an `account_pubkey` and an
-//! `Arc<Database>`, and delegates to the underlying DB functions without
-//! re-exposing the pubkey argument to callers.
+//! `Arc<AccountDatabase>` (some also hold `Arc<Database>` for shared lookups),
+//! and delegates to the underlying DB functions without re-exposing the pubkey
+//! argument to callers.
 //!
 //! Additional repositories will be added here as their domains migrate to
 //! session-scoped operations (see the session/projection implementation plan).

@@ -615,7 +615,7 @@ publications.
 
 ### Phase 18d: Move membership and push account tables to account DB (~800 LOC)
 
-- [ ] Not started
+- [x] Completed in PR #792
 
 <details>
 <summary>Details</summary>

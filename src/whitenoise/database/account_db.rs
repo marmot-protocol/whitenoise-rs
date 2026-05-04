@@ -3,11 +3,11 @@
 //! See `docs/session-projection-implementation-plan.md` for the full table
 //! ownership audit and the per-phase migration plan.
 //!
-//! **Current status (Phase 18c shipped):** physically separate file per
+//! **Current status (Phase 18d shipped):** physically separate file per
 //! account holding `account_settings`, `drafts`, `published_key_packages`,
-//! `published_events`, `account_follows`, and the account-scoped subset of
-//! `processed_events`. Phase 18d will move membership and push tables;
-//! 18e moves message projections.
+//! `published_events`, `account_follows`, the account-scoped subset of
+//! `processed_events`, plus `accounts_groups`, `push_registrations`, and
+//! `group_push_tokens`. Phase 18e will move message projections.
 
 use std::path::PathBuf;
 
@@ -33,15 +33,16 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 /// These FKs cross the account/shared boundary and require application-level
 /// enforcement after the physical split. Phase 18c moved
 /// `account_settings`, `drafts`, `published_key_packages`, `published_events`,
-/// and `account_follows` out of shared (their FKs are no longer relevant).
-/// Phase 18d/18e will move the rest.
+/// and `account_follows` out of shared. Phase 18d moved `accounts_groups`,
+/// `push_registrations`, and `group_push_tokens`. Phase 18e will move
+/// message projections.
 ///
 /// ## Pubkey-keyed FKs (application-level enforcement only — Phase 18d)
 ///
-/// - `accounts_groups.account_pubkey → accounts.pubkey` (migration 0018)
+/// - `accounts_groups.account_pubkey → accounts.pubkey` (moved in m0036)
 /// - `media_files.account_pubkey → accounts.pubkey` (migration 0015)
-/// - `push_registrations.account_pubkey → accounts.pubkey` (migration 0039)
-/// - `group_push_tokens.account_pubkey → accounts.pubkey` (migration 0041)
+/// - `push_registrations.account_pubkey → accounts.pubkey` (moved in m0032)
+/// - `group_push_tokens.account_pubkey → accounts.pubkey` (moved in m0034)
 ///
 /// ## Cross-scope data references (no schema FK, but logical dependency)
 ///
