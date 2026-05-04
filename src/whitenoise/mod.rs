@@ -1843,10 +1843,13 @@ mod tests {
         // ── Helper ────────────────────────────────────────────────────────────
 
         /// Insert a `ChatMessage` with an explicit Unix-seconds timestamp and a
-        /// deterministic ID derived from `seed`.  Returns the inserted message.
+        /// deterministic ID derived from `seed`. Writes into `account_pubkey`'s
+        /// per-account DB; `author` is just the message author field and may
+        /// differ from the storing account. Returns the inserted message.
         async fn insert_msg_at(
             seed: u8,
             author: nostr_sdk::PublicKey,
+            account_pubkey: &nostr_sdk::PublicKey,
             unix_secs: u64,
             group_id: &GroupId,
             whitenoise: &Whitenoise,
@@ -1866,11 +1869,11 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
-            let session = whitenoise.session(&author).unwrap();
+            let session = whitenoise.session(account_pubkey).unwrap();
             aggregated_message::AggregatedMessage::insert_message(
                 &msg,
                 group_id,
-                &author,
+                account_pubkey,
                 &session.account_db.inner,
             )
             .await
@@ -1970,7 +1973,8 @@ mod tests {
 
             // Insert 10 messages with distinct timestamps (seeds 1–10)
             for i in 1u8..=10 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
+                    .await;
             }
 
             let subscription = whitenoise
@@ -2006,7 +2010,8 @@ mod tests {
             let base: u64 = 1_711_000_000;
 
             for i in 1u8..=5 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
+                    .await;
             }
 
             let subscription = whitenoise
@@ -2034,7 +2039,8 @@ mod tests {
 
             // Insert exactly 50 messages
             for i in 1u8..=50 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
+                    .await;
             }
 
             let subscription = whitenoise
@@ -2061,7 +2067,8 @@ mod tests {
             let base: u64 = 1_713_000_000;
 
             for i in 1u8..=60 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
+                    .await;
             }
 
             let subscription = whitenoise
@@ -2098,7 +2105,8 @@ mod tests {
 
             // Insert in reverse order to confirm sorting is not dependent on insertion order
             for i in (1u8..=5).rev() {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
+                    .await;
             }
 
             let subscription = whitenoise
@@ -2144,7 +2152,7 @@ mod tests {
             let author = nostr_sdk::Keys::generate().public_key();
             setup_account_group(&author, &group_id, &whitenoise).await;
 
-            insert_msg_at(1, author, 1_715_000_001, &group_id, &whitenoise).await;
+            insert_msg_at(1, author, &author, 1_715_000_001, &group_id, &whitenoise).await;
 
             // No updates are emitted — the drain must exit via the Empty arm immediately
             let subscription = whitenoise
@@ -2178,7 +2186,7 @@ mod tests {
             setup_account_group(&author, &group_id, &whitenoise).await;
 
             // Insert a message into the DB — this is the "stale" row
-            insert_msg_at(1, author, 1_716_000_001, &group_id, &whitenoise).await;
+            insert_msg_at(1, author, &author, 1_716_000_001, &group_id, &whitenoise).await;
 
             let subscription = whitenoise
                 .subscribe_to_group_messages(&author, &group_id, None)
@@ -2262,8 +2270,8 @@ mod tests {
             let author = nostr_sdk::Keys::generate().public_key();
             setup_account_group(&author, &group_id, &whitenoise).await;
 
-            insert_msg_at(1, author, 1_718_000_001, &group_id, &whitenoise).await;
-            insert_msg_at(2, author, 1_718_000_002, &group_id, &whitenoise).await;
+            insert_msg_at(1, author, &author, 1_718_000_001, &group_id, &whitenoise).await;
+            insert_msg_at(2, author, &author, 1_718_000_002, &group_id, &whitenoise).await;
 
             let mut subscription = whitenoise
                 .subscribe_to_group_messages(&author, &group_id, None)
@@ -2349,7 +2357,7 @@ mod tests {
             let author = nostr_sdk::Keys::generate().public_key();
             setup_account_group(&author, &group_id, &whitenoise).await;
 
-            insert_msg_at(1, author, 1_720_000_001, &group_id, &whitenoise).await;
+            insert_msg_at(1, author, &author, 1_720_000_001, &group_id, &whitenoise).await;
 
             // Two independent subscriptions
             let mut sub_a = whitenoise
@@ -2515,7 +2523,15 @@ mod tests {
             // History: 10 messages at t+1 … t+10 (oldest → newest)
             let base: u64 = 1_730_000_000;
             for i in 1u8..=10 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &account.pubkey,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             // ── Step 1: open chat ─────────────────────────────────────────────
@@ -2713,7 +2729,15 @@ mod tests {
             // Exactly 10 messages, page size 5 — two full pages, then nothing
             let base: u64 = 1_731_000_000;
             for i in 1u8..=10 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &account.pubkey,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             // Page 1 (initial snapshot): seeds 6–10
@@ -2778,7 +2802,15 @@ mod tests {
 
             let base: u64 = 1_732_000_000;
             for i in 1u8..=15 {
-                insert_msg_at(i, author, base + u64::from(i), &group_id, &whitenoise).await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &account.pubkey,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             // Subscribe (snapshot = seeds 11–15)
@@ -2883,11 +2915,11 @@ mod tests {
 
             // 8 messages: seeds 1–6 all at the same second (tie), seed 7 earlier, seed 8 later
             let tie_ts: u64 = 1_733_000_000;
-            insert_msg_at(7, author, tie_ts - 1, &group_id, &whitenoise).await;
+            insert_msg_at(7, author, &account.pubkey, tie_ts - 1, &group_id, &whitenoise).await;
             for i in 1u8..=6 {
-                insert_msg_at(i, author, tie_ts, &group_id, &whitenoise).await;
+                insert_msg_at(i, author, &account.pubkey, tie_ts, &group_id, &whitenoise).await;
             }
-            insert_msg_at(8, author, tie_ts + 1, &group_id, &whitenoise).await;
+            insert_msg_at(8, author, &account.pubkey, tie_ts + 1, &group_id, &whitenoise).await;
 
             // Subscribe with limit=3 → snapshot is the 3 newest
             let subscription = whitenoise
