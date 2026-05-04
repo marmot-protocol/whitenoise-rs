@@ -21,13 +21,14 @@ impl SendMessageWithMediaTestCase {
     }
 
     /// Build imeta tag per MIP-04 spec
-    /// Format: `["imeta", "url <blossom_url>", "m <mime_type>", "filename <name>", "x <hash>", "v <version>"]`
-    /// Note: MIP-04 requires filename and version fields
+    /// Format: `["imeta", "url <blossom_url>", "m <mime_type>", "filename <name>", "x <hash>", "n <nonce>", "v <version>"]`
+    /// Note: MIP-04 requires url, m, filename, x, n, and v fields
     fn build_imeta_tag(
         &self,
         hash_hex: &str,
         blossom_url: &str,
         mime_type: &str,
+        nonce_hex: &str,
     ) -> Result<Tag, WhitenoiseError> {
         Tag::parse(vec![
             "imeta",
@@ -35,7 +36,8 @@ impl SendMessageWithMediaTestCase {
             &format!("m {}", mime_type),
             "filename image.jpg",
             &format!("x {}", hash_hex),
-            "v mip04-v1",
+            &format!("n {}", nonce_hex),
+            "v mip04-v2",
         ])
         .map_err(|e| WhitenoiseError::Internal(format!("Failed to create imeta tag: {}", e)))
     }
@@ -68,8 +70,16 @@ impl TestCase for SendMessageWithMediaTestCase {
             WhitenoiseError::Configuration("Uploaded media has no blossom URL".to_string())
         })?;
 
-        let imeta_tag =
-            self.build_imeta_tag(&media_hash_hex, blossom_url, &media_file.mime_type)?;
+        let nonce_hex = media_file.nonce.as_ref().ok_or_else(|| {
+            WhitenoiseError::Configuration("Chat media must have nonce for MIP-04 v2".to_string())
+        })?;
+
+        let imeta_tag = self.build_imeta_tag(
+            &media_hash_hex,
+            blossom_url,
+            &media_file.mime_type,
+            nonce_hex,
+        )?;
 
         // Send message with imeta tag
         let send_result = context

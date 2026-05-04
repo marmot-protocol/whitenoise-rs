@@ -200,13 +200,21 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             hex::encode(&receiver_media.encrypted_file_hash)
         );
 
-        // Verify file_path is empty (not downloaded yet)
-        assert!(
-            receiver_media.file_path.to_str().unwrap_or("").is_empty(),
-            "Receiver's MediaFile should have empty file_path (not downloaded yet)"
+        // In integration tests, sender and receiver share the same Whitenoise
+        // instance (same shared DB). The sender's upload already created a
+        // media_blobs row with a real file_path, and the receiver's save hits
+        // ON CONFLICT which preserves the existing non-empty path. In production,
+        // sender and receiver are on different devices so this would be empty.
+        // Either way, the receiver must reuse the existing blob row.
+        assert_eq!(
+            receiver_media.file_path, media_file.file_path,
+            "Receiver should reuse sender's media_blobs row, not create a new one"
         );
 
-        tracing::info!("✓ Receiver's MediaFile has empty file_path (not downloaded)");
+        tracing::info!(
+            "✓ Receiver's MediaFile file_path: {:?} (reuses sender's media_blobs row)",
+            receiver_media.file_path
+        );
 
         // Verify metadata was extracted correctly
         assert_eq!(
@@ -233,6 +241,13 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             "chat_media should not have nostr_key (uses MDK encryption)"
         );
 
+        // Verify nonce was preserved from imeta 'n' field (MIP-04 v2 contract)
+        assert_eq!(
+            receiver_media.nonce.as_deref(),
+            Some(nonce_hex.as_str()),
+            "Receiver should preserve the nonce from imeta 'n' field"
+        );
+
         tracing::info!(
             "✓ Media reference successfully created on receiver's database with both hashes"
         );
@@ -244,7 +259,7 @@ impl TestCase for ReceiveMessageWithMediaTestCase {
             "  • encrypted_file_hash: {} (from Blossom URL)",
             hex::encode(&receiver_media.encrypted_file_hash)
         );
-        tracing::info!("  • file_path: empty (not downloaded)");
+        tracing::info!("  • file_path: {:?}", receiver_media.file_path);
         tracing::info!("  • media_type: {}", receiver_media.media_type);
 
         Ok(())
