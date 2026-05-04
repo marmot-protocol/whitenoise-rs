@@ -41,7 +41,14 @@ pub mod key_packages;
 #[cfg(any(
     test,
     all(
-        any(target_os = "linux", target_os = "android"),
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "android"
+        ),
         not(feature = "integration-tests"),
         not(feature = "benchmark-tests")
     )
@@ -436,19 +443,22 @@ impl Whitenoise {
             }
             #[cfg(target_os = "linux")]
             {
-                let primary = Self::create_keyring_store(
-                    zbus_secret_service_keyring_store::Store::new(),
-                    "Linux Secret Service",
-                )?;
-                let primary = keyring_store::TargetedCredentialStore::new(
-                    primary,
-                    keyring_store::LINUX_SECRET_SERVICE_TARGET,
-                );
+                let primary = Self::create_secret_service_keyring_store("Linux Secret Service")?;
                 let store = Self::create_legacy_migration_keyring_store(
                     primary,
                     linux_keyutils_keyring_store::Store::new(),
                     "legacy Linux keyutils",
                 );
+                keyring_core::set_default_store(store);
+            }
+            #[cfg(any(
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                let store = Self::create_secret_service_keyring_store("BSD Secret Service")?;
                 keyring_core::set_default_store(store);
             }
             #[cfg(target_os = "android")]
@@ -469,6 +479,10 @@ impl Whitenoise {
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly",
                 target_os = "android",
             )))]
             {
@@ -496,6 +510,31 @@ impl Whitenoise {
             )))
         })?;
         Ok(store)
+    }
+
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ),
+        not(test),
+        not(feature = "integration-tests"),
+        not(feature = "benchmark-tests")
+    ))]
+    fn create_secret_service_keyring_store(
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>> {
+        let store = Self::create_keyring_store(
+            zbus_secret_service_keyring_store::Store::new(),
+            store_name,
+        )?;
+        Ok(keyring_store::TargetedCredentialStore::new(
+            store,
+            keyring_store::SECRET_SERVICE_TARGET,
+        ))
     }
 
     #[cfg(any(

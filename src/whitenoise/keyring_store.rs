@@ -6,7 +6,7 @@ use std::sync::Arc;
 use keyring_core::api::{CredentialApi, CredentialStoreApi};
 use keyring_core::{Credential, CredentialPersistence, CredentialStore, Entry, Error, Result};
 
-pub(crate) const LINUX_SECRET_SERVICE_TARGET: &str = "whitenoise";
+pub(crate) const SECRET_SERVICE_TARGET: &str = "whitenoise";
 
 pub(crate) struct TargetedCredentialStore {
     inner: Arc<CredentialStore>,
@@ -467,13 +467,13 @@ mod tests {
     #[test]
     fn build_injects_default_target() {
         let inner = Arc::new(RecordingStore::default());
-        let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let store = TargetedCredentialStore::new(inner.clone(), SECRET_SERVICE_TARGET);
 
         store.build("service", "user", None).unwrap();
 
         assert_eq!(
             inner.last_build_modifier("target"),
-            Some(LINUX_SECRET_SERVICE_TARGET.to_string())
+            Some(SECRET_SERVICE_TARGET.to_string())
         );
     }
 
@@ -482,7 +482,7 @@ mod tests {
         let inner = Arc::new(RecordingStore::default());
         assert!(format!("{inner:?}").contains("RecordingStore"));
         let store: Arc<CredentialStore> =
-            TargetedCredentialStore::new(inner, LINUX_SECRET_SERVICE_TARGET);
+            TargetedCredentialStore::new(inner, SECRET_SERVICE_TARGET);
 
         assert_eq!(store.vendor(), "test-store");
         assert_eq!(store.id(), "test-store");
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn build_preserves_explicit_target() {
         let inner = Arc::new(RecordingStore::default());
-        let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let store = TargetedCredentialStore::new(inner.clone(), SECRET_SERVICE_TARGET);
         let modifiers = HashMap::from([("target", "explicit")]);
 
         store.build("service", "user", Some(&modifiers)).unwrap();
@@ -511,21 +511,21 @@ mod tests {
     #[test]
     fn search_injects_default_target() {
         let inner = Arc::new(RecordingStore::default());
-        let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let store = TargetedCredentialStore::new(inner.clone(), SECRET_SERVICE_TARGET);
         let spec = HashMap::from([("service", "service"), ("user", "user")]);
 
         store.search(&spec).unwrap();
 
         assert_eq!(
             inner.last_search_spec("target"),
-            Some(LINUX_SECRET_SERVICE_TARGET.to_string())
+            Some(SECRET_SERVICE_TARGET.to_string())
         );
     }
 
     #[test]
     fn search_preserves_explicit_target() {
         let inner = Arc::new(RecordingStore::default());
-        let store = TargetedCredentialStore::new(inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+        let store = TargetedCredentialStore::new(inner.clone(), SECRET_SERVICE_TARGET);
         let spec = HashMap::from([("service", "service"), ("target", "explicit")]);
 
         store.search(&spec).unwrap();
@@ -537,16 +537,16 @@ mod tests {
     }
 
     #[test]
-    fn target_is_non_default_for_wsl() {
-        assert_eq!(LINUX_SECRET_SERVICE_TARGET, "whitenoise");
-        assert_ne!(LINUX_SECRET_SERVICE_TARGET, "default");
+    fn secret_service_target_is_non_default() {
+        assert_eq!(SECRET_SERVICE_TARGET, "whitenoise");
+        assert_ne!(SECRET_SERVICE_TARGET, "default");
     }
 
     #[test]
     fn targeted_primary_store_migrates_legacy_secret() {
         let primary_inner = Arc::new(RecordingStore::default());
         let primary: Arc<CredentialStore> =
-            TargetedCredentialStore::new(primary_inner.clone(), LINUX_SECRET_SERVICE_TARGET);
+            TargetedCredentialStore::new(primary_inner.clone(), SECRET_SERVICE_TARGET);
         let legacy = keyring_core::mock::Store::new().unwrap();
         let legacy_entry = legacy
             .build("com.whitenoise.app", "mdk.db.key.pubkey", None)
@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(entry.get_secret().unwrap(), b"legacy-mdk-key");
         assert_eq!(
             primary_inner.last_build_modifier("target"),
-            Some(LINUX_SECRET_SERVICE_TARGET.to_string())
+            Some(SECRET_SERVICE_TARGET.to_string())
         );
         assert!(matches!(legacy_entry.get_secret(), Err(Error::NoEntry)));
     }

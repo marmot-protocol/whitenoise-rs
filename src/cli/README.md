@@ -20,13 +20,13 @@ wn (client)                         wnd (daemon)
 
 **IPC protocol:** Newline-delimited JSON. Request is a serde-tagged enum (`{"method": "...", "params": {...}}`). Response has `result`, `error`, and `stream_end` fields.
 
-## Linux Keyring Requirements
+## Linux and BSD Keyring Requirements
 
-The CLI can be installed on headless Linux, but `wnd` must be able to open a
-Freedesktop Secret Service store at runtime. On Linux, Whitenoise stores new
-secrets in Secret Service and only reads keyutils as a legacy migration source.
-If no Secret Service provider is installed, running, and unlockable, daemon
-startup fails with a keyring unavailable error.
+The CLI can be installed on headless Linux and BSD systems, but `wnd` must be
+able to open a Freedesktop Secret Service store at runtime. On these targets,
+Whitenoise stores new secrets in Secret Service. Linux also reads keyutils as a
+legacy migration source. If no Secret Service provider is installed, running,
+and unlockable, daemon startup fails with a keyring unavailable error.
 
 Install a session D-Bus service and a provider for `org.freedesktop.secrets`.
 GNOME Keyring is the recommended provider for CLI and headless use:
@@ -36,6 +36,10 @@ GNOME Keyring is the recommended provider for CLI and headless use:
 | Debian/Ubuntu | `dbus-user-session gnome-keyring libsecret-tools` |
 | Fedora/RHEL | `dbus gnome-keyring libsecret` |
 | Arch | `dbus gnome-keyring libsecret` |
+| FreeBSD | `dbus gnome-keyring libsecret` |
+| OpenBSD | `dbus gnome-keyring libsecret` |
+| NetBSD/pkgsrc | `dbus gnome-keyring libsecret` |
+| DragonFly BSD | `dbus gnome-keyring libsecret` |
 
 `libsecret-tools`/`libsecret` provides `secret-tool`, which is useful for a
 quick check:

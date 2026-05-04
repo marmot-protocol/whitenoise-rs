@@ -155,20 +155,32 @@ fn map_keyring_error(e: KeyringError) -> SecretsStoreError {
 /// Produces a user-friendly message for `NoStorageAccess` errors, with
 /// platform-specific remediation hints.
 fn format_storage_access_error(inner: &dyn std::error::Error) -> String {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
     {
         format!(
-            "Platform keyring is not available. On Linux, White Noise uses the D-Bus \
-             Secret Service to store secret keys. This error typically occurs on \
-             headless systems, in SSH sessions, in containers, or when no Secret \
-             Service implementation such as GNOME Keyring or KWallet is running and \
-             unlocked. Start and unlock a Secret Service provider before starting \
-             White Noise. \
+            "Platform keyring is not available. On Linux and supported BSD targets, \
+             White Noise uses the D-Bus Secret Service to store secret keys. This \
+             error typically occurs on headless systems, in SSH sessions, in \
+             containers, or when no Secret Service implementation such as GNOME \
+             Keyring or KWallet is running and unlocked. Start and unlock a Secret \
+             Service provider before starting White Noise. \
              (Original error: {inner})"
         )
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
     {
         format!(
             "Platform keyring is not available: {inner}. \

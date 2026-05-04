@@ -111,11 +111,14 @@ apple-native-keyring-store = { version = "1", features = ["protected"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# Secret Service is the durable Linux store. Keyutils is retained only as a
-# legacy migration source for users upgrading from the old Linux backend.
-linux-keyutils-keyring-store = "1"
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
+# Secret Service is the durable store for Linux and BSD targets.
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keyutils is retained only as a legacy migration source for Linux users
+# upgrading from the old backend.
+linux-keyutils-keyring-store = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Keep the v0.5-and-earlier by-service layout for upgraded Android installs.
