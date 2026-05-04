@@ -72,7 +72,7 @@ impl<'a> GroupOps<'a> {
 
         let visible_account_groups = AccountGroup::find_visible_for_account(
             &self.session.account_pubkey,
-            &self.session.shared.database,
+            &self.session.account_db.inner.pool,
         )
         .await?;
 
@@ -433,7 +433,7 @@ impl<'a> GroupOps<'a> {
         let account_group = AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
-            database,
+            &self.session.account_db.inner.pool,
         )
         .await?
         .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -663,11 +663,11 @@ impl<'a> GroupOps<'a> {
             &self.session.account_pubkey,
             &group.mls_group_id,
             dm_peer,
-            &self.session.shared.database,
+            &self.session.account_db.inner.pool,
         )
         .await?;
         account_group
-            .update_user_confirmation(true, &self.session.shared.database)
+            .update_user_confirmation(true, &self.session.account_db.inner.pool)
             .await?;
 
         // Best-effort: share the creator's push token into the new group.

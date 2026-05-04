@@ -2,8 +2,9 @@
 //!
 //! This module exposes a small set of account-scoped repositories that wrap the
 //! existing DB functions. Each repository stores an `account_pubkey` and an
-//! `Arc<Database>`, and delegates to the underlying DB functions without
-//! re-exposing the pubkey argument to callers.
+//! `Arc<AccountDatabase>` (some also hold `Arc<Database>` for shared lookups),
+//! and delegates to the underlying DB functions without re-exposing the pubkey
+//! argument to callers.
 //!
 //! Additional repositories will be added here as their domains migrate to
 //! session-scoped operations (see the session/projection implementation plan).
@@ -58,10 +59,10 @@ impl AccountRepositories {
         Ok(Self {
             drafts: DraftsRepo::new(account_db.clone()),
             settings: AccountSettingsRepo::new(account_db.clone()),
-            follows: AccountFollowsRepo::new(account_db.clone(), db.clone()),
-            published_key_packages: PublishedKeyPackagesRepo::new(account_db),
-            push_registrations: PushRegistrationsRepo::new(account_pubkey, db.clone()),
-            group_push_tokens: GroupPushTokensRepo::new(account_pubkey, db),
+            follows: AccountFollowsRepo::new(account_db.clone(), db),
+            push_registrations: PushRegistrationsRepo::new(account_pubkey, account_db.clone()),
+            published_key_packages: PublishedKeyPackagesRepo::new(account_db.clone()),
+            group_push_tokens: GroupPushTokensRepo::new(account_pubkey, account_db),
         })
     }
 }

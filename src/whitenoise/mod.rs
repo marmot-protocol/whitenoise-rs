@@ -229,20 +229,10 @@ impl Whitenoise {
 
         // Best-effort read of `accounts.pubkey`. Fresh installs (no table yet)
         // return an empty list; that's fine — there's nothing to migrate.
-        let mut pubkeys: HashSet<String> =
-            match sqlx::query_scalar::<_, String>("SELECT pubkey FROM accounts")
-                .fetch_all(&shared.pool)
-                .await
-            {
-                Ok(rows) => rows.into_iter().collect(),
-                Err(e) => {
-                    tracing::debug!(
-                        target: "whitenoise::new",
-                        "No accounts table yet (fresh install or pre-bridge): {e}"
-                    );
-                    HashSet::new()
-                }
-            };
+        let mut pubkeys: HashSet<String> = accounts::Account::all_pubkeys_hex(shared)
+            .await?
+            .into_iter()
+            .collect();
 
         // Also include any per-account DB files on disk that aren't in
         // `shared.accounts` — orphan files still deserve their own migration
@@ -1897,9 +1887,9 @@ mod tests {
             .unwrap();
         }
 
-        /// Create the minimal user + account + accounts_groups rows for a
-        /// raw pubkey so that `chat_cleared_at_ms` (and similar methods) can
-        /// find the account-group association.
+        /// Create the minimal user + account + session + accounts_groups rows
+        /// for a raw pubkey so that `chat_cleared_at_ms` (and similar methods)
+        /// can find the account-group association.
         async fn setup_account_group(
             pubkey: &nostr_sdk::PublicKey,
             group_id: &GroupId,
@@ -1923,7 +1913,7 @@ mod tests {
                 .fetch_one(&whitenoise.shared.database.pool)
                 .await
                 .unwrap();
-            // account row (FK target for accounts_groups)
+            // account row
             sqlx::query(
                 "INSERT OR IGNORE INTO accounts \
                  (pubkey, user_id, account_type, created_at, updated_at) \
@@ -1936,12 +1926,29 @@ mod tests {
             .execute(&whitenoise.shared.database.pool)
             .await
             .unwrap();
-            // accounts_groups row
+            // Create and register a session so require_session() works
+            if whitenoise.account_manager.get_session(pubkey).is_none() {
+                let mdk = whitenoise.create_mdk_for_account(*pubkey).unwrap();
+                let session = std::sync::Arc::new(
+                    session::AccountSession::new(
+                        *pubkey,
+                        mdk,
+                        whitenoise.shared.clone(),
+                        std::sync::Weak::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                );
+                whitenoise.account_manager.insert_session(session);
+            }
+            // accounts_groups row (per-account DB)
+            let session = whitenoise.require_session(pubkey).unwrap();
             accounts_groups::AccountGroup::find_or_create(
                 pubkey,
                 group_id,
                 None,
-                &whitenoise.shared.database,
+                &session.account_db.inner.pool,
             )
             .await
             .unwrap();

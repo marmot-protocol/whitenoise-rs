@@ -166,7 +166,7 @@ impl<'a> ChatListOps<'a> {
         let account_group = AccountGroup::find_by_account_and_group(
             &self.session.account_pubkey,
             group_id,
-            &self.session.shared.database,
+            &self.session.account_db.inner.pool,
         )
         .await?;
         let Some(membership) = account_group else {
@@ -217,13 +217,11 @@ impl<'a> ChatListOps<'a> {
                 .collect::<HashMap<_, _>>()
         };
 
-        let dm_other_users: HashMap<GroupId, PublicKey> = AccountGroup::find_dm_peers_for_account(
-            &self.session.account_pubkey,
-            &self.session.shared.database,
-        )
-        .await?
-        .into_iter()
-        .collect();
+        let dm_other_users: HashMap<GroupId, PublicKey> =
+            AccountGroup::find_dm_peers_for_account(&self.session.account_db.inner.pool)
+                .await?
+                .into_iter()
+                .collect();
 
         let last_message_map: HashMap<GroupId, ChatMessageSummary> =
             AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.shared.database)

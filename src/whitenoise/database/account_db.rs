@@ -3,11 +3,11 @@
 //! See `docs/session-projection-implementation-plan.md` for the full table
 //! ownership audit and the per-phase migration plan.
 //!
-//! **Current status (Phase 18c shipped):** physically separate file per
+//! **Current status (Phase 18d shipped):** physically separate file per
 //! account holding `account_settings`, `drafts`, `published_key_packages`,
-//! `published_events`, `account_follows`, and the account-scoped subset of
-//! `processed_events`. Phase 18d will move membership and push tables;
-//! 18e moves message projections.
+//! `published_events`, `account_follows`, the account-scoped subset of
+//! `processed_events`, plus `accounts_groups`, `push_registrations`, and
+//! `group_push_tokens`. Phase 18e will move message projections.
 
 use std::path::PathBuf;
 
@@ -33,15 +33,16 @@ use crate::whitenoise::database::{Database, DatabaseError, rust_migrations};
 /// These FKs cross the account/shared boundary and require application-level
 /// enforcement after the physical split. Phase 18c moved
 /// `account_settings`, `drafts`, `published_key_packages`, `published_events`,
-/// and `account_follows` out of shared (their FKs are no longer relevant).
-/// Phase 18d/18e will move the rest.
+/// and `account_follows` out of shared. Phase 18d moved `accounts_groups`,
+/// `push_registrations`, and `group_push_tokens`. Phase 18e will move
+/// message projections.
 ///
 /// ## Pubkey-keyed FKs (application-level enforcement only — Phase 18d)
 ///
-/// - `accounts_groups.account_pubkey → accounts.pubkey` (migration 0018)
+/// - `accounts_groups.account_pubkey → accounts.pubkey` (moved in m0036)
 /// - `media_files.account_pubkey → accounts.pubkey` (migration 0015)
-/// - `push_registrations.account_pubkey → accounts.pubkey` (migration 0039)
-/// - `group_push_tokens.account_pubkey → accounts.pubkey` (migration 0041)
+/// - `push_registrations.account_pubkey → accounts.pubkey` (moved in m0032)
+/// - `group_push_tokens.account_pubkey → accounts.pubkey` (moved in m0034)
 ///
 /// ## Cross-scope data references (no schema FK, but logical dependency)
 ///
@@ -70,9 +71,11 @@ pub struct AccountDatabase {
 impl AccountDatabase {
     /// Open (or create) the account database for `account_pubkey` at `db_path`.
     ///
-    /// Runs all pending migrations on first open.
+    /// Does **not** run migrations. Call [`run_account_migrations`](Self::run_account_migrations)
+    /// with the real shared pool immediately after construction to apply
+    /// pending globals (against shared) and locals (against this pool).
     pub async fn new(account_pubkey: PublicKey, db_path: PathBuf) -> Result<Self, DatabaseError> {
-        let inner = Database::new(db_path).await?;
+        let inner = Database::open_without_migrations(db_path).await?;
         Ok(Self {
             account_pubkey,
             inner,
@@ -128,7 +131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_account_database_opens_and_migrates() {
+    async fn test_account_database_opens_without_migrations() {
         let dir = TempDir::new().expect("temp dir");
         let pubkey = test_pubkey();
         let path = dir.path().join(format!("{}.db", pubkey.to_hex()));
@@ -152,13 +155,13 @@ mod tests {
             .await
             .expect("first open");
 
-        // Second open — migrations already applied.
+        // Second open — no migrations run, just file reopen.
         let db = AccountDatabase::new(test_pubkey(), path).await;
         assert!(db.is_ok(), "expected Ok on second open, got {db:?}");
     }
 
     /// Opening an account DB and then running `run_account_migrations`
-    /// against a separate shared DB stamps the bootstrap (v=12) onto the
+    /// against a separate shared DB stamps the bootstrap (v=31) onto the
     /// account's `_rust_migrations` — proving the per-user-DB-creation
     /// hook fires the new-accounts-only timeline as designed.
     #[tokio::test]
@@ -167,12 +170,12 @@ mod tests {
         let shared_path = dir.path().join("shared.db");
         let account_path = dir.path().join(format!("{}.db", test_pubkey().to_hex()));
 
-        // Open shared first so it has globals 1..=11 stamped against
-        // `shared.db` (the realistic Phase 18b ordering).
+        // Open shared first so it has globals stamped against `shared.db`
+        // (the realistic Phase 18b ordering).
         let shared = Database::new(shared_path).await.expect("open shared");
 
-        // Open the per-user DB; `Database::new` runs globals against this
-        // pool too (as today). The bootstrap must still fire.
+        // Open the per-user DB without migrations (the production path).
+        // The bootstrap must fire when `run_account_migrations` is called.
         let account = AccountDatabase::new(test_pubkey(), account_path)
             .await
             .expect("open account");
@@ -183,19 +186,19 @@ mod tests {
             .expect("run account migrations");
 
         let (count,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations WHERE version = 12")
+            sqlx::query_as("SELECT COUNT(*) FROM _rust_migrations WHERE version = 31")
                 .fetch_one(&account.inner.pool)
                 .await
                 .expect("query account tracking table");
         assert_eq!(
             count, 1,
-            "bootstrap (v=12) must be recorded on the per-user DB"
+            "bootstrap (v=31) must be recorded on the per-user DB"
         );
 
         // Description should be the bootstrap's regular one, not an
         // auto-stamp marker — proving `run_local` actually executed.
         let (desc,): (String,) =
-            sqlx::query_as("SELECT description FROM _rust_migrations WHERE version = 12")
+            sqlx::query_as("SELECT description FROM _rust_migrations WHERE version = 31")
                 .fetch_one(&account.inner.pool)
                 .await
                 .unwrap();
@@ -203,5 +206,79 @@ mod tests {
             !desc.contains("auto-stamped"),
             "bootstrap must run (not stamp) on a fresh per-user file; got desc: {desc}"
         );
+    }
+
+    /// Reopening an account DB must not drop tables that local migrations
+    /// created (e.g. `accounts_groups`, `push_registrations`,
+    /// `group_push_tokens`).
+    ///
+    /// Guards against `AccountDatabase::new` accidentally running global
+    /// drop migrations (m0033, m0035, m0037) against the account pool.
+    #[tokio::test]
+    async fn test_account_tables_survive_reopen() {
+        let dir = TempDir::new().expect("temp dir");
+        let pubkey = test_pubkey();
+        let pubkey_hex = pubkey.to_hex();
+        let shared_path = dir.path().join("shared.db");
+        let account_path = dir.path().join(format!("{pubkey_hex}.db"));
+
+        // 1. Open shared + account without migrations.
+        let shared = Database::open_without_migrations(shared_path)
+            .await
+            .expect("open shared");
+        let account_pool = Database::open_without_migrations(account_path.clone())
+            .await
+            .expect("open account");
+
+        // 2. Run lockstep migration (the boot path).
+        let accounts = vec![(account_pool.pool.clone(), pubkey_hex.clone())];
+        rust_migrations::MIGRATOR
+            .run_all(&shared.pool, &accounts)
+            .await
+            .expect("run_all");
+
+        // 3. Assert per-account tables exist.
+        let account_tables = ["accounts_groups", "push_registrations", "group_push_tokens"];
+        for table in &account_tables {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name=?)",
+            )
+            .bind(*table)
+            .fetch_one(&account_pool.pool)
+            .await
+            .expect("check table exists");
+            assert!(exists, "{table} must exist after run_all");
+        }
+
+        // 4. Drop the pool to simulate process restart.
+        drop(account_pool);
+        drop(accounts);
+
+        // 5. Reopen via the production path.
+        let account_db = AccountDatabase::new(pubkey, account_path)
+            .await
+            .expect("reopen account");
+        account_db
+            .run_account_migrations(&shared.pool)
+            .await
+            .expect("run_account_migrations after reopen");
+
+        // 6. Assert tables still exist (the bug would have dropped them).
+        for table in &account_tables {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type='table' AND name=?)",
+            )
+            .bind(*table)
+            .fetch_one(&account_db.inner.pool)
+            .await
+            .expect("check table after reopen");
+            assert!(
+                exists,
+                "{table} must survive reopen — global drops must not \
+                 run against the account pool"
+            );
+        }
     }
 }

@@ -114,7 +114,7 @@ impl Whitenoise {
             let has_account_group = AccountGroup::find_by_account_and_group(
                 &account.pubkey,
                 group_id,
-                &self.shared.database,
+                &session.account_db.inner.pool,
             )
             .await?
             .is_some();
@@ -1599,10 +1599,16 @@ mod tests {
             .await
             .unwrap();
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1672,10 +1678,16 @@ mod tests {
             .await
             .unwrap();
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1720,6 +1732,12 @@ mod tests {
         let admin_leaf_index = admin_mdk.own_leaf_index(&group_id).unwrap();
         let token_tag = make_token_tag(4);
 
+        let member_pool = &whitenoise
+            .require_session(&member_account.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         GroupPushToken::upsert(
             &member_account.pubkey,
             &group_id,
@@ -1728,7 +1746,7 @@ mod tests {
             &token_tag.server_pubkey,
             Some(&token_tag.relay_hint),
             &token_tag.encrypted_token.to_base64(),
-            &whitenoise.shared.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1744,7 +1762,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_account.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            member_pool,
         )
         .await
         .unwrap();
@@ -1896,6 +1914,12 @@ mod tests {
             .expect("removed member leaf should exist before removal");
         let stale_token = make_token_tag(8);
 
+        let member_two_pool = &whitenoise
+            .require_session(&member_two.pubkey)
+            .unwrap()
+            .account_db
+            .inner
+            .pool;
         GroupPushToken::upsert(
             &member_two.pubkey,
             &group_id,
@@ -1904,7 +1928,7 @@ mod tests {
             &stale_token.server_pubkey,
             Some(&stale_token.relay_hint),
             &stale_token.encrypted_token.to_base64(),
-            &whitenoise.shared.database,
+            member_two_pool,
         )
         .await
         .unwrap();
@@ -1927,7 +1951,7 @@ mod tests {
         let stored = GroupPushToken::find_by_account_and_group(
             &member_two.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            member_two_pool,
         )
         .await
         .unwrap();

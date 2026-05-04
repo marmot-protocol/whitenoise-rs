@@ -36,6 +36,12 @@ mod m0027_drop_shared_account_follows;
 mod m0028_purge_account_processed_events;
 mod m0029_move_media_references;
 mod m0030_drop_shared_media_references;
+mod m0032_move_push_registrations;
+mod m0033_drop_shared_push_registrations;
+mod m0034_move_group_push_tokens;
+mod m0035_drop_shared_group_push_tokens;
+mod m0036_move_accounts_groups;
+mod m0037_drop_shared_accounts_groups;
 
 /// All global migrations, in version order. Lifted from individual modules
 /// so the test suite can build a globals-only `Migrator` for narrow tests.
@@ -63,6 +69,11 @@ pub fn all_global_migrations() -> Vec<Box<dyn GlobalMigration>> {
         Box::new(m0027_drop_shared_account_follows::Migration),
         Box::new(m0028_purge_account_processed_events::Migration),
         Box::new(m0030_drop_shared_media_references::Migration),
+        // Note: version 31 is occupied by m0012_bootstrap (BOOTSTRAP_VERSION = 31).
+        // No m0031 file exists because the bootstrap migration claims that slot.
+        Box::new(m0033_drop_shared_push_registrations::Migration),
+        Box::new(m0035_drop_shared_group_push_tokens::Migration),
+        Box::new(m0037_drop_shared_accounts_groups::Migration),
     ]
 }
 
@@ -77,6 +88,9 @@ pub fn all_local_migrations() -> Vec<Box<dyn LocalMigration>> {
         Box::new(m0021_move_processed_events::Migration),
         Box::new(m0022_move_account_follows::Migration),
         Box::new(m0029_move_media_references::Migration),
+        Box::new(m0032_move_push_registrations::Migration),
+        Box::new(m0034_move_group_push_tokens::Migration),
+        Box::new(m0036_move_accounts_groups::Migration),
     ]
 }
 

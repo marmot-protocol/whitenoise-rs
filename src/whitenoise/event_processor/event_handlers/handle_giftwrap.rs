@@ -186,7 +186,7 @@ impl Whitenoise {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        account_group.save(&self.shared.database).await?;
+        account_group.save(&session.account_db.inner.pool).await?;
         tracing::debug!(target: "whitenoise::event_processor::process_welcome", "New AccountGroup created and saved");
 
         // Now accept the welcome to finalize MLS membership
@@ -755,10 +755,11 @@ mod tests {
         assert!(!groups.is_empty(), "Member should have at least one group");
 
         let group_id = &groups[0].mls_group_id;
+        let session = whitenoise.require_session(&member_account.pubkey).unwrap();
         let account_group = AccountGroup::find_by_account_and_group(
             &member_account.pubkey,
             group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
@@ -875,10 +876,11 @@ mod tests {
         .await;
 
         // Verify AccountGroup still exists and is pending
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let account_group = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
@@ -1111,10 +1113,11 @@ mod tests {
         .await;
 
         // AccountGroup must still exist
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let ag = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             &group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();

@@ -97,3 +97,71 @@ CREATE INDEX IF NOT EXISTS idx_media_refs_group_hash
 
 CREATE INDEX IF NOT EXISTS idx_media_refs_hash
     ON media_references(encrypted_file_hash);
+
+CREATE TABLE IF NOT EXISTS push_registrations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform        TEXT NOT NULL CHECK (platform IN ('apns', 'fcm')),
+    raw_token       TEXT NOT NULL CHECK (
+        length(trim(raw_token, ' ' || char(9) || char(10) || char(13))) > 0
+    ),
+    server_pubkey   TEXT NOT NULL,
+    relay_hint      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    last_shared_at  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_push_registrations_server_pubkey
+    ON push_registrations(server_pubkey);
+
+CREATE TABLE IF NOT EXISTS group_push_tokens (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    mls_group_id    BLOB NOT NULL,
+    member_pubkey   TEXT NOT NULL,
+    leaf_index      INTEGER NOT NULL CHECK (leaf_index >= 0),
+    server_pubkey   TEXT NOT NULL,
+    relay_hint      TEXT,
+    encrypted_token TEXT NOT NULL CHECK (
+        length(trim(encrypted_token, ' ' || char(9) || char(10) || char(13))) > 0
+    ),
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE(mls_group_id, leaf_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_group_push_tokens_group
+    ON group_push_tokens(mls_group_id);
+
+CREATE INDEX IF NOT EXISTS idx_group_push_tokens_group_member
+    ON group_push_tokens(mls_group_id, member_pubkey);
+
+CREATE INDEX IF NOT EXISTS idx_group_push_tokens_server
+    ON group_push_tokens(server_pubkey);
+
+CREATE TABLE IF NOT EXISTS accounts_groups (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    mls_group_id         BLOB NOT NULL UNIQUE,
+    user_confirmation    INTEGER DEFAULT NULL
+        CHECK (user_confirmation IS NULL OR user_confirmation IN (0, 1)),
+    welcomer_pubkey      TEXT,
+    last_read_message_id TEXT
+        CHECK (last_read_message_id IS NULL OR
+               (length(last_read_message_id) = 64
+                AND last_read_message_id NOT GLOB '*[^0-9a-fA-F]*')),
+    pin_order            INTEGER DEFAULT NULL,
+    dm_peer_pubkey       TEXT DEFAULT NULL,
+    archived_at          INTEGER DEFAULT NULL,
+    removed_at           INTEGER DEFAULT NULL,
+    self_removed         INTEGER NOT NULL DEFAULT 0,
+    muted_until          INTEGER DEFAULT NULL,
+    chat_cleared_at      INTEGER DEFAULT NULL,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_groups_group
+    ON accounts_groups(mls_group_id);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_groups_dm_peer
+    ON accounts_groups(dm_peer_pubkey)
+    WHERE dm_peer_pubkey IS NOT NULL;

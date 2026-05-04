@@ -10,7 +10,7 @@ use std::sync::Arc;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{PublicKey, RelayUrl};
 
-use crate::whitenoise::database::Database;
+use crate::whitenoise::database::account_db::AccountDatabase;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::push_notifications::GroupPushToken;
 
@@ -18,21 +18,23 @@ use crate::whitenoise::push_notifications::GroupPushToken;
 #[derive(Clone, Debug)]
 pub struct GroupPushTokensRepo {
     account_pubkey: PublicKey,
-    db: Arc<Database>,
+    db: Arc<AccountDatabase>,
 }
 
 impl GroupPushTokensRepo {
     /// Construct a new [`GroupPushTokensRepo`] for `account_pubkey`.
-    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Self {
+    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<AccountDatabase>) -> Self {
         Self { account_pubkey, db }
     }
 
     /// Return all cached push tokens for a specific group.
     pub async fn find_by_group(&self, group_id: &GroupId) -> Result<Vec<GroupPushToken>> {
-        Ok(
-            GroupPushToken::find_by_account_and_group(&self.account_pubkey, group_id, &self.db)
-                .await?,
+        Ok(GroupPushToken::find_by_account_and_group(
+            &self.account_pubkey,
+            group_id,
+            &self.db.inner.pool,
         )
+        .await?)
     }
 
     /// Insert or update a single cached push token for a group member.
@@ -53,14 +55,14 @@ impl GroupPushTokensRepo {
             server_pubkey,
             relay_hint,
             encrypted_token,
-            &self.db,
+            &self.db.inner.pool,
         )
         .await?)
     }
 
     /// Delete the cached token for a specific leaf index in a group.
     pub async fn delete(&self, group_id: &GroupId, leaf_index: u32) -> Result<bool> {
-        Ok(GroupPushToken::delete(&self.account_pubkey, group_id, leaf_index, &self.db).await?)
+        Ok(GroupPushToken::delete(group_id, leaf_index, &self.db.inner.pool).await?)
     }
 
     /// Delete all cached tokens for a specific member in a group.
@@ -69,13 +71,10 @@ impl GroupPushTokensRepo {
         group_id: &GroupId,
         member_pubkey: &PublicKey,
     ) -> Result<bool> {
-        Ok(GroupPushToken::delete_by_member_pubkey(
-            &self.account_pubkey,
-            group_id,
-            member_pubkey,
-            &self.db,
+        Ok(
+            GroupPushToken::delete_by_member_pubkey(group_id, member_pubkey, &self.db.inner.pool)
+                .await?,
         )
-        .await?)
     }
 
     /// Bulk upsert tokens from a token-list response, filtering to active
@@ -87,11 +86,10 @@ impl GroupPushTokensRepo {
         tokens: Vec<mdk_core::mip05::LeafTokenTag>,
     ) -> Result<()> {
         Ok(GroupPushToken::upsert_active_token_list_response(
-            &self.account_pubkey,
             group_id,
             active_leaf_map,
             tokens,
-            &self.db,
+            &self.db.inner.pool,
         )
         .await?)
     }
