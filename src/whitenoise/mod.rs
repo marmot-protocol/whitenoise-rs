@@ -527,10 +527,34 @@ impl Whitenoise {
     fn create_secret_service_keyring_store(
         store_name: &str,
     ) -> Result<Arc<keyring_core::CredentialStore>> {
-        let store = Self::create_keyring_store(
+        Self::create_targeted_secret_service_keyring_store(
             zbus_secret_service_keyring_store::Store::new(),
             store_name,
-        )?;
+        )
+    }
+
+    #[cfg(any(
+        test,
+        all(
+            any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ),
+            not(feature = "integration-tests"),
+            not(feature = "benchmark-tests")
+        )
+    ))]
+    fn create_targeted_secret_service_keyring_store<S>(
+        store: keyring_core::Result<Arc<S>>,
+        store_name: &str,
+    ) -> Result<Arc<keyring_core::CredentialStore>>
+    where
+        S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+    {
+        let store = Self::create_keyring_store(store, store_name)?;
         Ok(keyring_store::TargetedCredentialStore::new(
             store,
             keyring_store::SECRET_SERVICE_TARGET,
@@ -1620,6 +1644,43 @@ mod tests {
             ))
                 if msg.contains("Failed to create test credential store")
                     && msg.contains("boom")
+        ));
+    }
+
+    #[test]
+    fn secret_service_keyring_store_wraps_store_with_target() {
+        let store = Whitenoise::create_targeted_secret_service_keyring_store(
+            keyring_core::mock::Store::new(),
+            "test Secret Service",
+        )
+        .unwrap();
+
+        assert!(
+            store
+                .as_any()
+                .is::<keyring_store::TargetedCredentialStore>()
+        );
+        assert!(format!("{store:?}").contains(keyring_store::SECRET_SERVICE_TARGET));
+    }
+
+    #[test]
+    fn secret_service_keyring_store_maps_creation_error() {
+        let result =
+            Whitenoise::create_targeted_secret_service_keyring_store::<keyring_core::mock::Store>(
+                Err(keyring_core::Error::Invalid(
+                    "Secret Service".to_string(),
+                    "missing session bus".to_string(),
+                )),
+                "test Secret Service",
+            );
+
+        assert!(matches!(
+            result,
+            Err(WhitenoiseError::SecretsStore(
+                SecretsStoreError::KeyringUnavailable(msg)
+            ))
+                if msg.contains("Failed to create test Secret Service credential store")
+                    && msg.contains("missing session bus")
         ));
     }
 
