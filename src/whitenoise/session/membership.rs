@@ -368,7 +368,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         // Delete draft (best-effort).
         if let Err(e) = self.session.repos.drafts.delete(self.group_id).await {
             tracing::warn!(
-                target: "whitenoise::membership",
+                target: "whitenoise::session::membership",
                 "Failed to delete draft during clear_chat: {e}"
             );
         }
@@ -378,7 +378,7 @@ impl<'a> MembershipOpsForGroup<'a> {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    target: "whitenoise::membership",
+                    target: "whitenoise::session::membership",
                     "resolve_min_cleared_at failed; skipping cleanup: {e}"
                 );
                 None
@@ -390,7 +390,7 @@ impl<'a> MembershipOpsForGroup<'a> {
             .await
         {
             tracing::warn!(
-                target: "whitenoise::membership",
+                target: "whitenoise::session::membership",
                 "Failed to cleanup cleared messages: {e}"
             );
         }
@@ -398,7 +398,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         // Delete MDK message state (best-effort).
         if let Err(e) = self.session.mdk.delete_messages_for_group(self.group_id) {
             tracing::warn!(
-                target: "whitenoise::membership",
+                target: "whitenoise::session::membership",
                 "Failed to delete MDK messages during clear_chat: {e}"
             );
         }
