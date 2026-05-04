@@ -230,7 +230,7 @@ impl Whitenoise {
         // Best-effort read of `accounts.pubkey`. Fresh installs (no table yet)
         // return an empty list; that's fine — there's nothing to migrate.
         let mut pubkeys: HashSet<String> = accounts::Account::all_pubkeys_hex(shared)
-            .await
+            .await?
             .into_iter()
             .collect();
 

@@ -545,19 +545,28 @@ impl AccountGroup {
         }
     }
 
-    /// Atomically updates last_read_message_id only if the new message is newer.
+    /// Atomically updates last_read_message_id only if the new message is
+    /// newer than the current marker.
     ///
-    /// Returns `Some(updated)` if the update was applied, `None` if skipped
-    /// because the new message is not newer than the current read marker.
+    /// Uses optimistic concurrency (CAS): the UPDATE includes a
+    /// `last_read_message_id IS ?expected` guard so concurrent writers cannot
+    /// regress the marker. Returns `Some(updated)` on success, `None` if the
+    /// new message is not newer than the current marker.
+    ///
+    /// `expected_marker_id` must be the current `last_read_message_id` value
+    /// (or `None` if there is no marker). If another writer changed it between
+    /// the caller's read and this write, 0 rows are updated — the caller
+    /// should re-read and retry.
     ///
     /// `current_marker_created_at_ms` is the `created_at` timestamp of the
-    /// current `last_read_message_id` (looked up from `aggregated_messages` in
-    /// the shared DB by the caller). Pass `0` if there is no current marker.
+    /// current marker (from `aggregated_messages`). Pass `0` if there is no
+    /// current marker.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_last_read_if_newer(
         &self,
         message_id: &EventId,
         message_created_at_ms: i64,
+        expected_marker_id: Option<&EventId>,
         current_marker_created_at_ms: i64,
         pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
@@ -568,6 +577,7 @@ impl AccountGroup {
             "UPDATE accounts_groups
              SET last_read_message_id = ?, updated_at = ?
              WHERE id = ?
+               AND last_read_message_id IS ?
                AND (
                  last_read_message_id IS NULL
                  OR ? > ?
@@ -577,6 +587,7 @@ impl AccountGroup {
         .bind(message_id.to_hex())
         .bind(now_ms)
         .bind(id)
+        .bind(expected_marker_id.map(|eid| eid.to_hex()))
         .bind(message_created_at_ms)
         .bind(current_marker_created_at_ms)
         .fetch_optional(pool)
@@ -941,9 +952,9 @@ mod tests {
 
         let msg_id = EventId::from_hex(&"aa".repeat(32)).unwrap();
 
-        // First read: no current marker (pass 0)
+        // First read: no current marker (expected=None, ts=0)
         let updated = ag
-            .update_last_read_if_newer(&msg_id, 1000, 0, &pool)
+            .update_last_read_if_newer(&msg_id, 1000, None, 0, &pool)
             .await
             .unwrap();
         assert!(updated.is_some());
@@ -955,22 +966,30 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Older message: should NOT update
+        // Older message: should NOT update (CAS expected=msg_id matches)
         let older_id = EventId::from_hex(&"bb".repeat(32)).unwrap();
         let not_updated = ag
-            .update_last_read_if_newer(&older_id, 500, 1000, &pool)
+            .update_last_read_if_newer(&older_id, 500, Some(&msg_id), 1000, &pool)
             .await
             .unwrap();
         assert!(not_updated.is_none());
 
-        // Newer message: should update
+        // Newer message: should update (CAS expected=msg_id matches)
         let newer_id = EventId::from_hex(&"cc".repeat(32)).unwrap();
         let updated = ag
-            .update_last_read_if_newer(&newer_id, 2000, 1000, &pool)
+            .update_last_read_if_newer(&newer_id, 2000, Some(&msg_id), 1000, &pool)
             .await
             .unwrap();
         assert!(updated.is_some());
         assert_eq!(updated.unwrap().last_read_message_id, Some(newer_id));
+
+        // CAS miss: expected=msg_id but current is now newer_id → 0 rows
+        let newest_id = EventId::from_hex(&"dd".repeat(32)).unwrap();
+        let cas_miss = ag
+            .update_last_read_if_newer(&newest_id, 3000, Some(&msg_id), 1000, &pool)
+            .await
+            .unwrap();
+        assert!(cas_miss.is_none(), "CAS must reject stale expected marker");
     }
 
     #[tokio::test]

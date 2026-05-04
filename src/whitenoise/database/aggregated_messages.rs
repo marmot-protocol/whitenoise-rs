@@ -643,6 +643,9 @@ impl AggregatedMessage {
     /// O(sum of all group sizes) rather than O(single_group_size). The covering
     /// index from migration 0043 still drives each per-partition scan, but users
     /// with many large groups will pay proportionally more.
+    ///
+    /// Group IDs are chunked to stay within SQLite's bind-parameter limit
+    /// (default 999). Results are merged, re-sorted, and truncated to `limit`.
     pub async fn search_messages(
         pubkey: &PublicKey,
         query: &str,
@@ -655,6 +658,48 @@ impl AggregatedMessage {
         }
 
         let limit_val = i64::from(limit.min(200));
+
+        // Each chunk query uses ~3 fixed binds (pubkey, like_pattern, limit)
+        // plus one per group ID. Stay well under SQLite's 999-parameter limit.
+        const CHUNK_SIZE: usize = 900;
+
+        if visible_group_ids.len() <= CHUNK_SIZE {
+            return Self::search_messages_chunk(
+                pubkey,
+                query,
+                limit_val,
+                visible_group_ids,
+                database,
+            )
+            .await;
+        }
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+        for chunk in visible_group_ids.chunks(CHUNK_SIZE) {
+            let mut chunk_results =
+                Self::search_messages_chunk(pubkey, query, limit_val, chunk, database).await?;
+            all_results.append(&mut chunk_results);
+        }
+
+        // Re-sort by (created_at DESC, message_id DESC) and truncate.
+        all_results.sort_by(|a, b| {
+            b.message
+                .created_at
+                .cmp(&a.message.created_at)
+                .then_with(|| b.message.id.cmp(&a.message.id))
+        });
+        all_results.truncate(limit_val as usize);
+        Ok(all_results)
+    }
+
+    /// Inner helper: runs a single search query for a chunk of group IDs.
+    async fn search_messages_chunk(
+        pubkey: &PublicKey,
+        query: &str,
+        limit_val: i64,
+        group_ids: &[Vec<u8>],
+        database: &Database,
+    ) -> Result<Vec<SearchResult>> {
         let like_pattern = super::content_search::query_to_like_pattern(query);
         let pubkey_hex = pubkey.to_hex();
 
@@ -675,7 +720,7 @@ impl AggregatedMessage {
         qb.push_bind(&pubkey_hex);
         qb.push(" WHERE am.kind = 9 AND am.mls_group_id IN (");
         let mut sep = qb.separated(", ");
-        for gid in visible_group_ids {
+        for gid in group_ids {
             sep.push_bind(gid.clone());
         }
         sep.push_unseparated(

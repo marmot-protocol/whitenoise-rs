@@ -62,47 +62,95 @@ impl<'a> MembershipOps<'a> {
 
     /// Mark a message as read for this account.
     ///
-    /// Looks up the message to find its group, then atomically advances the
-    /// read marker only if the new message is newer than the current one.
+    /// Looks up the message to find its group, then advances the read marker
+    /// only if the new message is newer than the current one. Uses CAS
+    /// (compare-and-swap on `last_read_message_id`) to handle concurrent
+    /// writers without cross-DB subqueries.
     pub async fn mark_message_read(&self, message_id: &EventId) -> Result<AccountGroup> {
         let message = AggregatedMessage::find_by_message_id(message_id, self.db())
             .await?
             .ok_or(WhitenoiseError::MessageNotFound)?;
 
-        let account_group = AccountGroup::find_by_account_and_group(
+        let message_created_at_ms = message.created_at.timestamp_millis();
+
+        // CAS retry loop: re-read the marker if another writer changed it
+        // between our read and our UPDATE (max 3 attempts).
+        for _ in 0..3 {
+            let account_group = AccountGroup::find_by_account_and_group(
+                self.pubkey(),
+                &message.mls_group_id,
+                self.pool(),
+            )
+            .await?
+            .ok_or(WhitenoiseError::GroupNotFound)?;
+
+            // Phase 18e: switch to account pool once aggregated_messages moves.
+            let current_marker_ts = match &account_group.last_read_message_id {
+                Some(marker_id) => AggregatedMessage::created_at_ms_for_message(
+                    marker_id,
+                    &message.mls_group_id,
+                    self.db(),
+                )
+                .await?
+                .unwrap_or(0),
+                None => 0,
+            };
+
+            match account_group
+                .update_last_read_if_newer(
+                    message_id,
+                    message_created_at_ms,
+                    account_group.last_read_message_id.as_ref(),
+                    current_marker_ts,
+                    self.pool(),
+                )
+                .await?
+            {
+                Some(updated) => return Ok(updated),
+                None => {
+                    // Either the message isn't newer (expected skip) or the
+                    // CAS guard failed (concurrent writer). Re-read to
+                    // distinguish: if the marker is now >= our message, the
+                    // skip was correct and we're done.
+                    let refreshed = AccountGroup::find_by_account_and_group(
+                        self.pubkey(),
+                        &message.mls_group_id,
+                        self.pool(),
+                    )
+                    .await?
+                    .ok_or(WhitenoiseError::GroupNotFound)?;
+
+                    let refreshed_ts = match &refreshed.last_read_message_id {
+                        Some(mid) => AggregatedMessage::created_at_ms_for_message(
+                            mid,
+                            &message.mls_group_id,
+                            self.db(),
+                        )
+                        .await?
+                        .unwrap_or(0),
+                        None => 0,
+                    };
+                    if refreshed_ts >= message_created_at_ms {
+                        // Another writer advanced past our message — done.
+                        return Ok(refreshed);
+                    }
+                    // CAS miss: marker changed but is still behind our
+                    // message. Retry with the fresh state.
+                    continue;
+                }
+            }
+        }
+
+        // Exhausted retries — return current state. This is benign: the
+        // marker will be corrected on the next mark_message_read call.
+        let current = AccountGroup::find_by_account_and_group(
             self.pubkey(),
             &message.mls_group_id,
             self.pool(),
         )
         .await?
         .ok_or(WhitenoiseError::GroupNotFound)?;
-
-        let message_created_at_ms = message.created_at.timestamp_millis();
-        // Phase 18e: switch to account pool once aggregated_messages moves.
-        let current_marker_ts = match &account_group.last_read_message_id {
-            Some(marker_id) => AggregatedMessage::created_at_ms_for_message(
-                marker_id,
-                &message.mls_group_id,
-                self.db(),
-            )
-            .await?
-            .unwrap_or(0),
-            None => 0,
-        };
-        if let Some(updated) = account_group
-            .update_last_read_if_newer(
-                message_id,
-                message_created_at_ms,
-                current_marker_ts,
-                self.pool(),
-            )
-            .await?
-        {
-            return Ok(updated);
-        }
-
-        // Update was skipped (message not newer), return current state.
-        Ok(account_group)
+        Ok(current)
     }
 
     /// Return the group ID of the latest DM group with `peer_pubkey`, if any.

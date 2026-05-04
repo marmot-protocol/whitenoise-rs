@@ -95,20 +95,28 @@ impl Account {
     /// Returns all persisted account pubkeys as hex strings.
     ///
     /// Best-effort: returns an empty vec if the `accounts` table doesn't
-    /// exist yet (fresh install).
+    /// exist yet (fresh install). Propagates all other DB errors.
     #[perf_instrument("db::accounts")]
-    pub(crate) async fn all_pubkeys_hex(database: &Database) -> Vec<String> {
+    pub(crate) async fn all_pubkeys_hex(
+        database: &Database,
+    ) -> Result<Vec<String>, WhitenoiseError> {
         match sqlx::query_scalar::<_, String>("SELECT pubkey FROM accounts")
             .fetch_all(&database.pool)
             .await
         {
-            Ok(rows) => rows,
+            Ok(rows) => Ok(rows),
             Err(e) => {
-                tracing::debug!(
-                    target: "whitenoise::database::accounts",
-                    "Could not read accounts table (fresh install?): {e}"
-                );
-                Vec::new()
+                // "no such table" → fresh install, not an error.
+                let msg = e.to_string();
+                if msg.contains("no such table") {
+                    tracing::debug!(
+                        target: "whitenoise::database::accounts",
+                        "accounts table does not exist (fresh install)"
+                    );
+                    Ok(Vec::new())
+                } else {
+                    Err(DatabaseError::Sqlx(e).into())
+                }
             }
         }
     }
