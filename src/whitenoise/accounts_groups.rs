@@ -651,8 +651,10 @@ impl Whitenoise {
         // 4. Delete per-account accounts_groups row
         AccountGroup::delete_for_group(group_id, &session.account_db.inner.pool).await?;
 
-        // 4-pre-shared: Delete per-account aggregated_messages for this group
-        // (message_delivery_status cascades via intra-DB FK).
+        // Delete per-account aggregated_messages for this group. Order doesn't
+        // matter relative to the steps below: there's no FK between
+        // accounts_groups and aggregated_messages, and message_delivery_status
+        // cascades via the intra-DB FK on aggregated_messages.
         crate::whitenoise::aggregated_message::AggregatedMessage::delete_by_group(
             group_id,
             &session.account_db.inner,
