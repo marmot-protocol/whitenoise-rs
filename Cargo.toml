@@ -24,13 +24,13 @@ hex = "0.4"
 image = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
-keyring-core = "0.7"
-mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46", features = [
+keyring-core = "1"
+mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
-mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "0babfa763f93fbd2c12e1f1b9ce9a28ab2516e46" }
+mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8" }
+mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8" }
 
 nostr-blossom = "0.44"
 nostr-sdk = { version = "0.44", features = [
@@ -39,6 +39,7 @@ nostr-sdk = { version = "0.44", features = [
     "nip47",
     "nip59",
 ] }
+once_cell = "1"
 
 # LOCAL MDK FOR DEVELOPMENT
 # mdk-core = { version = "0.7.1", path="../mdk/crates/mdk-core" }
@@ -102,19 +103,27 @@ indicatif = { version = "0.18.3", optional = true }
 # NOTE: apple_native_keyring_store::protected::Store requires the binary to be
 #   code-signed with a provisioning profile. The `cli` feature automatically
 #   selects keychain::Store instead, so CLI builds work without signing.
-apple-native-keyring-store = { version = "0.2", features = ["keychain", "protected"] }
+apple-native-keyring-store = { version = "1", features = ["keychain", "protected"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-apple-native-keyring-store = { version = "0.2", features = ["protected"] }
+apple-native-keyring-store = { version = "1", features = ["protected"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-native-keyring-store = "0.5"
+windows-native-keyring-store = "1"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
+# Secret Service is the durable store for Linux and BSD targets.
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-linux-keyutils-keyring-store = "0.2"
+# Keyutils is retained only as a legacy migration source for Linux users
+# upgrading from the old backend.
+linux-keyutils-keyring-store = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
-android-native-keyring-store = "0.5"
+# Keep the v0.5-and-earlier by-service layout for upgraded Android installs.
+# The v1 default Store uses named stores and cannot see existing MDK DB keys.
+android-native-keyring-store = { version = "1", features = ["legacy"] }
 
 [dev-dependencies]
 mockito = "1.2"

@@ -286,3 +286,18 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for WhitenoiseError {
         Self::Internal(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxed_error_converts_to_internal_error() {
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("boxed failure"));
+
+        let err = WhitenoiseError::from(boxed);
+
+        assert!(matches!(err, WhitenoiseError::Internal(msg) if msg == "boxed failure"));
+    }
+}
