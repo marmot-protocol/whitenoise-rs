@@ -1546,10 +1546,12 @@ mod tests {
     }
 
     #[test]
-    fn keyring_store_init_skips_initializer_when_default_store_exists() {
+    fn keyring_store_init_preserves_existing_default_store() {
         let init = KeyringStoreInit::new();
         let attempts = AtomicUsize::new(0);
 
+        // Host apps may configure keyring-core before Whitenoise starts. In
+        // that case initialization should preserve the existing default store.
         let result = init.initialize_with(
             || true,
             || {
