@@ -25,12 +25,12 @@ image = "0.25"
 indexmap = { version = "2", features = ["serde"] }
 infer = "0.19"
 keyring-core = "1"
-mdk-core = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8", features = [
+mdk-core = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "c1ee17ec4c811f28d5c1ffdbd9284121dda214ab", features = [
     "mip04",
     "mip05",
 ] }
-mdk-sqlite-storage = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8" }
-mdk-storage-traits = { version = "0.7.1", git = "https://github.com/marmot-protocol/mdk", rev = "8d479fa05bdb5cbb0eaf0a86f3bfc6ee2f1789b8" }
+mdk-sqlite-storage = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "c1ee17ec4c811f28d5c1ffdbd9284121dda214ab" }
+mdk-storage-traits = { version = "0.8.0", git = "https://github.com/marmot-protocol/mdk", rev = "c1ee17ec4c811f28d5c1ffdbd9284121dda214ab" }
 
 nostr-blossom = "0.44"
 nostr-sdk = { version = "0.44", features = [
@@ -42,8 +42,8 @@ nostr-sdk = { version = "0.44", features = [
 once_cell = "1"
 
 # LOCAL MDK FOR DEVELOPMENT
-# mdk-core = { version = "0.7.1", path="../mdk/crates/mdk-core" }
-# mdk-sqlite-storage = { version = "0.7.1", path="../mdk/crates/mdk-sqlite-storage" }
+# mdk-core = { version = "0.8.0", path="../mdk/crates/mdk-core" }
+# mdk-sqlite-storage = { version = "0.8.0", path="../mdk/crates/mdk-sqlite-storage" }
 
 # LOCAL RUST_NOSTR FOR DEVELOPMENT
 # nostr-blossom = { version = "0.43", path="../rust-nostr/rfs/nostr-blossom" }

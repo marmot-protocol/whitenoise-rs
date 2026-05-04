@@ -569,14 +569,16 @@ impl Whitenoise {
             not(feature = "benchmark-tests")
         )
     ))]
-    fn create_legacy_migration_keyring_store<S>(
+    fn create_legacy_migration_keyring_store<S, E>(
         primary: Arc<keyring_core::CredentialStore>,
-        legacy: keyring_core::Result<Arc<S>>,
+        legacy: core::result::Result<Arc<S>, E>,
         legacy_store_name: &str,
     ) -> Arc<keyring_core::CredentialStore>
     where
         S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+        E: Into<keyring_core::Error>,
     {
+        let legacy = legacy.map_err(Into::into);
         match Self::create_keyring_store(legacy, legacy_store_name) {
             Ok(legacy) => keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
             Err(err) => {
@@ -1572,6 +1574,17 @@ mod tests {
     use super::*;
     use database::aggregated_messages::PaginationOptions;
 
+    struct CustomLegacyStoreCreationError;
+
+    impl From<CustomLegacyStoreCreationError> for keyring_core::Error {
+        fn from(_: CustomLegacyStoreCreationError) -> Self {
+            keyring_core::Error::Invalid(
+                "legacy Android".to_string(),
+                "custom missing NDK context".to_string(),
+            )
+        }
+    }
+
     #[test]
     fn keyring_store_init_retries_after_failed_attempt() {
         let init = KeyringStoreInit::new();
@@ -1693,12 +1706,43 @@ mod tests {
             .set_secret(b"primary-db-key")
             .unwrap();
 
-        let store = Whitenoise::create_legacy_migration_keyring_store::<keyring_core::mock::Store>(
+        let store = Whitenoise::create_legacy_migration_keyring_store::<
+            keyring_core::mock::Store,
+            keyring_core::Error,
+        >(
             primary,
             Err(keyring_core::Error::Invalid(
                 "legacy Android".to_string(),
                 "missing NDK context".to_string(),
             )),
+            "legacy Android",
+        );
+
+        assert_eq!(
+            store
+                .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+                .unwrap()
+                .get_secret()
+                .unwrap(),
+            b"primary-db-key"
+        );
+    }
+
+    #[test]
+    fn legacy_migration_keyring_store_falls_back_to_primary_when_custom_legacy_error_converts() {
+        let primary = keyring_core::mock::Store::new().unwrap();
+        primary
+            .build("com.whitenoise.app", "whitenoise.db.key.v1", None)
+            .unwrap()
+            .set_secret(b"primary-db-key")
+            .unwrap();
+
+        let store = Whitenoise::create_legacy_migration_keyring_store::<
+            keyring_core::mock::Store,
+            CustomLegacyStoreCreationError,
+        >(
+            primary,
+            Err(CustomLegacyStoreCreationError),
             "legacy Android",
         );
 
