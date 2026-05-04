@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use crate::WhitenoiseError;
-use crate::integration_tests::core::{ScenarioContext, TestCase, retry_default};
+use crate::integration_tests::core::{ScenarioContext, TestCase, retry};
 use async_trait::async_trait;
 
 /// Test case that waits for specified accounts to receive and process welcome messages
@@ -43,7 +45,9 @@ impl TestCase for WaitForWelcomeTestCase {
                 self.group_name
             );
 
-            retry_default(
+            retry(
+                60,
+                Duration::from_millis(250),
                 || {
                     let account = account.clone();
                     let group_id = group_id.clone();

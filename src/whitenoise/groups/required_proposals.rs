@@ -2,9 +2,11 @@
 // whitenoise-owned mirror; this import is internal only.
 use std::collections::BTreeSet;
 
-use mdk_core::prelude::ProposalType;
+use mdk_core::prelude::{CapabilityUpgradeStatus, ProposalType, ProposalUpgradability};
 use nostr_sdk::prelude::PublicKey;
 use serde::{Deserialize, Serialize};
+
+use crate::whitenoise::error::WhitenoiseError;
 
 /// SelfRemove codepoint (`0x000a`). Used both as a proposal codepoint
 /// ([`RequiredProposal::SelfRemove`]) and an extension codepoint
@@ -44,6 +46,28 @@ pub enum RequiredProposal {
     SelfRemove,
     /// Any proposal type the whitenoise API does not distinguish today.
     Unknown,
+}
+
+/// Upgrade readiness for the proposal types WhiteNoise exposes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupCapabilityUpgradeStatus {
+    pub per_proposal: Vec<RequiredProposalUpgradeStatus>,
+}
+
+/// Upgrade readiness for one modeled required proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredProposalUpgradeStatus {
+    pub proposal: RequiredProposal,
+    pub state: RequiredProposalUpgradability,
+}
+
+/// Whether a modeled proposal can be added to the group's `RequiredCapabilities`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredProposalUpgradability {
+    AlreadyRequired,
+    Available,
+    Blocked { blockers: Vec<PublicKey> },
 }
 
 /// A whitenoise-owned mirror of the MLS extension-type registry, restricted to
@@ -117,6 +141,49 @@ impl From<ProposalType> for RequiredProposal {
     }
 }
 
+impl TryFrom<RequiredProposal> for ProposalType {
+    type Error = WhitenoiseError;
+
+    fn try_from(proposal: RequiredProposal) -> core::result::Result<Self, Self::Error> {
+        match proposal {
+            RequiredProposal::SelfRemove => Ok(Self::SelfRemove),
+            RequiredProposal::Unknown => Err(WhitenoiseError::InvalidInput(
+                "RequiredProposal::Unknown is a sentinel and cannot be used as an upgrade target"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+pub(crate) fn project_group_capability_upgrade_status(
+    status: CapabilityUpgradeStatus,
+) -> GroupCapabilityUpgradeStatus {
+    let per_proposal = status
+        .per_proposal
+        .into_iter()
+        .filter_map(|(proposal, state)| {
+            let proposal = RequiredProposal::from(proposal);
+            if matches!(proposal, RequiredProposal::Unknown) {
+                return None;
+            }
+
+            let state = match state {
+                ProposalUpgradability::AlreadyRequired => {
+                    RequiredProposalUpgradability::AlreadyRequired
+                }
+                ProposalUpgradability::Available => RequiredProposalUpgradability::Available,
+                ProposalUpgradability::Blocked { blockers } => {
+                    RequiredProposalUpgradability::Blocked { blockers }
+                }
+            };
+
+            Some(RequiredProposalUpgradeStatus { proposal, state })
+        })
+        .collect();
+
+    GroupCapabilityUpgradeStatus { per_proposal }
+}
+
 impl From<u16> for RequiredProposal {
     /// Maps a raw proposal codepoint to the mirror enum.
     ///
@@ -183,10 +250,101 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_status_serde_round_trip_preserves_payload() {
+        let blocker = Keys::generate().public_key();
+        let original = GroupCapabilityUpgradeStatus {
+            per_proposal: vec![RequiredProposalUpgradeStatus {
+                proposal: RequiredProposal::SelfRemove,
+                state: RequiredProposalUpgradability::Blocked {
+                    blockers: vec![blocker],
+                },
+            }],
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: GroupCapabilityUpgradeStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
     fn from_self_remove_maps_to_self_remove() {
         assert_eq!(
             RequiredProposal::from(ProposalType::SelfRemove),
             RequiredProposal::SelfRemove,
+        );
+    }
+
+    #[test]
+    fn try_from_self_remove_maps_to_proposal_type_self_remove() {
+        assert_eq!(
+            ProposalType::try_from(RequiredProposal::SelfRemove).unwrap(),
+            ProposalType::SelfRemove,
+        );
+    }
+
+    #[test]
+    fn try_from_unknown_rejects_upgrade_target() {
+        let error = ProposalType::try_from(RequiredProposal::Unknown).unwrap_err();
+
+        assert!(matches!(error, WhitenoiseError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn project_upgrade_status_maps_modeled_rows() {
+        let blocker = Keys::generate().public_key();
+        let status = mdk_core::prelude::CapabilityUpgradeStatus {
+            per_proposal: vec![
+                (
+                    ProposalType::SelfRemove,
+                    mdk_core::prelude::ProposalUpgradability::Blocked {
+                        blockers: vec![blocker],
+                    },
+                ),
+                (
+                    ProposalType::Add,
+                    mdk_core::prelude::ProposalUpgradability::Available,
+                ),
+            ],
+        };
+
+        let projected = project_group_capability_upgrade_status(status);
+
+        assert_eq!(
+            projected,
+            GroupCapabilityUpgradeStatus {
+                per_proposal: vec![RequiredProposalUpgradeStatus {
+                    proposal: RequiredProposal::SelfRemove,
+                    state: RequiredProposalUpgradability::Blocked {
+                        blockers: vec![blocker],
+                    },
+                }],
+            },
+        );
+    }
+
+    #[test]
+    fn project_upgrade_status_preserves_already_required_and_available_states() {
+        let already_required = mdk_core::prelude::CapabilityUpgradeStatus {
+            per_proposal: vec![(
+                ProposalType::SelfRemove,
+                mdk_core::prelude::ProposalUpgradability::AlreadyRequired,
+            )],
+        };
+        let available = mdk_core::prelude::CapabilityUpgradeStatus {
+            per_proposal: vec![(
+                ProposalType::SelfRemove,
+                mdk_core::prelude::ProposalUpgradability::Available,
+            )],
+        };
+
+        assert_eq!(
+            project_group_capability_upgrade_status(already_required).per_proposal[0].state,
+            RequiredProposalUpgradability::AlreadyRequired,
+        );
+        assert_eq!(
+            project_group_capability_upgrade_status(available).per_proposal[0].state,
+            RequiredProposalUpgradability::Available,
         );
     }
 

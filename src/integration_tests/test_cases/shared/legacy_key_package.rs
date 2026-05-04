@@ -7,12 +7,13 @@
 //! overridden — so this fixture exercises the WhiteNoise-side preflight
 //! softening without claiming to forge legacy MLS LeafNode bytes.
 
+use nostr_sdk::prelude::*;
+
 use crate::WhitenoiseError;
 use crate::integration_tests::core::*;
 use crate::whitenoise::groups::{KeyPackageCapabilities, MlsExtensionId, RequiredProposal};
 use crate::whitenoise::key_packages::MLS_KEY_PACKAGE_KIND_LEGACY;
 use crate::whitenoise::relays::Relay;
-use nostr_sdk::prelude::*;
 
 /// Codepoint emitted in the `mls_proposals` tag for [`RequiredProposal::SelfRemove`].
 /// Mirrors `crate::whitenoise::groups::required_proposals::SELF_REMOVE_CODEPOINT`,
@@ -154,11 +155,58 @@ pub(crate) async fn publish_legacy_capability_key_package(
         .await?;
 
     tracing::debug!(
+        target: "whitenoise::integration_tests::test_cases::shared::legacy_key_package",
         "Published legacy-capability key package {} for account {} (proposals={:?}, extensions={:?})",
         event_id.to_hex(),
         account.pubkey.to_hex(),
         capabilities.proposals,
         capabilities.extensions,
+    );
+
+    Ok(event_id)
+}
+
+/// Builds and publishes a legacy LeafNode key package whose MLS bytes do not
+/// advertise SelfRemove.
+///
+/// Unlike [`publish_legacy_capability_key_package`], this uses MDK's
+/// `test_util::create_legacy_key_package_event` helper, so MDK's LCD logic sees
+/// a real capability-poor leaf during group creation.
+pub(crate) async fn publish_legacy_leaf_key_package(
+    context: &ScenarioContext,
+    account: &crate::Account,
+) -> Result<EventId, WhitenoiseError> {
+    let nsec = context.whitenoise.export_account_nsec(account).await?;
+    let secret_key =
+        SecretKey::from_bech32(&nsec).map_err(|e| WhitenoiseError::Internal(e.to_string()))?;
+    let keys = Keys::new(secret_key);
+
+    let mdk = context.whitenoise.create_mdk_for_account(account.pubkey)?;
+    let event = mdk_core::test_util::create_legacy_key_package_event(&mdk, &keys);
+    let event_id = event.id;
+
+    let relays = account.key_package_relays(context.whitenoise).await?;
+    let relay_urls: Vec<&str> = relays.iter().map(|relay| relay.url.as_str()).collect();
+    let client = create_test_client(&relay_urls, keys).await?;
+    client.send_event(&event).await?;
+    client.disconnect().await;
+
+    context
+        .whitenoise
+        .track_published_key_package_for_testing(
+            &account.pubkey,
+            &[],
+            &event_id.to_hex(),
+            MLS_KEY_PACKAGE_KIND_LEGACY,
+            None,
+        )
+        .await?;
+
+    tracing::debug!(
+        target: "whitenoise::integration_tests::test_cases::shared::legacy_key_package",
+        "Published legacy LeafNode key package {} for account {}",
+        event_id.to_hex(),
+        account.pubkey.to_hex(),
     );
 
     Ok(event_id)

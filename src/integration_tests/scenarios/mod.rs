@@ -16,6 +16,7 @@ pub mod metadata_management;
 pub mod notification_streaming;
 pub mod scheduler;
 pub mod subscription_processing;
+pub mod upgrade_required_proposals_after_legacy_self_update;
 pub mod user_discovery;
 pub mod user_search;
 
@@ -37,5 +38,6 @@ pub use metadata_management::*;
 pub use notification_streaming::*;
 pub use scheduler::*;
 pub use subscription_processing::*;
+pub use upgrade_required_proposals_after_legacy_self_update::*;
 pub use user_discovery::*;
 pub use user_search::*;
