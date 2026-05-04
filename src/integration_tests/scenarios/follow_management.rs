@@ -9,6 +9,8 @@ use crate::integration_tests::{
 };
 use crate::{Whitenoise, WhitenoiseError};
 
+const CONTACT_LIST_SETTLE_DELAY: Duration = Duration::from_secs(2);
+
 pub struct FollowManagementScenario {
     context: ScenarioContext,
 }
@@ -46,24 +48,28 @@ impl Scenario for FollowManagementScenario {
         // Without this, rapid follow/unfollow can produce ContactList events with
         // identical second-precision timestamps, causing the relay to reject the
         // newer event ("replaced: have newer event") and leaving stale state.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(CONTACT_LIST_SETTLE_DELAY).await;
 
         // Test following a second user
         FollowUserTestCase::new("follow_mgmt_follower", test_contact2)
             .execute(&mut self.context)
             .await?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(CONTACT_LIST_SETTLE_DELAY).await;
 
         // Test unfollowing the first user
         UnfollowUserTestCase::new("follow_mgmt_follower", test_contact1)
             .execute(&mut self.context)
             .await?;
 
+        tokio::time::sleep(CONTACT_LIST_SETTLE_DELAY).await;
+
         // Test error handling: try to follow the same user again (should succeed without error)
         FollowUserTestCase::new("follow_mgmt_follower", test_contact2)
             .execute(&mut self.context)
             .await?;
+
+        tokio::time::sleep(CONTACT_LIST_SETTLE_DELAY).await;
 
         // Test error handling: try to unfollow a non-existent follow relationship
         let non_existent_contact = Keys::generate().public_key();
