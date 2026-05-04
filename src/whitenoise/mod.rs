@@ -569,14 +569,16 @@ impl Whitenoise {
             not(feature = "benchmark-tests")
         )
     ))]
-    fn create_legacy_migration_keyring_store<S>(
+    fn create_legacy_migration_keyring_store<S, E>(
         primary: Arc<keyring_core::CredentialStore>,
-        legacy: keyring_core::Result<Arc<S>>,
+        legacy: core::result::Result<Arc<S>, E>,
         legacy_store_name: &str,
     ) -> Arc<keyring_core::CredentialStore>
     where
         S: keyring_core::api::CredentialStoreApi + Send + Sync + 'static,
+        E: Into<keyring_core::Error>,
     {
+        let legacy = legacy.map_err(Into::into);
         match Self::create_keyring_store(legacy, legacy_store_name) {
             Ok(legacy) => keyring_store::LegacyMigrationCredentialStore::new(primary, legacy),
             Err(err) => {
@@ -1693,7 +1695,10 @@ mod tests {
             .set_secret(b"primary-db-key")
             .unwrap();
 
-        let store = Whitenoise::create_legacy_migration_keyring_store::<keyring_core::mock::Store>(
+        let store = Whitenoise::create_legacy_migration_keyring_store::<
+            keyring_core::mock::Store,
+            keyring_core::Error,
+        >(
             primary,
             Err(keyring_core::Error::Invalid(
                 "legacy Android".to_string(),
