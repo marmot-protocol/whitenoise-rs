@@ -255,7 +255,7 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<()> {
-        let last_message_id = self.get_last_message_id(group_id).await;
+        let last_message_id = self.get_last_message_id(account_pubkey, group_id).await;
 
         for (trigger, msg) in self
             .cache_deletion(account_pubkey, group_id, message)
@@ -486,10 +486,15 @@ impl Whitenoise {
     }
 
     /// Gets the ID of the last message in a group (if any).
-    async fn get_last_message_id(&self, group_id: &GroupId) -> Option<String> {
+    async fn get_last_message_id(
+        &self,
+        account_pubkey: &PublicKey,
+        group_id: &GroupId,
+    ) -> Option<String> {
+        let session = self.account_manager.get_session(account_pubkey)?;
         AggregatedMessage::find_last_by_group_ids(
             std::slice::from_ref(group_id),
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await
         .ok()
@@ -533,7 +538,7 @@ impl Whitenoise {
             &chat_message.id,
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
             && existing_message.delivery_status.is_some()
@@ -545,13 +550,13 @@ impl Whitenoise {
             &chat_message,
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
 
         // Apply orphaned reactions/deletions - modifies in-place and returns final state
         let final_message = self
-            .apply_orphaned_reactions_and_deletions(chat_message, group_id)
+            .apply_orphaned_reactions_and_deletions(account_pubkey, chat_message, group_id)
             .await?;
 
         tracing::debug!(
@@ -576,6 +581,10 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Option<ChatMessage>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // If this reaction already has a delivery status, it was sent by us and already
         // applied to the parent — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
@@ -583,7 +592,7 @@ impl Whitenoise {
             &message.id.to_string(),
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         {
@@ -596,7 +605,7 @@ impl Whitenoise {
             return Ok(None);
         }
 
-        AggregatedMessage::insert_reaction(message, group_id, &self.shared.database).await?;
+        AggregatedMessage::insert_reaction(message, group_id, &session.account_db.inner).await?;
 
         let result = self
             .apply_reaction_to_target(account_pubkey, message, group_id)
@@ -630,13 +639,17 @@ impl Whitenoise {
         reaction: &Message,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         let target_id = extract_reaction_target_id(&reaction.tags)?;
 
         let Some(mut target) = AggregatedMessage::find_by_id(
             &target_id,
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         else {
@@ -660,7 +673,7 @@ impl Whitenoise {
             &target.id,
             group_id,
             &target.reactions,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
 
@@ -678,6 +691,10 @@ impl Whitenoise {
         group_id: &GroupId,
         message: &Message,
     ) -> Result<Vec<(UpdateTrigger, ChatMessage)>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // If this deletion already has a delivery status, it was sent by us and already
         // applied to targets — skip re-applying to avoid unnecessary DB writes and
         // duplicate UI emissions.
@@ -685,7 +702,7 @@ impl Whitenoise {
             &message.id.to_string(),
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         {
@@ -698,7 +715,7 @@ impl Whitenoise {
             return Ok(Vec::new());
         }
 
-        AggregatedMessage::insert_deletion(message, group_id, &self.shared.database).await?;
+        AggregatedMessage::insert_deletion(message, group_id, &session.account_db.inner).await?;
 
         let updates = self
             .apply_deletions_to_targets(account_pubkey, message, group_id)
@@ -745,9 +762,13 @@ impl Whitenoise {
         deletion_event_id: &EventId,
         group_id: &GroupId,
     ) -> Result<Option<(UpdateTrigger, ChatMessage)>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         // Check if target is a reaction
         if let Some(reaction) =
-            AggregatedMessage::find_reaction_by_id(target_id, group_id, &self.shared.database)
+            AggregatedMessage::find_reaction_by_id(target_id, group_id, &session.account_db.inner)
                 .await?
         {
             let parent_update = self
@@ -757,7 +778,7 @@ impl Whitenoise {
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.shared.database,
+                &session.account_db.inner,
             )
             .await?;
             return Ok(parent_update.map(|msg| (UpdateTrigger::ReactionRemoved, msg)));
@@ -768,7 +789,7 @@ impl Whitenoise {
             target_id,
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         {
@@ -777,7 +798,7 @@ impl Whitenoise {
                 target_id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.shared.database,
+                &session.account_db.inner,
             )
             .await?;
             return Ok(Some((UpdateTrigger::MessageDeleted, msg)));
@@ -788,7 +809,7 @@ impl Whitenoise {
             target_id,
             group_id,
             &deletion_event_id.to_string(),
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
         Ok(None)
@@ -801,6 +822,10 @@ impl Whitenoise {
         reaction: &AggregatedMessage,
         group_id: &GroupId,
     ) -> Result<Option<ChatMessage>> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         let Ok(parent_id) = extract_reaction_target_id(&reaction.tags) else {
             return Ok(None);
         };
@@ -809,7 +834,7 @@ impl Whitenoise {
             &parent_id,
             group_id,
             account_pubkey,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?
         else {
@@ -821,7 +846,7 @@ impl Whitenoise {
                 &parent_id,
                 group_id,
                 &parent.reactions,
-                &self.shared.database,
+                &session.account_db.inner,
             )
             .await?;
 
@@ -844,20 +869,25 @@ impl Whitenoise {
     /// This avoids re-fetching from the database after applying orphans.
     async fn apply_orphaned_reactions_and_deletions(
         &self,
+        account_pubkey: &PublicKey,
         mut message: ChatMessage,
         group_id: &GroupId,
     ) -> Result<ChatMessage> {
+        let session = self
+            .account_manager
+            .get_session(account_pubkey)
+            .ok_or(WhitenoiseError::AccountNotFound)?;
         let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
             &message.id,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
 
         let orphaned_deletions = AggregatedMessage::find_orphaned_deletions(
             &message.id,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner,
         )
         .await?;
 
@@ -904,7 +934,7 @@ impl Whitenoise {
                 &message.id,
                 group_id,
                 &message.reactions,
-                &self.shared.database,
+                &session.account_db.inner,
             )
             .await?;
         }
@@ -916,7 +946,7 @@ impl Whitenoise {
                 &message.id,
                 group_id,
                 &deletion_event_id.to_string(),
-                &self.shared.database,
+                &session.account_db.inner,
             )
             .await?;
         }
@@ -1012,7 +1042,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1039,7 +1069,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1070,7 +1100,7 @@ mod tests {
             &message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1082,6 +1112,7 @@ mod tests {
     async fn test_cache_chat_message_preserves_existing_delivery_status() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
         let creator_account = whitenoise.create_identity().await.unwrap();
+        let creator_session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let members = setup_multiple_test_accounts(&whitenoise, 1).await;
         let member_pubkey = members[0].0.pubkey;
 
@@ -1131,7 +1162,7 @@ mod tests {
             &group.mls_group_id,
             &creator_account.pubkey,
             &DeliveryStatus::Sent(1),
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1147,7 +1178,7 @@ mod tests {
             &message_id.to_string(),
             &group.mls_group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1257,7 +1288,7 @@ mod tests {
         let orphaned_reactions = AggregatedMessage::find_orphaned_reactions(
             &future_message_id.to_string(),
             group_id,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1291,7 +1322,7 @@ mod tests {
             &future_message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1399,7 +1430,7 @@ mod tests {
             &future_message_id.to_string(),
             group_id,
             &creator_account.pubkey,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap()
@@ -1546,7 +1577,7 @@ mod tests {
             &group.mls_group_id,
             &creator_account.pubkey,
             None,
-            &whitenoise.shared.database,
+            &creator_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1626,7 +1657,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.shared.database,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1708,7 +1739,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.shared.database,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1772,7 +1803,7 @@ mod tests {
             &group_id,
             &member_account.pubkey,
             None,
-            &whitenoise.shared.database,
+            &member_session.account_db.inner,
         )
         .await
         .unwrap();

@@ -5,8 +5,6 @@
 //! acceptance/decline, read markers, pinning, archiving, muting, departure
 //! tracking, DM peer lookup, and chat clearing.
 
-use std::sync::Arc;
-
 use chrono::Utc;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
@@ -42,8 +40,8 @@ impl<'a> MembershipOps<'a> {
         &self.session.account_pubkey
     }
 
-    fn db(&self) -> &Arc<Database> {
-        &self.session.shared.database
+    fn db(&self) -> &Database {
+        &self.session.account_db.inner
     }
 
     fn pool(&self) -> &SqlitePool {
@@ -172,8 +170,8 @@ impl<'a> MembershipOpsForGroup<'a> {
         &self.session.account_pubkey
     }
 
-    fn db(&self) -> &Arc<Database> {
-        &self.session.shared.database
+    fn db(&self) -> &Database {
+        &self.session.account_db.inner
     }
 
     fn pool(&self) -> &SqlitePool {

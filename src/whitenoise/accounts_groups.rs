@@ -651,6 +651,14 @@ impl Whitenoise {
         // 4. Delete per-account accounts_groups row
         AccountGroup::delete_for_group(group_id, &session.account_db.inner.pool).await?;
 
+        // 4-pre-shared: Delete per-account aggregated_messages for this group
+        // (message_delivery_status cascades via intra-DB FK).
+        crate::whitenoise::aggregated_message::AggregatedMessage::delete_by_group(
+            group_id,
+            &session.account_db.inner,
+        )
+        .await?;
+
         // 4a. Check if any other account still has this group.
         // We can only inspect active sessions, not every persisted account.
         // If inactive accounts exist, conservatively keep shared data — the
@@ -1307,12 +1315,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1322,7 +1331,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1369,12 +1378,13 @@ mod tests {
         let older_msg_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
         let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "ddd")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             older_msg_id,
             group_id.clone(),
             account.pubkey,
             older_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1384,7 +1394,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             newer_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1430,12 +1440,13 @@ mod tests {
         let first_msg_id = EventId::from_hex(&format!("{:0>64}", "eee")).unwrap();
         let second_msg_id = EventId::from_hex(&format!("{:0>64}", "fff")).unwrap();
 
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             first_msg_id,
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -1445,7 +1456,7 @@ mod tests {
             group_id.clone(),
             account.pubkey,
             same_time,
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();
@@ -2550,12 +2561,13 @@ mod tests {
 
         // Create a message and mark it as read
         let msg_id = EventId::from_hex(&format!("{:0>64}", "aab")).unwrap();
+        let session = whitenoise.session(&account.pubkey).unwrap();
         AggregatedMessage::create_for_test(
             msg_id,
             group_id.clone(),
             account.pubkey,
             Utc::now(),
-            &whitenoise.shared.database,
+            &session.account_db.inner,
         )
         .await
         .unwrap();

@@ -63,7 +63,7 @@ impl Whitenoise {
             aggregated_message::AggregatedMessage::find_messages_by_group_paginated(
                 group_id,
                 account_pubkey,
-                &self.shared.database,
+                &session.account_db.inner,
                 &PaginationOptions::default(),
                 limit,
                 cleared_at_ms,

@@ -224,7 +224,7 @@ impl<'a> ChatListOps<'a> {
                 .collect();
 
         let last_message_map: HashMap<GroupId, ChatMessageSummary> =
-            AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.shared.database)
+            AggregatedMessage::find_last_by_group_ids(&group_ids, &self.session.account_db.inner)
                 .await?
                 .into_iter()
                 .map(|s| (s.mls_group_id.clone(), s))
@@ -249,7 +249,7 @@ impl<'a> ChatListOps<'a> {
             .collect();
         let unread_counts = AggregatedMessage::count_unread_for_groups(
             &group_markers,
-            &self.session.shared.database,
+            &self.session.account_db.inner,
         )
         .await?;
 

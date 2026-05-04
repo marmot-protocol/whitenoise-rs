@@ -1749,11 +1749,12 @@ mod tests {
                 delivery_status: None,
             };
 
+            let session = whitenoise.session(&test_pubkey).unwrap();
             aggregated_message::AggregatedMessage::insert_message(
                 &msg1,
                 &group_id,
                 &test_pubkey,
-                &whitenoise.shared.database,
+                &session.account_db.inner,
             )
             .await
             .unwrap();
@@ -1761,7 +1762,7 @@ mod tests {
                 &msg2,
                 &group_id,
                 &test_pubkey,
-                &whitenoise.shared.database,
+                &session.account_db.inner,
             )
             .await
             .unwrap();
@@ -1865,11 +1866,12 @@ mod tests {
                 media_attachments: vec![],
                 delivery_status: None,
             };
+            let session = whitenoise.session(&author).unwrap();
             aggregated_message::AggregatedMessage::insert_message(
                 &msg,
                 group_id,
                 &author,
-                &whitenoise.shared.database,
+                &session.account_db.inner,
             )
             .await
             .unwrap();
@@ -3427,6 +3429,7 @@ mod tests {
                 (&group_e, "5", "Message E", base_timestamp + 3600), // +1 hour
             ];
 
+            let session = whitenoise.session(&creator.pubkey).unwrap();
             for (group, id, content, timestamp) in messages {
                 let msg = message_aggregator::ChatMessage {
                     id: format!("{:0>64}", id),
@@ -3447,7 +3450,7 @@ mod tests {
                     &msg,
                     &group.mls_group_id,
                     &creator.pubkey,
-                    &whitenoise.shared.database,
+                    &session.account_db.inner,
                 )
                 .await
                 .unwrap();
