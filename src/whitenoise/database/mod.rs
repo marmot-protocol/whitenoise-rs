@@ -280,26 +280,22 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes aggregated messages that all accounts have cleared.
+    /// Delete aggregated messages whose `created_at <= threshold`.
     ///
-    /// Only deletes messages whose `created_at` is at or before the minimum
-    /// `chat_cleared_at` across all accounts in the group, and only when
-    /// every account has set a `chat_cleared_at` value.
+    /// Intended for the per-account cleanup path: after `clear_chat` advances
+    /// this account's `chat_cleared_at`, the caller passes that timestamp here
+    /// to drop the now-invisible message rows from this account's per-account
+    /// DB. Cross-account coordination is irrelevant because each account owns
+    /// its own copy of `aggregated_messages` post-phase-18e.
     ///
-    /// Returns the number of rows deleted.
-    /// Delete aggregated messages older than the given threshold.
-    ///
-    /// `min_cleared_at` is the minimum `chat_cleared_at` across all accounts
-    /// that have this group, but only if **every** account has set a
-    /// `chat_cleared_at` value (i.e. all accounts have cleared). If any
-    /// account has `chat_cleared_at = NULL`, pass `None` and no cleanup
-    /// occurs.
+    /// Pass `None` to make the call a no-op. Returns the number of rows
+    /// deleted.
     pub(crate) async fn try_cleanup_cleared_messages(
         &self,
         mls_group_id: &mdk_core::prelude::GroupId,
-        min_cleared_at: Option<i64>,
+        cleared_at_ms: Option<i64>,
     ) -> Result<u64, DatabaseError> {
-        let Some(threshold) = min_cleared_at else {
+        let Some(threshold) = cleared_at_ms else {
             return Ok(0);
         };
         retry_on_lock(|| self.try_cleanup_cleared_messages_inner(mls_group_id, threshold)).await

@@ -11,7 +11,6 @@ use nostr_sdk::{EventId, PublicKey};
 use sqlx::SqlitePool;
 
 use super::AccountSession;
-use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
@@ -359,8 +358,9 @@ impl<'a> MembershipOpsForGroup<'a> {
     pub async fn clear_chat(&self) -> Result<()> {
         let account_group = self.require_account_group().await?;
 
+        let cleared_at = Utc::now();
         account_group
-            .clear_chat_state(Utc::now(), self.pool())
+            .clear_chat_state(cleared_at, self.pool())
             .await?;
 
         // Delete draft (best-effort).
@@ -371,20 +371,13 @@ impl<'a> MembershipOpsForGroup<'a> {
             );
         }
 
-        // Cleanup aggregated messages that all accounts have cleared (best-effort).
-        let min_cleared_at = match self.resolve_min_cleared_at().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    target: "whitenoise::session::membership",
-                    "resolve_min_cleared_at failed; skipping cleanup: {e}"
-                );
-                None
-            }
-        };
+        // Delete this account's aggregated_messages older than the clear point
+        // (best-effort). Per-account DBs are independent post-18e: this clear
+        // only touches the current account's copy and is unaffected by what
+        // other accounts have or haven't cleared.
         if let Err(e) = self
             .db()
-            .try_cleanup_cleared_messages(self.group_id, min_cleared_at)
+            .try_cleanup_cleared_messages(self.group_id, Some(cleared_at.timestamp_millis()))
             .await
         {
             tracing::warn!(
@@ -405,55 +398,5 @@ impl<'a> MembershipOpsForGroup<'a> {
             .await;
 
         Ok(())
-    }
-
-    /// Compute the minimum `chat_cleared_at` across all accounts for this
-    /// group, returning `Ok(Some(millis))` only when **every** account has a
-    /// non-null value. Returns `Ok(None)` if any account has not cleared or
-    /// if not all accounts have active sessions (conservative — avoids
-    /// premature message deletion). Returns `Err` on real DB failures so
-    /// the caller can log the concrete error.
-    async fn resolve_min_cleared_at(&self) -> Result<Option<i64>> {
-        let wn = self
-            .session
-            .whitenoise
-            .upgrade()
-            .ok_or(WhitenoiseError::Initialization)?;
-        let total_accounts = Account::count(&wn.shared.database).await?;
-        let mut sessions_checked: i64 = 0;
-        let mut min: Option<i64> = None;
-        for session in wn.account_manager.sessions_iter() {
-            sessions_checked += 1;
-            match AccountGroup::chat_cleared_at_ms(
-                &session.account_pubkey,
-                self.group_id,
-                &session.account_db.inner.pool,
-            )
-            .await
-            {
-                Ok(Some(ms)) => {
-                    min = Some(min.map_or(ms, |prev: i64| prev.min(ms)));
-                }
-                Ok(None) => return Ok(None),
-                Err(WhitenoiseError::GroupNotFound) => {
-                    // This session doesn't have this group — skip it.
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        // If not all accounts have active sessions, we can't be sure every
-        // account has cleared — return None to prevent premature deletion.
-        if sessions_checked < total_accounts {
-            tracing::warn!(
-                target: "whitenoise::session::membership",
-                checked = sessions_checked,
-                total = total_accounts,
-                "Not all accounts have active sessions; \
-                 skipping cleared-message cleanup"
-            );
-            return Ok(None);
-        }
-        Ok(min)
     }
 }

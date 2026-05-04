@@ -2605,6 +2605,58 @@ mod tests {
         );
     }
 
+    /// Regression: post-phase-18e, `clear_chat` must drop this account's old
+    /// `aggregated_messages` rows immediately. The pre-18e logic gated cleanup
+    /// on a min-across-accounts `chat_cleared_at`, which after the per-account
+    /// split silently turned the cleanup into a no-op whenever any other
+    /// account in the group hadn't cleared its (totally separate) DB.
+    #[tokio::test]
+    async fn test_clear_chat_deletes_per_account_aggregated_messages() {
+        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+        let account = whitenoise.create_identity().await.unwrap();
+        let group_id = GroupId::from_slice(&[145; 32]);
+        let session = whitenoise.session(&account.pubkey).unwrap();
+
+        whitenoise
+            .get_or_create_account_group(&account, &group_id, None)
+            .await
+            .unwrap();
+
+        // Seed two old messages directly in this account's per-account DB.
+        let old = Utc::now() - chrono::Duration::seconds(10);
+        for tag in &["e1", "e2"] {
+            let id = EventId::from_hex(&format!("{:0>64}", tag)).unwrap();
+            AggregatedMessage::create_for_test(
+                id,
+                group_id.clone(),
+                account.pubkey,
+                old,
+                &session.account_db.inner,
+            )
+            .await
+            .unwrap();
+        }
+        let before = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+
+        session
+            .membership()
+            .for_group(&group_id)
+            .clear_chat()
+            .await
+            .unwrap();
+
+        let after = AggregatedMessage::count_by_group(&group_id, &session.account_db.inner)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "clear_chat must drop this account's seeded messages even when no other account has cleared"
+        );
+    }
+
     #[tokio::test]
     async fn test_clear_chat_idempotent() {
         let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;

@@ -1973,8 +1973,15 @@ mod tests {
 
             // Insert 10 messages with distinct timestamps (seeds 1–10)
             for i in 1u8..=10 {
-                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
-                    .await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &author,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             let subscription = whitenoise
@@ -2010,8 +2017,15 @@ mod tests {
             let base: u64 = 1_711_000_000;
 
             for i in 1u8..=5 {
-                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
-                    .await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &author,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             let subscription = whitenoise
@@ -2039,8 +2053,15 @@ mod tests {
 
             // Insert exactly 50 messages
             for i in 1u8..=50 {
-                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
-                    .await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &author,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             let subscription = whitenoise
@@ -2067,8 +2088,15 @@ mod tests {
             let base: u64 = 1_713_000_000;
 
             for i in 1u8..=60 {
-                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
-                    .await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &author,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             let subscription = whitenoise
@@ -2105,8 +2133,15 @@ mod tests {
 
             // Insert in reverse order to confirm sorting is not dependent on insertion order
             for i in (1u8..=5).rev() {
-                insert_msg_at(i, author, &author, base + u64::from(i), &group_id, &whitenoise)
-                    .await;
+                insert_msg_at(
+                    i,
+                    author,
+                    &author,
+                    base + u64::from(i),
+                    &group_id,
+                    &whitenoise,
+                )
+                .await;
             }
 
             let subscription = whitenoise
@@ -2915,11 +2950,27 @@ mod tests {
 
             // 8 messages: seeds 1–6 all at the same second (tie), seed 7 earlier, seed 8 later
             let tie_ts: u64 = 1_733_000_000;
-            insert_msg_at(7, author, &account.pubkey, tie_ts - 1, &group_id, &whitenoise).await;
+            insert_msg_at(
+                7,
+                author,
+                &account.pubkey,
+                tie_ts - 1,
+                &group_id,
+                &whitenoise,
+            )
+            .await;
             for i in 1u8..=6 {
                 insert_msg_at(i, author, &account.pubkey, tie_ts, &group_id, &whitenoise).await;
             }
-            insert_msg_at(8, author, &account.pubkey, tie_ts + 1, &group_id, &whitenoise).await;
+            insert_msg_at(
+                8,
+                author,
+                &account.pubkey,
+                tie_ts + 1,
+                &group_id,
+                &whitenoise,
+            )
+            .await;
 
             // Subscribe with limit=3 → snapshot is the 3 newest
             let subscription = whitenoise
