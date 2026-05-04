@@ -231,10 +231,14 @@ impl Whitenoise {
         account_pubkey: &PublicKey,
         group_id: &GroupId,
     ) -> Option<&'static str> {
+        let session = match self.account_manager.get_session(account_pubkey) {
+            Some(s) => s,
+            None => return Some("no_session"),
+        };
         match AccountGroup::find_by_account_and_group(
             account_pubkey,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         {
@@ -601,6 +605,7 @@ mod tests {
         account_pubkey: &PublicKey,
         group_id: &GroupId,
     ) -> AccountGroup {
+        let session = whitenoise.require_session(account_pubkey).unwrap();
         let ag = AccountGroup {
             id: None,
             account_pubkey: *account_pubkey,
@@ -619,7 +624,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.shared.database).await.unwrap()
+        ag.save(&session.account_db.inner.pool).await.unwrap()
     }
 
     #[tokio::test]
@@ -651,7 +656,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.shared.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_new_message_notification(
@@ -698,7 +704,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.shared.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_new_message_notification(
@@ -771,7 +778,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.shared.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         whitenoise
             .emit_group_invite_notification(&account, &group_id, "Invite Group", welcomer)
@@ -812,7 +820,8 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        ag.save(&whitenoise.shared.database).await.unwrap();
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        ag.save(&session.account_db.inner.pool).await.unwrap();
 
         assert_eq!(
             whitenoise
@@ -865,9 +874,10 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let saved = ag.save(&whitenoise.shared.database).await.unwrap();
+        let session = whitenoise.require_session(account_pubkey).unwrap();
+        let saved = ag.save(&session.account_db.inner.pool).await.unwrap();
         saved
-            .update_muted_until(Some(muted_until), &whitenoise.shared.database)
+            .update_muted_until(Some(muted_until), &session.account_db.inner.pool)
             .await
             .unwrap();
     }

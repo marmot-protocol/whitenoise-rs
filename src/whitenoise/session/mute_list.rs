@@ -346,9 +346,8 @@ impl<'a> MuteListOps<'a> {
     /// target user, if one exists.
     async fn emit_block_changed(&self, target_pubkey: &PublicKey) {
         match AccountGroup::find_dm_group_id_by_peer(
-            &self.session.account_pubkey,
             target_pubkey,
-            self.db(),
+            &self.session.account_db.inner.pool,
         )
         .await
         {

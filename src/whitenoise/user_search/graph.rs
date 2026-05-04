@@ -56,20 +56,33 @@ pub(super) async fn get_group_co_member_pubkeys(
         }
     };
 
-    let groups =
-        match AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.shared.database)
-            .await
-        {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(
-                    target: "whitenoise::user_search::graph",
-                    "Could not fetch account groups: {}",
-                    e
-                );
-                return HashSet::new();
-            }
-        };
+    let session = match whitenoise.session(&account.pubkey) {
+        Some(s) => s,
+        None => {
+            tracing::debug!(
+                target: "whitenoise::user_search::graph",
+                "No session found for account {}",
+                account.pubkey.to_hex()
+            );
+            return HashSet::new();
+        }
+    };
+    let groups = match AccountGroup::find_visible_for_account(
+        &account.pubkey,
+        &session.account_db.inner.pool,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::debug!(
+                target: "whitenoise::user_search::graph",
+                "Could not fetch account groups: {}",
+                e
+            );
+            return HashSet::new();
+        }
+    };
 
     let mut co_members = HashSet::new();
 
@@ -1173,11 +1186,12 @@ mod tests {
 
         // Insert a pending group (user_confirmation = None)
         let group_id = mdk_core::prelude::GroupId::from_slice(&[1, 2, 3]);
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         AccountGroup::find_or_create(
             &account.pubkey,
             &group_id,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
@@ -1194,15 +1208,16 @@ mod tests {
 
         // Insert and decline a group
         let group_id = mdk_core::prelude::GroupId::from_slice(&[4, 5, 6]);
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let (ag, _) = AccountGroup::find_or_create(
             &account.pubkey,
             &group_id,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
-        ag.update_user_confirmation(false, &whitenoise.shared.database)
+        ag.update_user_confirmation(false, &session.account_db.inner.pool)
             .await
             .unwrap();
 
@@ -1219,15 +1234,16 @@ mod tests {
         // Insert and accept a group — group_members() will fail because
         // mock whitenoise has no MLS infrastructure, exercising the error branch
         let group_id = mdk_core::prelude::GroupId::from_slice(&[7, 8, 9]);
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
         let (ag, _) = AccountGroup::find_or_create(
             &account.pubkey,
             &group_id,
             None,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
-        ag.update_user_confirmation(true, &whitenoise.shared.database)
+        ag.update_user_confirmation(true, &session.account_db.inner.pool)
             .await
             .unwrap();
 

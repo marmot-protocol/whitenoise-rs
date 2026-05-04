@@ -296,10 +296,11 @@ impl Whitenoise {
                 Err(_) => return Ok(None),
             };
 
+        let session = self.require_session(&account.pubkey)?;
         let account_group = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner.pool,
         )
         .await?;
         let Some(account_group) = account_group else {
@@ -435,32 +436,38 @@ impl Whitenoise {
         group_id: &GroupId,
         trigger: ChatListUpdateTrigger,
     ) {
-        let account_groups =
-            match AccountGroup::find_by_group(group_id, &self.shared.database).await {
-                Ok(groups) => groups,
+        for session in self.account_manager.sessions_iter() {
+            let account_pubkey = session.account_pubkey;
+            match AccountGroup::find_by_account_and_group(
+                &account_pubkey,
+                group_id,
+                &session.account_db.inner.pool,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!(
-                        target: "whitenoise::chat_list_streaming",
-                        "Failed to find accounts in group {}: {}",
-                        hex::encode(group_id.as_slice()),
-                        e
+                        target: "whitenoise::chat_list",
+                        account = %account_pubkey,
+                        "find_by_account_and_group failed: {e}"
                     );
-                    return;
+                    continue;
                 }
-            };
+            }
 
-        for ag in account_groups {
             let has_active = self
                 .shared
                 .chat_list_stream_manager
-                .has_subscribers(&ag.account_pubkey);
+                .has_subscribers(&account_pubkey);
             let has_archived = self
                 .shared
                 .archived_chat_list_stream_manager
-                .has_subscribers(&ag.account_pubkey);
+                .has_subscribers(&account_pubkey);
 
             if has_active || has_archived {
-                self.emit_chat_list_update_for_account(&ag.account_pubkey, group_id, trigger)
+                self.emit_chat_list_update_for_account(&account_pubkey, group_id, trigger)
                     .await;
             }
         }

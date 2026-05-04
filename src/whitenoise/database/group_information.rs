@@ -184,6 +184,24 @@ impl GroupInformation {
 
         Ok(group_information)
     }
+
+    /// Returns whether the given group is a DM (direct_message) in the shared DB.
+    #[perf_instrument("db::group_information")]
+    pub(crate) async fn is_dm(
+        mls_group_id: &GroupId,
+        database: &Database,
+    ) -> Result<bool, WhitenoiseError> {
+        let is_dm: bool = sqlx::query_scalar(
+            "SELECT EXISTS(\
+                 SELECT 1 FROM group_information \
+                 WHERE mls_group_id = ? AND group_type = 'direct_message'\
+             )",
+        )
+        .bind(mls_group_id.as_slice())
+        .fetch_one(&database.pool)
+        .await?;
+        Ok(is_dm)
+    }
 }
 
 #[cfg(test)]

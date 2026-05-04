@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use nostr_sdk::{PublicKey, RelayUrl};
 
-use crate::whitenoise::database::Database;
+use crate::whitenoise::database::account_db::AccountDatabase;
 use crate::whitenoise::error::Result;
 use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 
@@ -16,18 +16,18 @@ use crate::whitenoise::push_notifications::{PushPlatform, PushRegistration};
 #[derive(Clone, Debug)]
 pub struct PushRegistrationsRepo {
     account_pubkey: PublicKey,
-    db: Arc<Database>,
+    db: Arc<AccountDatabase>,
 }
 
 impl PushRegistrationsRepo {
     /// Construct a new [`PushRegistrationsRepo`] for `account_pubkey`.
-    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<Database>) -> Self {
+    pub(crate) fn new(account_pubkey: PublicKey, db: Arc<AccountDatabase>) -> Self {
         Self { account_pubkey, db }
     }
 
     /// Return the push registration for this account, if one exists.
     pub async fn find(&self) -> Result<Option<PushRegistration>> {
-        Ok(PushRegistration::find_by_account_pubkey(&self.account_pubkey, &self.db).await?)
+        Ok(PushRegistration::find(&self.account_pubkey, &self.db.inner.pool).await?)
     }
 
     /// Create or replace the push registration for this account.
@@ -44,7 +44,7 @@ impl PushRegistrationsRepo {
             raw_token,
             server_pubkey,
             relay_hint,
-            &self.db,
+            &self.db.inner.pool,
         )
         .await?)
     }
@@ -52,6 +52,6 @@ impl PushRegistrationsRepo {
     /// Delete the push registration for this account. Returns `true` if a row
     /// was removed.
     pub async fn delete(&self) -> Result<bool> {
-        Ok(PushRegistration::delete_by_account_pubkey(&self.account_pubkey, &self.db).await?)
+        Ok(PushRegistration::delete(&self.db.inner.pool).await?)
     }
 }

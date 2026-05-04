@@ -82,6 +82,37 @@ impl Account {
         Ok(accounts)
     }
 
+    /// Returns the number of persisted accounts in the shared database.
+    #[perf_instrument("db::accounts")]
+    pub(crate) async fn count(database: &Database) -> Result<i64, WhitenoiseError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM accounts")
+            .fetch_one(&database.pool)
+            .await
+            .map_err(DatabaseError::Sqlx)?;
+        Ok(count)
+    }
+
+    /// Returns all persisted account pubkeys as hex strings.
+    ///
+    /// Best-effort: returns an empty vec if the `accounts` table doesn't
+    /// exist yet (fresh install).
+    #[perf_instrument("db::accounts")]
+    pub(crate) async fn all_pubkeys_hex(database: &Database) -> Vec<String> {
+        match sqlx::query_scalar::<_, String>("SELECT pubkey FROM accounts")
+            .fetch_all(&database.pool)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(
+                    target: "whitenoise::database::accounts",
+                    "Could not read accounts table (fresh install?): {e}"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Gets the oldest account from the database.
     ///
     /// # Arguments

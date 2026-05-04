@@ -461,10 +461,11 @@ impl Whitenoise {
     #[allow(deprecated)]
     #[perf_instrument("groups")]
     pub async fn leave_group(&self, account: &Account, group_id: &GroupId) -> Result<()> {
+        let session = self.require_session(&account.pubkey)?;
         let account_group = AccountGroup::find_by_account_and_group(
             &account.pubkey,
             group_id,
-            &self.shared.database,
+            &session.account_db.inner.pool,
         )
         .await?
         .ok_or(WhitenoiseError::GroupNotFound)?;
@@ -686,10 +687,11 @@ mod tests {
         }
 
         // Verify AccountGroup was created and auto-accepted for the creator
+        let session = whitenoise.require_session(&creator_account.pubkey).unwrap();
         let account_group = AccountGroup::find_by_account_and_group(
             &creator_account.pubkey,
             &group.mls_group_id,
-            &whitenoise.shared.database,
+            &session.account_db.inner.pool,
         )
         .await
         .unwrap();
@@ -1359,10 +1361,10 @@ mod tests {
             .unwrap();
 
         // Delete the auto-created AccountGroup so tests can recreate with desired state
-        sqlx::query("DELETE FROM accounts_groups WHERE account_pubkey = ? AND mls_group_id = ?")
-            .bind(account.pubkey.to_hex())
+        let session = whitenoise.require_session(&account.pubkey).unwrap();
+        sqlx::query("DELETE FROM accounts_groups WHERE mls_group_id = ?")
             .bind(group.mls_group_id.as_slice())
-            .execute(&whitenoise.shared.database.pool)
+            .execute(&session.account_db.inner.pool)
             .await
             .unwrap();
 

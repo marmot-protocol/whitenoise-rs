@@ -41,7 +41,20 @@ impl<'a> MessageOps<'a> {
     /// Search messages across all groups.
     pub async fn search(&self, query: &str, limit: Option<u32>) -> Result<Vec<SearchResult>> {
         let limit_val = limit.unwrap_or(50);
-        Ok(AggregatedMessage::search_messages(self.pubkey(), query, limit_val, self.db()).await?)
+        let pool = &self.session.account_db.inner.pool;
+        let visible = AccountGroup::find_visible_for_account(self.pubkey(), pool).await?;
+        let visible_group_ids: Vec<Vec<u8>> = visible
+            .iter()
+            .map(|ag| ag.mls_group_id.as_slice().to_vec())
+            .collect();
+        Ok(AggregatedMessage::search_messages(
+            self.pubkey(),
+            query,
+            limit_val,
+            &visible_group_ids,
+            self.db(),
+        )
+        .await?)
     }
 
     fn pubkey(&self) -> &PublicKey {
@@ -66,6 +79,10 @@ impl<'a> MessageOpsForGroup<'a> {
 
     fn db(&self) -> &Arc<Database> {
         &self.session.shared.database
+    }
+
+    fn pool(&self) -> &sqlx::SqlitePool {
+        &self.session.account_db.inner.pool
     }
 
     fn emit(&self, trigger: UpdateTrigger, message: ChatMessage) {
@@ -97,7 +114,7 @@ impl<'a> MessageOpsForGroup<'a> {
         limit: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(self.pubkey(), self.group_id, self.db()).await?;
+            AccountGroup::chat_cleared_at_ms(self.pubkey(), self.group_id, self.pool()).await?;
 
         AggregatedMessage::find_messages_by_group_paginated(
             self.group_id,
@@ -124,7 +141,7 @@ impl<'a> MessageOpsForGroup<'a> {
         minimum: Option<u32>,
     ) -> Result<Vec<ChatMessage>> {
         let account_group =
-            AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.db())
+            AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.pool())
                 .await?
                 .ok_or(WhitenoiseError::GroupNotFound)?;
 
@@ -152,7 +169,7 @@ impl<'a> MessageOpsForGroup<'a> {
     /// Search messages by content within this group.
     pub async fn search(&self, query: &str, limit: Option<u32>) -> Result<Vec<SearchResult>> {
         let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(self.pubkey(), self.group_id, self.db()).await?;
+            AccountGroup::chat_cleared_at_ms(self.pubkey(), self.group_id, self.pool()).await?;
 
         Ok(AggregatedMessage::search_messages_in_group(
             self.group_id,
@@ -304,6 +321,7 @@ impl<'a> MessageOpsForGroup<'a> {
         let ephemeral = self.session.ephemeral.clone_inner();
         let account_pubkey = *self.pubkey();
         let shared = self.session.shared.clone();
+        let account_db = self.session.account_db.clone();
         let group_id = self.group_id.clone();
         let event_id_str = event_id.to_string();
         let tags = mdk_message.tags.clone();
@@ -328,6 +346,7 @@ impl<'a> MessageOpsForGroup<'a> {
                 if let Err(e) = publish_notification_requests_after_delivery_with(
                     &shared.config,
                     &shared.database,
+                    &account_db.inner.pool,
                     &shared.relay_control,
                     &shared.event_tracker,
                     &ephemeral,

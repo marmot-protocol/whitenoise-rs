@@ -58,10 +58,10 @@ impl AccountRepositories {
         Ok(Self {
             drafts: DraftsRepo::new(account_db.clone()),
             settings: AccountSettingsRepo::new(account_db.clone()),
-            follows: AccountFollowsRepo::new(account_db.clone(), db.clone()),
-            published_key_packages: PublishedKeyPackagesRepo::new(account_db),
-            push_registrations: PushRegistrationsRepo::new(account_pubkey, db.clone()),
-            group_push_tokens: GroupPushTokensRepo::new(account_pubkey, db),
+            follows: AccountFollowsRepo::new(account_db.clone(), db),
+            push_registrations: PushRegistrationsRepo::new(account_pubkey, account_db.clone()),
+            published_key_packages: PublishedKeyPackagesRepo::new(account_db.clone()),
+            group_push_tokens: GroupPushTokensRepo::new(account_pubkey, account_db),
         })
     }
 }

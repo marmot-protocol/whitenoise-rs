@@ -1,30 +1,36 @@
 use chrono::{DateTime, Utc};
 use mdk_core::prelude::GroupId;
 use nostr_sdk::prelude::*;
+use sqlx::SqlitePool;
 
-use super::{
-    Database,
-    utils::{parse_optional_timestamp, parse_timestamp},
-};
 use crate::perf_instrument;
 use crate::whitenoise::accounts_groups::AccountGroup;
 
-impl<'r, R> sqlx::FromRow<'r, R> for AccountGroup
-where
-    R: sqlx::Row,
-    &'r str: sqlx::ColumnIndex<R>,
-    String: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    i64: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    Vec<u8>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-    Option<i64>: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
-{
-    fn from_row(row: &'r R) -> Result<Self, sqlx::Error> {
-        let id: i64 = row.try_get("id")?;
-        let account_pubkey_str: String = row.try_get("account_pubkey")?;
-        let mls_group_id_bytes: Vec<u8> = row.try_get("mls_group_id")?;
-        let user_confirmation_int: Option<i64> = row.try_get("user_confirmation")?;
-        let welcomer_pubkey_str: Option<String> = row.try_get("welcomer_pubkey")?;
-        let welcomer_pubkey = match welcomer_pubkey_str {
+/// Per-account row shape. The per-account DB does not store `account_pubkey`
+/// (the file *is* the scope), so this intermediate struct decodes what the DB
+/// actually contains and converts to the domain `AccountGroup` via
+/// `into_account_group`.
+#[derive(sqlx::FromRow)]
+struct LocalAccountGroupRow {
+    id: i64,
+    mls_group_id: Vec<u8>,
+    user_confirmation: Option<i64>,
+    welcomer_pubkey: Option<String>,
+    last_read_message_id: Option<String>,
+    pin_order: Option<i64>,
+    dm_peer_pubkey: Option<String>,
+    archived_at: Option<i64>,
+    removed_at: Option<i64>,
+    self_removed: i64,
+    muted_until: Option<i64>,
+    chat_cleared_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl LocalAccountGroupRow {
+    fn into_account_group(self, account_pubkey: PublicKey) -> Result<AccountGroup, sqlx::Error> {
+        let welcomer_pubkey = match self.welcomer_pubkey {
             Some(s) => Some(PublicKey::parse(&s).map_err(|e| sqlx::Error::ColumnDecode {
                 index: "welcomer_pubkey".to_string(),
                 source: Box::new(e),
@@ -32,8 +38,7 @@ where
             None => None,
         };
 
-        let last_read_message_id_str: Option<String> = row.try_get("last_read_message_id")?;
-        let last_read_message_id = match last_read_message_id_str {
+        let last_read_message_id = match self.last_read_message_id {
             Some(hex) => Some(
                 EventId::from_hex(&hex).map_err(|e| sqlx::Error::ColumnDecode {
                     index: "last_read_message_id".to_string(),
@@ -43,10 +48,7 @@ where
             None => None,
         };
 
-        let pin_order: Option<i64> = row.try_get("pin_order")?;
-
-        let dm_peer_pubkey_str: Option<String> = row.try_get("dm_peer_pubkey")?;
-        let dm_peer_pubkey = match dm_peer_pubkey_str {
+        let dm_peer_pubkey = match self.dm_peer_pubkey {
             Some(s) => Some(PublicKey::parse(&s).map_err(|e| sqlx::Error::ColumnDecode {
                 index: "dm_peer_pubkey".to_string(),
                 source: Box::new(e),
@@ -54,28 +56,7 @@ where
             None => None,
         };
 
-        let archived_at = parse_optional_timestamp(row, "archived_at")?;
-        let removed_at = parse_optional_timestamp(row, "removed_at")?;
-        let self_removed_int: i64 = row.try_get("self_removed")?;
-        let self_removed = self_removed_int != 0;
-        let muted_until = parse_optional_timestamp(row, "muted_until")?;
-        let chat_cleared_at = parse_optional_timestamp(row, "chat_cleared_at")?;
-
-        // Parse pubkey from hex string
-        let account_pubkey =
-            PublicKey::parse(&account_pubkey_str).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "account_pubkey".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // `mls_group_id_bytes` is length-checked by the database schema
-        // (see the `group_information.mls_group_id` CHECK constraint), so
-        // `GroupId::from_slice` is safe here without an additional length
-        // check in this decoder.
-        let mls_group_id = GroupId::from_slice(&mls_group_id_bytes);
-
-        // Validate user_confirmation: only 0, 1, or NULL are valid
-        let user_confirmation = match user_confirmation_int {
+        let user_confirmation = match self.user_confirmation {
             None => None,
             Some(0) => Some(false),
             Some(1) => Some(true),
@@ -93,21 +74,27 @@ where
             }
         };
 
-        let created_at = parse_timestamp(row, "created_at")?;
-        let updated_at = parse_timestamp(row, "updated_at")?;
+        let mls_group_id = GroupId::from_slice(&self.mls_group_id);
 
-        Ok(Self {
-            id: Some(id),
+        let archived_at = parse_optional_timestamp_from_millis(self.archived_at)?;
+        let removed_at = parse_optional_timestamp_from_millis(self.removed_at)?;
+        let muted_until = parse_optional_timestamp_from_millis(self.muted_until)?;
+        let chat_cleared_at = parse_optional_timestamp_from_millis(self.chat_cleared_at)?;
+        let created_at = parse_timestamp_from_millis(self.created_at)?;
+        let updated_at = parse_timestamp_from_millis(self.updated_at)?;
+
+        Ok(AccountGroup {
+            id: Some(self.id),
             account_pubkey,
             mls_group_id,
             user_confirmation,
             welcomer_pubkey,
             last_read_message_id,
-            pin_order,
+            pin_order: self.pin_order,
             dm_peer_pubkey,
             archived_at,
             removed_at,
-            self_removed,
+            self_removed: self.self_removed != 0,
             muted_until,
             chat_cleared_at,
             created_at,
@@ -116,28 +103,55 @@ where
     }
 }
 
+fn parse_timestamp_from_millis(ms: i64) -> Result<DateTime<Utc>, sqlx::Error> {
+    DateTime::from_timestamp_millis(ms).ok_or_else(|| sqlx::Error::ColumnDecode {
+        index: "timestamp".to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid timestamp millis: {}", ms),
+        )),
+    })
+}
+
+fn parse_optional_timestamp_from_millis(
+    ms: Option<i64>,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    match ms {
+        None => Ok(None),
+        Some(v) => Ok(Some(parse_timestamp_from_millis(v)?)),
+    }
+}
+
 impl AccountGroup {
-    /// Finds an AccountGroup by account pubkey and MLS group ID.
+    /// Finds an AccountGroup by MLS group ID in the per-account database.
+    ///
+    /// `account_pubkey` is used to populate the returned struct but is NOT
+    /// used as a SQL filter (the per-account DB is implicitly scoped).
     #[perf_instrument("db::accounts_groups")]
     pub async fn find_by_account_and_group(
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
-        let row = sqlx::query_as::<_, Self>(
-            "SELECT *
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
+                    last_read_message_id, pin_order, dm_peer_pubkey,
+                    archived_at, removed_at, self_removed, muted_until,
+                    chat_cleared_at, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ? AND mls_group_id = ?",
+             WHERE mls_group_id = ?",
         )
-        .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(row)
+        match row {
+            Some(r) => Ok(Some(r.into_account_group(*account_pubkey)?)),
+            None => Ok(None),
+        }
     }
 
-    /// Finds or creates an AccountGroup for the given account and group.
+    /// Finds or creates an AccountGroup for the given group.
     /// Returns the AccountGroup and a boolean indicating if it was newly created.
     ///
     /// This uses an insert-first approach to avoid TOCTOU race conditions:
@@ -148,82 +162,69 @@ impl AccountGroup {
         account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         dm_peer_pubkey: Option<&PublicKey>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<(Self, bool), sqlx::Error> {
         // Try to create first - this handles the race condition properly
-        match Self::create(account_pubkey, mls_group_id, None, dm_peer_pubkey, database).await {
+        match Self::create(account_pubkey, mls_group_id, None, dm_peer_pubkey, pool).await {
             Ok(created) => Ok((created, true)),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Insert failed due to unique constraint - a concurrent task already created the row
                 // Fall back to fetching the existing record
-                let existing =
-                    Self::find_by_account_and_group(account_pubkey, mls_group_id, database)
-                        .await?
-                        .ok_or(sqlx::Error::RowNotFound)?;
+                let existing = Self::find_by_account_and_group(account_pubkey, mls_group_id, pool)
+                    .await?
+                    .ok_or(sqlx::Error::RowNotFound)?;
                 Ok((existing, false))
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Finds all visible AccountGroups for a given account.
+    /// Finds all visible AccountGroups for the account.
     /// Visible means: user_confirmation is NULL (pending) or true (accepted).
     /// Declined groups (user_confirmation = false) are hidden.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_visible_for_account(
         account_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, Self>(
-            "SELECT *
+        let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
+                    last_read_message_id, pin_order, dm_peer_pubkey,
+                    archived_at, removed_at, self_removed, muted_until,
+                    chat_cleared_at, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ?
-               AND (user_confirmation IS NULL OR user_confirmation = 1)",
+             WHERE user_confirmation IS NULL OR user_confirmation = 1",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await?;
 
-        Ok(rows)
+        rows.into_iter()
+            .map(|r| r.into_account_group(*account_pubkey))
+            .collect()
     }
 
-    /// Finds all pending AccountGroups for a given account.
+    /// Finds all pending AccountGroups for the account.
     /// Pending means: user_confirmation is NULL.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_pending_for_account(
         account_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, Self>(
-            "SELECT *
+        let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "SELECT id, mls_group_id, user_confirmation, welcomer_pubkey,
+                    last_read_message_id, pin_order, dm_peer_pubkey,
+                    archived_at, removed_at, self_removed, muted_until,
+                    chat_cleared_at, created_at, updated_at
              FROM accounts_groups
-             WHERE account_pubkey = ?
-               AND user_confirmation IS NULL
+             WHERE user_confirmation IS NULL
                AND removed_at IS NULL",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await?;
 
-        Ok(rows)
-    }
-
-    /// Finds all AccountGroups for a specific MLS group.
-    #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn find_by_group(
-        mls_group_id: &GroupId,
-        database: &Database,
-    ) -> Result<Vec<Self>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, Self>(
-            "SELECT *
-             FROM accounts_groups
-             WHERE mls_group_id = ?",
-        )
-        .bind(mls_group_id.as_slice())
-        .fetch_all(&database.pool)
-        .await?;
-
-        Ok(rows)
+        rows.into_iter()
+            .map(|r| r.into_account_group(*account_pubkey))
+            .collect()
     }
 
     /// Updates the user_confirmation status for this AccountGroup.
@@ -231,14 +232,14 @@ impl AccountGroup {
     pub(crate) async fn update_user_confirmation(
         &self,
         user_confirmation: bool,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
 
         let now_ms = Utc::now().timestamp_millis();
         let confirmation_int: i64 = if user_confirmation { 1 } else { 0 };
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET user_confirmation = ?, updated_at = ?
              WHERE id = ?
@@ -247,10 +248,10 @@ impl AccountGroup {
         .bind(confirmation_int)
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Saves the AccountGroup to the database (upsert).
@@ -258,13 +259,13 @@ impl AccountGroup {
     /// - If the record doesn't exist, inserts it
     /// - If it exists, updates all mutable fields to match the provided values
     #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn save(&self, database: &Database) -> Result<Self, sqlx::Error> {
+    pub(crate) async fn save(&self, pool: &SqlitePool) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, dm_peer_pubkey, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(account_pubkey, mls_group_id) DO UPDATE SET
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "INSERT INTO accounts_groups (mls_group_id, user_confirmation, welcomer_pubkey, last_read_message_id, pin_order, dm_peer_pubkey, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(mls_group_id) DO UPDATE SET
                user_confirmation = excluded.user_confirmation,
                welcomer_pubkey = excluded.welcomer_pubkey,
                last_read_message_id = excluded.last_read_message_id,
@@ -283,7 +284,6 @@ impl AccountGroup {
                updated_at = excluded.updated_at
              RETURNING *",
         )
-        .bind(self.account_pubkey.to_hex())
         .bind(self.mls_group_id.as_slice())
         .bind(self.user_confirmation.map(|b| if b { 1i64 } else { 0i64 }))
         .bind(self.welcomer_pubkey.as_ref().map(|pk| pk.to_hex()))
@@ -292,10 +292,10 @@ impl AccountGroup {
         .bind(self.dm_peer_pubkey.as_ref().map(|pk| pk.to_hex()))
         .bind(self.created_at.timestamp_millis())
         .bind(now_ms)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Updates the pin_order for this AccountGroup.
@@ -303,12 +303,12 @@ impl AccountGroup {
     pub(crate) async fn update_pin_order(
         &self,
         pin_order: Option<i64>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET pin_order = ?, updated_at = ?
              WHERE id = ?
@@ -317,10 +317,10 @@ impl AccountGroup {
         .bind(pin_order)
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Updates the archived_at timestamp for this AccountGroup.
@@ -328,12 +328,12 @@ impl AccountGroup {
     pub(crate) async fn update_archived_at(
         &self,
         archived_at: Option<DateTime<Utc>>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET archived_at = ?, updated_at = ?
              WHERE id = ?
@@ -342,10 +342,10 @@ impl AccountGroup {
         .bind(archived_at.map(|dt| dt.timestamp_millis()))
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Updates the muted_until timestamp for this AccountGroup.
@@ -356,12 +356,12 @@ impl AccountGroup {
     pub(crate) async fn update_muted_until(
         &self,
         muted_until: Option<DateTime<Utc>>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET muted_until = ?, updated_at = ?
              WHERE id = ?
@@ -370,10 +370,10 @@ impl AccountGroup {
         .bind(muted_until.map(|dt| dt.timestamp_millis()))
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Updates the chat_cleared_at timestamp for this AccountGroup.
@@ -384,12 +384,12 @@ impl AccountGroup {
     pub(crate) async fn update_chat_cleared_at(
         &self,
         chat_cleared_at: Option<DateTime<Utc>>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, updated_at = ?
              WHERE id = ?
@@ -398,22 +398,22 @@ impl AccountGroup {
         .bind(chat_cleared_at.map(|dt| dt.timestamp_millis()))
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Clears the last_read_message_id for this AccountGroup.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn reset_last_read_message_id(
         &self,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -421,10 +421,10 @@ impl AccountGroup {
         )
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
     /// Sets `chat_cleared_at` and resets `last_read_message_id` in a single atomic write.
@@ -435,13 +435,13 @@ impl AccountGroup {
     pub(crate) async fn clear_chat_state(
         &self,
         chat_cleared_at: DateTime<Utc>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
         let cleared_ms = chat_cleared_at.timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET chat_cleared_at = ?, last_read_message_id = NULL, updated_at = ?
              WHERE id = ?
@@ -450,20 +450,25 @@ impl AccountGroup {
         .bind(cleared_ms)
         .bind(now_ms)
         .bind(id)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(self.account_pubkey)
     }
 
-    /// Clears `muted_until` for all rows whose mute has expired.
+    /// Clears `muted_until` for all rows whose mute has expired in this
+    /// per-account database.
     ///
     /// Returns the affected rows so callers can emit stream updates.
+    /// Callers that need cross-account behaviour must iterate all sessions.
     #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn clear_expired_mutes(database: &Database) -> Result<Vec<Self>, sqlx::Error> {
+    pub(crate) async fn clear_expired_mutes(
+        account_pubkey: &PublicKey,
+        pool: &SqlitePool,
+    ) -> Result<Vec<Self>, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let rows = sqlx::query_as::<_, Self>(
+        let rows = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET muted_until = NULL, updated_at = ?
              WHERE muted_until IS NOT NULL AND muted_until <= ?
@@ -471,10 +476,12 @@ impl AccountGroup {
         )
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await?;
 
-        Ok(rows)
+        rows.into_iter()
+            .map(|r| r.into_account_group(*account_pubkey))
+            .collect()
     }
 
     /// Atomically marks this AccountGroup as voluntarily departed
@@ -486,12 +493,12 @@ impl AccountGroup {
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn mark_left_atomic(
         &self,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET removed_at = ?, self_removed = 1, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -500,10 +507,13 @@ impl AccountGroup {
         .bind(now_ms)
         .bind(now_ms)
         .bind(id)
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(row)
+        match row {
+            Some(r) => Ok(Some(r.into_account_group(self.account_pubkey)?)),
+            None => Ok(None),
+        }
     }
 
     /// Atomically marks this AccountGroup as removed (`UPDATE … WHERE removed_at IS NULL`).
@@ -512,12 +522,12 @@ impl AccountGroup {
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn mark_removed_atomic(
         &self,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET removed_at = ?, updated_at = ?
              WHERE id = ? AND removed_at IS NULL
@@ -526,10 +536,13 @@ impl AccountGroup {
         .bind(now_ms)
         .bind(now_ms)
         .bind(id)
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(row)
+        match row {
+            Some(r) => Ok(Some(r.into_account_group(self.account_pubkey)?)),
+            None => Ok(None),
+        }
     }
 
     /// Atomically updates last_read_message_id only if the new message is newer.
@@ -537,33 +550,27 @@ impl AccountGroup {
     /// Returns `Some(updated)` if the update was applied, `None` if skipped
     /// because the new message is not newer than the current read marker.
     ///
-    /// This is atomic: the timestamp comparison and update happen in a single
-    /// SQL statement, preventing race conditions between concurrent calls.
+    /// `current_marker_created_at_ms` is the `created_at` timestamp of the
+    /// current `last_read_message_id` (looked up from `aggregated_messages` in
+    /// the shared DB by the caller). Pass `0` if there is no current marker.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_last_read_if_newer(
         &self,
         message_id: &EventId,
         message_created_at_ms: i64,
-        database: &Database,
+        current_marker_created_at_ms: i64,
+        pool: &SqlitePool,
     ) -> Result<Option<Self>, sqlx::Error> {
         let id = self.id.expect("AccountGroup must be persisted");
         let now_ms = Utc::now().timestamp_millis();
 
-        // Atomic compare-and-update: only update if the new message is newer
-        // than the current read marker. Uses a subquery to get the current
-        // marker's timestamp from aggregated_messages, scoped to the same group.
-        let row = sqlx::query_as::<_, Self>(
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
             "UPDATE accounts_groups
              SET last_read_message_id = ?, updated_at = ?
              WHERE id = ?
                AND (
                  last_read_message_id IS NULL
-                 OR ? > COALESCE(
-                   (SELECT created_at FROM aggregated_messages
-                    WHERE message_id = accounts_groups.last_read_message_id
-                      AND mls_group_id = accounts_groups.mls_group_id),
-                   0
-                 )
+                 OR ? > ?
                )
              RETURNING *",
         )
@@ -571,58 +578,56 @@ impl AccountGroup {
         .bind(now_ms)
         .bind(id)
         .bind(message_created_at_ms)
-        .fetch_optional(&database.pool)
+        .bind(current_marker_created_at_ms)
+        .fetch_optional(pool)
         .await?;
 
-        Ok(row)
+        match row {
+            Some(r) => Ok(Some(r.into_account_group(self.account_pubkey)?)),
+            None => Ok(None),
+        }
     }
 
-    /// Finds the most recently created visible DM group between an account and a peer.
+    /// Finds the most recently created visible DM group with a given peer.
     ///
     /// Uses the `dm_peer_pubkey` column for an efficient single-query lookup
     /// without requiring MLS/MDK calls. Returns `None` if no DM group exists
-    /// between these users, or if the group has been declined.
+    /// with this peer, or if the group has been declined.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_group_id_by_peer(
-        account_pubkey: &PublicKey,
         peer_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Option<GroupId>, sqlx::Error> {
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT ag.mls_group_id
-             FROM accounts_groups ag
-             WHERE ag.account_pubkey = ?
-               AND ag.dm_peer_pubkey = ?
-               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)
-             ORDER BY ag.created_at DESC
+            "SELECT mls_group_id
+             FROM accounts_groups
+             WHERE dm_peer_pubkey = ?
+               AND (user_confirmation IS NULL OR user_confirmation = 1)
+             ORDER BY created_at DESC
              LIMIT 1",
         )
-        .bind(account_pubkey.to_hex())
         .bind(peer_pubkey.to_hex())
-        .fetch_optional(&database.pool)
+        .fetch_optional(pool)
         .await?;
 
         Ok(row.map(|(bytes,)| GroupId::from_slice(&bytes)))
     }
 
-    /// Returns DM peer pubkeys for all visible DM groups belonging to an account.
+    /// Returns DM peer pubkeys for all visible DM groups in this account.
     ///
     /// Returns `(mls_group_id, dm_peer_pubkey)` pairs for groups where
     /// `dm_peer_pubkey` is populated and the group is visible (not declined).
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn find_dm_peers_for_account(
-        account_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Vec<(GroupId, PublicKey)>, sqlx::Error> {
         let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
-            "SELECT ag.mls_group_id, ag.dm_peer_pubkey
-             FROM accounts_groups ag
-             WHERE ag.account_pubkey = ?
-               AND ag.dm_peer_pubkey IS NOT NULL
-               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)",
+            "SELECT mls_group_id, dm_peer_pubkey
+             FROM accounts_groups
+             WHERE dm_peer_pubkey IS NOT NULL
+               AND (user_confirmation IS NULL OR user_confirmation = 1)",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await?;
 
         let mut results = Vec::with_capacity(rows.len());
@@ -642,27 +647,23 @@ impl AccountGroup {
         Ok(results)
     }
 
-    /// Finds visible DM groups for an account that are missing `dm_peer_pubkey`.
+    /// Finds visible groups that are missing `dm_peer_pubkey`.
     ///
     /// Used by the startup backfill to identify records that need population.
-    /// Pushes all filtering to SQL (joins with `group_information`) so the caller
-    /// only receives rows that actually need MDK membership resolution.
+    /// Returns all visible groups with `dm_peer_pubkey IS NULL`; the caller
+    /// filters against `group_information` in the shared DB to find only DM
+    /// groups (cross-DB join replaced by application-level join).
     #[perf_instrument("db::accounts_groups")]
-    pub(crate) async fn find_dm_groups_missing_peer(
-        account_pubkey: &PublicKey,
-        database: &Database,
+    pub(crate) async fn find_groups_missing_peer(
+        pool: &SqlitePool,
     ) -> Result<Vec<GroupId>, sqlx::Error> {
         let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT ag.mls_group_id
-             FROM accounts_groups ag
-             INNER JOIN group_information gi ON ag.mls_group_id = gi.mls_group_id
-             WHERE ag.account_pubkey = ?
-               AND ag.dm_peer_pubkey IS NULL
-               AND gi.group_type = 'direct_message'
-               AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)",
+            "SELECT mls_group_id
+             FROM accounts_groups
+             WHERE dm_peer_pubkey IS NULL
+               AND (user_confirmation IS NULL OR user_confirmation = 1)",
         )
-        .bind(account_pubkey.to_hex())
-        .fetch_all(&database.pool)
+        .fetch_all(pool)
         .await?;
 
         Ok(rows
@@ -671,26 +672,24 @@ impl AccountGroup {
             .collect())
     }
 
-    /// Updates the dm_peer_pubkey for a specific account-group record.
+    /// Updates the dm_peer_pubkey for a specific group record.
     ///
     /// Used by the startup backfill to populate the column for existing DM groups.
     #[perf_instrument("db::accounts_groups")]
     pub(crate) async fn update_dm_peer_pubkey(
-        account_pubkey: &PublicKey,
         mls_group_id: &GroupId,
         dm_peer_pubkey: &PublicKey,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE accounts_groups
              SET dm_peer_pubkey = ?, updated_at = ?
-             WHERE account_pubkey = ? AND mls_group_id = ? AND dm_peer_pubkey IS NULL",
+             WHERE mls_group_id = ? AND dm_peer_pubkey IS NULL",
         )
         .bind(dm_peer_pubkey.to_hex())
         .bind(Utc::now().timestamp_millis())
-        .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
-        .execute(&database.pool)
+        .execute(pool)
         .await?;
 
         Ok(())
@@ -703,1593 +702,380 @@ impl AccountGroup {
         mls_group_id: &GroupId,
         welcomer_pubkey: Option<&PublicKey>,
         dm_peer_pubkey: Option<&PublicKey>,
-        database: &Database,
+        pool: &SqlitePool,
     ) -> Result<Self, sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
 
-        let row = sqlx::query_as::<_, Self>(
-            "INSERT INTO accounts_groups (account_pubkey, mls_group_id, user_confirmation, welcomer_pubkey, dm_peer_pubkey, created_at, updated_at)
-             VALUES (?, ?, NULL, ?, ?, ?, ?)
+        let row = sqlx::query_as::<_, LocalAccountGroupRow>(
+            "INSERT INTO accounts_groups (mls_group_id, user_confirmation, welcomer_pubkey, dm_peer_pubkey, created_at, updated_at)
+             VALUES (?, NULL, ?, ?, ?, ?)
              RETURNING *",
         )
-        .bind(account_pubkey.to_hex())
         .bind(mls_group_id.as_slice())
         .bind(welcomer_pubkey.map(|pk| pk.to_hex()))
         .bind(dm_peer_pubkey.map(|pk| pk.to_hex()))
         .bind(now_ms)
         .bind(now_ms)
-        .fetch_one(&database.pool)
+        .fetch_one(pool)
         .await?;
 
-        Ok(row)
+        row.into_account_group(*account_pubkey)
+    }
+    /// Deletes all accounts_groups rows for the given group in this per-account DB.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn delete_for_group(
+        mls_group_id: &GroupId,
+        pool: &SqlitePool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM accounts_groups WHERE mls_group_id = ?")
+            .bind(mls_group_id.as_slice())
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Returns whether an accounts_groups row exists for the given group in this per-account DB.
+    #[perf_instrument("db::accounts_groups")]
+    pub(crate) async fn exists_for_group(
+        mls_group_id: &GroupId,
+        pool: &SqlitePool,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM accounts_groups WHERE mls_group_id = ?)",
+        )
+        .bind(mls_group_id.as_slice())
+        .fetch_one(pool)
+        .await?;
+        Ok(exists)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sqlx::SqlitePool;
+    use tempfile::TempDir;
+
     use super::*;
-    use crate::whitenoise::group_information::{GroupInformation, GroupType};
-    use crate::whitenoise::test_utils::create_mock_whitenoise;
 
-    #[tokio::test]
-    async fn test_find_by_account_and_group_not_found() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[1; 32]);
-
-        let result = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
+    async fn test_pool() -> (SqlitePool, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let pool = SqlitePool::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("test.db").display()
+        ))
         .await
         .unwrap();
 
+        sqlx::query(
+            "CREATE TABLE accounts_groups (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                mls_group_id         BLOB NOT NULL UNIQUE,
+                user_confirmation    INTEGER DEFAULT NULL
+                    CHECK (user_confirmation IS NULL OR user_confirmation IN (0, 1)),
+                welcomer_pubkey      TEXT,
+                last_read_message_id TEXT,
+                pin_order            INTEGER DEFAULT NULL,
+                dm_peer_pubkey       TEXT DEFAULT NULL,
+                archived_at          INTEGER DEFAULT NULL,
+                removed_at           INTEGER DEFAULT NULL,
+                self_removed         INTEGER NOT NULL DEFAULT 0,
+                muted_until          INTEGER DEFAULT NULL,
+                chat_cleared_at      INTEGER DEFAULT NULL,
+                created_at           INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        (pool, dir)
+    }
+
+    fn test_pubkey() -> PublicKey {
+        PublicKey::parse(&"ab".repeat(32)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_find_by_account_and_group_not_found() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+        let group_id = GroupId::from_slice(&[1; 32]);
+
+        let result = AccountGroup::find_by_account_and_group(&pubkey, &group_id, &pool)
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_find_or_create_creates_new() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
         let group_id = GroupId::from_slice(&[2; 32]);
 
-        let (account_group, was_created) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let (ag, was_created) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
+            .await
+            .unwrap();
 
         assert!(was_created);
-        assert_eq!(account_group.account_pubkey, account.pubkey);
-        assert_eq!(account_group.mls_group_id, group_id);
-        assert!(account_group.user_confirmation.is_none()); // Should be pending
-        assert!(account_group.id.is_some());
+        assert_eq!(ag.account_pubkey, pubkey);
+        assert_eq!(ag.mls_group_id, group_id);
+        assert!(ag.user_confirmation.is_none());
+        assert!(ag.id.is_some());
     }
 
     #[tokio::test]
     async fn test_find_or_create_finds_existing() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
         let group_id = GroupId::from_slice(&[3; 32]);
 
-        // First create
-        let (original, was_created) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        assert!(was_created);
+        let (first, _) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
+            .await
+            .unwrap();
 
-        // Second call should find existing
-        let (found, was_created) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let (second, was_created) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
+            .await
+            .unwrap();
 
         assert!(!was_created);
-        assert_eq!(found.id, original.id);
+        assert_eq!(first.id, second.id);
     }
 
     #[tokio::test]
-    async fn test_update_user_confirmation_accept() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+    async fn test_update_user_confirmation() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
         let group_id = GroupId::from_slice(&[4; 32]);
 
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(account_group.user_confirmation.is_none());
-
-        let updated = account_group
-            .update_user_confirmation(true, &whitenoise.shared.database)
+        let (ag, _) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
             .await
             .unwrap();
+        assert!(ag.user_confirmation.is_none());
 
+        let updated = ag.update_user_confirmation(true, &pool).await.unwrap();
         assert_eq!(updated.user_confirmation, Some(true));
-        assert_eq!(updated.id, account_group.id);
     }
 
     #[tokio::test]
-    async fn test_update_user_confirmation_decline() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
+    async fn test_save_upsert() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
         let group_id = GroupId::from_slice(&[5; 32]);
 
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
+        let ag = AccountGroup {
+            id: None,
+            account_pubkey: pubkey,
+            mls_group_id: group_id,
+            user_confirmation: Some(true),
+            welcomer_pubkey: None,
+            last_read_message_id: None,
+            pin_order: Some(10),
+            dm_peer_pubkey: None,
+            archived_at: None,
+            removed_at: None,
+            self_removed: false,
+            muted_until: None,
+            chat_cleared_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
 
-        let updated = account_group
-            .update_user_confirmation(false, &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        assert_eq!(updated.user_confirmation, Some(false));
+        let saved = ag.save(&pool).await.unwrap();
+        assert!(saved.id.is_some());
+        assert_eq!(saved.pin_order, Some(10));
+        assert_eq!(saved.user_confirmation, Some(true));
     }
 
     #[tokio::test]
-    async fn test_find_visible_for_account() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id1 = GroupId::from_slice(&[8; 32]); // Will be pending
-        let group_id2 = GroupId::from_slice(&[9; 32]); // Will be accepted
-        let group_id3 = GroupId::from_slice(&[10; 32]); // Will be declined
+    async fn test_find_visible_and_pending() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
 
-        let (_ag1, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id1,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        let (ag2, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id2,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        let (ag3, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id3,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // ag1 stays pending (NULL)
-        ag2.update_user_confirmation(true, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        ag3.update_user_confirmation(false, &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        let visible =
-            AccountGroup::find_visible_for_account(&account.pubkey, &whitenoise.shared.database)
+        // Create 3 groups: pending, accepted, declined
+        let (pending, _) =
+            AccountGroup::find_or_create(&pubkey, &GroupId::from_slice(&[10; 32]), None, &pool)
                 .await
                 .unwrap();
 
-        // Should only include pending and accepted, not declined
-        assert_eq!(visible.len(), 2);
-        let ids: Vec<_> = visible.iter().map(|ag| ag.mls_group_id.clone()).collect();
-        assert!(ids.contains(&group_id1)); // pending
-        assert!(ids.contains(&group_id2)); // accepted
-        assert!(!ids.contains(&group_id3)); // declined - should NOT be visible
-    }
-
-    #[tokio::test]
-    async fn test_find_pending_for_account() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id1 = GroupId::from_slice(&[11; 32]); // Will be pending
-        let group_id2 = GroupId::from_slice(&[12; 32]); // Will be accepted
-
-        let (_, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id1,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        let (ag2, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id2,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        ag2.update_user_confirmation(true, &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        let pending =
-            AccountGroup::find_pending_for_account(&account.pubkey, &whitenoise.shared.database)
+        let (accepted, _) =
+            AccountGroup::find_or_create(&pubkey, &GroupId::from_slice(&[11; 32]), None, &pool)
                 .await
                 .unwrap();
-
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].mls_group_id, group_id1);
-    }
-
-    #[tokio::test]
-    async fn test_different_accounts_same_group() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account1 = whitenoise.create_identity().await.unwrap();
-        let account2 = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[14; 32]);
-
-        let (ag1, created1) = AccountGroup::find_or_create(
-            &account1.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        let (ag2, created2) = AccountGroup::find_or_create(
-            &account2.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(created1);
-        assert!(created2);
-        assert_ne!(ag1.id, ag2.id);
-        assert_eq!(ag1.mls_group_id, ag2.mls_group_id);
-        assert_ne!(ag1.account_pubkey, ag2.account_pubkey);
-    }
-
-    #[tokio::test]
-    async fn test_find_by_group_empty() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let group_id = GroupId::from_slice(&[15; 32]);
-
-        let result = AccountGroup::find_by_group(&group_id, &whitenoise.shared.database)
+        accepted
+            .update_user_confirmation(true, &pool)
             .await
             .unwrap();
 
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_find_by_group_single_account() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[16; 32]);
-
-        let (created_ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let result = AccountGroup::find_by_group(&group_id, &whitenoise.shared.database)
+        let (declined, _) =
+            AccountGroup::find_or_create(&pubkey, &GroupId::from_slice(&[12; 32]), None, &pool)
+                .await
+                .unwrap();
+        declined
+            .update_user_confirmation(false, &pool)
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].id, created_ag.id);
-        assert_eq!(result[0].account_pubkey, account.pubkey);
-        assert_eq!(result[0].mls_group_id, group_id);
+        let visible = AccountGroup::find_visible_for_account(&pubkey, &pool)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 2); // pending + accepted
+
+        let pendings = AccountGroup::find_pending_for_account(&pubkey, &pool)
+            .await
+            .unwrap();
+        assert_eq!(pendings.len(), 1);
+        assert_eq!(pendings[0].mls_group_id, pending.mls_group_id);
     }
 
     #[tokio::test]
-    async fn test_find_by_group_multiple_accounts() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account1 = whitenoise.create_identity().await.unwrap();
-        let account2 = whitenoise.create_identity().await.unwrap();
-        let account3 = whitenoise.create_identity().await.unwrap();
-        let target_group = GroupId::from_slice(&[17; 32]);
-        let other_group = GroupId::from_slice(&[18; 32]);
+    async fn test_update_last_read_if_newer() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+        let group_id = GroupId::from_slice(&[20; 32]);
 
-        // Add accounts 1 and 2 to the target group
-        AccountGroup::find_or_create(
-            &account1.pubkey,
-            &target_group,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        AccountGroup::find_or_create(
-            &account2.pubkey,
-            &target_group,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Add account 3 to a different group (should not be returned)
-        AccountGroup::find_or_create(
-            &account3.pubkey,
-            &other_group,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let result = AccountGroup::find_by_group(&target_group, &whitenoise.shared.database)
+        let (ag, _) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
             .await
             .unwrap();
 
-        assert_eq!(result.len(), 2);
+        let msg_id = EventId::from_hex(&"aa".repeat(32)).unwrap();
 
-        let pubkeys: Vec<_> = result.iter().map(|ag| ag.account_pubkey).collect();
-        assert!(pubkeys.contains(&account1.pubkey));
-        assert!(pubkeys.contains(&account2.pubkey));
-        assert!(!pubkeys.contains(&account3.pubkey)); // Should NOT be included
+        // First read: no current marker (pass 0)
+        let updated = ag
+            .update_last_read_if_newer(&msg_id, 1000, 0, &pool)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().last_read_message_id, Some(msg_id));
 
-        // All returned should have the target group_id
-        for ag in &result {
-            assert_eq!(ag.mls_group_id, target_group);
-        }
+        // Re-read fresh row
+        let ag = AccountGroup::find_by_account_and_group(&pubkey, &group_id, &pool)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Older message: should NOT update
+        let older_id = EventId::from_hex(&"bb".repeat(32)).unwrap();
+        let not_updated = ag
+            .update_last_read_if_newer(&older_id, 500, 1000, &pool)
+            .await
+            .unwrap();
+        assert!(not_updated.is_none());
+
+        // Newer message: should update
+        let newer_id = EventId::from_hex(&"cc".repeat(32)).unwrap();
+        let updated = ag
+            .update_last_read_if_newer(&newer_id, 2000, 1000, &pool)
+            .await
+            .unwrap();
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap().last_read_message_id, Some(newer_id));
     }
 
     #[tokio::test]
-    async fn test_save_creates_new_record() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let welcomer = whitenoise.create_identity().await.unwrap();
+    async fn test_dm_peer_pubkey_operations() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+        let peer = PublicKey::parse(&"cd".repeat(32)).unwrap();
         let group_id = GroupId::from_slice(&[30; 32]);
 
-        let ag = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: None,
-            welcomer_pubkey: Some(welcomer.pubkey),
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
+        // Create with dm_peer_pubkey
+        let (ag, _) = AccountGroup::find_or_create(&pubkey, &group_id, Some(&peer), &pool)
+            .await
+            .unwrap();
+        assert_eq!(ag.dm_peer_pubkey, Some(peer));
 
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        // find_dm_group_id_by_peer
+        let found = AccountGroup::find_dm_group_id_by_peer(&peer, &pool)
+            .await
+            .unwrap();
+        assert_eq!(found, Some(group_id.clone()));
 
-        let saved = ag.save(&whitenoise.shared.database).await.unwrap();
-
-        assert!(saved.id.is_some());
-        assert_eq!(saved.account_pubkey, account.pubkey);
-        assert_eq!(saved.mls_group_id, group_id);
-        assert!(saved.user_confirmation.is_none());
-        assert_eq!(saved.welcomer_pubkey, Some(welcomer.pubkey));
-        assert!(saved.pin_order.is_none());
+        // find_dm_peers_for_account
+        let peers = AccountGroup::find_dm_peers_for_account(&pool)
+            .await
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, group_id);
+        assert_eq!(peers[0].1, peer);
     }
 
     #[tokio::test]
-    async fn test_save_updates_existing_record() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let welcomer = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[31; 32]);
-
-        // Create initial record with welcomer
-        let ag = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: Some(true),
-            welcomer_pubkey: Some(welcomer.pubkey),
-            last_read_message_id: None,
-            pin_order: Some(100),
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let original = ag.save(&whitenoise.shared.database).await.unwrap();
-        assert_eq!(original.welcomer_pubkey, Some(welcomer.pubkey));
-        assert_eq!(original.user_confirmation, Some(true));
-        assert_eq!(original.pin_order, Some(100));
-
-        // Save with None values - should overwrite existing values
-        let update = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: None,
-            welcomer_pubkey: None,
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let saved = update.save(&whitenoise.shared.database).await.unwrap();
-
-        assert_eq!(saved.id, original.id);
-        assert!(saved.user_confirmation.is_none());
-        assert!(saved.welcomer_pubkey.is_none());
-        assert!(saved.pin_order.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_save_does_not_overwrite_archived_at() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[32; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Archive the group
-        let archived = ag
-            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(archived.is_archived());
-
-        // Re-save via save() — this simulates giftwrap processing
-        let resaved = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: Some(true),
-            welcomer_pubkey: None,
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        resaved.save(&whitenoise.shared.database).await.unwrap();
-
-        // Fetch and verify archived_at survived the save()
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(
-            found.is_archived(),
-            "save() must not overwrite archived_at — giftwrap processing would silently unarchive chats"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_update_last_read_if_newer_sets_when_null() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[40; 32]);
-
-        // Setup group_information (FK constraint)
-        GroupInformation::find_or_create_by_mls_group_id(
-            &group_id,
-            Some(GroupType::Group),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let message_id = EventId::all_zeros();
-        let message_time = Utc::now();
-
-        // Create the message
-        AggregatedMessage::create_for_test(
-            message_id,
-            group_id.clone(),
-            account.pubkey,
-            message_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(account_group.last_read_message_id.is_none());
-
-        // Should update when last_read_message_id is NULL
-        let updated = account_group
-            .update_last_read_if_newer(
-                &message_id,
-                message_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
-
-        assert!(updated.is_some());
-        assert_eq!(updated.unwrap().last_read_message_id, Some(message_id));
-    }
-
-    #[tokio::test]
-    async fn test_update_last_read_if_newer_advances_forward() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[41; 32]);
-
-        GroupInformation::find_or_create_by_mls_group_id(
-            &group_id,
-            Some(GroupType::Group),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let now = Utc::now();
-        let older_time = now - chrono::Duration::seconds(10);
-        let newer_time = now;
-
-        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "1")).unwrap();
-        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "2")).unwrap();
-
-        AggregatedMessage::create_for_test(
-            older_msg_id,
-            group_id.clone(),
-            account.pubkey,
-            older_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        AggregatedMessage::create_for_test(
-            newer_msg_id,
-            group_id.clone(),
-            account.pubkey,
-            newer_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Set to older message first
-        let updated = account_group
-            .update_last_read_if_newer(
-                &older_msg_id,
-                older_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.last_read_message_id, Some(older_msg_id));
-
-        // Should advance to newer message
-        let updated = updated
-            .update_last_read_if_newer(
-                &newer_msg_id,
-                newer_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
-
-        assert!(updated.is_some());
-        assert_eq!(updated.unwrap().last_read_message_id, Some(newer_msg_id));
-    }
-
-    #[tokio::test]
-    async fn test_update_last_read_if_newer_rejects_older() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[42; 32]);
-
-        GroupInformation::find_or_create_by_mls_group_id(
-            &group_id,
-            Some(GroupType::Group),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let now = Utc::now();
-        let older_time = now - chrono::Duration::seconds(10);
-        let newer_time = now;
-
-        let older_msg_id = EventId::from_hex(&format!("{:0>64}", "aaa")).unwrap();
-        let newer_msg_id = EventId::from_hex(&format!("{:0>64}", "bbb")).unwrap();
-
-        AggregatedMessage::create_for_test(
-            older_msg_id,
-            group_id.clone(),
-            account.pubkey,
-            older_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        AggregatedMessage::create_for_test(
-            newer_msg_id,
-            group_id.clone(),
-            account.pubkey,
-            newer_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Set to newer message first
-        let updated = account_group
-            .update_last_read_if_newer(
-                &newer_msg_id,
-                newer_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.last_read_message_id, Some(newer_msg_id));
-
-        // Should reject older message (returns None)
-        let result = updated
-            .update_last_read_if_newer(
-                &older_msg_id,
-                older_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-
-        // Verify the marker didn't change
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(found.last_read_message_id, Some(newer_msg_id));
-    }
-
-    #[tokio::test]
-    async fn test_last_read_persists_through_find() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[43; 32]);
-
-        GroupInformation::find_or_create_by_mls_group_id(
-            &group_id,
-            Some(GroupType::Group),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let message_id = EventId::from_hex(&format!("{:0>64}", "abc")).unwrap();
-        let message_time = Utc::now();
-
-        AggregatedMessage::create_for_test(
-            message_id,
-            group_id.clone(),
-            account.pubkey,
-            message_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        account_group
-            .update_last_read_if_newer(
-                &message_id,
-                message_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap();
-
-        // Fetch again and verify persistence
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(found.last_read_message_id, Some(message_id));
-    }
-
-    #[tokio::test]
-    async fn test_update_pin_order_sets_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[60; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(account_group.pin_order.is_none());
-
-        let updated = account_group
-            .update_pin_order(Some(42), &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        assert_eq!(updated.pin_order, Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_update_pin_order_clears_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[61; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Set pin order first
-        let pinned = account_group
-            .update_pin_order(Some(100), &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert_eq!(pinned.pin_order, Some(100));
-
-        // Clear pin order
-        let unpinned = pinned
-            .update_pin_order(None, &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        assert!(unpinned.pin_order.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_update_pin_order_persists() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[62; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        account_group
-            .update_pin_order(Some(77), &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        // Fetch again and verify persistence
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(found.pin_order, Some(77));
-    }
-
-    #[tokio::test]
-    async fn test_update_archived_at_sets_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[63; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(account_group.archived_at.is_none());
-
-        let now = Utc::now();
-        let updated = account_group
-            .update_archived_at(Some(now), &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        assert!(updated.archived_at.is_some());
-        assert!(updated.is_archived());
-    }
-
-    #[tokio::test]
-    async fn test_update_archived_at_clears_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[64; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Set archived
-        let archived = account_group
-            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(archived.is_archived());
-
-        // Clear archived
-        let unarchived = archived
-            .update_archived_at(None, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(unarchived.archived_at.is_none());
-        assert!(!unarchived.is_archived());
-    }
-
-    #[tokio::test]
-    async fn test_update_archived_at_persists() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[65; 32]);
-
-        let (account_group, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        account_group
-            .update_archived_at(Some(Utc::now()), &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        // Fetch again and verify persistence
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(found.is_archived());
-    }
-
-    #[tokio::test]
-    async fn test_find_dm_groups_missing_peer_returns_dm_without_peer() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[70; 32]);
-
-        // Create group_information with DirectMessage type
-        GroupInformation::create_for_group(
-            &whitenoise,
-            &group_id,
-            Some(GroupType::DirectMessage),
-            "",
-        )
-        .await
-        .unwrap();
-
-        // Create account_group WITHOUT dm_peer_pubkey (simulates pre-migration state)
+    async fn test_find_groups_missing_peer() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+
+        // Group with peer
         AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
+            &pubkey,
+            &GroupId::from_slice(&[40; 32]),
+            Some(&PublicKey::parse(&"ee".repeat(32)).unwrap()),
+            &pool,
         )
         .await
         .unwrap();
 
-        let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        // Group without peer
+        AccountGroup::find_or_create(&pubkey, &GroupId::from_slice(&[41; 32]), None, &pool)
+            .await
+            .unwrap();
 
+        let missing = AccountGroup::find_groups_missing_peer(&pool).await.unwrap();
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0], group_id);
+        assert_eq!(missing[0], GroupId::from_slice(&[41; 32]));
     }
 
     #[tokio::test]
-    async fn test_find_dm_groups_missing_peer_excludes_groups_with_peer() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let peer = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[71; 32]);
+    async fn test_clear_expired_mutes() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
+        let group_id = GroupId::from_slice(&[50; 32]);
 
-        // Create group_information with DirectMessage type
-        GroupInformation::create_for_group(
-            &whitenoise,
-            &group_id,
-            Some(GroupType::DirectMessage),
-            "",
-        )
-        .await
-        .unwrap();
-
-        // Create account_group WITH dm_peer_pubkey (already populated)
-        AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            Some(&peer.pubkey),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
-                .await
-                .unwrap();
-
-        assert!(missing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_find_dm_groups_missing_peer_excludes_regular_groups() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[72; 32]);
-
-        // Create group_information with Group type (not DM)
-        GroupInformation::create_for_group(
-            &whitenoise,
-            &group_id,
-            Some(GroupType::Group),
-            "Team Chat",
-        )
-        .await
-        .unwrap();
-
-        // Create account_group without dm_peer_pubkey
-        AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let missing =
-            AccountGroup::find_dm_groups_missing_peer(&account.pubkey, &whitenoise.shared.database)
-                .await
-                .unwrap();
-
-        // Should not include regular groups even if dm_peer_pubkey is NULL
-        assert!(missing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_update_dm_peer_pubkey_sets_peer() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let peer = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[73; 32]);
-
-        // Create account_group without dm_peer_pubkey
-        AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Update the dm_peer_pubkey
-        AccountGroup::update_dm_peer_pubkey(
-            &account.pubkey,
-            &group_id,
-            &peer.pubkey,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Verify it was set
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(found.dm_peer_pubkey, Some(peer.pubkey));
-    }
-
-    #[tokio::test]
-    async fn test_update_dm_peer_pubkey_does_not_overwrite_existing() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let original_peer = whitenoise.create_identity().await.unwrap();
-        let new_peer = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[74; 32]);
-
-        // Create account_group WITH dm_peer_pubkey already set
-        AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            Some(&original_peer.pubkey),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Try to update with a different peer
-        AccountGroup::update_dm_peer_pubkey(
-            &account.pubkey,
-            &group_id,
-            &new_peer.pubkey,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Verify original peer is preserved (WHERE clause includes dm_peer_pubkey IS NULL)
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(found.dm_peer_pubkey, Some(original_peer.pubkey));
-    }
-
-    #[tokio::test]
-    async fn test_save_does_not_overwrite_removed_at() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[83; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Mark as removed
-        let removed = ag
-            .mark_removed_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("first mark_removed_atomic must update the row");
-        assert!(removed.removed_at.is_some());
-
-        // Re-save via save() with removed_at = None — simulates giftwrap re-processing
-        let resaved = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: Some(true),
-            welcomer_pubkey: None,
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        resaved.save(&whitenoise.shared.database).await.unwrap();
-
-        // Fetch and verify removed_at survived
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert!(
-            found.removed_at.is_some(),
-            "save() must not overwrite removed_at — giftwrap re-processing would silently un-remove chats"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mark_left_atomic_sets_removed_at_and_self_removed() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[90; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-        assert!(ag.removed_at.is_none());
-        assert!(!ag.self_removed);
-
-        let left = ag
-            .mark_left_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("first mark_left_atomic must update the row");
-
-        assert!(left.removed_at.is_some(), "removed_at must be set");
-        assert!(left.self_removed, "self_removed must be true");
-        assert!(left.is_removed());
-    }
-
-    #[tokio::test]
-    async fn test_mark_left_atomic_idempotent() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[91; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let first = ag
-            .mark_left_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("first call must succeed");
-
-        // Second call must be a no-op
-        let second = first
-            .mark_left_atomic(&whitenoise.shared.database)
+        let (ag, _) = AccountGroup::find_or_create(&pubkey, &group_id, None, &pool)
             .await
             .unwrap();
-        assert!(second.is_none(), "second mark_left_atomic must return None");
+
+        // Set an already-expired mute
+        let past = Utc::now() - chrono::Duration::hours(1);
+        ag.update_muted_until(Some(past), &pool).await.unwrap();
+
+        let cleared = AccountGroup::clear_expired_mutes(&pubkey, &pool)
+            .await
+            .unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].muted_until.is_none());
     }
 
     #[tokio::test]
-    async fn test_mark_removed_atomic_noop_when_already_left() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[92; 32]);
+    async fn test_mark_left_and_removed() {
+        let (pool, _dir) = test_pool().await;
+        let pubkey = test_pubkey();
 
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // User leaves voluntarily
-        let left = ag
-            .mark_left_atomic(&whitenoise.shared.database)
+        // Test mark_left_atomic
+        let group_id1 = GroupId::from_slice(&[60; 32]);
+        let (ag, _) = AccountGroup::find_or_create(&pubkey, &group_id1, None, &pool)
             .await
-            .unwrap()
-            .expect("mark_left_atomic must succeed");
+            .unwrap();
+        let left = ag.mark_left_atomic(&pool).await.unwrap();
+        assert!(left.is_some());
+        let left = left.unwrap();
+        assert!(left.removed_at.is_some());
         assert!(left.self_removed);
 
-        // Later commit arrives — mark_removed_atomic must be a no-op
-        let removed = left
-            .mark_removed_atomic(&whitenoise.shared.database)
+        // Idempotent
+        let again = left.mark_left_atomic(&pool).await.unwrap();
+        assert!(again.is_none());
+
+        // Test mark_removed_atomic
+        let group_id2 = GroupId::from_slice(&[61; 32]);
+        let (ag2, _) = AccountGroup::find_or_create(&pubkey, &group_id2, None, &pool)
             .await
             .unwrap();
-        assert!(
-            removed.is_none(),
-            "mark_removed_atomic must no-op when mark_left_atomic already ran"
-        );
-
-        // Verify self_removed is still true (not overwritten)
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            found.self_removed,
-            "self_removed must survive mark_removed_atomic no-op"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mark_left_atomic_noop_when_already_removed() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[93; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Admin kicks user first
-        let removed = ag
-            .mark_removed_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("mark_removed_atomic must succeed");
+        let removed = ag2.mark_removed_atomic(&pool).await.unwrap();
+        assert!(removed.is_some());
+        let removed = removed.unwrap();
+        assert!(removed.removed_at.is_some());
         assert!(!removed.self_removed);
-
-        // User tries to leave — must be a no-op
-        let left = removed
-            .mark_left_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(
-            left.is_none(),
-            "mark_left_atomic must no-op when mark_removed_atomic already ran"
-        );
-
-        // Verify self_removed is still false
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(
-            !found.self_removed,
-            "self_removed must remain false after admin kick"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_save_does_not_overwrite_self_removed() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[94; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // User leaves voluntarily
-        let left = ag
-            .mark_left_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("mark_left_atomic must succeed");
-        assert!(left.self_removed);
-
-        // Re-save via save() — simulates giftwrap re-processing
-        let resaved = AccountGroup {
-            id: None,
-            account_pubkey: account.pubkey,
-            mls_group_id: group_id.clone(),
-            user_confirmation: Some(true),
-            welcomer_pubkey: None,
-            last_read_message_id: None,
-            pin_order: None,
-            dm_peer_pubkey: None,
-            archived_at: None,
-            removed_at: None,
-            self_removed: false,
-            muted_until: None,
-            chat_cleared_at: None,
-
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        resaved.save(&whitenoise.shared.database).await.unwrap();
-
-        // Fetch and verify self_removed survived
-        let found = AccountGroup::find_by_account_and_group(
-            &account.pubkey,
-            &group_id,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(found.self_removed, "save() must not overwrite self_removed");
-        assert!(
-            found.removed_at.is_some(),
-            "save() must not overwrite removed_at either"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mark_removed_atomic_preserves_declined_user_confirmation() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[84; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Decline the invite first
-        let declined = ag
-            .update_user_confirmation(false, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert_eq!(declined.user_confirmation, Some(false));
-
-        // Admin removes the user — user_confirmation must stay Some(false)
-        let removed = declined
-            .mark_removed_atomic(&whitenoise.shared.database)
-            .await
-            .unwrap()
-            .expect("mark_removed_atomic must update the row");
-
-        assert!(removed.removed_at.is_some());
-        assert_eq!(
-            removed.user_confirmation,
-            Some(false),
-            "mark_removed_atomic must not overwrite a declined user_confirmation"
-        );
-        // A declined+removed group stays hidden
-        assert!(!removed.is_visible());
-    }
-
-    #[tokio::test]
-    async fn test_update_chat_cleared_at_sets_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[90; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        assert!(ag.chat_cleared_at.is_none());
-
-        let now = Utc::now();
-        let updated = ag
-            .update_chat_cleared_at(Some(now), &whitenoise.shared.database)
-            .await
-            .unwrap();
-
-        assert!(updated.chat_cleared_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_update_chat_cleared_at_clears_value() {
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[91; 32]);
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let cleared = ag
-            .update_chat_cleared_at(Some(Utc::now()), &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(cleared.chat_cleared_at.is_some());
-
-        let uncleared = cleared
-            .update_chat_cleared_at(None, &whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(uncleared.chat_cleared_at.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_reset_last_read_message_id() {
-        use crate::whitenoise::aggregated_message::AggregatedMessage;
-        use crate::whitenoise::group_information::{GroupInformation, GroupType};
-
-        let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
-        let account = whitenoise.create_identity().await.unwrap();
-        let group_id = GroupId::from_slice(&[94; 32]);
-
-        GroupInformation::find_or_create_by_mls_group_id(
-            &group_id,
-            Some(GroupType::Group),
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let message_id = EventId::from_hex(&format!("{:0>64}", "ccc")).unwrap();
-        let message_time = Utc::now();
-
-        AggregatedMessage::create_for_test(
-            message_id,
-            group_id.clone(),
-            account.pubkey,
-            message_time,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        let (ag, _) = AccountGroup::find_or_create(
-            &account.pubkey,
-            &group_id,
-            None,
-            &whitenoise.shared.database,
-        )
-        .await
-        .unwrap();
-
-        // Set the read marker first
-        let with_marker = ag
-            .update_last_read_if_newer(
-                &message_id,
-                message_time.timestamp_millis(),
-                &whitenoise.shared.database,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(with_marker.last_read_message_id, Some(message_id));
-
-        // Reset
-        let reset = with_marker
-            .reset_last_read_message_id(&whitenoise.shared.database)
-            .await
-            .unwrap();
-        assert!(reset.last_read_message_id.is_none());
     }
 }

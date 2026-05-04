@@ -51,9 +51,13 @@ impl Whitenoise {
 
         // 2. Fetch the most-recent `limit` messages using the paginated query so the initial
         //    snapshot honours the same page size the Flutter side will use for further loads.
-        let cleared_at_ms =
-            AccountGroup::chat_cleared_at_ms(account_pubkey, group_id, &self.shared.database)
-                .await?;
+        let session = self.require_session(account_pubkey)?;
+        let cleared_at_ms = AccountGroup::chat_cleared_at_ms(
+            account_pubkey,
+            group_id,
+            &session.account_db.inner.pool,
+        )
+        .await?;
 
         let fetched_messages =
             aggregated_message::AggregatedMessage::find_messages_by_group_paginated(

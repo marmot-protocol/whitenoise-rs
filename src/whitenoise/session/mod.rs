@@ -293,7 +293,7 @@ impl AccountSession {
         self.pending_push_token_responses.insert(key, ());
 
         let mdk = Arc::clone(&self.mdk);
-        let database = Arc::clone(&self.shared.database);
+        let account_db = Arc::clone(&self.account_db);
         let pending = Arc::clone(&self.pending_push_token_responses);
         let relay_control = Arc::clone(self.group_handle.relay_control());
         let account_pubkey = self.account_pubkey;
@@ -316,7 +316,7 @@ impl AccountSession {
 
             if let Err(error) = respond_to_token_request_with(
                 &mdk,
-                &database,
+                &account_db.inner.pool,
                 &relay_control,
                 &account_pubkey,
                 &group_id,

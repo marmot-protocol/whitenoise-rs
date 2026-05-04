@@ -10,8 +10,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use mdk_core::prelude::GroupId;
 use nostr_sdk::{EventId, PublicKey};
+use sqlx::SqlitePool;
 
 use super::AccountSession;
+use crate::whitenoise::accounts::Account;
 use crate::whitenoise::accounts_groups::{AccountGroup, MuteDuration};
 use crate::whitenoise::aggregated_message::AggregatedMessage;
 use crate::whitenoise::chat_list_streaming::ChatListUpdateTrigger;
@@ -44,14 +46,18 @@ impl<'a> MembershipOps<'a> {
         &self.session.shared.database
     }
 
+    fn pool(&self) -> &SqlitePool {
+        &self.session.account_db.inner.pool
+    }
+
     /// Return all visible (pending + accepted) account-group memberships.
     pub async fn visible_groups(&self) -> Result<Vec<AccountGroup>> {
-        Ok(AccountGroup::find_visible_for_account(self.pubkey(), self.db()).await?)
+        Ok(AccountGroup::find_visible_for_account(self.pubkey(), self.pool()).await?)
     }
 
     /// Return all pending (awaiting user confirmation) account-group memberships.
     pub async fn pending_groups(&self) -> Result<Vec<AccountGroup>> {
-        Ok(AccountGroup::find_pending_for_account(self.pubkey(), self.db()).await?)
+        Ok(AccountGroup::find_pending_for_account(self.pubkey(), self.pool()).await?)
     }
 
     /// Mark a message as read for this account.
@@ -66,14 +72,29 @@ impl<'a> MembershipOps<'a> {
         let account_group = AccountGroup::find_by_account_and_group(
             self.pubkey(),
             &message.mls_group_id,
-            self.db(),
+            self.pool(),
         )
         .await?
         .ok_or(WhitenoiseError::GroupNotFound)?;
 
         let message_created_at_ms = message.created_at.timestamp_millis();
+        let current_marker_ts = match &account_group.last_read_message_id {
+            Some(marker_id) => AggregatedMessage::created_at_ms_for_message(
+                marker_id,
+                &message.mls_group_id,
+                self.db(),
+            )
+            .await?
+            .unwrap_or(0),
+            None => 0,
+        };
         if let Some(updated) = account_group
-            .update_last_read_if_newer(message_id, message_created_at_ms, self.db())
+            .update_last_read_if_newer(
+                message_id,
+                message_created_at_ms,
+                current_marker_ts,
+                self.pool(),
+            )
             .await?
         {
             return Ok(updated);
@@ -85,7 +106,7 @@ impl<'a> MembershipOps<'a> {
 
     /// Return the group ID of the latest DM group with `peer_pubkey`, if any.
     pub async fn dm_group_with_peer(&self, peer_pubkey: &PublicKey) -> Result<Option<GroupId>> {
-        Ok(AccountGroup::find_dm_group_id_by_peer(self.pubkey(), peer_pubkey, self.db()).await?)
+        Ok(AccountGroup::find_dm_group_id_by_peer(peer_pubkey, self.pool()).await?)
     }
 }
 
@@ -106,9 +127,13 @@ impl<'a> MembershipOpsForGroup<'a> {
         &self.session.shared.database
     }
 
+    fn pool(&self) -> &SqlitePool {
+        &self.session.account_db.inner.pool
+    }
+
     /// Load the account-group row, returning `GroupNotFound` if absent.
     async fn require_account_group(&self) -> Result<AccountGroup> {
-        AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.db())
+        AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.pool())
             .await?
             .ok_or(WhitenoiseError::GroupNotFound)
     }
@@ -133,7 +158,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         dm_peer_pubkey: Option<&PublicKey>,
     ) -> Result<(AccountGroup, bool)> {
         Ok(
-            AccountGroup::find_or_create(self.pubkey(), self.group_id, dm_peer_pubkey, self.db())
+            AccountGroup::find_or_create(self.pubkey(), self.group_id, dm_peer_pubkey, self.pool())
                 .await?,
         )
     }
@@ -141,7 +166,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     /// Return the last-read message ID for this account in this group.
     pub async fn last_read_message_id(&self) -> Result<Option<EventId>> {
         let account_group =
-            AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.db())
+            AccountGroup::find_by_account_and_group(self.pubkey(), self.group_id, self.pool())
                 .await?;
         Ok(account_group.and_then(|ag| ag.last_read_message_id))
     }
@@ -156,7 +181,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     pub async fn accept(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
         Ok(account_group
-            .update_user_confirmation(true, self.db())
+            .update_user_confirmation(true, self.pool())
             .await?)
     }
 
@@ -168,7 +193,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     pub async fn decline(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
         Ok(account_group
-            .update_user_confirmation(false, self.db())
+            .update_user_confirmation(false, self.pool())
             .await?)
     }
 
@@ -179,7 +204,9 @@ impl<'a> MembershipOpsForGroup<'a> {
     /// `None` = unpin, `Some(n)` = pin at order n (lower values first).
     pub async fn set_pin_order(&self, pin_order: Option<i64>) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        Ok(account_group.update_pin_order(pin_order, self.db()).await?)
+        Ok(account_group
+            .update_pin_order(pin_order, self.pool())
+            .await?)
     }
 
     // ── Archive ───────────────────────────────────────────────────
@@ -191,7 +218,7 @@ impl<'a> MembershipOpsForGroup<'a> {
             return Ok(account_group);
         }
         let updated = account_group
-            .update_archived_at(Some(Utc::now()), self.db())
+            .update_archived_at(Some(Utc::now()), self.pool())
             .await?;
         self.emit_chat_list_update(ChatListUpdateTrigger::ChatArchiveChanged)
             .await;
@@ -204,7 +231,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         if !account_group.is_archived() {
             return Ok(account_group);
         }
-        let updated = account_group.update_archived_at(None, self.db()).await?;
+        let updated = account_group.update_archived_at(None, self.pool()).await?;
         self.emit_chat_list_update(ChatListUpdateTrigger::ChatArchiveChanged)
             .await;
         Ok(updated)
@@ -226,7 +253,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         }
         let account_group = self.require_account_group().await?;
         let updated = account_group
-            .update_muted_until(Some(until), self.db())
+            .update_muted_until(Some(until), self.pool())
             .await?;
         self.emit_chat_list_update(ChatListUpdateTrigger::ChatMuteChanged)
             .await;
@@ -237,7 +264,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     /// mute already expired.
     pub async fn unmute(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        let updated = account_group.update_muted_until(None, self.db()).await?;
+        let updated = account_group.update_muted_until(None, self.pool()).await?;
         self.emit_chat_list_update(ChatListUpdateTrigger::ChatMuteChanged)
             .await;
         Ok(updated)
@@ -251,7 +278,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     /// changes.
     pub(crate) async fn mark_as_left(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        let Some(updated) = account_group.mark_left_atomic(self.db()).await? else {
+        let Some(updated) = account_group.mark_left_atomic(self.pool()).await? else {
             // Already departed — reload current state.
             return self.require_account_group().await;
         };
@@ -266,7 +293,7 @@ impl<'a> MembershipOpsForGroup<'a> {
     /// the row changes.
     pub(crate) async fn mark_as_removed(&self) -> Result<AccountGroup> {
         let account_group = self.require_account_group().await?;
-        let Some(updated) = account_group.mark_removed_atomic(self.db()).await? else {
+        let Some(updated) = account_group.mark_removed_atomic(self.pool()).await? else {
             // Another task won the atomic update — reload persisted state.
             return self.require_account_group().await;
         };
@@ -286,7 +313,7 @@ impl<'a> MembershipOpsForGroup<'a> {
         let account_group = self.require_account_group().await?;
 
         account_group
-            .clear_chat_state(Utc::now(), self.db())
+            .clear_chat_state(Utc::now(), self.pool())
             .await?;
 
         // Delete draft (best-effort).
@@ -298,7 +325,21 @@ impl<'a> MembershipOpsForGroup<'a> {
         }
 
         // Cleanup aggregated messages that all accounts have cleared (best-effort).
-        if let Err(e) = self.db().try_cleanup_cleared_messages(self.group_id).await {
+        let min_cleared_at = match self.resolve_min_cleared_at().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "whitenoise::membership",
+                    "resolve_min_cleared_at failed; skipping cleanup: {e}"
+                );
+                None
+            }
+        };
+        if let Err(e) = self
+            .db()
+            .try_cleanup_cleared_messages(self.group_id, min_cleared_at)
+            .await
+        {
             tracing::warn!(
                 target: "whitenoise::membership",
                 "Failed to cleanup cleared messages: {e}"
@@ -317,5 +358,55 @@ impl<'a> MembershipOpsForGroup<'a> {
             .await;
 
         Ok(())
+    }
+
+    /// Compute the minimum `chat_cleared_at` across all accounts for this
+    /// group, returning `Ok(Some(millis))` only when **every** account has a
+    /// non-null value. Returns `Ok(None)` if any account has not cleared or
+    /// if not all accounts have active sessions (conservative — avoids
+    /// premature message deletion). Returns `Err` on real DB failures so
+    /// the caller can log the concrete error.
+    async fn resolve_min_cleared_at(&self) -> Result<Option<i64>> {
+        let wn = self
+            .session
+            .whitenoise
+            .upgrade()
+            .ok_or(WhitenoiseError::Initialization)?;
+        let total_accounts = Account::count(&wn.shared.database).await?;
+        let mut sessions_checked: i64 = 0;
+        let mut min: Option<i64> = None;
+        for session in wn.account_manager.sessions_iter() {
+            sessions_checked += 1;
+            match AccountGroup::chat_cleared_at_ms(
+                &session.account_pubkey,
+                self.group_id,
+                &session.account_db.inner.pool,
+            )
+            .await
+            {
+                Ok(Some(ms)) => {
+                    min = Some(min.map_or(ms, |prev: i64| prev.min(ms)));
+                }
+                Ok(None) => return Ok(None),
+                Err(WhitenoiseError::GroupNotFound) => {
+                    // This session doesn't have this group — skip it.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // If not all accounts have active sessions, we can't be sure every
+        // account has cleared — return None to prevent premature deletion.
+        if sessions_checked < total_accounts {
+            tracing::warn!(
+                target: "whitenoise::session::membership",
+                checked = sessions_checked,
+                total = total_accounts,
+                "Not all accounts have active sessions; \
+                 skipping cleared-message cleanup"
+            );
+            return Ok(None);
+        }
+        Ok(min)
     }
 }

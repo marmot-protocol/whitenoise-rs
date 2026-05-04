@@ -647,41 +647,48 @@ impl AggregatedMessage {
         pubkey: &PublicKey,
         query: &str,
         limit: u32,
+        visible_group_ids: &[Vec<u8>],
         database: &Database,
     ) -> Result<Vec<SearchResult>> {
+        if visible_group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let limit_val = i64::from(limit.min(200));
         let like_pattern = super::content_search::query_to_like_pattern(query);
+        let pubkey_hex = pubkey.to_hex();
 
-        let rows: Vec<AggregatedMessageRow> = sqlx::query_as(
-            "WITH ranked AS (
-               SELECT am.*,
-                      mds.status AS delivery_status,
-                      (ROW_NUMBER() OVER (
-                         PARTITION BY am.mls_group_id
-                         ORDER BY am.created_at DESC, am.message_id DESC
-                      )) - 1 AS position
-               FROM aggregated_messages am
-               JOIN accounts_groups ag
-                 ON ag.mls_group_id = am.mls_group_id
-               LEFT JOIN message_delivery_status mds
-                 ON am.message_id = mds.message_id AND am.mls_group_id = mds.mls_group_id
-                    AND mds.account_pubkey = ?1
-               WHERE am.kind = 9
-                 AND ag.account_pubkey = ?1
-                 AND (ag.user_confirmation IS NULL OR ag.user_confirmation = 1)
-                 AND (mds.status IS NULL OR mds.status != '\"Retried\"')
-             )
-             SELECT * FROM ranked
-             WHERE deletion_event_id IS NULL
-               AND content_normalized LIKE ?2
-             ORDER BY created_at DESC, message_id DESC
-             LIMIT ?3",
-        )
-        .bind(pubkey.to_hex())
-        .bind(&like_pattern)
-        .bind(limit_val)
-        .fetch_all(&database.pool)
-        .await?;
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "WITH ranked AS ( \
+             SELECT am.*, \
+             mds.status AS delivery_status, \
+             (ROW_NUMBER() OVER ( \
+             PARTITION BY am.mls_group_id \
+             ORDER BY am.created_at DESC, am.message_id DESC \
+             )) - 1 AS position \
+             FROM aggregated_messages am \
+             LEFT JOIN message_delivery_status mds \
+             ON am.message_id = mds.message_id \
+             AND am.mls_group_id = mds.mls_group_id \
+             AND mds.account_pubkey = ",
+        );
+        qb.push_bind(&pubkey_hex);
+        qb.push(" WHERE am.kind = 9 AND am.mls_group_id IN (");
+        let mut sep = qb.separated(", ");
+        for gid in visible_group_ids {
+            sep.push_bind(gid.clone());
+        }
+        sep.push_unseparated(
+            ") AND (mds.status IS NULL OR mds.status != '\"Retried\"') \
+             ) SELECT * FROM ranked \
+             WHERE deletion_event_id IS NULL \
+             AND content_normalized LIKE ",
+        );
+        qb.push_bind(like_pattern);
+        qb.push(" ORDER BY created_at DESC, message_id DESC LIMIT ");
+        qb.push_bind(limit_val);
+
+        let rows: Vec<AggregatedMessageRow> = qb.build_query_as().fetch_all(&database.pool).await?;
 
         Self::rows_to_search_results(rows, query)
     }
@@ -1235,6 +1242,25 @@ impl AggregatedMessage {
                 .await?;
 
         Ok(row.map(AggregatedMessageRow::into_aggregated_message))
+    }
+
+    /// Returns the `created_at` timestamp (in milliseconds) for a specific
+    /// message in a group, or `None` if no such message exists.
+    #[perf_instrument("db::aggregated_messages")]
+    pub async fn created_at_ms_for_message(
+        message_id: &EventId,
+        mls_group_id: &GroupId,
+        database: &Database,
+    ) -> Result<Option<i64>> {
+        let ts: Option<i64> = sqlx::query_scalar(
+            "SELECT created_at FROM aggregated_messages \
+             WHERE message_id = ? AND mls_group_id = ?",
+        )
+        .bind(message_id.to_hex())
+        .bind(mls_group_id.as_slice())
+        .fetch_optional(&database.pool)
+        .await?;
+        Ok(ts)
     }
 
     /// Count unread messages for a group given its read marker message ID.
@@ -4952,7 +4978,8 @@ mod tests {
                 created_at: now,
                 updated_at: now,
             };
-            ag.save(&whitenoise.shared.database).await.unwrap();
+            let session = whitenoise.require_session(&pubkey).unwrap();
+            ag.save(&session.account_db.inner.pool).await.unwrap();
         }
 
         let author = Keys::generate().public_key();
@@ -4985,11 +5012,27 @@ mod tests {
             .await
             .unwrap();
 
-        // Cross-group search for "marmot"
-        let results =
-            AggregatedMessage::search_messages(&pubkey, "marmot", 50, &whitenoise.shared.database)
+        // Resolve visible group IDs from per-account DB (accepted + pending)
+        let session = whitenoise.require_session(&pubkey).unwrap();
+        let visible =
+            AccountGroup::find_visible_for_account(&pubkey, &session.account_db.inner.pool)
                 .await
                 .unwrap();
+        let visible_group_ids: Vec<Vec<u8>> = visible
+            .iter()
+            .map(|ag| ag.mls_group_id.as_slice().to_vec())
+            .collect();
+
+        // Cross-group search for "marmot"
+        let results = AggregatedMessage::search_messages(
+            &pubkey,
+            "marmot",
+            50,
+            &visible_group_ids,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
 
         // Should find 3 results (groups A and B), NOT the declined group
         assert_eq!(
@@ -5038,10 +5081,15 @@ mod tests {
         assert_eq!(group_b_result.position, 0);
 
         // Empty query returns all non-declined messages
-        let all_results =
-            AggregatedMessage::search_messages(&pubkey, "", 50, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let all_results = AggregatedMessage::search_messages(
+            &pubkey,
+            "",
+            50,
+            &visible_group_ids,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             all_results.len(),
             3,
@@ -5049,10 +5097,15 @@ mod tests {
         );
 
         // Limit is respected
-        let limited =
-            AggregatedMessage::search_messages(&pubkey, "marmot", 1, &whitenoise.shared.database)
-                .await
-                .unwrap();
+        let limited = AggregatedMessage::search_messages(
+            &pubkey,
+            "marmot",
+            1,
+            &visible_group_ids,
+            &whitenoise.shared.database,
+        )
+        .await
+        .unwrap();
         assert_eq!(limited.len(), 1, "limit should cap results");
 
         // No match returns empty
@@ -5060,6 +5113,7 @@ mod tests {
             &pubkey,
             "nonexistent",
             50,
+            &visible_group_ids,
             &whitenoise.shared.database,
         )
         .await
