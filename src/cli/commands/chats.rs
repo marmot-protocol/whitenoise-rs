@@ -12,6 +12,16 @@ pub enum ChatsCmd {
     /// List all chats with last message preview
     List,
 
+    /// Show a single chat list item, including membership state.
+    ///
+    /// Unlike `list`, surfaces the entry even when the user has declined
+    /// the group — useful for chat-detail screens that want to ask "am I
+    /// still a member?" without subscribing to the full chat list.
+    Show {
+        /// MLS group ID (hex)
+        group_id: String,
+    },
+
     /// Subscribe to live chat list updates
     Subscribe,
 
@@ -57,6 +67,7 @@ impl ChatsCmd {
     ) -> crate::cli::Result<()> {
         match self {
             Self::List => list(socket, json, account_flag).await,
+            Self::Show { group_id } => show(socket, json, account_flag, &group_id).await,
             Self::Subscribe => subscribe(socket, json, account_flag).await,
             Self::Archive { group_id } => archive(socket, json, account_flag, &group_id).await,
             Self::Unarchive { group_id } => unarchive(socket, json, account_flag, &group_id).await,
@@ -73,6 +84,24 @@ impl ChatsCmd {
 async fn list(socket: &Path, json: bool, account_flag: Option<&str>) -> crate::cli::Result<()> {
     let pubkey = account::resolve_account(socket, account_flag).await?;
     let resp = client::send(socket, &Request::ChatsList { account: pubkey }).await?;
+    output::print_and_exit(&resp, json)
+}
+
+async fn show(
+    socket: &Path,
+    json: bool,
+    account_flag: Option<&str>,
+    group_id: &str,
+) -> crate::cli::Result<()> {
+    let pubkey = account::resolve_account(socket, account_flag).await?;
+    let resp = client::send(
+        socket,
+        &Request::GetChatListItem {
+            account: pubkey,
+            group_id: group_id.to_string(),
+        },
+    )
+    .await?;
     output::print_and_exit(&resp, json)
 }
 
