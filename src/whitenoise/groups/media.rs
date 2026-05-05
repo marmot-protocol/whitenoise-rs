@@ -418,7 +418,7 @@ impl Whitenoise {
         let decrypted_data = Self::download_and_decrypt_chat_media_blob(
             &account.pubkey,
             &self.config.data_dir,
-            &self.config.keyring_service_id,
+            self.keyring_service_id(),
             group_id,
             &media_file,
             original_file_hash,
