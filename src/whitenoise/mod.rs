@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,7 +77,7 @@ pub mod utils;
 pub mod zapstore;
 
 use mdk_core::prelude::MDK;
-use mdk_sqlite_storage::MdkSqliteStorage;
+use mdk_sqlite_storage::{MdkSqliteStorage, keyring};
 
 use crate::init_tracing;
 use crate::perf_instrument;
@@ -955,8 +956,11 @@ impl Whitenoise {
         // Tear down all relay-control subscriptions
         self.relay_control.shutdown_all().await;
 
-        // Remove database (accounts and media) data
-        self.database.delete_all_data().await?;
+        // Remove database files and key material.
+        let accounts = Account::all(&self.database).await?;
+        let database_key_id = self.database_key_id().to_string();
+        self.database.close_and_delete_files().await?;
+        keyring::delete_db_key(&self.config.keyring_service_id, &database_key_id)?;
 
         // Remove storage artifacts (media cache, etc.)
         self.storage.wipe_all().await?;
@@ -973,6 +977,7 @@ impl Whitenoise {
         }
         // Always recreate the empty MLS directory
         tokio::fs::create_dir_all(&mls_dir).await?;
+        self.delete_mdk_database_keys_for_accounts(&accounts)?;
 
         // Remove logs
         if self.config.logs_dir.exists() {
@@ -988,6 +993,50 @@ impl Whitenoise {
         }
 
         Ok(())
+    }
+
+    async fn delete_mdk_storage_for_account(&self, pubkey: &PublicKey) -> Result<()> {
+        let mls_storage_path = self.config.data_dir.join("mls").join(pubkey.to_hex());
+        match tokio::fs::metadata(&mls_storage_path).await {
+            Ok(metadata) if metadata.is_dir() => {
+                tokio::fs::remove_dir_all(mls_storage_path).await?;
+            }
+            Ok(_) => {
+                tokio::fs::remove_file(mls_storage_path).await?;
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.delete_mdk_database_key_for_pubkey(pubkey)
+    }
+
+    fn delete_mdk_database_keys_for_accounts(&self, accounts: &[Account]) -> Result<()> {
+        for account in accounts {
+            self.delete_mdk_database_key_for_pubkey(&account.pubkey)?;
+        }
+
+        Ok(())
+    }
+
+    fn delete_mdk_database_key_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
+        let db_key_id = format!("mdk.db.key.{}", pubkey.to_hex());
+        keyring::delete_db_key(&self.config.keyring_service_id, &db_key_id)?;
+        Ok(())
+    }
+
+    fn database_key_id(&self) -> &str {
+        #[cfg(any(test, feature = "integration-tests", feature = "benchmark-tests"))]
+        {
+            self.config
+                .database_key_id
+                .as_deref()
+                .unwrap_or(WHITENOISE_DB_KEY_ID)
+        }
+
+        #[cfg(not(any(test, feature = "integration-tests", feature = "benchmark-tests")))]
+        {
+            WHITENOISE_DB_KEY_ID
+        }
     }
 
     /// Gracefully shuts down all scheduled tasks.
@@ -1899,6 +1948,8 @@ mod tests {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
 
             // Create test files in the whitenoise directories
+            let database_path = whitenoise.database.path.clone();
+            let database_key_id = whitenoise.database_key_id().to_string();
             let test_data_file = whitenoise.config.data_dir.join("test_data.txt");
             let test_log_file = whitenoise.config.logs_dir.join("test_log.txt");
             tokio::fs::write(&test_data_file, "test data")
@@ -1922,13 +1973,26 @@ mod tests {
                 .filter_map(|e| e.ok())
                 .collect();
             assert_eq!(cache_entries.len(), 1);
+            keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &database_key_id)
+                .expect("Failed to create app database key");
+            assert!(
+                keyring::get_db_key(&whitenoise.config.keyring_service_id, &database_key_id)
+                    .unwrap()
+                    .is_some()
+            );
 
             // Delete all data
             let result = whitenoise.delete_all_data().await;
             assert!(result.is_ok());
 
             // Verify cleanup
-            assert!(Account::all(&whitenoise.database).await.unwrap().is_empty());
+            assert!(!database_path.exists());
+            assert!(
+                keyring::get_db_key(&whitenoise.config.keyring_service_id, &database_key_id)
+                    .unwrap()
+                    .is_none(),
+                "App wipe should remove the app database key"
+            );
             assert!(!test_log_file.exists());
 
             // Media cache directory should be removed
@@ -1939,6 +2003,32 @@ mod tests {
             let mls_dir = whitenoise.config.data_dir.join("mls");
             assert!(mls_dir.exists());
             assert!(mls_dir.is_dir());
+        }
+
+        #[tokio::test]
+        async fn test_delete_all_data_removes_mdk_database_keys() {
+            let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
+            let (account, _keys) = create_test_account(&whitenoise).await;
+            account.save(&whitenoise.database).await.unwrap();
+
+            let db_key_id = format!("mdk.db.key.{}", account.pubkey.to_hex());
+            keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+                .expect("Failed to create MDK database key");
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_some()
+            );
+
+            whitenoise.delete_all_data().await.unwrap();
+
+            assert!(
+                keyring::get_db_key(&whitenoise.config.keyring_service_id, &db_key_id)
+                    .unwrap()
+                    .is_none(),
+                "App wipe should remove account-scoped MDK database keys"
+            );
         }
     }
 

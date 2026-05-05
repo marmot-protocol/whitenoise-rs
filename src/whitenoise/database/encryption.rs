@@ -2,6 +2,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -14,6 +15,7 @@ pub(super) const WHITENOISE_DB_KEY_ID: &str = "whitenoise.db.key.v1";
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const MIGRATION_LOCK_STALE_SECS: u64 = 15 * 60;
+static APP_DB_KEY_ROTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DatabaseFileState {
@@ -30,10 +32,16 @@ pub(super) async fn prepare_sqlcipher_database(
     assert_sqlcipher_available().await?;
 
     let mut state = database_file_state(db_path)?;
+    let has_recovery_sidecar = has_migration_recovery_sidecar(db_path);
     let config = match state {
         DatabaseFileState::Encrypted => existing_key(db_path, keyring_service_id, key_id)?,
-        DatabaseFileState::MissingOrEmpty | DatabaseFileState::Plaintext => {
+        DatabaseFileState::MissingOrEmpty | DatabaseFileState::Plaintext
+            if has_recovery_sidecar =>
+        {
             get_or_create_key(keyring_service_id, key_id)?
+        }
+        DatabaseFileState::MissingOrEmpty | DatabaseFileState::Plaintext => {
+            create_fresh_key(keyring_service_id, key_id)?
         }
     };
 
@@ -54,6 +62,15 @@ pub(super) fn cleanup_completed_migration(db_path: &Path) -> Result<(), Database
         remove_file_if_exists(&sidecar_path(db_path, ".plaintext.backup"))?;
     }
 
+    Ok(())
+}
+
+pub(super) fn delete_database_files(db_path: &Path) -> Result<(), DatabaseError> {
+    remove_file_if_exists(db_path)?;
+    remove_sqlite_sidecars(db_path)?;
+    remove_file_if_exists(&sidecar_path(db_path, ".encrypted.tmp"))?;
+    remove_file_if_exists(&sidecar_path(db_path, ".plaintext.backup"))?;
+    remove_file_if_exists(&sidecar_path(db_path, ".encryption.lock"))?;
     Ok(())
 }
 
@@ -304,6 +321,21 @@ fn get_or_create_key(
         .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))
 }
 
+fn create_fresh_key(
+    keyring_service_id: &str,
+    key_id: &str,
+) -> Result<EncryptionConfig, DatabaseError> {
+    let lock = APP_DB_KEY_ROTATION_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().map_err(|e| {
+        DatabaseError::EncryptionKey(format!("Failed to acquire app DB key rotation lock: {e}"))
+    })?;
+
+    keyring::delete_db_key(keyring_service_id, key_id)
+        .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))?;
+    keyring::get_or_create_db_key(keyring_service_id, key_id)
+        .map_err(|e| DatabaseError::EncryptionKey(e.to_string()))
+}
+
 fn database_file_state(db_path: &Path) -> Result<DatabaseFileState, DatabaseError> {
     if !db_path.exists() {
         return Ok(DatabaseFileState::MissingOrEmpty);
@@ -364,6 +396,11 @@ fn sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut path = db_path.as_os_str().to_owned();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+fn has_migration_recovery_sidecar(db_path: &Path) -> bool {
+    sidecar_path(db_path, ".encrypted.tmp").exists()
+        || sidecar_path(db_path, ".plaintext.backup").exists()
 }
 
 // SQLite's ATTACH DATABASE does not accept bind parameters — only literal strings — so we
