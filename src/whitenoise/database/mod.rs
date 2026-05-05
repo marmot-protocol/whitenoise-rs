@@ -460,7 +460,10 @@ mod tests {
         fs::{self, File},
         io::Read,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            LazyLock,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use mdk_sqlite_storage::keyring;
@@ -469,6 +472,8 @@ mod tests {
     use crate::whitenoise::Whitenoise;
 
     const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+    static SQLCIPHER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     fn unique_service_id() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -523,6 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypted_database_creation() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("encrypted.db");
@@ -548,6 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_encrypted_database_replaces_stale_keyring_entry() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("encrypted-stale-key.db");
@@ -590,6 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypted_database_reopen_existing() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("encrypted-reopen.db");
@@ -617,6 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypted_database_reopen_cleans_completed_migration_sidecars() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("encrypted-clean-sidecars.db");
@@ -643,6 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plaintext_database_migrates_to_encrypted_without_data_loss() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("migrate.db");
@@ -675,6 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plaintext_database_migration_replaces_stale_keyring_entry() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("migrate-stale-key.db");
@@ -729,6 +740,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupted_migration_restores_plaintext_backup_when_database_missing() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("recover-backup.db");
@@ -782,6 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupted_migration_restores_valid_encrypted_temp_when_database_missing() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("recover-encrypted-temp.db");
@@ -812,6 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_interrupted_migration_rejects_invalid_encrypted_temp_without_backup() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("recover-invalid-temp.db");
@@ -836,6 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_encrypted_database_requires_existing_key() {
+        let _sqlcipher_guard = SQLCIPHER_TEST_LOCK.lock().await;
         Whitenoise::initialize_mock_keyring_store();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let db_path = temp_dir.path().join("missing-key.db");
