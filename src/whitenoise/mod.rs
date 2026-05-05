@@ -2105,12 +2105,15 @@ mod tests {
         async fn test_delete_all_data_removes_app_database_key_when_file_delete_fails() {
             let (whitenoise, _data_temp, _logs_temp) = create_mock_whitenoise().await;
             let database_path = whitenoise.database.path.clone();
+            let lock_path = database_path.with_file_name(format!(
+                "{}.encryption.lock",
+                database_path.file_name().unwrap().to_string_lossy()
+            ));
             let database_key_id = whitenoise.database_key_id().to_string();
 
             keyring::get_or_create_db_key(&whitenoise.config.keyring_service_id, &database_key_id)
                 .expect("Failed to create app database key");
-            std::fs::remove_file(&database_path).unwrap();
-            std::fs::create_dir(&database_path).unwrap();
+            std::fs::create_dir(&lock_path).unwrap();
 
             let result = whitenoise.delete_all_data().await;
 
